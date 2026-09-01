@@ -585,6 +585,18 @@ fn build_observer_request_from_payload(payload: &serde_json::Value) -> Option<Tu
         return None;
     }
     let messages = object_array(hook_payload, "messages");
+    // A memory operation is already an explicit, typed write/read boundary.
+    // Never send its confirmation back through the observer as ordinary
+    // knowledge, even if a bridge payload omits the parallel tool_calls list.
+    if tool_calls
+        .iter()
+        .any(astra_turn_core::observer::is_memory_tool_message)
+        || messages
+            .iter()
+            .any(astra_turn_core::observer::is_memory_tool_message)
+    {
+        return None;
+    }
     let user_id = optional_object_str(hook_payload, "user_id")?.to_string();
     let session_id = optional_object_str(hook_payload, "session_id")?.to_string();
     let observer_messages = build_observer_messages(first_user_content(&messages), full_text);
@@ -741,8 +753,8 @@ mod inprocess_hook_contract_tests {
     };
 
     use super::{
-        ORDERED_SIDE_EFFECT_QUEUES, release_side_effect_drain_lease_after_panic,
-        run_bridge_hook_side_effects, truncate_text,
+        ORDERED_SIDE_EFFECT_QUEUES, build_observer_request_from_payload,
+        release_side_effect_drain_lease_after_panic, run_bridge_hook_side_effects, truncate_text,
     };
 
     #[derive(Clone, Default)]
@@ -1241,6 +1253,47 @@ mod inprocess_hook_contract_tests {
         let truncated = truncate_text(&input, 5);
         assert_eq!(truncated, "你好🚀你好…");
         assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    #[test]
+    fn bridge_observer_rejects_memory_operation_even_without_parallel_tool_calls() {
+        let messages = vec![
+            json!({"role": "user", "content": "Remember the launch date."}),
+            json!({
+                "role": "assistant",
+                "content": serde_json::Value::Null,
+                "tool_calls": [{
+                    "id": "memory-call-1",
+                    "function": {"name": "memory", "arguments": "{}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "name": "memory",
+                "tool_call_id": "memory-call-1",
+                "content": "{\"memory_id\":\"m1\"}"
+            }),
+            json!({"role": "assistant", "content": "Stored memory m1."}),
+        ];
+        let payload = Value::Object(build_turn_hook_args(
+            "user-1",
+            "session-memory",
+            &messages,
+            &[],
+            "Stored memory m1.",
+            &[],
+            None,
+            Some("gpt-4"),
+            None,
+            Some("memory-event"),
+            1,
+            None,
+            false,
+            false,
+            true,
+        ));
+
+        assert!(build_observer_request_from_payload(&payload).is_none());
     }
 
     #[tokio::test]

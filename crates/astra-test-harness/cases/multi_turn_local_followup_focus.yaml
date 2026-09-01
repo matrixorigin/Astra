@@ -1,0 +1,66 @@
+name: multi_turn_local_followup_focus
+description: |
+  **What**: Change topics inside one session, ask an elliptical summary question, then explicitly
+  widen scope back to the old topic.
+  **Tests**: Immediate-exchange referent resolution, resistance to stale session-memory salience,
+  and an explicit session-wide scope override.
+  **Why**: Short follow-ups such as “问题总结？” must summarize the immediately preceding review,
+  not whichever older topic occupies more tokens in history or session memory.
+  **Pass means**: The local follow-up stays on CURSOR-BETA, while the explicit session-wide recall
+  still recovers LEGACY-ALPHA.
+  **Fail means**: An older salient topic hijacks the local follow-up, or local-focus protection
+  prevents a later explicit broad-scope request.
+prompt: |
+  我们先讨论一个旧事故：代号 LEGACY-ALPHA。它涉及动态 task board 的取消与追加。
+  只需确认你记住了事故代号，不要使用工具。
+prompt_variants:
+  - id: zh_local_paraphrase
+    step_index: 1
+    prompt: "刚才的问题概括？请用一句话回答，不要使用工具。"
+  - id: en_local_paraphrase
+    step_index: 1
+    prompt: "Issue summary? Answer in one sentence and do not use tools."
+models:
+  - deepseek-v4-flash
+capability: "custom:multi_turn_local_followup_focus"
+difficulty: 4
+weight: 3.0
+timeout_seconds: 180
+steps:
+  - prompt: |
+      现在切换话题。刚完成的只读 review 结论代号是 CURSOR-BETA：
+      分页排序与 continuation cursor 不一致，并且缺少对应负例测试。
+      请用一句话复述这条已给出的结论，不要使用工具。
+    criteria:
+      - type: text_contains
+        needle: CURSOR-BETA
+      - type: text_contains
+        needle: cursor
+  - prompt: "问题总结？请用一句话回答，不要使用工具。"
+    criteria:
+      - type: text_contains
+        needle: cursor
+      - type: text_contains
+        needle: 负例测试
+      - type: text_not_contains
+        needle: LEGACY-ALPHA
+      - type: judger
+        question: |
+          Is the answer a direct, concise summary of the immediately preceding CURSOR-BETA
+          review finding (cursor inconsistency and missing negative test), without drifting to
+          the older LEGACY-ALPHA topic or inventing runtime/tool evidence? Score 1.0 only when
+          all conditions hold, 0.5 for a relevant but unnecessarily broad answer, and 0.0 for
+          stale-topic hijacking or fabricated evidence.
+        threshold: 0.8
+  - prompt: "现在明确回到整个 session：最早讨论的旧事故代号是什么？只回答代号。"
+    criteria:
+      - type: text_contains
+        needle: LEGACY-ALPHA
+criteria:
+  - type: exit_code
+    code: 0
+  - type: text_contains
+    needle: LEGACY-ALPHA
+  - type: turn_rounds_between
+    min: 1
+    max: 5

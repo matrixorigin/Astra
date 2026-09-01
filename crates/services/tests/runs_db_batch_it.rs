@@ -10,8 +10,8 @@ use astra_services::runs::{
     DatabaseRunStateStore, DurableRunRecord, RunStateStore, ToolOutputBatchItem,
 };
 use serde_json::json;
-use sqlx::Row;
-use std::sync::Arc;
+use sqlx::{Connection, Row, mysql::MySqlConnection};
+use std::{sync::Arc, time::Duration};
 
 async fn setup() -> (SharedPool, Arc<DatabaseRunStateStore>) {
     let (pool, _settings) = common::setup_pool_and_settings().await;
@@ -68,11 +68,104 @@ fn durable_run_record(run_id: String, user_id: String, session_id: String) -> Du
         agent_binding_schema_version: None,
         model_offering_id: None,
         resolved_model_name: None,
+        capability_server_refs_json: None,
         runtime_profile: None,
-        provider_request_fingerprint: None,
+        start_request_fingerprint: None,
+        work_binding: None,
         events: vec![],
         created_at: String::new(),
         updated_at: String::new(),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; set ASTRA_TEST_DB_IT=1"]
+async fn cancellation_intent_is_independent_from_a_locked_session_row() {
+    let (pool, store) = setup().await;
+    let user_id = format!("cancel-lock-user-{}", uuid::Uuid::new_v4());
+    let session_id = format!("cancel-lock-session-{}", uuid::Uuid::new_v4());
+    let run_id = format!("cancel-lock-run-{}", uuid::Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO agent_sessions
+         (user_id, session_id, status, created_at, updated_at, last_active_at)
+         VALUES (?, ?, 'active', NOW(6), NOW(6), NOW(6))",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .execute(pool.get())
+    .await
+    .expect("insert session fixture");
+    store
+        .insert_run(durable_run_record(
+            run_id.clone(),
+            user_id.clone(),
+            session_id.clone(),
+        ))
+        .await
+        .expect("insert run fixture");
+
+    let settings = common::require_db_it_env();
+    let mut lock_holder = MySqlConnection::connect(&settings.database_url_with_password())
+        .await
+        .expect("connect independent lock holder");
+    let mut lock_transaction = lock_holder
+        .begin()
+        .await
+        .expect("begin lock holder transaction");
+    sqlx::query(
+        "SELECT status FROM agent_sessions WHERE user_id = ? AND session_id = ? FOR UPDATE",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(&mut *lock_transaction)
+    .await
+    .expect("lock session fixture row");
+
+    let cancellation = tokio::time::timeout(
+        Duration::from_millis(750),
+        store.request_run_cancellation(&user_id, &run_id),
+    )
+    .await;
+    lock_transaction
+        .rollback()
+        .await
+        .expect("release session fixture lock");
+
+    let cancellation = cancellation.expect("cancellation must not wait on agent_sessions lock");
+    assert!(cancellation.expect("write cancellation intent"));
+    assert!(
+        store
+            .request_run_cancellation(&user_id, &run_id)
+            .await
+            .expect("repeat cancellation intent")
+    );
+    assert!(
+        store
+            .is_run_cancellation_requested(&user_id, &run_id)
+            .await
+            .expect("read cancellation intent")
+    );
+
+    for (sql, scoped_id) in [
+        (
+            "DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?",
+            &run_id,
+        ),
+        (
+            "DELETE FROM agent_runs WHERE user_id = ? AND run_id = ?",
+            &run_id,
+        ),
+        (
+            "DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+            &session_id,
+        ),
+    ] {
+        sqlx::query(sql)
+            .bind(&user_id)
+            .bind(scoped_id)
+            .execute(pool.get())
+            .await
+            .expect("cleanup fixture");
     }
 }
 
@@ -169,8 +262,10 @@ async fn batch_write_stores_and_loads_events() {
         agent_binding_schema_version: None,
         model_offering_id: None,
         resolved_model_name: None,
+        capability_server_refs_json: None,
         runtime_profile: None,
-        provider_request_fingerprint: None,
+        start_request_fingerprint: None,
+        work_binding: None,
         events: events.clone(),
         created_at: String::new(),
         updated_at: String::new(),
@@ -245,8 +340,10 @@ async fn batch_write_preserves_event_idx_ordering() {
         agent_binding_schema_version: None,
         model_offering_id: None,
         resolved_model_name: None,
+        capability_server_refs_json: None,
         runtime_profile: None,
-        provider_request_fingerprint: None,
+        start_request_fingerprint: None,
+        work_binding: None,
         events: events.clone(),
         created_at: String::new(),
         updated_at: String::new(),
@@ -339,8 +436,10 @@ async fn batch_write_idempotency_dedup_skips_duplicates() {
         agent_binding_schema_version: None,
         model_offering_id: None,
         resolved_model_name: None,
+        capability_server_refs_json: None,
         runtime_profile: None,
-        provider_request_fingerprint: None,
+        start_request_fingerprint: None,
+        work_binding: None,
         events: events.clone(),
         created_at: String::new(),
         updated_at: String::new(),
@@ -351,7 +450,7 @@ async fn batch_write_idempotency_dedup_skips_duplicates() {
     // Now try to append the same events again via append_events_batch
     // (should be deduped — no new events inserted).
     store
-        .append_events_batch(&user_id, &run_id, &events)
+        .append_events_batch(&user_id, &session_id, &run_id, &events)
         .await
         .expect("second append_events_batch should succeed (all deduped)");
 
@@ -373,7 +472,7 @@ async fn batch_write_idempotency_dedup_skips_duplicates() {
         make_event("tool_call", json!({"name": "bash"})),
     ];
     store
-        .append_events_batch(&user_id, &run_id, &mixed_events)
+        .append_events_batch(&user_id, &session_id, &run_id, &mixed_events)
         .await
         .expect("mixed append_events_batch should succeed");
 
@@ -412,7 +511,11 @@ async fn append_events_batch_isolates_idempotency_and_replay_by_owner() {
     let run_id = format!("owner-bound-run-{}", uuid::Uuid::new_v4());
     let idempotency_key = format!("idem-{}", uuid::Uuid::new_v4());
 
-    let record = durable_run_record(run_id.clone(), owner_user_id.clone(), owner_session_id);
+    let record = durable_run_record(
+        run_id.clone(),
+        owner_user_id.clone(),
+        owner_session_id.clone(),
+    );
     store.insert_run(record).await.expect("insert owner run");
 
     sqlx::query(
@@ -443,7 +546,12 @@ async fn append_events_batch_isolates_idempotency_and_replay_by_owner() {
         json!({"output": "owner result"}),
     );
     store
-        .append_events_batch(&owner_user_id, &run_id, std::slice::from_ref(&owner_event))
+        .append_events_batch(
+            &owner_user_id,
+            &owner_session_id,
+            &run_id,
+            std::slice::from_ref(&owner_event),
+        )
         .await
         .expect("owner append must ignore foreign idempotency row");
 
@@ -536,7 +644,7 @@ async fn checkpoints_isolate_idempotency_and_latest_load_by_owner() {
         .insert_run(durable_run_record(
             run_id.clone(),
             owner_user_id.clone(),
-            owner_session_id,
+            owner_session_id.clone(),
         ))
         .await
         .expect("insert owner run");
@@ -566,7 +674,12 @@ async fn checkpoints_isolate_idempotency_and_latest_load_by_owner() {
     .to_string();
     assert!(
         store
-            .save_checkpoint(&owner_user_id, &run_id, &owner_checkpoint)
+            .save_checkpoint(
+                &owner_user_id,
+                &owner_session_id,
+                &run_id,
+                &owner_checkpoint,
+            )
             .await
             .expect("save owner checkpoint"),
         "owner checkpoint save must ignore foreign idempotency row"
@@ -835,8 +948,10 @@ async fn single_event_append_uses_batch_path() {
         agent_binding_schema_version: None,
         model_offering_id: None,
         resolved_model_name: None,
+        capability_server_refs_json: None,
         runtime_profile: None,
-        provider_request_fingerprint: None,
+        start_request_fingerprint: None,
+        work_binding: None,
         events: vec![],
         created_at: String::new(),
         updated_at: String::new(),
@@ -847,6 +962,7 @@ async fn single_event_append_uses_batch_path() {
     store
         .append_event(
             &user_id,
+            &session_id,
             &run_id,
             make_event("tool_call", json!({"name": "read_file"})),
         )
@@ -855,13 +971,19 @@ async fn single_event_append_uses_batch_path() {
     store
         .append_event(
             &user_id,
+            &session_id,
             &run_id,
             make_event("tool_result", json!({"output": "hello"})),
         )
         .await
         .unwrap();
     store
-        .append_event(&user_id, &run_id, make_event("run_finished", json!({})))
+        .append_event(
+            &user_id,
+            &session_id,
+            &run_id,
+            make_event("run_finished", json!({})),
+        )
         .await
         .unwrap();
 
@@ -926,8 +1048,10 @@ async fn concurrent_append_no_event_idx_gaps() {
             agent_binding_schema_version: None,
             model_offering_id: None,
             resolved_model_name: None,
+            capability_server_refs_json: None,
             runtime_profile: None,
-            provider_request_fingerprint: None,
+            start_request_fingerprint: None,
+            work_binding: None,
             events: vec![],
             created_at: String::new(),
             updated_at: String::new(),
@@ -941,19 +1065,25 @@ async fn concurrent_append_no_event_idx_gaps() {
     let rid_b = run_id.clone();
     let uid_a = user_id.clone();
     let uid_b = user_id.clone();
+    let sid_a = session_id.clone();
+    let sid_b = session_id.clone();
 
     let (r1, r2) = tokio::join!(
         tokio::spawn(async move {
             let batch: Vec<_> = (0..5)
                 .map(|i| make_event("task_start", json!({"n": i})))
                 .collect();
-            store_a.append_events_batch(&uid_a, &rid_a, &batch).await
+            store_a
+                .append_events_batch(&uid_a, &sid_a, &rid_a, &batch)
+                .await
         }),
         tokio::spawn(async move {
             let batch: Vec<_> = (0..7)
                 .map(|i| make_event("tool_call", json!({"n": i})))
                 .collect();
-            store_b.append_events_batch(&uid_b, &rid_b, &batch).await
+            store_b
+                .append_events_batch(&uid_b, &sid_b, &rid_b, &batch)
+                .await
         }),
     );
 
@@ -1030,8 +1160,10 @@ async fn large_batch_50_events_contiguous() {
             agent_binding_schema_version: None,
             model_offering_id: None,
             resolved_model_name: None,
+            capability_server_refs_json: None,
             runtime_profile: None,
-            provider_request_fingerprint: None,
+            start_request_fingerprint: None,
+            work_binding: None,
             events: vec![],
             created_at: String::new(),
             updated_at: String::new(),
@@ -1052,7 +1184,7 @@ async fn large_batch_50_events_contiguous() {
         .collect();
 
     store
-        .append_events_batch(&user_id, &run_id, &batch)
+        .append_events_batch(&user_id, &session_id, &run_id, &batch)
         .await
         .unwrap();
 
@@ -1125,8 +1257,10 @@ async fn dedup_preserves_non_keyed_events() {
             agent_binding_schema_version: None,
             model_offering_id: None,
             resolved_model_name: None,
+            capability_server_refs_json: None,
             runtime_profile: None,
-            provider_request_fingerprint: None,
+            start_request_fingerprint: None,
+            work_binding: None,
             events: vec![],
             created_at: String::new(),
             updated_at: String::new(),
@@ -1141,7 +1275,7 @@ async fn dedup_preserves_non_keyed_events() {
         make_idempotent_event("tool_call", "tool_A", json!({"n": 0})),
     ];
     store
-        .append_events_batch(&user_id, &run_id, &batch1)
+        .append_events_batch(&user_id, &session_id, &run_id, &batch1)
         .await
         .unwrap();
 
@@ -1153,13 +1287,13 @@ async fn dedup_preserves_non_keyed_events() {
         make_event("heartbeat", json!({"ts": 2})),
     ];
     store
-        .append_events_batch(&user_id, &run_id, &batch2)
+        .append_events_batch(&user_id, &session_id, &run_id, &batch2)
         .await
         .unwrap();
 
     // Re-send batch2 — keyed skipped, non-keyed re-inserted
     store
-        .append_events_batch(&user_id, &run_id, &batch2)
+        .append_events_batch(&user_id, &session_id, &run_id, &batch2)
         .await
         .unwrap();
 
@@ -1233,8 +1367,10 @@ async fn append_event_delegates_to_append_events_batch() {
         agent_binding_schema_version: None,
         model_offering_id: None,
         resolved_model_name: None,
+        capability_server_refs_json: None,
         runtime_profile: None,
-        provider_request_fingerprint: None,
+        start_request_fingerprint: None,
+        work_binding: None,
         events: vec![],
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
@@ -1246,7 +1382,7 @@ async fn append_event_delegates_to_append_events_batch() {
     // append via the trait's `append_event` (delegates to append_events_batch)
     let event = make_event("user_query", serde_json::json!({"message": "hello"}));
     store
-        .append_event(&user_id, &run_id, event)
+        .append_event(&user_id, &session_id, &run_id, event)
         .await
         .expect("append_event via trait");
 
@@ -1316,8 +1452,10 @@ async fn insert_ignore_toctou_dedup_and_index_accounting() {
         agent_binding_schema_version: None,
         model_offering_id: None,
         resolved_model_name: None,
+        capability_server_refs_json: None,
         runtime_profile: None,
-        provider_request_fingerprint: None,
+        start_request_fingerprint: None,
+        work_binding: None,
         events: events.clone(),
         created_at: String::new(),
         updated_at: String::new(),
@@ -1334,7 +1472,7 @@ async fn insert_ignore_toctou_dedup_and_index_accounting() {
 
     // Re-append the same events — SELECT finds all keys → no INSERT.
     store
-        .append_events_batch(&user_id, &run_id, &events)
+        .append_events_batch(&user_id, &session_id, &run_id, &events)
         .await
         .expect("re-append same keys");
 
@@ -1357,7 +1495,7 @@ async fn insert_ignore_toctou_dedup_and_index_accounting() {
         make_idempotent_event("tool_result", "tctou-k3", json!({"output": "done"})),
     ];
     store
-        .append_events_batch(&user_id, &run_id, &mixed)
+        .append_events_batch(&user_id, &session_id, &run_id, &mixed)
         .await
         .expect("mixed batch");
 
@@ -1398,7 +1536,7 @@ async fn terminal_transition_persists_error_code_with_event_batch() {
         .insert_run(durable_run_record(
             run_id.clone(),
             user_id.clone(),
-            session_id,
+            session_id.clone(),
         ))
         .await
         .expect("insert run");
@@ -1425,8 +1563,10 @@ async fn terminal_transition_persists_error_code_with_event_batch() {
     let updated = store
         .update_run_status_with_events_if_current(
             &user_id,
+            &session_id,
             &run_id,
             &["running"],
+            None,
             "failed",
             None,
             Some("[network] LLM request failed"),

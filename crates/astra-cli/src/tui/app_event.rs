@@ -3,6 +3,13 @@
 #[derive(Debug, Clone)]
 pub(crate) enum TuiAppEvent {
     // ── Mapped from StreamEvent (one-layer bridge) ──────────────────────
+    /// The accepted stream established the canonical session identity.
+    ///
+    /// This must reach the foreground reducer before any tool result from
+    /// that stream: Work receipts are scoped to this durable session and
+    /// cannot be safely projected against an unbound observer.
+    SessionBound(String),
+    RunBound(String),
     ContextWindowPolicy {
         raw_window_tokens: u64,
         usable_input_tokens: u64,
@@ -39,6 +46,8 @@ pub(crate) enum TuiAppEvent {
         tool_use_id: String,
         parent_tool_use_id: Option<String>,
     },
+    /// Versioned server event for a durable canonical Work-board update.
+    WorkTaskBoardUpdate(serde_json::Value),
     AgentControlCompleted {
         action: String,
         label: String,
@@ -63,6 +72,13 @@ pub(crate) enum TuiAppEvent {
         event_index: usize,
         content: String,
     },
+    UserIntentReturned {
+        intent_id: String,
+        delivery: astra_turn_types::UserIntentDelivery,
+        status: astra_turn_types::UserIntentStatus,
+        event_index: usize,
+        content: String,
+    },
     AgentLive(astra_turn_core::agent_live_event::AgentLiveEvent),
     AgentLiveBatch(Vec<astra_turn_core::agent_live_event::AgentLiveEvent>),
     AgentLiveGap(astra_turn_core::agent_live_event::AgentLiveGap),
@@ -80,6 +96,9 @@ pub(crate) enum TuiAppEvent {
     /// projection, but does not claim that durable turn settlement has
     /// completed yet.
     TurnStreamClosed,
+    /// Every event produced for this turn has reached the foreground reducer.
+    /// No token or tool event from this turn can arrive after this barrier.
+    TurnProjectionDrained,
     TurnComplete,
     TurnError(String),
     SystemWarning(String),

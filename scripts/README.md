@@ -17,6 +17,9 @@ scripts/
 │   ├── mock_openai_server.py
 │   ├── multi_cli_capacity_probe.py
 │   └── db_capacity_report.py
+├── e2e/
+│   ├── validate_cases.py
+│   └── validate_capability_matrix.py
 ├── schema/
 │   └── schema_inventory.py
 ├── setup/
@@ -127,6 +130,15 @@ Useful checks:
 ```sh
 python3 scripts/schema/schema_inventory.py --fail-on-duplicates --fail-on-foreign-keys --output tmp/schema-inventory.json
 python3 scripts/schema/test_schema_inventory.py
+```
+
+### `scripts/e2e/validate_capability_matrix.py`
+Validates that every `system_test` name in the product capability matrix still
+resolves to a real Rust function somewhere under `crates/`. This is an
+offline, dependency-free guard against renamed or deleted evidence anchors:
+
+```sh
+python3 scripts/e2e/validate_capability_matrix.py
 ```
 
 ### Public CLI Installer

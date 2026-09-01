@@ -32,12 +32,12 @@ pub(crate) fn compact_or_raw(body: &str) -> String {
 
 pub(crate) fn print_json_or_raw(body: &str) {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
-        println!(
+        stdout_println!(
             "{}",
             serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
         );
     } else {
-        println!("{body}");
+        stdout_println!("{body}");
     }
 }
 

@@ -6,62 +6,41 @@ use crate::cli::theme;
 use crate::{manifest_loader, mcp_client};
 use astra_services::{
     ModelAccessProjectionResponse, ModelDefaultInvalidReason, ModelDefaultResolution,
-    ModelListItemResponse, session_journal,
+    ModelListCursor, ModelListItemResponse, ModelListPageResponse, session_journal,
 };
 #[cfg(test)]
 use astra_text_utils::str_preview::prefix_chars;
 use crossterm::style::Stylize;
+use std::collections::HashSet;
 
 pub(crate) fn create_pipeline_modules(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> PipelineModules {
-    create_pipeline_modules_inner(api, profile, true, true)
+    create_pipeline_modules_inner(api, profile, true, true, None)
 }
 
 pub(crate) fn create_pipeline_modules_quiet(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
 ) -> PipelineModules {
-    create_pipeline_modules_inner(api, profile, false, true)
+    create_pipeline_modules_inner(api, profile, false, true, None)
 }
 
 /// Build the local interactive baseline and defer every external provider.
 /// The TUI event loop owns and supervises convergence through
 /// [`discover_external_pipeline_capabilities`].
+///
+/// `project_root` anchors the local skill registry's project walk-up. Pass the
+/// session's resolved workspace root (git root preferred) so skills stay
+/// visible even when the process cwd differs from the tool execution workdir.
+/// `None` falls back to the process current directory.
 pub(crate) fn create_tui_pipeline_modules(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
+    project_root: Option<&std::path::Path>,
 ) -> PipelineModules {
-    create_pipeline_modules_inner(api, profile, false, false)
-}
-
-pub(crate) fn local_task_service() -> std::sync::Arc<dyn astra_services::TaskService> {
-    let tasks_dir = astra_runtime_env::local_state_root().join("tasks");
-    std::sync::Arc::new(astra_services::LocalTaskService::new(tasks_dir))
-}
-
-/// Resolve a `TaskService` impl for this CLI invocation.
-///
-/// Edge-cloud contract: the CLI never connects to MatrixOne
-/// directly. When `cloud_base` is configured (via env or the
-/// authenticated session), we return [`crate::cli::http_task_service::HttpTaskService`]
-/// which proxies trait calls through `POST /tasks:rpc`. Otherwise
-/// we fall back to the local on-disk store so offline / one-shot
-/// CLI and headless tests stay functional.
-///
-/// `profile` is forwarded to the access-token lookup so the same
-/// cloud session can be used for both the SSE stream and task RPC.
-pub(crate) async fn resolve_task_service(
-    profile: Option<&str>,
-) -> std::sync::Arc<dyn astra_services::TaskService> {
-    if let Some(cloud_base) = resolve_cloud_base() {
-        let token = current_access_token(profile);
-        return std::sync::Arc::new(crate::cli::http_task_service::HttpTaskService::new(
-            cloud_base, token,
-        ));
-    }
-    local_task_service()
+    create_pipeline_modules_inner(api, profile, false, false, project_root)
 }
 
 /// Resolve the astra server base URL. Returns `None` when no server
@@ -73,106 +52,9 @@ pub(crate) fn resolve_cloud_base() -> Option<String> {
         .map(|s| s.trim_end_matches('/').to_string())
 }
 
-/// Task store for the durable per-session task board (`session_todos`).
-///
-/// When cloud is configured, returns an [`crate::cli::session::session_todo_client::HttpTaskStore`]
-/// that polls the server's `GET /sessions/{sid}/todos` endpoint and
-/// receives broadcast notifications from `route_task_action` after
-/// every successful mutation. The observer sees tasks within one poll
-/// cycle (~50ms after the dirty flag fires).
-///
-/// Offline / headless falls back to the in-memory store (no server).
-///
-/// Returns `(store, Option<notify_tx>)`. Callers wire `notify_tx`
-/// into the tool executor so `route_task_action` can signal the
-/// observer after each cloud write.
-///
-/// `cloud_base` selection: prefers the explicit caller-supplied URL
-/// (typically `ThinClient::api_origin()` — the same source the tool
-/// executor uses), falling back to the `ASTRA_API_URL` env var so
-/// scripted callers without a thin client still hit the right server.
-/// Never reads the env var when an explicit base is provided — having
-/// two sources of truth was the root cause of the "TUI dashboard
-/// never appears" bug: the executor used `api_origin()` while the
-/// task store used the env var, so the in-memory store handed to
-/// the observer never saw the cloud writes.
-pub(crate) async fn resolve_task_store(
-    profile: Option<&str>,
-    cloud_base_override: Option<&str>,
-) -> (
-    std::sync::Arc<dyn astra_tools::task_mgmt::TaskStore>,
-    Option<tokio::sync::broadcast::Sender<String>>,
-) {
-    let cloud_base = cloud_base_override
-        .map(|s| s.trim_end_matches('/').to_string())
-        .or_else(resolve_cloud_base);
-    if let Some(cloud_base) = cloud_base {
-        let (store, notify_tx) =
-            crate::cli::session::session_todo_client::HttpTaskStore::for_profile(
-                cloud_base, profile,
-            );
-        return (store, Some(notify_tx));
-    }
-    (
-        std::sync::Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new().with_validation()),
-        None,
-    )
-}
-
-pub(crate) fn install_task_service(
-    state: &mut SessionState,
-    task_service: std::sync::Arc<dyn astra_services::TaskService>,
-) {
-    state.task_service = Some(task_service);
-}
-
 /// Replace the task manager's store (used once at startup when we upgrade
 /// from the synchronous in-memory fallback to an API-backed durable store).
 /// The new manager inherits the current session_id.
-pub(crate) fn install_task_store(
-    state: &mut SessionState,
-    store: std::sync::Arc<dyn astra_tools::task_mgmt::TaskStore>,
-) {
-    let session_id = state
-        .session_id
-        .clone()
-        .unwrap_or_else(|| "no-session".to_string());
-    state.task_manager =
-        std::sync::Arc::new(astra_tools::task_mgmt::TaskManager::new(session_id, store));
-}
-
-/// Resolve the durable cloud background-task runtime (TaskService + lease).
-///
-/// Edge-cloud contract: no direct MO connection from the CLI. Both
-/// services proxy through their REST surfaces:
-/// - TaskService → `POST /tasks:rpc`
-/// - TaskLeaseService → `/tasks/{id}/lease/*`
-///
-/// `profile` is forwarded to the access-token resolver so a logged-in
-/// CLI invocation gets bearer auth.
-pub(crate) async fn resolve_cloud_task_runtime(
-    profile: Option<&str>,
-) -> Result<
-    (
-        std::sync::Arc<dyn astra_services::TaskService>,
-        std::sync::Arc<dyn astra_services::TaskLeaseService>,
-    ),
-    String,
-> {
-    let cloud_base = resolve_cloud_base().ok_or_else(|| {
-        "Cloud task runtime requires ASTRA_API_URL; CLI does not connect to MatrixOne directly"
-            .to_string()
-    })?;
-    let token = current_access_token(profile);
-    let task_service: std::sync::Arc<dyn astra_services::TaskService> = std::sync::Arc::new(
-        crate::cli::http_task_service::HttpTaskService::new(cloud_base.clone(), token.clone()),
-    );
-    let lease_service: std::sync::Arc<dyn astra_services::TaskLeaseService> = std::sync::Arc::new(
-        crate::cli::http_task_service::HttpTaskLeaseService::new(cloud_base, token),
-    );
-    Ok((task_service, lease_service))
-}
-
 /// Shared runtime modules created during pipeline construction.
 ///
 /// Holds the unified skill registry, MCP client manager, and skill-watcher
@@ -280,6 +162,7 @@ fn create_pipeline_modules_inner(
     profile: Option<&str>,
     announce_skills: bool,
     connect_external: bool,
+    project_root: Option<&std::path::Path>,
 ) -> PipelineModules {
     // Selector removed — the runtime now builds the turn-specific tool surface
     // directly from the local CLI catalog plus any mounted server/MCP schemas.
@@ -301,9 +184,12 @@ fn create_pipeline_modules_inner(
         astra_runtime::capabilities::RemoteSkillCatalogProvider::new(api.clone(), token_provider),
     );
     let unified_skill_registry = if connect_external {
-        astra_runtime::capabilities::build_cli_local_skill_registry(remote_catalog)
+        astra_runtime::capabilities::build_cli_local_skill_registry(remote_catalog, project_root)
     } else {
-        astra_runtime::capabilities::build_cli_local_skill_registry_bootstrap(remote_catalog)
+        astra_runtime::capabilities::build_cli_local_skill_registry_bootstrap(
+            remote_catalog,
+            project_root,
+        )
     };
     let handle = tokio::runtime::Handle::current();
 
@@ -313,10 +199,16 @@ fn create_pipeline_modules_inner(
     let mcp_manager =
         std::sync::Arc::new(tokio::sync::RwLock::new(mcp_client::McpClientManager::new()));
 
-    // Set initial roots to the current working directory.
+    let workspace_root = project_root
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok());
+
+    // MCP roots, skill discovery, and the watcher must describe the same
+    // workspace.  Deriving them independently from process cwd lets a session
+    // discover one catalog at startup and watch a different one afterwards.
     {
-        if let Ok(cwd) = std::env::current_dir() {
-            let uri = format!("file://{}", cwd.display());
+        if let Some(root_path) = workspace_root.as_deref() {
+            let uri = format!("file://{}", root_path.display());
             let root = rmcp::model::Root::new(uri).with_name("workspace");
             tokio::task::block_in_place(|| {
                 handle.block_on(async {
@@ -401,7 +293,10 @@ fn create_pipeline_modules_inner(
     // Start file-system watcher for skill hot-reload
     let skill_watcher = astra_runtime::skills::watcher::start_watching(
         unified_skill_registry.clone(),
-        astra_skills::loader::skill_search_paths(),
+        workspace_root.as_deref().map_or_else(
+            astra_skills::loader::skill_search_paths,
+            astra_skills::loader::skill_search_paths_from_root,
+        ),
     );
 
     let creds = load_credentials();
@@ -460,6 +355,193 @@ fn model_selection_from_list_entry(entry: &ModelListItemResponse) -> Option<Serv
     })
 }
 
+pub(crate) async fn load_server_model_catalog(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+) -> Result<(Vec<ModelListItemResponse>, String), String> {
+    let mut cursor: Option<ModelListCursor> = None;
+    let mut items = Vec::new();
+    let mut total = None;
+    let mut revision = None;
+    let mut seen_cursors = HashSet::new();
+    loop {
+        if let Some(current) = &cursor {
+            if !seen_cursors.insert(current.clone()) {
+                return Err("server model registry cycled its continuation cursor".to_string());
+            }
+        }
+        let cursor_tuple = cursor.as_ref().map(|value| {
+            (
+                value.provider.as_str(),
+                value.model_name.as_str(),
+                value.model_id.as_str(),
+            )
+        });
+        let response = api
+            .get_models_page_response_timeout(
+                token,
+                std::time::Duration::from_secs(3),
+                cursor_tuple,
+            )
+            .await
+            .map_err(|error| format!("failed to load server model registry: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "server model registry request failed with status {}",
+                response.status()
+            ));
+        }
+        let page: ModelListPageResponse = response.json().await.map_err(|error| {
+            format!("server model registry response was not valid JSON: {error}")
+        })?;
+        if page.limit == 0 || page.limit > 200 {
+            return Err("server model registry returned an invalid page limit".to_string());
+        }
+        if total.get_or_insert(page.total) != &page.total {
+            return Err("server model registry changed total during pagination".to_string());
+        }
+        if revision.get_or_insert_with(|| page.catalog_revision.clone()) != &page.catalog_revision {
+            return Err("server model registry changed revision during pagination".to_string());
+        }
+        let page_had_items = !page.items.is_empty();
+        items.extend(page.items);
+        let Some(next) = page.next_cursor else {
+            if items.len() != page.total as usize {
+                return Err(format!(
+                    "server model registry ended with {} items but advertised {}",
+                    items.len(),
+                    page.total
+                ));
+            }
+            return Ok((items, revision.unwrap_or_default()));
+        };
+        if !page_had_items {
+            return Err("server model registry returned a cursor without items".to_string());
+        }
+        if cursor.as_ref() == Some(&next) {
+            return Err("server model registry repeated its continuation cursor".to_string());
+        }
+        cursor = Some(next);
+    }
+}
+
+pub(crate) async fn load_server_model_catalog_json(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+) -> Result<String, String> {
+    let (items, revision) = load_server_model_catalog(api, token).await?;
+    serde_json::to_string_pretty(&ModelListPageResponse {
+        total: items.len() as u32,
+        limit: 200,
+        items,
+        next_cursor: None,
+        catalog_revision: revision,
+    })
+    .map_err(|error| format!("failed to render complete model catalog: {error}"))
+}
+
+async fn load_server_model_access(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+) -> Result<ModelAccessProjectionResponse, String> {
+    let mut cursor: Option<ModelListCursor> = None;
+    let mut first: Option<ModelAccessProjectionResponse> = None;
+    let mut expected_revision = None;
+    let mut expected_total = None;
+    let mut seen_cursors = HashSet::new();
+    loop {
+        if let Some(current) = &cursor {
+            if !seen_cursors.insert(current.clone()) {
+                return Err("Model Access projection cycled its continuation cursor".to_string());
+            }
+        }
+        let cursor_tuple = cursor.as_ref().map(|value| {
+            (
+                value.provider.as_str(),
+                value.model_name.as_str(),
+                value.model_id.as_str(),
+            )
+        });
+        let response = api
+            .get_model_access_page_response_timeout(
+                token,
+                std::time::Duration::from_secs(3),
+                cursor_tuple,
+            )
+            .await
+            .map_err(|error| format!("failed to load Model Access projection: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "Model Access projection request failed with status {}",
+                response.status()
+            ));
+        }
+        let page: ModelAccessProjectionResponse = response
+            .json()
+            .await
+            .map_err(|error| format!("Model Access projection was not valid JSON: {error}"))?;
+        if page.limit == 0 || page.limit > 200 {
+            return Err("Model Access projection returned an invalid page limit".to_string());
+        }
+        if expected_total.get_or_insert(page.total) != &page.total {
+            return Err("Model Access projection changed total during pagination".to_string());
+        }
+        if expected_revision.get_or_insert_with(|| page.catalog_revision.clone())
+            != &page.catalog_revision
+        {
+            return Err(
+                "Model Access projection changed catalog revision during pagination".to_string(),
+            );
+        }
+        let page_had_offerings = !page.offerings.is_empty();
+        if page.next_cursor.is_some() && !page_had_offerings {
+            return Err("Model Access projection returned a cursor without offerings".to_string());
+        }
+        if let Some(existing) = &mut first {
+            if existing.accesses != page.accesses {
+                return Err(
+                    "Model Access projection changed access declarations during pagination"
+                        .to_string(),
+                );
+            }
+            existing.offerings.extend(page.offerings);
+            existing.next_cursor = page.next_cursor.clone();
+        } else {
+            first = Some(page);
+        }
+        let next = first.as_ref().and_then(|page| page.next_cursor.clone());
+        let Some(next) = next else {
+            let projection =
+                first.ok_or_else(|| "Model Access projection returned no page".to_string())?;
+            if projection.offerings.len() != projection.total as usize {
+                return Err(format!(
+                    "Model Access projection ended with {} offerings but advertised {}",
+                    projection.offerings.len(),
+                    projection.total
+                ));
+            }
+            for access in &projection.accesses {
+                let count = projection
+                    .offerings
+                    .iter()
+                    .filter(|offering| offering.access_id == access.id)
+                    .count() as u32;
+                if count != access.available_model_count {
+                    return Err(format!(
+                        "Model Access count for '{}' advertised {} but drained {}",
+                        access.id, access.available_model_count, count
+                    ));
+                }
+            }
+            return Ok(projection);
+        };
+        if cursor.as_ref() == Some(&next) {
+            return Err("Model Access projection repeated its continuation cursor".to_string());
+        }
+        cursor = Some(next);
+    }
+}
+
 pub(crate) fn default_model_selection_from_access(
     projection: &ModelAccessProjectionResponse,
 ) -> Result<Option<ServerModelSelection>, String> {
@@ -488,10 +570,9 @@ pub(crate) fn default_model_selection_from_access(
             );
         }
         Some(ModelDefaultResolution::Selected { .. }) => {}
-        // Servers predating default_resolution expose the legacy contract.
-        // Preserve its validation behavior while a capability-negotiated
-        // version of the external catalog protocol is introduced.
-        None => {}
+        None => {
+            return Err("Model Access omitted required default_resolution".to_string());
+        }
     }
     let Some(default_offering_id) = projection.default_offering_id.as_deref() else {
         return if projection.offerings.is_empty() {
@@ -555,22 +636,68 @@ pub(crate) async fn resolve_server_model_selection(
     token: &str,
     model: &str,
 ) -> Result<ServerModelSelection, String> {
-    let resp = api
-        .get_models_response_timeout(token, std::time::Duration::from_secs(3))
-        .await
-        .map_err(|error| format!("failed to load server model registry: {error}"))?;
-    if !resp.status().is_success() {
+    let (catalog, _) = load_server_model_catalog(api, token).await?;
+    resolve_server_model_selection_from_catalog(api, token, model, &catalog).await
+}
+
+/// Resolve an explicit selector against the complete authoritative catalog.
+/// The server catalog is paginated but this function only receives the fully
+/// drained projection, so a missing entry is a definitive admission failure.
+pub(crate) async fn resolve_server_model_selection_from_catalog(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    model: &str,
+    catalog: &[ModelListItemResponse],
+) -> Result<ServerModelSelection, String> {
+    if let Some(selection) = model_selection_for_name_from_catalog(catalog, model) {
+        return Ok(selection);
+    }
+    let _ = (api, token);
+    Err(format!(
+        "model '{model}' is not an active Server Offering in the authoritative catalog"
+    ))
+}
+
+fn model_selection_from_exact_response(
+    requested_model: &str,
+    body: &str,
+) -> Result<ServerModelSelection, String> {
+    let response: serde_json::Value = serde_json::from_str(body)
+        .map_err(|error| format!("exact model response was not valid JSON: {error}"))?;
+    let name = response
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| "exact model response omitted name".to_string())?;
+    if name != requested_model {
         return Err(format!(
-            "server model registry request failed with status {}",
-            resp.status()
+            "exact model response name mismatch: requested '{requested_model}', got '{name}'"
         ));
     }
-    let catalog: Vec<ModelListItemResponse> = resp
-        .json()
-        .await
-        .map_err(|error| format!("server model registry response was not valid JSON: {error}"))?;
-    model_selection_for_name_from_catalog(&catalog, model).ok_or_else(|| {
-        format!("model '{model}' is not an active Server Offering with an exact offering_id")
+    if !response
+        .get("is_active")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "model '{requested_model}' is not an active Server Offering"
+        ));
+    }
+    let offering_id = response
+        .get("model_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|offering_id| !offering_id.trim().is_empty())
+        .ok_or_else(|| "exact model response omitted model_id".to_string())?;
+    let context_window = response
+        .get("context_window")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value > 0);
+
+    Ok(ServerModelSelection {
+        name: name.to_string(),
+        context_window,
+        offering_id: offering_id.to_string(),
     })
 }
 
@@ -579,20 +706,7 @@ pub(crate) async fn resolve_server_offering_selection(
     token: &str,
     offering_id: &str,
 ) -> Result<ServerModelSelection, String> {
-    let resp = api
-        .get_models_response_timeout(token, std::time::Duration::from_secs(3))
-        .await
-        .map_err(|error| format!("failed to load Server Offering catalog: {error}"))?;
-    if !resp.status().is_success() {
-        return Err(format!(
-            "Server Offering catalog request failed with status {}",
-            resp.status()
-        ));
-    }
-    let catalog: Vec<ModelListItemResponse> = resp
-        .json()
-        .await
-        .map_err(|error| format!("Server Offering catalog was not valid JSON: {error}"))?;
+    let (catalog, _) = load_server_model_catalog(api, token).await?;
     model_selection_for_offering_from_catalog(&catalog, offering_id)
         .ok_or_else(|| format!("Offering '{offering_id}' is not active in the Server catalog"))
 }
@@ -607,35 +721,13 @@ pub(crate) async fn resolve_server_default_model(
         target: "astra_cli::model_selection",
         "resolve_server_default_model: calling GET /model-access"
     );
-    let resp = match api
-        .get_model_access_response_timeout(token, std::time::Duration::from_secs(3))
-        .await
-    {
-        Ok(r) if r.status().is_success() => r,
-        Ok(r) => {
+    let projection = match load_server_model_access(api, token).await {
+        Ok(projection) => projection,
+        Err(error) => {
             tracing::warn!(
                 target: "astra_cli::model_selection",
-                status = %r.status(),
-                "resolve_server_default_model: GET /model-access returned non-success status → Unavailable"
-            );
-            return ServerDefaultModel::Unavailable;
-        }
-        Err(e) => {
-            tracing::warn!(
-                target: "astra_cli::model_selection",
-                error = %e,
-                "resolve_server_default_model: GET /model-access request error → Unavailable"
-            );
-            return ServerDefaultModel::Unavailable;
-        }
-    };
-    let projection: ModelAccessProjectionResponse = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(
-                target: "astra_cli::model_selection",
-                error = %e,
-                "resolve_server_default_model: failed to parse /model-access JSON → Unavailable"
+                %error,
+                "resolve_server_default_model: failed to load complete Model Access projection → Unavailable"
             );
             return ServerDefaultModel::Unavailable;
         }
@@ -1013,10 +1105,6 @@ pub(crate) fn initialize_session_state(
         state.model = Some(m.to_string());
     }
 
-    // Initialize a durable task service synchronously; startup paths that can
-    // Startup may upgrade this to an API-backed store via `resolve_task_store`.
-    install_task_service(&mut state, local_task_service());
-
     // Initialize observability hub for M1-M6 integration
     // Use persistent storage under ~/.astra/observability for user profiles
     let obs_path = astra_runtime_env::local_state_root().join("observability");
@@ -1105,9 +1193,10 @@ fn workspace_matches_current_project(
     path_contains_or_matches(&current_cwd, std::path::Path::new(&workspace.cwd))
 }
 
-fn current_git_root() -> Option<std::path::PathBuf> {
+fn git_root_from(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
     std::process::Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
         .output()
         .ok()
         .filter(|output| output.status.success())
@@ -1116,6 +1205,21 @@ fn current_git_root() -> Option<std::path::PathBuf> {
             let trimmed = root.trim();
             (!trimmed.is_empty()).then(|| std::path::PathBuf::from(trimmed))
         })
+}
+
+fn current_git_root() -> Option<std::path::PathBuf> {
+    git_root_from(&std::env::current_dir().ok()?)
+}
+
+/// Resolve the session's project root for skill registry anchoring.
+///
+/// Preferred: the git repository root of the process cwd (the canonical
+/// project root for tool execution). Fallback: the process current directory.
+/// This keeps project skill discovery anchored at the tool execution
+/// workspace instead of a possibly-unrelated process cwd.
+pub(crate) fn resolved_session_project_root() -> Option<std::path::PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    Some(git_root_from(&cwd).unwrap_or(cwd))
 }
 
 fn canonical_or_original(path: &std::path::Path) -> std::path::PathBuf {
@@ -1160,9 +1264,57 @@ pub(crate) fn restore_history_from_journal(
         .history)
 }
 
-/// Full session counters + history from local JSONL (used after `/session fork`).
+/// Full session counters and history materialized from the local JSONL projection.
 pub fn session_state_from_journal(session_id: &str) -> Result<RestoredSessionState, String> {
     Ok(restore_session_state_from_journal(session_id)?.session)
+}
+
+/// Return the newest durable context-assembly trace for a local session.
+///
+/// Context traces are derived sidecar evidence, but the journal is still the
+/// recovery authority when a process exits between the primary turn commit
+/// and its workspace projection. Callers use the event turn as the monotonic
+/// boundary; the trace's internal `turn_id` may identify a model round rather
+/// than a user turn.
+pub(crate) fn latest_context_assembly_trace_from_journal(
+    session_id: &str,
+) -> Result<
+    Option<(
+        u32,
+        astra_turn_core::context_assembly_trace::ContextAssemblyTrace,
+    )>,
+    String,
+> {
+    session_journal::validate_session_id(session_id)
+        .map_err(|error| format!("failed to read session journal for {session_id}: {error}"))?;
+    if !session_journal::journal_file_path(session_id).exists() {
+        return Ok(None);
+    }
+    let events = session_journal::read_journal(session_id)
+        .map_err(|error| format!("failed to read session journal for {session_id}: {error}"))?;
+    for event in events.into_iter().rev() {
+        let Some(turn) = event.turn else {
+            continue;
+        };
+        if event.event_type != session_journal::JournalEventType::ContextAssemblyRecorded {
+            continue;
+        }
+        let Some(trace_json) = event.context_assembly_trace else {
+            continue;
+        };
+        match serde_json::from_value::<astra_turn_core::context_assembly_trace::ContextAssemblyTrace>(
+            trace_json,
+        ) {
+            Ok(trace) => return Ok(Some((turn, trace))),
+            Err(error) => tracing::warn!(
+                session_id,
+                turn,
+                %error,
+                "ignored malformed durable context-assembly trace during recovery"
+            ),
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn restored_journal_state(session_id: &str) -> Result<RestoredJournalState, String> {
@@ -1176,7 +1328,7 @@ fn restore_session_state_from_journal(session_id: &str) -> Result<RestoredJourna
     if !journal_exists {
         return Ok(RestoredJournalState::default());
     }
-    let events = match session_journal::read_journal(session_id) {
+    let events = match session_journal::read_journal_append_order(session_id) {
         Ok(events) => events,
         Err(error) => {
             return Err(format!(
@@ -1185,6 +1337,20 @@ fn restore_session_state_from_journal(session_id: &str) -> Result<RestoredJourna
         }
     };
 
+    Ok(restored_journal_state_from_append_order_events(
+        journal_exists,
+        &events,
+    ))
+}
+
+/// Rebuild interactive turn authority from one already-fenced physical
+/// append-order snapshot. Callers holding a session execution lease use this
+/// to avoid mixing a continuation cursor from one journal generation with
+/// counters/history from another.
+pub(crate) fn restored_journal_state_from_append_order_events(
+    journal_exists: bool,
+    events: &[session_journal::JournalEvent],
+) -> RestoredJournalState {
     let mut restored = RestoredSessionState::default();
     let start_idx = events
         .iter()
@@ -1194,14 +1360,27 @@ fn restore_session_state_from_journal(session_id: &str) -> Result<RestoredJourna
     let last_turn_event = events[start_idx..]
         .iter()
         .rev()
-        .find(|event| event.event_type == session_journal::JournalEventType::Turn)
+        .find(|event| {
+            matches!(
+                event.event_type,
+                session_journal::JournalEventType::Turn
+                    | session_journal::JournalEventType::TurnError
+            )
+        })
         .cloned();
 
-    for event in events.into_iter().skip(start_idx) {
-        if event.event_type != session_journal::JournalEventType::Turn {
+    for event in events.iter().skip(start_idx) {
+        if !matches!(
+            event.event_type,
+            session_journal::JournalEventType::Turn | session_journal::JournalEventType::TurnError
+        ) {
             continue;
         }
-        restored.history.extend(restored_turn_history_pairs(&event));
+        if event.event_type == session_journal::JournalEventType::Turn {
+            restored.history.extend(restored_turn_history_pairs(&event));
+        } else {
+            restored.history.extend(turn_error_history_pairs(&event));
+        }
         restored.turn = restored
             .turn
             .max(event.turn.unwrap_or(restored.turn.saturating_add(1)));
@@ -1209,8 +1388,8 @@ fn restore_session_state_from_journal(session_id: &str) -> Result<RestoredJourna
         restored.total_completion_tokens += event.tokens_out.unwrap_or(0);
         restored.total_cache_read_tokens += event.cache_read_tokens.unwrap_or(0);
         restored.total_cache_creation_tokens += event.cache_creation_tokens.unwrap_or(0);
-        if let Some(tools_used) = event.tools_used {
-            restored.recent_tools = tools_used;
+        if let Some(tools_used) = &event.tools_used {
+            restored.recent_tools = tools_used.clone();
         }
     }
     crate::cli::history_work::record_pair_history(
@@ -1218,11 +1397,33 @@ fn restore_session_state_from_journal(session_id: &str) -> Result<RestoredJourna
         &restored.history,
     );
 
-    Ok(RestoredJournalState {
+    RestoredJournalState {
         exists: journal_exists,
         session: restored,
         last_turn_event,
-    })
+    }
+}
+
+pub(crate) fn turn_error_history_pairs(
+    event: &session_journal::JournalEvent,
+) -> Vec<(String, String)> {
+    let mut inputs = Vec::new();
+    if let Some(input) = event
+        .user_input
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        inputs.push(input.to_string());
+    }
+    inputs.extend(applied_user_intents_from_turn_metadata(
+        event.metadata.as_ref(),
+    ));
+    let failure = event.error.as_deref().unwrap_or("turn failed");
+    inputs
+        .into_iter()
+        .map(|input| (input, format!("[Previous turn failed: {failure}]")))
+        .collect()
 }
 
 fn restored_turn_history_pairs(event: &session_journal::JournalEvent) -> Vec<(String, String)> {
@@ -1305,6 +1506,7 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
     let model_display = state.model.as_deref().unwrap_or("auto");
     let version = env!("CARGO_PKG_VERSION");
     let skills_count = state.unified_skill_registry.len();
+    let colors_enabled = std::env::var_os("NO_COLOR").is_none();
 
     // ── Two-column card layout ─────────────────────────────────────────
     let term_w = crossterm::terminal::size()
@@ -1332,9 +1534,13 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
     ];
     let left_footer = format!(
         " {} {} {}",
-        model_display.bold().yellow(),
-        "·".white().bold(),
-        format!("v{version} · {pname}").white().bold()
+        style_banner_text(model_display, BannerTextStyle::YellowBold, colors_enabled),
+        style_banner_text("·", BannerTextStyle::WhiteBold, colors_enabled),
+        style_banner_text(
+            format!("v{version} · {pname}"),
+            BannerTextStyle::WhiteBold,
+            colors_enabled,
+        )
     );
 
     // Build left column first so we can measure its actual width
@@ -1343,9 +1549,17 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
         if line.is_empty() {
             left.push(String::new());
         } else if *line == "    astra" {
-            left.push(format!("{}", line.magenta().bold()));
+            left.push(style_banner_text(
+                *line,
+                BannerTextStyle::MagentaBold,
+                colors_enabled,
+            ));
         } else {
-            left.push(format!("{}", line.magenta()));
+            left.push(style_banner_text(
+                *line,
+                BannerTextStyle::Magenta,
+                colors_enabled,
+            ));
         }
     }
     left.push(left_footer);
@@ -1385,28 +1599,37 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
     // Right column: build with truncation safety on every line
     let sep_line = "─".repeat(right_col_w);
     let mut right: Vec<String> = Vec::new();
-    right.push(trunc_vis("Tips", right_col_w).white().bold().to_string());
-    right.push(
-        trunc_vis("/help for all commands", right_col_w)
-            .white()
-            .bold()
-            .to_string(),
-    );
-    right.push(
-        trunc_vis("Ctrl+K command picker", right_col_w)
-            .white()
-            .bold()
-            .to_string(),
-    );
-    right.push(
-        trunc_vis("Alt+Enter multi-line input", right_col_w)
-            .white()
-            .bold()
-            .to_string(),
-    );
-    right.push(sep_line.as_str().white().bold().to_string());
-    right.push(trunc_vis("Status", right_col_w).white().bold().to_string());
-    right.push(
+    right.push(style_banner_text(
+        trunc_vis("Tips", right_col_w),
+        BannerTextStyle::WhiteBold,
+        colors_enabled,
+    ));
+    right.push(style_banner_text(
+        trunc_vis("/help for all commands", right_col_w),
+        BannerTextStyle::WhiteBold,
+        colors_enabled,
+    ));
+    right.push(style_banner_text(
+        trunc_vis("Ctrl+K command picker", right_col_w),
+        BannerTextStyle::WhiteBold,
+        colors_enabled,
+    ));
+    right.push(style_banner_text(
+        trunc_vis("Alt+Enter multi-line input", right_col_w),
+        BannerTextStyle::WhiteBold,
+        colors_enabled,
+    ));
+    right.push(style_banner_text(
+        sep_line,
+        BannerTextStyle::WhiteBold,
+        colors_enabled,
+    ));
+    right.push(style_banner_text(
+        trunc_vis("Status", right_col_w),
+        BannerTextStyle::WhiteBold,
+        colors_enabled,
+    ));
+    right.push(style_banner_text(
         trunc_vis(
             &format!(
                 "{skills_count} skills · {}",
@@ -1417,14 +1640,17 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
                 }
             ),
             right_col_w,
-        )
-        .white()
-        .bold()
-        .to_string(),
-    );
+        ),
+        BannerTextStyle::WhiteBold,
+        colors_enabled,
+    ));
     if let Some(line) = pending_recovery_status_line(state) {
         let truncated = trunc_vis(&line, right_col_w);
-        right.push(truncated.yellow().bold().to_string());
+        right.push(style_banner_text(
+            truncated,
+            BannerTextStyle::YellowBold,
+            colors_enabled,
+        ));
     }
 
     // Equalize heights
@@ -1470,8 +1696,12 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
         right_col_w: usize,
     }
 
-    fn render_banner_frame(layout: &BannerLayout<'_>, with_stars: bool, mut rng_seed: u64) {
-        use crossterm::style::Stylize;
+    fn render_banner_frame(
+        layout: &BannerLayout<'_>,
+        with_stars: bool,
+        mut rng_seed: u64,
+        colors_enabled: bool,
+    ) {
         use std::io::Write;
         let vis_w = crate::cli::terminal_region::visible_char_width;
         let next = |r: &mut u64| -> u64 {
@@ -1499,7 +1729,11 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
             for i in 0..pad {
                 if with_stars && next(rng) % 100 < density && i > 0 && i < pad.saturating_sub(1) {
                     let s = STARS[(next(rng) % STARS.len() as u64) as usize];
-                    out.push_str(&format!("{}", s.dark_grey()));
+                    out.push_str(&style_banner_text(
+                        s,
+                        BannerTextStyle::DarkGrey,
+                        colors_enabled,
+                    ));
                 } else {
                     out.push(' ');
                 }
@@ -1508,32 +1742,55 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
         };
 
         // Header — title is embedded inline; brighter so it stands out.
-        eprint!("{}", "╭".white().bold());
-        eprint!("{}", "─".repeat(*lead_dash).white().bold());
-        eprint!("{}", title_padded.bold().cyan());
-        eprint!("{}", "─".repeat(*trail_dash).white().bold());
-        eprintln!("{}", "╮".white().bold());
+        eprint!(
+            "{}",
+            style_banner_text("╭", BannerTextStyle::WhiteBold, colors_enabled)
+        );
+        eprint!(
+            "{}",
+            style_banner_text(
+                "─".repeat(*lead_dash),
+                BannerTextStyle::WhiteBold,
+                colors_enabled,
+            )
+        );
+        eprint!(
+            "{}",
+            style_banner_text(*title_padded, BannerTextStyle::BoldCyan, colors_enabled,)
+        );
+        eprint!(
+            "{}",
+            style_banner_text(
+                "─".repeat(*trail_dash),
+                BannerTextStyle::WhiteBold,
+                colors_enabled,
+            )
+        );
+        eprintln!(
+            "{}",
+            style_banner_text("╮", BannerTextStyle::WhiteBold, colors_enabled)
+        );
         // Body
         for row in 0..*total_rows {
             let l_pad = starfield_pad(*left_col_w, vis_w(&left[row]), &mut rng_seed, 12);
             let r_pad = starfield_pad(*right_col_w, vis_w(&right[row]), &mut rng_seed, 8);
             eprintln!(
                 "{} {}{} {} {}{} {}",
-                "│".white().bold(),
+                style_banner_text("│", BannerTextStyle::WhiteBold, colors_enabled),
                 left[row],
                 l_pad,
-                "│".white().bold(),
+                style_banner_text("│", BannerTextStyle::WhiteBold, colors_enabled),
                 right[row],
                 r_pad,
-                "│".white().bold(),
+                style_banner_text("│", BannerTextStyle::WhiteBold, colors_enabled),
             );
         }
         // Footer
         eprintln!(
             "{}{}{}",
-            "╰".white().bold(),
-            h_bar.white().bold(),
-            "╯".white().bold()
+            style_banner_text("╰", BannerTextStyle::WhiteBold, colors_enabled),
+            style_banner_text(*h_bar, BannerTextStyle::WhiteBold, colors_enabled),
+            style_banner_text("╯", BannerTextStyle::WhiteBold, colors_enabled)
         );
         let _ = std::io::stderr().flush();
     }
@@ -1571,29 +1828,72 @@ pub(crate) fn print_session_banner(profile: Option<&str>, state: &SessionState) 
             if frame > 0 {
                 eprint!("\x1b[{}A\r", card_lines);
             }
-            render_banner_frame(&layout, true, seed);
+            render_banner_frame(&layout, true, seed, colors_enabled);
             std::thread::sleep(Duration::from_millis(100));
         }
         eprint!("\x1b[{}A\r", card_lines);
-        render_banner_frame(&layout, false, 0);
+        render_banner_frame(&layout, false, 0, colors_enabled);
     } else {
-        render_banner_frame(&layout, false, 0);
+        render_banner_frame(&layout, false, 0, colors_enabled);
     }
 
     eprintln!();
     let welcome = banner_welcome_text(&pname, p, logged_in);
     let model_hint = if model_display == "auto" {
-        format!("{} {}", "auto".yellow(), "mode".grey())
+        format!(
+            "{} {}",
+            style_banner_text("auto", BannerTextStyle::Yellow, colors_enabled),
+            style_banner_text("mode", BannerTextStyle::Grey, colors_enabled)
+        )
     } else {
-        format!("{} {}", model_display.cyan(), "mode".grey())
+        format!(
+            "{} {}",
+            style_banner_text(model_display, BannerTextStyle::Cyan, colors_enabled),
+            style_banner_text("mode", BannerTextStyle::Grey, colors_enabled)
+        )
     };
     eprintln!(
         "  {} {} {}",
-        welcome.cyan(),
+        style_banner_text(welcome, BannerTextStyle::Cyan, colors_enabled),
         model_hint,
-        "· /model to change".grey()
+        style_banner_text("· /model to change", BannerTextStyle::Grey, colors_enabled)
     );
     eprintln!();
+}
+
+#[derive(Clone, Copy)]
+enum BannerTextStyle {
+    WhiteBold,
+    Magenta,
+    MagentaBold,
+    Yellow,
+    YellowBold,
+    BoldCyan,
+    Cyan,
+    Grey,
+    DarkGrey,
+}
+
+fn style_banner_text(
+    text: impl Into<String>,
+    style: BannerTextStyle,
+    colors_enabled: bool,
+) -> String {
+    let text = text.into();
+    if !colors_enabled {
+        return text;
+    }
+    match style {
+        BannerTextStyle::WhiteBold => text.white().bold().to_string(),
+        BannerTextStyle::Magenta => text.magenta().to_string(),
+        BannerTextStyle::MagentaBold => text.magenta().bold().to_string(),
+        BannerTextStyle::Yellow => text.yellow().to_string(),
+        BannerTextStyle::YellowBold => text.bold().yellow().to_string(),
+        BannerTextStyle::BoldCyan => text.bold().cyan().to_string(),
+        BannerTextStyle::Cyan => text.cyan().to_string(),
+        BannerTextStyle::Grey => text.grey().to_string(),
+        BannerTextStyle::DarkGrey => text.dark_grey().to_string(),
+    }
 }
 
 fn banner_welcome_text(
@@ -1642,15 +1942,16 @@ pub(crate) fn current_access_token(profile: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCESS_TOKEN_REFRESH_SKEW_SECS, RestoredSessionState, ServerDefaultModel,
+        ACCESS_TOKEN_REFRESH_SKEW_SECS, BannerTextStyle, RestoredSessionState, ServerDefaultModel,
         SilentRefreshError, access_token_needs_refresh, applied_user_intents_from_turn_metadata,
         banner_session_display, banner_welcome_text, current_access_token, current_git_root,
         default_model_selection_from_access, ensure_state_default_model, fresh_access_token,
-        initialize_session_state, model_default_invalid_reason_message,
-        model_selection_for_name_from_catalog, pending_recovery_status_line,
+        git_root_from, initialize_session_state, load_server_model_access,
+        model_default_invalid_reason_message, model_selection_for_name_from_catalog,
+        model_selection_from_exact_response, pending_recovery_status_line,
         resolve_server_default_model, resolve_server_model_selection, restore_history_from_journal,
         restore_session_state_from_journal, restored_journal_state,
-        should_keep_credentials_on_refresh_error,
+        should_keep_credentials_on_refresh_error, style_banner_text,
     };
     use crate::cli::cli_config::cli_utils::{
         CredentialsFile, Profile, load_credentials, save_credentials,
@@ -1660,10 +1961,10 @@ mod tests {
     use astra_services::{
         ModelAccessKind, ModelAccessProjectionResponse, ModelDefaultInvalidReason,
         ModelDefaultResolution, ModelDefaultScope, ModelDefaultSource, ModelExecutionPlacement,
-        ModelListItemResponse, session_journal,
+        ModelListCursor, ModelListItemResponse, session_journal,
     };
     use tempfile::tempdir;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{method, path, query_param, query_param_is_missing};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     struct EnvGuard {
@@ -1739,14 +2040,29 @@ mod tests {
             },
             None => ModelDefaultResolution::Missing,
         };
+        let total = offerings.len() as u32;
         ModelAccessProjectionResponse {
             accesses: Vec::new(),
             offerings,
             default_offering_id: default_offering_id.map(str::to_string),
             default_resolution: Some(default_resolution),
+            next_cursor: None,
+            limit: 50,
+            total,
             catalog_revision: "sha256:test-catalog".to_string(),
             observed_at: "2026-07-20T00:00:00Z".to_string(),
         }
+    }
+
+    fn catalog_page(items: Vec<ModelListItemResponse>) -> serde_json::Value {
+        let total = items.len();
+        serde_json::json!({
+            "items": items,
+            "next_cursor": null,
+            "limit": 50,
+            "total": total,
+            "catalog_revision": "sha256:test-catalog"
+        })
     }
 
     #[test]
@@ -1822,12 +2138,38 @@ mod tests {
         assert_eq!(selection.context_window, Some(1_000_000));
     }
 
+    #[test]
+    fn exact_model_selection_requires_canonical_active_identity() {
+        let resolved = model_selection_from_exact_response(
+            "overflow-model",
+            r#"{"name":"overflow-model","model_id":"offer-201","is_active":true,"context_window":200000}"#,
+        )
+        .expect("active exact model should resolve");
+        assert_eq!(resolved.name, "overflow-model");
+        assert_eq!(resolved.offering_id, "offer-201");
+        assert_eq!(resolved.context_window, Some(200_000));
+
+        let inactive = model_selection_from_exact_response(
+            "overflow-model",
+            r#"{"name":"overflow-model","model_id":"offer-201","is_active":false}"#,
+        )
+        .expect_err("inactive exact model must fail closed");
+        assert!(inactive.contains("not an active"), "{inactive}");
+
+        let mismatch = model_selection_from_exact_response(
+            "overflow-model",
+            r#"{"name":"other-model","model_id":"offer-202","is_active":true}"#,
+        )
+        .expect_err("path/name mismatch must fail closed");
+        assert!(mismatch.contains("name mismatch"), "{mismatch}");
+    }
+
     #[tokio::test]
     async fn server_model_resolution_preserves_offering_identity_and_optional_context() {
         let mock = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/models"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(vec![
+            .respond_with(ResponseTemplate::new(200).set_body_json(catalog_page(vec![
                 catalog_entry("offer-small", "small-model", true, 8_192),
                 catalog_entry(
                     "offer-deepseek",
@@ -1835,7 +2177,7 @@ mod tests {
                     true,
                     1_000_000,
                 ),
-            ]))
+            ])))
             .mount(&mock)
             .await;
         let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
@@ -1855,6 +2197,64 @@ mod tests {
         .expect("active Offering selected through thinking suffix");
         assert_eq!(deepseek.offering_id, "offer-deepseek");
         assert_eq!(deepseek.context_window, Some(1_000_000));
+    }
+
+    #[tokio::test]
+    async fn server_model_resolution_rejects_model_missing_from_authoritative_catalog() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(catalog_page(vec![
+                catalog_entry("offer-listed", "listed-model", true, 8_192),
+            ])))
+            .mount(&mock)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).expect("client");
+        let error = resolve_server_model_selection(&api, "token", "overflow-model(thinking:high)")
+            .await
+            .expect_err("a missing Offering must fail closed");
+        assert!(error.contains("authoritative catalog"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn server_model_resolution_drains_catalog_before_admission() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(query_param_is_missing("after_provider"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [catalog_entry("offer-first", "first-model", true, 8_192)],
+                "next_cursor": {
+                    "provider": "openai",
+                    "model_name": "first-model",
+                    "model_id": "offer-first"
+                },
+                "limit": 200,
+                "total": 2,
+                "catalog_revision": "sha256:drain"
+            })))
+            .mount(&mock)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(query_param("after_provider", "openai"))
+            .and(query_param("after_name", "first-model"))
+            .and(query_param("after_offering_id", "offer-first"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [catalog_entry("offer-second", "second-model", true, 16_384)],
+                "next_cursor": null,
+                "limit": 200,
+                "total": 2,
+                "catalog_revision": "sha256:drain"
+            })))
+            .mount(&mock)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).expect("client");
+        let selection = resolve_server_model_selection(&api, "token", "second-model")
+            .await
+            .expect("second-page Offering should resolve");
+        assert_eq!(selection.offering_id, "offer-second");
     }
 
     #[tokio::test]
@@ -1887,16 +2287,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_access_rejects_cursor_without_pagination_progress() {
+        let mock = MockServer::start().await;
+        let mut projection = access_projection(Vec::new(), None);
+        projection.total = 1;
+        projection.next_cursor = Some(ModelListCursor {
+            provider: "openai".to_string(),
+            model_name: "missing".to_string(),
+            model_id: "offer-missing".to_string(),
+        });
+        Mock::given(method("GET"))
+            .and(path("/model-access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(projection))
+            .mount(&mock)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).expect("client");
+
+        let error = load_server_model_access(&api, "token")
+            .await
+            .expect_err("a continuation cursor must accompany progress");
+
+        assert!(error.contains("cursor without offerings"), "{error}");
+    }
+
+    #[tokio::test]
     async fn ensure_state_default_model_updates_budget_for_explicit_model() {
         let mock = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/models"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(vec![catalog_entry(
-                "offer-deepseek",
-                "deepseek-v4-pro-official",
-                true,
-                1_000_000,
-            )]))
+            .respond_with(ResponseTemplate::new(200).set_body_json(catalog_page(vec![
+                catalog_entry(
+                    "offer-deepseek",
+                    "deepseek-v4-pro-official",
+                    true,
+                    1_000_000,
+                ),
+            ])))
             .mount(&mock)
             .await;
         let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
@@ -1955,6 +2381,9 @@ mod tests {
             default_resolution: Some(ModelDefaultResolution::Invalid {
                 reason: ModelDefaultInvalidReason::NotEffectiveOffering,
             }),
+            next_cursor: None,
+            limit: 50,
+            total: 1,
             catalog_revision: "sha256:invalid-provider-default".to_string(),
             observed_at: "2026-08-10T00:00:00Z".to_string(),
         };
@@ -1965,12 +2394,9 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/models"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(vec![catalog_entry(
-                "offer-valid",
-                "valid-model",
-                true,
-                8_192,
-            )]))
+            .respond_with(ResponseTemplate::new(200).set_body_json(catalog_page(vec![
+                catalog_entry("offer-valid", "valid-model", true, 8_192),
+            ])))
             .mount(&mock)
             .await;
         let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
@@ -2468,6 +2894,46 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn restore_turn_error_advances_cursor_usage_and_guidance_without_partial_success() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let sid = format!("restore-turn-error-{}", uuid::Uuid::new_v4());
+        let writer = astra_services::session_journal::JournalWriter::new(&sid).unwrap();
+        let mut event = astra_services::session_journal::JournalEvent::turn_error(
+            Some(&sid),
+            4,
+            Some("test-model"),
+            "original",
+            "approval callback failed",
+            10,
+        )
+        .with_applied_user_intents([(
+            "intent-recovered",
+            astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            astra_turn_types::UserIntentStatus::Applied,
+            17,
+            "do not modify",
+        )]);
+        event.tokens_in = Some(80);
+        event.tokens_out = Some(6);
+        event.cache_read_tokens = Some(70);
+        event.cache_creation_tokens = Some(2);
+        writer.append(&event).unwrap();
+
+        let restored = restore_session_state_from_journal(&sid).unwrap().session;
+        assert_eq!(restored.turn, 4);
+        assert_eq!(restored.total_prompt_tokens, 80);
+        assert_eq!(restored.total_completion_tokens, 6);
+        assert_eq!(restored.total_cache_read_tokens, 70);
+        assert_eq!(restored.total_cache_creation_tokens, 2);
+        assert!(restored.history.iter().any(|(input, output)| {
+            input == "do not modify"
+                && output.contains("Previous turn failed")
+                && !output.contains("partial assistant")
+        }));
+    }
+
     #[serial_test::serial]
     #[test]
     fn initialize_session_state_skips_cleanly_ended_session() {
@@ -2659,7 +3125,6 @@ mod tests {
 
         let cli_context = crate::cli::cli_config::cli_context::CliContext::from_launch_options(
             false,
-            None,
             &[],
             &[],
             &[],
@@ -2986,6 +3451,16 @@ mod tests {
         };
         let display = state.model.as_deref().unwrap_or("auto");
         assert_eq!(display, "gpt-5");
+    }
+
+    #[test]
+    fn banner_style_omits_ansi_when_colors_are_disabled() {
+        let plain = style_banner_text("Message", BannerTextStyle::WhiteBold, false);
+        assert_eq!(plain, "Message");
+        assert!(!plain.contains('\x1b'));
+
+        let colored = style_banner_text("Message", BannerTextStyle::WhiteBold, true);
+        assert!(colored.contains('\x1b'));
     }
 
     #[test]
@@ -3387,5 +3862,28 @@ mod tests {
         let profile = creds.profiles.get("default").unwrap();
         assert_eq!(profile.access_token.as_deref(), Some("fresh-access"));
         assert_eq!(profile.refresh_token.as_deref(), Some("fresh-refresh"));
+    }
+
+    #[test]
+    fn git_root_from_prefers_repository_root_without_mutating_process_cwd() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let nested = dir.path().join("nested");
+        std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        let root = git_root_from(&nested).unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&root).unwrap(),
+            std::fs::canonicalize(dir.path()).unwrap()
+        );
+    }
+
+    #[test]
+    fn git_root_from_returns_none_outside_repository() {
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(git_root_from(dir.path()).is_none());
     }
 }

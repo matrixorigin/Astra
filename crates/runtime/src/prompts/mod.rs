@@ -27,6 +27,7 @@ pub use system::{
     CacheScope, DeferredToolsPromptBlock, PARALLEL_BATCHING_NUDGE_THRESHOLD, PromptOverrides,
     PromptSection, PromptTokenBucket, STALL_NUDGE, SYSTEM_PROMPT_BASE,
     SYSTEM_PROMPT_DYNAMIC_BOUNDARY, SystemPromptBuilder, apply_overrides,
+    build_deferred_tool_names_prompt_block_with_budget,
     build_deferred_tools_prompt_block_with_budget, build_deferred_tools_section,
     build_deferred_tools_section_with_budget, build_main_system_prompt,
     build_main_system_prompt_with_style, build_pipeline_static_sections,
@@ -34,9 +35,9 @@ pub use system::{
     build_skill_listing_section_with_caps,
     build_skill_listing_section_with_context_window_and_caps, build_system_prompt_sections,
     build_system_prompt_sections_with_style, build_system_prompt_trace, default_overrides_dir,
-    load_overrides, parallel_batching_nudge_directive, parallel_execution_feedback,
-    sections_to_string, self_awareness_prompt_section, tool_round_guidance,
-    tool_round_guidance_trace, trailing_single_tool_round_streak,
+    execution_slice_guidance, load_overrides, parallel_batching_nudge_directive,
+    parallel_execution_feedback, sections_to_string, self_awareness_prompt_section,
+    tool_round_guidance, tool_round_guidance_trace, trailing_single_tool_round_streak,
 };
 pub(crate) use system::{self_model_section, tool_conditional_section};
 
@@ -73,6 +74,10 @@ mod tests {
         assert!(
             p.contains("Plan, Batch, Execute"),
             "should include protocol"
+        );
+        assert!(
+            p.contains("Evidence over surrogate checks"),
+            "should require user-supplied validation rather than a surrogate"
         );
     }
 

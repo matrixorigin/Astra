@@ -644,6 +644,7 @@ pub(crate) fn map_thin_err(e: astra_thin_client::ThinClientError) -> String {
         astra_thin_client::ThinClientError::SseParse(error) => {
             format!("SSE parse error: {error}")
         }
+        error @ astra_thin_client::ThinClientError::IncompatibleRuntime { .. } => error.to_string(),
         astra_thin_client::ThinClientError::InvalidSseJson(value) => {
             format!("Invalid SSE JSON payload: {value}")
         }
@@ -721,12 +722,12 @@ pub(crate) fn compact_or_raw(body: &str) -> String {
 
 pub(crate) fn print_json_or_raw(body: &str) {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
-        println!(
+        stdout_println!(
             "{}",
             serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
         );
     } else {
-        println!("{body}");
+        stdout_println!("{body}");
     }
 }
 
@@ -735,8 +736,8 @@ pub(crate) fn prompt_or(label: &str, existing: Option<String>) -> Result<String,
     if let Some(v) = existing {
         return Ok(v);
     }
-    print!("  {}: ", label.cyan().bold());
-    io::stdout().flush().map_err(|e| e.to_string())?;
+    stdout_print!("  {}: ", label.cyan().bold());
+    flush_prompt_stdout()?;
     let mut val = String::new();
     io::stdin().read_line(&mut val).map_err(|e| e.to_string())?;
     let val = val.trim().to_string();
@@ -755,14 +756,23 @@ pub(crate) fn prompt_password_masked(
     if let Some(v) = existing {
         return Ok(v);
     }
-    print!("  {}: ", label.cyan().bold());
-    io::stdout().flush().map_err(|e| e.to_string())?;
+    stdout_print!("  {}: ", label.cyan().bold());
+    flush_prompt_stdout()?;
     let val = rpassword::read_password().map_err(|e| e.to_string())?;
     let val = val.trim().to_string();
     if val.is_empty() {
         Err(format!("{label} cannot be empty"))
     } else {
         Ok(val)
+    }
+}
+
+fn flush_prompt_stdout() -> Result<(), String> {
+    match crate::cli::stream::output_sink::flush_stdout().map_err(|e| e.to_string())? {
+        crate::cli::stream::output_sink::OutputWriteStatus::Written => Ok(()),
+        crate::cli::stream::output_sink::OutputWriteStatus::Closed => {
+            Err("stdout output transport closed by its consumer".to_string())
+        }
     }
 }
 
@@ -1757,6 +1767,7 @@ mod tests {
             pipeline_state: None,
             compaction_state: None,
             config_version_id: None,
+            workspace_observation_quarantine: None,
         };
         astra_pipeline::step_checkpoint::write_step_checkpoint(
             &cli_user_id(),

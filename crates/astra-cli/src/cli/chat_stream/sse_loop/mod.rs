@@ -1,15 +1,17 @@
-//! SSE multi-turn agentic loop (`stream_chat_sse`).
+//! CLI streaming adapter for one Server-owned developer-loop admission.
 //!
-//! Entry [`stream_chat_sse`] builds a [`CliAgenticLoopHost`] + [`AgenticLoopState`],
-//! runs the runtime's [`run_agentic_loop_with_host`], then finalizes to [`StreamResult`].
-//! One iteration is driven by the runtime; the host handles payload prep + HTTP + SSE.
+//! Entry [`stream_chat_sse`] builds a [`CliServerAdmissionHost`] and common
+//! ingestion/finalization state. Any model/tool continuation is owned by the
+//! Server; Edge callbacks complete while the sole response stream is open.
 
 mod agentic_loop_turn;
 mod agentic_sse_loop;
-mod cli_loop_host;
 mod deferred_activation_state;
+mod server_admission_host;
 
-pub(crate) use agentic_loop_turn::turn_policy_from_payload_edge_tools;
+pub(crate) use agentic_loop_turn::{
+    server_loop_admission_payload, turn_policy_from_payload_edge_tools,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -47,8 +49,28 @@ use agentic_sse_loop::{
     StreamLoopSidecarEprint, StreamResultBuild, build_stream_result, eprint_stream_loop_sidecars,
     resolved_tool_metrics,
 };
-use cli_loop_host::CliAgenticLoopHost;
 use serde_json::{Value, json};
+use server_admission_host::CliServerAdmissionHost;
+
+fn non_tty_output_failure(
+    is_terminal: bool,
+    state: crate::cli::stream::output_sink::StdoutState,
+) -> Option<crate::cli::stream::streaming_types::OutputTransportFailure> {
+    use crate::cli::stream::streaming_types::OutputTransportFailure;
+
+    if is_terminal {
+        return None;
+    }
+    match state {
+        crate::cli::stream::output_sink::StdoutState::Open => None,
+        crate::cli::stream::output_sink::StdoutState::Closed => {
+            Some(OutputTransportFailure::Closed)
+        }
+        crate::cli::stream::output_sink::StdoutState::Failed => {
+            Some(OutputTransportFailure::Failed)
+        }
+    }
+}
 
 /// Map `ToolPolicyConfig` (from `astra-config`) to `BreakerConfig` (from
 /// `astra-turn-core`).
@@ -159,9 +181,9 @@ fn step_recorder_for_cli_turn(
     run_id: &str,
 ) -> StepRecorder {
     if let Some(session_id) = session_id {
-        StepRecorder::with_persistence(user_id, session_id, run_id)
+        StepRecorder::with_persistence_for_run(user_id, session_id, run_id, run_id)
     } else {
-        StepRecorder::with_deferred_persistence(user_id, "ephemeral", run_id)
+        StepRecorder::with_deferred_persistence_for_run(user_id, "ephemeral", run_id, run_id)
     }
 }
 
@@ -280,25 +302,14 @@ pub(crate) async fn stream_chat_sse(
     }
     let effective_max_turn_input_tokens = RuntimeLimits::global()
         .effective_max_turn_input_tokens_with_context_window(p.model, model_context_window);
-    if let Some(ref tx) = p.stream_event_tx {
-        let _ = tx.try_send(crate::cli::chat_stream::StreamEvent::ContextWindowPolicy {
-            raw_window_tokens: u64::from(context_window_tokens),
-            usable_input_tokens: effective_max_turn_input_tokens,
-        });
-    }
+    // This value governs CLI-owned preparation and recovery state only.  Do
+    // not publish it as the Server's context-window policy: the remote Server
+    // owns context assembly and compaction for this admission and may run
+    // under different process configuration.  The accepted `context_meta`
+    // SSE event carries the authoritative policy that observers receive.
     let root_agent_id = p.root_agent_id.unwrap_or("main");
     p.perm_manager.clear_turn_overrides();
 
-    // UX bridge: subscribe to the session-memory broker for this turn
-    // and forward qualifying events to the CLI stream as `StatusLine`
-    // so long-running LLM extraction gets a subtle visual cue. Runs
-    // for the duration of the turn; dropped when `_session_memory_ux`
-    // goes out of scope.
-    let _session_memory_ux =
-        crate::cli::chat_stream::session_memory_ux::SessionMemoryUxBridge::spawn(
-            p.session_memory_extractor.as_ref(),
-            p.stream_event_tx.clone(),
-        );
     // Stable run_id for this turn — shared by:
     //   1. state.current_run_id (so on_turn_completed captures the
     //      parent prefix keyed on this id)
@@ -388,16 +399,6 @@ pub(crate) async fn stream_chat_sse(
         } else {
             ex
         };
-        let ex = if let Some(ref task_manager) = p.task_manager {
-            ex.with_shared_task_manager(task_manager.clone())
-        } else {
-            ex
-        };
-        let ex = if let Some(ref tx) = p.task_notify_tx {
-            ex.with_task_notify_tx(tx.clone())
-        } else {
-            ex
-        };
         let ex = if let Some(ref cmds) = p.bg_task_commands {
             ex.with_bg_task_commands(cmds.clone())
         } else {
@@ -437,11 +438,14 @@ pub(crate) async fn stream_chat_sse(
                 working_dir: project_root.clone(),
                 spawner: spawner.clone(),
                 inherited_permissions: p.perm_manager.inherited_permissions_for_child(false),
+                enabled_tools: None,
                 active_skills: Vec::new(), // root agent — no inherited skills
                 live_event_sink: p.agent_live_event_sink.clone(),
                 client_tool_delivery_tx: None,
                 trace_context: None,
                 execution_metadata: None,
+                workspace_mutation:
+                    astra_runtime::orchestration::WorkspaceMutationAuthority::default(),
                 transcript_location:
                     astra_runtime::orchestration::AgentTranscriptLocation::LocalJournal,
             };
@@ -543,6 +547,7 @@ pub(crate) async fn stream_chat_sse(
     let cli_capabilities = edge_tools::cli_default_capabilities(
         p.agent_spawner.is_some(),
         p.bg_task_commands.is_some(),
+        executor.github_token.is_some(),
     );
     let all_schemas: (Vec<Value>, Vec<Value>) = (
         astra_runtime::capabilities::cli_local_tool_schemas(
@@ -689,7 +694,7 @@ pub(crate) async fn stream_chat_sse(
         .and_then(|s| s.prefix_store().cloned());
 
     // ─── Build host + state ──────────────────────────────────────────────
-    let mut host = CliAgenticLoopHost {
+    let mut host = CliServerAdmissionHost {
         api: p.api,
         token: p.token.to_string(),
         auth_profile: p.auth_profile,
@@ -735,7 +740,13 @@ pub(crate) async fn stream_chat_sse(
         ),
         prefix_store: prefix_store_for_host,
         append_system_prompt: p.append_system_prompt.take(),
+        execution_time_budget: p.execution_time_budget.take(),
         incremental_state: p.incremental_state.take(),
+        request_session_execution_lease: p.request_session_execution_lease.take(),
+        remote_cancel_required: false,
+        remote_cancel_run_id: None,
+        last_physical_run_id: None,
+        output_transport_failure: None,
     };
 
     let hook_sets = detect_turn_hook_sets(&project_root, task_profile, p.is_plan_subtask);
@@ -758,7 +769,8 @@ pub(crate) async fn stream_chat_sse(
             child_permissions,
             parent_cancel_token,
         )
-        .with_skill_resolver(skill_resolver.clone());
+        .with_skill_resolver(skill_resolver.clone())
+        .with_parent_run_id(parent_turn_run_id.clone());
         if let Some(session_id) = p.session_id {
             subrun_exec = subrun_exec.with_active_session_id(session_id.to_string());
         }
@@ -805,8 +817,8 @@ pub(crate) async fn stream_chat_sse(
         .clone();
 
     let mut state = AgenticLoopState {
-        observation_store: None,
         observation_journal: Default::default(),
+        tool_ledger_receipt: Default::default(),
         messages,
         run_transcript_capture: None,
         volatile_pending: Vec::new(),
@@ -815,6 +827,7 @@ pub(crate) async fn stream_chat_sse(
         session_memory_state: Default::default(),
         current_session_id,
         current_run_id: Some(parent_turn_run_id.clone()),
+        current_run_owner_generation: None,
         inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
         context_manifest_pool: None,
         context_manifest_user_id: persist_session_artifacts.then_some(current_user_id),
@@ -834,10 +847,8 @@ pub(crate) async fn stream_chat_sse(
         has_any_usage: false,
         max_turns,
         remaining_turns: max_turns,
-        turn_budget_hint_emitted_90: false,
-        turn_budget_hint_emitted_50: false,
-        turn_budget_hint_emitted_20: false,
         agentic_turn_budget: task_profile.agentic_turn_budget,
+        budget_is_explicit: false,
         current_round_index: 0,
         llm_rounds_completed: 0,
         last_request_message_count: None,
@@ -857,6 +868,7 @@ pub(crate) async fn stream_chat_sse(
         repeated_cache_hit_suppression: resolved_tool_policy.repeated_cache_hit_suppression,
         max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
         stall: StallTrackingState {
+            workspace_observation_quarantine: p.workspace_observation_quarantine.clone(),
             work_unit_observations: Default::default(),
             active_work_registry: None,
             turn_sigs: Vec::new(),
@@ -865,16 +877,15 @@ pub(crate) async fn stream_chat_sse(
             verdict_events: Vec::new(),
             last_heavy_checkpoint: None,
             tool_call_records: Vec::new(),
+            server_terminal_unverified: false,
             execution_escalation_advisory_emitted: false,
+            work_evidence_advisory_emitted: false,
             parallel_batching_advisory_emitted: false,
             repetition_advisory_emitted: false,
             introspection_count: 0,
-            redundant_reads_advisory_emitted: false,
             cache_waste_advisory_emitted: false,
-            search_fanout_advisory_emitted: false,
-            exploration_family_advisory_emitted: false,
-            stronger_exploration_family_advisory_emitted: false,
-            exploration_family_advisory_family: None,
+            active_policy_feedback: Default::default(),
+            runtime_policy_evaluation: Default::default(),
             nudge_count: 0,
             circuit_breaker: astra_turn_core::loop_circuit_breaker::LoopCircuitBreaker::new(
                 circuit_breaker_config,
@@ -886,10 +897,28 @@ pub(crate) async fn stream_chat_sse(
             explain_turns: Vec::new(),
             first_ttft_ms: None,
             all_tools_used: HashSet::new(),
+            authoritative_llm_rounds: None,
+            server_summary_run_ids: HashSet::new(),
+            server_summary_llm_rounds: 0,
+            server_summary_tool_calls: 0,
+            server_summary_observation_tool_calls: 0,
+            server_summary_tools_used: HashSet::new(),
+            local_usage_attempts: 0,
+            local_usage_provider_reported: 0,
+            local_usage_unavailable: 0,
+            server_summary_usage_attempts: 0,
+            server_summary_usage_provider_reported: 0,
+            server_summary_usage_unavailable: 0,
+            server_record_gap_observed: false,
+            terminal_execution_authority: Some(
+                astra_runtime::turn::agentic_loop::host::TerminalExecutionAuthority::EdgeLedger,
+            ),
             first_selection_report: None,
             first_budget_pressure: 0.0,
             first_context_assembly_ms: None,
             first_memoria_ms: None,
+            first_round_prompt_tokens: None,
+            max_round_prompt_tokens: None,
             all_selected_skills: Vec::new(),
             observability_session: p.observability_session.clone(),
             observability_hub: p.observability_hub.clone(),
@@ -923,8 +952,6 @@ pub(crate) async fn stream_chat_sse(
             workspace_root_hint: Some(project_root.to_string_lossy().into_owned()),
             forward_headers: std::collections::HashMap::new(),
             admitted_model_execution: None,
-            task_board_monitor: p.task_manager.clone(),
-            task_board_snapshot: Default::default(),
             completion_settlement: Default::default(),
         },
         messaging: MessagingState {
@@ -939,11 +966,14 @@ pub(crate) async fn stream_chat_sse(
             flag: None,
             pause_flag: None,
             token: p.cancel_token.clone(),
+            execution_lease_lost: None,
+            resolved_origin: None,
         },
         error_recovery: ErrorRecoveryState {
             consecutive_same_error: 0,
             last_error_category: None,
         },
+        provider_adaptation: Default::default(),
         run_control: p.run_control.clone(),
         pipeline_session: Some({
             let config = astra_turn_core::pipeline_config::PipelineConfig::default();
@@ -989,9 +1019,7 @@ pub(crate) async fn stream_chat_sse(
         budget_wrapup_ignored_rounds: 0,
         compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
         skill_produced_output: false,
-        max_cumulative_tokens: 0,
         thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
-        recent_file_reads: Vec::new(),
         permission_context: Some(root_permission_context),
         permission_handler: None,
         tactical_adapter: None,
@@ -1001,7 +1029,8 @@ pub(crate) async fn stream_chat_sse(
         runtime_tool_executor: None,
         interruption: None,
         session_facts: Default::default(),
-        memory_extraction_service: p.session_memory_extractor.clone(),
+        // Canonical Server execution is the sole per-turn memory producer.
+        memory_extraction_service: None,
         compact_strategy: astra_turn_core::microcompact::CompactStrategy::from_provider_and_model(
             p.provider, p.model,
         ),
@@ -1009,8 +1038,8 @@ pub(crate) async fn stream_chat_sse(
         confidence_trend: Default::default(),
         last_confidence_diagnosis: None,
         session_turn: current_session_turn,
-        bridge_turn_chain_id: Some(parent_turn_run_id.clone()),
-        bridge_user_query_event_id: Some(
+        canonical_turn_chain_id: Some(parent_turn_run_id.clone()),
+        root_user_query_event_id: Some(
             p.stream_json_emitter
                 .as_ref()
                 .map(|emitter| emitter.user_query_event_id().to_string())
@@ -1097,7 +1126,14 @@ pub(crate) async fn stream_chat_sse(
     if let Some(s) = early_spinner {
         s.stop_clear();
     }
-    if let Err(e) = run_agentic_loop_with_host(&mut host, &mut state).await {
+    let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
+    let loop_failure = match loop_result {
+        Err(error) => Some(error.to_string()),
+        Ok(_) => host
+            .output_transport_failure
+            .map(|failure| failure.message().to_string()),
+    };
+    if let Some(error) = loop_failure {
         deferred_activation_state::snapshot_from_executor(
             &mut p.activated_deferred_tool_names,
             host.executor.as_ref(),
@@ -1111,8 +1147,11 @@ pub(crate) async fn stream_chat_sse(
             state.telemetry.all_tools_used.iter().cloned(),
             &state.stall.tool_call_records,
         );
+        let tool_outcomes = astra_services::session_journal::ToolOutcomeSummary::from_records(
+            &state.stall.tool_call_records,
+        );
         return Err(crate::TurnFailure {
-            error: e.to_string(),
+            error,
             partial: crate::PartialTurnData {
                 tool_call_records: std::mem::take(&mut state.stall.tool_call_records),
                 tools_used,
@@ -1123,11 +1162,32 @@ pub(crate) async fn stream_chat_sse(
                 cache_read_tokens: state.total_cache_read,
                 cache_creation_tokens: state.total_cache_creation,
                 tool_calls_count,
+                llm_rounds: Some(state.llm_rounds_completed),
+                token_usage_coverage: state.token_usage_coverage(),
+                tool_outcomes: Some(tool_outcomes),
+                applied_user_intents: state
+                    .user_intents
+                    .applied_user_intents()
+                    .iter()
+                    .map(
+                        |input| crate::cli::stream::streaming_types::AppliedStreamUserIntent {
+                            intent_id: input.intent_id.clone(),
+                            delivery: input.delivery,
+                            status: input.status,
+                            event_index: input.event_index,
+                            content: input.content.clone(),
+                        },
+                    )
+                    .collect(),
                 session_id: state.current_session_id.clone(),
                 run_id: state.current_run_id.clone(),
                 last_heavy_checkpoint: state.stall.last_heavy_checkpoint.take(),
                 partial_text: std::mem::take(&mut state.final_text),
                 run_transcript_messages: state.take_run_transcript_capture(),
+                remote_cancel_required: host.remote_cancel_required,
+                remote_cancel_run_id: host.remote_cancel_run_id,
+                output_transport_failure: host.output_transport_failure,
+                interruption: state.interruption.as_ref().map(|i| i.to_json()),
             },
         });
     }
@@ -1257,6 +1317,8 @@ pub(crate) async fn stream_chat_sse(
     let run_transcript_messages = state.take_run_transcript_capture();
     let final_messages = std::mem::take(&mut state.messages);
 
+    let token_usage_coverage = state.token_usage_coverage();
+    let tool_ledger_aggregate = state.tool_ledger_receipt.canonical_aggregate();
     let result = build_stream_result(StreamResultBuild {
         tool_health_entries: p.tool_health_entries,
         session_id: state.current_session_id,
@@ -1267,6 +1329,7 @@ pub(crate) async fn stream_chat_sse(
         cache_read_tokens: state.total_cache_read,
         cache_creation_tokens: state.total_cache_creation,
         tool_calls_count: state.total_tool_calls,
+        tool_ledger_aggregate,
         first_surface_report: state.telemetry.first_selection_report,
         selected_skills: state.telemetry.all_selected_skills,
         tools_used: state.telemetry.all_tools_used,
@@ -1289,8 +1352,21 @@ pub(crate) async fn stream_chat_sse(
             .as_mut()
             .map(|b| b.drain())
             .unwrap_or_default(),
-        llm_rounds: state.turn_event_buffer.as_ref().map(|b| b.current_round()),
+        llm_rounds: state
+            .telemetry
+            .authoritative_llm_rounds
+            .or(Some(state.llm_rounds_completed)),
+        token_usage_coverage,
         interruption: state.interruption.as_ref().map(|i| i.to_json()),
+        server_terminal_unverified: state.stall.server_terminal_unverified,
+        server_terminal_authoritative: state
+            .telemetry
+            .terminal_execution_authority
+            .is_some_and(|authority| {
+                authority
+                    == astra_runtime::turn::agentic_loop::host::TerminalExecutionAuthority::RemoteServer
+            }),
+        tool_record_coverage_partial: state.telemetry.server_record_gap_observed,
         final_messages,
         run_transcript_messages,
         applied_user_intents,
@@ -1427,7 +1503,7 @@ mod tests {
     use super::{
         TurnMessageLoadError, circuit_breaker_config_from_tool_policy, detect_turn_hook_sets,
         load_turn_messages, missing_model_selection_journal_event,
-        missing_model_selection_turn_failure, normalize_turn_model,
+        missing_model_selection_turn_failure, non_tty_output_failure, normalize_turn_model,
         refresh_root_permission_context, require_selected_turn_model,
         restored_compaction_effectiveness, root_permission_context_handle,
         step_recorder_for_cli_turn,
@@ -1444,6 +1520,23 @@ mod tests {
 
     fn mutating_profile() -> TaskExecutionProfile {
         TaskExecutionProfile::from_structured_intent(true, false, TaskComplexity::Standard)
+    }
+
+    #[test]
+    fn final_non_tty_output_failure_reenters_the_turn_failure_boundary() {
+        use crate::cli::stream::output_sink::StdoutState;
+        use crate::cli::stream::streaming_types::OutputTransportFailure;
+
+        assert_eq!(non_tty_output_failure(false, StdoutState::Open), None);
+        assert_eq!(
+            non_tty_output_failure(false, StdoutState::Closed),
+            Some(OutputTransportFailure::Closed)
+        );
+        assert_eq!(
+            non_tty_output_failure(false, StdoutState::Failed),
+            Some(OutputTransportFailure::Failed)
+        );
+        assert_eq!(non_tty_output_failure(true, StdoutState::Closed), None);
     }
 
     #[test]

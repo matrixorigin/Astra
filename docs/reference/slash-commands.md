@@ -219,23 +219,18 @@ Memoria memory operations. In the TUI, `list`, `search`, and `stats` open panels
 /memory session                  # Show current session memory
 ```
 
-### `/task [subcommand]`
+### `/work [status|start]`
 
-Task management for async work.
+Open the canonical Work task graph or start durable Work in this conversation.
 
-| Subcommand     | Description     |
-| -------------- | --------------- |
-| `list`         | List tasks      |
-| `add <title>`  | Create task     |
-| `done <id>`    | Mark complete   |
-| `status <id>`  | Check status    |
-| `run <prompt>` | Run task prompt |
-| `result <id>`  | Get task result |
+| Subcommand     | Description                         |
+| -------------- | ----------------------------------- |
+| `status`       | Open the current Work task graph    |
+| `start <goal>` | Start Work with an explicit goal    |
 
 ```
-/task list                       # List tasks
-/task add "Review PR #123"       # Create task
-/task done review-pr-123         # Complete task
+/work status
+/work start "Review PR #123"
 ```
 
 ---
@@ -642,7 +637,6 @@ and their migration status towards TUI-native panels.
 | `slash_inspect.rs`   | 495   | **PORT**      | `InspectPanel`                 | Harness snapshot → `/inspect` handler (Phase 1.3)              |
 | `slash_stats.rs`     | 670   | **WRAP**      | `StatsPanel`                   | Stats viewer → `/stats` selector (done)                        |
 | `slash_plan.rs`      | 210   | **WRAP**      | `PlanMode`                     | Plan mode → `/plan` inline (done)                              |
-| `slash_task.rs`      | 501   | **WRAP**      | `TaskBoard`                    | Task mgmt → `/task` panel (Phase 1.3)                          |
 | `slash_profile.rs`   | 613   | **WRAP**      | Fallback                       | Profile mgmt → fallback to REPL handler                        |
 | `slash_telemetry.rs` | 2196  | **DEPRECATE** | `StatusLine` + observability   | Replaced by TUI-native telemetry                               |
 | `slash_health.rs`    | 225   | **DEPRECATE** | `StatusLine`                   | Health replaced by status bar indicators                       |

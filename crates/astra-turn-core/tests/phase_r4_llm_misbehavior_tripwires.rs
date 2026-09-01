@@ -120,39 +120,66 @@ fn tool_call_with_non_string_non_object_args_no_panic() {
 
 // ─── Contradictory / out-of-order events ─────────────────────────────────
 
-/// Contract: `text_done` with full_text AFTER streamed deltas does
-/// NOT overwrite the accumulated text — the streaming path wins. This
-/// matches the existing line 189-193 contract in apply_one_event.
+/// Contract: `text_done` is the server-owned terminal text boundary. It may
+/// replace a provisional streamed prefix when a bounded provider retry (or a
+/// durable replay) produced a different final answer. The typed terminal
+/// boundary wins over transport-time deltas.
 #[test]
-fn text_done_after_deltas_does_not_overwrite_accumulated_text() {
+fn text_done_after_deltas_replaces_provisional_accumulated_text() {
     let events = vec![
         json!({"type": "text_delta", "content": "hello "}),
         json!({"type": "text_delta", "content": "world"}),
         json!({"type": "text_done", "full_text": "something ELSE entirely"}),
     ];
     let a = drive_all(&events);
-    assert_eq!(
-        a.full_text, "hello world",
-        "if text_done ever overrides streamed deltas, users will see \
-         different text than what streamed — contradicting the \
-         streaming contract"
-    );
+    assert_eq!(a.full_text, "something ELSE entirely");
 }
 
-/// Contract: duplicate `session_info` events — the first wins for
-/// run_id/session_id; subsequent ones CAN overwrite (current policy).
-/// Pin this so we notice if it flips accidentally.
+/// Contract: stream identity is immutable after the authoritative
+/// `session_info` bootstrap. A conflicting duplicate is a contract violation,
+/// and neither identifier may be replaced because cleanup must retain the
+/// original physical owner.
 #[test]
-fn duplicate_session_info_current_policy_last_writer_wins() {
+fn duplicate_session_info_preserves_first_authoritative_identity() {
     let events = vec![
         json!({"type": "session_info", "session_id": "s1", "run_id": "r1"}),
         json!({"type": "session_info", "session_id": "s2", "run_id": "r2"}),
     ];
     let a = drive_all(&events);
-    // Document the CURRENT behavior. If a future refactor pins "first
-    // wins" instead, this test flips and we review intentionally.
-    assert_eq!(a.session_id.as_deref(), Some("s2"));
-    assert_eq!(a.run_id.as_deref(), Some("r2"));
+    assert_eq!(a.session_id.as_deref(), Some("s1"));
+    assert_eq!(a.run_id.as_deref(), Some("r1"));
+    assert_eq!(a.error_kind, Some(astra_core::ErrorKind::ContractViolation));
+}
+
+#[test]
+fn duplicate_session_info_rejects_each_identity_dimension_independently() {
+    for (second_session_id, second_run_id) in [("s2", "r1"), ("s1", "r2")] {
+        let events = vec![
+            json!({"type": "session_info", "session_id": "s1", "run_id": "r1"}),
+            json!({
+                "type": "session_info",
+                "session_id": second_session_id,
+                "run_id": second_run_id,
+            }),
+        ];
+        let a = drive_all(&events);
+        assert_eq!(a.session_id.as_deref(), Some("s1"));
+        assert_eq!(a.run_id.as_deref(), Some("r1"));
+        assert_eq!(
+            a.error_kind,
+            Some(astra_core::ErrorKind::ContractViolation),
+            "conflict session_id={second_session_id}, run_id={second_run_id}"
+        );
+    }
+}
+
+#[test]
+fn duplicate_session_info_with_same_identity_is_idempotent() {
+    let event = json!({"type": "session_info", "session_id": "s1", "run_id": "r1"});
+    let a = drive_all(&[event.clone(), event]);
+    assert_eq!(a.session_id.as_deref(), Some("s1"));
+    assert_eq!(a.run_id.as_deref(), Some("r1"));
+    assert!(a.error_kind.is_none());
 }
 
 /// Contract: `error` event after successful text streaming — the error

@@ -1,0 +1,96 @@
+name: work_item_inherits_admitted_capability_journey
+description: |
+  **What**: Give Astra one ordinary durable retrieval task whose useful capability is
+  deferred until needed.
+  **Tests**: Canonical Work creation, server-selected foreground execution, capability
+  activation in the primary task attempt, typed delivery settlement, and truthful continuation.
+  **Why**: A task must inherit the capability surface already admitted for the session.
+  The user should not need to understand agent spawning, task identities, or per-attempt
+  allowlists to get a durable result.
+  **Pass means**: DeepSeek Flash creates one Work task, executes it through the canonical
+  runner, obtains the retrieval evidence the offered capability actually returns, and records
+  a delivered outcome without interrupting the user or allowing the coordinator to perform
+  the fetch.
+  **Fail means**: Work is replaced with prose, generic delegation becomes the product path,
+  the active attempt loses its admitted capability, delivery is fabricated, or settlement is absent.
+prompt: |
+  Use canonical Work with activation=start and exactly one foreground task to fetch
+  https://example.com/ and report its document title. Cite the HTTP status, content type,
+  and retrieved title returned by your available retrieval capability as source evidence.
+  Keep the task visible and execute it without asking me to choose routine task-management
+  details. Do not edit files, delegate, or call run_next_work_item after start_work returns
+  its initial task assignment.
+models:
+  - deepseek-v4-flash
+capability: "custom:work_item_inherits_admitted_capability_journey"
+difficulty: 4
+weight: 3.0
+timeout_seconds: 240
+debug_log: true
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: start_work
+    min: 1
+    max: 1
+  - type: journal_tool_json
+    name: start_work
+    document: arguments
+    path: /activation
+    equals: start
+  - type: journal_tool_json
+    name: start_work
+    document: result
+    path: /task_board_update/schema_version
+    equals: 1
+  - type: journal_tool_call_count
+    name: run_next_work_item
+    min: 0
+    max: 0
+  - type: journal_work_item_execution_from_start
+  # An assignment receipt alone is not evidence that the selected task
+  # could use its admitted capability. Require the external retrieval itself:
+  # this catches an executor accidentally being given only coordinator tools,
+  # where it can churn on dispatch and eventually fabricate settlement.
+  - type: journal_tool_called
+    name: web_fetch
+  - type: journal_tool_call_count
+    name: settle_work_item
+    min: 1
+    max: 1
+  - type: journal_tool_json
+    name: settle_work_item
+    document: result
+    path: /status
+    equals: recorded
+  - type: journal_tool_json
+    name: settle_work_item
+    document: result
+    path: /outcome
+    equals: delivered
+  - type: all_of
+    criteria:
+      # Work admission may legitimately change the provider-visible tool
+      # surface once (for example, removing coordinator-only fanout after the
+      # foreground task is admitted). That transition starts a new cache
+      # epoch; repeated churn is the regression this case must catch.
+      - type: pipeline_alert_count
+        rule: prompt_cache_break
+        max: 1
+      - type: provider_prompt_cache_read_ratio
+        min: 0.95
+        # This case is one user turn with several model rounds. A one-turn
+        # warmup would discard the entire observation set and make the cache
+        # contract impossible to evaluate.
+        warmup_turns: 0
+  - type: journal_tool_call_count
+    name: ask_user
+    min: 0
+    max: 0
+  - type: turn_rounds_between
+    min: 3
+    max: 12
+  - type: duration_between
+    min_ms: 0
+    max_ms: 120000

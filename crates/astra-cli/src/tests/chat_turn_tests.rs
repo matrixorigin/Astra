@@ -27,7 +27,6 @@ async fn execute_cli_health_command() {
         None,
         &api,
         false,
-        0.0,
         &crate::cli::cli_config::cli_context::CliContext::default(),
     )
     .await;

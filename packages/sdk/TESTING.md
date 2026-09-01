@@ -77,7 +77,9 @@ Use this when adding methods to [`src/client.ts`](src/client.ts); each should ha
 - Memory: `memoryStore`, `memorySearch`, `memoryRetrieve`, `memoryPurge`
 - Skills: `listSkills`, `registerSkill`, `publishSkill`, `getSkill`, `unpublishSkill`
 - Events / edges: `listEvents`, `getCausalChain`, `getEdgesStatus`
-- Thin / edge: `postToolResult`, `postApprovalRespond`, `registerEdge`, `postEdgeHeartbeat`, `getTaskLease`, `postTaskLeaseClaim`, `postTaskLeaseRelease`, `postTaskLeaseRenew`
+- Thin / edge: `postToolResult`, `postApprovalRespond`, `registerEdge`, `postEdgeHeartbeat`
+
+Legacy task-lease, task-plan, and agent-job helpers are path-only compatibility shims. Their wiremock tests prove request construction, not runtime support; the current runtime route guardrail intentionally keeps these paths unavailable until a canonical replacement contract is delivered.
 
 Wire helper: `chatRequestToWire` — see `chatRequestToWire` tests in [`client.test.ts`](src/__tests__/client.test.ts).
 

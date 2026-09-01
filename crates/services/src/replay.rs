@@ -1,12 +1,13 @@
 use async_trait::async_trait;
 use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, query};
-use uuid::Uuid;
 
 use astra_core::{ErrorResponse, MatrixOneSettings, SharedPool, error_response, internal_error};
 
 use crate::storage::agent_session_exists_for_user;
+
+const REPLAY_UNAVAILABLE_DETAIL: &str =
+    "Session replay is unavailable until durable replay reconstruction is implemented";
 
 // ── Data types ───────────────────────────────────────────────────────────────
 
@@ -58,24 +59,6 @@ pub struct ReplaySessionRequestData {
     pub mock_mode: bool,
 }
 
-trait ReplayCountRow {
-    fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error>;
-}
-
-impl ReplayCountRow for sqlx::mysql::MySqlRow {
-    fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
-        self.try_get::<i64, _>(column)
-    }
-}
-
-fn replay_count_column(
-    row: &impl ReplayCountRow,
-    column: &str,
-) -> Result<i64, (StatusCode, Json<ErrorResponse>)> {
-    row.i64_column(column)
-        .map_err(|e| internal_error(format!("replay count decode column `{column}`: {e}")))
-}
-
 // ── Database implementation ──────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
@@ -107,34 +90,21 @@ impl ReplayService for DatabaseReplayService {
         &self,
         user_id: String,
         session_id: String,
-        request: ReplaySessionRequestData,
+        _request: ReplaySessionRequestData,
     ) -> Result<ReplayResponse, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
 
-        let session_row = query(
-            "SELECT event_count FROM agent_sessions
-             WHERE session_id = ? AND user_id = ? LIMIT 1",
-        )
-        .bind(&session_id)
-        .bind(&user_id)
-        .fetch_optional(&pool)
-        .await
-        .map_err(internal_error)?
-        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "Session not found"))?;
-        let events_replayed: i64 = session_row.try_get("event_count").map_err(internal_error)?;
+        if !agent_session_exists_for_user(&pool, &session_id, &user_id)
+            .await
+            .map_err(internal_error)?
+        {
+            return Err(error_response(StatusCode::NOT_FOUND, "Session not found"));
+        }
 
-        let replay_id = Uuid::new_v4().to_string();
-        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-
-        Ok(ReplayResponse {
-            replay_id,
-            session_id,
-            status: "completed".into(),
-            events_replayed,
-            sandbox_name: request.sandbox_name,
-            mock_mode: request.mock_mode,
-            created_at: now,
-        })
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            REPLAY_UNAVAILABLE_DETAIL,
+        ))
     }
 
     async fn compare_replay(
@@ -151,32 +121,10 @@ impl ReplayService for DatabaseReplayService {
             return Err(error_response(StatusCode::NOT_FOUND, "Session not found"));
         }
 
-        let counts = query(
-            "SELECT \
-               COUNT(CASE WHEN event_type != 'replay' THEN 1 END) AS original_cnt, \
-               COUNT(CASE WHEN event_type = 'replay' THEN 1 END) AS replay_cnt \
-             FROM agent_events WHERE session_id = ? AND user_id = ?",
-        )
-        .bind(&session_id)
-        .bind(&user_id)
-        .fetch_one(&pool)
-        .await
-        .map_err(internal_error)?;
-        let original_event_count = replay_count_column(&counts, "original_cnt")?;
-        let replay_event_count = replay_count_column(&counts, "replay_cnt")?;
-
-        let difference = (original_event_count - replay_event_count).abs();
-        let is_match = difference == 0;
-        let compared_at = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-
-        Ok(ComparisonResponse {
-            session_id,
-            original_event_count,
-            replay_event_count,
-            difference,
-            is_match,
-            compared_at,
-        })
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            REPLAY_UNAVAILABLE_DETAIL,
+        ))
     }
 }
 
@@ -231,60 +179,6 @@ mod tests {
     fn replay_session_request_explicit_mock_false() {
         let req: ReplaySessionRequest = serde_json::from_str(r#"{"mock_mode": false}"#).unwrap();
         assert_eq!(req.mock_mode, Some(false));
-    }
-
-    struct FakeReplayCountRow {
-        failed_column: Option<&'static str>,
-    }
-
-    impl FakeReplayCountRow {
-        fn complete() -> Self {
-            Self {
-                failed_column: None,
-            }
-        }
-
-        fn fail_on(column: &'static str) -> Self {
-            Self {
-                failed_column: Some(column),
-            }
-        }
-    }
-
-    impl ReplayCountRow for FakeReplayCountRow {
-        fn i64_column(&self, column: &str) -> Result<i64, sqlx::Error> {
-            if self.failed_column == Some(column) {
-                return Err(sqlx::Error::ColumnNotFound(column.to_string()));
-            }
-
-            match column {
-                "original_cnt" => Ok(7),
-                "replay_cnt" => Ok(5),
-                _ => Err(sqlx::Error::ColumnNotFound(column.to_string())),
-            }
-        }
-    }
-
-    #[test]
-    fn replay_count_column_preserves_database_values() {
-        let row = FakeReplayCountRow::complete();
-
-        assert_eq!(replay_count_column(&row, "original_cnt").unwrap(), 7);
-        assert_eq!(replay_count_column(&row, "replay_cnt").unwrap(), 5);
-    }
-
-    #[test]
-    fn replay_count_column_fails_loudly_on_decode_errors() {
-        for column in ["original_cnt", "replay_cnt"] {
-            let row = FakeReplayCountRow::fail_on(column);
-            let (status, Json(body)) = replay_count_column(&row, column).unwrap_err();
-            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-            assert!(
-                body.detail.contains(&format!("decode column `{column}`")),
-                "error should identify failed column: {:?}",
-                body.detail
-            );
-        }
     }
 
     #[test]

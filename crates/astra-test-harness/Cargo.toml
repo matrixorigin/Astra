@@ -13,7 +13,11 @@ path = "src/lib.rs"
 
 [dependencies]
 astra-credentials.workspace = true
+astra-harness.workspace = true
+astra-pipeline.workspace = true
 astra-services.workspace = true
+astra-server-types.workspace = true
+astra-turn-core.workspace = true
 astra-turn-types.workspace = true
 clap = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -30,7 +34,8 @@ axum = { workspace = true }
 tower-http = { workspace = true }
 tokio-util = { workspace = true }
 uuid = { workspace = true }
+nix = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
-tempfile = "3"
 serial_test = "3"

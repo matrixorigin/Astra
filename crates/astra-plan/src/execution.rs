@@ -1,9 +1,8 @@
 //! Execution-time helpers for prompting and subtask scheduling.
 
-use astra_services::{
-    VerifierKind,
-    task_orchestrator::{SubtaskPlan, TaskPlan},
-};
+use astra_services::VerifierKind;
+
+use crate::{SubtaskPlan, TaskPlan};
 
 /// Build the executor prompt for a subtask, optionally prefixed with stacked
 /// operator guidance from prior pause/correction turns.

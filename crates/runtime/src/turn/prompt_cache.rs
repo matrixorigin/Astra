@@ -81,8 +81,8 @@
 //!
 //! | Function | Consumer | Purpose |
 //! |---|---|---|
-//! | [`assemble_bridge_pipeline_outcome`] | Bridge proxy, agentic loop | Full assembly: prompt + tool schemas + cache strategy |
-//! | [`assemble_system_message_via_pipeline`] | Bridge proxy | Build Anthropic multi-block or OpenAI split message |
+//! | [`assemble_ephemeral_pipeline_outcome`] | Ephemeral proxy, agentic loop | Full assembly: prompt + tool schemas + cache strategy |
+//! | [`assemble_system_message_via_pipeline`] | Ephemeral proxy | Build Anthropic multi-block or OpenAI split message |
 //! | [`annotate_tool_schemas_for_caching_with_always_load`] | Request build | Add `cache_control` to tool definitions |
 //! | [`add_message_cache_breakpoint`] | Request build | Insert breakpoint into final message array |
 //! | [`apply_anthropic_cache_metadata`] | Anthropic adapter | Emit Anthropic-specific cache metadata response fields |
@@ -130,6 +130,7 @@ pub(crate) fn model_identity_prompt_section(model_id: &str) -> prompts::PromptSe
     )
 }
 
+#[cfg(test)]
 fn saturating_usize_to_u32(value: usize) -> u32 {
     value.min(u32::MAX as usize) as u32
 }
@@ -183,14 +184,15 @@ impl Default for PromptCacheConfig {
 //   bound into RuntimeVolatile post-cache-marker so it re-sends each turn
 //   without invalidating the cached prefix.
 
-/// Full pipeline output a bridge caller needs, in one place.
+/// Full pipeline output a ephemeral caller needs, in one place.
 ///
-/// Complements [`super::server_loop_host::PipelineTurnOutcome`]: the bridge
+/// Complements [`super::server_loop_host::PipelineTurnOutcome`]: the ephemeral
 /// has its own per-request lifecycle (no persistent `PipelineSession`) so
 /// it can't reuse the server struct, but the contract is the same — the
 /// pipeline is the sole source of truth for compaction tier + pruned tool
-/// schemas + system prompt, and the bridge consumes them verbatim.
-pub(crate) struct BridgePipelineOutcome {
+/// schemas + system prompt, and the ephemeral consumes them verbatim.
+#[cfg(test)]
+pub(crate) struct EphemeralPipelineOutcome {
     /// Primary system message (Anthropic multi-block or OpenAI stable text).
     pub primary_system: Value,
     /// Optional dynamic system message (OpenAI stable+dynamic split only).
@@ -199,7 +201,7 @@ pub(crate) struct BridgePipelineOutcome {
     pub messages: Vec<Value>,
     /// Trace-facing sections (original input form, for observability).
     pub prompt_sections: Vec<prompts::PromptSection>,
-    /// Compaction tier the planner selected this turn. Bridge must honour
+    /// Compaction tier the planner selected this turn. Ephemeral must honour
     /// this rather than re-deriving a tier downstream.
     pub tier: astra_turn_core::compaction_types::CompactionTier,
     /// Tool schemas already pruned to `tier` by the pipeline's Optimize phase.
@@ -229,6 +231,7 @@ pub(crate) fn provider_cache_policy_for(
     }
 }
 
+#[cfg(test)]
 fn compact_cache_control_marker(cache_control: &Value) -> Value {
     let Some(object) = cache_control.as_object() else {
         return cache_control.clone();
@@ -252,18 +255,15 @@ fn compact_cache_control_marker(cache_control: &Value) -> Value {
     Value::Object(marker)
 }
 
-/// Assemble a system message via the context pipeline directly, without
-/// requiring a [`PipelineSession`]. Used by the HTTP bridge
-/// ([`InProcessChatTurnBridge`]) which has its own per-request lifecycle
-/// and doesn't carry a pipeline session across turns.
+/// Assemble a system message through an ephemeral context-pipeline session.
 ///
 /// Produces an Anthropic multi-block or OpenAI stable+dynamic split system
 /// message by driving the pipeline's planner → binder → serializer. The
-/// `PipelineSession` is ephemeral for this call (bridge lifecycle is
+/// `PipelineSession` is ephemeral for this call (ephemeral lifecycle is
 /// per-request), so stats/recovery/latches all start at default.
 ///
 /// The `extra_dynamic_sections` (passed via `ExternalSources`) are the
-/// bridge's pre-built per-turn fragments (session anchor, feedback rules,
+/// caller's pre-built per-turn fragments (session anchor, feedback rules,
 /// memoria insights, etc.) — they append after the runtime-identity block
 /// in the None-scoped post-cache segment, so dynamic churn doesn't
 /// invalidate the cached prefix.
@@ -282,7 +282,7 @@ pub(crate) fn assemble_system_message_via_pipeline(
     edge_profile_cwd: Option<&str>,
     edge_profile_git_branch: Option<&str>,
 ) -> (Value, Option<Value>, Vec<prompts::PromptSection>) {
-    let outcome = assemble_bridge_pipeline_outcome(
+    let outcome = assemble_ephemeral_pipeline_outcome(
         tool_names,
         &[],
         &[], // legacy wrapper: no stable sections — tests pre-date the split
@@ -310,21 +310,21 @@ pub(crate) fn assemble_system_message_via_pipeline(
     )
 }
 
-/// Bridge-side equivalent of [`super::server_loop_host::run_turn_pipeline`]:
+/// Ephemeral equivalent of [`super::server_loop_host::run_turn_pipeline`]:
 /// drives the full context pipeline (Plan → Bind → Optimize → Serialize) for
 /// an ephemeral per-request session, and returns system message(s), trace
 /// sections, planner tier, and tier-pruned tool schemas.
 ///
-/// `tool_schemas` is the raw tool set the bridge wanted to expose; the
+/// `tool_schemas` is the raw tool set the caller requested to expose; the
 /// returned `tool_schemas` is the tier-pruned view from the pipeline's
 /// Optimize phase (mirrors `server_loop_host::PipelineTurnOutcome.tool_schemas`).
 ///
 /// Extra-sections are split into two lanes per cache strategy:
 ///
-/// * `extra_stable_sections` — session-stable bridge-composed content.
+/// * `extra_stable_sections` — session-stable caller-composed content.
 ///   Bound into RuntimeIdentity (Session scope) so it sits BEFORE the
 ///   Session→None cache marker.
-/// * `extra_volatile_sections` — per-turn bridge-composed content
+/// * `extra_volatile_sections` — per-turn caller-composed content
 ///   (session anchor, memoria insights, tool round guidance). Bound into
 ///   RuntimeVolatile (None scope) so churn does not invalidate the
 ///   cached session prefix.
@@ -335,9 +335,9 @@ pub(crate) fn assemble_system_message_via_pipeline(
 /// * `memory_entries` — per-turn Memoria retrieval results. Bound through
 ///   the Memory section (None scope), where the core binder applies rank,
 ///   deduplication, and token-budget trimming.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub(crate) fn assemble_bridge_pipeline_outcome(
+pub(crate) fn assemble_ephemeral_pipeline_outcome(
     tool_names: &[&str],
     tool_schemas: &[Value],
     extra_stable_sections: &[prompts::PromptSection],
@@ -357,8 +357,8 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     deferred_tools_block: &str,
     skill_listing_block: &str,
     current_date: &str,
-) -> BridgePipelineOutcome {
-    assemble_bridge_pipeline_outcome_with_messages(
+) -> EphemeralPipelineOutcome {
+    assemble_ephemeral_pipeline_outcome_with_messages(
         tool_names,
         tool_schemas,
         extra_stable_sections,
@@ -383,12 +383,13 @@ pub(crate) fn assemble_bridge_pipeline_outcome(
     )
 }
 
-/// Message-aware bridge entry point used by the production wire path.
+/// Message-aware ephemeral entry point used by the production wire path.
 ///
 /// The compatibility wrapper above deliberately supplies an empty history for
 /// older system-prompt-only callers and tests.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
+pub(crate) fn assemble_ephemeral_pipeline_outcome_with_messages(
     tool_names: &[&str],
     tool_schemas: &[Value],
     extra_stable_sections: &[prompts::PromptSection],
@@ -410,7 +411,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
     skill_listing_block: &str,
     current_date: &str,
     conversation_messages: &[Value],
-) -> BridgePipelineOutcome {
+) -> EphemeralPipelineOutcome {
     use astra_turn_core::context_sources::{
         AgentContext, EdgeProfile, ExternalSources, SessionContext, TurnState,
     };
@@ -426,9 +427,11 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
         tool_schemas,
     );
 
-    // Build ExternalSources from bridge-side signals. Guidance derived from
-    // the exact visible surface is rebuilt every turn but remains cacheable
-    // until that surface changes.
+    // Build ExternalSources from ephemeral-side signals. Cross-tool guidance
+    // is versioned by the exact visible surface: an unchanged surface reuses
+    // the session prefix, while a real capability transition starts a new
+    // epoch. It must not enter the volatile lane because strict-history
+    // providers suppress ordinary volatile prose from their wire prompt.
     let self_model_text = if tool_names.is_empty() {
         None
     } else {
@@ -542,11 +545,11 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
     };
 
     astra_core::history_work::record_serialized_value(
-        astra_core::history_work::HistoryWorkSite::BridgePipelineInputMaterialization,
+        astra_core::history_work::HistoryWorkSite::EphemeralPipelineInputMaterialization,
         tool_schemas,
     );
     astra_core::history_work::record_serialized_value(
-        astra_core::history_work::HistoryWorkSite::BridgePipelineInputMaterialization,
+        astra_core::history_work::HistoryWorkSite::EphemeralPipelineInputMaterialization,
         conversation_messages,
     );
     let agent = AgentContext {
@@ -558,15 +561,13 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
         tool_results: Vec::new(),
         tokens: Default::default(),
         active_skills: Vec::new(),
-        recent_file_reads: Default::default(),
-        remaining_turns: 20,
         turn_index: 0,
         recovery: Default::default(),
         last_user_message: String::new(),
     };
     let statics = prompts::build_pipeline_static_sections();
 
-    // Ephemeral per-request session. Bridge doesn't persist a session across
+    // Ephemeral per-request session. Ephemeral doesn't persist a session across
     // turns — its compaction lives elsewhere — so a fresh session per call
     // is the right lifecycle. Stats/recovery/latches all start at default.
     let mut session = PipelineSession::new(PipelineConfig {
@@ -579,7 +580,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
         turn: &turn_state,
         external: &external,
         model_id,
-        query_source: "bridge",
+        query_source: "ephemeral",
     };
 
     let output = match session.run_turn_adaptive_with_history_owner(
@@ -590,7 +591,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
         Err(abort) => {
             tracing::warn!(
                 error = ?abort,
-                "bridge pipeline abort during system assembly — returning empty system"
+                "ephemeral pipeline abort during system assembly — returning empty system"
             );
             astra_core::history_work::record_serialized_value(
                 astra_core::history_work::HistoryWorkSite::RuntimeContextMaterialization,
@@ -600,7 +601,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
                 astra_core::history_work::HistoryWorkSite::RuntimeContextMaterialization,
                 tool_schemas,
             );
-            return BridgePipelineOutcome {
+            return EphemeralPipelineOutcome {
                 primary_system: json!({"role": "system", "content": ""}),
                 dynamic_system: None,
                 messages: conversation_messages.to_vec(),
@@ -624,7 +625,7 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
     // Append caller-supplied extras (and any we injected, like output style)
     // in their original form — trace_signals intact. Downstream
     // `build_system_prompt_trace` aggregates context_signals across every
-    // section, so this preserves the bridge's telemetry contract.
+    // section, so this preserves the ephemeral's telemetry contract.
     sections.extend(trace_extra_sections);
 
     let tier = output.plan.compact_tier;
@@ -707,10 +708,10 @@ pub(crate) fn assemble_bridge_pipeline_outcome_with_messages(
         provider = %provider,
         model_id = %model_id,
         tier = ?tier,
-        "assembled bridge pipeline outcome with cache strategy",
+        "assembled ephemeral pipeline outcome with cache strategy",
     );
 
-    BridgePipelineOutcome {
+    EphemeralPipelineOutcome {
         primary_system,
         dynamic_system,
         messages: output.optimized.messages,
@@ -878,7 +879,7 @@ pub(crate) fn apply_anthropic_cache_metadata(
 /// Process-wide mutex guarding any test that mutates env vars read by the
 /// prompt-cache pipeline (`ASTRA_TEST_PROMPT_CACHE_DISABLED`,
 /// `ASTRA_OUTPUT_STYLE`, etc.). Exposed at module scope so sibling test
-/// modules (`bridge_inprocess::tests`) share the same lock — otherwise
+/// modules (`ephemeral_pipeline::tests`) share the same lock — otherwise
 /// two independent mutexes race to the same `std::env::set_var` and a
 /// panic in one poisons the other's tests. Recover from poison on lock
 /// acquire; test panics carry their own failure and should not cascade.
@@ -955,6 +956,12 @@ mod tests {
                 "{name} is part of the runtime default surface and must be cache-always_load"
             );
         }
+        for name in ["agent", "agent_fanout"] {
+            assert!(
+                always_load.contains(name),
+                "{name} is a stable execution topology and must remain in the cached tool prefix"
+            );
+        }
         for name in [
             "lsp",
             "github",
@@ -962,7 +969,6 @@ mod tests {
             "web_search",
             "session",
             "mo_query",
-            "agent",
             "symbols",
             "powershell",
             "run_script",
@@ -1109,11 +1115,11 @@ mod tests {
         assert!(tools.is_empty());
     }
 
-    // ── assemble_bridge_pipeline_outcome (Phase 1b contract) ─────────────
+    // ── assemble_ephemeral_pipeline_outcome (Phase 1b contract) ─────────────
 
     #[test]
-    fn bridge_pipeline_outcome_returns_tier_and_pruned_tool_schemas() {
-        // Phase 1b: the bridge consumes the pipeline's tier + pruned tool
+    fn ephemeral_pipeline_outcome_returns_tier_and_pruned_tool_schemas() {
+        // Phase 1b: the ephemeral consumes the pipeline's tier + pruned tool
         // schemas from a single helper call instead of re-deriving them via
         // `compaction_tier_calibrated` + `tool_schema_prune::prune_tool_schemas`
         // at two downstream sites. Lock that contract in.
@@ -1131,7 +1137,7 @@ mod tests {
                 "parameters": {"type": "object", "properties": {}}
             }
         })];
-        let outcome = assemble_bridge_pipeline_outcome(
+        let outcome = assemble_ephemeral_pipeline_outcome(
             &["bash"],
             &tool_schemas,
             &[], // stable
@@ -1141,7 +1147,7 @@ mod tests {
             None,
             &cache_cfg,
             None,
-            "sid-bridge",
+            "sid-ephemeral",
             "gpt-4o",
             None,
             "openai",
@@ -1157,7 +1163,7 @@ mod tests {
         assert_eq!(
             outcome.tier,
             astra_turn_core::compaction_types::CompactionTier::Normal,
-            "fresh bridge session with no PTL history must plan at Normal"
+            "fresh ephemeral session with no PTL history must plan at Normal"
         );
         assert_eq!(
             outcome.tool_schemas.len(),
@@ -1176,7 +1182,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_pipeline_measures_working_set_but_defers_lossy_history_reduction() {
+    fn ephemeral_pipeline_measures_working_set_but_defers_lossy_history_reduction() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
@@ -1192,7 +1198,7 @@ mod tests {
                 })
             })
             .collect();
-        let outcome = assemble_bridge_pipeline_outcome_with_messages(
+        let outcome = assemble_ephemeral_pipeline_outcome_with_messages(
             &[],
             &[],
             &[],
@@ -1202,7 +1208,7 @@ mod tests {
             None,
             &cache_cfg,
             None,
-            "sid-long-running-bridge",
+            "sid-long-running-ephemeral",
             "model-with-explicit-window",
             Some(8_000),
             0,
@@ -1223,12 +1229,12 @@ mod tests {
         );
         assert_eq!(
             outcome.messages, messages,
-            "the bridge's downstream semantic compactor is the sole lossy history owner"
+            "the ephemeral's downstream semantic compactor is the sole lossy history owner"
         );
     }
 
     #[test]
-    fn bridge_pipeline_outcome_preserves_many_extra_sections() {
+    fn ephemeral_pipeline_outcome_preserves_many_extra_sections() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
@@ -1252,7 +1258,7 @@ mod tests {
             })
             .collect();
 
-        let outcome = assemble_bridge_pipeline_outcome(
+        let outcome = assemble_ephemeral_pipeline_outcome(
             &[],
             &[],
             &stable,
@@ -1281,11 +1287,11 @@ mod tests {
             .join("\n");
         assert!(
             trace_text.contains("[stable-extra-124]"),
-            "bridge extras must not be truncated by section count"
+            "ephemeral extras must not be truncated by section count"
         );
         assert!(
             trace_text.contains("[volatile-extra-124]"),
-            "bridge extras must not be truncated by section count"
+            "ephemeral extras must not be truncated by section count"
         );
         let primary_text = outcome.primary_system["content"]
             .as_str()
@@ -1300,13 +1306,13 @@ mod tests {
     }
 
     #[test]
-    fn bridge_model_limit_conversion_saturates() {
+    fn ephemeral_model_limit_conversion_saturates() {
         assert_eq!(saturating_usize_to_u32(200_000), 200_000);
         assert_eq!(saturating_usize_to_u32(u32::MAX as usize + 1), u32::MAX);
     }
 
     #[test]
-    fn bridge_pipeline_outcome_routes_memory_entries_through_pipeline() {
+    fn ephemeral_pipeline_outcome_routes_memory_entries_through_pipeline() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
@@ -1318,7 +1324,7 @@ mod tests {
             astra_turn_core::context_sources::MemoryEntry::scored("lower value memory", 1.0),
         ];
 
-        let outcome = assemble_bridge_pipeline_outcome(
+        let outcome = assemble_ephemeral_pipeline_outcome(
             &["bash"],
             &[],
             &[],
@@ -1352,12 +1358,12 @@ mod tests {
         );
         assert!(
             dynamic_text.find("higher value memory") < dynamic_text.find("lower value memory"),
-            "binder ranking should be visible in production bridge output: {dynamic_text}"
+            "binder ranking should be visible in production ephemeral output: {dynamic_text}"
         );
     }
 
     #[test]
-    fn bridge_pipeline_outcome_routes_session_memory_through_runtime_volatile() {
+    fn ephemeral_pipeline_outcome_routes_session_memory_through_runtime_volatile() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
@@ -1368,7 +1374,7 @@ mod tests {
             "## Session State\nLatest state: keep refactoring the session-memory pipeline",
         );
 
-        let outcome = assemble_bridge_pipeline_outcome(
+        let outcome = assemble_ephemeral_pipeline_outcome(
             &["bash"],
             &[],
             &[],
@@ -1408,7 +1414,7 @@ mod tests {
         );
         assert!(
             dynamic_text.contains("session-memory pipeline"),
-            "session memory content must survive bridge assembly: {dynamic_text}"
+            "session memory content must survive ephemeral assembly: {dynamic_text}"
         );
         assert!(
             !primary_text.contains("## Session State"),
@@ -1417,7 +1423,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_pipeline_outcome_routes_system_override_through_runtime_identity() {
+    fn ephemeral_pipeline_outcome_routes_system_override_through_runtime_identity() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
@@ -1425,7 +1431,7 @@ mod tests {
             is_anthropic: false,
         };
 
-        let outcome = assemble_bridge_pipeline_outcome(
+        let outcome = assemble_ephemeral_pipeline_outcome(
             &["bash"],
             &[],
             &[],
@@ -1473,7 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_pipeline_outcome_keeps_session_memory_out_of_anthropic_cached_prefix() {
+    fn ephemeral_pipeline_outcome_keeps_session_memory_out_of_anthropic_cached_prefix() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
@@ -1484,7 +1490,7 @@ mod tests {
             "## Session State\nLatest state: volatile session memory update",
         );
 
-        let outcome = assemble_bridge_pipeline_outcome(
+        let outcome = assemble_ephemeral_pipeline_outcome(
             &["bash"],
             &[],
             &[],
@@ -1545,7 +1551,7 @@ mod tests {
                     .with_memory_identity(memory_id, "semantic")
                     .with_source("memoria.prefetch"),
             ];
-            assemble_bridge_pipeline_outcome(
+            assemble_ephemeral_pipeline_outcome(
                 &["bash"],
                 &[],
                 &[],
@@ -1581,7 +1587,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_pipeline_outcome_keeps_deferred_tools_block_in_session_prefix() {
+    fn ephemeral_pipeline_outcome_keeps_deferred_tools_block_after_cache_boundary() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
@@ -1589,7 +1595,7 @@ mod tests {
             is_anthropic: false,
         };
 
-        let outcome = assemble_bridge_pipeline_outcome(
+        let outcome = assemble_ephemeral_pipeline_outcome(
             &["bash"],
             &[],
             &[],
@@ -1623,12 +1629,47 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default();
 
-        assert!(primary_text.contains("<deferred-tools>"));
-        assert!(!dynamic_text.contains("<deferred-tools>"));
+        assert!(!primary_text.contains("<deferred-tools>"));
+        assert!(dynamic_text.contains("<deferred-tools>"));
+
+        let changed = assemble_ephemeral_pipeline_outcome(
+            &["bash"],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            None,
+            &cache_cfg,
+            None,
+            "sid-deferred-tools",
+            "gpt-4o",
+            None,
+            "openai",
+            None,
+            None,
+            None,
+            "<deferred-tools>\ngithub\nweb_fetch\n</deferred-tools>",
+            "",
+            "2026-05-25",
+        );
+        let changed_primary_text = changed
+            .primary_system
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let changed_dynamic_text = changed
+            .dynamic_system
+            .as_ref()
+            .and_then(|msg| msg.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(primary_text, changed_primary_text);
+        assert_ne!(dynamic_text, changed_dynamic_text);
     }
 
     #[test]
-    fn bridge_pipeline_keeps_model_visible_when_volatile_is_dynamic() {
+    fn ephemeral_pipeline_keeps_model_visible_when_volatile_is_dynamic() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_OUTPUT_STYLE");
         let cache_cfg = PromptCacheConfig {
@@ -1642,8 +1683,8 @@ mod tests {
             reuse_scope: None,
         };
 
-        let outcome = assemble_bridge_pipeline_outcome(
-            &["bash"],
+        let outcome = assemble_ephemeral_pipeline_outcome(
+            &["bash", "start_work"],
             &[],
             &[],
             &[prompts::PromptSection::dynamic(
@@ -1685,6 +1726,12 @@ mod tests {
         );
         assert!(!primary_text.contains("via openai"));
         assert!(
+            primary_text.contains("## Tool Availability Protocol")
+                && primary_text.contains("## Durable Work")
+                && primary_text.contains("`start_work` is the first tool call"),
+            "surface-versioned tool guidance must remain visible in the strict-history prompt: {primary_text}"
+        );
+        assert!(
             !primary_text.contains("must be suppressed"),
             "volatile sections must not leak into strict-history stable prompt: {primary_text}"
         );
@@ -1695,6 +1742,10 @@ mod tests {
         assert!(
             !dynamic_text.contains("Model:"),
             "model identity must not be duplicated into the dynamic prompt lane: {dynamic_text}"
+        );
+        assert!(
+            !dynamic_text.contains("## Tool Availability Protocol"),
+            "cross-tool guidance must not be routed through suppressible volatile content: {dynamic_text}"
         );
     }
 
@@ -1730,7 +1781,7 @@ mod tests {
             .collect::<String>();
         assert!(
             primary_text.contains("Tool Availability Protocol"),
-            "surface-derived guidance should be in the reusable prefix: {primary_text}"
+            "surface-versioned guidance must be carried in the reusable prefix: {primary_text}"
         );
         assert!(
             primary_text.contains("Model: claude-sonnet-4-6"),
@@ -1755,6 +1806,62 @@ mod tests {
             !sections.is_empty(),
             "sections vec must be populated for trace consumers"
         );
+    }
+
+    #[test]
+    fn real_tool_surface_transition_versions_cached_system_prefix() {
+        let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
+        remove_test_env("ASTRA_OUTPUT_STYLE");
+        let cache_cfg = PromptCacheConfig {
+            cache_enabled: true,
+            is_anthropic: true,
+        };
+        let (primary_without, dynamic_without, _) = assemble_system_message_via_pipeline(
+            &["bash"],
+            &[],
+            &cache_cfg,
+            "session",
+            "claude-sonnet-4-6",
+            "bedrock",
+            Some("/tmp/project"),
+            Some("main"),
+        );
+        let (primary_with, dynamic_with, _) = assemble_system_message_via_pipeline(
+            &["bash", "tool_search"],
+            &[],
+            &cache_cfg,
+            "session",
+            "claude-sonnet-4-6",
+            "bedrock",
+            Some("/tmp/project"),
+            Some("main"),
+        );
+
+        assert_ne!(
+            primary_without, primary_with,
+            "a real capability transition must version the matching cross-tool contract"
+        );
+        let without_text = dynamic_without
+            .as_ref()
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let with_text = dynamic_with
+            .as_ref()
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(
+            without_text, with_text,
+            "tool-surface guidance must not leak into the volatile lane"
+        );
+        let with_primary_text = primary_with["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .collect::<String>();
+        assert!(with_primary_text.contains("tool_search"));
     }
 
     #[test]
@@ -1801,7 +1908,7 @@ mod tests {
         }
     }
 
-    /// The bridge's escape-hatch use case: pre-built session anchor + feedback
+    /// The ephemeral's escape-hatch use case: pre-built session anchor + feedback
     /// rules flow through `extra_dynamic_sections` into the final system prompt.
     #[test]
     fn pipeline_assembly_carries_extra_dynamic_sections_through() {
@@ -2164,7 +2271,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_provider_policy_keeps_non_claude_bedrock_prefix_only() {
+    fn ephemeral_provider_policy_keeps_non_claude_bedrock_prefix_only() {
         let policy = provider_cache_policy_for(None, "bedrock", "us.amazon.nova-micro-v1:0");
 
         assert_eq!(
@@ -2177,7 +2284,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_provider_policy_enables_anthropic_for_bedrock_claude() {
+    fn ephemeral_provider_policy_enables_anthropic_for_bedrock_claude() {
         let policy =
             provider_cache_policy_for(None, "bedrock", "anthropic.claude-sonnet-4-20250514-v1:0");
 
@@ -2190,12 +2297,12 @@ mod tests {
     }
 
     #[test]
-    fn bridge_pipeline_outcome_prefers_explicit_capability_over_provider_hint() {
+    fn ephemeral_pipeline_outcome_prefers_explicit_capability_over_provider_hint() {
         let cache_cfg = PromptCacheConfig {
             cache_enabled: true,
             is_anthropic: false,
         };
-        let outcome = assemble_bridge_pipeline_outcome(
+        let outcome = assemble_ephemeral_pipeline_outcome(
             &[],
             &[],
             &[],
@@ -2233,7 +2340,7 @@ mod tests {
                 .get("content")
                 .and_then(Value::as_array)
                 .is_some(),
-            "explicit marker capability on bridge path must produce multi-block cache-control system content"
+            "explicit marker capability on ephemeral path must produce multi-block cache-control system content"
         );
     }
 

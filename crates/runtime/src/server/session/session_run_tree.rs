@@ -3,8 +3,8 @@ use crate::server::run::lifecycle::run_state::{
 };
 use crate::server::*;
 use astra_server_types::{
-    SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction, SessionRunLifecycleStatus, SessionRunNode,
-    SessionRunRuntimeFacts, SessionRunTreeSnapshot,
+    SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction, SessionRunCapabilityServerRefs,
+    SessionRunLifecycleStatus, SessionRunNode, SessionRunRuntimeFacts, SessionRunTreeSnapshot,
 };
 use astra_services::runs::{DurableRunRecord, validate_run_list_limit};
 use serde::Deserialize;
@@ -172,6 +172,23 @@ fn project_run_node_with_status(
         RunStatus::Failed => SessionRunLifecycleStatus::Failed,
         RunStatus::Cancelled => SessionRunLifecycleStatus::Cancelled,
     };
+    let capability_server_refs = run.capability_server_refs_json.as_deref().and_then(|raw| {
+        match serde_json::from_str::<astra_services::runs::CapabilityServerRefs>(raw) {
+            Ok(refs) => Some(SessionRunCapabilityServerRefs {
+                mcp: refs.mcp,
+                skills: refs.skills,
+            }),
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::session_run_tree",
+                    run_id = %run.run_id,
+                    %error,
+                    "durable run capability refs are malformed; omitting inspector fact"
+                );
+                None
+            }
+        }
+    });
     let available_actions = if inherited_control {
         matches!(lifecycle_status, RunStatus::Paused)
             .then_some(SessionRunAction::Cancel)
@@ -219,6 +236,7 @@ fn project_run_node_with_status(
             agent_binding_id: run.agent_binding_id.clone(),
             agent_binding_name: run.agent_binding_name.clone(),
             agent_binding_schema_version: run.agent_binding_schema_version.clone(),
+            capability_server_refs,
             background: None,
             permission: None,
         },
@@ -276,8 +294,10 @@ mod tests {
             agent_binding_schema_version: (depth > 0).then(|| "2".into()),
             model_offering_id: (depth > 0).then(|| "offer-gpt-5".into()),
             resolved_model_name: (depth > 0).then(|| "gpt-5".into()),
+            capability_server_refs_json: None,
             runtime_profile: Some("server".into()),
-            provider_request_fingerprint: None,
+            start_request_fingerprint: None,
+            work_binding: None,
             events: Vec::new(),
             created_at: format!("2026-07-11T00:00:0{depth}Z"),
             updated_at: format!("2026-07-11T00:01:0{depth}Z"),
@@ -412,6 +432,7 @@ mod tests {
             ],
             limit: 200,
             truncated: false,
+            recovery_next_cursor: None,
         };
         let first = build_session_run_tree_snapshot("session-1".into(), page.clone()).unwrap();
         let second = build_session_run_tree_snapshot("session-1".into(), page).unwrap();
@@ -439,6 +460,7 @@ mod tests {
             runs: vec![run("delegated", STATUS_DELEGATED, 0)],
             limit: 200,
             truncated: false,
+            recovery_next_cursor: None,
         };
 
         let snapshot = build_session_run_tree_snapshot("session-1".into(), page).unwrap();
@@ -459,6 +481,7 @@ mod tests {
                 runs: vec![descendant, ancestor],
                 limit: 200,
                 truncated: false,
+                recovery_next_cursor: None,
             };
 
             let snapshot = build_session_run_tree_snapshot("session-1".into(), page).unwrap();
@@ -483,6 +506,7 @@ mod tests {
             runs: vec![grandchild, child, root],
             limit: 200,
             truncated: false,
+            recovery_next_cursor: None,
         };
 
         let snapshot = build_session_run_tree_snapshot("session-1".into(), page).unwrap();
@@ -503,6 +527,7 @@ mod tests {
             runs: vec![child, root],
             limit: 200,
             truncated: false,
+            recovery_next_cursor: None,
         };
 
         let snapshot = build_session_run_tree_snapshot("session-1".into(), page).unwrap();
@@ -535,6 +560,7 @@ mod tests {
             runs: vec![child],
             limit: 200,
             truncated: false,
+            recovery_next_cursor: None,
         };
 
         let snapshot = build_session_run_tree_snapshot("session-1".into(), page).unwrap();
@@ -555,6 +581,7 @@ mod tests {
             runs: vec![run("broken", "mystery", 1)],
             limit: 200,
             truncated: false,
+            recovery_next_cursor: None,
         };
         let error = build_session_run_tree_snapshot("session-1".into(), page).unwrap_err();
         assert_eq!(error.0, StatusCode::INTERNAL_SERVER_ERROR);

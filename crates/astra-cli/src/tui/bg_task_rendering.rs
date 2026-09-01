@@ -191,17 +191,15 @@ pub(crate) fn background_task_output_snapshot_for_rejected_fanout_slot(
 ) -> Option<crate::edge_tools::BgTaskOutputSnapshot> {
     let row = background_task_row_for_rejected_fanout_slot(group, slot)?;
     let full_output = row.output_tail.clone().unwrap_or_default();
-    let total_bytes = full_output.len() as u64;
-    let start = offset.min(total_bytes) as usize;
-    let end = start.saturating_add(max_bytes).min(full_output.len());
-    let output = String::from_utf8_lossy(&full_output.as_bytes()[start..end]).into_owned();
+    let (output, end, total_bytes, total_lines) =
+        super::bg_task_proxy::safe_output_window(&full_output, offset, max_bytes);
     Some(crate::edge_tools::BgTaskOutputSnapshot {
         kind: "local agent".to_string(),
         title: Some(row.title),
         output,
-        end_offset: end as u64,
+        end_offset: end,
         total_bytes,
-        total_lines: full_output.lines().count() as u64,
+        total_lines,
         status: crate::edge_tools::BgTaskOutputStatus::Failed,
         output_ref: row.output_ref.unwrap_or_else(|| {
             format!(
@@ -679,15 +677,19 @@ pub(crate) async fn stop_background_task_with_agents(
         Err(BackgroundTaskError::NotFound { .. }) => {
             if let Some(spawner) = agent_spawner {
                 if spawner
-                    .cancel_fanout_group(task_id, "user-requested via background task control")
+                    .cancel_fanout_group_for_user(
+                        task_id,
+                        "user-requested via background task control",
+                    )
                     .await
                     .is_some()
                 {
                     return Ok(BackgroundTaskStopTarget::FanoutGroup);
                 }
                 if spawner
-                    .cancel_agent(task_id, "user-requested via background task control")
+                    .cancel_agent_for_user(task_id, "user-requested via background task control")
                     .await
+                    .owns_local_stop()
                 {
                     return Ok(BackgroundTaskStopTarget::LocalAgent);
                 }

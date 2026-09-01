@@ -1,7 +1,7 @@
 //! SaaS negative-path and boundary journeys: auth failures, resource governance denials,
-//! concurrent-cap recovery, and task-lease cross-user isolation.
+//! and concurrent-cap recovery.
 //!
-//! Maps to `docs/testing/saas-test-plan.md` §5.1–§5.3, §4.2 (P/N/B coverage).
+//! Maps to `docs/testing/saas-test-plan.md` §5.1–§5.3 (P/N/B coverage).
 
 use axum::Router;
 use axum::body::Body;
@@ -13,10 +13,10 @@ use tower::util::ServiceExt;
 use uuid::Uuid;
 
 use super::harness::{
-    E2E_PASSWORD, bootstrap, build_e2e_access_token, cleanup_task_rows, get_json,
-    grant_astra_admin_role, load_durable_interaction_event, maybe_tool_result_payload_from_sse,
-    model_selection, post_empty, post_json, post_json_with_headers, put_json,
-    revoke_astra_admin_role, seed_pending_approval, seeded_model_selection,
+    E2E_PASSWORD, bootstrap, build_e2e_access_token, get_json, grant_astra_admin_role,
+    load_durable_interaction_event, maybe_tool_result_payload_from_sse, model_selection,
+    post_empty, post_json, put_json, revoke_astra_admin_role, seed_pending_approval,
+    seeded_model_selection,
 };
 use super::journey_saas_platform_matrix::{
     cleanup_resource_limits, cleanup_seeded_run, limits_payload, seed_capacity_holding_run,
@@ -166,7 +166,7 @@ pub async fn run_saas_auth_negative_paths() {
     assert_eq!(st_ok, StatusCode::OK, "login recovery: {j_ok}");
     assert!(j_ok["access_token"].as_str().is_some());
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Resource governance negatives: non-admin override forbidden; token cap denies run;
@@ -278,7 +278,7 @@ pub async fn run_saas_resource_governance_negative_paths() {
     assert!(chat2.get("run_id").is_some(), "run_id: {chat2}");
 
     cleanup_resource_limits(pool, user_id).await;
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Concurrent session cap: deny then admin recovery allows new chat.
@@ -349,124 +349,7 @@ pub async fn run_saas_resource_concurrent_cap_recovery() {
 
     cleanup_seeded_run(pool, &holding_run).await;
     cleanup_resource_limits(pool, user_id).await;
-    ctx.pool.close().await;
-}
-
-/// Task lease cross-user and auth negative paths.
-pub async fn run_saas_task_lease_negative_paths() {
-    let b = bootstrap().await;
-    let ctx = &b.ctx;
-    let app = &ctx.app;
-    let auth_a = &b.auth_header;
-    let pool = &ctx.pool;
-    let user_a = ctx.user_id.clone();
-    let session_id = ctx.session_id.clone();
-    let edge_agent_id = ctx.edge_agent_id.clone();
-
-    let (st_task, task_j) = post_json(
-        app,
-        "/tasks",
-        Some(auth_a),
-        json!({
-            "title": "saas lease iso task",
-            "description": "owner A",
-            "session_id": session_id,
-        }),
-    )
-    .await;
-    assert_eq!(st_task, StatusCode::CREATED, "create task: {task_j}");
-    let task_id = task_j["task_id"].as_str().expect("task_id").to_string();
-
-    let (auth_b, _user_b) = register_login_user(app, "lease_iso_b").await;
-
-    // N: unauthenticated lease claim → 401
-    let (st_unauth, unauth_j) = post_json_with_headers(
-        app,
-        &format!("/tasks/{task_id}/lease/claim"),
-        None,
-        &[],
-        json!({ "edge_agent_id": edge_agent_id, "ttl_sec": 300 }),
-    )
-    .await;
-    assert_eq!(
-        st_unauth,
-        StatusCode::UNAUTHORIZED,
-        "claim without auth: {unauth_j}"
-    );
-
-    // N: empty edge_agent_id → 400
-    let (st_empty, empty_j) = post_json(
-        app,
-        &format!("/tasks/{task_id}/lease/claim"),
-        Some(auth_a),
-        json!({ "edge_agent_id": "  ", "ttl_sec": 300 }),
-    )
-    .await;
-    assert_eq!(
-        st_empty,
-        StatusCode::BAD_REQUEST,
-        "empty edge_agent_id: {empty_j}"
-    );
-
-    // N: user B cannot access A's task (404, not 403 leak)
-    let (st_get_b, get_b) = get_json(app, &format!("/tasks/{task_id}"), Some(&auth_b), &[]).await;
-    assert_eq!(st_get_b, StatusCode::NOT_FOUND, "B get task: {get_b}");
-
-    let (st_lease_b, lease_b) =
-        get_json(app, &format!("/tasks/{task_id}/lease"), Some(&auth_b), &[]).await;
-    assert_eq!(st_lease_b, StatusCode::NOT_FOUND, "B get lease: {lease_b}");
-
-    let (st_claim_b, claim_b) = post_json_with_headers(
-        app,
-        &format!("/tasks/{task_id}/lease/claim"),
-        Some(&auth_b),
-        &[("x-astra-edge-id", "foreign-edge")],
-        json!({ "edge_agent_id": "foreign-agent", "ttl_sec": 300 }),
-    )
-    .await;
-    assert_eq!(
-        st_claim_b,
-        StatusCode::NOT_FOUND,
-        "B claim A task: {claim_b}"
-    );
-
-    // P: owner A can claim
-    let edge_reg = axum::http::Request::builder()
-        .method("POST")
-        .uri("/agents/edge")
-        .header("authorization", auth_a.as_str())
-        .header("content-type", "application/json")
-        .header("x-astra-edge-id", "saas-neg-edge")
-        .body(axum::body::Body::from(
-            json!({
-                "edge_agent_id": edge_agent_id,
-                "hostname": "saas-neg-host",
-                "capabilities": { "tools": ["read_file"] }
-            })
-            .to_string(),
-        ))
-        .expect("edge register");
-    let edge_resp = app.clone().oneshot(edge_reg).await.expect("edge reg");
-    assert_eq!(edge_resp.status(), StatusCode::OK);
-
-    let (st_claim_a, claim_a) = post_json_with_headers(
-        app,
-        &format!("/tasks/{task_id}/lease/claim"),
-        Some(auth_a),
-        &[("x-astra-edge-id", "saas-neg-edge")],
-        json!({ "edge_agent_id": edge_agent_id, "ttl_sec": 300 }),
-    )
-    .await;
-    assert_eq!(st_claim_a, StatusCode::OK, "A claim own task: {claim_a}");
-
-    cleanup_task_rows(pool, &user_a, &task_id).await;
-    let _ = sqlx::query("DELETE FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?")
-        .bind(&user_a)
-        .bind(&edge_agent_id)
-        .execute(pool)
-        .await;
-
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Logout revokes refresh; expired access JWT is rejected.
@@ -525,7 +408,7 @@ pub async fn run_saas_auth_logout_and_expired_token() {
     let (st_me, me_j) = get_json(app, "/auth/me", Some(&new_auth), &[]).await;
     assert_eq!(st_me, StatusCode::OK, "me after re-login: {me_j}");
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Admin override for bash/disk limits is readable via GET /resources/limits (+ DB).
@@ -576,176 +459,81 @@ pub async fn run_saas_resource_limits_extended_fields() {
     assert_eq!(row.try_get::<i32, _>("max_sessions_per_day").ok(), Some(25));
 
     cleanup_resource_limits(pool, user_id).await;
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
-/// Task lease: contested when held; reclaim after forced expiry.
-pub async fn run_saas_task_lease_contested_and_expired_reclaim() {
-    let b = bootstrap().await;
-    let ctx = &b.ctx;
-    let app = &ctx.app;
-    let auth = &b.auth_header;
-    let pool = &ctx.pool;
-    let user_id = ctx.user_id.clone();
-    let session_id = ctx.session_id.clone();
-    let agent_a = ctx.edge_agent_id.clone();
-    let agent_b = format!("agent-b-{}", ctx.suffix);
-
-    let (st_task, task_j) = post_json(
-        app,
-        "/tasks",
-        Some(auth),
-        json!({
-            "title": "lease contested task",
-            "description": "contested + reclaim",
-            "session_id": session_id,
-        }),
-    )
-    .await;
-    assert_eq!(st_task, StatusCode::CREATED, "create task: {task_j}");
-    let task_id = task_j["task_id"].as_str().expect("task_id").to_string();
-
-    for (edge_hdr, agent_id, hostname) in [
-        ("edge-a", agent_a.as_str(), "host-a"),
-        ("edge-b", agent_b.as_str(), "host-b"),
-    ] {
-        let reg = Request::builder()
-            .method("POST")
-            .uri("/agents/edge")
-            .header("authorization", auth.as_str())
-            .header("content-type", "application/json")
-            .header("x-astra-edge-id", edge_hdr)
-            .body(Body::from(
-                json!({
-                    "edge_agent_id": agent_id,
-                    "hostname": hostname,
-                    "capabilities": { "tools": ["read_file"] }
-                })
-                .to_string(),
-            ))
-            .expect("edge register body");
-        let resp = app.clone().oneshot(reg).await.expect("edge reg");
-        assert_eq!(resp.status(), StatusCode::OK, "register {agent_id}");
-    }
-
-    // P: agent A claims
-    let (st_a, claim_a) = post_json_with_headers(
-        app,
-        &format!("/tasks/{task_id}/lease/claim"),
-        Some(auth),
-        &[("x-astra-edge-id", "edge-a")],
-        json!({ "edge_agent_id": agent_a, "ttl_sec": 300 }),
-    )
-    .await;
-    assert_eq!(st_a, StatusCode::OK, "A claim: {claim_a}");
-    assert_eq!(claim_a["status"].as_str(), Some("granted"));
-
-    // N: agent B contested while A holds active lease
-    let (st_b, claim_b) = post_json_with_headers(
-        app,
-        &format!("/tasks/{task_id}/lease/claim"),
-        Some(auth),
-        &[("x-astra-edge-id", "edge-b")],
-        json!({ "edge_agent_id": agent_b, "ttl_sec": 300 }),
-    )
-    .await;
-    assert_eq!(st_b, StatusCode::OK, "B contested claim: {claim_b}");
-    assert_eq!(claim_b["status"].as_str(), Some("contested"));
-    assert_eq!(
-        claim_b["holder_agent_id"].as_str(),
-        Some(agent_a.as_str()),
-        "contested holder: {claim_b}"
-    );
-
-    // Force-expire lease in DB (simulate TTL elapsed)
-    sqlx::query(
-        "UPDATE task_leases SET expires_at = DATE_SUB(NOW(6), INTERVAL 1 MINUTE) \
-         WHERE task_id = ? AND user_id = ?",
-    )
-    .bind(&task_id)
-    .bind(&user_id)
-    .execute(pool)
-    .await
-    .expect("expire lease row");
-
-    // P: agent B reclaims after expiry
-    let (st_reclaim, reclaim_j) = post_json_with_headers(
-        app,
-        &format!("/tasks/{task_id}/lease/claim"),
-        Some(auth),
-        &[("x-astra-edge-id", "edge-b")],
-        json!({ "edge_agent_id": agent_b, "ttl_sec": 300 }),
-    )
-    .await;
-    assert_eq!(st_reclaim, StatusCode::OK, "B reclaim: {reclaim_j}");
-    assert_eq!(reclaim_j["status"].as_str(), Some("granted"));
-
-    cleanup_task_rows(pool, &user_id, &task_id).await;
-    for agent_id in [&agent_a, &agent_b] {
-        let _ =
-            sqlx::query("DELETE FROM edge_agent_registry WHERE user_id = ? AND edge_agent_id = ?")
-                .bind(&user_id)
-                .bind(agent_id)
-                .execute(pool)
-                .await;
-    }
-
-    ctx.pool.close().await;
-}
-
-/// Valid `POST /tools/result` during live `/chat/turn` handoff (positive callback path).
+/// Valid `POST /tools/result` consumed by the same server-owned `/chat/stream`
+/// admission (positive callback path).
 pub async fn run_saas_edge_tool_result_success_path() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
     let app = &ctx.app;
     let auth = &b.auth_header;
-    let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
     let tool_output = "saas edge tool result ok";
 
     let payload = json!({
         "agent_id": "saas-edge-callback-agent",
-        "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
         "session_id": ctx.session_id,
+        "edge_executor_id": ctx.edge_agent_id,
+        "workspace_binding": {
+            "kind": "edge_workspace",
+            "display_name": "system-matrix-edge",
+            "root": "/tmp/astra-system-matrix-edge",
+            "authority": "read_write"
+        },
+        "executor_binding": {
+            "kind": "edge_agent",
+            "executor_id": ctx.edge_agent_id,
+            "display_name": "system-matrix-edge",
+            "transport": "edge_ledger",
+            "status": "online"
+        },
         "model_selection": seeded_model_selection(ctx),
-        "messages": [{ "role": "user", "content": "read saas probe file" }],
-        "edge_tools": [{
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "description": "read a file",
-                "parameters": {
-                    "type": "object",
-                    "properties": { "path": { "type": "string" } },
-                    "required": ["path"]
-                }
-            }
-        }],
-        "test_llm_rounds": [
-            {
-                "tool_calls": [{
-                    "id": "tc-saas-tool-ok",
-                    "type": "function",
-                    "function": {
-                        "name": "read_file",
-                        "arguments": "{\"path\":\"saas-probe.txt\"}"
-                    }
-                }]
+        "message": "read saas probe file",
+        "context": {
+            "edge_profile": {
+                "cwd": "/tmp/astra-system-matrix-edge",
+                "edge_agent_id": ctx.edge_agent_id,
+                "hostname": "system-matrix-edge"
             },
-            { "full_text": "Done after tool result." }
-        ]
+            "edge_tools": [{
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "read a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "path": { "type": "string" } },
+                        "required": ["path"]
+                    }
+                }
+            }],
+            "test_llm_rounds": [
+                {
+                    "tool_calls": [{
+                        "id": "tc-saas-tool-ok",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"saas-probe.txt\"}"
+                        }
+                    }]
+                },
+                { "full_text": "Done after tool result." }
+            ]
+        }
     });
 
     let req = Request::builder()
         .method("POST")
-        .uri("/chat/turn")
+        .uri("/chat/stream")
         .header("authorization", auth.as_str())
         .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", &test_secret)
         .body(Body::from(payload.to_string()))
-        .expect("chat/turn request");
+        .expect("chat/stream request");
 
-    let response = app.clone().oneshot(req).await.expect("chat/turn");
-    assert_eq!(response.status(), StatusCode::OK, "chat/turn status");
+    let response = app.clone().oneshot(req).await.expect("chat/stream");
+    assert_eq!(response.status(), StatusCode::OK, "chat/stream status");
 
     let mut stream = response.into_body().into_data_stream();
     let mut acc = Vec::new();
@@ -769,11 +557,12 @@ pub async fn run_saas_edge_tool_result_success_path() {
             assert_eq!(st_tool, StatusCode::OK, "valid /tools/result: {tool_j}");
             posted_result = true;
         }
-        if s.contains("\"type\":\"turn_complete\"") {
-            break;
-        }
     }
-    assert!(posted_result, "never posted /tools/result for tool_request");
+    assert!(
+        posted_result,
+        "server stream never emitted tool_request: {}",
+        String::from_utf8_lossy(&acc)
+    );
 
     let full = String::from_utf8_lossy(&acc).into_owned();
     let events = parse_sse_events(&full);
@@ -781,10 +570,38 @@ pub async fn run_saas_edge_tool_result_success_path() {
         .iter()
         .filter(|e| e["type"].as_str() == Some("turn_complete"))
         .collect();
-    assert!(!completes.is_empty(), "missing turn_complete: {full}");
-    assert_eq!(completes[0]["has_tool_calls"], true);
+    assert_eq!(completes.len(), 1, "one server-owned terminal: {full}");
+    assert_eq!(
+        completes[0]["continuation_owner"], "server",
+        "callback must be consumed by the same server-owned stream: {full}"
+    );
+    assert_eq!(
+        completes[0].get("tool_calls_count").and_then(Value::as_u64),
+        Some(1),
+        "SaaS callback terminal must account for one tool call: {full}"
+    );
+    assert_eq!(
+        completes[0]
+            .get("tools_used")
+            .and_then(Value::as_array)
+            .map(|tools| tools.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
+        Some(vec!["read_file"]),
+        "SaaS callback terminal must report the normalized tool list: {full}"
+    );
+    assert_eq!(
+        completes[0].get("llm_rounds").and_then(Value::as_u64),
+        Some(2),
+        "SaaS callback terminal must include the initial tool round and final model round: {full}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["type"].as_str() == Some("text_delta")
+                && event["content"].as_str() == Some("Done after tool result.")
+        }),
+        "server stream must reach the final model round after callback: {full}"
+    );
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Memoria proxy degradation: memory routes fail; chat main path stays available.
@@ -859,7 +676,7 @@ pub async fn run_saas_memoria_proxy_degradation() {
     .await;
     assert_eq!(st_ok, StatusCode::OK, "memory store after recovery: {ok_j}");
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Run control cross-user isolation and list scoping.
@@ -922,7 +739,7 @@ pub async fn run_saas_run_cross_user_isolation() {
         "A list should include own run: {list_a}"
     );
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Double pause on the same run returns conflict (invalid state transition).
@@ -959,7 +776,7 @@ pub async fn run_saas_run_double_pause_conflict() {
         "second pause should conflict: {pause2_j}"
     );
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// GET /edges/status auth + response shape (connected edges may be empty without WS).
@@ -983,7 +800,7 @@ pub async fn run_saas_edges_status_smoke() {
         "edges field must be array: {ok_j}"
     );
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// GET /service/edges/status: verifies auth gate and response shape.
@@ -993,11 +810,12 @@ pub async fn run_saas_edges_status_smoke() {
 /// 2. Invalid key → 401.
 /// 3. Valid key → 200 with `edges` array.
 pub async fn run_saas_service_edges_status_smoke() {
-    const SERVICE_KEY: &str = "test-service-key-e2e";
-    // Safety: test-only env mutation, isolated to this process.
-    unsafe {
-        std::env::set_var("ASTRA_BACKEND_SERVICE_KEY", SERVICE_KEY);
-    }
+    let service_key = std::env::var("ASTRA_BACKEND_SERVICE_KEY")
+        .expect("service-edge E2E runner must set ASTRA_BACKEND_SERVICE_KEY");
+    assert!(
+        !service_key.trim().is_empty(),
+        "service-edge E2E runner must set a non-empty ASTRA_BACKEND_SERVICE_KEY"
+    );
 
     let b = bootstrap().await;
     let ctx = &b.ctx;
@@ -1033,7 +851,7 @@ pub async fn run_saas_service_edges_status_smoke() {
     );
 
     // 3. Valid key → 200 with edges array (may be empty; no live WS in this test).
-    let valid_auth = format!("Bearer {SERVICE_KEY}");
+    let valid_auth = format!("Bearer {service_key}");
     let (st_ok, ok_j) = get_json(
         app,
         &format!("/service/edges/status?user_id={user_id}"),
@@ -1047,10 +865,7 @@ pub async fn run_saas_service_edges_status_smoke() {
         "edges field must be array: {ok_j}"
     );
 
-    unsafe {
-        std::env::remove_var("ASTRA_BACKEND_SERVICE_KEY");
-    }
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Valid approval respond commits one owner-scoped durable interaction decision.
@@ -1085,5 +900,5 @@ pub async fn run_saas_approval_respond_success_path() {
     assert_eq!(decision.pointer("/data/decision"), Some(&json!("allow")));
     assert_eq!(decision.pointer("/data/outcome"), Some(&json!("approved")));
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }

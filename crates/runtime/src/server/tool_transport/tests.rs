@@ -399,6 +399,19 @@ impl StaticEdgeDispatch {
     }
 
     fn terminal_admission(output: &str) -> Self {
+        let result = astra_thin_client::ToolResultRequest::new_with_hash(
+            astra_thin_client::ToolResultRequestParts {
+                session_id: "session-1".to_string(),
+                run_id: "run-1".to_string(),
+                turn_chain_id: "turn-chain-1".to_string(),
+                request_id: "call-1".to_string(),
+                edge_agent_id: "edge-selected".to_string(),
+                status: "completed".to_string(),
+                output: output.to_string(),
+                duration_ms: 0,
+                tool_result_fields: None,
+            },
+        );
         Self {
             inserted_edge_agent_ids: Mutex::new(Vec::new()),
             inserted_identities: Mutex::new(Vec::new()),
@@ -406,7 +419,7 @@ impl StaticEdgeDispatch {
             return_result: false,
             result_status: "completed",
             terminal_admission_result: Some(
-                serde_json::json!({"status":"completed","output":output}).to_string(),
+                serde_json::to_string(&result).expect("terminal result fixture must serialize"),
             ),
             admission_error: None,
             direct_claimed: AtomicBool::new(false),
@@ -1649,6 +1662,43 @@ fn edge_bound_execution_plan_uses_policy_snapshot_timeout_override() {
         binding.policy.resources.max_execution_secs,
         Some(7.2),
         "policy snapshot should override default read-only timeout"
+    );
+}
+
+#[test]
+fn edge_bound_execution_plan_clamps_invalid_or_excessive_policy_timeout() {
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let mut request = request(
+        "bash",
+        WorkspaceBinding::edge_workspace(
+            "MacBook Pro",
+            "/Users/test/project",
+            WorkspaceAuthority::ReadWrite,
+        ),
+        ExecutorBinding::edge_agent(
+            "edge-1",
+            "MacBook Pro",
+            ToolTransportKind::EdgeWs,
+            ExecutorStatus::Online,
+        ),
+    );
+
+    request.policy.max_execution_secs = Some(0.0);
+    let binding = request.runtime_environment_binding(&registry);
+    let plan = EdgeBoundExecutionPlan::try_from_request_with_binding(&request, &binding).unwrap();
+    assert_eq!(plan.execution_timeout_secs(), 1);
+    assert_eq!(plan.wait_timeout(), std::time::Duration::from_secs(11));
+
+    request.policy.max_execution_secs = Some(9_999.0);
+    let binding = request.runtime_environment_binding(&registry);
+    let plan = EdgeBoundExecutionPlan::try_from_request_with_binding(&request, &binding).unwrap();
+    assert_eq!(
+        plan.execution_timeout_secs(),
+        astra_server_types::MAX_EDGE_TOOL_TIMEOUT_SECS
+    );
+    assert_eq!(
+        plan.wait_timeout(),
+        std::time::Duration::from_secs(astra_server_types::MAX_EDGE_TOOL_TIMEOUT_SECS + 10)
     );
 }
 

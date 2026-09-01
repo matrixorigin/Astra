@@ -62,11 +62,10 @@ astra session show <session_id>
 astra session close <session_id>
 astra session delete <session_id>
 
-# Replay
-astra replay <session_id> [--sandbox-name test] [--mock-mode true] [--compare]
+# Replay (reserved; currently unavailable for owned sessions and returns HTTP 501)
 
 # Models
-astra model list
+astra model list                         # consumes the complete paginated catalog
 astra model show <model_name>
 
 # Skills
@@ -105,7 +104,7 @@ astra admin user grant-role alice astra_admin
 astra admin user revoke-role alice astra_admin
 
 # Model management
-astra admin model list
+astra admin model list                   # complete catalog; server pages are drained
 astra admin model add gpt-4 openai --api-key "$OPENAI_API_KEY" [--base-url URL]
 astra admin model show gpt-4
 astra admin model check gpt-4

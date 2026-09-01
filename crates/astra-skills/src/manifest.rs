@@ -24,6 +24,15 @@ pub enum SkillSourceKind {
     Plugin,
 }
 
+/// Closed execution topology a workflow may declare in trusted frontmatter.
+/// This protocol fact is never inferred from instruction prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillExecutionTopology {
+    Primary,
+    ParallelSubruns,
+}
+
 /// Single source of truth for [`SkillSourceKind`] string serialization.
 ///
 /// Adding a variant to the enum without a row here triggers a compile error
@@ -253,6 +262,21 @@ pub struct SkillManifest {
     /// Only meaningful when `execution_context` is `Fork`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_type: Option<String>,
+}
+
+impl SkillManifest {
+    /// Return the topology declaration validated and stored by the loader.
+    pub fn execution_topology(&self) -> Option<SkillExecutionTopology> {
+        match self
+            .metadata
+            .get("execution_topology")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("primary") => Some(SkillExecutionTopology::Primary),
+            Some("parallel_subruns") => Some(SkillExecutionTopology::ParallelSubruns),
+            _ => None,
+        }
+    }
 }
 
 fn default_true() -> bool {

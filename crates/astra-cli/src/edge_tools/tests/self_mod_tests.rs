@@ -1,17 +1,6 @@
-use crate::edge_tools::{SessionStateRollbackJournal, TaskManager, ToolExecutor};
+use crate::edge_tools::ToolExecutor;
 use astra_services::{session_journal::JournalDirGuard, session_workspace};
 use serde_json::{Value, json};
-
-/// Parse a task-tool response into JSON, tolerating the human-readable
-/// summary line that `prefix_summary` prepends to success responses.
-fn parse_task_json(response: &str) -> Value {
-    let body = response
-        .find('{')
-        .map(|pos| &response[pos..])
-        .unwrap_or(response);
-    serde_json::from_str(body)
-        .unwrap_or_else(|e| panic!("task response not JSON: {e}; raw: {response}"))
-}
 
 fn executor_with_session() -> (
     ToolExecutor,
@@ -161,62 +150,6 @@ async fn switching_sessions_clears_session_scoped_self_model_context() {
         after.turn_quality_feedback.is_none(),
         "latest turn quality feedback must not bleed into another session"
     );
-}
-
-#[tokio::test]
-async fn shared_task_manager_and_session_state_journal_survive_across_executors() {
-    let shared_tasks = std::sync::Arc::new(TaskManager::in_memory());
-    let shared_journal =
-        std::sync::Arc::new(std::sync::Mutex::new(SessionStateRollbackJournal::default()));
-
-    let exe_a = ToolExecutor::new(std::env::temp_dir())
-        .with_shared_task_manager(shared_tasks.clone())
-        .with_shared_session_state_journal(shared_journal.clone());
-    let exe_b = ToolExecutor::new(std::env::temp_dir())
-        .with_shared_task_manager(shared_tasks)
-        .with_shared_session_state_journal(shared_journal);
-
-    exe_a
-        .journal_turn_index
-        .store(11, std::sync::atomic::Ordering::Relaxed);
-    exe_b
-        .journal_turn_index
-        .store(11, std::sync::atomic::Ordering::Relaxed);
-
-    let create_out = exe_a
-        .execute(
-            "task_board",
-            &json!({"action": "create", "title": "shared task"}),
-        )
-        .await;
-    let create_json = parse_task_json(&create_out);
-    assert_eq!(create_json["success"], true);
-
-    let listed_via_b = exe_b
-        .execute("task_board", &json!({"action": "list"}))
-        .await;
-    let listed_via_b_json: Value = serde_json::from_str(&listed_via_b).unwrap();
-    assert_eq!(listed_via_b_json["count"], 1);
-
-    let rollback_json: Value = serde_json::from_str(
-        &exe_b
-            .rollback_session_state(&json!({"scope": "turn", "turn_index": 11}))
-            .await,
-    )
-    .unwrap();
-    assert_eq!(rollback_json["success"], true);
-    assert_eq!(
-        rollback_json["restored"]
-            .as_array()
-            .map(|entries| entries.len()),
-        Some(1)
-    );
-
-    let listed_after = exe_a
-        .execute("task_board", &json!({"action": "list"}))
-        .await;
-    let listed_after_json: Value = serde_json::from_str(&listed_after).unwrap();
-    assert_eq!(listed_after_json["count"], 0);
 }
 
 // ─── P4: P3 seams wired into SelfModel snapshot ─────────────────────────────

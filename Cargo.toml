@@ -114,6 +114,7 @@ opentelemetry-otlp = { version = "0.32.0", default-features = false, features = 
 ] }
 tracing-opentelemetry = { version = "0.33.0", default-features = false }
 tracing-appender = { version = "0.2", default-features = false }
+percent-encoding = "2.3"
 http-body-util = "0.1"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }

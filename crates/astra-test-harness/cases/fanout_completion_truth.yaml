@@ -8,8 +8,9 @@ description: |
   **Why**: Individual child events are progress, not group completion. Treating
   one child result, a transient lookup miss, or an empty background-shell list as
   fanout settlement creates fabricated "all completed" answers.
-  **Pass means**: `agent_fanout` ran once as a three-slot work unit, all three
-  child outputs reached the parent, and the parent synthesized the terminal group.
+  **Pass means**: `agent_fanout.start` ran once as a three-slot work unit, all
+  three child outputs reached the parent, and the parent synthesized the terminal
+  group. A structurally distinct `get_results` observation is allowed.
   **Fail means**: The tool was bypassed, evidence was invented or dropped, a slot
   was silently replaced, or the parent claimed completion without 3/3 evidence.
 prompt: |
@@ -41,9 +42,17 @@ criteria:
     name: agent_fanout
     min: 1
     max: 1
+    document: arguments
+    path: /action
+    equals: start
   - type: session_event_count
     event_type: agent_terminated
     min: 3
+  - type: session_event_count
+    event_type: turn_evaluation
+    min: 1
+  - type: journal_turn_evaluation_success
+    equals: true
   - type: journal_tool_json
     name: agent_fanout
     document: arguments
@@ -74,6 +83,26 @@ criteria:
     document: result
     path: /work_unit_observation/status
     equals: completed
+  # Explicit fanout is an admitted coordinator capability.  It must not spend
+  # a model boundary rediscovering its own entrypoint or silently fall back to
+  # generic agent spawning; both paths waste prompt tokens and can change the
+  # completion contract.
+  - type: journal_tool_call_count
+    name: tool_search
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: agent
+    min: 0
+    max: 0
+  # Child slots and their raw results are execution topology, not durable
+  # user deliverables. Starting Work here duplicates lifecycle state around
+  # the canonical fanout group and is a product-contract failure even when
+  # every child result is eventually correct.
+  - type: journal_tool_call_count
+    name: start_work
+    min: 0
+    max: 0
   - type: journal_tool_json
     name: agent_fanout
     document: result
@@ -103,12 +132,16 @@ criteria:
     needle: "FANOUT-EVIDENCE-BETA"
   - type: text_contains
     needle: "FANOUT-EVIDENCE-GAMMA"
-  - type: hard_judger
-    question: |
-      Did the agent use one three-slot fanout, wait for the canonical group to
-      settle, and synthesize exactly the three returned evidence tokens without
-      replacing slots or claiming completion from partial progress? Score 1.0
-      only when the final answer truthfully reports 3/3 and all three tokens;
-      score 0.0 if any token is missing or fabricated, if individual spawns were
-      substituted, or if completion was claimed from a non-terminal group.
-    threshold: 0.9
+  # A fanout run should preserve the stable admitted prefix. Cache ratios can
+  # fluctuate at provider quantization boundaries, so retain these as native
+  # quality diagnostics instead of allowing them to erase functional 3/3
+  # settlement evidence.
+  - type: pipeline_alert_count
+    rule: prompt_cache_break
+    max: 0
+  - type: provider_prompt_cache_read_ratio
+    min: 0.95
+    # This journey is one user turn. Excluding its only provider boundary
+    # would make the cache assertion vacuous; measure the actual fanout
+    # request instead.
+    warmup_turns: 0

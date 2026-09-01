@@ -8,20 +8,20 @@
 use chrono::{DateTime, Utc};
 use reqwest::{Client, Method, StatusCode};
 use serde_json::{Value, json};
-use std::sync::Mutex;
+use std::{fmt, sync::Mutex};
 use url::Url;
 
 fn enforce_github_api_url(url: &str) -> Result<(), String> {
-    let parsed = Url::parse(url).map_err(|e| format!("Error: invalid GitHub URL: {e}"))?;
+    let parsed = Url::parse(url).map_err(|e| format!("invalid GitHub URL: {e}"))?;
     if parsed.scheme() != "https" {
-        return Err("Error: GitHub API requests must use HTTPS".to_string());
+        return Err("GitHub API requests must use HTTPS".to_string());
     }
     match parsed.host_str() {
         Some("api.github.com") => Ok(()),
         Some(h) => Err(format!(
-            "Error: GitHub requests are restricted to https://api.github.com (got host {h:?})"
+            "GitHub requests are restricted to https://api.github.com (got host {h:?})"
         )),
-        None => Err("Error: GitHub URL must include host api.github.com".to_string()),
+        None => Err("GitHub URL must include host api.github.com".to_string()),
     }
 }
 
@@ -35,6 +35,37 @@ pub struct GitHubClient {
     client: Client,
     tokens: Mutex<Vec<String>>,
     preferred_repos: Mutex<Vec<String>>,
+}
+
+#[derive(Debug)]
+enum GitHubRequestFailure {
+    Transport(String),
+    Protocol(String),
+    Http { status: StatusCode, message: String },
+}
+
+impl GitHubRequestFailure {
+    fn allows_token_rotation(&self) -> bool {
+        matches!(
+            self,
+            Self::Http { status, .. }
+                if matches!(
+                    *status,
+                    StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::NOT_FOUND
+                )
+        )
+    }
+}
+
+impl fmt::Display for GitHubRequestFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport(message) | Self::Protocol(message) => {
+                write!(formatter, "Error: {message}")
+            }
+            Self::Http { message, .. } => formatter.write_str(message),
+        }
+    }
 }
 
 impl GitHubClient {
@@ -166,13 +197,24 @@ impl GitHubClient {
         url: &str,
         payload: Option<&Value>,
     ) -> Result<Value, String> {
-        enforce_github_api_url(url)?;
+        self.github_request_typed(method, url, payload)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn github_request_typed(
+        &self,
+        method: Method,
+        url: &str,
+        payload: Option<&Value>,
+    ) -> Result<Value, GitHubRequestFailure> {
+        enforce_github_api_url(url).map_err(GitHubRequestFailure::Protocol)?;
         let result = self.github_request_once(method.clone(), url, payload).await;
         // On 401/403/404 with a token, try rotating to the next candidate.
         // GitHub returns 404 (not 403) for private repos with bad auth to prevent info leakage.
         // Round-robin rotation is non-destructive, so retrying on real 404 is harmless.
-        if let Err(ref e) = result
-            && (e.contains("HTTP 401") || e.contains("HTTP 403") || e.contains("HTTP 404"))
+        if let Err(ref error) = result
+            && error.allows_token_rotation()
             && self.rotate_token()
         {
             return self.github_request_once(method, url, payload).await;
@@ -185,7 +227,7 @@ impl GitHubClient {
         method: Method,
         url: &str,
         payload: Option<&Value>,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, GitHubRequestFailure> {
         let mut request = self
             .client
             .request(method, url)
@@ -198,30 +240,37 @@ impl GitHubClient {
             request = request.json(payload);
         }
 
-        let response = request
-            .send()
-            .await
-            .map_err(|e| format!("Error: GitHub request failed: {e}"))?;
+        let response = request.send().await.map_err(|error| {
+            GitHubRequestFailure::Transport(format!("GitHub request failed: {error}"))
+        })?;
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| format!("Error: failed reading GitHub response: {e}"))?;
-
-        if body.trim().is_empty() {
-            return Err(format!("Error: empty response from GitHub (HTTP {status})"));
-        }
-
-        let value: Value = serde_json::from_str(&body)
-            .map_err(|e| format!("Error: invalid GitHub response: {e}"))?;
+        let body = response.text().await.map_err(|error| {
+            GitHubRequestFailure::Transport(format!("failed reading GitHub response: {error}"))
+        })?;
 
         if !status.is_success() {
-            return Err(github_api_error_message(
-                status,
-                &value,
-                self.current_token().is_some(),
-            ));
+            let message = serde_json::from_str::<Value>(&body)
+                .map(|value| {
+                    github_api_error_message(status, &value, self.current_token().is_some())
+                })
+                .unwrap_or_else(|error| {
+                    format!(
+                        "Error: GitHub API HTTP {} returned an invalid response: {error}",
+                        status.as_u16()
+                    )
+                });
+            return Err(GitHubRequestFailure::Http { status, message });
         }
+
+        if body.trim().is_empty() {
+            return Err(GitHubRequestFailure::Protocol(format!(
+                "empty response from GitHub (HTTP {status})"
+            )));
+        }
+
+        let value: Value = serde_json::from_str(&body).map_err(|error| {
+            GitHubRequestFailure::Protocol(format!("invalid GitHub response: {error}"))
+        })?;
 
         Ok(value)
     }
@@ -2432,6 +2481,34 @@ mod tests {
         assert_eq!(parsed["action"], "ci_status");
         assert_eq!(parsed["resolved_repo"], "MatrixOrigin/Memoria");
         assert_eq!(parsed["resolved_by_search"], true);
+    }
+
+    #[test]
+    fn token_rotation_depends_on_typed_http_status_not_error_prose() {
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
+            StatusCode::NOT_FOUND,
+        ] {
+            assert!(
+                GitHubRequestFailure::Http {
+                    status,
+                    message: "arbitrary provider prose".into(),
+                }
+                .allows_token_rotation()
+            );
+        }
+        assert!(
+            !GitHubRequestFailure::Http {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                message: "HTTP 401 appears only inside untrusted prose".into(),
+            }
+            .allows_token_rotation()
+        );
+        assert!(
+            !GitHubRequestFailure::Protocol("HTTP 403 in a decoder error".into())
+                .allows_token_rotation()
+        );
     }
 
     // ── Item formatting ──

@@ -7,7 +7,6 @@
 //! 8 tiers ordered by volatility (most stable first). The Plan phase reads
 //! only what it needs; the Bind phase fetches from all tiers Plan selected.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde_json::Value;
@@ -250,7 +249,9 @@ pub struct AgentContext {
     pub delegation_targets: Vec<String>,
 }
 
-/// Session-level context. Set at session start, stable within session.
+/// Session-level context. Most fields are stable within a session; the
+/// deferred-tool block is intentionally turn-scoped because runtime admission
+/// can change the discoverable surface before the next model call.
 #[derive(Debug, Clone, Default)]
 pub struct SessionContext {
     pub session_id: String,
@@ -270,8 +271,9 @@ pub struct SessionContext {
     pub project_context: String,
     pub edge_profile: EdgeProfile,
     pub self_model: Option<String>,
-    /// Pre-rendered `<deferred-tools>` system block. Session-scoped so it
-    /// joins the cached prefix. Empty when no tools are deferred.
+    /// Pre-rendered `<deferred-tools>` system block. The planner emits this
+    /// field after the session cache boundary because its names follow the
+    /// current runtime admission surface. Empty when no tools are deferred.
     pub deferred_tools_block: String,
     /// Pre-rendered `<available_skills>` system block. Session-scoped.
     /// Empty when no skills are loaded.
@@ -305,8 +307,6 @@ pub struct TurnState {
     pub tool_results: Vec<Value>,
     pub tokens: TokenAccounting,
     pub active_skills: Vec<String>,
-    pub recent_file_reads: HashMap<String, u32>,
-    pub remaining_turns: u32,
     pub turn_index: u32,
     pub recovery: RecoveryState,
     /// The user's latest message text (for memory retrieval queries).

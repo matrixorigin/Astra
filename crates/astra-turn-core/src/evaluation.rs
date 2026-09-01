@@ -41,12 +41,11 @@ pub enum EvalSignal {
     /// instead of fresh observational evidence. Carries the count.
     NoOpToolResults(usize),
 
-    /// Multiple read tool calls hit overlapping line ranges of the same file
-    /// without any intervening workspace mutation, suggesting the model
-    /// re-read content it had already loaded into context. Carries the
-    /// number of redundant read events (each read after the first overlap
-    /// in a file's no-mutation window counts once). Calibrated against
-    /// real session data; see `REDUNDANT_OVERLAPPING_READS_THRESHOLD`.
+    /// Multiple read tool calls requested line ranges already fully covered
+    /// by prior successful reads of the same unchanged file. Carries the
+    /// number of redundant read events. Partial overlaps that extend into
+    /// unseen content are not redundant, and an output-bounded unbounded read
+    /// does not claim that the whole file reached the model.
     RedundantOverlappingReads(usize),
     /// Many search-like tool calls (grep/rg/find) were issued in one turn,
     /// suggesting the model fanned out exploratory search instead of
@@ -62,9 +61,10 @@ pub enum EvalSignal {
     /// indicates tool churn or repeated replanning. Carries the round count and
     /// total prompt tokens consumed by the turn.
     LlmRoundChurn { rounds: u32, prompt_tokens: u64 },
-    /// Prompt tokens ballooned substantially across LLM rounds in one turn.
-    /// Carries the first observed prompt size, the peak prompt size, and the
-    /// delta between them.
+    /// Logical prompt/input size ballooned substantially across LLM rounds in
+    /// one turn. Each observed size includes fresh, cache-read, and cache-
+    /// creation lanes, so a cache miss alone cannot masquerade as context
+    /// growth. Carries the first observed size, the peak size, and the delta.
     PromptGrowthChurn {
         first_prompt_tokens: u64,
         max_prompt_tokens: u64,
@@ -119,9 +119,9 @@ pub const SEARCH_FANOUT_THRESHOLD: usize = 8;
 /// was an intervening mutation or configuration change.
 pub const REDUNDANT_VALIDATION_RETRIES_THRESHOLD: usize = 2;
 
-/// Default threshold for [`EvalSignal::LlmRoundChurn`]: user turns that need
-/// 8+ LLM rounds are usually in trouble unless they are doing something very
-/// deliberate.
+/// Default threshold for [`EvalSignal::LlmRoundChurn`]. Round count is a cost
+/// fact, not a failure fact: the signal is emitted only when an independent
+/// typed low-yield observation also proves that a long turn is not progressing.
 pub const LLM_ROUND_CHURN_THRESHOLD: usize = 8;
 pub const EXPLORATION_FAMILY_CHURN_THRESHOLD: usize = 3;
 pub const ONLINE_PROGRESS_MIN_TOOL_CALLS_BEFORE_NUDGE: usize = 2;
@@ -278,12 +278,12 @@ pub fn turn_evaluation_status_notice(eval: &TurnEvaluation) -> Option<String> {
     ))
 }
 
-/// Whether the turn ended with unresolved execution evidence.
+/// Whether the turn contains unresolved execution evidence for diagnostics.
 ///
 /// This is narrower than `!eval.success`: conversational turns and low-quality
-/// answers may score unsuccessfully without having an execution failure. Child
-/// run lifecycle projection uses this predicate so a model-produced explanation
-/// after failed tools is not mislabeled as successful task completion.
+/// answers may score unsuccessfully without having an execution failure. This
+/// is an outcome-quality signal, not lifecycle authority: callers must never
+/// rewrite an explicitly completed/cancelled/failed run from this heuristic.
 pub fn turn_evaluation_has_unresolved_execution_failure(eval: &TurnEvaluation) -> bool {
     let has_nested_incomplete_run = eval.signals.iter().any(|signal| {
         matches!(
@@ -308,12 +308,14 @@ pub fn turn_evaluation_has_unresolved_execution_failure(eval: &TurnEvaluation) -
     }
 
     // A minority failure in an otherwise productive turn remains visible as
-    // evaluation evidence, but must not poison the child lifecycle. Fanout
-    // review agents commonly use optional probes; one unavailable probe among
-    // dozens of successful reads does not make the review itself incomplete.
-    // Majority failure still means the delegated task lacks reliable execution
-    // evidence. Evaluations without a rate are treated conservatively because
-    // hand-built/external evaluations cannot prove successful recovery.
+    // evaluation evidence without classifying the overall execution evidence
+    // as unresolved. Review agents commonly use optional probes; one
+    // unavailable probe among many successful reads does not erase the useful
+    // evidence they returned.
+    // A majority failure or even split means diagnostic evidence remains
+    // unresolved. Evaluations without a rate are treated conservatively because
+    // hand-built/external evaluations cannot prove successful recovery. This
+    // threshold affects outcome diagnostics only, never run lifecycle.
     if let Some(is_majority) = eval.signals.iter().find_map(|signal| match signal {
         EvalSignal::ToolOutcomeFailureCoverage {
             unresolved,
@@ -564,8 +566,7 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
             // when present to keep the key bounded; fall back to the preview
             // for legacy records, then to the bare tool name.
             repeat_key: record
-                .args_full
-                .as_deref()
+                .authoritative_args_full()
                 .map(str::trim)
                 .filter(|full| !full.is_empty())
                 .map(|full| {
@@ -655,21 +656,6 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
         eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
     }
 
-    if let Some(rounds) = telemetry
-        .llm_rounds
-        .filter(|rounds| *rounds as usize >= thresholds.llm_round_churn)
-    {
-        let prompt_tokens = telemetry.prompt_tokens.unwrap_or(0);
-        eval.signals.push(EvalSignal::LlmRoundChurn {
-            rounds,
-            prompt_tokens,
-        });
-        let penalty =
-            (0.10 + 0.02 * (rounds as usize - thresholds.llm_round_churn) as f64).clamp(0.10, 0.25);
-        eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
-        eval.confidence = (eval.confidence + 0.05).clamp(0.0, 1.0);
-    }
-
     if let (Some(rounds), Some(first_prompt_tokens), Some(max_round_prompt_tokens)) = (
         telemetry.llm_rounds,
         telemetry.first_round_prompt_tokens,
@@ -703,6 +689,27 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
         let penalty =
             (0.04 + 0.01 * (streak - thresholds.exploration_family_churn) as f64).clamp(0.04, 0.16);
         eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
+    }
+
+    // Astra deliberately supports long, iterative work. A high round count
+    // must never become a quality verdict by itself; require an independent,
+    // typed low-yield fact such as repeated reads/validation or an exploration
+    // streak. This mirrors RuntimePolicy's online rule and avoids teaching the
+    // agent to stop merely because useful work takes time.
+    if eval.signals.iter().any(is_strong_low_yield_signal)
+        && let Some(rounds) = telemetry
+            .llm_rounds
+            .filter(|rounds| *rounds as usize >= thresholds.llm_round_churn)
+    {
+        let prompt_tokens = telemetry.prompt_tokens.unwrap_or(0);
+        eval.signals.push(EvalSignal::LlmRoundChurn {
+            rounds,
+            prompt_tokens,
+        });
+        let penalty =
+            (0.10 + 0.02 * (rounds as usize - thresholds.llm_round_churn) as f64).clamp(0.10, 0.25);
+        eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
+        eval.confidence = (eval.confidence + 0.05).clamp(0.0, 1.0);
     }
 
     revoke_all_tools_healthy_when_quality_signals_disagree(&mut eval, &tool_calls);
@@ -894,6 +901,39 @@ fn result_class_resolves_outcome_failure(class: &str) -> bool {
     matches!(class, "success" | "domain_negative")
 }
 
+/// Whether a non-zero process result is explicitly a domain outcome rather
+/// than an execution failure. `ToolCallRecord::ok` is intentionally not the
+/// sole source of truth: grep no-match, diff differences, and truncated
+/// pipelines can be valid observations with a non-zero exit status. An
+/// explicit typed failure class still wins over the process-level semantic.
+fn record_is_non_failure_outcome(record: &ToolCallRecord) -> bool {
+    if let Some(class) = effective_tool_result_class(record) {
+        if result_class_is_outcome_failure(&class) {
+            return false;
+        }
+        if result_class_resolves_outcome_failure(&class) {
+            return true;
+        }
+    }
+    if record.ok {
+        return false;
+    }
+    matches!(
+        record.exit_semantics.as_deref().and_then(|tag| {
+            serde_json::from_value::<astra_tools::exit_semantics::ExitSemantics>(
+                serde_json::Value::String(tag.to_string()),
+            )
+            .ok()
+        }),
+        Some(
+            astra_tools::exit_semantics::ExitSemantics::Success
+                | astra_tools::exit_semantics::ExitSemantics::EmptyResult
+                | astra_tools::exit_semantics::ExitSemantics::DomainNegative
+                | astra_tools::exit_semantics::ExitSemantics::PipelineTruncated
+        )
+    )
+}
+
 fn hash_bounded_key(value: &str) -> String {
     use std::hash::{Hash, Hasher};
 
@@ -908,21 +948,45 @@ fn outcome_resolution_key(record: &ToolCallRecord) -> Option<String> {
         return None;
     }
 
-    let args = record.args_full.as_deref().unwrap_or("").trim();
-    if let Some(prefix) = normalize_validation_prefix(&record.name, args) {
-        return Some(format!("validation::{prefix}"));
+    operation_identity_key(record)
+}
+
+fn fallback_tool_outcome_identity(record: &ToolCallRecord) -> Option<String> {
+    operation_identity_key(record)
+}
+
+/// Stable identity of the governed operation, independent of result class,
+/// disposition, provider attempt id, or JSON object key order. Outcome
+/// classifiers are ledger values; they must never change the operation key
+/// used to correlate a failure with a later retry.
+fn operation_identity_key(record: &ToolCallRecord) -> Option<String> {
+    let args = record.authoritative_args_full().unwrap_or("").trim();
+    if !args.is_empty() {
+        if let Some(prefix) = normalize_validation_prefix(&record.name, args) {
+            return Some(format!("validation::{prefix}"));
+        }
+        return Some(format!(
+            "tool::{}::args::{}",
+            record.name,
+            hash_bounded_key(&crate::stall::canonical_tool_args(args))
+        ));
     }
 
-    let args_key = if !args.is_empty() {
-        args
-    } else {
-        record.args_preview.as_deref().unwrap_or("").trim()
-    };
-    Some(format!(
-        "tool::{}::{}",
-        record.name,
-        hash_bounded_key(args_key)
-    ))
+    let preview = record.args_preview.as_deref().unwrap_or("").trim();
+    if !preview.is_empty() {
+        return Some(format!(
+            "tool::{}::preview::{}",
+            record.name,
+            hash_bounded_key(&crate::stall::canonical_tool_args(preview))
+        ));
+    }
+
+    record
+        .tool_call_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(|id| format!("tool::{}::call::{}", record.name, hash_bounded_key(id)))
 }
 
 fn unresolved_tool_outcome_failure_counts(
@@ -930,13 +994,68 @@ fn unresolved_tool_outcome_failure_counts(
 ) -> std::collections::BTreeMap<String, usize> {
     let mut unresolved_by_key = std::collections::BTreeMap::<String, String>::new();
 
-    for record in records {
+    for (record_index, record) in records.iter().enumerate() {
+        let disposition = record.effective_disposition();
         if !matches!(
-            record.effective_disposition(),
+            disposition,
             astra_services::session_journal::ToolCallDisposition::Executed
                 | astra_services::session_journal::ToolCallDisposition::Rejected
         ) {
             continue;
+        }
+
+        // A rejected domain carrier never began that domain execution. Its
+        // rendered payload can still look like `agent_incomplete`; do not
+        // charge the request once as blocked and again as unfinished work.
+        // Preserve the one rejected class that is itself execution evidence:
+        // `execution_error` means route/launch setup was attempted and failed
+        // before the executor could report an Executed disposition.
+        if disposition == astra_services::session_journal::ToolCallDisposition::Rejected
+            && effective_tool_result_class(record).as_deref() != Some("execution_error")
+        {
+            continue;
+        }
+
+        // A governed execution may fail before it can attach a structured
+        // result class (for example a process launch, transport, or sandbox
+        // failure). `ok=false` is already the typed terminal fact at this
+        // boundary; do not silently lose it just because the optional
+        // classifier was unavailable. Rejected requests remain a separate
+        // signal and must not be double-counted as unresolved execution.
+        if disposition == astra_services::session_journal::ToolCallDisposition::Executed
+            && !record.ok
+            && !record_is_non_failure_outcome(record)
+        {
+            let key = outcome_resolution_key(record).unwrap_or_else(|| {
+                fallback_tool_outcome_identity(record).unwrap_or_else(|| {
+                    // Without structured class, arguments, preview, or a
+                    // provider call id, there is no safe success-to-failure
+                    // identity. Keep the failure visible under a unique
+                    // opaque key instead of allowing another same-named call
+                    // to erase it.
+                    format!("tool::{}::opaque::{record_index}", record.name)
+                })
+            });
+            let class =
+                effective_tool_result_class(record).unwrap_or_else(|| "tool_failure".to_string());
+            unresolved_by_key.insert(key, class);
+            continue;
+        }
+
+        // A successful unclassified execution resolves an earlier fallback
+        // failure for the same governed operation. Typed classes below still
+        // provide the more precise resolution path when available.
+        if record.ok {
+            if let Some(key) = fallback_tool_outcome_identity(record) {
+                unresolved_by_key.remove(&key);
+            }
+            // A successful exact operation resolves a typed failure even when
+            // the success record omits an optional result class. This keeps
+            // the recovery contract based on the canonical operation identity
+            // rather than requiring every executor path to repeat metadata.
+            if let Some(key) = untyped_operation_key(record) {
+                unresolved_by_key.remove(&key);
+            }
         }
         let Some(class) = effective_tool_result_class(record) else {
             continue;
@@ -957,6 +1076,140 @@ fn unresolved_tool_outcome_failure_counts(
         *counts.entry(class.clone()).or_insert(0) += 1;
     }
     counts
+}
+
+/// Return the canonical operation identity used by the terminal outcome
+/// ledger for a record.  Runtime policy and terminal evaluation must share
+/// this exact identity; callers should not derive a second key from tool names
+/// or ad-hoc argument fields.
+pub fn tool_outcome_operation_key(record: &ToolCallRecord) -> Option<String> {
+    outcome_resolution_key(record).or_else(|| {
+        if record.ok {
+            untyped_operation_key(record)
+        } else {
+            fallback_tool_outcome_identity(record)
+        }
+    })
+}
+
+/// All canonical identities a successful execution may use to resolve an
+/// earlier failure. The list is intentionally produced by the same core
+/// ledger, including typed, untyped-argument, and fallback identities.
+pub fn tool_outcome_recovery_keys(record: &ToolCallRecord) -> Vec<String> {
+    let mut keys = Vec::with_capacity(3);
+    for key in [
+        tool_outcome_operation_key(record),
+        fallback_tool_outcome_identity(record),
+        untyped_operation_key(record),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
+/// Return currently active failed execution obligations using the same ledger
+/// semantics as [`count_unresolved_tool_outcome_failures`]. Records without a
+/// stable identity remain countable by terminal evaluation, but are omitted
+/// from this set because a later success cannot safely prove that it resolved
+/// that opaque failure.
+pub fn active_execution_failure_operation_keys(
+    records: &[ToolCallRecord],
+) -> std::collections::BTreeSet<String> {
+    let mut unresolved = std::collections::BTreeMap::<String, String>::new();
+
+    for record in records {
+        if record.effective_disposition()
+            != astra_services::session_journal::ToolCallDisposition::Executed
+        {
+            continue;
+        }
+        if !record.ok && !record_is_non_failure_outcome(record) {
+            if let Some(key) = tool_outcome_operation_key(record) {
+                let class = effective_tool_result_class(record)
+                    .unwrap_or_else(|| "tool_failure".to_string());
+                unresolved.insert(key, class);
+            }
+            continue;
+        }
+        if let Some(key) = fallback_tool_outcome_identity(record) {
+            unresolved.remove(&key);
+        }
+        if let Some(key) = untyped_operation_key(record) {
+            unresolved.remove(&key);
+        }
+        if let Some(key) = outcome_resolution_key(record)
+            && result_class_resolves_outcome_failure(
+                effective_tool_result_class(record)
+                    .as_deref()
+                    .unwrap_or_default(),
+            )
+        {
+            unresolved.remove(&key);
+        }
+    }
+
+    unresolved.into_keys().collect()
+}
+
+fn untyped_operation_key(record: &ToolCallRecord) -> Option<String> {
+    operation_identity_key(record)
+}
+
+/// Return currently active rejected-operation obligations using the same
+/// exact-argument resolution key as terminal evaluation.
+pub fn active_rejected_operation_keys(
+    records: &[ToolCallRecord],
+) -> std::collections::BTreeSet<String> {
+    let mut unresolved = std::collections::BTreeSet::new();
+    for (record_index, record) in records.iter().enumerate() {
+        let key = rejected_operation_key(record)
+            .unwrap_or_else(|| blocked_resolution_key(record, record_index));
+        if record_is_rejected_attempt(record) {
+            unresolved.insert(key);
+        } else if record_was_executed(record) && record.ok {
+            unresolved.remove(&key);
+        }
+    }
+    unresolved
+}
+
+/// Stable identity for a rejected request when its arguments or provider call
+/// id make a later exact execution matchable. Opaque rejected requests remain
+/// terminal evidence but cannot be safely used for cause-level persistence.
+pub fn rejected_operation_key(record: &ToolCallRecord) -> Option<String> {
+    operation_identity_key(record)
+}
+
+/// Number of currently unresolved, typed tool outcomes.
+///
+/// This is the online-safe projection of the same failure ledger used by
+/// terminal turn evaluation. A later authoritative success/domain-negative
+/// result for the same operation removes the earlier failure, so runtime
+/// feedback does not keep advising about a problem the agent already fixed.
+pub fn count_unresolved_tool_outcome_failures(records: &[ToolCallRecord]) -> usize {
+    unresolved_tool_outcome_failure_counts(records)
+        .values()
+        .copied()
+        .sum()
+}
+
+/// Whether an executed operation carries affirmative typed success evidence.
+///
+/// `ToolCallRecord::ok` only proves that the tool transport/executor completed;
+/// domain outcomes such as an empty search, a false predicate, or an
+/// inconclusive pipeline are not positive validation receipts.  Callers that
+/// authorize delivery must require this stronger fact instead of inferring
+/// success from the absence of an unresolved failure.
+pub fn tool_outcome_is_positive_success(record: &ToolCallRecord) -> bool {
+    record.effective_disposition() == astra_services::session_journal::ToolCallDisposition::Executed
+        && record.ok
+        && effective_tool_result_class(record).as_deref() == Some("success")
+        && record.exit_semantics.as_deref() == Some("success")
 }
 
 fn effective_tool_result_class(record: &ToolCallRecord) -> Option<String> {
@@ -994,10 +1247,7 @@ fn parse_structured_tool_result(record: &ToolCallRecord) -> Option<Value> {
 }
 
 fn apply_blocked_tool_failures(eval: &mut TurnEvaluation, records: &[ToolCallRecord]) {
-    let blocked = records
-        .iter()
-        .filter(|record| !record.is_synthetic_placeholder() && record.was_blocked_by_policy())
-        .count();
+    let blocked = unresolved_blocked_attempt_count(records);
     if blocked == 0 {
         return;
     }
@@ -1010,14 +1260,56 @@ fn apply_blocked_tool_failures(eval: &mut TurnEvaluation, records: &[ToolCallRec
     eval.quality = (eval.quality - penalty).clamp(0.0, 1.0);
     eval.confidence = (eval.confidence + 0.15).clamp(0.0, 1.0);
 
-    let real_call_count = records
-        .iter()
-        .filter(|record| record_was_executed(record) || record.was_blocked_by_policy())
-        .count()
-        .max(1);
-    if blocked == real_call_count || blocked.saturating_mul(2) >= real_call_count {
-        eval.success = false;
+    // A blocked invocation is an unresolved execution obligation. Successful
+    // observations elsewhere can improve quality, but cannot make the
+    // operational boundary itself successful. A later authoritative recovery
+    // should replace/resolve the blocked record before terminal evaluation.
+    eval.success = false;
+}
+
+fn blocked_resolution_key(record: &ToolCallRecord, record_index: usize) -> String {
+    rejected_operation_key(record)
+        .map(|key| key.to_string())
+        .unwrap_or_else(|| format!("tool::{}::opaque::{record_index}", record.name))
+}
+
+/// Count rejected invocations that have not been resolved by a successful
+/// execution of the same tool and arguments later in the ledger.
+pub fn unresolved_blocked_attempt_count(records: &[ToolCallRecord]) -> usize {
+    let mut unresolved = std::collections::BTreeMap::<String, usize>::new();
+    for (record_index, record) in records.iter().enumerate() {
+        let key = blocked_resolution_key(record, record_index);
+        if record_is_rejected_attempt(record) {
+            *unresolved.entry(key).or_insert(0) += 1;
+        } else if record_was_executed(record) && record.ok {
+            unresolved.remove(&key);
+        }
     }
+    unresolved.values().sum()
+}
+
+/// Count the consecutive rejected invocations at the end of the execution
+/// ledger. A later executed call is evidence that the model continued through
+/// a recovery path, even when the corrected call necessarily used different
+/// arguments or a different tool. Terminal prose directly after a rejection
+/// has no such boundary and needs one bounded recovery opportunity.
+pub fn terminal_rejected_attempt_count(records: &[ToolCallRecord]) -> usize {
+    records
+        .iter()
+        .rev()
+        .take_while(|record| record_is_rejected_attempt(record))
+        .count()
+}
+
+/// A rejected request is a user-visible failed attempt even though it never
+/// reached an executor.  Keep it out of execution health/error-rate math, but
+/// include it in the turn boundary so policy/admission failures cannot make a
+/// turn look successful merely because the executor saw zero calls.
+fn record_is_rejected_attempt(record: &ToolCallRecord) -> bool {
+    !record.is_synthetic_placeholder()
+        && (record.effective_disposition()
+            == astra_services::session_journal::ToolCallDisposition::Rejected
+            || record.was_blocked_by_policy())
 }
 
 fn apply_unresolved_tool_outcome_failures(eval: &mut TurnEvaluation, records: &[ToolCallRecord]) {
@@ -1035,7 +1327,7 @@ fn apply_unresolved_tool_outcome_failures(eval: &mut TurnEvaluation, records: &[
     }
     let observed = records
         .iter()
-        .filter(|record| record_was_executed(record) || record.was_blocked_by_policy())
+        .filter(|record| record_was_executed(record) || record_is_rejected_attempt(record))
         .count();
     eval.signals.push(EvalSignal::ToolOutcomeFailureCoverage {
         unresolved: total,
@@ -1066,7 +1358,7 @@ impl ExplorationFamily {
 }
 
 fn classify_exploration_family(record: &ToolCallRecord) -> Option<ExplorationFamily> {
-    let args = record.args_full.as_deref().unwrap_or("");
+    let args = record.authoritative_args_full().unwrap_or("");
     match record.name.as_str() {
         name if is_diff_like_tool_call(name, args) => Some(ExplorationFamily::Diff),
         "read_file" => Some(ExplorationFamily::Read),
@@ -1219,18 +1511,398 @@ pub fn count_search_fanout(records: &[ToolCallRecord]) -> usize {
     records
         .iter()
         .filter(|rec| record_was_executed(rec))
-        .filter(|rec| is_search_like_tool_call(&rec.name, rec.args_full.as_deref().unwrap_or("")))
+        .filter(|rec| {
+            is_search_like_tool_call(&rec.name, rec.authoritative_args_full().unwrap_or(""))
+        })
         .count()
 }
 
-fn split_shell_control_segments(command: &str) -> impl Iterator<Item = &str> {
-    command
-        .split("&&")
-        .flat_map(|s| s.split("||"))
-        .flat_map(|s| s.split(';'))
+const MAX_SHELL_LEX_BYTES: usize = 32 * 1024;
+const MAX_NESTED_SHELL_SCAN_BYTES: usize = 16 * 1024;
+const MAX_NESTED_SHELL_DEPTH: usize = 16;
+
+/// Top-level shell control-flow operator retained for evidence consumers.
+/// This is metadata only; it never authorizes or blocks command execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellControlOp {
+    And,
+    Or,
+    Sequence,
+    Neutral,
 }
 
-fn normalize_validation_prefix(name: &str, args: &str) -> Option<String> {
+/// Split a shell command at validated top-level sequencing operators.  The
+/// lexer is shared by evidence consumers so they do not each invent a partial
+/// quote/substitution parser.  Unsupported or malformed shell syntax returns
+/// `None`; callers must then keep the command executable but decline to infer
+/// a completion receipt.
+pub fn split_shell_control_segments(command: &str) -> Option<Vec<&str>> {
+    split_shell_segments(command, true, false)
+}
+
+/// Split a command while retaining the operator which followed each segment.
+/// The ordinary public splitter intentionally exposes only segment text for
+/// callers that need a best-effort read/mutation classification.  Completion
+/// receipts additionally need the control-flow fact: a validator followed by
+/// `;` or `||` is not a proof that the overall command succeeded, whereas a
+/// validator followed by `&&` remains on the successful path.  Comments are
+/// neutral; a newline after a comment is represented by the following empty
+/// segment and therefore still applies its sequence semantics.
+pub fn split_shell_control_segments_with_ops(command: &str) -> Option<Vec<(&str, ShellControlOp)>> {
+    let delimiters = top_level_shell_delimiters(command, true, false)?;
+    if delimiters.is_empty() {
+        return Some(vec![(command, ShellControlOp::Neutral)]);
+    }
+    let bytes = command.as_bytes();
+    let mut segments = Vec::with_capacity(delimiters.len() + 1);
+    let mut start = 0usize;
+    for (index, width) in delimiters {
+        let op = match bytes.get(index..index + width) {
+            Some(b"&&") => ShellControlOp::And,
+            Some(b"||") => ShellControlOp::Or,
+            Some(b";") | Some(b"\n") | Some(b"\r\n") => ShellControlOp::Sequence,
+            // A comment delimiter consumes its text up to (but not including)
+            // a following newline. It does not itself change command status.
+            _ => ShellControlOp::Neutral,
+        };
+        segments.push((&command[start..index], op));
+        start = index + width;
+    }
+    segments.push((&command[start..], ShellControlOp::Neutral));
+    Some(segments)
+}
+
+/// Parse one already-segmented shell command into literal words.  This is a
+/// deliberately static lexer, not a shell interpreter: it preserves quoted
+/// whitespace, rejects expansion/operators/escapes, and returns `None` for
+/// anything whose destination cannot be known without executing a shell.
+pub fn split_static_shell_words(segment: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut token_started = false;
+    let chars = segment.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+    while index < chars.len() {
+        let ch = chars[index];
+        if let Some(active_quote) = quote {
+            if ch == active_quote {
+                quote = None;
+            } else {
+                if active_quote == '"' && matches!(ch, '$' | '`' | '\\') {
+                    return None;
+                }
+                current.push(ch);
+            }
+            token_started = true;
+            index += 1;
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                token_started = true;
+            }
+            ch if ch.is_whitespace() => {
+                if token_started {
+                    words.push(std::mem::take(&mut current));
+                    token_started = false;
+                }
+            }
+            '>' => {
+                if token_started {
+                    words.push(std::mem::take(&mut current));
+                    token_started = false;
+                }
+                if chars.get(index + 1) == Some(&'>') {
+                    words.push(">>".to_string());
+                    index += 1;
+                } else {
+                    words.push(">".to_string());
+                }
+            }
+            '$' | '`' | '~' | '*' | '?' | '[' | ']' | '\\' | ';' | '|' | '&' | '<' | '(' | ')'
+            | '\n' | '\r' => return None,
+            _ => {
+                current.push(ch);
+                token_started = true;
+            }
+        }
+        index += 1;
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if token_started {
+        words.push(current);
+    }
+    Some(words)
+}
+
+fn split_top_level_pipeline_segments(command: &str) -> Option<Vec<&str>> {
+    split_shell_segments(command, false, true)
+}
+
+/// Split a shell command at top-level pipelines using the same quote,
+/// substitution, and malformed-input rules as the evidence evaluator.
+/// Consumers may use this for scope/receipt analysis, but it never authorizes
+/// execution and returns `None` for syntax it cannot prove.
+pub fn split_shell_pipeline_segments(command: &str) -> Option<Vec<&str>> {
+    split_top_level_pipeline_segments(command)
+}
+
+fn split_shell_segments(
+    command: &str,
+    include_control: bool,
+    include_pipeline: bool,
+) -> Option<Vec<&str>> {
+    let delimiters = top_level_shell_delimiters(command, include_control, include_pipeline)?;
+    if delimiters.is_empty() {
+        return Some(vec![command]);
+    }
+    let mut segments = Vec::with_capacity(delimiters.len() + 1);
+    let mut start = 0;
+    for (index, width) in delimiters {
+        segments.push(&command[start..index]);
+        start = index + width;
+    }
+    segments.push(&command[start..]);
+    Some(segments)
+}
+
+/// Find the closing parenthesis for a `$()` beginning at `open_index` and
+/// return `(exclusive_end, body_end)`. This is a lexical matcher only; it
+/// rejects unsupported backticks, here-docs, malformed quotes, and excessive
+/// nesting rather than guessing at shell semantics.
+fn command_substitution_end(command: &str, open_index: usize) -> Option<(usize, usize)> {
+    let bytes = command.as_bytes();
+    if open_index + 1 >= bytes.len() || bytes[open_index] != b'$' || bytes[open_index + 1] != b'(' {
+        return None;
+    }
+    let mut depth = 1usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut index = open_index + 2;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if byte == b'\\' {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if byte == b'`' {
+            return None;
+        }
+        if let Some(active_quote) = quote {
+            if active_quote == b'\'' {
+                if byte == active_quote {
+                    quote = None;
+                }
+                index += 1;
+                continue;
+            }
+            if byte == b'"' {
+                quote = None;
+                index += 1;
+                continue;
+            }
+            if byte == b'$' && bytes.get(index + 1) == Some(&b'(') {
+                depth += 1;
+                if depth > MAX_NESTED_SHELL_DEPTH {
+                    return None;
+                }
+                index += 2;
+                continue;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'#' && shell_comment_starts(bytes, index) {
+            index = shell_comment_end(bytes, index);
+            continue;
+        }
+        if byte == b'\'' || byte == b'"' {
+            quote = Some(byte);
+            index += 1;
+            continue;
+        }
+        if byte == b'`' || bytes.get(index..index + 2) == Some(b"<<") {
+            return None;
+        }
+        if byte == b'$' && bytes.get(index + 1) == Some(&b'(') {
+            depth += 1;
+            if depth > MAX_NESTED_SHELL_DEPTH {
+                return None;
+            }
+            index += 2;
+            continue;
+        }
+        match byte {
+            b'(' => {
+                depth += 1;
+                if depth > MAX_NESTED_SHELL_DEPTH {
+                    return None;
+                }
+            }
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some((index + 1, index));
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Lightweight shell lexer used only for evidence segmentation.  It tracks
+/// quotes, escapes, and parenthesis depth so control operators inside `$()`
+/// are never mistaken for outer sequencing.  It intentionally does not
+/// execute or fully parse shell grammar; malformed/oversized input returns
+/// `None` so callers fail closed rather than treating the whole input as one
+/// apparently safe segment.
+fn top_level_shell_delimiters(
+    command: &str,
+    include_control: bool,
+    include_pipeline: bool,
+) -> Option<Vec<(usize, usize)>> {
+    if command.len() > MAX_SHELL_LEX_BYTES {
+        return None;
+    }
+    let bytes = command.as_bytes();
+    let mut delimiters = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if byte == b'\\' {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if active_quote == b'\'' {
+                if byte == active_quote {
+                    quote = None;
+                }
+                index += 1;
+                continue;
+            }
+            if byte == b'$' && bytes.get(index + 1) == Some(&b'(') {
+                index = command_substitution_end(command, index)?.0;
+                continue;
+            }
+            if byte == active_quote {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'#' && shell_comment_starts(bytes, index) {
+            // Preserve the comment as a lexical separator so the caller
+            // cannot let an unknown comment prefix erase a receipt. The
+            // newline, if any, is processed on the next iteration.
+            let end = shell_comment_end(bytes, index);
+            delimiters.push((index, end - index));
+            index = end;
+            continue;
+        }
+        if byte == b'\'' || byte == b'"' {
+            quote = Some(byte);
+            index += 1;
+            continue;
+        }
+        if byte == b'`' || bytes.get(index..index + 2) == Some(b"<<") {
+            return None;
+        }
+        if byte == b'$' && bytes.get(index + 1) == Some(&b'(') {
+            index = command_substitution_end(command, index)?.0;
+            continue;
+        }
+        if byte == b'(' || byte == b')' {
+            // Shell grouping/arithmetic is intentionally outside this
+            // evidence lexer. Unknown syntax must not be treated as a safe
+            // separator; callers fail closed instead.
+            return None;
+        }
+        if include_control && bytes.get(index..index + 2) == Some(b"&&") {
+            delimiters.push((index, 2));
+            index += 2;
+            continue;
+        }
+        if include_control && bytes.get(index..index + 2) == Some(b"||") {
+            delimiters.push((index, 2));
+            index += 2;
+            continue;
+        }
+        if include_control && byte == b';' {
+            delimiters.push((index, 1));
+            index += 1;
+            continue;
+        }
+        if include_control && byte == b'\n' {
+            delimiters.push((index, 1));
+            index += 1;
+            continue;
+        }
+        if include_control && byte == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+            delimiters.push((index, 2));
+            index += 2;
+            continue;
+        }
+        if include_pipeline && byte == b'|' {
+            delimiters.push((index, 1));
+            index += 1;
+            continue;
+        }
+        if byte == b'&' {
+            // Preserve the two benign file-descriptor redirects used by
+            // ordinary compiler/test commands. They are not sequencing or
+            // background operators and are normalized by the caller.
+            if index >= 2
+                && bytes[index - 1] == b'>'
+                && matches!(
+                    (bytes[index - 2], bytes.get(index + 1).copied()),
+                    (b'2', Some(b'1')) | (b'1', Some(b'2'))
+                )
+            {
+                index += 2;
+                continue;
+            }
+            // `&&` was consumed above; a standalone background operator is
+            // not modeled and therefore cannot yield positive evidence.
+            return None;
+        }
+        index += 1;
+    }
+    if quote.is_some() || escaped {
+        return None;
+    }
+    Some(delimiters)
+}
+
+/// Return the canonical operation prefix for a known build/test validation
+/// command.  This is intentionally a positive, narrow predicate: unlike the
+/// permission classifier (which must fail closed for unknown shell syntax), it
+/// only reports validation evidence when the command family is recognized.
+///
+/// The normalized prefix is shared by evaluation and completion settlement so
+/// a successful `python3 -m pytest`/`cargo test` receipt cannot be mistaken for
+/// an opaque, potentially mutating shell call.
+pub fn normalize_validation_prefix(name: &str, args: &str) -> Option<String> {
     if name != "bash" {
         return None;
     }
@@ -1239,44 +1911,571 @@ fn normalize_validation_prefix(name: &str, args: &str) -> Option<String> {
     if command.is_empty() {
         return None;
     }
-    for seg in split_shell_control_segments(command) {
-        let seg = seg.trim();
-        if seg.is_empty() {
-            continue;
-        }
-        let seg = seg.split('|').next().unwrap_or(seg).trim();
-        let seg = seg.strip_suffix("2>&1").unwrap_or(seg).trim();
-        let seg = seg.strip_suffix("1>&2").unwrap_or(seg).trim();
-        let normalized = seg.split_whitespace().collect::<Vec<_>>().join(" ");
-        let lower = normalized.to_ascii_lowercase();
-        if lower.starts_with("cargo check ")
-            || lower == "cargo check"
-            || lower.starts_with("cargo test ")
-            || lower == "cargo test"
-            || lower.starts_with("cargo build ")
-            || lower == "cargo build"
-            || lower.starts_with("npx tsc --noemit")
-            || lower == "tsc --noemit"
-            || lower.starts_with("tsc --noemit ")
-            || lower == "pytest"
-            || lower.starts_with("pytest ")
-            || lower == "npm test"
-            || lower.starts_with("npm test ")
-            || lower == "npm run build"
-            || lower.starts_with("npm run build ")
-            || lower == "go test"
-            || lower.starts_with("go test ")
-        {
-            return Some(normalized);
-        }
-    }
-    None
+    bash_command_post_mutation_validation_prefix(command)
 }
 
-/// Return the maximum number of redundant retries of the same heavy validation
-/// prefix within any no-mutation window in the turn. A retry count of 2 means
-/// the same prefix ran 3 times total in one window.
-fn max_redundant_validation_retries(records: &[ToolCallRecord]) -> usize {
+fn normalized_validation_segment(segment: &str) -> Option<String> {
+    if validation_segment_has_meta_option(segment) {
+        return None;
+    }
+    let lower = segment.to_ascii_lowercase();
+    let recognized = lower.starts_with("cargo check ")
+        || lower == "cargo check"
+        || lower.starts_with("cargo test ")
+        || lower == "cargo test"
+        || lower.starts_with("cargo build ")
+        || lower == "cargo build"
+        || lower.starts_with("npx tsc --noemit")
+        || lower == "tsc --noemit"
+        || lower.starts_with("tsc --noemit ")
+        || lower == "pytest"
+        || lower.starts_with("pytest ")
+        || lower == "python -m pytest"
+        || lower.starts_with("python -m pytest ")
+        || lower == "python3 -m pytest"
+        || lower.starts_with("python3 -m pytest ")
+        || lower == "python -m unittest"
+        || lower.starts_with("python -m unittest ")
+        || lower == "python3 -m unittest"
+        || lower.starts_with("python3 -m unittest ")
+        || lower == "python -m build"
+        || lower.starts_with("python -m build ")
+        || lower == "python3 -m build"
+        || lower.starts_with("python3 -m build ")
+        || lower.starts_with("python setup.py build ")
+        || lower == "python setup.py build"
+        || lower.starts_with("python setup.py build_ext ")
+        || lower == "python setup.py build_ext"
+        || lower.starts_with("python3 setup.py build ")
+        || lower == "python3 setup.py build"
+        || lower.starts_with("python3 setup.py build_ext ")
+        || lower == "python3 setup.py build_ext"
+        || lower == "npm test"
+        || lower.starts_with("npm test ")
+        || lower == "npm run build"
+        || lower.starts_with("npm run build ")
+        || lower == "go test"
+        || lower.starts_with("go test ");
+    recognized.then_some(segment.to_string())
+}
+
+/// A framework command's help/version mode is an informational query, not a
+/// validation receipt. Keep this check provider- and task-neutral: it applies
+/// to the common validation command families, while leaving ordinary reader
+/// option semantics to the shell-observation classifier.
+fn validation_segment_has_meta_option(segment: &str) -> bool {
+    // Use the same static shell lexer as the path/redirect classifiers.  A
+    // completion receipt must never be inferred from a command whose argv is
+    // dynamic or malformed: `cargo test "$MODE"` could resolve to a metadata
+    // query, and quoted spellings such as `cargo test '--help'` must retain
+    // their option semantics.  This remains evidence-only; the command is
+    // still executable under the normal permission policy.
+    let Some(words) = split_static_shell_words(segment) else {
+        // An opaque outer wrapper (for example an assignment containing a
+        // command substitution) is handled by the nested-observation
+        // classifier.  Only reject an unparseable command when its first
+        // static token is itself a known validation family; otherwise this
+        // check would turn every dynamic reader into a metadata failure.
+        let first = segment
+            .split_whitespace()
+            .next()
+            .map(|word| word.trim_matches(['\'', '"']))
+            .map(str::to_ascii_lowercase);
+        return first.is_some_and(|first| {
+            matches!(
+                first.as_str(),
+                "cargo" | "go" | "npm" | "npx" | "pytest" | "python" | "python3" | "tsc"
+            )
+        });
+    };
+    let Some(first) = words.first().map(|word| word.to_ascii_lowercase()) else {
+        return false;
+    };
+    if !matches!(
+        first.as_str(),
+        "cargo" | "go" | "npm" | "npx" | "pytest" | "python" | "python3" | "tsc"
+    ) {
+        return false;
+    }
+    words.iter().skip(1).any(|word| match word.as_str() {
+        "-h" | "-?" | "--help" | "--version" | "--usage" => true,
+        // Cargo/Go/Pytest use lower-case -v for verbose output, while the
+        // TypeScript/npm frontends use it as a version query. Cargo's -V is
+        // the version query; keep short-option meaning family-specific.
+        "-v" => matches!(first.as_str(), "tsc" | "npx" | "npm"),
+        "-V" => true,
+        _ => false,
+    })
+}
+
+/// Return the canonical build/test receipt that occurs after the final
+/// possible mutation barrier in a shell command.  A validator before a later
+/// writer is deliberately not returned; callers must not combine an old
+/// project-wide prefix with a new, weaker observation.
+pub fn bash_command_post_mutation_validation_prefix(command: &str) -> Option<String> {
+    let mut latest = None;
+    let control_segments = split_shell_control_segments_with_ops(command)?;
+    for (segment_index, (raw_segment, op_after)) in control_segments.iter().enumerate() {
+        let pipeline_segments = split_top_level_pipeline_segments(raw_segment)?;
+        let mut pipeline_latest = None;
+        let mut pipeline_blocked = false;
+        for pipeline_segment in pipeline_segments {
+            let segment = pipeline_segment.trim();
+            if segment.is_empty() {
+                continue;
+            }
+            let segment = segment.strip_suffix("2>&1").unwrap_or(segment).trim();
+            let segment = segment.strip_suffix("1>&2").unwrap_or(segment).trim();
+            let normalized = segment.split_whitespace().collect::<Vec<_>>().join(" ");
+            if normalized.is_empty() {
+                continue;
+            }
+            // `cd`/`set` are neutral only when they are pure control
+            // statements. A redirect on a control segment is still a write
+            // and, in a pipeline, runs concurrently with the validator.
+            if shell_segment_has_non_benign_redirect(segment) {
+                pipeline_blocked = true;
+                break;
+            }
+            if is_shell_control_segment(&normalized) {
+                continue;
+            }
+            if let Some(prefix) = normalized_validation_segment(&normalized) {
+                pipeline_latest = Some(prefix);
+                continue;
+            }
+            if is_positive_validation_segment(&normalized)
+                || output_wrapper_without_substitution(&normalized)
+                || nested_shell_validation_is_positive(&normalized)
+                || is_status_neutral_segment(&normalized)
+                || crate::cloud_approval_policy::bash_command_is_read_only(&normalized)
+            {
+                continue;
+            }
+            // Pipeline stages execute concurrently. An unknown or mutating
+            // stage cannot be ordered before a validator merely because the
+            // validator appears later in the text; treat the whole pipeline
+            // as a barrier instead of manufacturing a post-mutation receipt.
+            pipeline_blocked = true;
+            break;
+        }
+        if pipeline_blocked {
+            latest = None;
+        } else if let Some(prefix) = pipeline_latest {
+            latest = Some(prefix);
+        }
+        // A successful `&&` continuation is conditional on the validator
+        // succeeding, so it does not mask that receipt. `;` and `||` both
+        // permit a later command to run after a failed validator and must
+        // close the evidence epoch. Empty segments are significant here: a
+        // newline following a comment appears as an empty segment.
+        let sequence_has_rhs = control_segments[segment_index + 1..]
+            .iter()
+            .any(|(segment, _)| {
+                let segment = segment.trim();
+                !segment.is_empty() && !segment.starts_with('#')
+            });
+        if matches!(op_after, ShellControlOp::Or)
+            || (matches!(op_after, ShellControlOp::Sequence) && sequence_has_rhs)
+        {
+            latest = None;
+        }
+    }
+    latest
+}
+
+/// Return whether a compound shell command contains a positive validation
+/// receipt after its last potentially state-changing segment.
+///
+/// Permission classification intentionally treats unknown shell syntax as
+/// unsafe.  Completion evidence has a different question: a command such as
+/// `prepare; deploy; cat result; curl endpoint` can still provide a useful
+/// post-change observation, while `cat result; deploy` cannot.  Keep this
+/// small and provider-neutral: unknown segments are barriers, known
+/// validation/read commands are receipts, and shell control wrappers are
+/// neutral.  This is evidence classification only; it never grants
+/// execution authority or changes the shell safety policy.
+pub fn bash_command_has_post_mutation_validation(command: &str) -> bool {
+    let mut validation_after_barrier = false;
+    let mut strict_receipt = false;
+    let Some(control_segments) = split_shell_control_segments_with_ops(command) else {
+        return false;
+    };
+    for (segment_index, (raw_segment, op_after)) in control_segments.iter().enumerate() {
+        let Some(pipeline_segments) = split_top_level_pipeline_segments(raw_segment) else {
+            return false;
+        };
+        let mut pipeline_validation = None;
+        let mut pipeline_blocked = false;
+        for pipeline_segment in pipeline_segments {
+            let segment = pipeline_segment.trim();
+            if segment.is_empty() {
+                continue;
+            }
+            let segment = segment.strip_suffix("2>&1").unwrap_or(segment).trim();
+            let segment = segment.strip_suffix("1>&2").unwrap_or(segment).trim();
+            let normalized = segment.split_whitespace().collect::<Vec<_>>().join(" ");
+            if normalized.is_empty() {
+                continue;
+            }
+            // Keep control-wrapper handling behind the raw redirect barrier;
+            // otherwise `cd ... > out | cargo test` or `set -e > out | ...`
+            // could manufacture a validation receipt.
+            if shell_segment_has_non_benign_redirect(segment) {
+                pipeline_blocked = true;
+                break;
+            }
+            if is_shell_control_segment(&normalized) {
+                continue;
+            }
+            if normalized_validation_segment(&normalized).is_some() {
+                pipeline_validation = Some(true);
+                continue;
+            }
+            if is_positive_validation_segment(&normalized) {
+                pipeline_validation = Some(is_strict_local_validation_segment(&normalized));
+                continue;
+            }
+
+            if is_status_neutral_segment(&normalized) {
+                continue;
+            }
+
+            // Plain output of an already-computed shell variable is a neutral
+            // presentation step. It must not erase a receipt observed
+            // immediately before it, while command substitutions still go
+            // through the stricter nested recognizer below.
+            if output_wrapper_without_substitution(&normalized) {
+                continue;
+            }
+
+            // A verification command is often wrapped in a harmless shell
+            // presentation expression, for example `echo "$(curl …)"` or
+            // `value=$(test -f …)`. The permission classifier must still
+            // reject command substitution as unsafe syntax, but completion
+            // evidence can inspect the nested command without granting it
+            // execution authority. Only allow known read-only
+            // wrappers/assignments; a redirect or an unknown outer command
+            // remains a mutation barrier.
+            if nested_shell_validation_is_positive(&normalized) {
+                pipeline_validation = Some(false);
+                continue;
+            }
+
+            // A command not proven read-only is a possible mutation barrier.
+            // It includes unknown Python/Perl helpers and writes to external
+            // systems such as `git push`; a later receipt is still useful, but
+            // an earlier receipt must not survive it.
+            if !crate::cloud_approval_policy::bash_command_is_read_only(&normalized) {
+                pipeline_blocked = true;
+                break;
+            }
+        }
+        if pipeline_blocked {
+            // Pipeline stages execute concurrently. A later validator cannot
+            // prove that it ran after an earlier writer in the same pipeline.
+            validation_after_barrier = false;
+            strict_receipt = false;
+        } else if let Some(strict) = pipeline_validation {
+            validation_after_barrier = true;
+            strict_receipt = strict;
+        }
+        let sequence_has_rhs = control_segments[segment_index + 1..]
+            .iter()
+            .any(|(segment, _)| {
+                let segment = segment.trim();
+                !segment.is_empty() && !segment.starts_with('#')
+            });
+        if strict_receipt
+            && (matches!(op_after, ShellControlOp::Or)
+                || (matches!(op_after, ShellControlOp::Sequence) && sequence_has_rhs))
+        {
+            validation_after_barrier = false;
+            strict_receipt = false;
+        }
+    }
+    validation_after_barrier
+}
+
+fn is_status_neutral_segment(segment: &str) -> bool {
+    let normalized = segment.trim().to_ascii_lowercase();
+    normalized == "true" || normalized == ":"
+}
+
+fn is_strict_local_validation_segment(segment: &str) -> bool {
+    let Some(first) = segment.split_whitespace().next() else {
+        return false;
+    };
+    matches!(first.to_ascii_lowercase().as_str(), "cmp" | "diff")
+        || (matches!(
+            first.to_ascii_lowercase().as_str(),
+            "sha256sum" | "sha512sum"
+        ) && segment.split_whitespace().any(|word| word == "-c"))
+}
+
+/// Return whether a shell segment contains a positive validation receipt in
+/// command substitution(s) under a presentation-only wrapper.  This is a
+/// deliberately small lexical recognizer, not a shell interpreter: it tracks
+/// balanced `$()` and quotes, delegates each body back to the same
+/// provider-neutral evidence predicate, and refuses writes/unknown wrappers.
+fn nested_shell_validation_is_positive(segment: &str) -> bool {
+    if segment.contains('>') {
+        return false;
+    }
+    let Some(bodies) = command_substitution_bodies(segment) else {
+        return false;
+    };
+    if bodies.is_empty() || !observation_wrapper_prefix(segment) {
+        return false;
+    }
+
+    let mut saw_receipt = false;
+    for body in bodies {
+        if bash_command_has_post_mutation_validation(body) {
+            saw_receipt = true;
+        } else if !crate::cloud_approval_policy::bash_command_is_read_only(body) {
+            // A nested command that is neither a known receipt nor a known
+            // read-only formatter is a possible post-receipt mutation.
+            return false;
+        }
+    }
+    saw_receipt
+}
+
+fn output_wrapper_without_substitution(segment: &str) -> bool {
+    if segment.contains("$(") || segment.contains('`') || segment.contains('>') {
+        return false;
+    }
+    matches!(
+        segment.split_whitespace().next().unwrap_or_default(),
+        "echo" | "printf"
+    )
+}
+
+/// Presentation-only shell forms for which nested command output is itself
+/// an observation.  Keep this structural (assignments and standard output),
+/// rather than matching task words, paths, or frameworks.
+fn observation_wrapper_prefix(segment: &str) -> bool {
+    let first = segment.split_whitespace().next().unwrap_or_default();
+    if matches!(first, "echo" | "printf" | "test" | "[") {
+        return true;
+    }
+    // A plain shell assignment (`name=$(...)`) does not execute an outer
+    // command and is safe to use as an observation carrier.  Reject `$` in
+    // the variable name so arbitrary command prefixes cannot masquerade as
+    // assignments.
+    let Some((name, _)) = first.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name.bytes().enumerate().all(|(index, byte)| {
+            (index == 0 && (byte == b'_' || byte.is_ascii_alphabetic()))
+                || (index > 0 && (byte == b'_' || byte.is_ascii_alphanumeric()))
+        })
+}
+
+/// Extract top-level command-substitution bodies while respecting quotes,
+/// escapes, and nested parentheses. `None` means an unterminated `$()` was
+/// found; an empty vector means the segment has no command substitutions.
+fn command_substitution_bodies(command: &str) -> Option<Vec<&str>> {
+    if command.len() > MAX_NESTED_SHELL_SCAN_BYTES
+        || command.contains('`')
+        || command.contains("<<")
+    {
+        return None;
+    }
+    let bytes = command.as_bytes();
+    let mut bodies = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if escaped {
+            escaped = false;
+            index += 1;
+            continue;
+        }
+        if byte == b'\\' {
+            escaped = true;
+            index += 1;
+            continue;
+        }
+        if byte == b'#' && shell_comment_starts(bytes, index) {
+            index = shell_comment_end(bytes, index);
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            // `$()` is evaluated inside double quotes, but not inside single
+            // quotes. Let the normal substitution branch below handle it.
+            if active_quote == b'\'' || (byte != b'$' || bytes.get(index + 1) != Some(&b'(')) {
+                if byte == active_quote {
+                    quote = None;
+                }
+                index += 1;
+                continue;
+            }
+        }
+        if byte == b'\'' || byte == b'"' {
+            quote = Some(byte);
+            index += 1;
+            continue;
+        }
+        if byte != b'$' || bytes.get(index + 1) != Some(&b'(') {
+            index += 1;
+            continue;
+        }
+
+        let start = index + 2;
+        let (end, body_end) = command_substitution_end(command, index)?;
+        bodies.push(&command[start..body_end]);
+        if bodies.len() > MAX_NESTED_SHELL_DEPTH {
+            return None;
+        }
+        index = end;
+    }
+    quote.is_none().then_some(bodies)
+}
+
+fn shell_comment_starts(bytes: &[u8], index: usize) -> bool {
+    if bytes.get(index) != Some(&b'#') {
+        return false;
+    }
+    index == 0
+        || matches!(
+            bytes[index - 1],
+            b' ' | b'\t' | b'\n' | b'\r' | b';' | b'|' | b'&' | b'('
+        )
+}
+
+fn shell_comment_end(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() && bytes[index] != b'\n' && bytes[index] != b'\r' {
+        index += 1;
+    }
+    index
+}
+
+fn is_shell_control_segment(segment: &str) -> bool {
+    let lower = segment.to_ascii_lowercase();
+    lower == "set -e"
+        || lower == "set -u"
+        || lower == "set -o pipefail"
+        || lower.starts_with("set -e ")
+        || lower.starts_with("set -u ")
+        || lower.starts_with("set -o pipefail ")
+        || lower.starts_with("cd ")
+        || lower == "cd"
+}
+
+fn is_positive_validation_segment(segment: &str) -> bool {
+    if validation_segment_has_meta_option(segment) || shell_segment_has_non_benign_redirect(segment)
+    {
+        return false;
+    }
+    let lower = segment.to_ascii_lowercase();
+    let mut words = lower.split_whitespace();
+    let Some(first) = words.next() else {
+        return false;
+    };
+    match first {
+        "cat" | "head" | "tail" | "grep" | "rg" | "find" | "ls" | "stat" | "file" | "sha256sum"
+        | "sha512sum" | "cmp" | "diff" | "test" | "[" | "curl" | "wget" => {
+            // Network clients are receipts only for read requests.  Do not
+            // treat a POST/upload form as observation of the workspace.
+            if matches!(first, "curl" | "wget")
+                && lower.split_whitespace().any(|word| {
+                    matches!(
+                        word,
+                        "-d" | "--data"
+                            | "--data-raw"
+                            | "--data-binary"
+                            | "--post-data"
+                            | "--upload-file"
+                            | "-t"
+                            | "--method=post"
+                            | "--method=put"
+                            | "--method=patch"
+                            | "--method=delete"
+                    ) || (word == "-x" || word == "--request")
+                })
+            {
+                return false;
+            }
+            true
+        }
+        "git" => matches!(
+            words.next(),
+            Some("status" | "diff" | "show" | "log" | "ls-files" | "branch" | "remote")
+        ),
+        "openssl" => matches!(words.next(), Some("x509" | "verify" | "s_client")),
+        "nginx" => words.next() == Some("-t"),
+        "systemctl" => matches!(words.next(), Some("status" | "is-active" | "is-enabled")),
+        "cargo" => matches!(words.next(), Some("check" | "test" | "build")),
+        "pytest" => true,
+        "python" | "python3" => {
+            let Some(second) = words.next() else {
+                return false;
+            };
+            match second {
+                "-m" => matches!(words.next(), Some("pytest" | "unittest" | "build")),
+                // Building a local extension is also a validation receipt:
+                // the command must successfully compile the changed source
+                // before the completion ledger can settle it.
+                "setup.py" => {
+                    matches!(words.next(), Some("build" | "build_ext" | "check" | "test"))
+                }
+                _ => false,
+            }
+        }
+        "npm" => {
+            matches!(words.next(), Some("test"))
+                || (matches!(words.next(), Some("run"))
+                    && matches!(words.next(), Some("test" | "build")))
+        }
+        "go" => words.next() == Some("test"),
+        _ => false,
+    }
+}
+
+/// Output redirection changes state even when the command name is a reader.
+/// The two benign descriptor-forwarding forms are stripped by callers before
+/// this predicate is used; an unparsed stage is conservatively treated as a
+/// possible redirect/mutation rather than a receipt.
+pub fn shell_segment_has_non_benign_redirect(segment: &str) -> bool {
+    let mut quote = None;
+    let mut escaped = false;
+    for byte in segment.trim().bytes() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if byte == b'\\' && quote != Some(b'\'') {
+            escaped = true;
+            continue;
+        }
+        if let Some(active) = quote {
+            if byte == active {
+                quote = None;
+            }
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' => quote = Some(byte),
+            b'>' => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Largest unresolved retry count for one normalized validation operation.
+///
+/// Output-shaping suffixes are ignored and an authoritative workspace
+/// mutation resets the operation, so runtime feedback can reuse the terminal
+/// evaluator's definition without treating a changed program as a retry. A
+/// retry count of 2 means the same prefix ran 3 times in one no-mutation
+/// window.
+pub fn max_redundant_validation_retries(records: &[ToolCallRecord]) -> usize {
     use std::collections::HashMap;
     let mut seen: HashMap<String, usize> = HashMap::new();
     let mut best = 0usize;
@@ -1284,7 +2483,7 @@ fn max_redundant_validation_retries(records: &[ToolCallRecord]) -> usize {
         if !record_was_executed(rec) {
             continue;
         }
-        let args = rec.args_full.as_deref().unwrap_or("");
+        let args = rec.authoritative_args_full().unwrap_or("");
         if is_mutation_for_redundant_read(&rec.name, args) {
             seen.clear();
             continue;
@@ -1306,13 +2505,53 @@ struct ReadRange {
     range: Option<(u32, u32)>,
 }
 
-fn ranges_overlap(a: &ReadRange, b: &ReadRange) -> bool {
-    if a.file != b.file {
-        return false;
+#[derive(Debug, Default)]
+struct ReadCoverage {
+    unbounded_requested: bool,
+    /// Sorted, disjoint inclusive ranges requested from the unchanged file.
+    ranges: Vec<(u32, u32)>,
+}
+
+impl ReadCoverage {
+    fn already_covers(&self, current: &ReadRange) -> bool {
+        // An unbounded request is not proof that the whole file reached the
+        // model: read_file may truncate or return an outline at its output
+        // boundary. A repeated unbounded request asks for the same projection
+        // again, but it must not make later targeted ranges look known.
+        let Some((current_start, current_end)) = current.range else {
+            return self.unbounded_requested;
+        };
+        self.ranges
+            .iter()
+            .any(|(start, end)| *start <= current_start && *end >= current_end)
     }
-    match (a.range, b.range) {
-        (None, _) | (_, None) => true,
-        (Some((a0, a1)), Some((b0, b1))) => !(a1 < b0 || b1 < a0),
+
+    fn record(&mut self, current: &ReadRange) {
+        let Some((mut start, mut end)) = current.range else {
+            self.unbounded_requested = true;
+            return;
+        };
+
+        let mut merged = Vec::with_capacity(self.ranges.len().saturating_add(1));
+        let mut inserted = false;
+        for (prior_start, prior_end) in self.ranges.drain(..) {
+            if prior_end.saturating_add(1) < start {
+                merged.push((prior_start, prior_end));
+            } else if end.saturating_add(1) < prior_start {
+                if !inserted {
+                    merged.push((start, end));
+                    inserted = true;
+                }
+                merged.push((prior_start, prior_end));
+            } else {
+                start = start.min(prior_start);
+                end = end.max(prior_end);
+            }
+        }
+        if !inserted {
+            merged.push((start, end));
+        }
+        self.ranges = merged;
     }
 }
 
@@ -1461,13 +2700,13 @@ fn mutation_target_file(name: &str, args: &str) -> Option<String> {
 /// behavioral intervention.
 pub fn count_redundant_overlapping_reads(records: &[ToolCallRecord]) -> usize {
     use std::collections::HashMap;
-    let mut per_file: HashMap<String, Vec<ReadRange>> = HashMap::new();
+    let mut per_file: HashMap<String, ReadCoverage> = HashMap::new();
     let mut redundant = 0usize;
     for rec in records {
         if !record_was_executed(rec) {
             continue;
         }
-        let args = rec.args_full.as_deref().unwrap_or("");
+        let args = rec.authoritative_args_full().unwrap_or("");
         if is_mutation_for_redundant_read(&rec.name, args) {
             // Mutation: invalidate the relevant file's read history (or all
             // file histories if we can't pinpoint the target).
@@ -1480,14 +2719,55 @@ pub fn count_redundant_overlapping_reads(records: &[ToolCallRecord]) -> usize {
             continue;
         }
         if let Some(target) = extract_read_target(&rec.name, args) {
-            let entry = per_file.entry(target.file.clone()).or_default();
-            if entry.iter().any(|prev| ranges_overlap(prev, &target)) {
+            let coverage = per_file.entry(target.file.clone()).or_default();
+            if coverage.already_covers(&target) {
                 redundant += 1;
             }
-            entry.push(target);
+            coverage.record(&target);
         }
     }
     redundant
+}
+
+/// Count redundant reads that are still actionable at the current boundary.
+///
+/// Unlike [`count_redundant_overlapping_reads`], this projection forgets a
+/// file's prior redundancy after an authoritative workspace mutation.  The
+/// historical counter remains appropriate for terminal audit; runtime policy
+/// must not keep advising against behavior that the agent has already left.
+pub fn count_active_redundant_overlapping_reads(records: &[ToolCallRecord]) -> usize {
+    use std::collections::HashMap;
+
+    let mut per_file: HashMap<String, ReadCoverage> = HashMap::new();
+    let mut redundant_per_file: HashMap<String, usize> = HashMap::new();
+    for rec in records {
+        if !record_was_executed(rec) || !rec.ok {
+            continue;
+        }
+        let args = rec.authoritative_args_full().unwrap_or("");
+        if is_mutation_for_redundant_read(&rec.name, args) {
+            match mutation_target_file(&rec.name, args) {
+                Some(file) => {
+                    per_file.remove(&file);
+                    redundant_per_file.remove(&file);
+                }
+                None => {
+                    per_file.clear();
+                    redundant_per_file.clear();
+                }
+            }
+            continue;
+        }
+        if let Some(target) = extract_read_target(&rec.name, args) {
+            let coverage = per_file.entry(target.file.clone()).or_default();
+            if coverage.already_covers(&target) {
+                let count = redundant_per_file.entry(target.file.clone()).or_default();
+                *count = count.saturating_add(1);
+            }
+            coverage.record(&target);
+        }
+    }
+    redundant_per_file.values().copied().sum()
 }
 
 pub fn eval_signal_to_json(signal: &EvalSignal) -> serde_json::Value {
@@ -1844,6 +3124,114 @@ mod tests {
         );
     }
 
+    #[test]
+    fn admission_rejections_fail_the_boundary_without_counting_as_execution_errors() {
+        let records = vec![ToolCallRecord {
+            tool_call_id: Some("call-rejected".into()),
+            name: "list_dir".into(),
+            ok: false,
+            error: Some("canonical Work admission unavailable".into()),
+            error_kind: Some(astra_core::ErrorKind::ContractViolation),
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Rejected),
+            ..Default::default()
+        }];
+
+        let eval =
+            evaluate_tool_call_records("inspect the workspace", &[], &records, 0, false, 0.0);
+
+        assert!(!eval.success);
+        assert!(
+            eval.signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::BlockedToolCall { count: 1 })),
+            "typed admission rejection must be visible to evaluation: {:?}",
+            eval.signals
+        );
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::ToolErrorRate(rate) if (*rate - 1.0).abs() < f64::EPSILON)),
+            "a pre-execution rejection must not become an executor error: {:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn one_blocked_route_cannot_hide_behind_many_successful_observations() {
+        let mut records = (0..7)
+            .map(|index| journal_ok_call(&format!("read_{index}")))
+            .collect::<Vec<_>>();
+        records.push(ToolCallRecord {
+            tool_call_id: Some("required-route".into()),
+            name: "bash".into(),
+            ok: false,
+            error: Some("policy rejected the required route".into()),
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Rejected),
+            ..Default::default()
+        });
+
+        let eval = evaluate_tool_call_records("diagnose the failure", &[], &records, 0, false, 0.0);
+        assert!(
+            !eval.success,
+            "successful side observations must not erase an unresolved blocked route: {eval:?}"
+        );
+        assert!(
+            eval.signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::BlockedToolCall { count: 1 }))
+        );
+    }
+
+    #[test]
+    fn successful_retry_resolves_the_same_blocked_operation() {
+        let args = serde_json::json!({"command": "custom-inspector --status"}).to_string();
+        let mut blocked = ToolCallRecord {
+            tool_call_id: Some("blocked-call".into()),
+            name: "bash".into(),
+            ok: false,
+            error: Some("approval required".into()),
+            args_full: Some(args.clone()),
+            disposition: Some(astra_services::session_journal::ToolCallDisposition::Rejected),
+            ..Default::default()
+        };
+        let mut recovered = journal_ok_call("bash");
+        recovered.tool_call_id = Some("retry-call".into());
+        recovered.args_full = Some(args);
+        recovered.disposition =
+            Some(astra_services::session_journal::ToolCallDisposition::Executed);
+
+        let eval = evaluate_tool_call_records(
+            "inspect the environment",
+            &[],
+            &[blocked.clone(), recovered],
+            0,
+            false,
+            0.0,
+        );
+        assert!(
+            eval.success,
+            "an authoritative same-operation retry resolves the block: {eval:?}"
+        );
+        assert!(
+            !eval
+                .signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::BlockedToolCall { .. }))
+        );
+
+        blocked.args_full = Some(serde_json::json!({"command": "other-command"}).to_string());
+        let unresolved = evaluate_tool_call_records(
+            "inspect the environment",
+            &[],
+            &[blocked, journal_ok_call("bash")],
+            0,
+            false,
+            0.0,
+        );
+        assert!(!unresolved.success);
+    }
+
     fn journal_ok_call(name: &str) -> ToolCallRecord {
         ToolCallRecord {
             name: name.to_string(),
@@ -1859,6 +3247,246 @@ mod tests {
             original_tool_name: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn unclassified_failed_execution_is_feedback_and_matching_success_resolves_it() {
+        let args = serde_json::json!({"command": "cargo test"}).to_string();
+        let mut failed = journal_ok_call("bash");
+        failed.ok = false;
+        failed.args_full = Some(args.clone());
+        failed.result_class = None;
+
+        assert_eq!(
+            count_unresolved_tool_outcome_failures(std::slice::from_ref(&failed)),
+            1,
+            "a governed failure must remain actionable even without optional classification"
+        );
+
+        let mut recovered = journal_ok_call("bash");
+        recovered.args_full = Some(args);
+        recovered.result_class = None;
+        assert_eq!(
+            count_unresolved_tool_outcome_failures(&[failed, recovered]),
+            0,
+            "a later successful execution of the same operation resolves the fallback failure"
+        );
+    }
+
+    #[test]
+    fn domain_negative_exit_does_not_create_unresolved_obligation() {
+        let mut record = journal_ok_call("bash");
+        record.ok = false;
+        record.args_full = Some(serde_json::json!({"command": "grep missing file"}).to_string());
+        record.exit_semantics = Some("domain_negative".to_string());
+        assert_eq!(count_unresolved_tool_outcome_failures(&[record.clone()]), 0);
+        assert!(active_execution_failure_operation_keys(&[record]).is_empty());
+    }
+
+    #[test]
+    fn rejected_typed_agent_result_is_not_an_unresolved_execution() {
+        let mut record = journal_ok_call("agent");
+        record.ok = false;
+        record.disposition = Some(astra_services::session_journal::ToolCallDisposition::Rejected);
+        record.args_full =
+            Some(serde_json::json!({"action":"spawn","prompt":"review"}).to_string());
+        record.result_class = Some("agent_incomplete".to_string());
+
+        assert_eq!(
+            count_unresolved_tool_outcome_failures(std::slice::from_ref(&record)),
+            0
+        );
+        assert!(active_execution_failure_operation_keys(&[record]).is_empty());
+    }
+
+    #[test]
+    fn positive_success_is_stricter_than_completed_domain_outcome() {
+        let mut record = journal_ok_call("bash");
+        record.args_full =
+            Some(serde_json::json!({"command": "cargo test | grep PASSED"}).to_string());
+        record.result_class = Some("empty_result".to_string());
+        record.exit_semantics = Some("empty_result".to_string());
+        assert!(record.ok, "the shell transport itself completed");
+        assert!(!tool_outcome_is_positive_success(&record));
+
+        record.result_class = Some("success".to_string());
+        record.exit_semantics = Some("success".to_string());
+        assert!(tool_outcome_is_positive_success(&record));
+
+        record.exit_semantics = Some("pipeline_truncated".to_string());
+        assert!(
+            !tool_outcome_is_positive_success(&record),
+            "a truncated pipeline is not an affirmative validation receipt"
+        );
+
+        record.exit_semantics = None;
+        assert!(
+            !tool_outcome_is_positive_success(&record),
+            "missing process semantics must remain fail-closed"
+        );
+    }
+
+    #[test]
+    fn typed_failure_overrides_domain_negative_process_semantics() {
+        let mut record = journal_ok_call("bash");
+        record.ok = false;
+        record.args_full = Some(serde_json::json!({"command": "cargo test"}).to_string());
+        record.result_class = Some("test_failure".to_string());
+        record.exit_semantics = Some("domain_negative".to_string());
+        assert_eq!(count_unresolved_tool_outcome_failures(&[record.clone()]), 1);
+        assert_eq!(active_execution_failure_operation_keys(&[record]).len(), 1);
+    }
+
+    #[test]
+    fn unclassified_failure_without_identity_is_not_erased_by_same_named_success() {
+        let mut failed = journal_ok_call("bash");
+        failed.ok = false;
+        failed.result_class = None;
+
+        let recovered = journal_ok_call("bash");
+        assert_eq!(
+            count_unresolved_tool_outcome_failures(&[failed, recovered]),
+            1,
+            "without an operation identity, an unrelated success must not erase feedback"
+        );
+
+        let mut failed_with_id = journal_ok_call("bash");
+        failed_with_id.ok = false;
+        failed_with_id.result_class = None;
+        failed_with_id.tool_call_id = Some("call-1".to_string());
+        let mut recovered_with_id = journal_ok_call("bash");
+        recovered_with_id.tool_call_id = Some("call-1".to_string());
+        assert_eq!(
+            count_unresolved_tool_outcome_failures(&[failed_with_id, recovered_with_id]),
+            0,
+            "a shared provider call identity is sufficient to resolve the fallback failure"
+        );
+
+        let args = serde_json::json!({"command": "cargo test"}).to_string();
+        let mut failed_retry = journal_ok_call("bash");
+        failed_retry.ok = false;
+        failed_retry.args_full = Some(args.clone());
+        failed_retry.tool_call_id = Some("failed-attempt".to_string());
+        let mut recovered_retry = journal_ok_call("bash");
+        recovered_retry.args_full = Some(args);
+        recovered_retry.tool_call_id = Some("new-attempt".to_string());
+        assert_eq!(
+            count_unresolved_tool_outcome_failures(&[failed_retry, recovered_retry]),
+            0,
+            "stable operation arguments must resolve a retry even when provider ids rotate"
+        );
+    }
+
+    #[test]
+    fn active_operation_projection_matches_terminal_recovery_identity() {
+        let mut failed = journal_ok_call("bash");
+        failed.ok = false;
+        failed.args_full = Some(serde_json::json!({"command":"cargo test"}).to_string());
+        failed.result_class = Some("test_failure".into());
+
+        let mut unrelated_success = journal_ok_call("bash");
+        unrelated_success.args_full =
+            Some(serde_json::json!({"command":"cargo build"}).to_string());
+        assert_eq!(
+            count_unresolved_tool_outcome_failures(&[failed.clone(), unrelated_success]),
+            1
+        );
+
+        let mut matching_success = journal_ok_call("bash");
+        matching_success.args_full = Some(serde_json::json!({"command":"cargo test"}).to_string());
+        assert!(
+            active_execution_failure_operation_keys(&[failed, matching_success.clone()]).is_empty()
+        );
+        assert_eq!(
+            count_unresolved_tool_outcome_failures(&[
+                {
+                    let mut f = journal_ok_call("bash");
+                    f.ok = false;
+                    f.args_full = Some(serde_json::json!({"command":"cargo test"}).to_string());
+                    f.result_class = Some("test_failure".into());
+                    f
+                },
+                matching_success,
+            ]),
+            0
+        );
+    }
+
+    #[test]
+    fn operation_identity_is_stable_across_result_shape_and_json_key_order() {
+        let mut typed_failure = journal_ok_call("bash");
+        typed_failure.ok = false;
+        typed_failure.result_class = Some("execution_error".into());
+        typed_failure.args_full = Some(r#"{"command":"probe","options":{"z":1,"a":2}}"#.into());
+
+        let mut untyped_retry = journal_ok_call("bash");
+        untyped_retry.result_class = None;
+        untyped_retry.args_full = Some(r#"{"options":{"a":2,"z":1},"command":"probe"}"#.into());
+
+        assert_eq!(
+            tool_outcome_operation_key(&typed_failure),
+            tool_outcome_operation_key(&untyped_retry),
+            "result classification and JSON object ordering must not change operation identity"
+        );
+        assert_eq!(
+            count_unresolved_tool_outcome_failures(&[typed_failure, untyped_retry]),
+            0,
+            "a successful untyped retry must resolve a typed failure for the same operation"
+        );
+    }
+
+    #[test]
+    fn operation_identity_keeps_distinct_arguments_isolated() {
+        let mut first = journal_ok_call("bash");
+        first.ok = false;
+        first.result_class = Some("execution_error".into());
+        first.args_full = Some(r#"{"command":"probe-a"}"#.into());
+
+        let mut different = journal_ok_call("bash");
+        different.args_full = Some(r#"{"command":"probe-b"}"#.into());
+
+        assert_ne!(
+            tool_outcome_operation_key(&first),
+            tool_outcome_operation_key(&different)
+        );
+        assert_eq!(
+            count_unresolved_tool_outcome_failures(&[first, different]),
+            1,
+            "a different operation must not clear the active failure"
+        );
+    }
+
+    #[test]
+    fn rejected_operation_identity_is_cleared_by_canonical_success() {
+        let mut rejected = journal_ok_call("bash");
+        rejected.ok = false;
+        rejected.disposition = Some(astra_services::session_journal::ToolCallDisposition::Rejected);
+        rejected.args_full = Some(r#"{"command":"probe","options":{"z":1,"a":2}}"#.into());
+
+        let mut recovered = journal_ok_call("bash");
+        recovered.args_full = Some(r#"{"options":{"a":2,"z":1},"command":"probe"}"#.into());
+
+        assert!(active_rejected_operation_keys(&[rejected, recovered]).is_empty());
+        assert_eq!(
+            unresolved_blocked_attempt_count(&[
+                {
+                    let mut record = journal_ok_call("bash");
+                    record.ok = false;
+                    record.disposition =
+                        Some(astra_services::session_journal::ToolCallDisposition::Rejected);
+                    record.args_full =
+                        Some(r#"{"command":"probe","options":{"z":1,"a":2}}"#.into());
+                    record
+                },
+                {
+                    let mut record = journal_ok_call("bash");
+                    record.args_full =
+                        Some(r#"{"options":{"a":2,"z":1},"command":"probe"}"#.into());
+                    record
+                },
+            ]),
+            0
+        );
     }
 
     // ── evaluate_turn quality levels ──
@@ -2276,7 +3904,7 @@ mod tests {
     }
 
     #[test]
-    fn minority_optional_probe_failure_does_not_poison_completed_execution() {
+    fn minority_optional_probe_failure_is_not_unresolved_execution_evidence() {
         let mut failed_probe = journal_ok_call("bash");
         failed_probe.args_full =
             Some(serde_json::json!({"command": "optional-environment-probe"}).to_string());
@@ -2306,7 +3934,63 @@ mod tests {
         )));
         assert!(
             !turn_evaluation_has_unresolved_execution_failure(&eval),
-            "the failed probe remains advisory evidence, while the productive child lifecycle completes"
+            "the failed probe remains advisory evidence without erasing the productive evidence"
+        );
+    }
+
+    #[test]
+    fn successful_fallback_preserves_failure_evidence_without_claiming_health() {
+        let mut rejected_route = journal_ok_call("bash");
+        rejected_route.args_full =
+            Some(serde_json::json!({"command": "curl https://news.example/"}).to_string());
+        rejected_route.ok = false;
+        rejected_route.result_class = Some("execution_error".to_string());
+        rejected_route.disposition =
+            Some(astra_services::session_journal::ToolCallDisposition::Rejected);
+
+        let mut successful_fallback = journal_ok_call("web_fetch");
+        successful_fallback.args_full =
+            Some(serde_json::json!({"url": "https://news.example/"}).to_string());
+
+        let eval = evaluate_tool_call_records(
+            "fetch one current headline",
+            &[],
+            &[rejected_route, successful_fallback],
+            0,
+            false,
+            0.2,
+        );
+
+        assert!(
+            !eval.success,
+            "the rejected route remains visible: {eval:?}"
+        );
+        assert!(eval.signals.iter().any(|signal| matches!(
+            signal,
+            EvalSignal::ToolOutcomeFailureCoverage {
+                unresolved: 1,
+                observed: 2
+            }
+        )));
+        assert!(
+            eval.signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::BlockedToolCall { count: 1 }))
+        );
+    }
+
+    #[test]
+    fn terminal_rejection_boundary_does_not_reopen_after_a_later_execution() {
+        let mut rejected = journal_ok_call("bash");
+        rejected.ok = false;
+        rejected.disposition = Some(astra_services::session_journal::ToolCallDisposition::Rejected);
+        let recovered = journal_ok_call("read_file");
+
+        assert_eq!(terminal_rejected_attempt_count(&[rejected.clone()]), 1);
+        assert_eq!(
+            terminal_rejected_attempt_count(&[rejected, recovered]),
+            0,
+            "a real later execution is already a recovery boundary"
         );
     }
 
@@ -2869,7 +4553,7 @@ mod tests {
         };
 
         let distinct_full_args = vec![
-            record("/home/xupeng/github/astra/crates/services/src/durable_task.rs"),
+            record("/home/xupeng/github/astra/crates/services/src/work.rs"),
             record("/home/xupeng/github/astra/crates/astra-tools/src/fs_ops.rs"),
             record("/home/xupeng/github/astra/crates/astra-sandbox/src/policy.rs"),
         ];
@@ -3065,7 +4749,7 @@ mod tests {
     }
 
     #[test]
-    fn llm_round_churn_surfaces_even_when_tool_calls_succeed() {
+    fn round_count_alone_does_not_classify_productive_long_work_as_churn() {
         let records = vec![journal_ok_call("git")];
         let eval = evaluate_tool_call_records_with_thresholds_and_telemetry(
             "review local changes",
@@ -3082,45 +4766,64 @@ mod tests {
                 llm_rounds: Some(9),
                 prompt_tokens: Some(136_947),
                 first_round_prompt_tokens: Some(9_401),
-                max_round_prompt_tokens: Some(20_954),
+                max_round_prompt_tokens: Some(9_401),
             },
         );
 
         assert!(
-            eval.signals.iter().any(|signal| matches!(
-                signal,
-                EvalSignal::LlmRoundChurn {
-                    rounds: 9,
-                    prompt_tokens: 136_947,
-                }
-            )),
-            "expected llm_round_churn signal, got {:?}",
-            eval.signals
-        );
-        assert!(
-            eval.signals.iter().any(|signal| matches!(
-                signal,
-                EvalSignal::PromptGrowthChurn {
-                    first_prompt_tokens: 9_401,
-                    max_prompt_tokens: 20_954,
-                    delta_tokens: 11_553,
-                }
-            )),
-            "expected prompt_growth_churn signal, got {:?}",
-            eval.signals
-        );
-        assert!(
             !eval
                 .signals
                 .iter()
-                .any(|signal| matches!(signal, EvalSignal::AllToolsHealthy)),
-            "llm-round churn must revoke all_tools_healthy: {:?}",
+                .any(|signal| matches!(signal, EvalSignal::LlmRoundChurn { .. })),
+            "a long successful turn is not churn without independent low-yield evidence: {:?}",
             eval.signals
         );
         assert!(
-            eval.quality < 0.5,
-            "quality should be downgraded, got {}",
-            eval.quality
+            eval.signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::AllToolsHealthy)),
+            "healthy long work should retain its positive execution fact: {:?}",
+            eval.signals
+        );
+    }
+
+    #[test]
+    fn llm_round_churn_requires_independent_low_yield_evidence() {
+        let records = vec![
+            journal_ok_call("git"),
+            journal_ok_call("git"),
+            journal_ok_call("git"),
+        ];
+        let eval = evaluate_tool_call_records_with_thresholds_and_telemetry(
+            "review local changes",
+            &["git".to_string()],
+            &records,
+            0,
+            false,
+            0.26,
+            EvaluationThresholds {
+                llm_round_churn: 8,
+                ..Default::default()
+            },
+            TurnEvaluationTelemetry {
+                llm_rounds: Some(9),
+                prompt_tokens: Some(136_947),
+                first_round_prompt_tokens: Some(9_401),
+                max_round_prompt_tokens: Some(9_401),
+            },
+        );
+
+        assert!(eval.signals.iter().any(|signal| matches!(
+            signal,
+            EvalSignal::LlmRoundChurn {
+                rounds: 9,
+                prompt_tokens: 136_947,
+            }
+        )));
+        assert!(
+            eval.signals
+                .iter()
+                .any(|signal| matches!(signal, EvalSignal::RepeatToolCall(tool) if tool == "git"))
         );
 
         let event = build_turn_evaluation_journal_event(
@@ -3145,15 +4848,6 @@ mod tests {
         assert_eq!(signal["rounds"], 9);
         assert_eq!(signal["prompt_tokens"], 136_947);
         assert_eq!(signal["threshold"], 8);
-        let growth = metadata["signals"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|signal| signal["kind"] == "prompt_growth_churn")
-            .expect("prompt_growth_churn signal");
-        assert_eq!(growth["first_prompt_tokens"], 9_401);
-        assert_eq!(growth["max_prompt_tokens"], 20_954);
-        assert_eq!(growth["delta_tokens"], 11_553);
     }
 
     #[test]
@@ -3244,7 +4938,10 @@ mod tests {
             },
         );
 
-        assert_eq!(eval.quality, 0.0, "{eval:?}");
+        assert!(
+            eval.quality <= 0.10,
+            "late failure penalties must leave high-cost low-yield work with a very low quality score: {eval:?}"
+        );
         assert!(
             eval.confidence <= high_cost_low_yield_confidence_cap(eval.quality),
             "high-cost low-yield confidence must stay calibrated after later penalties: {eval:?}"
@@ -3926,8 +5623,10 @@ mod tests {
     }
 
     #[test]
-    fn redundant_reads_detects_overlapping_but_not_identical_ranges() {
-        // Reading 100-150 then 120-180 = same content overlap; should count.
+    fn extending_overlapping_ranges_are_new_evidence() {
+        // Every request extends beyond the previously delivered range. Partial
+        // overlap alone is not redundancy because the model receives unseen
+        // content on each call.
         let records = vec![
             record_with_args("bash", 0, "sed -n '100,150p' src/foo.rs"),
             record_with_args("bash", 1, "sed -n '120,180p' src/foo.rs"),
@@ -3938,10 +5637,9 @@ mod tests {
             EvalSignal::RedundantOverlappingReads(n) => Some(*n),
             _ => None,
         });
-        // calls 2 and 3 each overlap a prior, and threshold=3 fires only at 3.
         assert_eq!(
             count, None,
-            "only 2 redundant — below threshold 3, must be silent"
+            "extending ranges must not be classified as redundant"
         );
     }
 
@@ -3996,9 +5694,9 @@ mod tests {
     }
 
     #[test]
-    fn redundant_reads_signal_recognizes_read_file_with_overlapping_ranges() {
-        // The native `read_file` tool with overlapping ranges should also
-        // count — the failure mode is identical regardless of bash vs read_file.
+    fn redundant_reads_signal_requires_full_prior_coverage() {
+        // Prior ranges can jointly cover a later request. This is redundant
+        // even when no single prior request contains the whole range.
         let records = vec![
             record_with_args(
                 "read_file",
@@ -4008,17 +5706,22 @@ mod tests {
             record_with_args(
                 "read_file",
                 1,
-                r#"{"path":"src/foo.rs","start_line":20,"end_line":60}"#,
+                r#"{"path":"src/foo.rs","start_line":51,"end_line":80}"#,
             ),
             record_with_args(
                 "read_file",
                 2,
-                r#"{"path":"src/foo.rs","start_line":30,"end_line":70}"#,
+                r#"{"path":"src/foo.rs","start_line":20,"end_line":70}"#,
             ),
             record_with_args(
                 "read_file",
                 3,
-                r#"{"path":"src/foo.rs","start_line":40,"end_line":80}"#,
+                r#"{"path":"src/foo.rs","start_line":25,"end_line":65}"#,
+            ),
+            record_with_args(
+                "read_file",
+                4,
+                r#"{"path":"src/foo.rs","start_line":30,"end_line":60}"#,
             ),
         ];
         let eval = evaluate_tool_call_records("q", &[], &records, 0, false, 0.3);
@@ -4045,7 +5748,56 @@ mod tests {
     }
 
     #[test]
-    fn redundant_reads_recognizes_read_file_with_overlapping_ranges() {
+    fn active_redundant_reads_resolve_after_authoritative_mutation() {
+        let mut records = vec![
+            record_with_args("read_file", 0, r#"{"path":"src/main.rs"}"#),
+            record_with_args("read_file", 1, r#"{"path":"src/main.rs"}"#),
+            record_with_args("read_file", 2, r#"{"path":"src/main.rs"}"#),
+            record_with_args("read_file", 3, r#"{"path":"src/main.rs"}"#),
+        ];
+        assert_eq!(count_active_redundant_overlapping_reads(&records), 3);
+
+        let mut failed_mutation = record_with_args("str_replace", 4, r#"{"path":"src/main.rs"}"#);
+        failed_mutation.ok = false;
+        records.push(failed_mutation);
+        assert_eq!(
+            count_active_redundant_overlapping_reads(&records),
+            3,
+            "a failed mutation cannot invalidate successful read evidence"
+        );
+
+        records.push(record_with_args(
+            "str_replace",
+            5,
+            r#"{"path":"src/main.rs"}"#,
+        ));
+        assert_eq!(
+            count_redundant_overlapping_reads(&records),
+            3,
+            "terminal audit retains the historical inefficiency"
+        );
+        assert_eq!(
+            count_active_redundant_overlapping_reads(&records),
+            0,
+            "online feedback resolves after the relevant state changed"
+        );
+
+        let mut failed_reads = vec![
+            record_with_args("read_file", 0, r#"{"path":"src/failed.rs"}"#),
+            record_with_args("read_file", 1, r#"{"path":"src/failed.rs"}"#),
+            record_with_args("read_file", 2, r#"{"path":"src/failed.rs"}"#),
+            record_with_args("read_file", 3, r#"{"path":"src/failed.rs"}"#),
+        ];
+        failed_reads.iter_mut().for_each(|record| record.ok = false);
+        assert_eq!(
+            count_active_redundant_overlapping_reads(&failed_reads),
+            0,
+            "failed reads never become online behavioral evidence"
+        );
+    }
+
+    #[test]
+    fn extending_read_file_ranges_are_not_redundant() {
         let records = vec![
             record_with_args(
                 "read_file",
@@ -4064,9 +5816,23 @@ mod tests {
             ),
         ];
         let count = count_redundant_overlapping_reads(&records);
+        assert_eq!(count, 0, "each read contributes previously unseen lines");
+    }
+
+    #[test]
+    fn unbounded_read_does_not_claim_full_file_delivery() {
+        let records = vec![
+            record_with_args("read_file", 0, r#"{"path":"src/lib.rs"}"#),
+            record_with_args(
+                "read_file",
+                1,
+                r#"{"path":"src/lib.rs","start_line":200,"end_line":260}"#,
+            ),
+        ];
         assert_eq!(
-            count, 2,
-            "read_file overlapping ranges should count as redundant"
+            count_redundant_overlapping_reads(&records),
+            0,
+            "an output-bounded whole-file request cannot prove later lines were delivered"
         );
     }
 
@@ -4160,5 +5926,238 @@ mod tests {
             "grep calls must not be classified as reads; got {:?}",
             eval.signals
         );
+    }
+
+    #[test]
+    fn compound_shell_receipt_must_follow_the_last_possible_mutation() {
+        assert!(bash_command_has_post_mutation_validation(
+            "rm -rf build && git push origin main && cat dist/index.html && curl -sk https://localhost/"
+        ));
+        assert!(bash_command_has_post_mutation_validation(
+            "set -e; cargo test -p example; test -f target/debug/example"
+        ));
+        assert!(bash_command_has_post_mutation_validation(
+            "sed -i 's/np.int/np.intp/' source.py && python setup.py build_ext --inplace 2>&1 | tail -20"
+        ));
+        assert!(bash_command_has_post_mutation_validation(
+            "python3 -m build --wheel"
+        ));
+        assert!(bash_command_has_post_mutation_validation(
+            "python3 -m pytest 2>&1"
+        ));
+        assert!(bash_command_has_post_mutation_validation(
+            "python3 -m pytest 1>&2"
+        ));
+        // A validator followed by an alternate/fallback command is not a
+        // status-determining receipt: the shell can report success even when
+        // the validator failed.
+        assert!(!bash_command_has_post_mutation_validation(
+            "cargo test || true"
+        ));
+        assert!(!bash_command_has_post_mutation_validation(
+            "cargo test; true"
+        ));
+        assert!(bash_command_has_post_mutation_validation(
+            "cargo test && true"
+        ));
+        assert!(bash_command_post_mutation_validation_prefix("cargo test || true").is_none());
+        assert!(bash_command_post_mutation_validation_prefix("cargo test; true").is_none());
+        assert!(bash_command_post_mutation_validation_prefix("cargo test && true").is_some());
+        assert!(bash_command_has_post_mutation_validation("cargo test;"));
+        assert!(bash_command_has_post_mutation_validation("cargo test\n"));
+        assert!(bash_command_has_post_mutation_validation(
+            "cargo test # comment\n"
+        ));
+        assert!(bash_command_post_mutation_validation_prefix("cargo test;").is_some());
+        assert!(bash_command_post_mutation_validation_prefix("cargo test\n").is_some());
+        assert!(bash_command_post_mutation_validation_prefix("cargo test # comment\n").is_some());
+        assert!(!bash_command_has_post_mutation_validation(
+            "python3 -m pytest 1>&1"
+        ));
+        assert!(!bash_command_has_post_mutation_validation(
+            "python3 -m pytest 2>&2"
+        ));
+        assert!(!bash_command_has_post_mutation_validation(
+            "python3 -m pytest 3>&1"
+        ));
+        assert!(!bash_command_has_post_mutation_validation(
+            "python3 -m pytest &"
+        ));
+        assert!(!bash_command_has_post_mutation_validation(
+            "cat dist/index.html && rm -rf build"
+        ));
+        assert!(!bash_command_has_post_mutation_validation(
+            "rm -rf build && echo done"
+        ));
+        assert!(!bash_command_has_post_mutation_validation(
+            "curl -X POST https://localhost/deploy"
+        ));
+        assert_eq!(
+            bash_command_post_mutation_validation_prefix(
+                "sed -i 's/a/b/' src/lib.rs && cargo test"
+            ),
+            Some("cargo test".into())
+        );
+        assert_eq!(
+            bash_command_post_mutation_validation_prefix(
+                "cargo test && sed -i 's/a/b/' src/lib.rs && test -e src/lib.rs"
+            ),
+            None
+        );
+        assert!(bash_command_post_mutation_validation_prefix("npx tsc --noEmit").is_some());
+        assert!(bash_command_post_mutation_validation_prefix("npm run build").is_some());
+        assert!(
+            bash_command_post_mutation_validation_prefix("python setup.py build_ext --inplace")
+                .is_some()
+        );
+        for command in [
+            "cargo test --help",
+            "cargo test --version",
+            "cargo test '--help'",
+            "cargo test \"$MODE\"",
+            "pytest --help",
+            "pytest \"$MODE\"",
+            "python3 -m pytest -h",
+            "npx tsc --noEmit --help",
+        ] {
+            assert!(
+                !bash_command_has_post_mutation_validation(command),
+                "metadata mode is not validation evidence: {command}"
+            );
+            assert!(
+                bash_command_post_mutation_validation_prefix(command).is_none(),
+                "metadata mode is not a strict validation receipt: {command}"
+            );
+        }
+        for command in ["cargo test -v", "go test -v", "pytest -v"] {
+            assert!(
+                bash_command_post_mutation_validation_prefix(command).is_some(),
+                "verbose validation must remain a receipt: {command}"
+            );
+        }
+        for command in [
+            "touch /workspace/out | cargo test",
+            "cargo test | touch /workspace/out",
+            "time cp /workspace/source /workspace/out | cargo test",
+            "time cat /workspace/source > /workspace/out | cargo test",
+            "cd /workspace > /workspace/out | cargo test",
+            "set -e > /workspace/out | cargo test",
+            "cat /workspace/source > /workspace/output",
+        ] {
+            assert!(
+                !bash_command_has_post_mutation_validation(command),
+                "a concurrent writer cannot be ordered around a validator: {command}"
+            );
+            assert!(
+                bash_command_post_mutation_validation_prefix(command).is_none(),
+                "a concurrent writer cannot produce a strict receipt: {command}"
+            );
+        }
+        // A `>` inside a quoted argument is data, not shell redirection. The
+        // same raw-syntax predicate is consumed by runtime lifecycle checks.
+        assert!(bash_command_has_post_mutation_validation(
+            "grep '>' /workspace/file"
+        ));
+        assert!(bash_command_has_post_mutation_validation(
+            "cat /workspace/source > /workspace/output && cat /workspace/output"
+        ));
+        assert_eq!(
+            split_static_shell_words("cp src '/tmp/volatile file'"),
+            Some(vec!["cp".into(), "src".into(), "/tmp/volatile file".into()])
+        );
+        assert_eq!(
+            split_static_shell_words("printf x > '/workspace/out file'"),
+            Some(vec![
+                "printf".into(),
+                "x".into(),
+                ">".into(),
+                "/workspace/out file".into()
+            ])
+        );
+        assert_eq!(
+            split_static_shell_words("sed -i 's/$/x/' '/workspace/out file'"),
+            Some(vec![
+                "sed".into(),
+                "-i".into(),
+                "s/$/x/".into(),
+                "/workspace/out file".into()
+            ])
+        );
+        assert!(split_static_shell_words("cp $DEST source").is_none());
+        assert!(split_static_shell_words("cp src 'unterminated").is_none());
+        assert!(split_static_shell_words("cp src | tee out").is_none());
+    }
+
+    #[test]
+    fn nested_read_receipts_inside_assignments_and_output_are_evidence() {
+        assert!(bash_command_has_post_mutation_validation(
+            r#"rm -rf work; deploy-command; value=$(curl -fsS https://localhost/); echo "state=$value""#
+        ));
+        assert!(bash_command_has_post_mutation_validation(
+            r#"git push origin main; echo "state=$(curl -fsS https://localhost/ | tr -d '\n')""#
+        ));
+        assert!(bash_command_has_post_mutation_validation(
+            r#"write-command; echo "$(test -f result.json && echo PASS || echo FAIL)""#
+        ));
+        assert!(bash_command_has_post_mutation_validation(
+            "mutate-command\nvalue=$(curl -fsS https://service/ | tr -d '\\n')\necho \"status=$([ \\\"$value\\\" = expected ] && echo PASS || echo FAIL)\"\n"
+        ));
+        assert!(bash_command_has_post_mutation_validation(
+            "mutate-command\ncat result.json # ; $(unknown_probe) `unknown_probe` &\n"
+        ));
+        assert!(bash_command_has_post_mutation_validation(
+            "mutate-command\necho \"state=#not-a-comment\"\ncat result.json # preserve receipt\n"
+        ));
+        assert!(bash_command_has_post_mutation_validation(
+            "mutate-command\nvalue=$(curl -fsS https://service/#fragment)\n"
+        ));
+    }
+
+    #[test]
+    fn nested_unknown_or_post_receipt_writes_do_not_fake_validation() {
+        assert!(!bash_command_has_post_mutation_validation(
+            r#"write-command; echo "$(unknown_probe)""#
+        ));
+        assert!(!bash_command_has_post_mutation_validation(
+            r#"write-command; echo "$(cat result.json)" > report.txt"#
+        ));
+        assert!(!bash_command_has_post_mutation_validation(
+            r#"write-command; value=$(cat result.json; unknown_probe)"#
+        ));
+        assert!(!bash_command_has_post_mutation_validation(
+            r#"write-command; echo "$(curl -X POST https://localhost/deploy)""#
+        ));
+        assert!(!bash_command_has_post_mutation_validation(
+            r#"write-command; echo "$(cat result.json)" | tee changed.txt"#
+        ));
+        assert!(!bash_command_has_post_mutation_validation(
+            r#"write-command; echo '$(cat result.json)'"#
+        ));
+        assert!(!bash_command_has_post_mutation_validation(
+            r#"write-command; echo "$(cat result.json""#
+        ));
+        assert!(!bash_command_has_post_mutation_validation(
+            r#"write-command; value=$(echo "$(echo "$(echo "$(echo "$(echo "$(echo "$(echo "$(echo "$(echo "$(echo "$(echo "$(echo "$(echo "$(echo "$(echo "$(echo "$(echo "$(echo "$(cat result.json)"))))))))))))))))")"#
+        ));
+        let oversized = format!(
+            "cat result.json; {}unknown-write",
+            "x".repeat(MAX_SHELL_LEX_BYTES)
+        );
+        assert!(!bash_command_has_post_mutation_validation(&oversized));
+        assert!(!bash_command_has_post_mutation_validation(
+            r#"cat result.json; echo "unterminated"#
+        ));
+        assert!(!bash_command_has_post_mutation_validation(
+            r#"cat result.json; echo "$(cat result.json"#
+        ));
+        assert!(!bash_command_has_post_mutation_validation(
+            r#"cat result.json; echo `unknown_probe`"#
+        ));
+        assert!(!bash_command_has_post_mutation_validation(
+            "cat result.json; echo \"$(cat result.json)\" & unknown-write"
+        ));
+        assert!(!bash_command_has_post_mutation_validation(
+            "cat result.json <<EOF\nunknown-write\nEOF"
+        ));
     }
 }

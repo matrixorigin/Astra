@@ -1,6 +1,7 @@
 //! Progress events for spawned agents.
 
 use super::fanout_group::AgentFanoutSlotIdentity;
+use super::types::CancellationOrigin;
 use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
@@ -60,7 +61,10 @@ pub enum ProgressEventType {
     /// Agent is waiting for external input or an execution boundary to recover.
     Waiting { reason: String },
     /// Agent cancelled.
-    Cancelled { reason: String },
+    Cancelled {
+        reason: String,
+        origin: CancellationOrigin,
+    },
     /// Tool blocked by permission policy (emitted so parent/UI can surface warnings).
     PermissionDenied {
         tool_name: String,
@@ -247,9 +251,10 @@ impl AgentProgressEmitter {
         });
     }
 
-    pub fn cancelled(&self, reason: impl Into<String>) {
+    pub fn cancelled(&self, reason: impl Into<String>, origin: CancellationOrigin) {
         self.emit(ProgressEventType::Cancelled {
             reason: reason.into(),
+            origin,
         });
     }
 
@@ -493,12 +498,16 @@ mod tests {
             "run-root".to_string(),
             None,
         );
-        emitter2.cancelled("user request");
+        emitter2.cancelled("user request", CancellationOrigin::User);
         let e2 = rx.recv().await.unwrap();
         assert_eq!(e2.agent_id, "agent-3");
-        assert!(
-            matches!(e2.event_type, ProgressEventType::Cancelled { reason } if reason == "user request")
-        );
+        assert!(matches!(
+            e2.event_type,
+            ProgressEventType::Cancelled {
+                reason,
+                origin: CancellationOrigin::User,
+            } if reason == "user request"
+        ));
 
         let emitter3 = broadcaster.for_agent_with_run_context(
             "agent-4".to_string(),

@@ -11,13 +11,11 @@ mod request;
 use serde::{Deserialize, Serialize};
 
 use crate::injection_tracking::{ChannelFreshness, ChannelStatus, InjectionChannel};
-use astra_core::{ObservationDepth, ObservationFacet};
-pub use observation::{IntrospectReport, build_introspect_report};
+use astra_core::{ObservationDepth, ObservationFacet, ObservationHorizon};
+pub use observation::{
+    INTROSPECT_REPORT_SCHEMA_VERSION, IntrospectReport, build_introspect_report,
+};
 pub use request::{IntrospectDepth, IntrospectFormat, IntrospectRequest};
-
-fn is_false(value: &bool) -> bool {
-    !*value
-}
 
 fn is_zero_u32(value: &u32) -> bool {
     *value == 0
@@ -26,31 +24,16 @@ fn is_zero_u32(value: &u32) -> bool {
 /// Input snapshot provided by the runtime to the introspect renderer.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IntrospectSnapshot {
-    /// Concrete model selected for this turn. This is the authoritative
-    /// self-identity fact for "what model am I?" questions; callers must not
-    /// infer it from recent rounds or defaults.
+    /// Canonical facts from the latest successfully ingested provider round.
+    /// `None` means no provider round has been observed yet; consumers must
+    /// not manufacture zero-valued progress or capacity from that absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub current_model: Option<String>,
-    pub token_pressure: f64,
-    /// Prompt-cache read share for this live runtime snapshot:
-    /// `cache_read_tokens / total_input_tokens`.
-    ///
-    /// This is not a durable session-wide aggregate unless the producer
-    /// explicitly populated the snapshot from a session aggregate.
-    pub cache_hit_ratio: f64,
-    pub turns_completed: u32,
-    pub turns_remaining: u32,
-    /// Explicit budget semantics for hosts where `turns_remaining == 0` means
-    /// unbounded rather than exhausted. Renderers must use this field instead
-    /// of inferring unlimited/exhausted from the numeric value alone.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub turn_budget_unlimited: bool,
+    pub runtime_feedback: Option<crate::context_feedback::RuntimeFeedbackFrame>,
     /// Number of user/session turns elapsed since this snapshot was captured.
     /// Live snapshots use 0; holders that serve older snapshots can increment
     /// this before rendering.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub snapshot_age_turns: u32,
-    pub compaction_tier: String,
     pub alerts: Vec<String>,
     pub tool_health: Vec<ToolHealthEntry>,
     pub working_memory_summary: String,
@@ -80,27 +63,6 @@ pub struct IntrospectSnapshot {
     /// read-only projection and never becomes execution authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invocation_lifecycle: Option<InvocationLifecycleSnapshot>,
-    /// Provider-reported input token total for this snapshot. This includes
-    /// fresh input tokens, cached-read input tokens, and cache-creation tokens.
-    pub total_input_tokens: u64,
-    pub total_output_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_creation_tokens: u64,
-    /// Current estimated input tokens for the live prompt/context. This is the
-    /// numerator used for token pressure and can differ from cumulative
-    /// provider input tokens.
-    #[serde(default)]
-    pub estimated_input_tokens: u64,
-    /// Effective per-turn input budget after model/config reserves. This is
-    /// not necessarily the full provider context window; callers should label
-    /// it as an effective input budget.
-    #[serde(default)]
-    pub effective_input_budget_tokens: u64,
-    /// Full provider context window for the active model, when the runtime has
-    /// registry metadata. This differs from `effective_input_budget_tokens`,
-    /// which keeps output/protocol headroom.
-    #[serde(default)]
-    pub context_window_tokens: u64,
 
     // ── Task #46: enhanced self-awareness ──
     /// Summary of the most recent LLM rounds (in-memory ring). Available
@@ -263,6 +225,13 @@ pub use astra_runtime_env::CapacityProviderCoverageEntry;
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ToolAdmissionSnapshotEntry {
     pub tool_name: String,
+    /// Whether this exact tool schema was present on the most recent provider
+    /// request. `None` means the host has not observed a provider wire surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_visible: Option<bool>,
+    /// Route/provider readiness is a candidate-plane fact, not proof that the
+    /// schema was sent to the model. Keep the legacy field name on the wire,
+    /// but render it with its precise scope.
     pub visible: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_offer_id: Option<String>,
@@ -345,13 +314,21 @@ pub fn render_introspect_request(
     snapshot: &IntrospectSnapshot,
     request: &IntrospectRequest,
 ) -> String {
+    let historical_horizon = matches!(
+        request.horizon,
+        ObservationHorizon::Turn | ObservationHorizon::Session | ObservationHorizon::CrossSession
+    );
     if request.format.is_json() {
         return observation::render_introspect_report_json(snapshot, request);
     }
 
-    match request.facet {
+    let mut live_request = request.clone();
+    if historical_horizon {
+        live_request.horizon = ObservationHorizon::Recent;
+    }
+    let body = match live_request.facet {
         ObservationFacet::Session => {
-            let depth = match request.depth {
+            let depth = match live_request.depth {
                 ObservationDepth::Hint => IntrospectTextDepth::Hint,
                 ObservationDepth::Summary => IntrospectTextDepth::Summary,
                 ObservationDepth::Diagnostic | ObservationDepth::Forensic => {
@@ -367,8 +344,20 @@ pub fn render_introspect_request(
         ObservationFacet::Errors => render_errors(snapshot),
         ObservationFacet::Overview => render_all(snapshot),
         ObservationFacet::Cache | ObservationFacet::SessionMemory => {
-            render_edge_local_unavailable(request)
+            render_edge_local_unavailable(&live_request)
         }
+    };
+    let boundary = "## Observation Boundary\n\
+snapshot_cutoff=before_current_introspect_execution; the selecting round may list `introspect` as requested/in-flight, and calls made after this snapshot are absent. Treat counts and states as snapshot-time observations, not final session totals.";
+    if historical_horizon {
+        format!(
+            "## Introspect Live Projection\nrequested_horizon={} coverage=recent-only; use reflect for persisted causal evidence.\n\n{}\n\n{}",
+            request.horizon.as_str(),
+            boundary,
+            body
+        )
+    } else {
+        format!("{boundary}\n\n{body}")
     }
 }
 
@@ -398,24 +387,54 @@ fn render_introspect(snapshot: &IntrospectSnapshot, depth: IntrospectTextDepth) 
 }
 
 fn render_hint(s: &IntrospectSnapshot) -> String {
+    let Some(frame) = s.runtime_feedback.as_ref() else {
+        let mut out = format!(
+            "runtime_feedback=not_yet_observed alerts={} providers={} tool_admission={}",
+            s.alerts.len(),
+            capacity_provider_inline_summary(s),
+            tool_admission_inline_summary(s),
+        );
+        if s.snapshot_age_turns > 0 {
+            out.push_str(&format!(" snapshot_age_turns={}", s.snapshot_age_turns));
+        }
+        return out;
+    };
+    let pressure = frame.context.token_pressure.map_or_else(
+        || "unknown".to_string(),
+        |value| format!("{:.0}%", value * 100.0),
+    );
+    let cache_share = prompt_cache_read_share_pct(s)
+        .map_or_else(|| "unknown".to_string(), |value| format!("{value:.0}%"));
+    let (input_total, cached_read, cache_create) = frame.run_usage.map_or_else(
+        || ("unknown".into(), "unknown".into(), "unknown".into()),
+        |usage| {
+            (
+                usage.total_input().to_string(),
+                usage.cache_read.to_string(),
+                usage.cache_creation.to_string(),
+            )
+        },
+    );
     let mut out = format!(
-        "pressure={:.0}% prompt_cache_read_share={:.0}% prompt_cache_scope=current_runtime_snapshot input_total={} cached_read={} cache_create={} turns={} alerts={} tier={}",
-        s.token_pressure * 100.0,
-        prompt_cache_read_share_pct(s),
-        s.total_input_tokens,
-        s.cache_read_tokens,
-        s.cache_creation_tokens,
+        "pressure={} prompt_cache_read_share={} prompt_cache_scope=current_runtime_snapshot input_total={} cached_read={} cache_create={} turns={} alerts={} tier={}",
+        pressure,
+        cache_share,
+        input_total,
+        cached_read,
+        cache_create,
         turn_budget_label(s),
         s.alerts.len(),
-        s.compaction_tier,
+        format_args!("{:?}", frame.context.compaction_tier),
     );
     if s.snapshot_age_turns > 0 {
         out.push_str(&format!(" snapshot_age_turns={}", s.snapshot_age_turns));
     }
-    if let Some(model) = s.current_model.as_deref() {
-        out.push_str(" model=");
-        out.push_str(model);
-    }
+    out.push_str(" model=");
+    out.push_str(&frame.identity.model_id);
+    out.push_str(" topology=");
+    out.push_str(frame.identity.topology.as_str());
+    out.push_str(" policy_feedback=");
+    out.push_str(&frame.policy_feedback.inline_summary());
     if !s.capacity_provider_coverage.is_empty() {
         out.push_str(" providers=");
         out.push_str(&capacity_provider_inline_summary(s));
@@ -446,47 +465,115 @@ fn render_hint(s: &IntrospectSnapshot) -> String {
 
 fn render_summary(s: &IntrospectSnapshot) -> String {
     let mut out = String::new();
+    let Some(frame) = s.runtime_feedback.as_ref() else {
+        out.push_str("## Current Runtime Snapshot\n");
+        out.push_str("Runtime feedback: not yet observed. No provider round has been successfully ingested for this runtime.\n");
+        if s.snapshot_age_turns > 0 {
+            out.push_str(&format!("Snapshot age: {} turn(s)\n", s.snapshot_age_turns));
+        }
+        if !s.capacity_provider_coverage.is_empty() {
+            out.push_str("Capacity providers: ");
+            out.push_str(&capacity_provider_inline_summary(s));
+            out.push('\n');
+        }
+        if !s.alerts.is_empty() {
+            out.push_str("Alerts:\n");
+            for alert in s.alerts.iter().take(3) {
+                out.push_str("- ");
+                out.push_str(alert);
+                out.push('\n');
+            }
+        }
+        if !s.working_memory_summary.is_empty() {
+            out.push_str(&s.working_memory_summary);
+            out.push('\n');
+        }
+        if !s.lifecycle_summary.is_empty() {
+            out.push_str(&s.lifecycle_summary);
+            out.push('\n');
+        }
+        if !s.tool_admission.is_empty() {
+            out.push_str(&format!(
+                "Route readiness: {}\n",
+                tool_admission_inline_summary(s)
+            ));
+            if let Some(surface) = provider_tool_surface_inline_summary(s) {
+                out.push_str(&format!("Provider wire tool surface: {surface}\n"));
+            }
+        }
+        return out.trim_end().to_string();
+    };
+    let pressure = frame.context.token_pressure.map_or_else(
+        || "unknown".to_string(),
+        |value| format!("{:.0}%", value * 100.0),
+    );
+    let cache_share = prompt_cache_read_share_pct(s)
+        .map_or_else(|| "unknown".to_string(), |value| format!("{value:.0}%"));
+    let (input_total, fresh, cached_read, cache_create, output) = frame.run_usage.map_or_else(
+        || {
+            (
+                "unknown".into(),
+                "unknown".into(),
+                "unknown".into(),
+                "unknown".into(),
+                "unknown".into(),
+            )
+        },
+        |usage| {
+            (
+                usage.total_input().to_string(),
+                usage.prompt.to_string(),
+                usage.cache_read.to_string(),
+                usage.cache_creation.to_string(),
+                usage.completion.to_string(),
+            )
+        },
+    );
     out.push_str(&format!(
         "## Current Runtime Snapshot\n\
          Scope: current live runtime snapshot; prompt-cache values are not durable session-wide aggregates.\n\
-         Pressure: {:.0}% | Prompt cache read share: {:.0}% | Turns: {} | Tier: {}\n\
+         Pressure: {} | Prompt cache read share: {} | Turns: {} | Tier: {}\n\
          Prompt tokens: input_total={} fresh={} cached_read={} cache_create={} | Output tokens: {}\n",
-        s.token_pressure * 100.0,
-        prompt_cache_read_share_pct(s),
+        pressure,
+        cache_share,
         turn_budget_label(s),
-        s.compaction_tier,
-        s.total_input_tokens,
-        prompt_cache_fresh_input_tokens(s),
-        s.cache_read_tokens,
-        s.cache_creation_tokens,
-        s.total_output_tokens,
+        format_args!("{:?}", frame.context.compaction_tier),
+        input_total,
+        fresh,
+        cached_read,
+        cache_create,
+        output,
     ));
-    if let Some(model) = s.current_model.as_deref() {
-        out.push_str("Current model: ");
-        out.push_str(model);
-        out.push('\n');
-    }
+    out.push_str("Current model: ");
+    out.push_str(&frame.identity.model_id);
+    out.push('\n');
+    out.push_str("Execution topology: ");
+    out.push_str(frame.identity.topology.as_str());
+    out.push('\n');
+    out.push_str("Runtime policy feedback: ");
+    out.push_str(&frame.policy_feedback.inline_summary());
+    out.push('\n');
     if s.snapshot_age_turns > 0 {
         out.push_str(&format!("Snapshot age: {} turn(s)\n", s.snapshot_age_turns));
     }
-    if s.context_window_tokens > 0 {
+    if let Some(context_window_tokens) = frame.context.model_context_window_tokens {
         out.push_str(&format!(
             "Provider context window: {} tokens\n",
-            s.context_window_tokens
+            context_window_tokens
         ));
     }
-    if s.effective_input_budget_tokens > 0 {
-        if s.estimated_input_tokens > 0 {
+    if let Some(effective_input_limit_tokens) = frame.context.effective_input_limit_tokens {
+        if let Some(estimated_input_tokens) = frame.context.estimated_input_tokens {
             out.push_str(&format!(
                 "Effective input budget: {}/{} tokens ({:.0}% used)\n",
-                s.estimated_input_tokens,
-                s.effective_input_budget_tokens,
-                (s.estimated_input_tokens as f64 / s.effective_input_budget_tokens as f64) * 100.0,
+                estimated_input_tokens,
+                effective_input_limit_tokens,
+                (estimated_input_tokens as f64 / effective_input_limit_tokens as f64) * 100.0,
             ));
         } else {
             out.push_str(&format!(
                 "Effective input budget: {} tokens (usage estimate unavailable)\n",
-                s.effective_input_budget_tokens,
+                effective_input_limit_tokens,
             ));
         }
     }
@@ -516,9 +603,12 @@ fn render_summary(s: &IntrospectSnapshot) -> String {
     }
     if !s.tool_admission.is_empty() {
         out.push_str(&format!(
-            "Tool admission: {}\n",
+            "Route readiness: {}\n",
             tool_admission_inline_summary(s)
         ));
+        if let Some(surface) = provider_tool_surface_inline_summary(s) {
+            out.push_str(&format!("Provider wire tool surface: {surface}\n"));
+        }
     }
     if !s.semantic_cache_decisions.is_empty() {
         out.push_str("Semantic read cache decisions: ");
@@ -533,7 +623,7 @@ fn render_summary(s: &IntrospectSnapshot) -> String {
     }
     if let Some(lifecycle) = s.invocation_lifecycle.as_ref() {
         out.push_str(&format!(
-            "Invocation lifecycle: hot={} prepared={} dispatched={} succeeded={} failed={} rejected={} not_dispatched_rejections={} outcome_unknown={} archive_chunks={} artifact_refs={} reconciliations={} deferred={}\n",
+            "Durable invocation lifecycle: hot={} prepared={} dispatched={} succeeded={} failed={} rejected={} not_dispatched_rejections={} outcome_unknown={} archive_chunks={} artifact_refs={} reconciliations={} deferred={}\n",
             lifecycle.hot_total,
             lifecycle.prepared,
             lifecycle.dispatched,
@@ -564,6 +654,23 @@ fn tool_admission_inline_summary(s: &IntrospectSnapshot) -> String {
         .count();
     let hidden = total.saturating_sub(visible);
     format!("visible={visible}/{total} hidden={hidden}")
+}
+
+fn provider_tool_surface_inline_summary(s: &IntrospectSnapshot) -> Option<String> {
+    let observed = s
+        .tool_admission
+        .iter()
+        .filter(|entry| entry.provider_visible.is_some())
+        .count();
+    (observed > 0).then(|| {
+        let names = s
+            .tool_admission
+            .iter()
+            .filter(|entry| entry.provider_visible == Some(true))
+            .map(|entry| entry.tool_name.as_str())
+            .collect::<Vec<_>>();
+        format!("visible={} tools=[{}]", names.len(), names.join(", "))
+    })
 }
 
 pub fn capacity_provider_coverage_summary(coverage: &[CapacityProviderCoverageEntry]) -> String {
@@ -599,30 +706,40 @@ fn capacity_provider_unavailable_text(reason: &str) -> &str {
 }
 
 pub fn turn_budget_label(s: &IntrospectSnapshot) -> String {
-    if s.turn_budget_unlimited || (s.turns_completed == 0 && s.turns_remaining == 0) {
-        format!("{}/∞", s.turns_completed)
-    } else {
-        format!(
-            "{}/{}",
-            s.turns_completed,
-            s.turns_completed.saturating_add(s.turns_remaining)
-        )
-    }
+    let Some(frame) = s.runtime_feedback.as_ref() else {
+        return "not_yet_observed".to_string();
+    };
+    let progress = frame.progress;
+    let ceiling = progress
+        .absolute_round_ceiling
+        .map_or_else(|| "renewable".to_string(), |value| value.to_string());
+    format!(
+        "session_turn={} round={}/{} remaining={} ceiling={}",
+        progress.session_turn,
+        progress.llm_rounds_completed,
+        progress.slice_round_limit,
+        progress.slice_rounds_remaining,
+        ceiling,
+    )
 }
 
 pub fn mark_snapshot_age(snapshot: &mut IntrospectSnapshot, current_session_turn: u32) {
-    let age = current_session_turn.saturating_sub(snapshot.turns_completed);
-    snapshot.snapshot_age_turns = snapshot.snapshot_age_turns.max(age);
+    if let Some(frame) = snapshot.runtime_feedback.as_ref() {
+        let age = current_session_turn.saturating_sub(frame.progress.session_turn);
+        snapshot.snapshot_age_turns = snapshot.snapshot_age_turns.max(age);
+    }
 }
 
-pub fn prompt_cache_read_share_pct(s: &IntrospectSnapshot) -> f64 {
-    s.cache_hit_ratio * 100.0
+pub fn prompt_cache_read_share_pct(s: &IntrospectSnapshot) -> Option<f64> {
+    s.runtime_feedback
+        .as_ref()
+        .and_then(|frame| frame.cache_hit_ratio().map(|ratio| ratio * 100.0))
 }
 
-pub fn prompt_cache_fresh_input_tokens(s: &IntrospectSnapshot) -> u64 {
-    s.total_input_tokens
-        .saturating_sub(s.cache_read_tokens)
-        .saturating_sub(s.cache_creation_tokens)
+pub fn prompt_cache_fresh_input_tokens(s: &IntrospectSnapshot) -> Option<u64> {
+    s.runtime_feedback
+        .as_ref()
+        .and_then(|frame| frame.run_usage.map(|usage| usage.prompt))
 }
 
 fn render_full(s: &IntrospectSnapshot) -> String {
@@ -895,7 +1012,7 @@ pub fn render_stall_state(s: &IntrospectSnapshot) -> String {
 /// Render `facet=errors` — recent tool failures with error previews.
 pub fn render_errors(s: &IntrospectSnapshot) -> String {
     if s.tool_errors.is_empty() {
-        return "## Recent Tool Errors\n(No failures recorded this session.)".to_string();
+        return "## Recent Tool Errors\n(No failures in this live runtime projection. Admission rejections and durable session alerts may exist outside this recent-tool view; use reflect for session-wide evidence.)".to_string();
     }
     let mut out = String::from(
         "## Recent Tool Errors (newest first)\n\
@@ -1080,22 +1197,64 @@ fn preview_line(text: &str, max: usize) -> String {
 }
 
 #[cfg(test)]
+pub(crate) fn test_runtime_feedback(
+    session_turn: u32,
+    llm_rounds_completed: u32,
+    slice_rounds_remaining: u32,
+) -> crate::context_feedback::RuntimeFeedbackFrame {
+    crate::context_feedback::RuntimeFeedbackFrame {
+        schema_version: crate::context_feedback::RuntimeFeedbackFrame::SCHEMA_VERSION,
+        identity: crate::context_feedback::RuntimeFeedbackIdentity {
+            session_id: "session-1".into(),
+            run_id: "run-1".into(),
+            agent_id: "agent-1".into(),
+            model_id: "deepseek-v4-flash".into(),
+            topology: astra_services::ModelRequestTopology::ServerOnly,
+            request: None,
+        },
+        progress: crate::context_feedback::RuntimeFeedbackProgress {
+            session_turn,
+            agentic_round_index: llm_rounds_completed.saturating_sub(1),
+            llm_rounds_completed,
+            slice_round_limit: llm_rounds_completed.saturating_add(slice_rounds_remaining),
+            slice_rounds_remaining,
+            absolute_round_ceiling: None,
+        },
+        context: crate::context_feedback::RuntimeContextFeedback {
+            prompt_cache_identity: None,
+            model_context_window_tokens: Some(1_000_000),
+            effective_input_limit_tokens: Some(800_000),
+            estimated_input_tokens: Some(132_000),
+            token_pressure: Some(0.72),
+            compaction_tier: crate::compaction_types::CompactionTier::Normal,
+        },
+        request_usage: Some(crate::token_accounting::TokenAccounting::from_fields(
+            42_000, 95_000, 8_000, 12_000,
+        )),
+        run_usage: Some(crate::token_accounting::TokenAccounting::from_fields(
+            42_000, 95_000, 8_000, 12_000,
+        )),
+        was_truncated: false,
+        cache_break_detected: None,
+        policy_feedback: Default::default(),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+    use crate::context_feedback::{
+        RuntimePolicyFeedbackEntry, RuntimePolicyFeedbackSet, RuntimePolicyRecommendation,
+        RuntimePolicySignal, RuntimePolicyStage, RuntimePolicySubject,
+    };
     use astra_core::EvidenceRef;
 
     fn sample_snapshot() -> IntrospectSnapshot {
         IntrospectSnapshot {
-            current_model: Some("deepseek-v4-pro-official(thinking:high)".into()),
-            token_pressure: 0.72,
-            cache_hit_ratio: 0.65,
-            turns_completed: 8,
-            turns_remaining: 12,
-            turn_budget_unlimited: false,
+            runtime_feedback: Some(test_runtime_feedback(8, 8, 12)),
             snapshot_age_turns: 0,
-            compaction_tier: "Normal".into(),
             alerts: vec![
                 "cache_regression: hit rate dropped 20% in 3 turns".into(),
                 "tool_health: bash error rate >30%".into(),
@@ -1140,13 +1299,6 @@ mod tests {
             tool_admission: Vec::new(),
             semantic_cache_decisions: Vec::new(),
             invocation_lifecycle: None,
-            total_input_tokens: 145_000,
-            total_output_tokens: 12_000,
-            cache_read_tokens: 95_000,
-            cache_creation_tokens: 8_000,
-            estimated_input_tokens: 132_000,
-            effective_input_budget_tokens: 800_000,
-            context_window_tokens: 1_000_000,
             recent_rounds: Vec::new(),
             step_latency: Vec::new(),
             volatile_pending: Vec::new(),
@@ -1166,15 +1318,58 @@ mod tests {
             "hint must be a single line: {output}"
         );
         assert!(output.contains("pressure=72%"));
-        assert!(output.contains("prompt_cache_read_share=65%"));
+        assert!(output.contains("prompt_cache_read_share=66%"));
         assert!(output.contains("prompt_cache_scope=current_runtime_snapshot"));
         assert!(output.contains("input_total=145000"));
         assert!(output.contains("cached_read=95000"));
         assert!(output.contains("cache_create=8000"));
-        assert!(!output.contains("cache=65%"));
-        assert!(output.contains("turns=8/20"));
+        assert!(!output.contains("cache=66%"));
+        assert!(output.contains("turns=session_turn=8 round=8/20 remaining=12"));
         assert!(output.contains("alerts=2"));
-        assert!(output.contains("model=deepseek-v4-pro-official(thinking:high)"));
+        assert!(output.contains("model=deepseek-v4-flash"));
+        assert!(output.contains("topology=server_only"));
+    }
+
+    #[test]
+    fn policy_feedback_subject_is_visible_at_every_text_depth() {
+        let mut snapshot = sample_snapshot();
+        snapshot
+            .runtime_feedback
+            .as_mut()
+            .expect("runtime feedback")
+            .policy_feedback = RuntimePolicyFeedbackSet::Evaluated {
+            schema_version: RuntimePolicyFeedbackSet::SCHEMA_VERSION,
+            revision: 4,
+            evaluated_at_round: 8,
+            subject: RuntimePolicySubject::WorkItem {
+                attempt_id: "attempt-1".to_string(),
+                item_id: "item-2".to_string(),
+                item_revision: 3,
+                objective: "Inspect one target".to_string(),
+                expected_result: "One verified fact".to_string(),
+            },
+            entries: vec![RuntimePolicyFeedbackEntry {
+                signal: RuntimePolicySignal::RedundantReads,
+                stage: RuntimePolicyStage::Converge,
+                observed_at_round: 8,
+                evidence_count: 9,
+                recommendation: RuntimePolicyRecommendation::ReuseKnownContent,
+            }],
+        };
+
+        for depth in [
+            IntrospectTextDepth::Hint,
+            IntrospectTextDepth::Summary,
+            IntrospectTextDepth::Full,
+        ] {
+            let output = render_introspect(&snapshot, depth);
+            assert!(output.contains("server_only"), "{depth:?}: {output}");
+            assert!(output.contains("work_item=item-2@3"), "{depth:?}: {output}");
+            assert!(
+                output.contains("RedundantReads/Converge"),
+                "{depth:?}: {output}"
+            );
+        }
     }
 
     #[test]
@@ -1252,13 +1447,13 @@ mod tests {
         let output = render_introspect(&sample_snapshot(), IntrospectTextDepth::Summary);
         assert!(output.contains("## Current Runtime Snapshot"));
         assert!(output.contains("Scope: current live runtime snapshot"));
-        assert!(output.contains("Prompt cache read share: 65%"));
+        assert!(output.contains("Prompt cache read share: 66%"));
         assert!(output.contains(
             "Prompt tokens: input_total=145000 fresh=42000 cached_read=95000 cache_create=8000"
         ));
-        assert!(!output.contains("Cache: 65%"));
+        assert!(!output.contains("Cache: 66%"));
         assert!(output.contains("cache_regression"));
-        assert!(output.contains("Current model: deepseek-v4-pro-official(thinking:high)"));
+        assert!(output.contains("Current model: deepseek-v4-flash"));
         assert!(output.contains("Provider context window: 1000000 tokens"));
         assert!(output.contains("Effective input budget: 132000/800000 tokens"));
         assert!(output.contains("Goal: implement streaming resume"));
@@ -1282,6 +1477,7 @@ mod tests {
         let snap = IntrospectSnapshot {
             tool_admission: vec![ToolAdmissionSnapshotEntry {
                 tool_name: "web_fetch".to_string(),
+                provider_visible: Some(true),
                 visible: true,
                 selected_offer_id: Some("web_fetch@edge-1".to_string()),
                 selected_route: "EdgeBound".to_string(),
@@ -1321,7 +1517,8 @@ mod tests {
         };
 
         let summary = render_introspect(&snap, IntrospectTextDepth::Summary);
-        assert!(summary.contains("Tool admission: visible=1/1 hidden=0"));
+        assert!(summary.contains("Route readiness: visible=1/1 hidden=0"));
+        assert!(summary.contains("Provider wire tool surface: visible=1 tools=[web_fetch]"));
 
         let req = IntrospectRequest {
             format: IntrospectFormat::Json,
@@ -1356,10 +1553,21 @@ mod tests {
         let report: IntrospectReport = serde_json::from_str(&out).expect("json report");
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("json value");
 
-        assert_eq!(report.schema_version, 1);
+        assert_eq!(report.schema_version, INTROSPECT_REPORT_SCHEMA_VERSION);
         assert_eq!(report.tool, "introspect");
-        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["schema_version"], INTROSPECT_REPORT_SCHEMA_VERSION);
         assert_eq!(parsed["tool"], "introspect");
+        assert_eq!(
+            parsed["runtime_feedback"]["identity"]["topology"],
+            "server_only"
+        );
+        assert_eq!(
+            report
+                .runtime_feedback
+                .as_ref()
+                .map(|frame| frame.identity.topology),
+            Some(astra_services::ModelRequestTopology::ServerOnly)
+        );
         assert_eq!(parsed["topic"], parsed["view"]["topic"]);
         assert_eq!(parsed["facet"], parsed["view"]["facet"]);
         assert_eq!(parsed["depth"], parsed["view"]["depth"]);
@@ -1367,6 +1575,11 @@ mod tests {
         assert_eq!(parsed["data_coverage"], parsed["view"]["data_coverage"]);
         assert_eq!(report.view.topic, "execution");
         assert_eq!(report.view.facet, "errors");
+        assert!(
+            report
+                .summary
+                .contains("snapshot_cutoff=before_current_introspect_execution")
+        );
         assert!(report.summary.contains("recent tool errors"));
         assert!(
             report
@@ -1389,6 +1602,50 @@ mod tests {
         );
         assert!(!report.budget_result.truncated);
         assert_report_refs_are_valid(&report);
+    }
+
+    #[test]
+    fn historical_horizon_returns_a_labeled_recent_live_projection() {
+        let request = IntrospectRequest::from_args(&serde_json::json!({
+            "facet": "trace",
+            "horizon": "session"
+        }));
+        let text = render_introspect_request(&sample_snapshot(), &request);
+        assert!(text.contains("Introspect Live Projection"), "{text}");
+        assert!(text.contains("requested_horizon=session"), "{text}");
+        assert!(text.contains("coverage=recent-only"), "{text}");
+        assert!(text.contains("use reflect"), "{text}");
+        assert!(
+            text.contains("snapshot_cutoff=before_current_introspect_execution"),
+            "{text}"
+        );
+        assert!(
+            text.contains("No rounds recorded yet in this turn"),
+            "{text}"
+        );
+
+        let json_request = IntrospectRequest::from_args(&serde_json::json!({
+            "facet": "trace",
+            "horizon": "session",
+            "format": "json"
+        }));
+        let report: IntrospectReport = serde_json::from_str(&render_introspect_request(
+            &sample_snapshot(),
+            &json_request,
+        ))
+        .expect("live projection report");
+        assert_eq!(report.data_coverage.overall, "partial");
+        assert_eq!(report.horizon, "recent");
+        assert_eq!(report.view.horizon, "recent");
+        assert!(report.summary.contains("use reflect"));
+        assert!(
+            report
+                .data_coverage
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("requested historical horizon=session") })
+        );
+        assert!(!report.evidence.is_empty());
     }
 
     #[test]
@@ -1588,33 +1845,29 @@ mod tests {
         let hint = render_introspect(&empty, IntrospectTextDepth::Hint);
         assert_eq!(
             hint,
-            "pressure=0% prompt_cache_read_share=0% prompt_cache_scope=current_runtime_snapshot input_total=0 cached_read=0 cache_create=0 turns=0/∞ alerts=0 tier="
+            "runtime_feedback=not_yet_observed alerts=0 providers= tool_admission=visible=0/0 hidden=0"
         );
         let full = render_introspect(&empty, IntrospectTextDepth::Full);
         assert!(full.contains("## Current Runtime Snapshot"));
-        assert!(full.contains("Pressure: 0% | Prompt cache read share: 0% | Turns: 0/∞ | Tier:"));
+        assert!(full.contains("Runtime feedback: not yet observed"));
         assert!(!full.contains("Cache: 0%"));
         assert!(!full.contains("## Tool Health"));
         assert!(!full.contains("Current model:"));
     }
 
     #[test]
-    fn unlimited_turn_budget_renders_infinity_instead_of_zero_total() {
+    fn zero_remaining_is_exhausted_not_unlimited() {
         let snap = IntrospectSnapshot {
-            turns_completed: 3,
-            turns_remaining: 0,
-            turn_budget_unlimited: true,
+            runtime_feedback: Some(test_runtime_feedback(3, 3, 0)),
             ..Default::default()
         };
 
         let hint = render_introspect(&snap, IntrospectTextDepth::Hint);
-        assert!(hint.contains("turns=3/∞"), "got: {hint}");
+        assert!(hint.contains("remaining=0"), "got: {hint}");
+        assert!(!hint.contains('∞'), "got: {hint}");
 
         let summary = render_introspect(&snap, IntrospectTextDepth::Summary);
-        assert!(
-            summary.contains("Turns: 3/∞"),
-            "summary should preserve unlimited semantics: {summary}"
-        );
+        assert!(summary.contains("remaining=0"), "got: {summary}");
     }
 
     #[test]
@@ -1993,8 +2246,8 @@ mod tests {
         let snap = IntrospectSnapshot::default();
         let out = render_errors(&snap);
         assert!(
-            out.contains("No failures recorded"),
-            "empty errors should report no failures: {out}"
+            out.contains("No failures in this live runtime projection"),
+            "empty errors should state the bounded evidence scope: {out}"
         );
     }
 

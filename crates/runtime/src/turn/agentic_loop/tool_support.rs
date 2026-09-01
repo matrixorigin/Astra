@@ -5,12 +5,8 @@ use astra_turn_core::sse_stream_host::EdgeToolExecResult;
 use super::host::AgenticLoopState;
 
 pub(crate) fn edge_tool_status_exit_code(status: &str) -> Option<i32> {
-    match status.trim().to_ascii_lowercase().as_str() {
-        "completed" | "skipped" => Some(0),
-        "failed" | "partial_failure" | "denied" | "rejected" | "cancelled" | "timeout"
-        | "timed_out" => Some(1),
-        _ => None,
-    }
+    astra_thin_client::tool_result_status_is_error(status)
+        .map(|is_error| if is_error { 1 } else { 0 })
 }
 
 fn structured_edge_exit_code(fields: Option<&Map<String, Value>>) -> Option<i32> {
@@ -129,7 +125,7 @@ pub(crate) fn delegate_tool_schema() -> Value {
                     "max_turns": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Maximum turns for each explicit fork task (default: 10)."
+                        "description": "Maximum turns for each explicit fork task. If omitted, the selected agent profile supplies the bounded default; set this explicitly when a different hard limit is intended."
                     },
                     "timeout": {
                         "type": "integer",
@@ -175,14 +171,19 @@ mod tests {
     #[test]
     fn edge_tool_status_exit_code_maps_common_statuses() {
         assert_eq!(edge_tool_status_exit_code("completed"), Some(0));
-        assert_eq!(edge_tool_status_exit_code("skipped"), Some(0));
+        assert_eq!(edge_tool_status_exit_code("success"), None);
+        assert_eq!(edge_tool_status_exit_code("ok"), None);
+        assert_eq!(edge_tool_status_exit_code("skipped"), None);
         assert_eq!(edge_tool_status_exit_code("failed"), Some(1));
+        assert_eq!(edge_tool_status_exit_code("error"), None);
         assert_eq!(edge_tool_status_exit_code("partial_failure"), Some(1));
         assert_eq!(edge_tool_status_exit_code("rejected"), Some(1));
-        assert_eq!(edge_tool_status_exit_code("ok"), None);
-        assert_eq!(edge_tool_status_exit_code("success"), None);
-        assert_eq!(edge_tool_status_exit_code("error"), None);
+        assert_eq!(edge_tool_status_exit_code("interrupted"), Some(1));
+        assert_eq!(edge_tool_status_exit_code("timeout"), Some(1));
+        assert_eq!(edge_tool_status_exit_code("unexpected"), None);
         assert_eq!(edge_tool_status_exit_code("unknown"), None);
+        assert_eq!(edge_tool_status_exit_code(" OK "), None);
+        assert_eq!(edge_tool_status_exit_code("SUCCESS"), None);
     }
 
     #[test]

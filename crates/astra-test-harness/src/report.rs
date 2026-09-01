@@ -3,7 +3,7 @@
 //! After all cases × models have run, the harness folds every
 //! result into one `SuiteReport` and emits it in one of two formats:
 //!
-//! - `text` — human-scannable, grouped by case, colored PASS/FAIL
+//! - `text` — human-scannable, grouped by case, colored PASS/FAIL/UNAVAILABLE
 //!   markers, one line per criterion. Default.
 //! - `json` — machine-readable dump used by CI / dashboards. Shape
 //!   mirrors the in-memory struct so downstream consumers can
@@ -20,18 +20,51 @@ fn default_weight() -> f64 {
     1.0
 }
 
+/// Terminal state of one case/model run.
+///
+/// `Unavailable` means the harness deliberately did not execute the case, so
+/// it is never evidence for a capability and must not be counted as a pass.
+/// In particular, metadata-based prompt-cache exclusions and model-resolution
+/// errors use this state instead of manufacturing a green result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaseRunStatus {
+    Passed,
+    Failed,
+    /// The work item was planned but never executed because the suite was
+    /// cancelled or circuit-broken. It is deliberately not evidence, but it
+    /// remains a terminal row so planned work can never disappear from the
+    /// report denominator.
+    Cancelled,
+    Unavailable,
+}
+
+impl CaseRunStatus {
+    pub fn is_passed(self) -> bool {
+        matches!(self, Self::Passed)
+    }
+
+    pub fn is_unavailable(self) -> bool {
+        matches!(self, Self::Unavailable)
+    }
+
+    pub fn is_cancelled(self) -> bool {
+        matches!(self, Self::Cancelled)
+    }
+}
+
 /// One (case, model) pair's full result.
 ///
 /// Serialized into `--format json` reports, so this struct is a
-/// de-facto public wire format. `#[non_exhaustive]` lets us add
-/// fields (new diagnostic hints, new counter buckets) without a
-/// SemVer break. External consumers must use `..` when matching.
+/// de-facto public wire format. `status` is the sole terminal-state
+/// authority; consumers must not infer execution state from criteria or
+/// rendered text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[non_exhaustive]
 pub struct CaseRunReport {
     pub case_name: String,
     pub model: String,
-    pub passed: bool,
+    /// Authoritative terminal state for this run.
+    pub status: CaseRunStatus,
     /// 0-based index when `--runs N` repeats the same case/model.
     /// Always 0 for single-run mode.
     #[serde(default)]
@@ -50,6 +83,10 @@ pub struct CaseRunReport {
     /// Step-level results for multi-turn cases. Empty for single-turn.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub steps: Vec<StepResult>,
+    /// Every root execution attempt, including a rate-limit retry. A retry
+    /// must remain auditable instead of replacing the first terminal outcome.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<AttemptRecord>,
     /// Optional session journal dump — only present when
     /// `debug_log: true` on the case or `--capture-session` on the CLI.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -72,13 +109,48 @@ pub struct CaseRunReport {
     /// without hiding it inside the case FAIL.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub digest_error: Option<String>,
-    /// Failure classification — populated only when `passed == false`.
+    /// Failure classification — populated only when `status` is not `Passed`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub failure_class: Option<crate::classify::FailureClass>,
-    /// True when passed==true but some Soft/Quality criteria failed.
+    /// True when status is `Passed` but some Soft/Quality criteria failed.
     /// Frontend shows these as yellow warnings, not green passes.
     #[serde(default)]
     pub has_warnings: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttemptRecord {
+    pub attempt_index: u32,
+    pub outcome: RunOutcome,
+}
+
+impl CaseRunReport {
+    pub fn is_passed(&self) -> bool {
+        self.status.is_passed()
+    }
+
+    pub fn is_unavailable(&self) -> bool {
+        self.status.is_unavailable()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.status.is_cancelled()
+    }
+
+    /// A row with a real executor terminal outcome can contribute runtime
+    /// evidence. Cancelled and unavailable rows are planned/accounting rows,
+    /// not observations of Astra behavior.
+    pub fn is_evidence(&self) -> bool {
+        !self.is_unavailable() && !self.is_cancelled()
+    }
+}
+
+/// One authoritative weight for every capability aggregate. Difficulty is a
+/// first-class scoring dimension and `weight` scales the case within that
+/// dimension; report, eval, and dashboard consumers must not invent separate
+/// formulas.
+pub fn scoring_weight(run: &CaseRunReport) -> f64 {
+    run.weight * run.difficulty.unwrap_or(1) as f64
 }
 
 /// Result of a single step in a multi-turn case.
@@ -119,9 +191,24 @@ impl SuiteReport {
         self.runs.len()
     }
     pub fn passed(&self) -> usize {
-        self.runs.iter().filter(|r| r.passed).count()
+        self.runs.iter().filter(|r| r.status.is_passed()).count()
     }
     pub fn failed(&self) -> usize {
+        self.runs
+            .iter()
+            .filter(|r| matches!(r.status, CaseRunStatus::Failed))
+            .count()
+    }
+    pub fn cancelled(&self) -> usize {
+        self.runs.iter().filter(|r| r.status.is_cancelled()).count()
+    }
+    pub fn unavailable(&self) -> usize {
+        self.runs
+            .iter()
+            .filter(|r| r.status.is_unavailable())
+            .count()
+    }
+    pub fn non_passed(&self) -> usize {
         self.total() - self.passed()
     }
 }
@@ -229,10 +316,12 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         String::new()
     };
     s.push_str(&format!(
-        "total={} passed={} failed={} | tokens: {} fresh-in/{}out{} | wall: {}m{}s (sum: {}m{}s)\n\n",
+        "total={} passed={} failed={} cancelled={} unavailable={} | tokens: {} fresh-in/{}out{} | wall: {}m{}s (sum: {}m{}s)\n\n",
         report.total(),
         report.passed(),
         report.failed(),
+        report.cancelled(),
+        report.unavailable(),
         total_prompt,
         total_completion,
         cache_ratio_pct,
@@ -242,7 +331,12 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         sum_dur / 1000 % 60,
     ));
     for run in &report.runs {
-        let marker = if run.passed { "PASS" } else { "FAIL" };
+        let marker = match run.status {
+            CaseRunStatus::Passed => "PASS",
+            CaseRunStatus::Failed => "FAIL",
+            CaseRunStatus::Cancelled => "CANCELLED",
+            CaseRunStatus::Unavailable => "UNAVAILABLE",
+        };
         let run_suffix = if run.run_index > 0 {
             format!(" run={}", run.run_index)
         } else {
@@ -257,6 +351,12 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
             run.outcome.duration_ms,
             run.outcome.turn_rounds,
         ));
+        if run.attempts.len() > 1 {
+            s.push_str(&format!(
+                "    warning: {} terminal attempts recorded; totals include every attempt\n",
+                run.attempts.len()
+            ));
+        }
         if let Some(ref class) = run.failure_class {
             s.push_str(&format!(
                 "    class: {} → {}\n",
@@ -265,12 +365,18 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
             ));
         }
         for c in &run.criteria {
-            let m = if c.passed { " ok " } else { "FAIL" };
+            let m = match (run.status, c.passed, c.severity) {
+                (CaseRunStatus::Unavailable | CaseRunStatus::Cancelled, _, _) => " N/A",
+                (_, true, _) => " ok ",
+                (_, false, crate::criteria::CriterionSeverity::Hard) => "FAIL",
+                (_, false, crate::criteria::CriterionSeverity::Soft)
+                | (_, false, crate::criteria::CriterionSeverity::Quality) => "WARN",
+            };
             s.push_str(&format!("    [{m}] {}\n", c.detail));
             // FAIL or --verbose: dump the untruncated diagnostic if
             // the criterion carries one (judger quorum votes, etc.).
             // Indented block so it's visually nested under the fail.
-            if (!c.passed || verbose)
+            if (run.is_unavailable() || !c.passed || verbose)
                 && let Some(full) = c.full_detail.as_deref()
                 && full != c.detail
             {
@@ -281,7 +387,7 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
                 }
             }
         }
-        if verbose || !run.passed {
+        if verbose || !run.is_passed() {
             if !run.outcome.text.is_empty() {
                 s.push_str(&format!("    text: {}\n", truncate(&run.outcome.text, 500)));
             }
@@ -302,7 +408,7 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
                 step.outcome.completion_tokens,
                 step.outcome.tool_calls_count,
             ));
-            if verbose || !run.passed {
+            if verbose || !run.is_passed() {
                 let text_preview = truncate(&step.outcome.text, 200);
                 if !text_preview.is_empty() {
                     s.push_str(&format!("      text: {text_preview}\n"));
@@ -337,7 +443,7 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
             }
         }
         // Diagnostic hints on FAIL — copy-paste debugging commands.
-        if !run.passed {
+        if !run.is_passed() {
             if let Some(id) = run.outcome.session_id.as_deref() {
                 // Session ids should be UUIDs or simple slugs. If the
                 // runtime ever returns something richer, we refuse to
@@ -345,17 +451,14 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
                 // with shell metachars could make the copy-paste hint
                 // a remote-execution vector for an unwary developer.
                 if is_safe_session_id(id) {
-                    // Reuse the writer's owner-scoped path resolver. Both the
-                    // old flat location and the old jq field shape became
-                    // stale when session artifacts gained envelopes.
-                    let journal = astra_services::session_journal::journal_file_path(id);
-                    let steps = journal
-                        .parent()
-                        .expect("journal path always has a parent")
-                        .join(id)
-                        .join("step_events.jsonl");
-                    s.push_str(&format!("    journal: {}\n", journal.display()));
-                    s.push_str(&format!("    steps:   {}\n", steps.display()));
+                    if let Some(capture) = run.session.as_ref() {
+                        s.push_str(&format!(
+                            "    capture: {}\n",
+                            capture.journal_path.display()
+                        ));
+                    } else {
+                        s.push_str("    capture: unavailable\n");
+                    }
                     s.push_str(&format!("    hint:    astra journal digest {id}\n"));
                 } else {
                     // Report the anomaly so the reviewer sees SOMETHING,
@@ -375,7 +478,7 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
                 // the numbers they need to triage without scrolling
                 // through structured data; full blob is in JSON format.
                 s.push_str("    digest:\n");
-                render_digest_summary(&d.json, &mut s);
+                render_digest_summary(&d.json, &d.session_id, &mut s);
             }
             if let Some(err) = run.digest_error.as_deref() {
                 s.push_str(&format!("    digest_error: {err}\n"));
@@ -396,35 +499,56 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
     };
     if has_repeats {
         s.push_str("=== pass rate (flaky detection) ===\n");
-        let mut groups: BTreeMap<(&str, &str), (u32, u32)> = BTreeMap::new();
+        let mut groups: BTreeMap<(&str, &str), (u32, u32, u32, u32)> = BTreeMap::new();
         for r in &report.runs {
             let entry = groups.entry((&r.case_name, &r.model)).or_default();
-            entry.1 += 1;
-            if r.passed {
-                entry.0 += 1;
+            if r.is_unavailable() {
+                entry.2 += 1;
+            } else if r.is_cancelled() {
+                entry.3 += 1;
+            } else {
+                entry.1 += 1;
+                if r.is_passed() {
+                    entry.0 += 1;
+                }
             }
         }
-        for ((case, model), (passed, total)) in &groups {
-            let pct = (*passed as f64 / *total as f64) * 100.0;
-            let marker = if *passed == *total {
+        for ((case, model), (passed, available, unavailable, cancelled)) in &groups {
+            let planned = *available + *cancelled;
+            if planned == 0 {
+                s.push_str(&format!(
+                    "  [!] {case} × {model}: unavailable={unavailable} cancelled={cancelled} (not executed)\n"
+                ));
+                continue;
+            }
+            let pct = (*passed as f64 / planned as f64) * 100.0;
+            let marker = if *passed == planned {
                 "✓"
             } else if *passed == 0 {
                 "✗"
             } else {
                 "~"
             };
+            let mut unavailable_suffix = String::new();
+            if *unavailable > 0 {
+                unavailable_suffix.push_str(&format!(", unavailable={unavailable}"));
+            }
+            if *cancelled > 0 {
+                unavailable_suffix.push_str(&format!(", cancelled={cancelled}"));
+            }
             s.push_str(&format!(
-                "  [{marker}] {case} × {model}: {passed}/{total} ({pct:.0}%)\n"
+                "  [{marker}] {case} × {model}: {passed}/{planned} ({pct:.0}%){unavailable_suffix}\n"
             ));
         }
         s.push('\n');
     }
 
-    // Collect distinct models (normalized for display).
+    // Collect distinct raw execution identities; display labels are not keys.
     let models: BTreeSet<&str> = report
         .runs
         .iter()
-        .map(|r| normalize_model_display(&r.model))
+        .filter(|r| r.is_evidence())
+        .map(|r| r.model.as_str())
         .collect();
     let multi_model = models.len() > 1;
 
@@ -443,12 +567,15 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         }
         let mut stats: BTreeMap<&str, ModelStats> = BTreeMap::new();
         for r in &report.runs {
-            let e = stats.entry(normalize_model_display(&r.model)).or_default();
+            if !r.is_evidence() {
+                continue;
+            }
+            let e = stats.entry(r.model.as_str()).or_default();
             e.total += 1;
             let tok = r.outcome.prompt_tokens + r.outcome.completion_tokens;
             e.all_tokens += tok;
             e.all_dur_ms += r.outcome.duration_ms;
-            if r.passed {
+            if r.is_passed() {
                 e.pass += 1;
                 e.pass_tokens += tok;
                 e.pass_dur_ms += r.outcome.duration_ms;
@@ -493,18 +620,24 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
     }
 
     // ── Capability × model ──
-    let has_capabilities = report.runs.iter().any(|r| r.capability.is_some());
+    let has_capabilities = report
+        .runs
+        .iter()
+        .any(|r| r.is_evidence() && r.capability.is_some());
     if has_capabilities {
         s.push_str("=== capability × model ===\n");
         let mut cap_groups: BTreeMap<(String, &str), (f64, f64)> = BTreeMap::new();
         for r in &report.runs {
+            if !r.is_evidence() {
+                continue;
+            }
             if let Some(ref cap) = r.capability {
                 let entry = cap_groups
-                    .entry((cap.to_string(), normalize_model_display(&r.model)))
+                    .entry((cap.to_string(), r.model.as_str()))
                     .or_default();
-                entry.1 += r.weight;
-                if r.passed {
-                    entry.0 += r.weight;
+                entry.1 += scoring_weight(r);
+                if r.is_passed() {
+                    entry.0 += scoring_weight(r);
                 }
             }
         }
@@ -516,25 +649,29 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
     }
 
     // ── Difficulty curve (per-difficulty pass rate across models) ──
-    let has_difficulty = report.runs.iter().any(|r| r.difficulty.is_some());
+    let has_difficulty = report
+        .runs
+        .iter()
+        .any(|r| r.is_evidence() && r.difficulty.is_some());
     if has_difficulty {
         s.push_str("=== difficulty curve ===\n");
         // (difficulty, model) → (weighted_pass, weighted_total)
         let mut diff_groups: BTreeMap<(u8, &str), (f64, f64)> = BTreeMap::new();
         let mut diff_all: BTreeMap<u8, (f64, f64)> = BTreeMap::new();
         for r in &report.runs {
+            if !r.is_evidence() {
+                continue;
+            }
             if let Some(d) = r.difficulty {
-                let entry = diff_groups
-                    .entry((d, normalize_model_display(&r.model)))
-                    .or_default();
-                entry.1 += r.weight;
-                if r.passed {
-                    entry.0 += r.weight;
+                let entry = diff_groups.entry((d, r.model.as_str())).or_default();
+                entry.1 += scoring_weight(r);
+                if r.is_passed() {
+                    entry.0 += scoring_weight(r);
                 }
                 let all = diff_all.entry(d).or_default();
-                all.1 += r.weight;
-                if r.passed {
-                    all.0 += r.weight;
+                all.1 += scoring_weight(r);
+                if r.is_passed() {
+                    all.0 += scoring_weight(r);
                 }
             }
         }
@@ -557,13 +694,16 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
         s.push_str("=== capability × difficulty × model ===\n");
         let mut cdm: BTreeMap<(String, u8, &str), (f64, f64)> = BTreeMap::new();
         for r in &report.runs {
+            if !r.is_evidence() {
+                continue;
+            }
             if let (Some(cap), Some(diff)) = (&r.capability, r.difficulty) {
                 let entry = cdm
-                    .entry((cap.to_string(), diff, normalize_model_display(&r.model)))
+                    .entry((cap.to_string(), diff, r.model.as_str()))
                     .or_default();
-                entry.1 += r.weight;
-                if r.passed {
-                    entry.0 += r.weight;
+                entry.1 += scoring_weight(r);
+                if r.is_passed() {
+                    entry.0 += scoring_weight(r);
                 }
             }
         }
@@ -580,12 +720,28 @@ fn render_text(report: &SuiteReport, verbose: bool) -> String {
 /// Extract scannable lines from a `astra journal digest --focus summary`
 /// JSON blob. Defensive about missing fields — a schema change should
 /// shrink the rendered block, not panic the whole report.
-fn render_digest_summary(json: &serde_json::Value, out: &mut String) {
-    let aggr = json.get("aggregates");
-    if let Some(a) = aggr {
-        let get_u = |key: &str| a.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
-        let get_f = |key: &str| a.get(key).and_then(|v| v.as_f64()).unwrap_or(0.0);
+fn render_digest_summary(json: &serde_json::Value, expected_session_id: &str, out: &mut String) {
+    if let Err(error) = crate::digest::validate_digest_json(json, expected_session_id) {
         out.push_str(&format!(
+            "      digest_error: invalid typed digest: {error}\n"
+        ));
+        return;
+    }
+    let a = json
+        .get("aggregates")
+        .and_then(serde_json::Value::as_object)
+        .expect("validated digest aggregates");
+    let get_u = |key: &str| {
+        a.get(key)
+            .and_then(|v| v.as_u64())
+            .expect("validated count")
+    };
+    let get_f = |key: &str| {
+        a.get(key)
+            .and_then(|v| v.as_f64())
+            .expect("validated average")
+    };
+    out.push_str(&format!(
             "      attempts={} turns={} turn_errors={} tool_calls={} tool_failures={} errors={} compacts={} stalls={}\n",
             get_u("attempt_count"),
             get_u("turn_count"),
@@ -595,27 +751,26 @@ fn render_digest_summary(json: &serde_json::Value, out: &mut String) {
             get_u("error_event_count"),
             get_u("compact_count"),
             get_u("stall_count"),
-        ));
-        out.push_str(&format!(
-            "      root_tokens_in={} root_tokens_out={} root_duration_ms={}\n",
-            get_u("total_tokens_in"),
-            get_u("total_tokens_out"),
-            get_u("total_duration_ms"),
-        ));
-        out.push_str(&format!(
-            "      subruns={} inclusive_tokens_in={} inclusive_tokens_out={} inclusive_tool_calls={}\n",
-            get_u("subrun_count"),
-            get_u("inclusive_total_tokens_in"),
-            get_u("inclusive_total_tokens_out"),
-            get_u("inclusive_total_tool_calls"),
-        ));
-        out.push_str(&format!(
-            "      avg_tokens_in={:.1} avg_tokens_out={:.1} avg_duration_ms={:.1}\n",
-            get_f("avg_tokens_in"),
-            get_f("avg_tokens_out"),
-            get_f("avg_duration_ms"),
-        ));
-    }
+    ));
+    out.push_str(&format!(
+        "      root_tokens_in={} root_tokens_out={} root_duration_ms={}\n",
+        get_u("total_tokens_in"),
+        get_u("total_tokens_out"),
+        get_u("total_duration_ms"),
+    ));
+    out.push_str(&format!(
+        "      subruns={} inclusive_tokens_in={} inclusive_tokens_out={} inclusive_tool_calls={}\n",
+        get_u("subrun_count"),
+        get_u("inclusive_total_tokens_in"),
+        get_u("inclusive_total_tokens_out"),
+        get_u("inclusive_total_tool_calls"),
+    ));
+    out.push_str(&format!(
+        "      avg_tokens_in={:.1} avg_tokens_out={:.1} avg_duration_ms={:.1}\n",
+        get_f("avg_tokens_in"),
+        get_f("avg_tokens_out"),
+        get_f("avg_duration_ms"),
+    ));
     // Point the reviewer at the full digest — if and only if the
     // session_id is a recognized shape. See `is_safe_session_id`
     // for why: any id with shell metachars would turn a friendly
@@ -701,7 +856,7 @@ mod tests {
             runs: vec![CaseRunReport {
                 case_name: "c1".into(),
                 model: "m".into(),
-                passed: true,
+                status: CaseRunStatus::Passed,
                 run_index: 0,
                 capability: None,
                 weight: 1.0,
@@ -718,6 +873,7 @@ mod tests {
                     score: None,
                 }],
                 steps: vec![],
+                attempts: Vec::new(),
                 session: None,
                 reproducer: None,
                 digest: None,
@@ -742,12 +898,26 @@ mod tests {
     #[test]
     fn text_report_shows_stderr_and_text_on_fail() {
         let mut r = mk_report_passed();
-        r.runs[0].passed = false;
+        r.runs[0].status = CaseRunStatus::Failed;
         r.runs[0].outcome.stderr = "boom".into();
         let out = render(&r, Format::Text, false);
         assert!(out.contains("[FAIL]"));
         assert!(out.contains("text: hello"));
         assert!(out.contains("stderr: boom"));
+    }
+
+    #[test]
+    fn text_report_distinguishes_advisory_warning_from_hard_failure() {
+        let mut r = mk_report_passed();
+        r.runs[0].criteria[0].passed = false;
+        r.runs[0].criteria[0].severity = crate::criteria::CriterionSeverity::Soft;
+        r.runs[0].criteria[0].detail = "token budget exceeded".into();
+        r.runs[0].has_warnings = true;
+
+        let out = render(&r, Format::Text, false);
+
+        assert!(out.contains("[WARN] token budget exceeded"));
+        assert!(!out.contains("[FAIL] token budget exceeded"));
     }
 
     #[test]
@@ -771,12 +941,18 @@ mod tests {
     #[test]
     fn text_report_emits_diag_hints_on_fail() {
         let mut r = mk_report_passed();
-        r.runs[0].passed = false;
+        r.runs[0].status = CaseRunStatus::Failed;
+        r.runs[0].session = Some(SessionCapture {
+            session_id: "sess".into(),
+            journal_path: std::path::PathBuf::from("/captures/account/sess.jsonl"),
+            events: Vec::new(),
+            skipped_lines: 0,
+            dropped_lines: 0,
+            integrity_errors: 0,
+        });
         r.runs[0].reproducer = Some("/path/to/astra chat -m 'say ok' --model m --json -y".into());
         let out = render(&r, Format::Text, false);
-        let journal = astra_services::session_journal::journal_file_path("sess");
-        assert!(out.contains(&format!("journal: {}", journal.display())));
-        assert!(out.contains("step_events.jsonl"));
+        assert!(out.contains("capture: /captures/account/sess.jsonl"));
         assert!(out.contains("astra journal digest sess"));
         assert!(out.contains("rerun:"));
         assert!(out.contains("/path/to/astra chat"));
@@ -796,7 +972,7 @@ mod tests {
             "sess'; echo pwned",
         ] {
             let mut r = mk_report_passed();
-            r.runs[0].passed = false;
+            r.runs[0].status = CaseRunStatus::Failed;
             r.runs[0].outcome.session_id = Some(injection.to_string());
             let out = render(&r, Format::Text, false);
             assert!(
@@ -855,11 +1031,15 @@ mod tests {
     fn text_report_renders_digest_summary_on_fail() {
         use crate::digest::DigestArtifact;
         let mut r = mk_report_passed();
-        r.runs[0].passed = false;
+        r.runs[0].status = CaseRunStatus::Failed;
         r.runs[0].digest = Some(DigestArtifact {
             session_id: "sess".into(),
             json: serde_json::json!({
+                "schema_version": "astra-journal-digest-v2",
                 "session_id": "sess",
+                "journal_file": "/tmp/sess.jsonl",
+                "journal_lines_non_empty": 3,
+                "journal_lines_malformed": 0,
                 "aggregates": {
                     "attempt_count": 3,
                     "turn_count": 3,
@@ -876,9 +1056,20 @@ mod tests {
                     "inclusive_total_tokens_in": 12000,
                     "inclusive_total_tokens_out": 450,
                     "inclusive_total_tool_calls": 5,
+                    "total_fresh_tool_calls": 5,
+                    "total_noop_or_cached_tool_calls": 0,
+                    "safety_guard_blocks": 0,
+                    "session_start_count": 1,
+                    "session_end_count": 1,
+                    "subrun_total_tokens_in": 0,
+                    "subrun_total_tokens_out": 0,
+                    "subrun_total_duration_ms": 0,
+                    "subrun_total_tool_calls": 0,
                     "avg_tokens_in": 4000.0,
                     "avg_tokens_out": 150.0,
                     "avg_duration_ms": 2733.33,
+                    "avg_llm_rounds": 1.0,
+                    "avg_tool_calls_per_round": 1.67,
                 }
             }),
         });
@@ -896,11 +1087,15 @@ mod tests {
     fn text_report_renders_v2_digest_aggregate_names_without_false_zeroes() {
         use crate::digest::DigestArtifact;
         let mut r = mk_report_passed();
-        r.runs[0].passed = false;
+        r.runs[0].status = CaseRunStatus::Failed;
         r.runs[0].digest = Some(DigestArtifact {
             session_id: "sess-v2".into(),
             json: serde_json::json!({
+                "schema_version": "astra-journal-digest-v2",
                 "session_id": "sess-v2",
+                "journal_file": "/tmp/sess-v2.jsonl",
+                "journal_lines_non_empty": 2,
+                "journal_lines_malformed": 0,
                 "aggregates": {
                     "attempt_count": 2,
                     "turn_count": 1,
@@ -917,9 +1112,20 @@ mod tests {
                     "inclusive_total_tokens_in": 189908,
                     "inclusive_total_tokens_out": 29610,
                     "inclusive_total_tool_calls": 96,
+                    "total_fresh_tool_calls": 12,
+                    "total_noop_or_cached_tool_calls": 2,
+                    "safety_guard_blocks": 0,
+                    "session_start_count": 1,
+                    "session_end_count": 1,
+                    "subrun_total_tokens_in": 129761,
+                    "subrun_total_tokens_out": 22498,
+                    "subrun_total_duration_ms": 0,
+                    "subrun_total_tool_calls": 82,
                     "avg_tokens_in": 30073.5,
                     "avg_tokens_out": 3556.0,
-                    "avg_duration_ms": 58160.0
+                    "avg_duration_ms": 58160.0,
+                    "avg_llm_rounds": 2.0,
+                    "avg_tool_calls_per_round": 7.0
                 }
             }),
         });
@@ -935,9 +1141,30 @@ mod tests {
     }
 
     #[test]
+    fn text_report_does_not_render_partial_digest_as_zero_health() {
+        use crate::digest::DigestArtifact;
+        let mut r = mk_report_passed();
+        r.runs[0].status = CaseRunStatus::Failed;
+        r.runs[0].digest = Some(DigestArtifact {
+            session_id: "requested".into(),
+            json: serde_json::json!({
+                "schema_version": "astra-journal-digest-v2",
+                "session_id": "foreign",
+                "journal_file": "/tmp/foreign.jsonl",
+                "journal_lines_non_empty": 1,
+                "journal_lines_malformed": 0,
+                "aggregates": {}
+            }),
+        });
+        let out = render(&r, Format::Text, false);
+        assert!(out.contains("digest_error: invalid typed digest"));
+        assert!(!out.contains("attempts=0 turns=0"));
+    }
+
+    #[test]
     fn text_report_renders_digest_error_on_fail() {
         let mut r = mk_report_passed();
-        r.runs[0].passed = false;
+        r.runs[0].status = CaseRunStatus::Failed;
         r.runs[0].digest_error = Some("digest timeout after 15s".into());
         let out = render(&r, Format::Text, false);
         assert!(out.contains("digest_error: digest timeout after 15s"));
@@ -949,7 +1176,7 @@ mod tests {
         r.runs.push(CaseRunReport {
             case_name: "c2".into(),
             model: "m".into(),
-            passed: false,
+            status: CaseRunStatus::Failed,
             run_index: 0,
             capability: None,
             weight: 1.0,
@@ -957,6 +1184,7 @@ mod tests {
             outcome: mk_outcome(),
             criteria: vec![],
             steps: vec![],
+            attempts: Vec::new(),
             session: None,
             reproducer: None,
             digest: None,
@@ -967,6 +1195,27 @@ mod tests {
         assert_eq!(r.total(), 2);
         assert_eq!(r.passed(), 1);
         assert_eq!(r.failed(), 1);
+    }
+
+    #[test]
+    fn unavailable_is_visible_and_never_counted_as_pass() {
+        let mut report = mk_report_passed();
+        report.runs[0].status = CaseRunStatus::Unavailable;
+        report.runs[0].outcome.text = "unavailable: metadata does not prove scope".into();
+        report.runs[0].failure_class =
+            Some(crate::classify::FailureClass::InfraVerificationUnavailable);
+
+        assert_eq!(report.passed(), 0);
+        assert_eq!(report.failed(), 0);
+        assert_eq!(report.unavailable(), 1);
+        let text = render(&report, Format::Text, false);
+        assert!(text.contains("[UNAVAILABLE]"), "{text}");
+        assert!(text.contains("unavailable=1"), "{text}");
+
+        let json: serde_json::Value = serde_json::from_str(&render(&report, Format::Json, false))
+            .expect("status report must be valid JSON");
+        assert_eq!(json["runs"][0]["status"], "unavailable");
+        assert!(json["runs"][0].get("passed").is_none());
     }
 
     // ── JSON render fallback (R5 nit a) ──
@@ -1043,7 +1292,7 @@ mod tests {
             runs: vec![CaseRunReport {
                 case_name: "a".into(),
                 model: "m".into(),
-                passed: true,
+                status: CaseRunStatus::Passed,
                 run_index: 0,
                 capability: None,
                 weight: 1.0,
@@ -1057,6 +1306,7 @@ mod tests {
                 steps: vec![],
                 failure_class: None,
                 has_warnings: false,
+                attempts: Vec::new(),
                 session: None,
                 reproducer: None,
                 digest: None,
@@ -1078,7 +1328,7 @@ mod tests {
             runs: vec![CaseRunReport {
                 case_name: "cache".into(),
                 model: "m".into(),
-                passed: true,
+                status: CaseRunStatus::Passed,
                 run_index: 0,
                 capability: None,
                 weight: 1.0,
@@ -1095,6 +1345,7 @@ mod tests {
                 steps: vec![],
                 failure_class: None,
                 has_warnings: false,
+                attempts: Vec::new(),
                 session: None,
                 reproducer: None,
                 digest: None,
@@ -1122,7 +1373,7 @@ mod tests {
             runs: vec![CaseRunReport {
                 case_name: "cache".into(),
                 model: "m".into(),
-                passed: true,
+                status: CaseRunStatus::Passed,
                 run_index: 0,
                 capability: None,
                 weight: 1.0,
@@ -1139,6 +1390,7 @@ mod tests {
                 steps: vec![],
                 failure_class: None,
                 has_warnings: false,
+                attempts: Vec::new(),
                 session: None,
                 reproducer: None,
                 digest: None,
@@ -1163,7 +1415,7 @@ mod tests {
             runs: vec![CaseRunReport {
                 case_name: "cache-create-only".into(),
                 model: "m".into(),
-                passed: true,
+                status: CaseRunStatus::Passed,
                 run_index: 0,
                 capability: None,
                 weight: 1.0,
@@ -1180,6 +1432,7 @@ mod tests {
                 steps: vec![],
                 failure_class: None,
                 has_warnings: false,
+                attempts: Vec::new(),
                 session: None,
                 reproducer: None,
                 digest: None,
@@ -1200,7 +1453,11 @@ mod tests {
         let make_run = |passed: bool| CaseRunReport {
             case_name: "flaky".into(),
             model: "m".into(),
-            passed,
+            status: if passed {
+                CaseRunStatus::Passed
+            } else {
+                CaseRunStatus::Failed
+            },
             run_index: 0,
             capability: None,
             weight: 1.0,
@@ -1210,6 +1467,7 @@ mod tests {
             steps: vec![],
             failure_class: None,
             has_warnings: false,
+            attempts: Vec::new(),
             session: None,
             reproducer: None,
             digest: None,
@@ -1226,6 +1484,81 @@ mod tests {
         );
         assert!(out.contains("2/3"), "missing 2/3 count: {out}");
         assert!(out.contains("67%"), "missing percentage: {out}");
+    }
+
+    #[test]
+    fn render_text_does_not_count_unavailable_repeats_as_failures() {
+        let make_run = |status| CaseRunReport {
+            case_name: "unavailable-repeat".into(),
+            model: "m".into(),
+            status,
+            run_index: 0,
+            capability: None,
+            weight: 1.0,
+            difficulty: None,
+            outcome: RunOutcome::new("m"),
+            criteria: vec![],
+            steps: vec![],
+            failure_class: None,
+            has_warnings: false,
+            attempts: Vec::new(),
+            session: None,
+            reproducer: None,
+            digest: None,
+            digest_error: None,
+        };
+        let report = SuiteReport {
+            runs: vec![
+                make_run(CaseRunStatus::Unavailable),
+                make_run(CaseRunStatus::Unavailable),
+            ],
+            ..Default::default()
+        };
+        let out = render_text(&report, false);
+        assert!(
+            out.contains("unavailable=2 cancelled=0 (not executed)"),
+            "unavailable repeats must be explicit: {out}"
+        );
+        assert!(
+            !out.contains("0/2 (0%)"),
+            "unavailable is not a failed run: {out}"
+        );
+    }
+
+    #[test]
+    fn render_text_counts_cancelled_repeats_in_planned_denominator() {
+        let make_run = |status| CaseRunReport {
+            case_name: "cancelled-repeat".into(),
+            model: "m".into(),
+            status,
+            run_index: 0,
+            capability: None,
+            weight: 1.0,
+            difficulty: None,
+            outcome: RunOutcome::new("m"),
+            criteria: vec![],
+            steps: vec![],
+            failure_class: None,
+            has_warnings: false,
+            attempts: Vec::new(),
+            session: None,
+            reproducer: None,
+            digest: None,
+            digest_error: None,
+        };
+        let report = SuiteReport {
+            runs: vec![
+                make_run(CaseRunStatus::Passed),
+                make_run(CaseRunStatus::Cancelled),
+                make_run(CaseRunStatus::Cancelled),
+            ],
+            ..Default::default()
+        };
+        let out = render_text(&report, false);
+        assert!(
+            out.contains("cancelled-repeat × m: 1/3 (33%)") && out.contains("cancelled=2"),
+            "cancelled planned rows must remain in the denominator: {out}"
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1262,7 +1595,11 @@ mod tests {
         CaseRunReport {
             case_name: case.into(),
             model: model.into(),
-            passed,
+            status: if passed {
+                CaseRunStatus::Passed
+            } else {
+                CaseRunStatus::Failed
+            },
             run_index: 0,
             capability: cap,
             weight,
@@ -1280,6 +1617,7 @@ mod tests {
             steps: vec![],
             failure_class: None,
             has_warnings: false,
+            attempts: Vec::new(),
             session: None,
             reproducer: None,
             digest: None,
@@ -1452,8 +1790,9 @@ mod tests {
     }
 
     #[test]
-    fn model_comparison_collapses_provider_variants() {
-        // us.anthropic.claude-sonnet-4-6 and claude-sonnet-4-6 should merge
+    fn model_comparison_preserves_provider_route_identity() {
+        // Region/provider routes are distinct execution identities. They may
+        // share a display suffix, but must never share a score denominator.
         let r = SuiteReport {
             runs: vec![
                 mk_run("c1", "claude-sonnet-4-6", true, None, None, 1.0, 100, 10, 5),
@@ -1477,10 +1816,10 @@ mod tests {
             out.contains("model comparison"),
             "multi-model must show comparison:\n{out}"
         );
-        // Should show claude-sonnet-4-6 with 2/2 (collapsed), not two separate entries
         assert!(
-            out.contains("claude-sonnet-4-6: pass=2/2"),
-            "provider variants must collapse in comparison table: {out}"
+            out.contains("claude-sonnet-4-6: pass=1/1")
+                && out.contains("us.anthropic.claude-sonnet-4-6: pass=1/1"),
+            "provider route identities must remain separate: {out}"
         );
     }
 

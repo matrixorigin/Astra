@@ -627,8 +627,10 @@ mod tests {
         for run_id in &run_ids {
             sqlx::query(
                 "INSERT INTO agent_runs
-                 (run_id, user_id, session_id, root_run_id, ancestor_path, status)
-                 VALUES (?, ?, ?, ?, ?, 'running')",
+                 (run_id, user_id, session_id, root_run_id, ancestor_path, status,
+                  owner_pod_id, owner_lease_expires_at, run_generation)
+                 VALUES (?, ?, ?, ?, ?, 'running', 'compactor-test-owner',
+                         TIMESTAMPADD(MINUTE, 10, NOW(6)), 0)",
             )
             .bind(run_id)
             .bind(&user_id)
@@ -653,7 +655,16 @@ mod tests {
             identities.push(identity);
         }
         ledger
-            .claim_dispatch(&identities[2], "fair-worker", 90_000)
+            .claim_dispatch(
+                &identities[2],
+                "fair-worker",
+                90_000,
+                astra_services::tool_invocation_ledger::ToolInvocationDispatchAdmission {
+                    expected_control_epoch: -1,
+                    expected_owner_generation: 0,
+                    expected_owner_pod_id: "compactor-test-owner".to_string(),
+                },
+            )
             .await
             .unwrap();
         ledger

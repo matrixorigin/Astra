@@ -158,7 +158,7 @@ pub(crate) async fn handle_memory_domain_command(
                                 hint.as_ref().map(|h| h.summary.as_str()),
                                 Some(&status),
                             );
-                            println!("{out}");
+                            stdout_println!("{out}");
                         }
                         Err(error) => {
                             eprintln!("  {} {}", theme::icon_err(), error.red());

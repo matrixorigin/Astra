@@ -4,8 +4,6 @@
 //! without an actual LLM call, verifying that the pipeline
 //! produces correct, well-structured output.
 
-use std::collections::HashMap;
-
 use astra_turn_core::compaction_types::CompactionTier;
 use astra_turn_core::context_binder::bind_all;
 use astra_turn_core::context_feedback::ContextFeedback;
@@ -67,8 +65,6 @@ fn build_sources() -> (
             tool_results: vec![],
             tokens: TokenAccounting::from_fields(5000, 3000, 500, 200),
             active_skills: vec!["code_review".into()],
-            recent_file_reads: HashMap::new(),
-            remaining_turns: 10,
             turn_index: 3,
             recovery: RecoveryState::default(),
             last_user_message: "Fix the bug in main.rs".into(),
@@ -368,7 +364,7 @@ fn pipeline_trace_alerts_on_recovery() {
     let feedback = ContextFeedback::from_usage(0, 0, 5000, 100, false);
     let stats = PipelineStats::default();
 
-    let alerts = evaluate_alerts(5, "model-a", "test", &feedback, &stats, &recovery);
+    let alerts = evaluate_alerts(5, &feedback, &stats, &recovery);
     assert!(
         alerts.iter().any(|a| a.rule == "recovery_loop"),
         "2 PTL errors should trigger recovery_loop alert"

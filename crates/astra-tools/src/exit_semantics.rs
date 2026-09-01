@@ -75,6 +75,20 @@ impl CommandResultClass {
     }
 }
 
+/// Source-authored recovery evidence for a command that executed but did not
+/// complete successfully. The command's process status is authoritative here:
+/// callers must not re-classify its stdout/stderr as tool-schema, credential,
+/// or transport failures.
+#[must_use]
+pub fn command_failed_evidence() -> astra_core::ToolFailureEvidence {
+    astra_core::ToolFailureEvidence::new(
+        astra_core::ErrorKind::Unknown,
+        astra_core::ToolFailureCause::CommandFailed,
+        false,
+        vec![astra_core::ToolRecoveryAction::InspectStructuredFailure],
+    )
+}
+
 #[must_use]
 pub fn classify_exit(command: &str, exit_code: i32) -> ExitSemantics {
     if exit_code == 0 {
@@ -145,26 +159,29 @@ pub fn classify_command_result(
     // can legitimately contain phrases such as "command not found" or
     // "test failed". Treating those phrases as control signals turns inspected
     // text into a false runtime failure.
-    if let Some(code) = exit_code {
-        // POSIX shells reserve 126 for "found but not executable" and 127 for
-        // "command not found". Both are authoritative environment failures;
-        // do not depend on localized or concurrently truncated stderr text to
-        // preserve that classification.
-        if matches!(code, 126 | 127) {
-            return CommandResultClass::EnvFailure;
-        }
-        match classify_exit(command, code) {
+    let exit_semantics = exit_code.map(|code| classify_exit(command, code));
+    // POSIX shells reserve 126 for "found but not executable" and 127 for
+    // "command not found". Both are authoritative environment failures; do
+    // not depend on localized or truncated stderr text.
+    if matches!(exit_code, Some(126 | 127)) {
+        return CommandResultClass::EnvFailure;
+    }
+    if let Some(semantics) = exit_semantics {
+        match semantics {
             ExitSemantics::Success | ExitSemantics::PipelineTruncated => {
                 return CommandResultClass::Success;
             }
             ExitSemantics::EmptyResult => return CommandResultClass::EmptyResult,
-            ExitSemantics::DomainNegative => {
-                return if is_build_test_or_lint_command(command) {
-                    CommandResultClass::TestFailure
-                } else {
-                    CommandResultClass::DomainNegative
-                };
+            // Non-build domain negatives (notably `diff` and `test`) are
+            // complete semantic answers. Their output is domain data and
+            // must never be reinterpreted as an infrastructure signal.
+            ExitSemantics::DomainNegative if !is_build_test_or_lint_command(command) => {
+                return CommandResultClass::DomainNegative;
             }
+            // A build/test/lint non-zero needs a positive, executor-produced
+            // failure signature below before it can authorize repair. Unknown
+            // non-zero outcomes fail closed as inconclusive.
+            ExitSemantics::DomainNegative => {}
             ExitSemantics::TimedOut | ExitSemantics::Cancelled | ExitSemantics::Signaled => {
                 return CommandResultClass::ExecutionError;
             }
@@ -185,8 +202,15 @@ pub fn classify_command_result(
         return CommandResultClass::EnvFailure;
     }
 
-    if is_build_test_or_lint_command(command) && looks_like_build_or_test_failure(&lower) {
+    if matches!(exit_semantics, Some(ExitSemantics::DomainNegative))
+        && is_build_test_or_lint_command(command)
+        && looks_like_build_or_test_failure(&lower)
+    {
         return CommandResultClass::TestFailure;
+    }
+
+    if matches!(exit_semantics, Some(ExitSemantics::DomainNegative)) {
+        return CommandResultClass::Inconclusive;
     }
 
     match exit_code {
@@ -197,13 +221,7 @@ pub fn classify_command_result(
                 CommandResultClass::ExecutionError
             }
         }
-        None => {
-            if looks_like_build_or_test_failure(&lower) {
-                CommandResultClass::TestFailure
-            } else {
-                CommandResultClass::Inconclusive
-            }
-        }
+        None => CommandResultClass::Inconclusive,
     }
 }
 
@@ -489,6 +507,13 @@ fn looks_like_env_failure(lower_output: &str) -> bool {
         "failed to create virtual environment",
         "error: externally-managed-environment",
         "no python at",
+        "network is unreachable",
+        "temporary failure in name resolution",
+        "could not resolve host",
+        "connection timed out",
+        "failed to download",
+        "no space left on device",
+        "permission denied",
     ]
     .iter()
     .any(|needle| lower_output.contains(needle))
@@ -517,7 +542,22 @@ fn looks_like_build_or_test_failure(lower_output: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandResultClass, ExitSemantics, classify_command_result, classify_exit};
+    use super::{
+        CommandResultClass, ExitSemantics, classify_command_result, classify_exit,
+        command_failed_evidence,
+    };
+
+    #[test]
+    fn command_failure_evidence_is_typed_and_non_retryable() {
+        let evidence = command_failed_evidence();
+        assert_eq!(evidence.kind, astra_core::ErrorKind::Unknown);
+        assert_eq!(evidence.cause, astra_core::ToolFailureCause::CommandFailed);
+        assert!(!evidence.retryable);
+        assert_eq!(
+            evidence.recovery_actions,
+            vec![astra_core::ToolRecoveryAction::InspectStructuredFailure]
+        );
+    }
 
     #[test]
     fn grep_no_match_is_empty_result() {
@@ -805,6 +845,35 @@ mod tests {
                 "{code}"
             );
         }
+    }
+
+    #[test]
+    fn nonzero_build_test_environment_failure_is_not_test_failure() {
+        assert_eq!(
+            classify_command_result(
+                "cargo test --lib",
+                "",
+                "error: failed to get dependency: network is unreachable",
+                Some(101),
+            ),
+            CommandResultClass::EnvFailure
+        );
+    }
+
+    #[test]
+    fn nonzero_build_test_without_positive_failure_evidence_is_inconclusive() {
+        assert_eq!(
+            classify_command_result("cargo test --lib", "", "process exited 101", Some(101)),
+            CommandResultClass::Inconclusive
+        );
+    }
+
+    #[test]
+    fn diff_domain_result_does_not_promote_its_content_to_environment_failure() {
+        assert_eq!(
+            classify_command_result("diff left right", "permission denied", "", Some(1)),
+            CommandResultClass::DomainNegative
+        );
     }
 
     #[test]

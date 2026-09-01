@@ -1,0 +1,103 @@
+name: parallel_synthesized_review
+description: |
+  **What**: Review one commit through three independent specialist slots and
+  return one combined user-facing report.
+  **Tests**: The admission boundary distinguishes execution topology from
+  durable deliverables. A review may fan out, but its child findings are not a
+  task board and must never trigger `start_work`.
+  **Why**: Treating every reviewer perspective as an independently accepted
+  outcome creates an impossible durable-Work-plus-parallel contract, then the
+  old runtime rejected every later tool call and still reported completion.
+  **Pass means**: One three-slot fanout settles and the parent synthesizes it;
+  no durable Work is created and no generic child-spawn fallback is used.
+prompt: |
+  Deep-review the latest commit from three independent angles: correctness and
+  data integrity; cancellation/concurrency/lifecycle; and tests plus public
+  API contracts. Use exactly one three-agent fanout, then return one
+  synthesized review report for me. The three perspectives are evidence for
+  that one report, not separately accepted deliverables. Do not edit files.
+prompt_variants:
+  - id: chinese_user_boundary
+    prompt: |
+      请用三个独立视角 deep review 最新 commit：正确性和数据完整性；
+      取消、并发与生命周期；测试和公开 API 契约。只做一次三 agent fanout，最后给我
+      一份综合 review 报告。三个视角只是这份报告的证据，不是三个需要分别验收的交付物。
+      不要修改文件。
+models:
+  - deepseek-v4-flash
+capability: delegation
+difficulty: 5
+weight: 3.0
+timeout_seconds: 300
+debug_log: true
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: agent_fanout
+    min: 1
+    max: 1
+    document: arguments
+    path: /action
+    equals: start
+  - type: journal_tool_json
+    name: agent_fanout
+    document: arguments
+    path: /target_count
+    equals: 3
+  - type: session_event_count
+    event_type: agent_terminated
+    min: 3
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /fanout/accepted
+    equals: 3
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /fanout/terminal
+    equals: 3
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /provenance/all_slots_delivered
+    equals: true
+  - type: journal_tool_outcome_count
+    name: agent_fanout
+    ok: false
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: start_work
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: agent
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: tool_search
+    min: 0
+    max: 0
+  - type: session_event_count
+    event_type: turn_evaluation
+    min: 1
+  - type: journal_turn_evaluation_success
+    equals: true
+  - type: journal_turn_evaluation_signal_count
+    kind: tool_outcome_failure
+    min: 0
+    max: 0
+  - type: journal_turn_evaluation_signal_count
+    kind: llm_round_churn
+    min: 0
+    max: 0
+  - type: session_subsystem_healthy
+    settled_subsystem: post_loop_memory
+  - type: tools_count_between
+    min: 1
+    max: 12
+  - type: turn_rounds_between
+    min: 2
+    max: 10

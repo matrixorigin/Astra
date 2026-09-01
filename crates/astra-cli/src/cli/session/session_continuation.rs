@@ -3,7 +3,7 @@
 //!
 //! Used by one-shot mode (`-m "..." --session-id <id>`) to provide multi-turn continuity.
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 #[derive(Debug)]
 pub(crate) struct SessionContinuation {
@@ -141,36 +141,26 @@ pub(crate) fn continuation_from_resume_bundle(
             astra_turn_core::active_conversation::ActiveConversationSource::LegacyDisplayProjection
         }
     };
-    let active_conversation = if cursor.schema_version == 0 {
-        astra_turn_core::active_conversation::ActiveConversation::from_projection(
-            &cursor.owner_id,
-            &cursor.session_id,
-            messages.clone(),
-            cursor.completed_turn,
-            source,
-        )
-        .ok()?
-    } else {
-        // The server's schema-v2 cursor identifies the immutable manifest,
-        // while the local ActiveConversation journal identifies its flattened
-        // projection. Keep the authoritative cursor in `resume`, but derive a
-        // schema-v1 content cursor for the local projection store.
-        let mut projection_cursor = cursor.clone();
-        if projection_cursor.projection_schema
-            == astra_turn_types::SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION
-        {
-            projection_cursor.projection_schema =
-                astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION;
-            projection_cursor.canonical_root_hash =
-                astra_turn_types::canonical_conversation_root(&messages);
-        }
+    // The server's schema-v2 cursor identifies the immutable manifest, while
+    // the local ActiveConversation journal identifies its flattened
+    // projection. Keep the authoritative cursor in `resume`, but derive a
+    // schema-v1 content cursor for the local projection store.
+    let mut projection_cursor = cursor.clone();
+    if projection_cursor.projection_schema
+        == astra_turn_types::SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION
+    {
+        projection_cursor.projection_schema =
+            astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION;
+        projection_cursor.canonical_root_hash =
+            astra_turn_types::canonical_conversation_root(&messages);
+    }
+    let active_conversation =
         astra_turn_core::active_conversation::ActiveConversation::from_cursor_projection(
             projection_cursor,
             messages.clone(),
             source,
         )
-        .ok()?
-    };
+        .ok()?;
     Some(SessionContinuation {
         completed_turn_count: Some(cursor.completed_turn),
         activated_deferred_tool_names,
@@ -209,9 +199,8 @@ pub(crate) fn continuation_activation_names(
 /// conversation history that the model needs for multi-turn continuity.
 ///
 /// Typed commits in the primary session journal are the durable canonical
-/// source. CSL is an asynchronous continuation projection; a heavy checkpoint
-/// and legacy journal display pairs are explicit compatibility fallbacks. The
-/// TUI transcript is a display projection and is never used as model history.
+/// source. CSL and heavy checkpoints are admitted only with an exact versioned
+/// cursor. Display-oriented history is never used as model history.
 pub(crate) fn load_session_messages_for_continuation(session_id: &str) -> Option<Vec<Value>> {
     load_session_continuation_for_recovery(session_id).map(|continuation| continuation.messages)
 }
@@ -224,22 +213,44 @@ pub(crate) fn load_session_continuation_for_recovery(
             let messages = active_conversation.materialize();
             record_session_restore_hydration(&messages);
             let cursor = active_conversation.cursor().clone();
-            let checkpoint = load_heavy_checkpoint(session_id);
-            let checkpoint_activation = checkpoint
-                .as_ref()
-                .filter(|checkpoint| {
-                    checkpoint
-                        .conversation_cursor
-                        .as_ref()
-                        .is_some_and(|checkpoint_cursor| {
-                            astra_turn_types::cursor_relation(checkpoint_cursor, &cursor)
-                                == astra_turn_types::CursorRelationV1::Exact
-                        })
-                })
-                .into_iter()
-                .flat_map(|checkpoint| checkpoint.activated_deferred_tool_names.iter().cloned());
-            let activated_deferred_tool_names =
-                continuation_activation_names(&messages, checkpoint_activation);
+            let activated_deferred_tool_names = if cursor.conversation_seq == 0 {
+                // The journal file itself is the canonical empty-state marker.
+                // No side projection is allowed to populate either messages
+                // or activation state before the first canonical commit.
+                continuation_activation_names(&messages, Vec::new())
+            } else {
+                let checkpoint = load_heavy_checkpoint(session_id);
+                let checkpoint_activation = checkpoint
+                    .as_ref()
+                    .filter(|checkpoint| {
+                        checkpoint
+                            .conversation_cursor
+                            .as_ref()
+                            .is_some_and(|checkpoint_cursor| {
+                                astra_turn_types::cursor_relation(checkpoint_cursor, &cursor)
+                                    == astra_turn_types::CursorRelationV1::Exact
+                            })
+                    })
+                    .into_iter()
+                    .flat_map(|checkpoint| {
+                        checkpoint.activated_deferred_tool_names.iter().cloned()
+                    });
+                let csl_activation = load_csl_continuation(session_id)
+                    .ok()
+                    .flatten()
+                    .filter(|continuation| {
+                        astra_turn_types::cursor_relation(
+                            continuation.active_conversation.cursor(),
+                            &cursor,
+                        ) == astra_turn_types::CursorRelationV1::Exact
+                    })
+                    .into_iter()
+                    .flat_map(|continuation| continuation.activated_deferred_tool_names);
+                continuation_activation_names(
+                    &messages,
+                    checkpoint_activation.chain(csl_activation),
+                )
+            };
             let resume = select_single_resume_descriptor(
                 Some(&cursor),
                 resume_descriptor(
@@ -280,67 +291,14 @@ pub(crate) fn load_session_continuation_for_recovery(
         }
     }
 
-    let journal_messages = match load_journal_messages_for_continuation(session_id) {
-        Ok(messages) => messages,
-        Err(error) => {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %error,
-                "failed to read journal continuation fallback; falling back to heavy checkpoint"
-            );
-            None
-        }
-    };
-
     let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
     let heavy = load_heavy_checkpoint(session_id);
 
-    if let Some(messages) = journal_messages {
-        record_session_restore_hydration(&messages);
-        let cursor = astra_turn_types::legacy_resume_cursor(
-            &crate::cli::cli_config::cli_utils::cli_user_id(),
-            session_id,
-            0,
-            &messages,
-        );
-        let activated_deferred_tool_names = continuation_activation_names(&messages, Vec::new());
-        let resume = select_single_resume_descriptor(
-            None,
-            resume_descriptor(
-                astra_turn_types::ResumeSourceV1::JournalDisplayProjection,
-                cursor,
-                vec![
-                    astra_turn_types::ResumeDegradedReasonV1::LegacyCursorUnknown,
-                    astra_turn_types::ResumeDegradedReasonV1::DisplayPairsOnly,
-                ],
-                vec![
-                    astra_turn_types::ResumeRepairActionV1::InspectCanonicalJournal,
-                    astra_turn_types::ResumeRepairActionV1::RebuildProjectionFromJournal,
-                ],
-            ),
-            &messages,
-        )?;
-        return Some(SessionContinuation {
-            completed_turn_count: None,
-            activated_deferred_tool_names,
-            active_conversation: projection_active_conversation(
-                session_id,
-                messages.clone(),
-                0,
-                astra_turn_core::active_conversation::ActiveConversationSource::LegacyDisplayProjection,
-            )?,
-            messages,
-            resume,
-        });
-    }
-
     match heavy {
         Some(cp) if !cp.messages.is_empty() => {
-            let prompt_state = heavy_checkpoint_prompt_state(&cp);
             record_session_restore_hydration(&cp.messages);
-            let messages = match astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_state(
+            let messages = match astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
                 cp.messages,
-                &prompt_state,
             ) {
                     Ok(messages) => messages,
                     Err(error) => {
@@ -361,55 +319,30 @@ pub(crate) fn load_session_continuation_for_recovery(
                 );
                 None
             } else {
-                let checkpoint_cursor = cp.conversation_cursor.clone();
-                let active_conversation = match checkpoint_cursor.clone() {
-                    Some(cursor) => {
-                        if !is_attached_cli_canonical_owner(&cursor.owner_id) {
-                            tracing::warn!(
-                                cursor_owner = %cursor.owner_id,
-                                session_id,
-                                "checkpoint cursor does not belong to the attached account"
-                            );
-                            return None;
-                        }
-                        astra_turn_core::active_conversation::ActiveConversation::from_cursor_projection(
-                            cursor,
-                            messages.clone(),
-                            astra_turn_core::active_conversation::ActiveConversationSource::Checkpoint,
-                        )
-                        .ok()?
-                    }
-                    None => projection_active_conversation(
+                let cursor = cp.conversation_cursor.clone()?;
+                if let Err(error) = validate_flat_projection_cursor(session_id, &cursor) {
+                    tracing::warn!(
                         session_id,
+                        %error,
+                        "checkpoint cursor is not exact for the requested session"
+                    );
+                    return None;
+                }
+                let active_conversation =
+                    astra_turn_core::active_conversation::ActiveConversation::from_cursor_projection(
+                        cursor.clone(),
                         messages.clone(),
-                        0,
                         astra_turn_core::active_conversation::ActiveConversationSource::Checkpoint,
-                    )?,
-                };
-                let cursor = checkpoint_cursor.unwrap_or_else(|| {
-                    astra_turn_types::legacy_resume_cursor(
-                        &crate::cli::cli_config::cli_utils::cli_user_id(),
-                        session_id,
-                        0,
-                        &messages,
                     )
-                });
+                    .ok()?;
                 let activated_deferred_tool_names =
                     continuation_activation_names(&messages, cp.activated_deferred_tool_names);
-                let mut degraded_reasons =
-                    vec![astra_turn_types::ResumeDegradedReasonV1::CheckpointFallback];
-                if cursor.schema_version == 0 {
-                    degraded_reasons.extend([
-                        astra_turn_types::ResumeDegradedReasonV1::LegacyCursorUnknown,
-                        astra_turn_types::ResumeDegradedReasonV1::ProjectionCursorMissing,
-                    ]);
-                }
                 let resume = select_single_resume_descriptor(
                     None,
                     resume_descriptor(
                         astra_turn_types::ResumeSourceV1::Checkpoint,
                         cursor.clone(),
-                        degraded_reasons,
+                        vec![astra_turn_types::ResumeDegradedReasonV1::CheckpointFallback],
                         vec![
                             astra_turn_types::ResumeRepairActionV1::InspectCanonicalJournal,
                             astra_turn_types::ResumeRepairActionV1::RebuildProjectionFromJournal,
@@ -418,8 +351,7 @@ pub(crate) fn load_session_continuation_for_recovery(
                     &messages,
                 )?;
                 Some(SessionContinuation {
-                    completed_turn_count: (cursor.schema_version > 0)
-                        .then_some(cursor.completed_turn),
+                    completed_turn_count: Some(cursor.completed_turn),
                     activated_deferred_tool_names,
                     active_conversation,
                     messages,
@@ -451,37 +383,44 @@ pub(crate) fn recover_or_initialize_active_conversation(
     }
 }
 
-fn projection_active_conversation(
+/// Replay canonical prompt continuation from the same physical append-order
+/// snapshot used to refresh the interactive turn counters. The caller must
+/// hold the matching execution lease while obtaining and consuming `events`.
+pub(crate) fn recover_or_initialize_active_conversation_from_append_order_events(
     session_id: &str,
-    messages: Vec<Value>,
-    completed_turn: u32,
-    source: astra_turn_core::active_conversation::ActiveConversationSource,
-) -> Option<astra_turn_core::active_conversation::ActiveConversation> {
-    astra_turn_core::active_conversation::ActiveConversation::from_projection(
-        &crate::cli::cli_config::cli_utils::cli_user_id(),
-        session_id,
-        messages,
-        completed_turn,
-        source,
+    events: &[astra_services::session_journal::JournalEvent],
+) -> Result<astra_turn_core::active_conversation::ActiveConversation, String> {
+    active_conversation_from_append_order_events(session_id, events)?.map_or_else(
+        || {
+            astra_turn_core::active_conversation::ActiveConversation::empty(
+                &crate::cli::cli_config::cli_utils::cli_user_id(),
+                session_id,
+            )
+            .map_err(|error| error.to_string())
+        },
+        Ok,
     )
-    .map_err(|error| {
-        tracing::warn!(
-            session_id = %session_id,
-            error = %error,
-            "failed to attach recovered canonical conversation"
-        );
-        error
-    })
-    .ok()
 }
 
 fn load_journal_canonical_conversation(
     session_id: &str,
 ) -> Result<Option<astra_turn_core::active_conversation::ActiveConversation>, String> {
-    let commits = astra_services::session_journal::read_journal_append_order(session_id)
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .filter_map(|event| event.conversation_commit)
+    let events = astra_services::session_journal::read_journal_append_order(session_id)
+        .map_err(|error| error.to_string())?;
+    let journal_exists = astra_services::session_journal::journal_file_path(session_id).is_file();
+    if !journal_exists {
+        return Ok(None);
+    }
+    active_conversation_from_append_order_events(session_id, &events)
+}
+
+fn active_conversation_from_append_order_events(
+    session_id: &str,
+    events: &[astra_services::session_journal::JournalEvent],
+) -> Result<Option<astra_turn_core::active_conversation::ActiveConversation>, String> {
+    let commits = events
+        .iter()
+        .filter_map(|event| event.conversation_commit.clone())
         .collect::<Vec<_>>();
     let owner_id = commits
         .first()
@@ -492,8 +431,56 @@ fn load_journal_canonical_conversation(
             "canonical journal belongs to owner `{owner_id}`, not the attached account"
         ));
     }
+    if commits.is_empty() {
+        return astra_turn_core::active_conversation::ActiveConversation::from_projection(
+            &owner_id,
+            session_id,
+            Vec::new(),
+            0,
+            astra_turn_core::active_conversation::ActiveConversationSource::Journal,
+        )
+        .map(Some)
+        .map_err(|error| error.to_string());
+    }
     astra_turn_core::active_conversation::ActiveConversation::replay(&owner_id, session_id, commits)
         .map_err(|error| error.to_string())
+}
+
+fn validate_flat_projection_cursor(
+    session_id: &str,
+    cursor: &astra_turn_types::SessionCursorV1,
+) -> Result<(), String> {
+    if !is_attached_cli_canonical_owner(&cursor.owner_id) {
+        return Err(format!(
+            "cursor belongs to owner `{}`, not the attached account",
+            cursor.owner_id
+        ));
+    }
+    if cursor.session_id != session_id {
+        return Err(format!(
+            "cursor belongs to session `{}`, expected `{session_id}`",
+            cursor.session_id
+        ));
+    }
+    if cursor.branch_id != astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID {
+        return Err(format!(
+            "cursor branch `{}` is unsupported",
+            cursor.branch_id
+        ));
+    }
+    if cursor.schema_version != astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION {
+        return Err(format!(
+            "cursor schema {} is unsupported",
+            cursor.schema_version
+        ));
+    }
+    if cursor.projection_schema != astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION {
+        return Err(format!(
+            "cursor projection schema {} is unsupported for a flat projection",
+            cursor.projection_schema
+        ));
+    }
+    Ok(())
 }
 
 fn load_heavy_checkpoint(
@@ -514,35 +501,6 @@ fn load_heavy_checkpoint(
     }
 }
 
-/// Rebuild a prompt-facing history from completed durable journal turns.
-///
-/// The journal intentionally records only real user input and assistant
-/// output, so this fallback cannot smuggle runtime scaffolding, tool payloads
-/// or UI transcript artifacts into the next prompt.
-fn load_journal_messages_for_continuation(session_id: &str) -> Result<Option<Vec<Value>>, String> {
-    let restored = crate::cli::session::session_runtime::restored_journal_state(session_id)?;
-    if !restored.exists {
-        return Ok(None);
-    }
-
-    let messages = restored
-        .session
-        .history
-        .into_iter()
-        .flat_map(|(user, assistant)| {
-            let mut turn = Vec::with_capacity(2);
-            if !user.trim().is_empty() {
-                turn.push(json!({"role": "user", "content": user}));
-            }
-            if !assistant.trim().is_empty() {
-                turn.push(json!({"role": "assistant", "content": assistant}));
-            }
-            turn
-        })
-        .collect::<Vec<_>>();
-    Ok((!messages.is_empty()).then_some(messages))
-}
-
 pub(crate) fn load_csl_continuation(
     session_id: &str,
 ) -> Result<Option<SessionContinuation>, String> {
@@ -555,65 +513,36 @@ pub(crate) fn load_csl_continuation(
     let Some(materialized) = materialized else {
         return Ok(None);
     };
+    let cursor = materialized
+        .session_state
+        .source_cursor
+        .as_ref()
+        .ok_or_else(|| format!("CSL continuation has no versioned cursor: {session_id}"))?;
+    validate_flat_projection_cursor(session_id, cursor)?;
+    let cursor = cursor.clone();
     record_session_restore_hydration(&materialized.messages);
-    let messages =
-        astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_state(
-            materialized.messages,
-            &materialized.session_state,
-        )
-        .map_err(|error| error.to_string())?;
+    let messages = astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
+        materialized.messages,
+    )
+    .map_err(|error| error.to_string())?;
     let activated_deferred_tool_names = continuation_activation_names(
         &messages,
         materialized.session_state.activated_deferred_tool_names,
     );
-    let source_cursor = materialized.session_state.source_cursor;
-    let (active_conversation, cursor, degraded_reasons, repair_actions) = match source_cursor {
-        Some(cursor) => {
-            if !is_attached_cli_canonical_owner(&cursor.owner_id) {
-                return Err(format!(
-                    "CSL cursor belongs to owner `{}`, not the attached account",
-                    cursor.owner_id
-                ));
-            }
-            let active =
-                astra_turn_core::active_conversation::ActiveConversation::from_cursor_projection(
-                    cursor.clone(),
-                    messages.clone(),
-                    astra_turn_core::active_conversation::ActiveConversationSource::CslProjection,
-                )
-                .map_err(|error| error.to_string())?;
-            (active, cursor, Vec::new(), Vec::new())
-        }
-        None => (
-            projection_active_conversation(
-                session_id,
-                messages.clone(),
-                materialized.last_turn,
-                astra_turn_core::active_conversation::ActiveConversationSource::CslProjection,
-            )
-            .ok_or_else(|| {
-                format!("failed to attach legacy CSL continuation for session {session_id}")
-            })?,
-            astra_turn_types::legacy_resume_cursor(
-                &crate::cli::cli_config::cli_utils::cli_user_id(),
-                session_id,
-                materialized.last_turn,
-                &messages,
-            ),
-            vec![
-                astra_turn_types::ResumeDegradedReasonV1::LegacyCursorUnknown,
-                astra_turn_types::ResumeDegradedReasonV1::ProjectionCursorMissing,
-            ],
-            vec![astra_turn_types::ResumeRepairActionV1::RebuildProjectionFromJournal],
-        ),
-    };
+    let active_conversation =
+        astra_turn_core::active_conversation::ActiveConversation::from_cursor_projection(
+            cursor.clone(),
+            messages.clone(),
+            astra_turn_core::active_conversation::ActiveConversationSource::CslProjection,
+        )
+        .map_err(|error| error.to_string())?;
     let resume = select_single_resume_descriptor(
         None,
         resume_descriptor(
             astra_turn_types::ResumeSourceV1::CslProjection,
             cursor.clone(),
-            degraded_reasons,
-            repair_actions,
+            Vec::new(),
+            Vec::new(),
         ),
         &messages,
     )
@@ -625,24 +554,6 @@ pub(crate) fn load_csl_continuation(
         activated_deferred_tool_names,
         resume,
     }))
-}
-
-fn heavy_checkpoint_prompt_state(
-    cp: &astra_pipeline::step_protocol::HeavyCheckpoint,
-) -> astra_turn_core::conversation_log::SessionStateCompact {
-    astra_turn_core::conversation_log::SessionStateCompact {
-        source_cursor: cp.conversation_cursor.clone(),
-        recent_tools: cp.recent_tools.clone(),
-        consecutive_ctx_errors: cp.consecutive_context_window_errors,
-        delegation: cp.delegation_id.as_ref().map(|id| {
-            astra_turn_core::conversation_log::DelegationCompact {
-                id: id.clone(),
-                pattern: cp.delegation_pattern.clone().unwrap_or_default(),
-                completed_sub_runs: cp.delegation_sub_run_summaries.clone(),
-            }
-        }),
-        ..Default::default()
-    }
 }
 
 /// Strip runtime-injected scaffolding messages that must not persist across
@@ -730,7 +641,35 @@ pub(crate) fn history_pairs_from_messages(msgs: &[Value]) -> Vec<(String, String
 mod tests {
     use astra_pipeline::step_protocol::{ExecutionCursor, StepCheckpoint};
     use astra_services::session_journal;
-    use serde_json::json;
+    use serde_json::{Value, json};
+
+    fn exact_test_cursor(
+        session_id: &str,
+        completed_turn: u32,
+        messages: &[Value],
+    ) -> astra_turn_types::SessionCursorV1 {
+        astra_turn_core::active_conversation::ActiveConversation::empty(
+            astra_services::local_owner_scope().id(),
+            session_id,
+        )
+        .unwrap()
+        .prepare_commit(completed_turn, None, messages.to_vec())
+        .unwrap()
+        .next
+        .cursor()
+        .clone()
+    }
+
+    fn exact_csl_state(
+        session_id: &str,
+        completed_turn: u32,
+        messages: &[Value],
+    ) -> astra_turn_core::conversation_log::SessionStateCompact {
+        astra_turn_core::conversation_log::SessionStateCompact {
+            source_cursor: Some(exact_test_cursor(session_id, completed_turn, messages)),
+            ..Default::default()
+        }
+    }
 
     #[test]
     #[serial_test::serial]
@@ -843,9 +782,8 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn unversioned_checkpoint_activation_cannot_attach_to_a_journal_projection() {
-        let temp = tempfile::tempdir().unwrap();
-        let _journal_dir = session_journal::JournalDirGuard::new(temp.path());
+    fn journal_without_a_conversation_commit_is_explicitly_empty_canonical_state() {
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("journal-continuation-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&session_id).unwrap();
         writer
@@ -871,6 +809,19 @@ mod tests {
         let StepCheckpoint::Heavy(heavy) = &mut checkpoint else {
             unreachable!("StepCheckpoint::heavy must create a heavy checkpoint");
         };
+        heavy.messages = vec![
+            json!({"role": "user", "content": "stale checkpoint question"}),
+            json!({"role": "assistant", "content": "stale checkpoint answer"}),
+        ];
+        heavy.conversation_cursor = Some(
+            astra_turn_core::active_conversation::ActiveConversation::empty(
+                astra_services::local_owner_scope().id(),
+                &session_id,
+            )
+            .unwrap()
+            .cursor()
+            .clone(),
+        );
         heavy.activated_deferred_tool_names = vec!["github".to_string()];
         astra_pipeline::step_checkpoint::write_step_checkpoint(
             &user_id,
@@ -879,27 +830,120 @@ mod tests {
             &checkpoint,
         )
         .unwrap();
+        let stale_csl = vec![
+            json!({"role": "user", "content": "stale CSL question"}),
+            json!({"role": "assistant", "content": "stale CSL answer"}),
+        ];
+        crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
+            &session_id,
+            1,
+            &stale_csl,
+            &exact_csl_state(&session_id, 1, &stale_csl),
+        )
+        .unwrap();
 
         let continuation = super::load_session_continuation_for_recovery(&session_id)
-            .expect("journal turn should provide continuation while CSL is absent");
-
+            .expect("the journal explicitly owns an empty canonical generation");
+        assert!(
+            continuation.messages.is_empty(),
+            "CSL and checkpoint content must not resurrect history past an existing empty journal"
+        );
+        assert_eq!(
+            continuation.active_conversation.source(),
+            astra_turn_core::active_conversation::ActiveConversationSource::Journal
+        );
         assert_eq!(
             continuation.activated_deferred_tool_names,
             Vec::<String>::new(),
-            "activation state without a source cursor must not be spliced into another projection"
+            "side projections from another cursor must not activate tools on the empty generation"
         );
-        assert!(continuation.resume.is_degraded());
-        assert_eq!(continuation.resume.cursor.schema_version, 0);
-        let messages = continuation.messages;
-        assert_eq!(messages.len(), 2);
-        assert_eq!(
-            messages[0],
-            json!({"role": "user", "content": "keep the result"})
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn unversioned_checkpoint_cannot_create_a_resume_projection() {
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let session_id = format!("unversioned-checkpoint-{}", uuid::Uuid::new_v4());
+        let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
+        let mut checkpoint = StepCheckpoint::heavy(
+            "s1".to_string(),
+            "t1".to_string(),
+            "astra-cli".to_string(),
+            ExecutionCursor::default(),
         );
-        assert_eq!(
-            messages[1],
-            json!({"role": "assistant", "content": "the result is durable"})
+        let StepCheckpoint::Heavy(heavy) = &mut checkpoint else {
+            unreachable!("StepCheckpoint::heavy must create a heavy checkpoint");
+        };
+        heavy.messages = vec![
+            json!({"role": "user", "content": "unversioned question"}),
+            json!({"role": "assistant", "content": "unversioned answer"}),
+        ];
+        assert!(heavy.conversation_cursor.is_none());
+        astra_pipeline::step_checkpoint::write_step_checkpoint(
+            &user_id,
+            &session_id,
+            1,
+            &checkpoint,
+        )
+        .unwrap();
+
+        assert!(
+            super::load_session_continuation_for_recovery(&session_id).is_none(),
+            "checkpoint messages without a versioned cursor must not create resume authority"
         );
+    }
+
+    #[test]
+    fn flat_projection_cursor_requires_exact_owner_session_branch_and_schema() {
+        let session_id = "exact-session";
+        let messages = vec![json!({"role": "user", "content": "private"})];
+        let cursor = exact_test_cursor(session_id, 1, &messages);
+        super::validate_flat_projection_cursor(session_id, &cursor).unwrap();
+
+        let mut cases = Vec::new();
+        let mut foreign_owner = cursor.clone();
+        foreign_owner.owner_id = "foreign-owner".into();
+        cases.push(foreign_owner);
+        let mut foreign_session = cursor.clone();
+        foreign_session.session_id = "other-session".into();
+        cases.push(foreign_session);
+        let mut foreign_branch = cursor.clone();
+        foreign_branch.branch_id = "other-branch".into();
+        cases.push(foreign_branch);
+        let mut unsupported_cursor = cursor.clone();
+        unsupported_cursor.schema_version += 1;
+        cases.push(unsupported_cursor);
+        let mut unsupported_projection = cursor;
+        unsupported_projection.projection_schema =
+            astra_turn_types::SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION;
+        cases.push(unsupported_projection);
+
+        for invalid in cases {
+            assert!(
+                super::validate_flat_projection_cursor(session_id, &invalid).is_err(),
+                "invalid projection identity was admitted: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn csl_cursor_for_another_session_is_rejected_at_the_restore_boundary() {
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let session_id = format!("requested-csl-{}", uuid::Uuid::new_v4());
+        let messages = vec![json!({"role": "user", "content": "private"})];
+        let state = exact_csl_state("different-session", 1, &messages);
+        crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
+            &session_id,
+            1,
+            &messages,
+            &state,
+        )
+        .unwrap();
+
+        let error = super::load_csl_continuation(&session_id)
+            .expect_err("a CSL cursor cannot cross a session boundary");
+        assert!(error.contains("different-session"), "{error}");
     }
 
     #[test]
@@ -1010,6 +1054,7 @@ mod tests {
             json!({"role": "user", "content": "Remember: code is ZEBRA-99"}),
             json!({"role": "assistant", "content": "OK, noted."}),
         ];
+        heavy.conversation_cursor = Some(exact_test_cursor(&session_id, 2, &heavy.messages));
         heavy.activated_deferred_tool_names = vec!["github".to_string()];
         let user_id = crate::cli::cli_config::cli_utils::cli_user_id();
         astra_pipeline::step_checkpoint::write_step_checkpoint(
@@ -1087,14 +1132,15 @@ mod tests {
         )
         .unwrap();
 
+        let csl_messages = vec![
+            json!({"role": "user", "content": "canonical question"}),
+            json!({"role": "assistant", "content": "canonical answer"}),
+        ];
         crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
             &session_id,
             9,
-            &[
-                json!({"role": "user", "content": "canonical question"}),
-                json!({"role": "assistant", "content": "canonical answer"}),
-            ],
-            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+            &csl_messages,
+            &exact_csl_state(&session_id, 9, &csl_messages),
         )
         .unwrap();
 
@@ -1140,14 +1186,15 @@ mod tests {
         );
         let mut canonical_current = json!({"role": "user", "content": "canonical current"});
         astra_turn_types::mark_user_turn_semantics(&mut canonical_current, semantics);
+        let csl_messages = vec![
+            canonical_current,
+            json!({"role": "assistant", "content": "current answer"}),
+        ];
         crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
             &session_id,
             2,
-            &[
-                canonical_current,
-                json!({"role": "assistant", "content": "current answer"}),
-            ],
-            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+            &csl_messages,
+            &exact_csl_state(&session_id, 2, &csl_messages),
         )
         .unwrap();
 
@@ -1170,12 +1217,9 @@ mod tests {
     fn load_session_messages_restores_completed_tool_evidence_from_csl() {
         let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("test-session-csl-tools-{}", uuid::Uuid::new_v4());
-        crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
-            &session_id,
-            1,
-            &[
-                json!({"role": "user", "content": "inspect Cargo.toml"}),
-                json!({
+        let csl_messages = vec![
+            json!({"role": "user", "content": "inspect Cargo.toml"}),
+            json!({
                     "role": "assistant",
                     "tool_calls": [{
                         "id": "call-1",
@@ -1185,15 +1229,19 @@ mod tests {
                             "arguments": "{\"path\":\"Cargo.toml\"}"
                         }
                     }]
-                }),
-                json!({
+            }),
+            json!({
                     "role": "tool",
                     "tool_call_id": "call-1",
                     "content": "[package]\nname = \"astra\""
-                }),
-                json!({"role": "assistant", "content": "done"}),
-            ],
-            &astra_turn_core::conversation_log::SessionStateCompact::default(),
+            }),
+            json!({"role": "assistant", "content": "done"}),
+        ];
+        crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
+            &session_id,
+            1,
+            &csl_messages,
+            &exact_csl_state(&session_id, 1, &csl_messages),
         )
         .unwrap();
 
@@ -1204,53 +1252,6 @@ mod tests {
         assert_eq!(messages[1]["tool_calls"][0]["id"], "call-1");
         assert_eq!(messages[2]["role"], "tool");
         assert_eq!(messages[2]["content"], "[package]\nname = \"astra\"");
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn csl_continuation_upgrades_legacy_activation_from_paired_history() {
-        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
-        let session_id = format!("test-session-csl-activation-{}", uuid::Uuid::new_v4());
-        let selected = json!({
-            "mode": "select",
-            "query": "select:github",
-            "requested": ["github"],
-            "matches": [{"name": "github", "parameters": {"type": "object"}}],
-            "missing": []
-        })
-        .to_string();
-        crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
-            &session_id,
-            1,
-            &[
-                json!({"role": "user", "content": "list pull requests"}),
-                json!({
-                    "role": "assistant",
-                    "tool_calls": [{
-                        "id": "search-1",
-                        "type": "function",
-                        "function": {
-                            "name": "tool_search",
-                            "arguments": "{\"query\":\"select:github\"}"
-                        }
-                    }]
-                }),
-                json!({"role": "tool", "tool_call_id": "search-1", "content": selected}),
-                json!({"role": "assistant", "content": "done"}),
-            ],
-            &astra_turn_core::conversation_log::SessionStateCompact::default(),
-        )
-        .unwrap();
-
-        let continuation = super::load_csl_continuation(&session_id)
-            .unwrap()
-            .expect("canonical continuation");
-
-        assert_eq!(
-            continuation.activated_deferred_tool_names,
-            vec!["github"],
-            "older CSL snapshots must recover activation only from paired canonical evidence"
-        );
     }
 
     #[test]

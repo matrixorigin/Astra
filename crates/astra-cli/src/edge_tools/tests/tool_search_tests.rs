@@ -328,30 +328,37 @@ async fn activated_deferred_tool_is_pruned_when_no_longer_visible_or_activatable
 }
 
 #[tokio::test]
-async fn keyword_search_uses_the_same_visible_union_activatable_pool() {
+async fn explicit_selection_uses_the_same_visible_union_activatable_pool() {
     let executor = executor();
     set_visible(&executor, &["bash", "tool_search"]);
     executor.set_current_activatable_tool_names(HashSet::from(["web_fetch".to_string()]));
 
-    let parsed = run_search(
-        &executor,
-        json!({"query": "fetch web url", "max_results": 20}),
-    )
-    .await;
+    let parsed = run_search(&executor, json!({"query": "select:web_fetch"})).await;
     let names = match_names(&parsed);
 
-    assert_eq!(parsed["mode"].as_str(), Some("keyword"));
+    assert_eq!(parsed["mode"].as_str(), Some("select"));
     assert_eq!(parsed["total_tools"].as_u64(), Some(3));
-    assert!(
-        names.iter().any(|name| name == "web_fetch"),
-        "keyword search should find the activatable deferred tool: {parsed}"
-    );
+    assert_eq!(names, strings(&["web_fetch"]));
     assert!(
         names
             .iter()
             .all(|name| matches!(name.as_str(), "bash" | "tool_search" | "web_fetch")),
-        "keyword search must not leak tools outside visible ∪ activatable: {parsed}"
+        "selection must not leak tools outside visible ∪ activatable: {parsed}"
     );
+}
+
+#[tokio::test]
+async fn natural_language_query_fails_without_guessing_from_the_edge_surface() {
+    let executor = executor();
+    set_visible(&executor, &["bash", "tool_search"]);
+    executor.set_current_activatable_tool_names(HashSet::from(["web_fetch".to_string()]));
+
+    let parsed = run_search(&executor, json!({"query": "fetch web url"})).await;
+
+    assert_eq!(parsed["mode"].as_str(), Some("error"));
+    assert_eq!(parsed["status"].as_str(), Some("failed"));
+    assert!(parsed.get("matches").is_none());
+    assert!(executor.activated_deferred_tool_names().is_empty());
 }
 
 #[tokio::test]

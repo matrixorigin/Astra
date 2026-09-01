@@ -110,6 +110,7 @@ pub(crate) struct CompactionStageItem {
 /// can distinguish "retrieved this turn" from "injected anyway."
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct MemoryFocus {
+    pub outcome: astra_turn_types::MemoryRetrievalOutcome,
     pub query: String,
     pub candidates_considered: u32,
     pub retrieval_latency_ms: u64,
@@ -120,7 +121,8 @@ pub(crate) struct MemoryFocus {
 
 impl MemoryFocus {
     pub fn has_retrieval_activity(&self) -> bool {
-        !self.query.is_empty()
+        self.outcome.was_attempted()
+            || !self.query.is_empty()
             || self.candidates_considered > 0
             || self.retrieval_latency_ms > 0
             || !self.rejected.is_empty()
@@ -176,7 +178,7 @@ pub(crate) enum SignalKind {
     Guidance,
 }
 
-/// Session + budget summary built from [`ContextSnapshot::session`]
+/// Session summary built from [`ContextSnapshot::session`]
 /// (which in turn wraps `SessionState` fields).  Rendered as a
 /// dedicated section so users can see cost, token totals, and
 /// sticky state that drives follow-up turns.
@@ -186,7 +188,6 @@ pub(crate) struct SessionSummary {
     pub turn: u32,
     pub model: Option<String>,
     pub total_cost: f64,
-    pub max_budget: f64,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub cache_read_tokens: u64,
@@ -1118,6 +1119,7 @@ fn build_memory_focus(trace: &ContextAssemblyTrace) -> MemoryFocus {
             preview: mi.content_preview.clone(),
         });
     MemoryFocus {
+        outcome: m.outcome,
         query: m.query.clone(),
         candidates_considered: m.candidates_considered,
         retrieval_latency_ms: m.retrieval_latency_ms,

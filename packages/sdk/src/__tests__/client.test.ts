@@ -933,9 +933,10 @@ describe("AstraClient — Memory", () => {
 // ─── Skills ─────────────────────────────────────────────────────────
 
 describe("AstraClient — Models", () => {
-  test("listModels uses the canonical Offering array", async () => {
-    globalThis.fetch = mockFetch(200, [
-      {
+  test("listModels drains the canonical Offering pages", async () => {
+    globalThis.fetch = mockFetch(200, {
+      items: [
+        {
         offering_id: "m1",
         access_id: "self-hosted",
         access_kind: "self_hosted",
@@ -949,15 +950,66 @@ describe("AstraClient — Models", () => {
         max_completion_tokens: null,
         architecture: null,
         thinking_capability: null,
-      },
-    ]);
+        },
+      ],
+      next_cursor: null,
+      limit: 200,
+      total: 1,
+      catalog_revision: "sha256:catalog",
+    });
 
     const result = await createClient().listModels();
     expect(result).toHaveLength(1);
     expect(result[0].name).toBe("m1");
     expect(
       (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
-    ).toContain("/models");
+    ).toContain("/models?limit=200");
+  });
+
+  test("listModels follows seek cursors and rejects a repeated page", async () => {
+    const item = {
+      offering_id: "m1",
+      access_id: "self-hosted",
+      access_kind: "self_hosted",
+      access_label: "Self-hosted",
+      execution_placement: "server",
+      name: "m1",
+      provider: "p1",
+      description: null,
+      is_active: true,
+      context_window: 8192,
+      max_completion_tokens: null,
+      architecture: null,
+      thinking_capability: null,
+    };
+    const cursor = { provider: "p1", model_name: "m1", model_id: "m1" };
+    const fetchMock = vi.fn();
+    fetchMock
+      .mockResolvedValueOnce(
+        mockFetch(200, {
+          items: [item],
+          next_cursor: cursor,
+          limit: 1,
+          total: 2,
+          catalog_revision: "sha256:catalog",
+        })(),
+      )
+      .mockResolvedValueOnce(
+        mockFetch(200, {
+          items: [{ ...item, offering_id: "m2", name: "m2" }],
+          next_cursor: null,
+          limit: 1,
+          total: 2,
+          catalog_revision: "sha256:catalog",
+        })(),
+      );
+    globalThis.fetch = fetchMock;
+
+    const result = await createClient().listModels();
+    expect(result.map((entry) => entry.offering_id)).toEqual(["m1", "m2"]);
+    expect(fetchMock.mock.calls[1][0]).toContain(
+      "after_provider=p1&after_name=m1&after_offering_id=m1",
+    );
   });
 
   test("getModelAccess preserves product source and execution placement", async () => {
@@ -979,6 +1031,9 @@ describe("AstraClient — Models", () => {
       offerings: [],
       default_offering_id: null,
       default_resolution: { state: "missing" },
+      next_cursor: null,
+      limit: 200,
+      total: 0,
       catalog_revision: "sha256:catalog",
       observed_at: "2026-07-20T00:00:00Z",
     });
@@ -996,6 +1051,72 @@ describe("AstraClient — Models", () => {
     expect(
       (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0],
     ).toContain("/model-access");
+  });
+
+  test("getModelAccess drains pages while preserving first-page default", async () => {
+    const access = {
+      id: "self-hosted",
+      kind: "self_hosted",
+      label: "Self-hosted",
+      execution_placement: "server",
+      status: "ready",
+      reason: null,
+      usable: true,
+      retry_after_seconds: null,
+      available_model_count: 2,
+      actions: [],
+    };
+    const offering = {
+      offering_id: "m1",
+      access_id: "self-hosted",
+      access_kind: "self_hosted",
+      access_label: "Self-hosted",
+      execution_placement: "server",
+      name: "m1",
+      provider: "p1",
+      description: null,
+      is_active: true,
+      context_window: 8192,
+      max_completion_tokens: null,
+      architecture: null,
+      thinking_capability: null,
+    };
+    const cursor = { provider: "p1", model_name: "m1", model_id: "m1" };
+    const fetchMock = vi.fn();
+    fetchMock
+      .mockResolvedValueOnce(
+        mockFetch(200, {
+          accesses: [access],
+          offerings: [offering],
+          default_offering_id: "m1",
+          next_cursor: cursor,
+          limit: 1,
+          total: 2,
+          catalog_revision: "sha256:catalog",
+          observed_at: "2026-07-20T00:00:00Z",
+        })(),
+      )
+      .mockResolvedValueOnce(
+        mockFetch(200, {
+          accesses: [access],
+          offerings: [{ ...offering, offering_id: "m2", name: "m2" }],
+          default_offering_id: null,
+          next_cursor: null,
+          limit: 1,
+          total: 2,
+          catalog_revision: "sha256:catalog",
+          observed_at: "2026-07-20T00:00:00Z",
+        })(),
+      );
+    globalThis.fetch = fetchMock;
+
+    const result = await createClient().getModelAccess();
+    expect(result.offerings.map((entry) => entry.offering_id)).toEqual([
+      "m1",
+      "m2",
+    ]);
+    expect(result.default_offering_id).toBe("m1");
+    expect(result.next_cursor).toBeNull();
   });
 });
 
@@ -1341,6 +1462,7 @@ describe("chatRequestToWire", () => {
         hardTurnLimit: 7,
       },
       sessionId: "sess-1",
+      workBinding: { workId: "work-1", branchId: "branch-1" },
       agentId: "ag-1",
       modelSelection: { offeringId: "offer-kimi" },
       agentBinding: {
@@ -1384,6 +1506,7 @@ describe("chatRequestToWire", () => {
         hard_turn_limit: 7,
       },
       session_id: "sess-1",
+      work_binding: { work_id: "work-1", branch_id: "branch-1" },
       agent_id: "ag-1",
       model_selection: { offering_id: "offer-kimi" },
       agent_binding: {

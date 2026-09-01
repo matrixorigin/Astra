@@ -24,6 +24,79 @@ fn apply_guidance(pane: &mut BottomPane, intent_id: &str, text: &str) -> Option<
     .map(|intent| intent.text)
 }
 
+#[test]
+fn active_run_guidance_transfers_ownership_only_after_remote_acknowledgement() {
+    let mut pane = BottomPane::new();
+    accept_guidance(&mut pane, "stable-intent", "keep investigating");
+
+    assert!(pane.promote_user_intent_accepted("stable-intent"));
+    assert!(!pane.promote_user_intent_accepted("stable-intent"));
+    assert!(
+        pane.take_client_recoverable_user_intents().is_empty(),
+        "a remotely accepted stable identity must never become a duplicate next turn"
+    );
+    assert!(pane.has_pending_user_intents());
+}
+
+#[test]
+fn ambiguous_guidance_ownership_is_visible_and_never_auto_replayed() {
+    let mut pane = BottomPane::new();
+    accept_guidance(&mut pane, "ambiguous-intent", "keep investigating");
+
+    assert!(pane.mark_user_intent_unconfirmed("ambiguous-intent"));
+    assert!(!pane.mark_user_intent_unconfirmed("ambiguous-intent"));
+    assert!(pane.remove_local_user_intent("ambiguous-intent").is_none());
+    assert!(
+        pane.take_client_recoverable_user_intents().is_empty(),
+        "ownership uncertainty must not manufacture a second canonical submission"
+    );
+    assert!(pane.has_pending_user_intents());
+    let rendered = render_text(&pane, Rect::new(0, 0, 90, 8));
+    assert!(
+        rendered.contains("Guidance delivery uncertain · stable identity retained"),
+        "the unresolved protocol state must remain visible: {rendered:?}"
+    );
+}
+
+#[test]
+fn accepted_guidance_with_unresolved_disposition_becomes_unconfirmed_not_replayable() {
+    let mut pane = BottomPane::new();
+    accept_guidance(
+        &mut pane,
+        "accepted-then-unconfirmed",
+        "do not modify files",
+    );
+    assert!(pane.promote_user_intent_accepted("accepted-then-unconfirmed"));
+    assert!(pane.mark_user_intent_unconfirmed("accepted-then-unconfirmed"));
+    assert!(pane.take_client_recoverable_user_intents().is_empty());
+    assert!(pane.has_pending_user_intents());
+    let rendered = render_text(&pane, Rect::new(0, 0, 90, 8));
+    assert!(
+        rendered.contains("Guidance delivery uncertain · stable identity retained"),
+        "{rendered:?}"
+    );
+}
+
+#[test]
+fn definitive_guidance_rejection_removes_only_the_matching_local_identity() {
+    let mut pane = BottomPane::new();
+    accept_guidance(&mut pane, "rejected-intent", "first");
+    accept_guidance(&mut pane, "other-intent", "second");
+
+    let removed = pane
+        .remove_local_user_intent("rejected-intent")
+        .expect("locally owned intent");
+    assert_eq!(removed.text, "first");
+    assert!(pane.remove_local_user_intent("rejected-intent").is_none());
+    assert_eq!(
+        pane.take_client_recoverable_user_intents()
+            .into_iter()
+            .map(|intent| intent.intent_id)
+            .collect::<Vec<_>>(),
+        vec!["other-intent"]
+    );
+}
+
 fn render_text(pane: &BottomPane, area: Rect) -> String {
     let mut buf = Buffer::empty(area);
     pane.render(area, &mut buf);
@@ -244,7 +317,7 @@ fn restore_into_composer_ignores_blank_input() {
 }
 
 #[test]
-fn pending_user_intent_panel_renders_immediate_feedback() {
+fn locally_accepted_intent_does_not_claim_remote_delivery() {
     let mut pane = BottomPane::new();
     pane.set_task_status(TaskStatus::TurnRunning {
         started_at: Instant::now(),
@@ -253,16 +326,16 @@ fn pending_user_intent_panel_renders_immediate_feedback() {
 
     let rendered = render_text(&pane, Rect::new(0, 0, 90, 8));
     assert!(
-        rendered.contains("Queued for current run"),
-        "queued follow-up panel should name its delivery semantics; got {rendered:?}"
+        rendered.contains("Sending guidance"),
+        "local acknowledgement should expose the in-flight delivery state; got {rendered:?}"
     );
     assert!(
-        rendered.contains("next model boundary"),
-        "intent panel should explain when guidance applies; got {rendered:?}"
+        rendered.contains("awaiting server acceptance"),
+        "local acknowledgement must not promise an application boundary; got {rendered:?}"
     );
     assert!(
-        rendered.contains("queued"),
-        "intent panel should show the typed queue acknowledgement; got {rendered:?}"
+        rendered.contains("sending"),
+        "intent panel should show the typed local delivery status; got {rendered:?}"
     );
     assert!(
         rendered.contains("hi from the user"),
@@ -283,7 +356,7 @@ fn agent_guidance_uses_its_named_target_and_never_drains_into_root_chat() {
     let rendered = render_text(&pane, Rect::new(0, 0, 90, 8));
     assert!(rendered.contains("Sending guidance to Reviewer"));
     assert!(!rendered.contains("internal-run-id"));
-    assert!(pane.take_unapplied_user_intents().is_empty());
+    assert!(pane.take_client_recoverable_user_intents().is_empty());
     assert!(pane.promote_agent_guide_accepted("intent-agent-1"));
     let pending = pane
         .remove_agent_guide("intent-agent-1")
@@ -301,15 +374,101 @@ fn guidance_during_tool_execution_explains_the_real_application_boundary() {
         name: "agent_fanout".into(),
         started_at: Instant::now(),
     });
-    accept_guidance(&mut pane, "input-during-tool", "review the latest finding");
+    assert!(pane.accept_user_intent(
+        "input-during-tool",
+        astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+        astra_turn_types::UserIntentStatus::AcceptedRemote,
+        "review the latest finding",
+    ));
 
     let rendered = render_text(&pane, Rect::new(0, 0, 90, 8));
-    assert!(rendered.contains("Queued for current run"), "{rendered:?}");
+    assert!(rendered.contains("Guidance accepted"), "{rendered:?}");
     assert!(
-        rendered.contains("applies after current tool"),
+        rendered.contains("before next unstarted action"),
         "{rendered:?}"
     );
+    assert!(rendered.contains("Ctrl+C requests stop"), "{rendered:?}");
+    assert!(!rendered.contains("Guidance applied"), "{rendered:?}");
     assert!(!rendered.contains("accepted locally"), "{rendered:?}");
+}
+
+#[test]
+fn remotely_accepted_guidance_is_not_recovered_as_a_second_user_turn() {
+    let mut pane = BottomPane::new();
+    assert!(pane.accept_user_intent(
+        "accepted-before-stream-close",
+        astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+        astra_turn_types::UserIntentStatus::AcceptedRemote,
+        "stop here",
+    ));
+
+    assert!(
+        pane.take_client_recoverable_user_intents().is_empty(),
+        "server acknowledgement transfers exactly-once delivery ownership"
+    );
+    assert!(
+        pane.has_pending_user_intents(),
+        "accepted identity remains visible until an Applied disposition arrives"
+    );
+}
+
+#[test]
+fn remotely_accepted_guidance_is_not_replayed_when_local_settlement_fails() {
+    let mut pane = BottomPane::new();
+    assert!(pane.accept_user_intent(
+        "accepted-before-failure",
+        astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+        astra_turn_types::UserIntentStatus::AcceptedRemote,
+        "preserve this input",
+    ));
+
+    assert!(
+        pane.take_client_recoverable_user_intents().is_empty(),
+        "local failure cannot revoke server ownership or prove the intent was not applied"
+    );
+    pane.set_task_status(TaskStatus::Idle);
+    let rendered = render_text(&pane, Rect::new(0, 0, 90, 8));
+    assert!(rendered.contains("being reconciled"), "{rendered:?}");
+}
+
+#[test]
+fn durable_return_restores_only_the_matching_owned_guidance_as_a_draft() {
+    let mut pane = BottomPane::new();
+    pane.composer.set_text("existing draft");
+    assert!(pane.accept_user_intent(
+        "returned-intent",
+        astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+        astra_turn_types::UserIntentStatus::AcceptedRemote,
+        "original local copy",
+    ));
+
+    assert!(pane.return_user_intent(
+        "returned-intent",
+        astra_turn_types::UserIntentStatus::Returned,
+        "authoritative returned input",
+    ));
+    assert_eq!(
+        pane.composer.text(),
+        "existing draft\n\nauthoritative returned input"
+    );
+    assert!(!pane.has_pending_user_intents());
+    assert!(!pane.return_user_intent(
+        "returned-intent",
+        astra_turn_types::UserIntentStatus::Returned,
+        "authoritative returned input",
+    ));
+}
+
+#[test]
+fn returned_guidance_from_another_attached_client_does_not_mutate_the_composer() {
+    let mut pane = BottomPane::new();
+    pane.composer.set_text("my draft");
+    assert!(!pane.return_user_intent(
+        "not-owned-here",
+        astra_turn_types::UserIntentStatus::Returned,
+        "another client's guidance",
+    ));
+    assert_eq!(pane.composer.text(), "my draft");
 }
 
 #[test]

@@ -22,7 +22,7 @@ use crate::step_protocol::{
 /// Directory name within session workspace for step checkpoints.
 const STEP_CHECKPOINT_DIR: &str = "step_checkpoints";
 pub const STEP_LOCAL_LAYOUT_VERSION: &str = astra_services::LOCAL_SESSION_LAYOUT_VERSION;
-pub const STEP_ARTIFACT_SCHEMA_VERSION: u32 = 1;
+pub const STEP_ARTIFACT_SCHEMA_VERSION: u32 = 2;
 const STEP_CHECKPOINT_ARTIFACT_KIND: &str = "step_checkpoint";
 const STEP_EVENT_ARTIFACT_KIND: &str = "step_event";
 const STEP_BREAKPOINT_INDEX_ARTIFACT_KIND: &str = "step_breakpoint_index";
@@ -143,64 +143,60 @@ fn append_jsonl_line(
         ));
     };
     std::fs::create_dir_all(dir)?;
-    let existed = path.exists();
-    let needs_leading_newline = existed && file_needs_trailing_newline(path)?;
+    use fs2::FileExt;
     use std::io::Write;
-    // Create with 0o600 atomically — no window where sensitive payload is world-readable.
-    // Unconditional chmod covers pre-existing artifacts created before this
-    // append path enforced private permissions.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(path)?;
-        if needs_leading_newline {
-            file.write_all(b"\n")?;
+    let create_attempt = {
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).read(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
-        writeln!(file, "{content}")?;
-        if matches!(durability, WriteDurability::Durable) {
-            file.sync_data()?;
-        }
-        drop(file);
-    }
-    #[cfg(not(unix))]
-    {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        if needs_leading_newline {
-            file.write_all(b"\n")?;
-        }
-        writeln!(file, "{content}")?;
-        if matches!(durability, WriteDurability::Durable) {
-            file.sync_data()?;
-        }
-        drop(file);
-    }
-    // Heal permissions unconditionally: if a prior crash left a 0o644 file, fix it.
+        options.open(path)
+    };
+    let (mut file, created) = match create_attempt {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (
+            std::fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(path)?,
+            false,
+        ),
+        Err(error) => return Err(error),
+    };
+    file.lock_exclusive()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    if !existed && matches!(durability, WriteDurability::Durable) {
+
+    // Inspect and append while holding the same cross-process lock. Without
+    // this, two writers can both observe a torn/no-newline tail and interleave
+    // records, corrupting the recovery authority they are trying to publish.
+    let needs_leading_newline = file_needs_trailing_newline_from(&mut file)?;
+    if needs_leading_newline {
+        file.write_all(b"\n")?;
+    }
+    writeln!(file, "{content}")?;
+    if matches!(durability, WriteDurability::Durable) {
+        file.sync_data()?;
+    }
+    if created && matches!(durability, WriteDurability::Durable) {
         sync_parent_dir(path)?;
     }
+    FileExt::unlock(&file)?;
     Ok(())
 }
 
-fn file_needs_trailing_newline(path: &Path) -> std::io::Result<bool> {
-    let metadata = std::fs::metadata(path)?;
+fn file_needs_trailing_newline_from(file: &mut std::fs::File) -> std::io::Result<bool> {
+    let metadata = file.metadata()?;
     if metadata.len() == 0 {
         return Ok(false);
     }
-
     use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::End(-1))?;
     let mut last = [0_u8; 1];
     file.read_exact(&mut last)?;
@@ -382,14 +378,22 @@ pub fn write_step_checkpoint(
 ) -> std::io::Result<PathBuf> {
     let dir = checkpoint_dir_for(user_id, session_id)?;
     std::fs::create_dir_all(&dir)?;
+    with_session_checkpoint_lock(&dir, || {
+        write_step_checkpoint_unlocked(user_id, session_id, number, checkpoint, &dir)
+    })
+}
 
+fn write_step_checkpoint_unlocked(
+    user_id: &str,
+    session_id: &str,
+    number: u32,
+    checkpoint: &StepCheckpoint,
+    dir: &Path,
+) -> std::io::Result<PathBuf> {
     let tier = match checkpoint {
         StepCheckpoint::Light(_) => "light",
         StepCheckpoint::Heavy(_) => "heavy",
     };
-    let filename = format!("{:06}-{}.json", number, tier);
-    let path = dir.join(&filename);
-
     let json = encode_versioned_step_artifact(
         STEP_CHECKPOINT_ARTIFACT_KIND,
         user_id,
@@ -401,20 +405,43 @@ pub fn write_step_checkpoint(
         &json,
     );
 
+    let mut allocated_number = number;
+    let path = loop {
+        let candidate = dir.join(format!("{allocated_number:06}-{tier}.json"));
+        if !candidate.exists() {
+            break candidate;
+        }
+        if std::fs::read_to_string(&candidate).is_ok_and(|existing| existing == json) {
+            return Ok(candidate);
+        }
+        allocated_number = list_checkpoints(user_id, session_id)?
+            .into_iter()
+            .map(|(number, _)| number)
+            .max()
+            .unwrap_or(allocated_number)
+            .checked_add(1)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "session checkpoint sequence exhausted u32",
+                )
+            })?;
+    };
+
     write_atomic_text(&path, &json, checkpoint_write_durability(checkpoint))?;
 
     match checkpoint {
-        StepCheckpoint::Light(_) => prune_light_checkpoints(&dir)?,
+        StepCheckpoint::Light(_) => prune_light_checkpoints(dir)?,
         StepCheckpoint::Heavy(_) => {
             // A heavy checkpoint embeds the complete light cursor and is
             // durably on disk at this point. Older light artifacts no longer
             // improve recovery and only amplify writes/listing work. Cleanup
             // is best-effort: failure must not invalidate the durable anchor.
-            if let Err(error) = prune_light_checkpoints_superseded_by(&dir, number) {
+            if let Err(error) = prune_light_checkpoints_superseded_by(dir, allocated_number) {
                 astra_core::agent_warn!(
                     "checkpoint",
                     "Failed to prune light checkpoints superseded by heavy checkpoint {}: {}",
-                    number,
+                    allocated_number,
                     error
                 );
             }
@@ -422,6 +449,25 @@ pub fn write_step_checkpoint(
     }
 
     Ok(path)
+}
+
+fn with_session_checkpoint_lock<T>(
+    dir: &Path,
+    operation: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    use fs2::FileExt;
+    std::fs::create_dir_all(dir)?;
+    let lock_path = dir.join(".session-checkpoint.lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options.open(lock_path)?;
+    lock.lock_exclusive()?;
+    operation()
 }
 
 fn checkpoint_write_durability(checkpoint: &StepCheckpoint) -> WriteDurability {
@@ -687,6 +733,55 @@ fn prune_light_checkpoints_superseded_by(dir: &Path, heavy_number: u32) -> std::
     }
     Ok(())
 }
+
+/// Remove heavy recovery artifacts that no composite snapshot can address.
+///
+/// Post-tool policy may write a defensive heavy anchor before terminal
+/// finalization. Once a newer composite index is durable, those unreferenced
+/// anchors are neither rollback points nor the latest recovery authority and
+/// retaining them makes long tool loops grow storage quadratically.
+pub fn prune_unreferenced_heavy_checkpoints(
+    user_id: &str,
+    session_id: &str,
+    index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
+) -> std::io::Result<usize> {
+    let dir = checkpoint_dir_for(user_id, session_id)?;
+    with_session_checkpoint_lock(&dir, || {
+        prune_unreferenced_heavy_checkpoints_unlocked(&dir, index)
+    })
+}
+
+fn prune_unreferenced_heavy_checkpoints_unlocked(
+    dir: &Path,
+    index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
+) -> std::io::Result<usize> {
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let referenced = index
+        .snapshots
+        .iter()
+        .filter_map(|snapshot| snapshot.session_state())
+        .collect::<std::collections::HashSet<_>>();
+    let mut removed = 0usize;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if !file_name.ends_with("-heavy.json") || referenced.contains(file_name.as_ref()) {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => removed = removed.saturating_add(1),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if removed > 0 {
+        sync_dir(dir)?;
+    }
+    Ok(removed)
+}
 pub fn read_breakpoint_index(
     user_id: &str,
     session_id: &str,
@@ -714,6 +809,17 @@ pub fn write_composite_snapshot_index(
 ) -> std::io::Result<()> {
     let dir = checkpoint_dir_for(user_id, session_id)?;
     std::fs::create_dir_all(&dir)?;
+    with_session_checkpoint_lock(&dir, || {
+        write_composite_snapshot_index_unlocked(user_id, session_id, index, &dir)
+    })
+}
+
+fn write_composite_snapshot_index_unlocked(
+    user_id: &str,
+    session_id: &str,
+    index: &astra_core::composite_snapshot::CompositeSnapshotIndex,
+    dir: &Path,
+) -> std::io::Result<()> {
     let path = dir.join("composite_snapshots.json");
     let json = encode_versioned_step_artifact(
         STEP_COMPOSITE_INDEX_ARTIFACT_KIND,
@@ -726,6 +832,61 @@ pub fn write_composite_snapshot_index(
         &json,
     );
     write_atomic_text(&path, &json, WriteDurability::Durable)
+}
+
+/// Atomically allocate and publish a heavy checkpoint plus its composite
+/// index entry within one cross-process session lock. The returned index is
+/// the exact durable version written by this transaction.
+pub fn commit_composite_checkpoint(
+    user_id: &str,
+    session_id: &str,
+    checkpoint: &StepCheckpoint,
+    mut snapshot: astra_core::composite_snapshot::CompositeSnapshot,
+) -> std::io::Result<(
+    u32,
+    astra_core::composite_snapshot::CompositeSnapshot,
+    astra_core::composite_snapshot::CompositeSnapshotIndex,
+)> {
+    if !matches!(checkpoint, StepCheckpoint::Heavy(_)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "composite checkpoint publication requires a heavy checkpoint",
+        ));
+    }
+    let dir = checkpoint_dir_for(user_id, session_id)?;
+    with_session_checkpoint_lock(&dir, || {
+        let number = list_checkpoints(user_id, session_id)?
+            .into_iter()
+            .map(|(number, _)| number)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "session checkpoint sequence exhausted u32",
+                )
+            })?;
+        write_step_checkpoint_unlocked(user_id, session_id, number, checkpoint, &dir)?;
+        snapshot.refs.retain(|reference| {
+            !matches!(
+                reference,
+                astra_core::composite_snapshot::SnapshotRef::SessionState(_)
+            )
+        });
+        snapshot
+            .refs
+            .push(astra_core::composite_snapshot::SnapshotRef::SessionState(
+                format!("{number:06}-heavy.json"),
+            ));
+        let mut index = read_composite_snapshot_index(user_id, session_id)?;
+        index.append(&mut snapshot).map_err(|error| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+        })?;
+        write_composite_snapshot_index_unlocked(user_id, session_id, &index, &dir)?;
+        prune_unreferenced_heavy_checkpoints_unlocked(&dir, &index)?;
+        Ok((number, snapshot, index))
+    })
 }
 
 /// Read the composite snapshot index from disk.
@@ -1096,7 +1257,7 @@ impl FileBackedEventStore {
             &self.session_id,
             event,
         )?;
-        append_jsonl_line(&path, &json, WriteDurability::Buffered)
+        append_jsonl_line(&path, &json, step_event_write_durability(event))
     }
 
     /// Get all events (for audit/replay).
@@ -1107,6 +1268,43 @@ impl FileBackedEventStore {
     /// Event count.
     pub fn event_count(&self) -> usize {
         self.events.len()
+    }
+}
+
+fn step_event_write_durability(event: &StepEvent) -> WriteDurability {
+    use crate::step_protocol::StepEventType;
+
+    // A non-replay-safe tool's start and terminal receipt are the minimal
+    // crash-consistency boundary around an external side effect. Persisting
+    // the start prevents a reboot from treating an uncertain invocation as
+    // never attempted; persisting the terminal receipt proves completion.
+    // Pure reads, idempotent writes, and other trace events stay buffered so
+    // ordinary observation does not pay two fsyncs per tool. A skip receipt
+    // follows the same safety class as its start: otherwise a durable start
+    // plus a lost skip would look like an in-flight side effect after reboot.
+    match &event.event_type {
+        StepEventType::ToolCallStarted
+        | StepEventType::ToolCallCompleted
+        | StepEventType::ToolCallFailed
+        | StepEventType::ToolCallSkipped => {
+            let replay_safe = event
+                .payload
+                .as_ref()
+                .and_then(|payload| payload.get("tool_name"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|tool_name| {
+                    !matches!(
+                        astra_turn_types::classify_tool_idempotency(tool_name, None),
+                        astra_turn_types::ToolIdempotency::NonIdempotent
+                    )
+                });
+            if replay_safe {
+                WriteDurability::Buffered
+            } else {
+                WriteDurability::Durable
+            }
+        }
+        _ => WriteDurability::Buffered,
     }
 }
 
@@ -1238,6 +1436,7 @@ mod tests {
             compaction_state: None,
             pipeline_state: None,
             config_version_id: None,
+            workspace_observation_quarantine: None,
         }
     }
 
@@ -1270,13 +1469,46 @@ mod tests {
     }
 
     #[test]
-    fn buffered_event_append_is_immediately_readable() {
+    fn tool_receipts_are_durable_while_non_execution_trace_stays_buffered() {
+        for event_type in [
+            StepEventType::ToolCallStarted,
+            StepEventType::ToolCallCompleted,
+            StepEventType::ToolCallFailed,
+        ] {
+            let event = make_event("receipt", "step", event_type);
+            assert_eq!(
+                step_event_write_durability(&event),
+                WriteDurability::Durable
+            );
+        }
+        let mut replay_safe = make_event("read-receipt", "step", StepEventType::ToolCallCompleted);
+        replay_safe.payload = Some(json!({"tool_name": "read_file"}));
+        assert_eq!(
+            step_event_write_durability(&replay_safe),
+            WriteDurability::Buffered
+        );
+        let mut skipped = make_event("skipped", "step", StepEventType::ToolCallSkipped);
+        skipped.payload = Some(json!({"tool_name": "read_file"}));
+        assert_eq!(
+            step_event_write_durability(&skipped),
+            WriteDurability::Buffered
+        );
+        let trace = make_event("trace", "step", StepEventType::LlmRoundCompleted);
+        assert_eq!(
+            step_event_write_durability(&trace),
+            WriteDurability::Buffered
+        );
+    }
+
+    #[test]
+    fn durable_tool_receipt_append_is_immediately_replayable() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
         let session_id = unique_session_id("buffered-event");
         let mut store = FileBackedEventStore::empty(TEST_USER_ID, &session_id);
         let event = StepEvent {
             event_id: "evt-buffered".to_string(),
+            run_id: "test-run".into(),
             canonical_event_id: None,
             step_id: "step-buffered".to_string(),
             event_type: crate::step_protocol::StepEventType::ToolCallCompleted,
@@ -1286,11 +1518,69 @@ mod tests {
             created_at: 123,
         };
 
-        store.append(event).expect("append buffered event");
+        store.append(event).expect("append durable tool receipt");
         let replayed = FileBackedEventStore::new(TEST_USER_ID, &session_id);
 
         assert_eq!(replayed.event_count(), 1);
         assert_eq!(replayed.all_events()[0].event_id, "evt-buffered");
+    }
+
+    #[test]
+    fn concurrent_event_writers_preserve_complete_jsonl_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("events.jsonl");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut writers = Vec::new();
+        for writer in 0..8 {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            writers.push(std::thread::spawn(move || {
+                barrier.wait();
+                for index in 0..5 {
+                    let record = json!({"writer": writer, "index": index}).to_string();
+                    append_jsonl_line(&path, &record, WriteDurability::Durable).unwrap();
+                }
+            }));
+        }
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let records = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 40);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (
+                    record["writer"].as_u64().unwrap(),
+                    record["index"].as_u64().unwrap()
+                ))
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            40
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn append_repairs_legacy_event_journal_permissions_while_locked() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("events.jsonl");
+        std::fs::write(&path, "{}\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        append_jsonl_line(&path, "{}", WriteDurability::Buffered).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
@@ -1376,6 +1666,45 @@ mod tests {
     }
 
     #[test]
+    fn composite_index_prunes_only_unreferenced_heavy_recovery_anchors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let session_id = unique_session_id("prune-unreferenced-heavy");
+        for number in 1..=3 {
+            write_step_checkpoint(
+                TEST_USER_ID,
+                &session_id,
+                number,
+                &StepCheckpoint::Heavy(Box::new(make_heavy(
+                    &format!("step-{number}"),
+                    vec![json!({"role": "assistant", "content": number})],
+                ))),
+            )
+            .unwrap();
+        }
+
+        let mut index = astra_core::composite_snapshot::CompositeSnapshotIndex::default();
+        for number in [1, 3] {
+            let mut snapshot = astra_core::composite_snapshot::CompositeSnapshotBuilder::new(
+                session_id.clone(),
+                number,
+            )
+            .session_state(format!("{number:06}-heavy.json"))
+            .build();
+            index.append(&mut snapshot).unwrap();
+        }
+
+        assert_eq!(
+            prune_unreferenced_heavy_checkpoints(TEST_USER_ID, &session_id, &index).unwrap(),
+            1
+        );
+        assert_eq!(
+            list_checkpoints(TEST_USER_ID, &session_id).unwrap(),
+            vec![(1, CheckpointTier::Heavy), (3, CheckpointTier::Heavy)]
+        );
+    }
+
+    #[test]
     fn heavy_checkpoint_never_prunes_a_later_light_cursor() {
         let tmp = tempfile::tempdir().unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
@@ -1445,6 +1774,57 @@ mod tests {
             next_checkpoint_number(TEST_USER_ID, &session_id).unwrap(),
             13,
             "a new run must continue the session sequence instead of reusing its local counter"
+        );
+    }
+
+    #[test]
+    fn concurrent_composite_publishers_keep_both_index_entries_and_anchors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let sessions_root = tmp.path().to_path_buf();
+        let session_id = unique_session_id("concurrent-composite");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut threads = Vec::new();
+        for turn in [1_u32, 2_u32] {
+            let session_id = session_id.clone();
+            let barrier = barrier.clone();
+            let sessions_root = sessions_root.clone();
+            threads.push(std::thread::spawn(move || {
+                let _guard = astra_services::session_journal::JournalDirGuard::new(sessions_root);
+                let checkpoint = StepCheckpoint::Heavy(Box::new(make_heavy(
+                    &format!("step-{turn}"),
+                    vec![json!({"role": "assistant", "content": format!("turn-{turn}")})],
+                )));
+                let snapshot = astra_core::composite_snapshot::CompositeSnapshotBuilder::new(
+                    session_id.clone(),
+                    turn,
+                )
+                .workspace_state(session_id.clone())
+                .build();
+                barrier.wait();
+                commit_composite_checkpoint(TEST_USER_ID, &session_id, &checkpoint, snapshot)
+                    .unwrap()
+            }));
+        }
+        barrier.wait();
+        let committed = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect::<Vec<_>>();
+        let index = read_composite_snapshot_index(TEST_USER_ID, &session_id).unwrap();
+        assert_eq!(index.snapshots.len(), 2);
+        let refs = index
+            .snapshots
+            .iter()
+            .filter_map(|snapshot| snapshot.session_state())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(refs.len(), 2);
+        let dir = checkpoint_dir_for(TEST_USER_ID, &session_id).unwrap();
+        assert!(refs.iter().all(|reference| dir.join(reference).exists()));
+        assert!(
+            committed
+                .iter()
+                .all(|(_, snapshot, _)| snapshot.version > 0)
         );
     }
 
@@ -1604,6 +1984,7 @@ mod tests {
     fn make_event(id: &str, step_id: &str, event_type: StepEventType) -> StepEvent {
         StepEvent {
             event_id: id.to_string(),
+            run_id: "test-run".into(),
             step_id: step_id.to_string(),
             event_type,
             agent_id: None,

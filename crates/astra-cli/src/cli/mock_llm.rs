@@ -1,6 +1,6 @@
 //! Mock LLM server for end-to-end testing of team orchestration without real LLM calls.
 //!
-//! Starts an in-process axum HTTP server that responds to `POST /chat/turn` with
+//! Starts an in-process axum HTTP server that responds to `POST /chat/stream` with
 //! pre-scripted SSE streams. Every other part of the system (worktrees, progress
 //! channels, delegation engine, tool execution, journal) runs for real.
 //!
@@ -19,9 +19,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use axum::Router;
-use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::Response;
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -202,12 +202,23 @@ fn tool_call_start(call_id: &str, tool: &str, args: Value) -> String {
 }
 
 fn tool_request(call_id: &str, tool: &str, args: Value) -> String {
+    tool_request_for_run(call_id, tool, args, "mock-run-tool", "mock-turn-chain-tool")
+}
+
+fn tool_request_for_run(
+    call_id: &str,
+    tool: &str,
+    args: Value,
+    run_id: &str,
+    turn_chain_id: &str,
+) -> String {
     sse_line(&serde_json::json!({
         "type": "tool_request",
         "session_id": "mock-session",
-        "run_id": "mock-run-agent-root",
-        "turn_chain_id": "mock-turn-chain-agent-root",
+        "run_id": run_id,
+        "turn_chain_id": turn_chain_id,
         "request_id": call_id,
+        "schema_admitted_by_server": true,
         "tool": tool,
         "args": args,
     }))
@@ -354,20 +365,8 @@ pub const AGENT_JOURNEY_CHILD_TASK: &str =
     "Inspect the assigned work and return one evidence-backed finding.";
 
 fn is_agent_journey_child_request(body: &Value) -> bool {
-    if body.get("agent_type").and_then(Value::as_str) != Some("general-purpose") {
-        return false;
-    }
-    body.get("messages")
-        .and_then(Value::as_array)
-        .and_then(|messages| {
-            messages
-                .iter()
-                .rev()
-                .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
-        })
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_str)
-        == Some(AGENT_JOURNEY_CHILD_TASK)
+    body.get("message").and_then(Value::as_str) == Some(AGENT_JOURNEY_CHILD_TASK)
+        && body.pointer("/context/agent_type").and_then(Value::as_str) == Some("general-purpose")
 }
 
 fn root_has_tool_result(body: &Value, tool_name: &str) -> bool {
@@ -423,6 +422,13 @@ fn root_has_tool_result(body: &Value, tool_name: &str) -> bool {
 }
 
 async fn body_agent_then_complete(body: &Value) -> String {
+    body_agent_then_complete_with_callbacks(body, None).await
+}
+
+async fn body_agent_then_complete_with_callbacks(
+    body: &Value,
+    callbacks: Option<&Arc<Mutex<Vec<Value>>>>,
+) -> String {
     if is_agent_journey_child_request(body) {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         let message = "child_evidence_visible: delegated review completed successfully.";
@@ -433,10 +439,14 @@ async fn body_agent_then_complete(body: &Value) -> String {
         return stream;
     }
 
-    match (
-        root_has_tool_result(body, "tool_search"),
-        root_has_tool_result(body, "agent"),
-    ) {
+    let tool_search_done = callbacks
+        .map(|callbacks| callback_recorded(callbacks, "call-activate-agent"))
+        .unwrap_or_else(|| root_has_tool_result(body, "tool_search"));
+    let agent_done = callbacks
+        .map(|callbacks| callback_recorded(callbacks, "call-spawn-child"))
+        .unwrap_or_else(|| root_has_tool_result(body, "agent"));
+
+    match (tool_search_done, agent_done) {
         (false, false) => {
             let mut stream = session_info("mock-run-agent-root");
             let args = serde_json::json!({"query": "select:agent"});
@@ -445,7 +455,13 @@ async fn body_agent_then_complete(body: &Value) -> String {
                 "tool_search",
                 args.clone(),
             ));
-            stream.push_str(&tool_request("call-activate-agent", "tool_search", args));
+            stream.push_str(&tool_request_for_run(
+                "call-activate-agent",
+                "tool_search",
+                args,
+                "mock-run-agent-root",
+                "mock-turn-chain-agent-root",
+            ));
             stream.push_str(&done_event(40));
             stream
         }
@@ -458,7 +474,13 @@ async fn body_agent_then_complete(body: &Value) -> String {
                 "agent_type": "general-purpose"
             });
             stream.push_str(&tool_call_start("call-spawn-child", "agent", args.clone()));
-            stream.push_str(&tool_request("call-spawn-child", "agent", args));
+            stream.push_str(&tool_request_for_run(
+                "call-spawn-child",
+                "agent",
+                args,
+                "mock-run-agent-root",
+                "mock-turn-chain-agent-root",
+            ));
             stream.push_str(&done_event(80));
             stream
         }
@@ -480,15 +502,38 @@ pub const FANOUT_JOURNEY_CHILD_TASKS: [&str; 3] = [
 ];
 pub const FANOUT_JOURNEY_STATUS_QUESTION: &str = "what_background_work_is_running";
 
+fn edge_profile(body: &Value) -> Option<&Value> {
+    body.get("edge_profile")
+        .or_else(|| body.pointer("/context/edge_profile"))
+}
+
+fn server_edge_profile(body: &Value) -> Option<&Value> {
+    body.pointer("/context/edge_profile")
+}
+
+fn server_message(body: &Value) -> Option<&str> {
+    body.get("message").and_then(Value::as_str)
+}
+
+fn server_fanout_journey_child_index(body: &Value) -> Option<usize> {
+    body.get("context")?;
+    let prompt = server_message(body)?;
+    FANOUT_JOURNEY_CHILD_TASKS
+        .iter()
+        .position(|candidate| *candidate == prompt)
+}
+
 fn latest_user_message(body: &Value) -> Option<&str> {
-    body.get("messages")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .rev()
-        .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
-        .and_then(|message| message.get("content"))
-        .and_then(Value::as_str)
+    body.get("message").and_then(Value::as_str).or_else(|| {
+        body.get("messages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .rev()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+    })
 }
 
 fn fanout_journey_child_index(body: &Value) -> Option<usize> {
@@ -504,7 +549,33 @@ async fn body_fanout_then_complete(
     completed_children: &AtomicU8,
     held_response_release: Option<&tokio::sync::Notify>,
 ) -> String {
-    if let Some(index) = fanout_journey_child_index(body) {
+    body_fanout_then_complete_with_callbacks(
+        body,
+        failed_child,
+        completed_children,
+        held_response_release,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+async fn body_fanout_then_complete_with_callbacks(
+    body: &Value,
+    failed_child: Option<usize>,
+    completed_children: &AtomicU8,
+    held_response_release: Option<&tokio::sync::Notify>,
+    callbacks: Option<&Arc<Mutex<Vec<Value>>>>,
+    guidance_pending: Option<&Arc<AtomicU8>>,
+    guidance_requests: Option<&Arc<Mutex<Vec<Value>>>>,
+) -> String {
+    let child_index = if callbacks.is_some() {
+        server_fanout_journey_child_index(body)
+    } else {
+        fanout_journey_child_index(body)
+    };
+    if let Some(index) = child_index {
         match index {
             0 => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
             1 => tokio::time::sleep(std::time::Duration::from_millis(700)).await,
@@ -535,7 +606,11 @@ async fn body_fanout_then_complete(
     // the existing fanout. Handle it before ordinary tool discovery so this
     // journey fails if a terminal notification accidentally re-enters the
     // delegation bootstrap and creates the work again.
-    let latest_user = latest_user_message(body).unwrap_or_default();
+    let latest_user = if callbacks.is_some() {
+        server_message(body).unwrap_or_default()
+    } else {
+        latest_user_message(body).unwrap_or_default()
+    };
     if latest_user == astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE
     {
         let message = "Parent reconciled one terminal fanout group exactly once.";
@@ -547,14 +622,18 @@ async fn body_fanout_then_complete(
     }
     if latest_user == FANOUT_JOURNEY_STATUS_QUESTION {
         let request = body.to_string();
-        let active_work = body
-            .pointer("/edge_profile/runtime_volatile_injections")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|injections| {
-                injections
-                    .iter()
-                    .find(|injection| injection["kind"] == "active_work_snapshot")
-            });
+        let active_work = if callbacks.is_some() {
+            server_edge_profile(body)
+        } else {
+            edge_profile(body)
+        }
+        .and_then(|profile| profile.get("runtime_volatile_injections"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|injections| {
+            injections
+                .iter()
+                .find(|injection| injection["kind"] == "active_work_snapshot")
+        });
         let payload = active_work.map(|injection| &injection["payload"]);
         let guidance_snapshot = payload
             .and_then(|payload| payload["snapshots"].as_array())
@@ -604,7 +683,10 @@ async fn body_fanout_then_complete(
         return stream;
     }
 
-    if !root_has_tool_result(body, "tool_search") {
+    let tool_search_done = callbacks
+        .map(|callbacks| callback_recorded(callbacks, "call-activate-fanout"))
+        .unwrap_or_else(|| root_has_tool_result(body, "tool_search"));
+    if !tool_search_done {
         let mut stream = session_info("mock-run-fanout-root");
         let args = serde_json::json!({"query": "select:agent_fanout"});
         stream.push_str(&tool_call_start(
@@ -612,18 +694,31 @@ async fn body_fanout_then_complete(
             "tool_search",
             args.clone(),
         ));
-        stream.push_str(&tool_request("call-activate-fanout", "tool_search", args));
+        stream.push_str(&tool_request_for_run(
+            "call-activate-fanout",
+            "tool_search",
+            args,
+            "mock-run-fanout-root",
+            "mock-turn-chain-fanout-root",
+        ));
         stream.push_str(&done_event(40));
         return stream;
     }
-    if !root_has_tool_result(body, "agent_fanout") {
+    let fanout_done = callbacks
+        .map(|callbacks| callback_recorded(callbacks, "call-start-fanout"))
+        .unwrap_or_else(|| root_has_tool_result(body, "agent_fanout"));
+    if !fanout_done {
         let mut stream = session_info("mock-run-fanout-root");
         let args = serde_json::json!({
             "action": "start",
             "group_id": "mock-review-group",
             "title": "Three mock reviews",
             "target_count": 3,
-            "defaults": {"agent_type": "general-purpose"},
+            // This is the production-shaped review fanout: qualitative
+            // complexity supplies a renewable persona slice, not a numeric
+            // child hard limit. The PTY journey below therefore guards the
+            // same code-review/deep configuration used by real audits.
+            "defaults": {"agent_type": "code-review", "complexity": "deep"},
             "slots": FANOUT_JOURNEY_CHILD_TASKS.iter().enumerate().map(|(index, prompt)| {
                 serde_json::json!({
                     "id": format!("review-{}", index + 1),
@@ -637,17 +732,40 @@ async fn body_fanout_then_complete(
             "agent_fanout",
             args.clone(),
         ));
-        stream.push_str(&tool_request("call-start-fanout", "agent_fanout", args));
+        stream.push_str(&tool_request_for_run(
+            "call-start-fanout",
+            "agent_fanout",
+            args,
+            "mock-run-fanout-root",
+            "mock-turn-chain-fanout-root",
+        ));
         stream.push_str(&done_event(80));
         return stream;
     }
 
-    let message = if failed_child.is_some() {
+    let guidance_was_accepted = guidance_pending.is_some_and(|pending| {
+        pending
+            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    });
+    let message = if guidance_was_accepted {
+        "Astra knows Three mock reviews completed as one foreground work group. Parent synthesized one terminal fanout group exactly once."
+    } else if failed_child.is_some() {
         "Parent synthesized the available 2/3 fanout evidence exactly once."
     } else {
         "Parent synthesized one terminal fanout group exactly once."
     };
     let mut stream = session_info("mock-run-fanout-root");
+    if guidance_was_accepted
+        && let Some(request) =
+            guidance_requests.and_then(|requests| requests.lock().ok()?.last().cloned())
+    {
+        stream.push_str(&user_intent_applied_event(
+            "mock-run-fanout-root",
+            &request,
+            1,
+        ));
+    }
     stream.push_str(&text_delta(message));
     stream.push_str(&text_done(message));
     stream.push_str(&done_event(140));
@@ -754,11 +872,118 @@ fn body_text_only(agent_id: &str, turn: u32) -> String {
 
 // ─── Server state ─────────────────────────────────────────────────────────────
 
+fn callback_recorded(callbacks: &Arc<Mutex<Vec<Value>>>, request_id: &str) -> bool {
+    callbacks
+        .lock()
+        .map(|records| {
+            records.iter().any(|record| {
+                record.get("request_id").and_then(Value::as_str) == Some(request_id)
+                    && record.get("status").and_then(Value::as_str) == Some("completed")
+            })
+        })
+        .unwrap_or(false)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IssuedToolRequestIdentity {
+    session_id: String,
+    run_id: String,
+    turn_chain_id: String,
+    request_id: String,
+}
+
+impl IssuedToolRequestIdentity {
+    fn from_sse_event(event: &Value) -> Option<Self> {
+        if event.get("type").and_then(Value::as_str) != Some("tool_request")
+            || event
+                .get("schema_admitted_by_server")
+                .and_then(Value::as_bool)
+                != Some(true)
+        {
+            return None;
+        }
+
+        let identity = Self {
+            session_id: event.get("session_id")?.as_str()?.to_string(),
+            run_id: event.get("run_id")?.as_str()?.to_string(),
+            turn_chain_id: event.get("turn_chain_id")?.as_str()?.to_string(),
+            request_id: event.get("request_id")?.as_str()?.to_string(),
+        };
+        (!identity.session_id.trim().is_empty()
+            && !identity.run_id.trim().is_empty()
+            && !identity.turn_chain_id.trim().is_empty()
+            && !identity.request_id.trim().is_empty())
+        .then_some(identity)
+    }
+
+    fn matches_result(&self, result: &astra_thin_client::ToolResultRequest) -> bool {
+        self.session_id == result.session_id
+            && self.run_id == result.run_id
+            && self.turn_chain_id == result.turn_chain_id
+            && self.request_id == result.request_id
+    }
+}
+
+fn issued_tool_requests_from_sse(body: &str) -> Vec<IssuedToolRequestIdentity> {
+    body.split("\n\n")
+        .filter_map(|event_block| {
+            let data = event_block
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!data.is_empty())
+                .then(|| serde_json::from_str::<Value>(&data).ok())
+                .flatten()
+        })
+        .filter_map(|event| IssuedToolRequestIdentity::from_sse_event(&event))
+        .collect()
+}
+
+fn record_issued_tool_requests(ledger: &Arc<Mutex<Vec<IssuedToolRequestIdentity>>>, body: &str) {
+    let issued = issued_tool_requests_from_sse(body);
+    if issued.is_empty() {
+        return;
+    }
+    if let Ok(mut ledger) = ledger.lock() {
+        const MAX_ISSUED_TOOL_REQUESTS: usize = 64;
+        for identity in issued {
+            if !ledger.contains(&identity) {
+                if ledger.len() == MAX_ISSUED_TOOL_REQUESTS {
+                    ledger.remove(0);
+                }
+                ledger.push(identity);
+            }
+        }
+    }
+}
+
+fn user_intent_applied_event(run_id: &str, request: &Value, event_index: usize) -> String {
+    let content = request
+        .pointer("/input/content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    sse_line(&serde_json::json!({
+        "type": "user_intent_applied",
+        "run_id": run_id,
+        "intent_id": request.get("intent_id").and_then(Value::as_str).unwrap_or_default(),
+        "delivery": "guide_current_run",
+        "status": "applied",
+        "event_index": event_index,
+        "index": event_index,
+        "content": content,
+    }))
+}
+
 #[derive(Clone)]
 struct ServerState {
     scenario: MockScenario,
     call_count: Arc<AtomicU32>,
     received_requests: Arc<Mutex<Vec<Value>>>,
+    issued_tool_requests: Arc<Mutex<Vec<IssuedToolRequestIdentity>>>,
+    tool_results: Arc<Mutex<Vec<Value>>>,
+    guidance_requests: Arc<Mutex<Vec<Value>>>,
+    guidance_pending: Arc<AtomicU8>,
     completed_fanout_children: Arc<AtomicU8>,
     held_response_release: Option<Arc<tokio::sync::Notify>>,
 }
@@ -793,22 +1018,30 @@ async fn handle_chat_turn(
             body_slow(&agent_id, turn, state.held_response_release.as_deref()).await
         }
         MockScenario::CancellationPending => body_cancellation_pending(&agent_id, turn).await,
-        MockScenario::AgentThenComplete => body_agent_then_complete(&request_body).await,
+        MockScenario::AgentThenComplete => {
+            body_agent_then_complete_with_callbacks(&request_body, Some(&state.tool_results)).await
+        }
         MockScenario::FanoutThenComplete => {
-            body_fanout_then_complete(
+            body_fanout_then_complete_with_callbacks(
                 &request_body,
                 None,
                 &state.completed_fanout_children,
                 state.held_response_release.as_deref(),
+                Some(&state.tool_results),
+                Some(&state.guidance_pending),
+                Some(&state.guidance_requests),
             )
             .await
         }
         MockScenario::FanoutPartialThenComplete => {
-            body_fanout_then_complete(
+            body_fanout_then_complete_with_callbacks(
                 &request_body,
                 Some(1),
                 &state.completed_fanout_children,
                 state.held_response_release.as_deref(),
+                Some(&state.tool_results),
+                Some(&state.guidance_pending),
+                Some(&state.guidance_requests),
             )
             .await
         }
@@ -824,10 +1057,19 @@ async fn handle_chat_turn(
                 .expect("valid HTTP response");
         }
     };
+    // Callback authority is the exact request identity this mock emitted,
+    // rather than a second scenario-name allowlist that can drift from the
+    // scripted SSE protocol. Record it before returning the response so a
+    // fast client cannot race the mock's ledger projection.
+    record_issued_tool_requests(&state.issued_tool_requests, &sse_body);
 
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/event-stream")
+        .header(
+            astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER,
+            astra_server_types::AGENT_INTERACTION_API_MAJOR,
+        )
         .header("cache-control", "no-cache")
         .body(axum::body::Body::from(sse_body))
         .expect("valid HTTP response")
@@ -852,7 +1094,14 @@ fn mock_model_catalog_entry(name: &str) -> Value {
 }
 
 async fn handle_models() -> axum::Json<Value> {
-    axum::Json(Value::Array(mock_model_catalog()))
+    let items = mock_model_catalog();
+    axum::Json(serde_json::json!({
+        "items": items,
+        "next_cursor": null,
+        "limit": 50,
+        "total": 3,
+        "catalog_revision": "sha256:mock-catalog"
+    }))
 }
 
 fn mock_model_catalog() -> Vec<Value> {
@@ -878,14 +1127,161 @@ async fn handle_model_access() -> axum::Json<Value> {
             "actions": []
         }],
         "default_offering_id": "offer-gpt-5",
+        "next_cursor": null,
+        "limit": 50,
+        "total": 3,
         "catalog_revision": "sha256:mock-catalog",
         "observed_at": "2026-07-20T00:00:00Z",
         "offerings": offerings
     }))
 }
 
-async fn handle_tool_result() -> axum::Json<Value> {
-    axum::Json(serde_json::json!({"accepted": true}))
+async fn handle_tool_result(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<axum::Json<Value>, (StatusCode, axum::Json<Value>)> {
+    let record =
+        serde_json::from_slice::<astra_thin_client::ToolResultRequest>(&body).map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "accepted": false,
+                    "error": format!("invalid tool result envelope: {error}"),
+                })),
+            )
+        })?;
+
+    let has_valid_identity = state
+        .issued_tool_requests
+        .lock()
+        .map(|issued| {
+            issued
+                .iter()
+                .any(|identity| identity.matches_result(&record))
+        })
+        .unwrap_or(false)
+        && !record.edge_agent_id.trim().is_empty()
+        && matches!(record.status.as_str(), "completed" | "failed" | "skipped")
+        && record.result_hash
+            == astra_thin_client::ToolResultRequest::compute_result_hash(
+                &record.session_id,
+                &record.run_id,
+                &record.turn_chain_id,
+                &record.request_id,
+                &record.edge_agent_id,
+                &record.status,
+                &record.output,
+                record.duration_ms,
+                record.tool_result_fields.as_ref(),
+            );
+    let header_edge_id = headers
+        .get(astra_thin_client::ASTRA_EDGE_ID_HEADER)
+        .and_then(|value| value.to_str().ok());
+    if !has_valid_identity || header_edge_id != Some(record.edge_agent_id.as_str()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "accepted": false,
+                "error": "tool result identity, status, hash, or edge header is invalid",
+            })),
+        ));
+    }
+
+    if let Ok(mut records) = state.tool_results.lock() {
+        const MAX_RECORDED_TOOL_RESULTS: usize = 64;
+        if records.len() == MAX_RECORDED_TOOL_RESULTS {
+            records.remove(0);
+        }
+        records.push(serde_json::to_value(&record).expect("tool result request serializes"));
+    }
+    Ok(axum::Json(serde_json::json!({"accepted": true})))
+}
+
+async fn handle_run_user_intent(
+    State(state): State<ServerState>,
+    Path(run_id): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<axum::Json<astra_thin_client::RunUserIntentResponse>, (StatusCode, axum::Json<Value>)> {
+    let request = serde_json::from_slice::<astra_thin_client::RunUserIntentRequest>(&body)
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "accepted": false,
+                    "error": format!("invalid run intent envelope: {error}"),
+                })),
+            )
+        })?;
+    let expected_run = match state.scenario {
+        MockScenario::FanoutThenComplete | MockScenario::FanoutPartialThenComplete => {
+            Some("mock-run-fanout-root")
+        }
+        _ => None,
+    };
+    let input_is_typed = request
+        .input
+        .get("content")
+        .and_then(Value::as_str)
+        .is_some_and(|content| !content.trim().is_empty())
+        && request.input["astra_runtime_context"]["authority"] == "run_control_provider"
+        && request.input["astra_runtime_context"]["schema"] == "active_work_snapshot.v1";
+    if expected_run != Some(run_id.as_str())
+        || request.delivery != astra_turn_types::UserIntentDelivery::GuideCurrentRun
+        || !input_is_typed
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "accepted": false,
+                "error": "run intent identity, delivery, or typed context is invalid",
+            })),
+        ));
+    }
+    if let Ok(mut requests) = state.guidance_requests.lock() {
+        const MAX_RECORDED_GUIDANCE_REQUESTS: usize = 16;
+        if requests.len() == MAX_RECORDED_GUIDANCE_REQUESTS {
+            requests.remove(0);
+        }
+        requests.push(serde_json::to_value(&request).expect("run intent request serializes"));
+    }
+    state.guidance_pending.store(1, Ordering::Release);
+    Ok(axum::Json(astra_thin_client::RunUserIntentResponse {
+        run_id,
+        intent_id: request.intent_id,
+        status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+        duplicate: false,
+        event_index: 0,
+    }))
+}
+
+async fn handle_run_stream(
+    State(state): State<ServerState>,
+    Path(run_id): Path<String>,
+) -> Response<axum::body::Body> {
+    if run_id != "mock-run-fanout-root" {
+        return (StatusCode::NOT_FOUND, "unknown mock run").into_response();
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    while state.guidance_pending.load(Ordering::Acquire) != 2 {
+        if tokio::time::Instant::now() >= deadline {
+            return (StatusCode::NO_CONTENT, "").into_response();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let request = state
+        .guidance_requests
+        .lock()
+        .ok()
+        .and_then(|requests| requests.last().cloned());
+    let Some(request) = request else {
+        return (StatusCode::CONFLICT, "missing mock guidance request").into_response();
+    };
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+        user_intent_applied_event(&run_id, &request, 1),
+    )
+        .into_response()
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -894,6 +1290,8 @@ async fn handle_tool_result() -> axum::Json<Value> {
 pub struct MockLlmServer {
     pub base_url: String,
     received_requests: Arc<Mutex<Vec<Value>>>,
+    tool_results: Arc<Mutex<Vec<Value>>>,
+    guidance_requests: Arc<Mutex<Vec<Value>>>,
     completed_fanout_children: Arc<AtomicU8>,
     held_response_release: Option<Arc<tokio::sync::Notify>>,
     _shutdown: tokio::sync::oneshot::Sender<()>,
@@ -933,19 +1331,29 @@ impl MockLlmServer {
         let base_url = format!("http://127.0.0.1:{}", addr.port());
 
         let received_requests = Arc::new(Mutex::new(Vec::new()));
+        let issued_tool_requests = Arc::new(Mutex::new(Vec::new()));
+        let tool_results = Arc::new(Mutex::new(Vec::new()));
+        let guidance_requests = Arc::new(Mutex::new(Vec::new()));
+        let guidance_pending = Arc::new(AtomicU8::new(0));
         let completed_fanout_children = Arc::new(AtomicU8::new(0));
         let held_response_release = hold_response.then(|| Arc::new(tokio::sync::Notify::new()));
         let state = ServerState {
             scenario,
             call_count: Arc::new(AtomicU32::new(0)),
             received_requests: received_requests.clone(),
+            issued_tool_requests,
+            tool_results: tool_results.clone(),
+            guidance_requests: guidance_requests.clone(),
+            guidance_pending,
             completed_fanout_children: completed_fanout_children.clone(),
             held_response_release: held_response_release.clone(),
         };
 
         let app = Router::new()
-            .route("/chat/turn", post(handle_chat_turn))
+            .route("/chat/stream", post(handle_chat_turn))
             .route("/tools/result", post(handle_tool_result))
+            .route("/chat/runs/{run_id}/intents", post(handle_run_user_intent))
+            .route("/chat/runs/{run_id}/stream", get(handle_run_stream))
             .route("/models", get(handle_models))
             .route("/model-access", get(handle_model_access))
             .with_state(state);
@@ -973,6 +1381,8 @@ impl MockLlmServer {
         Ok(Self {
             base_url,
             received_requests,
+            tool_results,
+            guidance_requests,
             completed_fanout_children,
             held_response_release,
             _shutdown: tx,
@@ -993,6 +1403,24 @@ impl MockLlmServer {
             .count_ones()
     }
 
+    /// Return the bounded callback bodies accepted by the mock server.
+    /// Server-owned turns deliver tool outcomes through `/tools/result`, not
+    /// through client-supplied conversation history.
+    pub fn tool_results(&self) -> Vec<Value> {
+        self.tool_results
+            .lock()
+            .map(|records| records.clone())
+            .unwrap_or_default()
+    }
+
+    /// Return the bounded active-run guidance requests accepted by the mock.
+    pub fn guidance_requests(&self) -> Vec<Value> {
+        self.guidance_requests
+            .lock()
+            .map(|requests| requests.clone())
+            .unwrap_or_default()
+    }
+
     pub fn release_held_response(&self) {
         self.held_response_release
             .as_ref()
@@ -1006,11 +1434,13 @@ impl MockLlmServer {
 #[cfg(test)]
 mod tests {
     use super::{
-        MockScenario, body_agent_then_complete, body_complete, body_fail, body_malformed_json,
-        body_multi_turn, body_rate_limited, body_sse_chunk_split, body_text_only,
-        body_tool_then_complete, root_has_tool_result,
+        IssuedToolRequestIdentity, MockScenario, body_agent_then_complete, body_complete,
+        body_fail, body_malformed_json, body_multi_turn, body_rate_limited, body_sse_chunk_split,
+        body_text_only, body_tool_then_complete, callback_recorded, issued_tool_requests_from_sse,
+        root_has_tool_result, tool_request_for_run,
     };
     use serde_json::Value;
+    use std::sync::{Arc, Mutex};
 
     // Test the SSE body generators directly (no HTTP server needed)
 
@@ -1035,6 +1465,57 @@ mod tests {
         assert!(completion.contains("text_done"));
         assert!(!completion.contains("tool_call_start"));
         assert!(completion.contains("\"type\":\"done\""));
+    }
+
+    #[test]
+    fn callback_identity_is_derived_from_the_exact_issued_tool_request() {
+        let body = tool_request_for_run(
+            "request-dynamic",
+            "write_file",
+            serde_json::json!({"path": "out.txt", "content": "ok"}),
+            "run-dynamic",
+            "turn-chain-dynamic",
+        );
+        let issued = issued_tool_requests_from_sse(&body);
+        assert_eq!(
+            issued,
+            vec![IssuedToolRequestIdentity {
+                session_id: "mock-session".to_string(),
+                run_id: "run-dynamic".to_string(),
+                turn_chain_id: "turn-chain-dynamic".to_string(),
+                request_id: "request-dynamic".to_string(),
+            }]
+        );
+
+        let result = astra_thin_client::ToolResultRequest::new_with_hash(
+            astra_thin_client::ToolResultRequestParts {
+                session_id: "mock-session".to_string(),
+                run_id: "run-dynamic".to_string(),
+                turn_chain_id: "turn-chain-dynamic".to_string(),
+                request_id: "request-dynamic".to_string(),
+                edge_agent_id: "edge-1".to_string(),
+                status: "completed".to_string(),
+                output: "done".to_string(),
+                duration_ms: 1,
+                tool_result_fields: None,
+            },
+        );
+        assert!(issued[0].matches_result(&result));
+
+        let foreign_result = astra_thin_client::ToolResultRequest::new_with_hash(
+            astra_thin_client::ToolResultRequestParts {
+                session_id: "mock-session".to_string(),
+                run_id: "run-dynamic".to_string(),
+                turn_chain_id: "turn-chain-dynamic".to_string(),
+                request_id: "request-never-issued".to_string(),
+                edge_agent_id: "edge-1".to_string(),
+                status: "completed".to_string(),
+                output: "done".to_string(),
+                duration_ms: 1,
+                tool_result_fields: None,
+            },
+        );
+        assert!(!issued[0].matches_result(&foreign_result));
     }
 
     #[test]
@@ -1065,6 +1546,19 @@ mod tests {
 
         assert!(root_has_tool_result(&request, "agent"));
         assert!(!root_has_tool_result(&request, "tool_search"));
+    }
+
+    #[test]
+    fn callback_progress_requires_a_completed_typed_result() {
+        let callbacks = Arc::new(Mutex::new(vec![
+            serde_json::json!({"request_id": "failed", "status": "failed"}),
+            serde_json::json!({"request_id": "complete", "status": "completed"}),
+            serde_json::json!({"request_id": "missing-status"}),
+        ]));
+
+        assert!(!callback_recorded(&callbacks, "failed"));
+        assert!(callback_recorded(&callbacks, "complete"));
+        assert!(!callback_recorded(&callbacks, "missing-status"));
     }
 
     #[tokio::test]

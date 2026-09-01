@@ -1,6 +1,10 @@
 #![allow(dead_code)]
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::{Arc, Mutex, OnceLock},
+};
 
 use astra_core::ErrorResponse;
 use astra_runtime::{
@@ -15,6 +19,44 @@ use axum::{Json, http::StatusCode};
 use serde_json::{Value, json};
 
 pub type EdgeCallbackLedger = Arc<tokio::sync::Mutex<HashMap<String, Value>>>;
+
+static SHARED_DB_TEST_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static SHARED_DB_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Run a live-database integration case on one process-owned Tokio runtime.
+///
+/// A SQLx pool must not outlive the runtime that owns its sockets and
+/// maintenance tasks. Integration-test binaries that cache one pool across
+/// cases use this runner so every case shares the same long-lived runtime,
+/// matching the production server's ownership topology. The suite-wide lock
+/// also keeps recovery/lease cases from claiming each other's UUID-scoped
+/// active rows when libtest schedules cases concurrently.
+pub fn run_shared_db_test(future: impl Future<Output = ()>) {
+    let _serial = SHARED_DB_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    SHARED_DB_TEST_RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .thread_name("astra-db-test")
+                .build()
+                .expect("shared database test runtime")
+        })
+        .block_on(future);
+}
+
+#[macro_export]
+macro_rules! shared_db_test {
+    ($(#[$meta:meta])* async fn $name:ident() $body:block) => {
+        #[test]
+        $(#[$meta])*
+        fn $name() {
+            $crate::test_support::run_shared_db_test(async $body);
+        }
+    };
+}
 
 pub fn test_model_service(offering_id: &str, model_name: &str) -> Arc<dyn ModelService> {
     Arc::new(StaticTestModelService {

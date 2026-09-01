@@ -105,5 +105,5 @@ pub async fn run_context_decision_chain_db() {
         Some("e2e_matrix_ctx_chain_decision")
     );
 
-    b.ctx.pool.close().await;
+    b.ctx.close().await;
 }

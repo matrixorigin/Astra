@@ -7,7 +7,7 @@ use super::super::agentic::adaptive_runtime::record_loop_completion_feedback;
 use super::host::{AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, run_agentic_loop_impl};
 use super::lifecycle::{
     cancel_unfinished_child_agents, current_agentic_step, interruption_state_summary,
-    session_turn_number,
+    resolve_cancellation_origin, session_turn_number,
 };
 
 /// Finalize the turn trace collector: record measured token budget, feed to
@@ -268,49 +268,6 @@ fn checkpoint_blocked_tools(restricted_tools: &std::collections::HashSet<String>
     blocked_tools
 }
 
-/// Promote unresolved structured tool/runtime failures into child-run
-/// lifecycle before callers project a successful completion.
-///
-/// A model may produce a useful explanation after every tool failed. That is
-/// a completed model response, but not a completed delegated task. Keeping the
-/// projection here gives CLI, Server-only, and Edge+Server the same semantics
-/// without parsing assistant prose.
-pub fn mark_execution_incomplete_from_turn_evaluation(state: &mut AgenticLoopState) -> bool {
-    if state.interruption.is_some() {
-        return false;
-    }
-    let has_verdict_warning = state.stall.verdict_events.iter().any(|verdict| {
-        verdict.severity.eq_ignore_ascii_case("warning")
-            || verdict.severity.eq_ignore_ascii_case("critical")
-    });
-    let evaluation = crate::pipeline::evaluation::evaluate_tool_call_records_with_thresholds(
-        &state.message,
-        &state.recent_tools,
-        &state.stall.tool_call_records,
-        state.stall.events.len(),
-        has_verdict_warning,
-        state.telemetry.first_budget_pressure,
-        crate::pipeline::evaluation::current_evaluation_thresholds(),
-    );
-    if !crate::pipeline::evaluation::turn_evaluation_has_unresolved_execution_failure(&evaluation) {
-        return false;
-    }
-    state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
-        astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete,
-        astra_turn_core::interruption::ResumeAction::ContinueImmediately,
-        astra_turn_core::interruption::InterruptionStateSummary {
-            has_checkpoint: state.stall.last_heavy_checkpoint.is_some(),
-            tool_calls_completed: state.total_tool_calls,
-            turns_completed: state.llm_rounds_completed,
-            remaining_turns: u32::try_from(state.remaining_turns).unwrap_or(u32::MAX),
-            error_detail: crate::pipeline::evaluation::turn_evaluation_status_notice(&evaluation),
-            stall_signal: None,
-            resume_restricted_tools: Vec::new(),
-        },
-    ));
-    true
-}
-
 /// Best-effort heavy checkpoint write.
 ///
 /// Several early-exit paths in the agentic loop (for example text-only
@@ -362,14 +319,14 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         .and_then(|ao| ao.to_json());
 
     let checkpoint_blocked_tools = checkpoint_blocked_tools(&state.restricted_tools);
-    astra_core::history_work::record_serialized_value(
-        astra_core::history_work::HistoryWorkSite::FinalizationCheckpointClone,
-        &state.messages,
-    );
     let checkpoint_messages =
         astra_turn_core::runtime_scaffolding::sanitize_recoverable_runtime_messages(
             state.messages.clone(),
         );
+    astra_core::history_work::record_serialized_value(
+        astra_core::history_work::HistoryWorkSite::FinalizationCheckpointClone,
+        &checkpoint_messages,
+    );
     let context_input_headroom_tokens = match (
         state.max_turn_input_tokens,
         state.last_measured_prompt_tokens,
@@ -420,6 +377,10 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
             }
         };
     }
+    // Carry transport-neutral ownership uncertainty through a heavy
+    // checkpoint.  The next process must not infer safety from a trimmed
+    // local record window or from prose-only conversation state.
+    heavy.workspace_observation_quarantine = state.stall.workspace_observation_quarantine.clone();
     let cp = StepCheckpoint::Heavy(Box::new(heavy));
     if state
         .stall
@@ -448,56 +409,24 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
         return;
     }
 
-    let ckpt_num = match step_checkpoint::next_checkpoint_number(user_id, sid) {
-        Ok(number) => number,
-        Err(error) => {
-            astra_core::agent_warn!(
-                "checkpoint",
-                "Failed to allocate session checkpoint number for {sid}: {error}"
-            );
-            return;
-        }
-    };
-    if let Err(e) = step_checkpoint::write_step_checkpoint(user_id, sid, ckpt_num, &cp) {
-        astra_core::agent_warn!(
-            "checkpoint",
-            "Failed to write step checkpoint {ckpt_num}: {e}"
-        );
-        // Disk write failed: do not commit composite snapshot state, otherwise
-        // resume logic would read state pointing at a non-existent checkpoint
-        // file. Leave `state.last_composite_snapshot` and the stall heavy
-        // checkpoint cache untouched so the next iteration retries cleanly.
-        return;
-    }
-
     let turn = session_turn_number(state);
-    let checkpoint_ref = format!("{:06}-heavy.json", ckpt_num);
-    let mut index = match step_checkpoint::read_composite_snapshot_index(user_id, sid) {
-        Ok(index) => index,
-        Err(error) => {
-            astra_core::agent_warn!(
-                "checkpoint",
-                "Failed to read snapshot index for session {sid}: {error}"
-            );
-            return;
-        }
-    };
-    let mut snapshot =
-        astra_core::composite_snapshot::CompositeSnapshotBuilder::new(sid.clone(), turn)
-            .label(format!("checkpoint-t{turn}"))
-            .session_state(checkpoint_ref)
-            .workspace_state(sid.clone())
-            .build();
-    if let Err(e) = index.append(&mut snapshot) {
-        astra_core::agent_warn!("checkpoint", "Failed to append snapshot version: {e}");
-        return;
-    }
-    if let Err(e) = step_checkpoint::write_composite_snapshot_index(user_id, sid, &index) {
-        astra_core::agent_warn!("checkpoint", "Failed to write snapshot index: {e}");
-        // Index write failed: leave snapshot state untouched so a subsequent
-        // checkpoint can re-attempt without referencing a half-written index.
-        return;
-    }
+    let snapshot = astra_core::composite_snapshot::CompositeSnapshotBuilder::new(sid.clone(), turn)
+        .label(format!("checkpoint-t{turn}"))
+        .workspace_state(sid.clone())
+        .build();
+    let (_ckpt_num, snapshot, index) =
+        match step_checkpoint::commit_composite_checkpoint(user_id, sid, &cp, snapshot) {
+            Ok(committed) => committed,
+            Err(error) => {
+                astra_core::agent_warn!(
+                    "checkpoint",
+                    "Failed to atomically publish session checkpoint for {sid}: {error}"
+                );
+                // The cross-process transaction did not publish a partial index.
+                // Leave local caches untouched so the next boundary retries.
+                return;
+            }
+        };
     persist_remote_composite_snapshot_index_blocking(
         state,
         sid,
@@ -571,17 +500,45 @@ pub async fn run_agentic_loop_with_host<H: AgenticLoopHost>(
     // settle the same producer queue as normal and error returns.
     let _recall_run_boundary = UnattributedRecallRunBoundary::new(host.memory_recall_scope(state));
     let result = run_agentic_loop_impl(host, state).await;
-    let user_cancelled = matches!(&result, Ok(AgenticLoopOutcome::Cancelled))
+    let cancellation_exit = matches!(result, Ok(AgenticLoopOutcome::Cancelled))
         || matches!(
-            &result,
-            Err(error) if error.kind == astra_core::ErrorKind::Cancelled
-        )
-        || state.interruption.as_ref().is_some_and(|interruption| {
-            interruption.kind == astra_turn_core::interruption::InterruptionKind::UserCancelled
-        });
-    if user_cancelled {
-        let _cancelled =
-            cancel_unfinished_child_agents(host, state, "parent turn cancelled by user").await;
+            result,
+            Err(ref error) if error.kind == astra_core::ErrorKind::Cancelled
+        );
+    if cancellation_exit {
+        let origin = resolve_cancellation_origin(state).await;
+        let reason = match origin {
+            astra_turn_core::orchestration_types::CancellationOrigin::User => {
+                "parent turn cancelled by user"
+            }
+            astra_turn_core::orchestration_types::CancellationOrigin::Runtime => {
+                "parent execution cancelled by runtime"
+            }
+            astra_turn_core::orchestration_types::CancellationOrigin::Unverified => {
+                crate::orchestration::CANCELLATION_ORIGIN_UNVERIFIED
+            }
+        };
+        let _cancelled = cancel_unfinished_child_agents(host, state, reason, origin).await;
+        if origin == astra_turn_core::orchestration_types::CancellationOrigin::User
+            && !state.interruption.as_ref().is_some_and(|interruption| {
+                interruption.kind == astra_turn_core::interruption::InterruptionKind::UserCancelled
+            })
+        {
+            state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+                astra_turn_core::interruption::InterruptionKind::UserCancelled,
+                astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+                interruption_state_summary(state, None),
+            ));
+        } else if origin != astra_turn_core::orchestration_types::CancellationOrigin::User
+            && state.interruption.as_ref().is_some_and(|interruption| {
+                interruption.kind == astra_turn_core::interruption::InterruptionKind::UserCancelled
+            })
+        {
+            // The inner provider loop historically used UserCancelled as a
+            // generic Cancelled breadcrumb. The canonical origin boundary
+            // above owns that distinction; do not persist a false user fact.
+            state.interruption = None;
+        }
     }
 
     // Ensure SessionEnd fires even on error returns that skip finalize_and_render.
@@ -677,6 +634,7 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     // displayed answer looking live just because a database, workspace, or
     // checkpoint is slow.
     ensure_terminal_text(state);
+    materialize_terminal_text_message(state);
     if !state.final_text.is_empty() && !state.final_text_streamed {
         host.render_final_text(&state.final_text);
         state.final_text_streamed = true;
@@ -693,8 +651,20 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     // and debounce. See `crate::session_memory::MemoryExtractionService`.
     maybe_run_memory_extraction(state);
 
+    // Desired-state convergence authority is deliberately live-only. A
+    // terminal turn (successful, interrupted, or cancelled) must not leave a
+    // no-op writer snapshot consumable by a later run on the same long-lived
+    // session executor. Normal write->read convergence consumes it earlier;
+    // this is the abandoned-turn cleanup boundary.
+    if let (Some(executor), Some(run_id), Some(turn_chain_id)) = (
+        state.runtime_tool_executor.as_deref(),
+        state.current_run_id.as_deref(),
+        state.canonical_turn_chain_id.as_deref(),
+    ) {
+        executor.clear_desired_state_convergence_authority(run_id, turn_chain_id);
+    }
+
     reset_per_turn_advisory_state(state);
-    state.refresh_task_board_snapshot().await;
     update_working_memory_for_turn_settlement(state);
 
     // ── Harness: SessionEnd (observe only, fire at most once) ──
@@ -719,12 +689,35 @@ pub(crate) async fn finalize_and_render<H: AgenticLoopHost>(
     try_write_heavy_checkpoint(state);
 }
 
+fn materialize_terminal_text_message(state: &mut AgenticLoopState) {
+    let final_text = state.final_text.trim();
+    if final_text.is_empty() {
+        return;
+    }
+    let current_turn_start = state
+        .messages
+        .iter()
+        .rposition(|message| {
+            message.get("role").and_then(serde_json::Value::as_str) == Some("user")
+        })
+        .unwrap_or(0);
+    let already_materialized = state.messages[current_turn_start..]
+        .iter()
+        .rev()
+        .find(|message| {
+            message.get("role").and_then(serde_json::Value::as_str) == Some("assistant")
+        })
+        .and_then(astra_turn_core::prompt_facing::extract_text_content)
+        .is_some_and(|content| content.trim() == final_text);
+    if !already_materialized {
+        state.push_prompt_history_message(serde_json::json!({
+            "role": "assistant",
+            "content": state.final_text.clone(),
+        }));
+    }
+}
+
 fn update_working_memory_for_turn_settlement(state: &mut AgenticLoopState) {
-    let task_summary = state
-        .hooks
-        .task_board_snapshot
-        .has_paused_or_blocked_tasks()
-        .then(|| state.hooks.task_board_snapshot.short_summary());
     let interruption = state.interruption.clone();
     let Some(session) = state.pipeline_session.as_mut() else {
         return;
@@ -734,24 +727,6 @@ fn update_working_memory_for_turn_settlement(state: &mut AgenticLoopState) {
     // Rebuild blocker pressure from current settlement state instead of
     // accumulating old outages/nudges across turns.
     memory.clear_blockers();
-
-    if let Some(summary) = task_summary {
-        memory.clear_next_action();
-        memory.push_blocker(format!(
-            "unfinished_task_board: {}",
-            bounded_working_memory_line(&summary)
-        ));
-        if let Some(interruption) = interruption.as_ref()
-            && interruption_requires_intervention(interruption)
-        {
-            memory.push_blocker(format!(
-                "{}: {}",
-                interruption.kind.label(),
-                bounded_working_memory_line(&interruption.user_message)
-            ));
-        }
-        return;
-    }
 
     let Some(interruption) = interruption.as_ref() else {
         memory.clear_next_action();
@@ -818,19 +793,71 @@ fn settlement_interruption_summary(
     interruption_state_summary(state, error_detail)
 }
 
+const PARTIAL_ASSISTANT_RESPONSE_MARKER: &str =
+    "\n\nPartial assistant response before interruption:\n";
+
 fn ensure_terminal_text(state: &mut AgenticLoopState) {
-    if state.hooks.task_board_snapshot.has_unfinished_tasks() {
-        tracing::info!(
-            target: "astra::loop_guard",
-            summary = %state.hooks.task_board_snapshot.short_summary(),
-            "unfinished task-board state retained as settlement evidence"
-        );
-    }
-    if let Some(candidate) = state
+    let latest_provider_text = state
+        .hooks
+        .completion_settlement
+        .latest_provider_text
+        .take();
+    let deferred_candidate = state
         .hooks
         .completion_settlement
         .deferred_candidate_text
-        .take()
+        .take();
+
+    // An interruption is authoritative. Never let a candidate (or a stale
+    // model answer) turn an interrupted turn into a success-shaped response.
+    // Preserve useful mixed-response text as an explicitly labelled partial
+    // section so callers can resume with evidence instead of losing the last
+    // substantive model output.
+    if let Some(interruption) = state.interruption.as_ref() {
+        let interruption_text = interruption_terminal_message(interruption);
+        // Finalization can be reached from more than one terminal path (for
+        // example, a provider boundary followed by lifecycle settlement).
+        // Treat the already-rendered interruption envelope as idempotent. If
+        // we append it to itself on the second pass, users see duplicate
+        // stop messages and the partial answer becomes misleading evidence.
+        let already_rendered = state.final_text.starts_with(&interruption_text)
+            && (state.final_text == interruption_text
+                || state.final_text.contains(PARTIAL_ASSISTANT_RESPONSE_MARKER));
+        if already_rendered {
+            // Preserve whether the existing envelope has already crossed the
+            // render boundary. Resetting this bit here makes a second
+            // finalization pass render identical interruption text twice;
+            // forcing it true would instead suppress a first render when an
+            // earlier lifecycle path assembled but did not display the text.
+            return;
+        }
+
+        // Prefer an explicitly deferred mixed response. Otherwise retain a
+        // substantive provider text that ingest recorded before the typed
+        // interruption was known. A pre-existing interruption envelope is
+        // not a candidate and is handled by the idempotence guard above.
+        let candidate = latest_provider_text
+            .filter(|text| !text.trim().is_empty())
+            .or_else(|| deferred_candidate.filter(|text| !text.trim().is_empty()))
+            .or_else(|| {
+                // Work-settlement contract text is runtime-owned outcome
+                // copy, not a provider candidate. Repeating it under the
+                // interruption envelope would make a typed failure look like
+                // duplicated assistant prose.
+                (!state.hooks.completion_settlement.work_settlement_only
+                    && !state.final_text.trim().is_empty())
+                .then(|| state.final_text.trim().to_string())
+            });
+        state.final_text = interruption_text;
+        if let Some(candidate) = candidate {
+            state.final_text.push_str(PARTIAL_ASSISTANT_RESPONSE_MARKER);
+            state.final_text.push_str(candidate.trim());
+        }
+        state.final_text_streamed = false;
+        return;
+    }
+
+    if let Some(candidate) = deferred_candidate
         && state.final_text.trim().is_empty()
     {
         state.final_text = candidate;
@@ -940,12 +967,7 @@ fn append_interruption_detail(
     message: &mut String,
     interruption: &astra_turn_core::interruption::InterruptionRecord,
 ) {
-    if matches!(
-        interruption.kind,
-        astra_turn_core::interruption::InterruptionKind::BudgetExhausted
-            | astra_turn_core::interruption::InterruptionKind::TokenBudgetExceeded
-            | astra_turn_core::interruption::InterruptionKind::CumulativeBudgetExceeded
-    ) && let Some(detail) = interruption
+    if let Some(detail) = interruption
         .error_detail
         .as_deref()
         .map(str::trim)
@@ -964,15 +986,13 @@ fn reset_per_turn_advisory_state(state: &mut AgenticLoopState) {
         }
     }
     state.stall.execution_escalation_advisory_emitted = false;
+    state.stall.work_evidence_advisory_emitted = false;
     state.stall.parallel_batching_advisory_emitted = false;
     state.stall.repetition_advisory_emitted = false;
-    state.stall.redundant_reads_advisory_emitted = false;
     state.stall.cache_waste_advisory_emitted = false;
-    state.stall.search_fanout_advisory_emitted = false;
-    state.stall.exploration_family_advisory_emitted = false;
-    state.stall.stronger_exploration_family_advisory_emitted = false;
+    state.stall.active_policy_feedback = Default::default();
+    state.stall.runtime_policy_evaluation = Default::default();
     state.hooks.completion_settlement = Default::default();
-    state.stall.exploration_family_advisory_family = None;
     // Hard tool restrictions are owned by capability/permission boundaries.
     // Behavioral advisories no longer add entries here, so finalization must
     // not broaden the surface by clearing the set.
@@ -985,6 +1005,7 @@ fn reset_per_turn_advisory_state(state: &mut AgenticLoopState) {
     // which was exactly the stale-state bug the code-review called out.
     state.budget_wrapup_injected = false;
     state.budget_wrapup_ignored_rounds = 0;
+    state.hooks.completion_settlement.wrapup_origin = None;
     // Defensive reset: last_finish_reason is rewritten before every LLM call
     // in execution_phase.rs, but resetting here prevents stale leakage if a
     // future early-exit path reads it before the next LLM invocation.
@@ -1154,35 +1175,50 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_execution_marks_child_lifecycle_incomplete_without_rewriting_output() {
+    fn terminal_text_is_materialized_once_for_canonical_history() {
         let mut state = make_state();
-        state.message = "fetch one current headline".to_string();
-        state.final_text = "The bound executor is unavailable.".to_string();
-        state.total_tool_calls = 2;
-        state.llm_rounds_completed = 3;
-        state.remaining_turns = 7;
-        state
-            .stall
-            .tool_call_records
-            .push(astra_services::session_journal::ToolCallRecord {
-                name: "web_fetch".to_string(),
-                ok: true,
-                result_class: Some("execution_error".to_string()),
-                exit_semantics: Some("domain_negative".to_string()),
-                disposition: Some(astra_services::session_journal::ToolCallDisposition::Rejected),
-                ..Default::default()
-            });
+        state.messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "perform the typed operation"
+        })];
+        state.final_text = "Operation completed.".to_string();
 
-        assert!(mark_execution_incomplete_from_turn_evaluation(&mut state));
-        let interruption = state.interruption.as_ref().expect("interruption");
-        assert_eq!(
-            interruption.kind,
-            astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete
-        );
-        assert_eq!(interruption.tool_calls_completed, 2);
-        assert_eq!(interruption.turns_completed, 3);
-        assert_eq!(interruption.remaining_turns, 7);
-        assert_eq!(state.final_text, "The bound executor is unavailable.");
+        materialize_terminal_text_message(&mut state);
+        materialize_terminal_text_message(&mut state);
+
+        assert_eq!(state.messages.len(), 2);
+        assert_eq!(state.messages[1]["role"], "assistant");
+        assert_eq!(state.messages[1]["content"], "Operation completed.");
+    }
+
+    #[test]
+    fn existing_model_answer_is_not_duplicated_during_finalization() {
+        let mut state = make_state();
+        state.messages = vec![
+            serde_json::json!({"role": "user", "content": "answer"}),
+            serde_json::json!({"role": "assistant", "content": "Done."}),
+        ];
+        state.final_text = "Done.".to_string();
+
+        materialize_terminal_text_message(&mut state);
+
+        assert_eq!(state.messages.len(), 2);
+    }
+
+    #[test]
+    fn earlier_equal_assistant_text_does_not_hide_the_actual_terminal_answer() {
+        let mut state = make_state();
+        state.messages = vec![
+            serde_json::json!({"role": "user", "content": "compare both stages"}),
+            serde_json::json!({"role": "assistant", "content": "Done."}),
+            serde_json::json!({"role": "assistant", "content": "Intermediate update."}),
+        ];
+        state.final_text = "Done.".to_string();
+
+        materialize_terminal_text_message(&mut state);
+
+        assert_eq!(state.messages.len(), 4);
+        assert_eq!(state.messages.last().unwrap()["content"], "Done.");
     }
 
     #[test]
@@ -1197,6 +1233,75 @@ mod tests {
 
         assert_eq!(state.final_text, "The code style is consistent.");
         assert!(state.final_text_streamed);
+    }
+
+    #[test]
+    fn interruption_keeps_typed_reason_and_partial_candidate_without_success_shape() {
+        let mut state = make_state();
+        state.final_text = "stale completion-shaped summary".to_string();
+        state.hooks.completion_settlement.deferred_candidate_text =
+            Some("The build passed its final check.".to_string());
+        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+            astra_turn_core::interruption::InterruptionKind::TokenBudgetExceeded,
+            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+            astra_turn_core::interruption::InterruptionStateSummary {
+                has_checkpoint: true,
+                tool_calls_completed: 8,
+                turns_completed: 12,
+                remaining_turns: 0,
+                error_detail: Some("prompt budget remained above the configured rail".into()),
+                stall_signal: None,
+                resume_restricted_tools: vec![],
+            },
+        ));
+
+        ensure_terminal_text(&mut state);
+
+        assert!(state.final_text.contains("token budget"));
+        assert!(state.final_text.contains("Why stopped: prompt budget"));
+        assert!(
+            state
+                .final_text
+                .contains("Partial assistant response before interruption:")
+        );
+        assert!(
+            state
+                .final_text
+                .contains("The build passed its final check.")
+        );
+        assert!(
+            !state
+                .final_text
+                .starts_with("stale completion-shaped summary")
+        );
+        assert!(!state.final_text_streamed);
+    }
+
+    #[test]
+    fn interruption_prefers_latest_provider_text_over_older_mixed_candidate() {
+        let mut state = make_state();
+        state.hooks.completion_settlement.deferred_candidate_text =
+            Some("older mixed response".to_string());
+        state.hooks.completion_settlement.latest_provider_text =
+            Some("latest truthful handoff".to_string());
+        state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+            astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete,
+            astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+            astra_turn_core::interruption::InterruptionStateSummary {
+                has_checkpoint: true,
+                tool_calls_completed: 2,
+                turns_completed: 3,
+                remaining_turns: 0,
+                error_detail: Some("typed completion action was not satisfied".into()),
+                stall_signal: None,
+                resume_restricted_tools: vec![],
+            },
+        ));
+
+        ensure_terminal_text(&mut state);
+
+        assert!(state.final_text.contains("latest truthful handoff"));
+        assert!(!state.final_text.contains("older mixed response"));
     }
 
     #[test]
@@ -1359,87 +1464,6 @@ mod tests {
         assert!(!state.final_text.contains("empty_completion"));
         assert!(!state.final_text.contains("[turn_interrupted]"));
         assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
-    }
-
-    #[tokio::test]
-    async fn finalize_and_render_does_not_pause_final_answer_for_in_progress_bookkeeping() {
-        let mut host = MockHost::new(Vec::new());
-        let mut state = make_state();
-        state.final_text = "Done.".into();
-        state.hooks.task_board_snapshot =
-            crate::turn::agentic_loop::host::TaskBoardSnapshot::from_active_tasks(&[
-                astra_tools::task_mgmt::SessionTask {
-                    archived_at: None,
-                    id: "task-1".to_string(),
-                    title: "finish validation".to_string(),
-                    description: None,
-                    status: astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
-                    subtasks: Vec::new(),
-                    created_at: "2025-01-01T00:00:00Z".to_string(),
-                    updated_at: "2025-01-01T00:00:00Z".to_string(),
-                    active_form: None,
-                    owner: None,
-                    metadata: None,
-                    blocks: Vec::new(),
-                    blocked_by: Vec::new(),
-                },
-            ]);
-
-        finalize_and_render(&mut host, &mut state).await;
-
-        assert_eq!(
-            state.final_text, "Done.",
-            "assistant text is model output and must not be rewritten by task-board control state"
-        );
-        assert!(
-            state.interruption.is_none(),
-            "in-progress task-board bookkeeping must not turn an answered run into a paused run"
-        );
-        assert_eq!(host.rendered_final_text, vec!["Done.".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn finalize_and_render_persists_paused_task_as_blocker_not_auto_resume() {
-        let mut host = MockHost::new(Vec::new());
-        let mut state = make_state();
-        attach_pipeline_session(&mut state);
-        state.final_text = "Done.".into();
-        state.hooks.task_board_snapshot =
-            crate::turn::agentic_loop::host::TaskBoardSnapshot::from_active_tasks(&[
-                astra_tools::task_mgmt::SessionTask {
-                    archived_at: None,
-                    id: "task-1".to_string(),
-                    title: "finish validation".to_string(),
-                    description: None,
-                    status: astra_tools::task_mgmt::SessionTaskStatusKind::Paused,
-                    subtasks: Vec::new(),
-                    created_at: "2025-01-01T00:00:00Z".to_string(),
-                    updated_at: "2025-01-01T00:00:00Z".to_string(),
-                    active_form: None,
-                    owner: None,
-                    metadata: None,
-                    blocks: Vec::new(),
-                    blocked_by: Vec::new(),
-                },
-            ]);
-
-        finalize_and_render(&mut host, &mut state).await;
-
-        let rendered = state
-            .pipeline_session
-            .as_ref()
-            .expect("pipeline session")
-            .working_memory()
-            .render_prompt_section();
-        assert!(
-            rendered.contains("Blockers:") && rendered.contains("unfinished_task_board:"),
-            "paused task-board state must be preserved without auto-resume pressure: {rendered}"
-        );
-        assert!(
-            !rendered.contains("Next action:"),
-            "unfinished task-board state must not become an automatic next action: {rendered}"
-        );
-        assert!(rendered.contains("finish validation"));
     }
 
     #[tokio::test]
@@ -1821,61 +1845,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_and_render_refreshes_task_board_before_settlement() {
-        let manager = std::sync::Arc::new(astra_tools::task_mgmt::TaskManager::in_memory());
-        manager
-            .create(&serde_json::json!({"title": "finish validation"}))
-            .await;
-        manager
-            .update(&serde_json::json!({
-                "task_id": "task-1",
-                "new_status": "in_progress"
-            }))
-            .await;
-        manager
-            .update(&serde_json::json!({
-                "task_id": "task-1",
-                "new_status": "completed"
-            }))
-            .await;
-
-        let mut host = MockHost::new(Vec::new());
-        let mut state = make_state();
-        state.final_text = "Done.".into();
-        state.hooks.task_board_monitor = Some(manager);
-        state.hooks.task_board_snapshot =
-            crate::turn::agentic_loop::host::TaskBoardSnapshot::from_active_tasks(&[
-                astra_tools::task_mgmt::SessionTask {
-                    archived_at: None,
-                    id: "task-1".to_string(),
-                    title: "finish validation".to_string(),
-                    description: None,
-                    status: astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
-                    subtasks: Vec::new(),
-                    created_at: "2025-01-01T00:00:00Z".to_string(),
-                    updated_at: "2025-01-01T00:00:00Z".to_string(),
-                    active_form: None,
-                    owner: None,
-                    metadata: None,
-                    blocks: Vec::new(),
-                    blocked_by: Vec::new(),
-                },
-            ]);
-
-        finalize_and_render(&mut host, &mut state).await;
-
-        assert_eq!(
-            state.final_text, "Done.",
-            "finalization must refresh active tasks so completed tool-round work does not get falsely blocked"
-        );
-        assert!(
-            !state.hooks.task_board_snapshot.has_unfinished_tasks(),
-            "refreshed snapshot should observe that the task board has no active tasks"
-        );
-        assert_eq!(host.rendered_final_text, vec!["Done.".to_string()]);
-    }
-
-    #[tokio::test]
     async fn finalize_and_render_surfaces_budget_interruption_detail() {
         let mut host = MockHost::new(Vec::new());
         let mut state = make_state();
@@ -1904,85 +1873,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_and_render_empty_completion_is_independent_of_task_board_state() {
-        let mut host = MockHost::new(Vec::new());
-        let mut state = make_state();
-        state.final_text.clear();
-        state.hooks.task_board_snapshot =
-            crate::turn::agentic_loop::host::TaskBoardSnapshot::from_active_tasks(&[
-                astra_tools::task_mgmt::SessionTask {
-                    archived_at: None,
-                    id: "task-1".to_string(),
-                    title: "finish validation".to_string(),
-                    description: None,
-                    status: astra_tools::task_mgmt::SessionTaskStatusKind::InProgress,
-                    subtasks: Vec::new(),
-                    created_at: "2025-01-01T00:00:00Z".to_string(),
-                    updated_at: "2025-01-01T00:00:00Z".to_string(),
-                    active_form: None,
-                    owner: None,
-                    metadata: None,
-                    blocks: Vec::new(),
-                    blocked_by: Vec::new(),
-                },
-            ]);
-
-        finalize_and_render(&mut host, &mut state).await;
-
-        let interruption = state
-            .interruption
-            .as_ref()
-            .expect("empty model completion should record interruption state");
-        assert_eq!(
-            interruption.kind,
-            astra_turn_core::interruption::InterruptionKind::EmptyCompletion
-        );
-        assert!(matches!(
-            &interruption.resume_action,
-            astra_turn_core::interruption::ResumeAction::ContinueImmediately
-        ));
-        assert_eq!(
-            state.final_text,
-            interruption_terminal_message(interruption)
-        );
-        assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
-    }
-
-    #[tokio::test]
-    async fn paused_task_board_does_not_override_a_real_final_answer() {
-        let mut host = MockHost::new(Vec::new());
-        let mut state = make_state();
-        state.final_text = "Current evidence supports shipping the verified fix.".into();
-        state.hooks.task_board_snapshot =
-            crate::turn::agentic_loop::host::TaskBoardSnapshot::from_active_tasks(&[
-                astra_tools::task_mgmt::SessionTask {
-                    archived_at: None,
-                    id: "task-1".to_string(),
-                    title: "optional follow-up".to_string(),
-                    description: None,
-                    status: astra_tools::task_mgmt::SessionTaskStatusKind::Paused,
-                    subtasks: Vec::new(),
-                    created_at: "2025-01-01T00:00:00Z".to_string(),
-                    updated_at: "2025-01-01T00:00:00Z".to_string(),
-                    active_form: None,
-                    owner: None,
-                    metadata: None,
-                    blocks: Vec::new(),
-                    blocked_by: Vec::new(),
-                },
-            ]);
-
-        finalize_and_render(&mut host, &mut state).await;
-
-        assert!(state.interruption.is_none());
-        assert_eq!(
-            state.final_text,
-            "Current evidence supports shipping the verified fix."
-        );
-        assert_eq!(host.rendered_final_text, vec![state.final_text.clone()]);
-    }
-
-    #[tokio::test]
     async fn single_text_turn_completes() {
         let mut host = MockHost::new(vec![text_result("Hello, world!", 10, 5, Some(42))]);
         let mut state = make_state();
@@ -1997,13 +1887,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutating_profile_text_completion_is_preserved_without_guard_retry() {
-        let mut host = MockHost::new(vec![text_result(
-            "No workspace mutation was needed based on the evidence.",
-            10,
-            5,
-            Some(42),
-        )]);
+    async fn mutating_profile_marks_repeated_no_change_explanation_incomplete() {
+        let answer = "No workspace mutation was needed based on the evidence.";
+        let mut host = MockHost::new(vec![
+            text_result(answer, 10, 5, Some(42)),
+            text_result(answer, 10, 5, Some(42)),
+        ]);
         let mut state = make_state();
         state.message = "fix the bug".to_string();
         state.user_intent = state.message.clone();
@@ -2012,18 +1901,33 @@ mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
 
         assert!(outcome.is_ok());
-        assert_eq!(host.turn_count(), 1);
+        assert_eq!(host.turn_count(), 2);
         assert_eq!(
-            state.final_text,
-            "No workspace mutation was needed based on the evidence."
+            state.interruption.as_ref().map(|record| record.kind),
+            Some(astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete)
         );
+        assert!(
+            state
+                .final_text
+                .contains("Why stopped: required workspace mutation was still missing")
+        );
+        assert!(state.final_text.contains(answer));
+        assert_eq!(state.messages.len(), 2);
         assert_eq!(
-            state.messages,
-            vec![serde_json::json!({
+            state.messages[0],
+            serde_json::json!({
                 "role": "assistant",
                 "content": "No workspace mutation was needed based on the evidence."
-            })],
-            "runtime behavior signals must not add synthetic control history"
+            }),
+            "the provider response must remain intact as historical evidence"
+        );
+        assert_eq!(
+            state.messages[1],
+            serde_json::json!({
+                "role": "assistant",
+                "content": state.final_text,
+            }),
+            "the typed interruption envelope must be retained after the provider response"
         );
     }
 
@@ -2546,12 +2450,14 @@ mod tests {
         astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
         astra_tools::memoria::MemoriaToolGateway::record_recall_for_producer(
             &session_id,
+            None,
             &producer_id,
             1,
             vec!["m1".into()],
         );
         astra_tools::memoria::MemoriaToolGateway::record_recall_for_producer(
             &session_id,
+            None,
             "concurrent-run",
             1,
             vec!["m2".into()],
@@ -2575,6 +2481,7 @@ mod tests {
         struct CancelledHost {
             valid_tool_names: std::collections::HashSet<String>,
             cancelled_agent_ids: Vec<String>,
+            cancellation_origins: Vec<astra_turn_core::orchestration_types::CancellationOrigin>,
         }
 
         #[async_trait::async_trait]
@@ -2609,8 +2516,10 @@ mod tests {
                 &mut self,
                 agent_ids: &[String],
                 _reason: &str,
+                origin: astra_turn_core::orchestration_types::CancellationOrigin,
             ) -> Vec<String> {
                 self.cancelled_agent_ids.extend_from_slice(agent_ids);
+                self.cancellation_origins.push(origin);
                 agent_ids.to_vec()
             }
         }
@@ -2618,6 +2527,7 @@ mod tests {
         let mut host = CancelledHost {
             valid_tool_names: std::collections::HashSet::new(),
             cancelled_agent_ids: Vec::new(),
+            cancellation_origins: Vec::new(),
         };
         let mut state = make_state();
         state.stall.tool_call_records = vec![astra_services::session_journal::ToolCallRecord {
@@ -2655,6 +2565,17 @@ mod tests {
             host.cancelled_agent_ids,
             vec!["agent-running".to_string()],
             "the shared loop exit must cancel children even when cancellation surfaces as an error"
+        );
+        assert_eq!(
+            host.cancellation_origins,
+            vec![astra_turn_core::orchestration_types::CancellationOrigin::Runtime],
+            "a provider cancellation without a user marker remains runtime-origin"
+        );
+        assert!(
+            !state.interruption.as_ref().is_some_and(|interruption| {
+                interruption.kind == astra_turn_core::interruption::InterruptionKind::UserCancelled
+            }),
+            "runtime cancellation must not record a user interruption"
         );
     }
 
@@ -2700,6 +2621,7 @@ mod tests {
         state.current_run_id = Some("cancelled-run".to_string());
         astra_tools::memoria::MemoriaToolGateway::record_recall_for_producer(
             &session_id,
+            None,
             "cancelled-run",
             1,
             vec!["m1".into()],

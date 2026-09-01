@@ -16,6 +16,11 @@ pub fn validate_sql_identifier(value: &str, label: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err(format!("empty {label}"));
     }
+    if value.len() > 64 {
+        return Err(format!(
+            "invalid {label} '{value}': MySQL/MatrixOne identifiers are at most 64 ASCII bytes"
+        ));
+    }
     if !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err(format!(
             "invalid {label} '{value}': only [a-zA-Z0-9_] allowed"
@@ -120,5 +125,6 @@ mod tests {
         assert!(validate_sql_identifier("has spaces", "name").is_err());
         assert!(validate_sql_identifier("back`tick", "name").is_err());
         assert!(validate_sql_identifier("path/sep", "name").is_err());
+        assert!(validate_sql_identifier(&"a".repeat(65), "database").is_err());
     }
 }

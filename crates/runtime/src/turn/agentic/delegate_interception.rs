@@ -24,7 +24,11 @@ pub(crate) struct DelegationInterceptionResult {
 }
 
 pub(crate) fn tool_call_name(tool_call: &Value) -> Option<&str> {
-    astra_turn_core::tool_call_shape::tool_call_name(tool_call)
+    tool_call
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        .and_then(astra_core::canonical_names::normalize_name)
 }
 
 pub(crate) fn tool_call_arguments_value(tool_call: &Value) -> Value {
@@ -35,15 +39,7 @@ pub(crate) fn is_delegation_call(tool_call: &Value) -> bool {
     tool_call_name(tool_call) == Some(DELEGATE_TOOL_NAME)
 }
 
-fn source_agent_alias_candidates(source_agent_id: &str) -> impl Iterator<Item = &str> {
-    std::iter::once(source_agent_id).chain(match source_agent_id {
-        "orchestrator" => Some("main"),
-        "main" => Some("orchestrator"),
-        _ => None,
-    })
-}
-
-async fn execute_delegation_with_source_agent_alias(
+async fn execute_delegation(
     engine: &crate::server::delegation::engine::DelegationEngine,
     request: astra_services::coordination::DelegationRequest,
     source_agent_id: &str,
@@ -51,20 +47,10 @@ async fn execute_delegation_with_source_agent_alias(
     admitted_model_execution: Option<&astra_services::AdmittedModelExecution>,
     live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
 ) -> Result<astra_services::coordination::DelegationResult, String> {
-    // `main` and `orchestrator` are identity aliases at the runtime boundary.
-    // Resolve them from the typed registry before execution; never retry based
-    // on presentation text from a validation error.
-    let source_agent_id = {
-        let registry = engine.registry().read().await;
-        source_agent_alias_candidates(source_agent_id)
-            .find(|candidate| registry.get(candidate).is_some())
-            .unwrap_or(source_agent_id)
-            .to_string()
-    };
     engine
         .execute_with_forward_headers_and_live_events(
             request,
-            &source_agent_id,
+            source_agent_id,
             None,
             forward_headers.clone(),
             admitted_model_execution.cloned(),
@@ -210,6 +196,11 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
             adaptive_delegation_context.as_ref(),
             &state.delegation_chain,
             host.agent_live_event_sink(),
+            state
+                .turn_intent
+                .as_ref()
+                .map(|intent| intent.workspace_mutation)
+                .unwrap_or_default(),
         )
         .await
     } else {
@@ -619,7 +610,7 @@ pub(crate) fn pattern_from_name(
                 astra_services::coordination::CoordinationPattern::Fork {
                     agent_id: agent.clone(),
                     tasks: tasks.into_iter().map(ToString::to_string).collect(),
-                    max_turns: 10,
+                    max_turns: default_fork_max_turns(agent),
                     aggregation: astra_services::coordination::AggregationStrategy::AllResults,
                     timeout_sec: timeout,
                 }
@@ -766,7 +757,8 @@ pub(crate) fn parse_coordination_pattern(
                         })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let max_turns = optional_u64_arg(args, "max_turns")?.unwrap_or(10);
+            let max_turns = optional_u64_arg(args, "max_turns")?
+                .unwrap_or_else(|| u64::from(default_fork_max_turns(&agents[0])));
             if max_turns == 0 {
                 return Err("delegate max_turns must be greater than zero".to_string());
             }
@@ -801,6 +793,26 @@ pub(crate) fn parse_coordination_pattern(
             "unknown delegate pattern '{unknown}'; expected sequential, fan_out, pipeline, adversarial, fork, or auto"
         )),
     }
+}
+
+/// Resolve the implicit fork budget from the selected agent profile instead
+/// of imposing one global ten-turn ceiling on every task. An explicit
+/// `max_turns` remains caller authority; unknown/custom agent IDs use the
+/// bounded task profile as the generic execution default.
+fn default_fork_max_turns(agent_id: &str) -> u32 {
+    let definitions = astra_turn_core::orchestration_builtin_agents::get_builtin_agent_types();
+    definitions
+        .iter()
+        .find(|definition| definition.agent_type.eq_ignore_ascii_case(agent_id.trim()))
+        .map(|definition| definition.max_turns)
+        .or_else(|| {
+            definitions
+                .iter()
+                .find(|definition| definition.agent_type == "task")
+                .map(|definition| definition.max_turns)
+        })
+        .unwrap_or(1)
+        .max(1)
 }
 
 /// Splice an allowlist into the cross-process delegation context as a sorted
@@ -850,6 +862,24 @@ pub(crate) fn merge_workspace_hint_into_delegation_request(
     c.insert("cwd".to_string(), Value::String(root.to_string()));
 }
 
+pub(crate) fn merge_workspace_mutation_into_delegation_request(
+    request: &mut astra_services::coordination::DelegationRequest,
+    workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent,
+) {
+    // Runtime authority always wins, including Unknown: a model cannot smuggle
+    // a stronger or weaker effect policy through its free-form context.
+    request
+        .context
+        .remove(crate::orchestration::WORKSPACE_MUTATION_CONTEXT_KEY);
+    if workspace_mutation != astra_config::user_profile::WorkspaceMutationIntent::Unknown {
+        request.context.insert(
+            crate::orchestration::WORKSPACE_MUTATION_CONTEXT_KEY.to_string(),
+            serde_json::to_value(workspace_mutation)
+                .expect("workspace mutation intent has a closed JSON representation"),
+        );
+    }
+}
+
 pub(crate) async fn partition_and_execute_delegations(
     tool_calls: &[Value],
     engine: &crate::server::delegation::engine::DelegationEngine,
@@ -864,6 +894,7 @@ pub(crate) async fn partition_and_execute_delegations(
     adaptive_context: Option<&DelegationAdaptiveContext>,
     parent_delegation_chain: &[String],
     live_event_sink: Option<astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
+    workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent,
 ) -> (Vec<DelegationExecutionResult>, Vec<Value>) {
     let source_agent_id = self_agent_id;
     let mut delegation_results = Vec::new();
@@ -885,6 +916,13 @@ pub(crate) async fn partition_and_execute_delegations(
                 adaptive_context,
             ) {
                 Ok(mut request) => {
+                    // This key is runtime-owned. Never let model-authored
+                    // delegation context widen or contradict the root effect
+                    // boundary.
+                    merge_workspace_mutation_into_delegation_request(
+                        &mut request,
+                        workspace_mutation,
+                    );
                     // Inherit parent's delegation chain and append source agent_id
                     // to enable circular delegation detection across hops.
                     request.delegation_chain = parent_delegation_chain.to_vec();
@@ -920,7 +958,7 @@ pub(crate) async fn partition_and_execute_delegations(
                                     .and_then(|v| v.as_str().map(String::from))
                                     .unwrap_or_else(|| format!("{s:?}").to_lowercase())
                             });
-                    match execute_delegation_with_source_agent_alias(
+                    match execute_delegation(
                         engine,
                         request,
                         source_agent_id,
@@ -1176,13 +1214,56 @@ mod tests {
     }
 
     #[test]
-    fn is_delegation_call_accepts_legacy_top_level_shape() {
+    fn runtime_workspace_mutation_authority_overwrites_model_context() {
+        let mut request = astra_services::coordination::DelegationRequest {
+            delegation_id: "delegation-1".into(),
+            session_id: "session-1".into(),
+            parent_run_id: "run-1".into(),
+            task: "inspect the repository".into(),
+            pattern: astra_services::coordination::CoordinationPattern::Sequential {
+                agent_ids: vec!["reviewer".into()],
+                stop_on_success: true,
+                timeout_sec: 0,
+            },
+            user_id: "user-1".into(),
+            depth: 0,
+            delegation_chain: Vec::new(),
+            context: std::collections::HashMap::from([(
+                crate::orchestration::WORKSPACE_MUTATION_CONTEXT_KEY.to_string(),
+                json!("must_mutate"),
+            )]),
+            execution_metadata: None,
+        };
+
+        merge_workspace_mutation_into_delegation_request(
+            &mut request,
+            astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+        );
+        assert_eq!(
+            crate::orchestration::workspace_mutation_from_context(&request.context),
+            astra_config::user_profile::WorkspaceMutationIntent::ReadOnly
+        );
+
+        merge_workspace_mutation_into_delegation_request(
+            &mut request,
+            astra_config::user_profile::WorkspaceMutationIntent::Unknown,
+        );
+        assert!(
+            !request
+                .context
+                .contains_key(crate::orchestration::WORKSPACE_MUTATION_CONTEXT_KEY),
+            "unknown authority must remove an untrusted model-provided value"
+        );
+    }
+
+    #[test]
+    fn is_delegation_call_rejects_flat_provider_shape() {
         let delegate = json!({
-            "id": "call_legacy",
+            "id": "call_flat",
             "name": "delegate",
             "arguments": {"task": "review"}
         });
-        assert!(is_delegation_call(&delegate));
+        assert!(!is_delegation_call(&delegate));
     }
 
     #[test]
@@ -1313,6 +1394,35 @@ mod tests {
                 timeout_sec: 30,
                 ..
             } if tasks == ["inspect storage", "inspect TUI"] && agent_id == "coder"
+        ));
+    }
+
+    #[test]
+    fn fork_default_budget_follows_agent_profile() {
+        for (agent, expected) in [("explore", 20), ("code-review", 12), ("task", 30)] {
+            let pattern = parse_coordination_pattern(&json!({
+                "pattern": "fork",
+                "agents": [agent],
+                "tasks": ["first", "second"]
+            }))
+            .expect("fork should parse");
+            assert!(matches!(
+                pattern,
+                astra_services::coordination::CoordinationPattern::Fork { max_turns, .. }
+                    if max_turns == expected
+            ));
+        }
+
+        let custom = parse_coordination_pattern(&json!({
+            "pattern": "fork",
+            "agents": ["custom-agent"],
+            "tasks": ["first", "second"]
+        }))
+        .expect("custom fork should use the generic task profile");
+        assert!(matches!(
+            custom,
+            astra_services::coordination::CoordinationPattern::Fork { max_turns, .. }
+                if max_turns == 30
         ));
     }
 
@@ -1624,6 +1734,18 @@ mod tests {
             }
             _ => panic!("expected Pipeline"),
         }
+    }
+
+    #[test]
+    fn pattern_from_name_fork_uses_agent_profile_budget() {
+        let agents = vec!["code-review".to_string()];
+        let args = json!({"tasks": ["inspect", "verify"]});
+        let pattern = pattern_from_name("fork", &agents, &args).unwrap();
+        assert!(matches!(
+            pattern,
+            astra_services::coordination::CoordinationPattern::Fork { max_turns, .. }
+                if max_turns == 12
+        ));
     }
 
     #[test]
@@ -1964,7 +2086,7 @@ mod tests {
             "test-run",
             "test-session",
             0,
-            "orchestrator",
+            "main",
             None,
             &std::collections::HashMap::new(),
             None,
@@ -1972,6 +2094,7 @@ mod tests {
             None,
             &[],
             None,
+            Default::default(),
         )
         .await;
 
@@ -1984,7 +2107,7 @@ mod tests {
 
     #[tokio::test]
     async fn partition_handles_all_delegate_calls() {
-        let engine = make_partition_engine("orchestrator", &["coder", "reviewer"]);
+        let engine = make_partition_engine("main", &["coder", "reviewer"]);
         let tool_calls = vec![
             json!({
                 "id": "d1",
@@ -2010,6 +2133,7 @@ mod tests {
             None,
             &[],
             None,
+            Default::default(),
         )
         .await;
 
@@ -2031,7 +2155,7 @@ mod tests {
             "run-1",
             "sess-1",
             0,
-            "orchestrator",
+            "main",
             None,
             &std::collections::HashMap::new(),
             None,
@@ -2039,6 +2163,7 @@ mod tests {
             None,
             &[],
             None,
+            Default::default(),
         )
         .await;
 
@@ -2052,10 +2177,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partition_preserves_target_error_after_typed_source_alias_resolution() {
+    async fn partition_preserves_target_error_with_exact_source_identity() {
         let engine = make_partition_engine("main", &[]);
         let tool_calls = vec![json!({
             "id": "missing_target",
+            "function": {"name": "delegate", "arguments": "{\"task\": \"code\", \"agents\": [\"coder\"]}"}
+        })];
+
+        let (delegation_results, remaining) = partition_and_execute_delegations(
+            &tool_calls,
+            &engine,
+            "run-1",
+            "sess-1",
+            0,
+            "main",
+            None,
+            &std::collections::HashMap::new(),
+            None,
+            &RequestConstraints::default(),
+            None,
+            &[],
+            None,
+            Default::default(),
+        )
+        .await;
+
+        assert_eq!(delegation_results.len(), 1);
+        assert!(remaining.is_empty());
+        assert!(
+            delegation_results[0]
+                .summary
+                .contains("target agent 'coder' not registered"),
+            "{:?}",
+            delegation_results[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn partition_rejects_retired_root_agent_alias() {
+        let engine = make_partition_engine("main", &["coder"]);
+        let tool_calls = vec![json!({
+            "id": "retired_source",
             "function": {"name": "delegate", "arguments": "{\"task\": \"code\", \"agents\": [\"coder\"]}"}
         })];
 
@@ -2073,15 +2235,15 @@ mod tests {
             None,
             &[],
             None,
+            Default::default(),
         )
         .await;
 
         assert_eq!(delegation_results.len(), 1);
         assert!(remaining.is_empty());
         assert!(
-            delegation_results[0]
-                .summary
-                .contains("target agent 'coder' not registered"),
+            delegation_results[0].summary.contains("orchestrator")
+                && delegation_results[0].summary.contains("not registered"),
             "{:?}",
             delegation_results[0]
         );
@@ -2131,7 +2293,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn intercept_delegations_resolves_root_agent_alias_from_registry() {
+    async fn intercept_delegations_uses_exact_root_agent_identity() {
         let mut host = MockHost::new(Vec::new()).with_valid_tools(&["delegate"]);
         let mut state = make_state();
         state.delegation_engine = Some(Arc::new(make_partition_engine("main", &["coder"])));

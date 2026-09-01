@@ -19,10 +19,8 @@ pub(crate) struct PlanModeSnapshot {
 /// permission-overlay behaviour: the model must call ExitPlanMode before
 /// writing anything.
 ///
-/// Read-only tools (grep, glob, read_file, git action=status/diff/log,
-/// web_search) and session-scoped authoring tools (`task`, memory_retrieve,
-/// ...) stay available so the agent can continue exploring while authoring a
-/// plan.
+/// Read-only tools (grep, glob, read_file, git action=status/diff/log and
+/// web_search) stay available so the agent can continue exploring.
 pub(crate) fn is_plan_mode_blocked_tool(tool: &str, args: &Value) -> bool {
     crate::turn::plan_mode_guard::is_plan_mode_blocked_tool(tool, args)
 }
@@ -78,18 +76,20 @@ pub(crate) async fn recompute_plan_mode_snapshot(
     };
     match repo.load(user_id, &plan_id).await {
         Ok(state) => {
-            let has_subtasks = !state.plan.subtasks.is_empty();
-            let any_in_progress = state.plan.subtasks.iter().any(|subtask| {
-                subtask.status == astra_services::task_orchestrator::TaskStatus::InProgress
-            });
-            let items_done = state.plan.items_done() > 0;
-            let progress_complete = state.plan.progress_pct() == 100;
-            let authoring =
-                !has_subtasks || (!any_in_progress && !items_done && !progress_complete);
+            let authoring = astra_plan::plan_mode_authoring_active(&state);
             let hint = astra_plan::plan_resume_prompt_hint(&state);
             (authoring, hint)
         }
-        Err(_) => (false, None),
+        Err(error) => {
+            tracing::warn!(
+                %user_id,
+                %session_id,
+                %plan_id,
+                error = %error,
+                "plan mode: active binding exists but draft load failed; retaining write guard"
+            );
+            (true, None)
+        }
     }
 }
 
@@ -261,6 +261,8 @@ pub(crate) async fn execute_exit_plan_mode(
     cache: &tokio::sync::RwLock<PlanModeSnapshot>,
     resume_hint_handle: Option<&Arc<std::sync::RwLock<Option<String>>>>,
     authoring_active_handle: Option<&Arc<std::sync::RwLock<bool>>>,
+    approval_gate: Option<&dyn astra_tools::ToolApprovalGate>,
+    approval_request_id: &str,
     args: &Value,
 ) -> String {
     let Some(repo) = repo.cloned() else {
@@ -311,16 +313,6 @@ pub(crate) async fn execute_exit_plan_mode(
         }
     }
 
-    invalidate_plan_mode_cache(
-        Some(&repo),
-        user_id,
-        session_id,
-        cache,
-        resume_hint_handle,
-        authoring_active_handle,
-    )
-    .await;
-
     if let Ok(writer) =
         astra_services::session_journal::JournalWriter::for_user(user_id, session_id)
     {
@@ -333,15 +325,125 @@ pub(crate) async fn execute_exit_plan_mode(
         );
     }
 
-    format!(
-        "Plan {active} submitted for trusted user approval. Write tools remain blocked until the UI/control plane records the user's approval."
-    )
+    let Some(approval_gate) = approval_gate else {
+        invalidate_plan_mode_cache(
+            Some(&repo),
+            user_id,
+            session_id,
+            cache,
+            resume_hint_handle,
+            authoring_active_handle,
+        )
+        .await;
+        return format!(
+            "Error: Plan {active} was saved, but this run has no interactive approval channel. \
+             Write tools remain blocked; reconnect from an interactive client and submit the plan again."
+        );
+    };
+
+    match approval_gate
+        .request_approval(approval_request_id, "exit_plan_mode", args)
+        .await
+    {
+        astra_tools::ApprovalDecision::Approved => {
+            if let Err(error) = repo.set_active_plan(user_id, session_id, None).await {
+                invalidate_plan_mode_cache(
+                    Some(&repo),
+                    user_id,
+                    session_id,
+                    cache,
+                    resume_hint_handle,
+                    authoring_active_handle,
+                )
+                .await;
+                return format!(
+                    "Error: Plan {active} was approved, but plan mode could not be cleared: {error}. \
+                     Write tools remain blocked."
+                );
+            }
+            clear_shared_plan_mode_state(cache, resume_hint_handle, authoring_active_handle).await;
+            if let Ok(writer) =
+                astra_services::session_journal::JournalWriter::for_user(user_id, session_id)
+            {
+                let _ = writer.append(
+                    &astra_services::session_journal::JournalEvent::plan_lifecycle(
+                        Some(session_id),
+                        "plan_approved",
+                        Some(serde_json::json!({ "plan_id": active })),
+                    ),
+                );
+            }
+            format!("Plan {active} approved. Plan mode is off and write tools are available.")
+        }
+        astra_tools::ApprovalDecision::Denied { reason } => {
+            invalidate_plan_mode_cache(
+                Some(&repo),
+                user_id,
+                session_id,
+                cache,
+                resume_hint_handle,
+                authoring_active_handle,
+            )
+            .await;
+            let reason = reason.unwrap_or_else(|| "the reviewer kept the plan in authoring".into());
+            format!(
+                "Plan {active} was not approved: {reason}. Plan mode remains active and write tools remain blocked."
+            )
+        }
+        astra_tools::ApprovalDecision::Timeout => {
+            invalidate_plan_mode_cache(
+                Some(&repo),
+                user_id,
+                session_id,
+                cache,
+                resume_hint_handle,
+                authoring_active_handle,
+            )
+            .await;
+            format!(
+                "Plan {active} approval timed out. Plan mode remains active and write tools remain blocked; submit it again when an interactive reviewer is connected."
+            )
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_plan::PlanRepository;
+    use astra_plan::{SubtaskPlan, TaskStatus};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn active_binding_keeps_write_guard_after_embedded_task_completion() {
+        let repo: Arc<dyn PlanRepository> = Arc::new(astra_plan::InMemoryPlanRepository::new());
+        let mut state = astra_plan::PlanModeState::new_with_owner(
+            "Review release proposal".into(),
+            "alice".into(),
+        );
+        state.plan.subtasks = vec![SubtaskPlan {
+            id: "legacy-execution-projection".into(),
+            title: "Do not infer approval from this row".into(),
+            status: TaskStatus::Completed,
+            ..Default::default()
+        }];
+        repo.save("alice", "plan-review", &mut state, None)
+            .await
+            .unwrap();
+        repo.set_active_plan("alice", "session-1", Some("plan-review"))
+            .await
+            .unwrap();
+
+        let (authoring, hint) =
+            recompute_plan_mode_snapshot(Some(&repo), "alice", "session-1").await;
+        assert!(
+            authoring,
+            "only trusted approval may release the write guard"
+        );
+        let hint = hint.expect("active draft hint");
+        assert!(hint.contains("awaiting trusted user review"), "{hint}");
+        assert!(!hint.contains("completed"), "{hint}");
+    }
 
     #[test]
     fn plan_mode_blocks_all_write_and_execute_class_tools() {
@@ -382,11 +484,6 @@ mod tests {
             ("git", json!({"action": "status"})),
             ("git", json!({"action": "diff"})),
             ("github", json!({"action": "list_prs"})),
-            ("task_board", json!({"action": "list"})),
-            (
-                "task_board",
-                json!({"action": "create", "title": "draft plan item"}),
-            ),
             (
                 "memory",
                 json!({"action": "remember", "content": "plan context"}),
@@ -404,10 +501,6 @@ mod tests {
         assert!(is_plan_mode_blocked_tool(
             "task_stop",
             &json!({"task_id": "bg-shell-1"})
-        ));
-        assert!(is_plan_mode_blocked_tool(
-            "task_board",
-            &json!({"action": "stop", "task_id": "bg-shell-1"})
         ));
         assert!(is_plan_mode_blocked_tool(
             "git",

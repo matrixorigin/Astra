@@ -2,16 +2,12 @@
 //! sync persistence, and shutdown tracking. Used by `astra-server` [`AppState`]
 //! and by the CLI [`ReplState`] as a single `Arc` attachment.
 
-use std::collections::{BTreeMap, HashSet};
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::task::JoinSet;
 
 use astra_core::{MatrixOneSettings, SharedPool};
 use astra_services::{
-    TaskLeaseHoldCache, TaskRecord,
     event_ingestion::{self, IngestionConfig, IngestionEvent},
     session_journal::JournalEvent,
     state_sync::MatrixOneSyncService,
@@ -19,17 +15,6 @@ use astra_services::{
 
 /// Max time to wait for the ingestion worker to finish during shutdown.
 const INGESTION_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Trait for tracking fire-and-forget persist futures so they are drained on shutdown.
-///
-/// `InProcessChatTurnBridge` uses this to hand off its SSE-generator persist tasks to
-/// a shutdown-aware tracker rather than raw `tokio::spawn`.  The production impl is
-/// [`MatrixCloudRuntime`]; tests inject a lightweight stub.
-///
-/// Object-safe: uses `Pin<Box<dyn Future>>` instead of a generic parameter.
-pub trait BridgePersistTracker: Send + Sync {
-    fn track_persist_task(&self, task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>);
-}
 
 /// Environment-driven MatrixOne settings.
 ///
@@ -132,12 +117,6 @@ pub struct MatrixCloudRuntime {
     ingestion_stats: Arc<std::sync::Mutex<astra_services::event_ingestion::IngestionStats>>,
     /// Normalized ingestion config used by this runtime instance.
     ingestion_config: astra_services::event_ingestion::IngestionConfig,
-    /// Phase 3: shared with HTTP lease handlers (process-local export filter).
-    pub lease_hold_cache: Arc<TaskLeaseHoldCache>,
-    /// Phase 3: local task mirror.
-    pub task_mirror: Arc<Mutex<BTreeMap<String, TaskRecord>>>,
-    /// Phase 3: dirty task IDs pending sync.
-    pub task_dirty: Arc<Mutex<HashSet<String>>>,
     edge_agent_id: Arc<str>,
     sync_service: Arc<MatrixOneSyncService>,
     audit_flusher_shutdown: tokio_util::sync::CancellationToken,
@@ -156,17 +135,10 @@ impl MatrixCloudRuntime {
     /// Wire owner-neutral ingestion and sync infrastructure to an existing
     /// [`SharedPool`]. Request-owned services are bound later from authenticated
     /// run context; the process root never invents a user principal.
-    pub fn attach(
-        shared_pool: SharedPool,
-        _profile: &str,
-        lease_hold_cache: Arc<TaskLeaseHoldCache>,
-    ) -> Self {
+    pub fn attach(shared_pool: SharedPool, _profile: &str) -> Self {
         let edge_agent_id: Arc<str> = std::env::var("ASTRA_EDGE_AGENT_ID")
             .unwrap_or_else(|_| "astra-server".into())
             .into();
-        let task_mirror = Arc::new(Mutex::new(BTreeMap::new()));
-        let task_dirty = Arc::new(Mutex::new(HashSet::new()));
-
         let pool = shared_pool.get().clone();
         let ingestion_config = IngestionConfig::default();
         let (sender, ingestion_shutdown, ingestion_stats, ingestion_jh) =
@@ -184,9 +156,6 @@ impl MatrixCloudRuntime {
             session_sync_tasks: Mutex::new(JoinSet::new()),
             ingestion_stats,
             ingestion_config,
-            lease_hold_cache,
-            task_mirror,
-            task_dirty,
             edge_agent_id,
             sync_service: sync_svc,
             audit_flusher_shutdown: audit_flusher.shutdown,
@@ -225,7 +194,38 @@ impl MatrixCloudRuntime {
                     memoria_client,
                     ingestion,
                     broker,
-                ),
+                )
+                .with_local_event_sink(Arc::new(|event, user_id| {
+                    let Some(session_id) = event
+                        .session_id
+                        .as_deref()
+                        .filter(|session_id| !session_id.is_empty())
+                    else {
+                        return;
+                    };
+                    match astra_services::session_journal::JournalWriter::for_user(
+                        user_id, session_id,
+                    ) {
+                        Ok(writer) => {
+                            if let Err(error) = writer.append(event) {
+                                tracing::warn!(
+                                    user_id,
+                                    session_id,
+                                    event_type = ?event.event_type,
+                                    ?error,
+                                    "failed to append owner-scoped session-memory event"
+                                );
+                            }
+                        }
+                        Err(error) => tracing::warn!(
+                            user_id,
+                            session_id,
+                            event_type = ?event.event_type,
+                            ?error,
+                            "failed to open owner-scoped session-memory journal"
+                        ),
+                    }
+                })),
             );
             self.memory_extraction_service = Some(svc);
         }
@@ -480,12 +480,6 @@ impl MatrixCloudRuntime {
     }
 }
 
-impl BridgePersistTracker for MatrixCloudRuntime {
-    fn track_persist_task(&self, task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
-        self.spawn_session_sync_task(task);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,36 +493,5 @@ mod tests {
         assert!(s.port > 0);
         assert!(!s.database.is_empty());
         unsafe { std::env::remove_var("MATRIXONE_PASSWORD") };
-    }
-
-    /// HIGH #4: BridgePersistTracker functional test — future runs via a minimal test impl.
-    #[tokio::test]
-    async fn bridge_persist_tracker_future_runs_and_drains() {
-        use std::pin::Pin;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use tokio::sync::oneshot;
-
-        struct SpawningTracker;
-        impl BridgePersistTracker for SpawningTracker {
-            fn track_persist_task(&self, task: Pin<Box<dyn Future<Output = ()> + Send + 'static>>) {
-                tokio::spawn(task);
-            }
-        }
-
-        let task_ran = Arc::new(AtomicBool::new(false));
-        let task_ran2 = task_ran.clone();
-        let (tx, rx) = oneshot::channel::<()>();
-
-        let tracker: Arc<dyn BridgePersistTracker> = Arc::new(SpawningTracker);
-        tracker.track_persist_task(Box::pin(async move {
-            task_ran2.store(true, Ordering::SeqCst);
-            let _ = tx.send(());
-        }));
-
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), rx).await;
-        assert!(
-            task_ran.load(Ordering::SeqCst),
-            "tracked future must execute"
-        );
     }
 }

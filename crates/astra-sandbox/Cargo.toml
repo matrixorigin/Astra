@@ -12,6 +12,7 @@ regex = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true, features = ["process", "io-util", "time"] }
+tokio-util.workspace = true
 
 # Logging
 tracing = { workspace = true }
@@ -22,6 +23,7 @@ tree-sitter-bash = "0.23"
 
 # UUID for isolation namespaces
 uuid = { workspace = true }
+libc.workspace = true
 
 # Skill types (for TrustTier)
 astra-skills = { workspace = true }
@@ -35,3 +37,6 @@ astra-core = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tempfile.workspace = true
 temp-env.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true

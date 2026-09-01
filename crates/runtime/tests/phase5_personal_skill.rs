@@ -1,5 +1,5 @@
 use astra_services::{
-    ActivateUserSkillVersion, CreateUserSkillSource, DatabasePersonalSkillStore, InstallUserSkill,
+    ActivateUserSkillVersion, CreateUserSkillSource, DatabasePersonalSkillStore,
     PersonalSkillError, RecordUserSkillEvaluation, SubmitUserSkillVersion, skill_md_content_hash,
 };
 use serde_json::json;
@@ -129,7 +129,7 @@ async fn l2_44_skill_md_content_hash_is_deterministic_after_normalization() {
 
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_45_active_switch_does_not_mutate_draft_or_auto_activate_install() {
+async fn l2_45_active_switch_accepts_only_published_version() {
     let pool = setup_pool().await;
     let store = DatabasePersonalSkillStore::new(pool.clone());
     let (user_id, skill_name) = test_ids();
@@ -144,35 +144,39 @@ async fn l2_45_active_switch_does_not_mutate_draft_or_auto_activate_install() {
         .await
         .unwrap();
     store
-        .install_skill(
-            &user_id,
-            &skill_name,
-            InstallUserSkill {
-                version_id: Some(v1.version_id.clone()),
-                scope: Some("workspace".to_string()),
-                session_id: None,
-                workspace_id: Some("workspace-test".to_string()),
-                auto_activate_on_topic_match: Some(false),
-            },
-        )
-        .await
-        .unwrap();
-    store
         .activate_version(&user_id, &session_id, &skill_name, &v1.version_id)
         .await
         .unwrap();
+    assert!(matches!(
+        store
+            .activate_version(&user_id, &session_id, &skill_name, &v2.version_id)
+            .await,
+        Err(PersonalSkillError::VersionNotActivatable { .. })
+    ));
+    let typo_session = format!("typo-{}", Uuid::new_v4());
+    assert!(matches!(
+        store
+            .activate_version(&user_id, &typo_session, &skill_name, &v1.version_id)
+            .await,
+        Err(PersonalSkillError::SessionNotActive { .. })
+    ));
+    let typo_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&typo_session)
+    .fetch_one(pool.get())
+    .await
+    .unwrap();
+    assert_eq!(typo_count, 0, "activation typo must not create a session");
 
     let row = sqlx::query(
         "SELECT
           (SELECT status FROM user_skill_versions WHERE version_id = ?) AS draft_status,
-          (SELECT auto_activate_on_topic_match FROM skill_installations
-           WHERE user_id = ? AND skill_name = ?) AS auto_activate,
           (SELECT payload_json FROM session_state_items
            WHERE session_id = ? AND user_id = ? AND category = 'active_skill' AND item_key = ?) AS payload_json",
     )
     .bind(&v2.version_id)
-    .bind(&user_id)
-    .bind(&skill_name)
     .bind(&session_id)
     .bind(&user_id)
     .bind(&skill_name)
@@ -180,7 +184,6 @@ async fn l2_45_active_switch_does_not_mutate_draft_or_auto_activate_install() {
     .await
     .unwrap();
     assert_eq!(row.try_get::<String, _>("draft_status").unwrap(), "draft");
-    assert_eq!(row.try_get::<i64, _>("auto_activate").unwrap(), 0);
     assert!(
         row.try_get::<String, _>("payload_json")
             .unwrap()
@@ -205,7 +208,7 @@ async fn l2_46_skill_evaluations_use_independent_table_and_unified_denominator()
             RecordUserSkillEvaluation {
                 source_id: version.source_id.clone(),
                 version_id: version.version_id.clone(),
-                run_id: Some(format!("run-{}", Uuid::new_v4())),
+                run_id: None,
                 hits: 7,
                 suspects: 10,
                 false_positives: 2,
@@ -237,11 +240,11 @@ async fn l2_46_skill_evaluations_use_independent_table_and_unified_denominator()
     assert!(
         matches!(
             rejected,
-            PersonalSkillError::VersionNotFound {
+            PersonalSkillError::RunNotFound {
                 ref owner_user_id,
-                ref version_id,
+                ref run_id,
                 ..
-            } if owner_user_id == &foreign_user_id && version_id == &version.version_id
+            } if owner_user_id == &foreign_user_id && !run_id.is_empty()
         ),
         "unexpected foreign-owner error: {rejected:?}"
     );
@@ -300,55 +303,44 @@ async fn l2_47_personal_skill_search_uses_owner_skill_name_index() {
 
 #[tokio::test]
 #[ignore = "requires ASTRA_TEST_DB_IT=1"]
-async fn l2_48_auto_activate_topic_match_switch_controls_candidates() {
+async fn l2_48_active_personal_skill_content_is_exactly_session_and_owner_scoped() {
     let pool = setup_pool().await;
     let store = DatabasePersonalSkillStore::new(pool.clone());
     let (user_id, skill_name) = test_ids();
+    let session_a = format!("session-{}", Uuid::new_v4());
+    let session_b = format!("session-{}", Uuid::new_v4());
+    let foreign_user = Uuid::new_v4().to_string();
+    insert_session(&pool, &session_a, &user_id).await;
+    insert_session(&pool, &session_b, &user_id).await;
+    insert_session(&pool, &session_a, &foreign_user).await;
     let version = store
         .submit_version(&user_id, &skill_name, submit_request("v1", "published"))
         .await
         .unwrap();
     store
-        .install_skill(
-            &user_id,
-            &skill_name,
-            InstallUserSkill {
-                version_id: Some(version.version_id.clone()),
-                scope: Some("user".to_string()),
-                session_id: None,
-                workspace_id: None,
-                auto_activate_on_topic_match: Some(false),
-            },
-        )
+        .activate_version(&user_id, &session_a, &skill_name, &version.version_id)
         .await
         .unwrap();
-    assert!(
-        !store
-            .auto_activate_candidates(&user_id)
-            .await
-            .unwrap()
-            .contains(&skill_name)
-    );
-    store
-        .install_skill(
-            &user_id,
-            &skill_name,
-            InstallUserSkill {
-                version_id: Some(version.version_id),
-                scope: Some("user".to_string()),
-                session_id: None,
-                workspace_id: None,
-                auto_activate_on_topic_match: Some(true),
-            },
-        )
+    let active = store
+        .load_active_for_session(&user_id, &session_a)
         .await
         .unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].version_id, version.version_id);
+    assert_eq!(active[0].content_markdown, version.content_markdown);
     assert!(
         store
-            .auto_activate_candidates(&user_id)
+            .load_active_for_session(&user_id, &session_b)
             .await
             .unwrap()
-            .contains(&skill_name)
+            .is_empty()
+    );
+    assert!(
+        store
+            .load_active_for_session(&foreign_user, &session_a)
+            .await
+            .unwrap()
+            .is_empty()
     );
 }
 

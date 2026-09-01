@@ -66,6 +66,20 @@ pub fn validate_runtime_capability_descriptor(
             }
         }
     }
+    match (expected_type, descriptor.model_context_window) {
+        ("model_gateway", Some(context_window)) if context_window > 0 => {}
+        ("model_gateway", _) => {
+            return Err(provider_context_invalid(
+                "model_gateway.model_context_window must be positive",
+            ));
+        }
+        (_, Some(_)) => {
+            return Err(provider_context_invalid(
+                "model_context_window is only valid for model_gateway capability descriptors",
+            ));
+        }
+        (_, None) => {}
+    }
     Ok(())
 }
 
@@ -142,6 +156,7 @@ mod tests {
             endpoint_url: endpoint_url.to_string(),
             protocol: "moi-runtime-model-gateway.v1".to_string(),
             semantic_read: None,
+            model_context_window: (descriptor_type == "model_gateway").then_some(128_000),
             metadata: Map::new(),
         }
     }

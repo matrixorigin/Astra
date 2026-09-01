@@ -159,6 +159,33 @@ export function resumeChatRun(chatId: string) {
   );
 }
 
+export type PendingRunApproval = {
+  requestId: string;
+  tool: string;
+  detail?: string;
+  displayLabel?: string;
+  sessionId: string;
+  runId: string;
+  approvalKind: "standard" | "explicit";
+};
+
+export function respondChatRunApproval(
+  chatId: string,
+  approval: PendingRunApproval,
+  decision: "allow" | "deny",
+) {
+  return requestJson<{ status: string }>(
+    `/api/chats/${encodeURIComponent(chatId)}/approval`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        ...approval,
+        decision,
+      }),
+    },
+  );
+}
+
 export type ChatStreamHandlers = {
   signal?: AbortSignal;
   onLocalMessages?: (messages: {
@@ -182,6 +209,8 @@ export type ChatStreamHandlers = {
     status: string;
     error?: string | null;
   }) => void;
+  onApprovalRequired?: (approval: PendingRunApproval) => void;
+  onInteractionResolved?: () => void;
   onWorkSurfaceEvent?: (event: WorkSurfaceEvent) => void;
   onCancelled?: (text: string) => void;
   onPaused?: (text: string) => void;
@@ -248,7 +277,6 @@ function parseSseFrame(frame: string) {
 }
 
 const WORK_SURFACE_STREAM_EVENT_TYPES = new Set([
-  "task_board_snapshot",
   "workspace_bound",
   "executor_bound",
   "executor_status_changed",
@@ -388,6 +416,40 @@ function applyStreamEvent(
     return;
   }
 
+  if (
+    type === "approval_required" &&
+    typeof event.request_id === "string" &&
+    typeof event.tool === "string"
+  ) {
+    const runId =
+      typeof event.run_id === "string" && event.run_id.trim()
+        ? event.run_id
+        : state.runId;
+    if (runId && typeof event.session_id === "string") {
+      handlers.onApprovalRequired?.({
+        requestId: event.request_id,
+        tool: event.tool,
+        detail: typeof event.detail === "string" ? event.detail : undefined,
+        displayLabel:
+          typeof event.display_label === "string"
+            ? event.display_label
+            : undefined,
+        sessionId: event.session_id,
+        runId,
+        approvalKind:
+          event.approval_kind === "explicit" ? "explicit" : "standard",
+      });
+      handlers.onRunUpdated?.(
+        runUpdate(state, {
+          runId,
+          status: "waiting",
+          waitingFor: "tool_approval",
+        }),
+      );
+    }
+    return;
+  }
+
   if (isRunBlockedEvent(type)) {
     forwardWorkSurfaceEvent(event, handlers);
     const runId =
@@ -464,6 +526,7 @@ function applyStreamEvent(
     state.runId = event.run_id;
     forwardWorkSurfaceEvent(event, handlers);
     state.paused = false;
+    handlers.onInteractionResolved?.();
     handlers.onRunUpdated?.(
       runUpdate(state, {
         runId: event.run_id,

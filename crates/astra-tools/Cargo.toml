@@ -28,6 +28,8 @@ uuid.workspace = true
 url = "2.5"
 scraper = "0.27"
 futures = "0.3"
+fs2.workspace = true
+hex.workspace = true
 
 # Git operations (gix)
 gix = { version = "0.85.0", features = ["status", "blame", "mailmap", "revision"] }

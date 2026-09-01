@@ -1,0 +1,44 @@
+name: read_only_shell_diagnostics
+description: |
+  **What**: Use the shell for a diagnostic command in a turn whose requested
+  workspace outcome is explicitly read-only.
+  **Tests**: Shell schema visibility, separation of semantic intent from
+  authorization, permission/sandbox ownership, and real output delivery.
+  **Why**: A read-only task must constrain workspace effects without deleting
+  or rejecting the execution capability needed to gather evidence. An
+  LLM-inferred task label is guidance, never executable authority.
+  **Pass means**: One bash call executes and its real version output reaches the
+  final response.
+  **Fail means**: Bash is hidden, rejected as `read_only_turn_workspace_mutation`,
+  retried, or replaced by unsupported prose.
+prompt: |
+  这是只读环境诊断，不要修改 workspace。请只调用一次 `bash`，执行准确命令
+  `command -v git && git --version`。然后用一句话原样报告命令输出；不要调用其他工具。
+prompt_variants:
+  - id: en
+    prompt: |
+      This is a read-only environment diagnostic; do not modify the workspace.
+      Call `bash` exactly once with `command -v git && git --version`, then report
+      the command output in one sentence. Do not call any other tool.
+models:
+  - deepseek-v4-flash
+capability: tool_use
+difficulty: 2
+weight: 2.0
+timeout_seconds: 120
+debug_log: true
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: bash
+    min: 1
+    max: 1
+  - type: text_contains
+    needle: "git version"
+  - type: tools_count_between
+    min: 1
+    max: 1
+  - type: turn_rounds_between
+    min: 2
+    max: 4

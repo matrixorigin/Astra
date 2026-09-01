@@ -1,11 +1,7 @@
 //! Shared Memoria-compaction + LLM-message-assembly primitives.
 //!
-//! Used by both the server loop host (`ServerAgenticLoopHost::execute_turn`)
-//! and the HTTP bridge (`InProcessChatTurnBridge::forward`). Before this
-//! module each path had its own inlined copy of the Memoria call and the
-//! wire-building logic — the bodies had drifted apart (e.g. the server
-//! path discarded `CompactResult.boundary` and so lost the P2 compaction
-//! context note) and every cache-annotation tweak had to be mirrored twice.
+//! Used by the server-owned loop to keep compaction and provider wire
+//! assembly behind one deterministic boundary.
 //!
 //! Callers orchestrate three steps per turn:
 //!
@@ -29,14 +25,17 @@ use crate::turn::prompt_cache::{PromptCacheConfig, apply_anthropic_cache_metadat
 
 pub(crate) const REQUIRED_RUNTIME_PREAMBLE_MARKER: &str = "__astra_required_runtime_context";
 pub(crate) const RUNTIME_SYSTEM_CONTEXT_MARKER: &str = "__astra_runtime_system_context";
+pub(crate) const DECISION_FEEDBACK_PREAMBLE_MARKER: &str = "__astra_runtime_decision_feedback";
+#[cfg(test)]
 const TOOL_RUNTIME_CONTEXT_PREFIX: &str = "<runtime-context-after-tool>";
+#[cfg(test)]
 const TOOL_RUNTIME_CONTEXT_SUFFIX: &str = "</runtime-context-after-tool>";
 const MAX_DERIVED_BUDGET_REFINEMENTS: usize = 8;
 
 /// Convert a Memoria boundary into a typed provider-wire observation.
 ///
 /// The shared estimator covers the fixed prefix, compacted history, and
-/// visible tool schemas so server and bridge callers report the same facts.
+/// visible tool schemas so server and ephemeral callers report the same facts.
 pub(crate) fn observe_context_compaction(
     id: impl Into<String>,
     kind: astra_turn_core::compaction_types::CompactionKind,
@@ -245,6 +244,12 @@ pub(crate) fn required_runtime_preamble_message(text: &str) -> Option<Value> {
     runtime_system_context_message(text, true)
 }
 
+pub(crate) fn decision_feedback_preamble_message(text: &str) -> Option<Value> {
+    let mut message = runtime_system_context_message(text, false)?;
+    message[DECISION_FEEDBACK_PREAMBLE_MARKER] = Value::Bool(true);
+    Some(message)
+}
+
 pub(crate) fn runtime_system_context_message(text: &str, required: bool) -> Option<Value> {
     let text = text.trim();
     if text.is_empty() {
@@ -259,6 +264,16 @@ pub(crate) fn runtime_system_context_message(text: &str, required: bool) -> Opti
         message[REQUIRED_RUNTIME_PREAMBLE_MARKER] = Value::Bool(true);
     }
     Some(message)
+}
+
+pub(crate) fn system_reminder_wrapped_text(text: &str) -> String {
+    const SYSTEM_REMINDER_PREFIX: &str = "<system-reminder>";
+    const SYSTEM_REMINDER_SUFFIX: &str = "</system-reminder>";
+    if text.starts_with(SYSTEM_REMINDER_PREFIX) && text.ends_with(SYSTEM_REMINDER_SUFFIX) {
+        text.to_string()
+    } else {
+        format!("{SYSTEM_REMINDER_PREFIX}\n{text}{SYSTEM_REMINDER_SUFFIX}")
+    }
 }
 
 fn runtime_system_context_from_message(mut message: Value) -> Option<Value> {
@@ -366,10 +381,19 @@ pub(crate) fn is_required_runtime_preamble(message: &Value) -> bool {
         .unwrap_or(false)
 }
 
+fn is_prompt_visible_under_strict_history(message: &Value) -> bool {
+    is_required_runtime_preamble(message)
+        || message
+            .get(DECISION_FEEDBACK_PREAMBLE_MARKER)
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
 pub(crate) fn strip_required_runtime_preamble_marker(message: &mut Value) {
     if let Some(object) = message.as_object_mut() {
         object.remove(REQUIRED_RUNTIME_PREAMBLE_MARKER);
         object.remove(RUNTIME_SYSTEM_CONTEXT_MARKER);
+        object.remove(DECISION_FEEDBACK_PREAMBLE_MARKER);
     }
 }
 
@@ -385,7 +409,7 @@ pub(crate) fn session_memory_entry_for_pipeline(
         .map(|turn| format!("updated through session turn {turn}"))
         .unwrap_or_else(|| "update turn unavailable".to_string());
     let prompt_evidence = format!(
-        "## Session Memory Evidence\nSnapshot provenance: {freshness}. This is system-supplied background evidence, not a new user message, instruction, turn boundary, interruption, or request to resume. Use it only for continuity; do not announce a resume or restart planning because it is present. The current user message and live tool results take precedence.\n\n{content}"
+        "## Session Memory Evidence\nSnapshot provenance: {freshness}. This is a lossy, model-derived background summary, not a new user message, instruction, turn boundary, interruption, request to resume, live runtime snapshot, direct tool output, or text the user just supplied. Use it only for continuity; do not announce a resume or restart planning because it is present. Never attribute its claims to a tool or to the user, and verify current-state claims before presenting them as authoritative. The current user message, its immediately preceding exchange, and live tool results take precedence.\n\n{content}"
     );
     let mut entry = astra_turn_core::context_sources::MemoryEntry::new(prompt_evidence)
         .with_source("session_memory.snapshot");
@@ -465,7 +489,7 @@ pub(crate) struct MemoriaContext<'a> {
     pub summary_client: Option<&'a dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
     /// Pipeline-selected compaction tier (authoritative — do NOT re-derive).
     pub tier: CompactionTier,
-    /// Optional pre-parsed session facts (bridge path provides these;
+    /// Optional pre-parsed session facts (ephemeral path provides these;
     /// server path does not yet).
     pub session_facts: Option<astra_turn_types::session_facts::SessionFacts>,
 }
@@ -703,22 +727,16 @@ impl<'a> MemoriaContext<'a> {
 }
 
 /// Post-compaction state-driven attachments that the server path re-injects
-/// so the LLM retains skill + file context after history compaction.
+/// so the LLM retains invoked-skill context after history compaction.
 ///
-/// Empty on the bridge path today — the bridge is ephemeral per-request and
-/// has no session-state tracking for invoked skills or recently-read files.
+/// Empty on the ephemeral path today because it has no session-state tracking
+/// for invoked skills.
 #[derive(Default)]
 pub(crate) struct PostCompactAttachments<'a> {
     /// Skills that have been invoked earlier in the session, sorted most-
     /// recent-first. Their instructions get re-injected (truncated) so the
     /// LLM can follow them even after the original tool_result was compacted.
     pub invoked_skills: Vec<InvokedSkillRef<'a>>,
-    /// Recently-read files `(absolute_path, turn_number)` — restored as
-    /// required runtime-system context with truncated content so the LLM
-    /// remembers the code it was looking at before compaction.
-    pub recent_file_reads: &'a [(String, u32)],
-    /// CWD for resolving relative file paths in `recent_file_reads`.
-    pub cwd: Option<&'a str>,
 }
 
 /// Minimal view of a single invoked skill that `assemble_llm_messages_with_cache_capability` needs.
@@ -818,7 +836,9 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
     runtime_system_messages.extend(
         render_drained_volatile_messages(&drained_volatile)
             .into_iter()
-            .filter(|message| !suppress_volatile || is_required_runtime_preamble(message)),
+            .filter(|message| {
+                !suppress_volatile || is_prompt_visible_under_strict_history(message)
+            }),
     );
     runtime_system_messages.extend(
         take_runtime_system_context_messages(&mut compacted_messages)
@@ -843,21 +863,6 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
         }));
     }
 
-    if !attachments.recent_file_reads.is_empty() {
-        runtime_system_messages.extend(
-            astra_turn_core::cloud_attachments::restore_recent_files(
-                attachments.recent_file_reads,
-                attachments.cwd,
-            )
-            .into_iter()
-            .filter_map(|message| {
-                message
-                    .get("content")
-                    .and_then(Value::as_str)
-                    .and_then(|content| runtime_system_context_message(content, true))
-            }),
-        );
-    }
     let mut llm_messages = system_messages;
     llm_messages.extend(compacted_messages);
     let runtime_system_start = if runtime_system_messages.is_empty() {
@@ -904,6 +909,7 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
     llm_messages
 }
 
+#[cfg(test)]
 pub(crate) fn strip_runtime_context_from_tool_message(message: &mut Value) {
     if message.get("role").and_then(Value::as_str) != Some("tool") {
         return;
@@ -960,9 +966,20 @@ fn render_drained_volatile_messages(
         let Some(text) = edge_injection.render_for_prompt() else {
             continue;
         };
-        let required = inj.kind.delivery_class()
-            == astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext;
-        if let Some(message) = runtime_system_context_message(&text, required) {
+        let delivery_class = inj.kind.delivery_class();
+        let message = match delivery_class {
+            astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext => {
+                runtime_system_context_message(&text, true)
+            }
+            astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::DecisionFeedback => {
+                decision_feedback_preamble_message(&text)
+            }
+            astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::AdvisoryEvidence => {
+                runtime_system_context_message(&text, false)
+            }
+            astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::TelemetryOnly => None,
+        };
+        if let Some(message) = message {
             out.push(message);
         }
     }
@@ -1464,12 +1481,22 @@ mod tests {
             .expect("session memory entry");
 
         assert_eq!(entry.source.as_deref(), Some("session_memory.snapshot"));
+        assert!(entry.content.contains("not a new user message"));
         assert!(
             entry
                 .content
-                .contains("system-supplied background evidence")
+                .contains("lossy, model-derived background summary")
         );
-        assert!(entry.content.contains("not a new user message"));
+        assert!(
+            entry
+                .content
+                .contains("not a new user message, instruction, turn boundary")
+        );
+        assert!(
+            entry
+                .content
+                .contains("Never attribute its claims to a tool or to the user")
+        );
         assert!(
             entry
                 .content
@@ -1601,7 +1628,6 @@ mod tests {
                     name: "code-review",
                     content: "review instructions",
                 }],
-                ..Default::default()
             },
             "s1",
             "openai",
@@ -1716,27 +1742,19 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────
-    // Cross-caller parity pins
-    //
-    // Both `ServerAgenticLoopHost::execute_turn` and
-    // `InProcessChatTurnBridge::forward` call `assemble_llm_messages_with_cache_capability`.
-    // These tests pin the convergence invariants the two callers rely on:
-    // any drift here means one caller's wire output no longer matches the
-    // other's for the same logical input.
+    // Wire assembly invariants.
     // ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn parity_bridge_empty_attachments_matches_server_empty_attachments() {
-        // The bridge path always supplies an empty `PostCompactAttachments`
-        // (no state-backed skill/file re-injection). The server path supplies
-        // an empty one too whenever `state.skills.invoked` + `recent_file_reads`
+    fn empty_attachments_preserve_the_canonical_wire_shape() {
+        // An empty attachment set must not add a synthetic conversation turn.
         // are both empty. In that shared case, the output must be IDENTICAL.
         let system = vec![json!({"role": "system", "content": "sys"})];
         let compacted = vec![
             json!({"role": "user", "content": "hi"}),
             json!({"role": "assistant", "content": "hello"}),
         ];
-        let bridge_msgs = assemble_llm_messages_with_cache_capability(
+        let ephemeral_msgs = assemble_llm_messages_with_cache_capability(
             system.clone(),
             Vec::new(),
             Vec::new(),
@@ -1756,8 +1774,6 @@ mod tests {
             compacted,
             &PostCompactAttachments {
                 invoked_skills: Vec::new(),
-                recent_file_reads: &[],
-                cwd: Some("/tmp"),
             },
             "sid",
             "openai",
@@ -1767,15 +1783,15 @@ mod tests {
             &cache_cfg(),
         );
         assert_eq!(
-            bridge_msgs, server_msgs,
-            "bridge (default attachments) and server (empty-but-populated attachments) \
+            ephemeral_msgs, server_msgs,
+            "ephemeral (default attachments) and server (empty-but-populated attachments) \
              must produce byte-identical output — otherwise caller drift is possible"
         );
     }
 
     #[test]
     fn parity_continuation_then_assemble_is_deterministic() {
-        // The server + bridge call sequence is:
+        // The server + ephemeral call sequence is:
         //   1. memoria.compact() → CompactResult
         //   2. maybe_append_continuation_prompt(&mut result.messages, hit)
         //   3. assemble_llm_messages_with_cache_capability(system, preamble, result.messages, ...)
@@ -1831,7 +1847,7 @@ mod tests {
 
     #[test]
     fn parity_server_attachments_preserve_conversation_messages() {
-        // Invariant: server-path attachments (invoked_skills, recent_file_reads)
+        // Invariant: server-path invoked-skill attachments
         // use the runtime-system lane and never mutate or masquerade as
         // canonical conversation messages.
         let system = vec![json!({"role": "system", "content": "sys"})];
@@ -1839,7 +1855,7 @@ mod tests {
             json!({"role": "user", "content": "hi"}),
             json!({"role": "assistant", "content": "there"}),
         ];
-        let bridge_out = assemble_llm_messages_with_cache_capability(
+        let ephemeral_out = assemble_llm_messages_with_cache_capability(
             system.clone(),
             Vec::new(),
             Vec::new(),
@@ -1862,8 +1878,6 @@ mod tests {
                     name: "code-review",
                     content: "review checklist",
                 }],
-                recent_file_reads: &[],
-                cwd: None,
             },
             "sid",
             "openai",
@@ -1873,10 +1887,10 @@ mod tests {
             &cache_cfg(),
         );
         assert!(
-            server_out.len() > bridge_out.len(),
+            server_out.len() > ephemeral_out.len(),
             "server with attachments must have strictly more messages"
         );
-        let bridge_conversation = bridge_out
+        let bridge_conversation = ephemeral_out
             .iter()
             .filter(|message| message.get("role").and_then(Value::as_str) != Some("system"))
             .collect::<Vec<_>>();
@@ -1904,7 +1918,7 @@ mod tests {
         let system = vec![json!({"role": "system", "content": "sys"})];
         let compacted = vec![json!({"role": "user", "content": "hi"})];
 
-        let bridge_out = assemble_llm_messages_with_cache_capability(
+        let ephemeral_out = assemble_llm_messages_with_cache_capability(
             system.clone(),
             Vec::new(),
             Vec::new(),
@@ -1927,8 +1941,6 @@ mod tests {
                     name: "code-review",
                     content: "checklist",
                 }],
-                recent_file_reads: &[],
-                cwd: None,
             },
             "sid",
             "anthropic",
@@ -1939,11 +1951,11 @@ mod tests {
         );
 
         // Both paths must emit well-formed message arrays; the last message
-        // differs (it's the user message for bridge, the skill attachment
+        // differs (it's the user message for ephemeral, the skill attachment
         // for server) but each of them individually must be a valid message
         // with a `role` field, i.e. the cache-annotation step didn't corrupt
         // structure.
-        assert!(bridge_out.last().unwrap().get("role").is_some());
+        assert!(ephemeral_out.last().unwrap().get("role").is_some());
         assert!(server_out.last().unwrap().get("role").is_some());
     }
 
@@ -2167,7 +2179,7 @@ mod tests {
         let runtime_text = message_text(&msgs[1]);
         assert!(runtime_text.contains("policy_advisory.v1"));
         assert!(runtime_text.contains("consider changing approach"));
-        assert!(runtime_text.contains("<runtime-advisory-evidence>"));
+        assert!(runtime_text.contains("<runtime-decision-feedback>"));
         assert!(runtime_text.contains("\"kind\":\"policy_advisory\""));
         assert!(
             !runtime_text.contains("Do NOT call"),
@@ -2177,6 +2189,7 @@ mod tests {
             msgs[2],
             json!({"role": "user", "content": "fix the failing tests"})
         );
+        assert_eq!(msgs[2]["role"], "user");
     }
 
     #[test]
@@ -2366,7 +2379,6 @@ mod tests {
                     name: "review",
                     content: "stable skill instructions",
                 }],
-                ..Default::default()
             },
             "sid",
             "anthropic",
@@ -2426,7 +2438,7 @@ mod tests {
     }
 
     #[test]
-    fn current_user_only_models_drop_volatile_entirely() {
+    fn current_user_only_models_keep_typed_decision_feedback_only() {
         let system = vec![json!({"role": "system", "content": "sys"})];
         let preamble = vec![json!({"role": "system", "content": "volatile"})];
         let drained = vec![crate::turn::agentic_loop::host::VolatileInjection {
@@ -2452,31 +2464,29 @@ mod tests {
             None,
             &cache_cfg(),
         );
-        assert_eq!(msgs.len(), 4, "no runtime system message should remain");
+        assert_eq!(msgs.len(), 5, "typed decision feedback must remain visible");
         assert_eq!(msgs[0]["role"], "system");
-        assert_eq!(msgs[1]["role"], "user");
-        assert_eq!(msgs[1]["content"], "hi");
-        assert_eq!(msgs[2]["role"], "assistant");
-        assert_eq!(msgs[3]["role"], "tool");
+        assert_eq!(msgs[1]["role"], "system");
+        assert!(message_text(&msgs[1]).contains("optional policy advisory"));
+        assert!(message_text(&msgs[1]).contains("<runtime-decision-feedback>"));
+        assert_eq!(msgs[2]["role"], "user");
+        assert_eq!(msgs[2]["content"], "hi");
+        assert_eq!(msgs[3]["role"], "assistant");
+        assert_eq!(msgs[4]["role"], "tool");
         assert!(
             msgs.iter().all(|message| {
                 !message
                     .get("content")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
-                    .contains("optional policy advisory")
-                    && !message
-                        .get("content")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .contains("tools executed in parallel")
+                    .contains("tools executed in parallel")
                     && !message
                         .get("content")
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .contains("volatile")
             }),
-            "CurrentUserOnly providers must drop all volatile wire content"
+            "CurrentUserOnly providers must drop untyped optional volatile content"
         );
     }
 

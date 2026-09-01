@@ -11,10 +11,28 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sqlx::{MySql, Pool, QueryBuilder, mysql::MySqlPoolOptions};
 
+fn matrixone_pool_options(settings: &MatrixOneSettings) -> MySqlPoolOptions {
+    MySqlPoolOptions::new()
+        .max_connections(settings.db_pool_max_connections)
+        .min_connections(settings.db_pool_min_connections)
+        .test_before_acquire(true)
+        .acquire_timeout(std::time::Duration::from_secs(
+            settings.db_pool_acquire_timeout_secs,
+        ))
+        .idle_timeout(std::time::Duration::from_secs(
+            settings.db_pool_idle_timeout_secs,
+        ))
+        .max_lifetime(std::time::Duration::from_secs(
+            settings.db_pool_max_lifetime_secs,
+        ))
+}
+
+pub mod build_info;
 pub mod history_work;
 pub mod history_work_baseline;
 pub mod identity;
 pub mod local_state;
+pub mod process_runtime;
 pub mod work_unit;
 
 /// Give MatrixOne a distinct prepared-statement identity for each nullable
@@ -570,8 +588,8 @@ pub use observation::{
     truncate_graph_summary, urn_component,
 };
 pub use observation_journal::{
-    JournalEntry, JournalFacts, MetricTrend, ObservationJournal, ObservationStore, StoredEntry,
-    StrategyVerification, render_compact_status,
+    JournalEntry, JournalFacts, MetricTrend, ObservationJournal, StrategyVerification,
+    render_compact_status,
 };
 pub use runtime_limits::RuntimeLimits;
 #[cfg(any(test, feature = "dev-defaults"))]
@@ -757,19 +775,7 @@ pub async fn connect_matrixone(settings: &MatrixOneSettings) -> Result<Pool<MySq
     try_allocate_global_connections(max)
         .map_err(|e| sqlx::Error::Configuration(e.to_string().into()))?;
 
-    let pool = MySqlPoolOptions::new()
-        .max_connections(settings.db_pool_max_connections)
-        .min_connections(settings.db_pool_min_connections)
-        .test_before_acquire(true)
-        .acquire_timeout(std::time::Duration::from_secs(
-            settings.db_pool_acquire_timeout_secs,
-        ))
-        .idle_timeout(std::time::Duration::from_secs(
-            settings.db_pool_idle_timeout_secs,
-        ))
-        .max_lifetime(std::time::Duration::from_secs(
-            settings.db_pool_max_lifetime_secs,
-        ))
+    let pool = matrixone_pool_options(settings)
         .connect(&settings.database_url_with_password())
         .await;
 
@@ -808,19 +814,7 @@ impl SharedPool {
             .map_err(|e| sqlx::Error::Configuration(e.to_string().into()))?;
 
         // Build the pool. On failure, release the reserved quota.
-        let pool = match MySqlPoolOptions::new()
-            .max_connections(settings.db_pool_max_connections)
-            .min_connections(settings.db_pool_min_connections)
-            .test_before_acquire(true)
-            .acquire_timeout(std::time::Duration::from_secs(
-                settings.db_pool_acquire_timeout_secs,
-            ))
-            .idle_timeout(std::time::Duration::from_secs(
-                settings.db_pool_idle_timeout_secs,
-            ))
-            .max_lifetime(std::time::Duration::from_secs(
-                settings.db_pool_max_lifetime_secs,
-            ))
+        let pool = match matrixone_pool_options(settings)
             .connect(&settings.database_url_with_password())
             .await
         {
@@ -1031,15 +1025,15 @@ mod tests {
     fn error_response_coded_with_metadata_sets_machine_fields() {
         let (status, Json(body)) = error_response_coded_with_metadata(
             StatusCode::CONFLICT,
-            "stale",
-            "bridge_session_turn_stale",
+            "mismatch",
+            "bridge_session_turn_mismatch",
             serde_json::json!({"expected_session_turn": 2}),
         );
         assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(body.detail, "stale");
+        assert_eq!(body.detail, "mismatch");
         assert_eq!(
             body.error_code.as_deref(),
-            Some("bridge_session_turn_stale")
+            Some("bridge_session_turn_mismatch")
         );
         assert_eq!(
             body.metadata

@@ -1,6 +1,7 @@
 //! Retry orchestration for recoverable turn failures.
 
 use super::turn_auth_retry::prepare_auth_refresh_retry;
+use super::turn_entry::{acquire_interactive_turn_admission, ensure_interactive_session_identity};
 use super::turn_session_retry::{
     prepare_session_not_found_retry, should_retry_after_session_not_found,
 };
@@ -37,10 +38,10 @@ pub(crate) async fn settle_turn_attempt(
                 settle_successful_turn(state, dispatch, result).await;
                 Ok(TurnSettlementOutcome::Succeeded)
             }
-            Err(failure) => {
+            Err(mut failure) => {
                 if let Some(outcome) =
                     try_retry_after_session_not_found(state, dispatch, &failure, &run_chat_turn)
-                        .await
+                        .await?
                 {
                     return Ok(outcome);
                 }
@@ -51,7 +52,7 @@ pub(crate) async fn settle_turn_attempt(
                     return Ok(outcome);
                 }
 
-                settle_failed_turn(state, dispatch, &failure);
+                settle_failed_turn(state, dispatch, &mut failure).await;
                 Ok(TurnSettlementOutcome::Failed)
             }
         },
@@ -67,15 +68,24 @@ async fn try_retry_after_session_not_found(
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = TurnAttempt> + 'a>,
     >,
-) -> Option<TurnSettlementOutcome> {
+) -> Result<Option<TurnSettlementOutcome>, String> {
     if !should_retry_after_session_not_found(&failure.error, state.session_id.is_some()) {
-        return None;
+        return Ok(None);
     }
 
     prepare_session_not_found_retry(state, dispatch.ctx.profile).await;
     dispatch
         .ui
         .show_warning("  Session not found. Creating a new session…");
+
+    let session_id = ensure_interactive_session_identity(
+        state,
+        dispatch.ctx.api,
+        dispatch.ctx.profile,
+        dispatch.token,
+    )
+    .await?;
+    let _retry_execution_lease = acquire_interactive_turn_admission(state)?;
 
     let retry = run_chat_turn(TurnExecutionRequest {
         state,
@@ -88,12 +98,12 @@ async fn try_retry_after_session_not_found(
             input_runtime_required_texts: dispatch.input_runtime_required_texts,
             input_active_system_skills: dispatch.input_active_system_skills,
             input_runtime_volatile_texts: dispatch.input_runtime_volatile_texts,
-            session_id: None,
+            session_id: &session_id,
             semantic_query_override: dispatch.semantic_query_override,
         },
     })
     .await;
-    Some(settle_retry_attempt(state, dispatch, retry).await)
+    Ok(Some(settle_retry_attempt(state, dispatch, retry).await))
 }
 
 async fn try_retry_after_auth_refresh(
@@ -144,8 +154,8 @@ async fn settle_retry_attempt(
                 settle_successful_turn(state, dispatch, result).await;
                 TurnSettlementOutcome::Succeeded
             }
-            Err(retry_failure) => {
-                settle_failed_turn(state, dispatch, &retry_failure);
+            Err(mut retry_failure) => {
+                settle_failed_turn(state, dispatch, &mut retry_failure).await;
                 TurnSettlementOutcome::Failed
             }
         },
@@ -161,8 +171,24 @@ mod tests {
     use std::time::Instant;
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn successful_retry_clears_last_turn_interrupted() {
-        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let fresh_session_id = format!("sess-fresh-{}", uuid::Uuid::new_v4());
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "session_id": fresh_session_id,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let _credentials_guard = crate::tests::isolate_credentials();
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
         let ctx = TurnContext {
             api: &api,
             profile: None,
@@ -183,7 +209,7 @@ mod tests {
             input_active_system_skills: &[],
             input_runtime_volatile_texts: &[],
             token: "token",
-            session_id: Some("sess-stale"),
+            session_id: "sess-stale",
             semantic_query_override: None,
             turn_start: Instant::now(),
             ui: &mut ui,

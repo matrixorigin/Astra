@@ -319,12 +319,12 @@ impl std::fmt::Debug for ModelUpdateRequestData {
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingCapability {
     /// Model supports Normal (off) and Thinking modes — suppression works.
-    /// Picker: Normal / Thinking (Low) / Thinking (High).
+    /// Adaptive picker: Normal / Thinking (Low) / Thinking (High) / Thinking (Max).
     /// Examples: Bedrock Claude, DashScope Qwen-Plus, GLM-5.1.
     Both,
-    /// Model always thinks but supports effort control (low/medium/high).
+    /// Model always thinks but supports provider-specific effort control.
     /// Cannot be turned off completely — no "Normal" option.
-    /// Picker: Thinking (Low) / Thinking (High).
+    /// Adaptive picker: Thinking (Low) / Thinking (High) / Thinking (Max).
     /// Examples: DeepSeek V4.
     EffortOnly,
     /// Model always thinks, no control at all.
@@ -412,7 +412,7 @@ pub struct ModelRecord {
     pub thinking_probe: Option<ThinkingProbeResult>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ModelListItem {
     pub offering_id: String,
     pub access_id: String,
@@ -427,6 +427,50 @@ pub struct ModelListItem {
     pub max_completion_tokens: Option<i32>,
     pub architecture: Option<String>,
     pub thinking_capability: Option<ThinkingCapability>,
+}
+
+/// Stable seek cursor for the model catalog.
+///
+/// The tuple is ordered lexicographically by provider, local model name, and
+/// durable model id.  The id is the final tie-breaker because model names are
+/// only unique within a provider.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelListCursor {
+    pub provider: String,
+    pub model_name: String,
+    pub model_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelListPage {
+    pub items: Vec<ModelListItem>,
+    pub next_cursor: Option<ModelListCursor>,
+    pub limit: u32,
+    pub total: u32,
+}
+
+/// Wire envelope shared by every model-catalog consumer. The catalog is a
+/// seek-paginated projection; clients must follow `next_cursor` until it is
+/// absent instead of treating one response as the complete registry.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelListPageResponse {
+    pub items: Vec<ModelListItemResponse>,
+    pub next_cursor: Option<ModelListCursor>,
+    pub limit: u32,
+    pub total: u32,
+    pub catalog_revision: String,
+}
+
+/// Stable revision for the complete effective catalog, independent of which
+/// page was requested. It is deliberately based on the canonical sorted
+/// Offering projection rather than page-local transport fields.
+pub fn model_catalog_revision(items: &[ModelListItem]) -> String {
+    let mut canonical = items.to_vec();
+    sort_model_list_items(&mut canonical);
+    let bytes = serde_json::to_vec(&canonical).expect("ModelListItem is serializable");
+    format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
 /// Decrypted credentials for the active (or preferred) row in `infra_llm_models`.
@@ -538,6 +582,10 @@ pub struct AdmittedModelExecution {
     pub base_url: String,
     pub provider: String,
     pub cache_capability: Option<PromptCacheCapabilityData>,
+    /// Probe-derived reasoning control contract. Inference adapters use this
+    /// capability fact rather than model-name heuristics when selecting a
+    /// bounded auxiliary reasoning policy.
+    pub thinking_capability: Option<ThinkingCapability>,
     pub request_body_overrides: Option<Map<String, Value>>,
     pub context_window: Option<u32>,
     pub max_completion_tokens: Option<u32>,
@@ -559,6 +607,7 @@ impl AdmittedModelExecution {
             base_url: offering.model.base_url,
             provider: offering.model.provider,
             cache_capability: offering.model.prompt_cache_capability,
+            thinking_capability: offering.model.thinking_capability,
             request_body_overrides: offering.model.request_body_overrides,
             context_window: offering.model.context_window,
             max_completion_tokens: offering.model.max_completion_tokens,
@@ -575,6 +624,7 @@ impl AdmittedModelExecution {
         endpoint_url: String,
         authorization: String,
         timeout_ms: Option<u64>,
+        context_window: u32,
     ) -> Self {
         Self {
             offering_id,
@@ -586,8 +636,9 @@ impl AdmittedModelExecution {
             base_url: String::new(),
             provider,
             cache_capability: None,
+            thinking_capability: None,
             request_body_overrides: None,
-            context_window: None,
+            context_window: Some(context_window),
             max_completion_tokens: None,
             header_overrides: HashMap::from([("authorization".to_string(), authorization)]),
             completions_url_override: Some(endpoint_url),
@@ -1796,6 +1847,109 @@ fn model_context_window_from_db(value: i32, model_name: &str) -> Result<u32, Str
     )
 }
 
+fn validate_model_list_limit(limit: u32) -> u32 {
+    limit.clamp(1, crate::pagination::MAX_API_LIST_LIMIT)
+}
+
+fn model_list_query_limit(limit: u32) -> i64 {
+    i64::from(validate_model_list_limit(limit)) + 1
+}
+
+fn validate_model_list_cursor(
+    cursor: &ModelListCursor,
+) -> Result<ModelListCursor, (StatusCode, Json<ErrorResponse>)> {
+    let provider = cursor.provider.trim();
+    if provider.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid model list cursor: provider is required",
+        ));
+    }
+    let model_name = cursor.model_name.trim();
+    if model_name.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid model list cursor: model_name is required",
+        ));
+    }
+    let model_id = cursor.model_id.trim();
+    if model_id.is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid model list cursor: model_id is required",
+        ));
+    }
+    Ok(ModelListCursor {
+        provider: provider.to_string(),
+        model_name: model_name.to_string(),
+        model_id: model_id.to_string(),
+    })
+}
+
+fn model_list_cursor_from_item(
+    item: &ModelListItem,
+) -> Result<ModelListCursor, (StatusCode, Json<ErrorResponse>)> {
+    validate_model_list_cursor(&ModelListCursor {
+        provider: item.provider.clone(),
+        model_name: item.name.clone(),
+        model_id: item.offering_id.clone(),
+    })
+}
+
+fn model_list_item_after_cursor(item: &ModelListItem, cursor: &ModelListCursor) -> bool {
+    (
+        item.provider.as_str(),
+        item.name.as_str(),
+        item.offering_id.as_str(),
+    ) > (
+        cursor.provider.as_str(),
+        cursor.model_name.as_str(),
+        cursor.model_id.as_str(),
+    )
+}
+
+fn sort_model_list_items(items: &mut [ModelListItem]) {
+    items.sort_by(|left, right| {
+        left.provider
+            .cmp(&right.provider)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.offering_id.cmp(&right.offering_id))
+    });
+}
+
+fn model_list_page_from_items(
+    mut items: Vec<ModelListItem>,
+    limit: u32,
+    cursor: Option<ModelListCursor>,
+) -> Result<ModelListPage, (StatusCode, Json<ErrorResponse>)> {
+    let limit = validate_model_list_limit(limit);
+    let cursor = cursor
+        .as_ref()
+        .map(validate_model_list_cursor)
+        .transpose()?;
+    let total = u32::try_from(items.len())
+        .map_err(|error| internal_error(format!("model list total exceeds u32: {error}")))?;
+    sort_model_list_items(&mut items);
+    if let Some(cursor) = &cursor {
+        items.retain(|item| model_list_item_after_cursor(item, cursor));
+    }
+    let has_more = items.len() > limit as usize;
+    if has_more {
+        items.truncate(limit as usize);
+    }
+    let next_cursor = if has_more {
+        items.last().map(model_list_cursor_from_item).transpose()?
+    } else {
+        None
+    };
+    Ok(ModelListPage {
+        items,
+        next_cursor,
+        limit,
+        total,
+    })
+}
+
 // ── Trait ─────────────────────────────────────────────────────────────────────
 
 #[async_trait]
@@ -1811,6 +1965,32 @@ pub trait ModelService: Send + Sync {
         user_id: String,
         is_admin: bool,
     ) -> Result<Vec<ModelListItem>, (StatusCode, Json<ErrorResponse>)>;
+
+    /// List models using a stable seek cursor ordered by provider, model name,
+    /// and durable model id. Implementations without a native seek query may
+    /// materialize the complete authoritative catalog and page it in memory.
+    async fn list_models_page(
+        &self,
+        user_id: String,
+        is_admin: bool,
+        limit: u32,
+        cursor: Option<ModelListCursor>,
+    ) -> Result<ModelListPage, (StatusCode, Json<ErrorResponse>)> {
+        let limit = validate_model_list_limit(limit);
+        let items = self.list_models(user_id, is_admin).await?;
+        model_list_page_from_items(items, limit, cursor)
+    }
+
+    /// Return a revision for the complete effective catalog, independent of
+    /// the page currently being transferred.
+    async fn model_catalog_revision(
+        &self,
+        user_id: String,
+        is_admin: bool,
+    ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+        let items = self.list_models(user_id, is_admin).await?;
+        Ok(model_catalog_revision(&items))
+    }
 
     async fn get_model(
         &self,
@@ -1858,6 +2038,20 @@ pub struct DatabaseModelService {
     matrixone: MatrixOneSettings,
     pool: Option<SharedPool>,
     encryptor: std::sync::Arc<FernetTokenEncryptor>,
+    catalog_revision_cache: Arc<Mutex<HashMap<bool, CachedCatalogRevision>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CachedCatalogRevision {
+    fingerprint: CatalogRevisionFingerprint,
+    revision: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CatalogRevisionFingerprint {
+    total: i64,
+    min_updated_at: Option<String>,
+    max_updated_at: Option<String>,
 }
 
 /// Parse a required JSON column without degrading malformed persisted data to defaults.
@@ -1878,6 +2072,7 @@ impl DatabaseModelService {
             matrixone,
             encryptor,
             pool: None,
+            catalog_revision_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1959,8 +2154,46 @@ impl DatabaseModelService {
         self
     }
 
+    fn invalidate_catalog_revision_cache(&self) {
+        self.catalog_revision_cache
+            .lock()
+            .expect("catalog revision cache lock poisoned")
+            .clear();
+    }
+
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
         crate::require_shared_pool(self.pool.as_ref(), "DatabaseModelService", &self.matrixone)
+    }
+
+    fn model_list_item_from_row(
+        row: &sqlx::mysql::MySqlRow,
+    ) -> Result<ModelListItem, (StatusCode, Json<ErrorResponse>)> {
+        let is_active_int: i16 = row.try_get("is_active").map_err(internal_error)?;
+        let name: String = row.try_get("model_name").map_err(internal_error)?;
+        let context_window: i32 = row.try_get("context_window").map_err(internal_error)?;
+        let context_window =
+            model_context_window_from_db(context_window, &name).map_err(internal_error)? as i32;
+        let cap_str: Option<String> = row.try_get("thinking_capability").map_err(internal_error)?;
+        let thinking_capability =
+            ThinkingCapability::try_from_db_column(cap_str.as_deref()).map_err(internal_error)?;
+
+        Ok(ModelListItem {
+            offering_id: row.try_get("model_id").map_err(internal_error)?,
+            access_id: "self-hosted".to_string(),
+            access_kind: ModelAccessKind::SelfHosted,
+            access_label: "Self-hosted".to_string(),
+            execution_placement: ModelExecutionPlacement::Server,
+            name,
+            provider: row.try_get("provider").map_err(internal_error)?,
+            description: row.try_get("description").map_err(internal_error)?,
+            is_active: is_active_int != 0,
+            context_window,
+            max_completion_tokens: row
+                .try_get("max_completion_tokens")
+                .map_err(internal_error)?,
+            architecture: row.try_get("architecture").map_err(internal_error)?,
+            thinking_capability,
+        })
     }
 }
 
@@ -1978,7 +2211,10 @@ const MODEL_LIST_SELECT_COLS: &str = "\
     model_id, model_name, provider, description, is_active, \
     context_window, max_completion_tokens, architecture, \
     thinking_capability";
-const MAX_MODEL_LIST_ROWS: i64 = 200;
+const MODEL_LIST_CURSOR_SQL: &str = " AND (provider > ? \
+     OR (provider = ? AND model_name > ?) \
+     OR (provider = ? AND model_name = ? AND model_id > ?))";
+const MODEL_LIST_ORDER_SQL: &str = " ORDER BY provider ASC, model_name ASC, model_id ASC LIMIT ?";
 
 #[async_trait]
 impl ModelService for DatabaseModelService {
@@ -2064,7 +2300,7 @@ impl ModelService for DatabaseModelService {
               is_active, context_window, max_completion_tokens, input_modalities, output_modalities, \
               supported_parameters, pricing, architecture, tags, quirks, \
               created_by, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
         )
         .bind(&model_id)
         .bind(&request.name)
@@ -2087,6 +2323,7 @@ impl ModelService for DatabaseModelService {
         .await
         .map_err(internal_error)?;
         invalidate_active_llm_model_resolution_cache();
+        self.invalidate_catalog_revision_cache();
 
         // Thinking probe is NOT run during create — it's a separate
         // concern triggered by `model check`.  create_model only validates
@@ -2116,13 +2353,13 @@ impl ModelService for DatabaseModelService {
 
         let sql = if is_admin {
             format!(
-                "SELECT {} FROM infra_llm_models ORDER BY provider, model_name LIMIT {}",
-                MODEL_LIST_SELECT_COLS, MAX_MODEL_LIST_ROWS
+                "SELECT {} FROM infra_llm_models ORDER BY provider, model_name, model_id",
+                MODEL_LIST_SELECT_COLS
             )
         } else {
             format!(
-                "SELECT {} FROM infra_llm_models WHERE is_active = 1 ORDER BY provider, model_name LIMIT {}",
-                MODEL_LIST_SELECT_COLS, MAX_MODEL_LIST_ROWS
+                "SELECT {} FROM infra_llm_models WHERE is_active = 1 ORDER BY provider, model_name, model_id",
+                MODEL_LIST_SELECT_COLS
             )
         };
         let rows = query(&sql).fetch_all(&pool).await.map_err(internal_error)?;
@@ -2158,6 +2395,125 @@ impl ModelService for DatabaseModelService {
             });
         }
         Ok(models)
+    }
+
+    async fn list_models_page(
+        &self,
+        _user_id: String,
+        is_admin: bool,
+        limit: u32,
+        cursor: Option<ModelListCursor>,
+    ) -> Result<ModelListPage, (StatusCode, Json<ErrorResponse>)> {
+        let limit = validate_model_list_limit(limit);
+        let cursor = cursor
+            .as_ref()
+            .map(validate_model_list_cursor)
+            .transpose()?;
+        let pool = self.get_pool().await.map_err(internal_error)?;
+
+        let visibility = if is_admin { "1 = 1" } else { "is_active = 1" };
+        let count_sql =
+            format!("SELECT COUNT(*) AS total FROM infra_llm_models WHERE {visibility}");
+        let total_i64: i64 = query(&count_sql)
+            .fetch_one(&pool)
+            .await
+            .map_err(internal_error)?
+            .try_get("total")
+            .map_err(internal_error)?;
+        let total = u32::try_from(total_i64)
+            .map_err(|error| internal_error(format!("model list total exceeds u32: {error}")))?;
+
+        let cursor_sql = cursor.as_ref().map_or("", |_| MODEL_LIST_CURSOR_SQL);
+        let sql = format!(
+            "SELECT {} FROM infra_llm_models WHERE {}{}{}",
+            MODEL_LIST_SELECT_COLS, visibility, cursor_sql, MODEL_LIST_ORDER_SQL
+        );
+        let mut list_query = query(&sql);
+        if let Some(cursor) = &cursor {
+            list_query = list_query
+                .bind(&cursor.provider)
+                .bind(&cursor.provider)
+                .bind(&cursor.model_name)
+                .bind(&cursor.provider)
+                .bind(&cursor.model_name)
+                .bind(&cursor.model_id);
+        }
+        let rows = list_query
+            .bind(model_list_query_limit(limit))
+            .fetch_all(&pool)
+            .await
+            .map_err(internal_error)?;
+
+        let mut items = rows
+            .iter()
+            .map(Self::model_list_item_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_more = items.len() > limit as usize;
+        if has_more {
+            items.truncate(limit as usize);
+        }
+        let next_cursor = if has_more {
+            items.last().map(model_list_cursor_from_item).transpose()?
+        } else {
+            None
+        };
+        Ok(ModelListPage {
+            items,
+            next_cursor,
+            limit,
+            total,
+        })
+    }
+
+    async fn model_catalog_revision(
+        &self,
+        _user_id: String,
+        is_admin: bool,
+    ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+        let pool = self.get_pool().await.map_err(internal_error)?;
+        let visibility = if is_admin { "1 = 1" } else { "is_active = 1" };
+        let fingerprint_sql = format!(
+            "SELECT COUNT(*) AS total, \
+                    CAST(MIN(updated_at) AS CHAR) AS min_updated_at, \
+                    CAST(MAX(updated_at) AS CHAR) AS max_updated_at \
+             FROM infra_llm_models WHERE {visibility}"
+        );
+        let row = query(&fingerprint_sql)
+            .fetch_one(&pool)
+            .await
+            .map_err(internal_error)?;
+        let fingerprint = CatalogRevisionFingerprint {
+            total: row.try_get("total").map_err(internal_error)?,
+            min_updated_at: row.try_get("min_updated_at").map_err(internal_error)?,
+            max_updated_at: row.try_get("max_updated_at").map_err(internal_error)?,
+        };
+        if let Some(cached) = self
+            .catalog_revision_cache
+            .lock()
+            .expect("catalog revision cache lock poisoned")
+            .get(&is_admin)
+            .filter(|cached| cached.fingerprint == fingerprint)
+        {
+            return Ok(cached.revision.clone());
+        }
+
+        // The fingerprint is cheap and changes on every catalog mutation made
+        // through this service. Only a new fingerprint pays the full
+        // canonical serialization cost; page drains therefore stay O(pages),
+        // not O(rows × pages).
+        let items = self.list_models(String::new(), is_admin).await?;
+        let revision = model_catalog_revision(&items);
+        self.catalog_revision_cache
+            .lock()
+            .expect("catalog revision cache lock poisoned")
+            .insert(
+                is_admin,
+                CachedCatalogRevision {
+                    fingerprint,
+                    revision: revision.clone(),
+                },
+            );
+        Ok(revision)
     }
 
     async fn get_model(
@@ -2280,7 +2636,7 @@ impl ModelService for DatabaseModelService {
             )
             .await;
 
-            query("UPDATE infra_llm_models SET api_key_encrypted = ?, updated_at = NOW() WHERE model_name = ?")
+            query("UPDATE infra_llm_models SET api_key_encrypted = ?, updated_at = NOW(6) WHERE model_name = ?")
                 .bind(&encrypted)
                 .bind(&model_name)
                 .execute(&pool)
@@ -2289,7 +2645,9 @@ impl ModelService for DatabaseModelService {
 
             if request.is_active.is_none() {
                 let active: i16 = if check.is_none() { 1 } else { 0 };
-                query("UPDATE infra_llm_models SET is_active = ? WHERE model_name = ?")
+                query(
+                    "UPDATE infra_llm_models SET is_active = ?, updated_at = NOW(6) WHERE model_name = ?",
+                )
                     .bind(active)
                     .bind(&model_name)
                     .execute(&pool)
@@ -2302,14 +2660,14 @@ impl ModelService for DatabaseModelService {
         macro_rules! update_field {
             ($field:ident, $col:expr) => {
                 if let Some(val) = &request.$field {
-                    let sql = format!("UPDATE infra_llm_models SET {} = ?, updated_at = NOW() WHERE model_name = ?", $col);
+                    let sql = format!("UPDATE infra_llm_models SET {} = ?, updated_at = NOW(6) WHERE model_name = ?", $col);
                     query(&sql).bind(val).bind(&model_name).execute(&pool).await.map_err(internal_error)?;
                 }
             };
             ($field:ident, $col:expr, json) => {
                 if let Some(val) = &request.$field {
                     let json_str = serde_json::to_string(val).map_err(internal_error)?;
-                    let sql = format!("UPDATE infra_llm_models SET {} = ?, updated_at = NOW() WHERE model_name = ?", $col);
+                    let sql = format!("UPDATE infra_llm_models SET {} = ?, updated_at = NOW(6) WHERE model_name = ?", $col);
                     query(&sql).bind(&json_str).bind(&model_name).execute(&pool).await.map_err(internal_error)?;
                 }
             };
@@ -2329,7 +2687,7 @@ impl ModelService for DatabaseModelService {
 
         if let Some(active) = request.is_active {
             let val: i16 = if active { 1 } else { 0 };
-            query("UPDATE infra_llm_models SET is_active = ?, updated_at = NOW() WHERE model_name = ?")
+            query("UPDATE infra_llm_models SET is_active = ?, updated_at = NOW(6) WHERE model_name = ?")
                 .bind(val)
                 .bind(&model_name)
                 .execute(&pool)
@@ -2350,6 +2708,7 @@ impl ModelService for DatabaseModelService {
         let mut record = Self::model_record_from_row(row)?;
         record.connectivity = conn_result;
         invalidate_active_llm_model_resolution_cache();
+        self.invalidate_catalog_revision_cache();
         Ok(record)
     }
 
@@ -2376,6 +2735,7 @@ impl ModelService for DatabaseModelService {
             .await
             .map_err(internal_error)?;
         invalidate_active_llm_model_resolution_cache();
+        self.invalidate_catalog_revision_cache();
         Ok(())
     }
 
@@ -2431,12 +2791,14 @@ impl ModelService for DatabaseModelService {
         .await;
 
         let is_active: i16 = if check.is_none() { 1 } else { 0 };
-        query("UPDATE infra_llm_models SET is_active = ?, updated_at = NOW() WHERE model_name = ?")
-            .bind(is_active)
-            .bind(&model_name)
-            .execute(&pool)
-            .await
-            .map_err(internal_error)?;
+        query(
+            "UPDATE infra_llm_models SET is_active = ?, updated_at = NOW(6) WHERE model_name = ?",
+        )
+        .bind(is_active)
+        .bind(&model_name)
+        .execute(&pool)
+        .await
+        .map_err(internal_error)?;
 
         // Phase 2: two-phase thinking behavior probe (only when connected)
         let thinking_probe = if check.is_none() {
@@ -2455,7 +2817,7 @@ impl ModelService for DatabaseModelService {
             let err_str = result.error.as_deref();
             if let Err(e) = query(
                 "UPDATE infra_llm_models SET thinking_capability = ?, \
-                 thinking_probe_error = ?, updated_at = NOW() WHERE model_name = ?",
+                 thinking_probe_error = ?, updated_at = NOW(6) WHERE model_name = ?",
             )
             .bind(cap_str)
             .bind(err_str)
@@ -2488,6 +2850,7 @@ impl ModelService for DatabaseModelService {
         record.connectivity = Some(check.unwrap_or_else(|| "ok".to_string()));
         record.thinking_probe = thinking_probe;
         invalidate_active_llm_model_resolution_cache();
+        self.invalidate_catalog_revision_cache();
         Ok(record)
     }
 }
@@ -2688,6 +3051,32 @@ pub async fn validate_connectivity(
     }
 }
 
+/// Select the DeepSeek probe only from the admitted provider identity or the
+/// endpoint authority. Model names and arbitrary hostname substrings are not
+/// protocol evidence; a gateway such as `deepseek-proxy.example.com` must not
+/// receive a DeepSeek-only extension field by accident.
+fn is_deepseek_probe_route(provider: &str, base_url: &str) -> bool {
+    let provider = provider.trim().to_ascii_lowercase();
+    if provider == "deepseek" || provider.starts_with("deepseek-") {
+        return true;
+    }
+    let authority = base_url
+        .trim()
+        .strip_prefix("https://")
+        .or_else(|| base_url.trim().strip_prefix("http://"))
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or_default()
+        .split('@')
+        .next_back()
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    authority == "api.deepseek.com" || authority.ends_with(".deepseek.com")
+}
+
 /// Provider-aware two-phase probe of a model's thinking behavior.
 ///
 /// **Bedrock/Anthropic** (default = no thinking):
@@ -2757,20 +3146,43 @@ pub async fn probe_thinking_behavior(
         "messages": [{"role": "user", "content": "Say hello"}]
     });
 
-    // ── DeepSeek: always thinks, supports reasoning_effort (low/high) but can't disable ──
-    if url_lower.contains("deepseek") {
-        return match send_openai_probe(&client, &probe_url, api_key, &base_body).await {
+    // ── DeepSeek: V4 exposes a typed thinking toggle on the OpenAI endpoint ──
+    if is_deepseek_probe_route(provider, &url) {
+        let default_thinks = match send_openai_probe(&client, &probe_url, api_key, &base_body).await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return ThinkingProbeResult {
+                    capability: ThinkingCapability::None,
+                    error: Some(e),
+                };
+            }
+        };
+        if !default_thinks {
+            return ThinkingProbeResult {
+                capability: ThinkingCapability::None,
+                error: None,
+            };
+        }
+
+        // DeepSeek V4 uses `thinking: {type: "disabled"}`. A rejection of
+        // this extension means the endpoint is an older/native-only route;
+        // keep the conservative effort-only contract rather than guessing
+        // that suppression succeeded.
+        let mut body_disable = base_body;
+        body_disable["thinking"] = serde_json::json!({"type": "disabled"});
+        return match send_openai_probe(&client, &probe_url, api_key, &body_disable).await {
+            Ok(false) => ThinkingProbeResult {
+                capability: ThinkingCapability::Both,
+                error: None,
+            },
             Ok(true) => ThinkingProbeResult {
+                capability: ThinkingCapability::NativeOnly,
+                error: None,
+            },
+            Err(_) => ThinkingProbeResult {
                 capability: ThinkingCapability::EffortOnly,
                 error: None,
-            },
-            Ok(false) => ThinkingProbeResult {
-                capability: ThinkingCapability::None,
-                error: None,
-            },
-            Err(e) => ThinkingProbeResult {
-                capability: ThinkingCapability::None,
-                error: Some(e),
             },
         };
     }
@@ -3350,6 +3762,11 @@ pub struct ModelAccessProjectionResponse {
     /// choice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_resolution: Option<ModelDefaultResolution>,
+    pub next_cursor: Option<ModelListCursor>,
+    /// Requested page size after server-side clamping.
+    pub limit: u32,
+    /// Number of effective Offerings in the complete catalog, not this page.
+    pub total: u32,
     pub catalog_revision: String,
     pub observed_at: String,
 }
@@ -3593,11 +4010,48 @@ pub fn project_model_access(
 }
 
 /// Build Model Access while resolving an optional scoped provider candidate.
-/// Astra never substitutes another Offering for an invalid provider
-/// candidate, while still returning the valid Offerings for explicit choice.
 pub fn project_model_access_with_default(
     declared: Vec<DeclaredModelAccess>,
+    offerings: Vec<ModelListItemResponse>,
+    provider_default: Option<ModelDefaultCandidate>,
+    observed_at: String,
+) -> crate::service_error::ServiceResult<ModelAccessProjectionResponse> {
+    let default_catalog = offerings.clone();
+    project_model_access_page_with_default_catalog(
+        declared,
+        offerings,
+        None,
+        &default_catalog,
+        provider_default,
+        observed_at,
+    )
+}
+
+/// Project one catalog page while retaining the global visible Offering count.
+pub fn project_model_access_page(
+    declared: Vec<DeclaredModelAccess>,
+    offerings: Vec<ModelListItemResponse>,
+    total_offerings: Option<u32>,
+    observed_at: String,
+) -> crate::service_error::ServiceResult<ModelAccessProjectionResponse> {
+    let default_catalog = offerings.clone();
+    project_model_access_page_with_default_catalog(
+        declared,
+        offerings,
+        total_offerings,
+        &default_catalog,
+        None,
+        observed_at,
+    )
+}
+
+/// Project a page while resolving its default against the complete effective
+/// catalog. Pagination cannot invalidate a default on a later page.
+pub fn project_model_access_page_with_default_catalog(
+    declared: Vec<DeclaredModelAccess>,
     mut offerings: Vec<ModelListItemResponse>,
+    total_offerings: Option<u32>,
+    default_catalog: &[ModelListItemResponse],
     provider_default: Option<ModelDefaultCandidate>,
     observed_at: String,
 ) -> crate::service_error::ServiceResult<ModelAccessProjectionResponse> {
@@ -3613,13 +4067,10 @@ pub fn project_model_access_with_default(
         }
     }
 
-    offerings.sort_by_cached_key(|offering| {
-        (
-            offering.access_id.clone(),
-            offering.name.to_ascii_lowercase(),
-            offering.offering_id.clone(),
-        )
-    });
+    // Keep the wire page in the same canonical order as ModelListCursor.
+    // Re-sorting a seek-paginated page by access identity would make its
+    // continuation cursor describe a different order from the returned data.
+    sort_model_list_item_responses(&mut offerings);
 
     let mut offering_ids = BTreeSet::new();
     let mut counts = BTreeMap::<String, u32>::new();
@@ -3664,7 +4115,8 @@ pub fn project_model_access_with_default(
     let accesses: Vec<ModelAccessViewResponse> = accesses
         .into_values()
         .map(|access| {
-            let available_model_count = counts.get(&access.id).copied().unwrap_or_default();
+            let available_model_count = total_offerings
+                .unwrap_or_else(|| counts.get(&access.id).copied().unwrap_or_default());
             let availability = project_access_availability(&access, available_model_count)?;
             Ok(ModelAccessViewResponse {
                 id: access.id,
@@ -3681,7 +4133,12 @@ pub fn project_model_access_with_default(
         })
         .collect::<crate::service_error::ServiceResult<_>>()?;
 
-    let default_resolution = resolve_model_default(&offerings, provider_default);
+    // Default selection is a catalog fact, not a caller-order fact. Resolve
+    // against the same canonical order used by seek pagination even when the
+    // caller supplied an unsorted complete catalog.
+    let mut canonical_default_catalog = default_catalog.to_vec();
+    sort_model_list_item_responses(&mut canonical_default_catalog);
+    let default_resolution = resolve_model_default(&canonical_default_catalog, provider_default);
     let default_offering_id = match &default_resolution {
         ModelDefaultResolution::Selected { offering_id, .. } => Some(offering_id.clone()),
         ModelDefaultResolution::Missing | ModelDefaultResolution::Invalid { .. } => None,
@@ -3709,14 +4166,27 @@ pub fn project_model_access_with_default(
     })?;
     let catalog_revision = format!("sha256:{:x}", Sha256::digest(revision_bytes));
 
+    let page_len = u32::try_from(offerings.len()).unwrap_or(u32::MAX);
     Ok(ModelAccessProjectionResponse {
         accesses,
         offerings,
         default_offering_id,
         default_resolution: Some(default_resolution),
+        next_cursor: None,
+        limit: page_len.max(1),
+        total: total_offerings.unwrap_or(page_len),
         catalog_revision,
         observed_at,
     })
+}
+
+fn sort_model_list_item_responses(offerings: &mut [ModelListItemResponse]) {
+    offerings.sort_by(|left, right| {
+        left.provider
+            .cmp(&right.provider)
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.offering_id.cmp(&right.offering_id))
+    });
 }
 
 /// Resolve a source-scoped candidate only against the catalog it was admitted
@@ -3764,6 +4234,133 @@ fn resolve_model_default(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_model_list_item(provider: &str, name: &str, offering_id: &str) -> ModelListItem {
+        ModelListItem {
+            offering_id: offering_id.to_string(),
+            access_id: "self-hosted".to_string(),
+            access_kind: ModelAccessKind::SelfHosted,
+            access_label: "Self-hosted".to_string(),
+            execution_placement: ModelExecutionPlacement::Server,
+            name: name.to_string(),
+            provider: provider.to_string(),
+            description: None,
+            is_active: true,
+            context_window: 8_192,
+            max_completion_tokens: None,
+            architecture: None,
+            thinking_capability: None,
+        }
+    }
+
+    #[test]
+    fn model_list_cursor_serializes_and_rejects_empty_fields() {
+        let cursor = ModelListCursor {
+            provider: " openai ".to_string(),
+            model_name: " gpt-5 ".to_string(),
+            model_id: " offer-1 ".to_string(),
+        };
+        let encoded = serde_json::to_string(&cursor).expect("serialize model list cursor");
+        let decoded: ModelListCursor =
+            serde_json::from_str(&encoded).expect("deserialize model list cursor");
+        assert_eq!(decoded, cursor);
+        assert_eq!(
+            validate_model_list_cursor(&cursor).unwrap().provider,
+            "openai"
+        );
+
+        for invalid in [
+            ModelListCursor {
+                provider: " ".to_string(),
+                model_name: "gpt-5".to_string(),
+                model_id: "offer-1".to_string(),
+            },
+            ModelListCursor {
+                provider: "openai".to_string(),
+                model_name: "".to_string(),
+                model_id: "offer-1".to_string(),
+            },
+            ModelListCursor {
+                provider: "openai".to_string(),
+                model_name: "gpt-5".to_string(),
+                model_id: "\t".to_string(),
+            },
+        ] {
+            let (status, _) = validate_model_list_cursor(&invalid).unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[test]
+    fn model_list_page_uses_stable_seek_order_and_continuation() {
+        let items = vec![
+            test_model_list_item("zeta", "same", "model-1"),
+            test_model_list_item("alpha", "second", "model-3"),
+            test_model_list_item("alpha", "first", "model-2"),
+            test_model_list_item("alpha", "first", "model-1"),
+        ];
+        let first = model_list_page_from_items(items.clone(), 2, None).unwrap();
+        assert_eq!(first.limit, 2);
+        assert_eq!(first.total, 4);
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|item| item.offering_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["model-1", "model-2"]
+        );
+        assert_eq!(
+            first.next_cursor,
+            Some(ModelListCursor {
+                provider: "alpha".to_string(),
+                model_name: "first".to_string(),
+                model_id: "model-2".to_string(),
+            })
+        );
+
+        let second = model_list_page_from_items(items, 2, first.next_cursor.clone()).unwrap();
+        assert_eq!(second.total, 4);
+        assert_eq!(
+            second
+                .items
+                .iter()
+                .map(|item| item.offering_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["model-3", "model-1"]
+        );
+        assert!(second.next_cursor.is_none());
+    }
+
+    #[test]
+    fn model_list_seek_sql_and_limit_contract() {
+        assert_eq!(validate_model_list_limit(0), 1);
+        assert_eq!(
+            validate_model_list_limit(u32::MAX),
+            crate::pagination::MAX_API_LIST_LIMIT
+        );
+        assert_eq!(
+            model_list_query_limit(crate::pagination::MAX_API_LIST_LIMIT),
+            i64::from(crate::pagination::MAX_API_LIST_LIMIT) + 1
+        );
+        assert!(MODEL_LIST_ORDER_SQL.contains("provider ASC"));
+        assert!(MODEL_LIST_ORDER_SQL.contains("model_name ASC"));
+        assert!(MODEL_LIST_ORDER_SQL.contains("model_id ASC"));
+        assert!(MODEL_LIST_CURSOR_SQL.contains("model_id > ?"));
+        assert!(
+            !MODEL_LIST_CURSOR_SQL
+                .to_ascii_uppercase()
+                .contains("OFFSET")
+        );
+        let paged_sql = format!(
+            "SELECT {} FROM infra_llm_models WHERE {}{}{}",
+            MODEL_LIST_SELECT_COLS, "is_active = 1", MODEL_LIST_CURSOR_SQL, MODEL_LIST_ORDER_SQL
+        );
+        assert!(
+            paged_sql.contains("WHERE is_active = 1 AND (provider > ?"),
+            "seek predicate must be separated from visibility predicate: {paged_sql}"
+        );
+    }
 
     #[test]
     fn offering_identity_is_exact_and_bounded() {
@@ -3836,6 +4433,7 @@ mod tests {
             "https://private.example/v1/chat/completions".to_string(),
             "Bearer top-secret".to_string(),
             Some(2_500),
+            128_000,
         );
 
         let debug = format!("{execution:?}");
@@ -4993,6 +5591,52 @@ mod tests {
     }
 
     #[test]
+    fn paged_model_access_preserves_canonical_seek_order() {
+        let declared = DeclaredModelAccess {
+            id: "self-hosted".into(),
+            kind: ModelAccessKind::SelfHosted,
+            label: "Self-hosted".into(),
+            execution_placement: ModelExecutionPlacement::Server,
+            availability: ModelAccessAvailability::Ready,
+        };
+        let offering = |id: &str, provider: &str, name: &str| ModelListItemResponse {
+            offering_id: id.into(),
+            access_id: declared.id.clone(),
+            access_kind: declared.kind,
+            access_label: declared.label.clone(),
+            execution_placement: declared.execution_placement,
+            name: name.into(),
+            provider: provider.into(),
+            description: None,
+            is_active: true,
+            context_window: 8_192,
+            max_completion_tokens: None,
+            architecture: None,
+            thinking_capability: None,
+        };
+
+        let projection = project_model_access_page(
+            vec![declared.clone()],
+            vec![
+                offering("offer-z", "z-provider", "Alpha"),
+                offering("offer-a", "a-provider", "Zulu"),
+            ],
+            Some(2),
+            "2026-08-12T00:00:00Z".into(),
+        )
+        .expect("paged projection");
+
+        assert_eq!(
+            projection
+                .offerings
+                .iter()
+                .map(|offering| offering.offering_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["offer-a", "offer-z"]
+        );
+    }
+
+    #[test]
     fn model_access_projection_honors_provider_default_offering() {
         let declared = DeclaredModelAccess {
             id: "this-device".into(),
@@ -5657,6 +6301,26 @@ mod tests {
     // Based on real API recordings from 2026-05-04.
     // Each mock simulates the provider's actual response pattern.
 
+    #[test]
+    fn deepseek_probe_route_uses_typed_provider_or_authority_only() {
+        assert!(is_deepseek_probe_route(
+            "deepseek",
+            "http://127.0.0.1:1234/v1"
+        ));
+        assert!(is_deepseek_probe_route(
+            "openai",
+            "https://api.deepseek.com/v1"
+        ));
+        assert!(!is_deepseek_probe_route(
+            "openai",
+            "https://deepseek-proxy.example.com/v1"
+        ));
+        assert!(!is_deepseek_probe_route(
+            "openai",
+            "https://provider.example/v1/deepseek"
+        ));
+    }
+
     /// Mock that responds differently based on enable_thinking in request.
     async fn spawn_dashscope_mock(supports_thinking: bool) -> String {
         use axum::{Router, routing::post};
@@ -5715,6 +6379,35 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// DeepSeek V4 mock: default requests think, while the typed
+    /// `thinking: {type: "disabled"}` request suppresses reasoning.
+    async fn spawn_deepseek_v4_mock() -> String {
+        use axum::{Router, routing::post};
+
+        let handler = |axum::Json(body): axum::Json<serde_json::Value>| async move {
+            let disabled = body
+                .get("thinking")
+                .and_then(|thinking| thinking.get("type"))
+                .and_then(serde_json::Value::as_str)
+                == Some("disabled");
+            let mut msg = serde_json::json!({"content": "Hello!"});
+            if !disabled {
+                msg["reasoning_content"] = serde_json::json!("thinking...");
+            }
+            axum::Json(serde_json::json!({"choices": [{"message": msg}]}))
+        };
+        let app = Router::new().route("/chat/completions", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        format!("http://{addr}")
+    }
+
     // ── DashScope qwen-plus: default=no think, enable_thinking works → Both ──
     #[tokio::test]
     async fn probe_dashscope_qwen_plus_both() {
@@ -5739,30 +6432,13 @@ mod tests {
         assert_eq!(result.capability, ThinkingCapability::Both, "{:?}", result);
     }
 
-    // ── DeepSeek: always has reasoning_content → EffortOnly ──
+    // ── DeepSeek V4: typed suppression is probed independently of model text ──
     #[tokio::test]
-    async fn probe_deepseek_v4_effort_only() {
-        let captured = Arc::new(Mutex::new(None));
-        let base = spawn_probe_mock(
-            captured.clone(),
-            serde_json::json!({
-                "choices": [{"message": {
-                    "content": "",
-                    "reasoning_content": "thinking about hello..."
-                }}]
-            }),
-        )
-        .await;
-        let result = probe_thinking_behavior("openai", "deepseek-v4-flash", "k", Some(&base)).await;
-        // Generic path (no "deepseek" in localhost URL) → detects reasoning → tries suppression
-        // For real DeepSeek, the url_lower check would match "deepseek"
-        assert!(
-            result.capability == ThinkingCapability::EffortOnly
-                || result.capability == ThinkingCapability::NativeOnly
-                || result.capability == ThinkingCapability::Both,
-            "model with reasoning_content should not be None: {:?}",
-            result
-        );
+    async fn probe_deepseek_v4_supports_typed_suppression() {
+        let base = spawn_deepseek_v4_mock().await;
+        let result =
+            probe_thinking_behavior("deepseek", "deepseek-v4-flash", "k", Some(&base)).await;
+        assert_eq!(result.capability, ThinkingCapability::Both, "{result:?}");
     }
 
     // ── MiniMax: always has <think> tags → NativeOnly ──

@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use serde_json::{Map, Value, json};
 
-use super::tool_binding_projection::is_server_runtime_tool;
+use super::tool_binding_projection::{is_server_control_plane_tool, is_server_runtime_tool};
 use super::tool_execution_binding::{
     ExecutorBinding, ExecutorBindingKind, ExecutorStatus, ToolExecutionRequest, ToolTransportKind,
     WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind,
@@ -74,6 +74,15 @@ impl ToolRouteBoundary {
         registry: &astra_runtime_env::ToolRegistry,
     ) {
         attach_binding_metadata(result, &self.request, registry);
+        if let Some(route_fields) = self.route_fields() {
+            let metadata = result.metadata.get_or_insert_with(Map::new);
+            // The selected execution route is the terminal authority. Request
+            // binding describes where the call originated; it must not make a
+            // Server-executed control tool look Edge-owned (or vice versa).
+            for (key, value) in route_fields {
+                metadata.insert(key.clone(), value.clone());
+            }
+        }
     }
 }
 
@@ -82,6 +91,7 @@ pub(crate) fn route_binding_event_fields(
     request: &ToolExecutionRequest,
 ) -> Option<Map<String, Value>> {
     match route {
+        ToolExecutionRouteKind::ServerControlPlane => Some(server_control_plane_event_fields()),
         ToolExecutionRouteKind::ServerRuntime => Some(server_runtime_event_fields()),
         ToolExecutionRouteKind::RequestScopedMcp => {
             Some(request_scoped_mcp_event_fields(&request.workspace))
@@ -215,6 +225,10 @@ pub(crate) fn tool_call_end_event(
     event.insert("call_id".to_string(), Value::String(call_id.to_string()));
     insert_run_id(&mut event, request);
     event.insert("tool".to_string(), Value::String(request.tool_name.clone()));
+    event.insert(
+        "arguments".to_string(),
+        public_tool_arguments(&request.args),
+    );
     event.insert("result".to_string(), Value::String(result.output.clone()));
     event.insert("success".to_string(), Value::Bool(!result.is_error));
     event.insert(
@@ -289,9 +303,82 @@ mod invocation_identity_tests {
             assert_eq!(event["tool"], "reflect");
         }
         assert_eq!(started["arguments"], args);
+        assert_eq!(ended["arguments"], started["arguments"]);
         assert!(started["arguments"].get("_run_id").is_none());
         assert!(started["arguments"].get("_turn_chain_id").is_none());
         assert!(started["arguments"].get("_tool_call_id").is_none());
+    }
+
+    #[test]
+    fn selected_server_route_overrides_edge_request_binding_at_terminal() {
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "user-1",
+            "session-1",
+            "run-1",
+            "turn-1",
+            "call-1",
+        )
+        .unwrap();
+        let mut state = ExecutionBindingState::server_sandbox(".");
+        state.set_edge_workspace_binding(
+            "edge-1",
+            "Laptop",
+            "/workspace",
+            WorkspaceAuthority::ReadWrite,
+        );
+        let request = state.tool_execution_request_for_invocation(
+            &identity,
+            "tool_search",
+            &json!({"query": "select:agent_fanout"}),
+        );
+        let boundary = ToolRouteBoundary::new(request, ToolExecutionRouteKind::ServerRuntime);
+        let mut result = astra_tools::ToolResult::text("ok".into());
+        boundary.attach_binding_metadata(&mut result, &astra_runtime_env::ToolRegistry::default());
+        let terminal = boundary.tool_call_end_event(&result, 4).unwrap();
+
+        assert_eq!(terminal["transport"], "server_local");
+        assert_eq!(terminal["executor"]["kind"], "server_local");
+        assert_ne!(terminal["workspace"]["kind"], "edge_workspace");
+    }
+
+    #[test]
+    fn selected_control_plane_route_overrides_edge_request_binding_for_every_lifecycle_event() {
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "user-1",
+            "session-1",
+            "run-1",
+            "turn-1",
+            "call-1",
+        )
+        .unwrap();
+        let mut state = ExecutionBindingState::server_sandbox(".");
+        state.set_edge_workspace_binding(
+            "edge-1",
+            "Laptop",
+            "/workspace",
+            WorkspaceAuthority::ReadWrite,
+        );
+        let request = state.tool_execution_request_for_invocation(
+            &identity,
+            "introspect",
+            &json!({"topic": "execution"}),
+        );
+        let boundary = ToolRouteBoundary::new(request, ToolExecutionRouteKind::ServerControlPlane);
+        let mut result = astra_tools::ToolResult::text("snapshot".into());
+        boundary.attach_binding_metadata(&mut result, &astra_runtime_env::ToolRegistry::builtins());
+
+        let events = [
+            boundary.routing_decision_event().unwrap(),
+            boundary.transport_started_event().unwrap(),
+            boundary.transport_finished_event(&result, 4).unwrap(),
+            boundary.tool_call_end_event(&result, 4).unwrap(),
+        ];
+        for event in events {
+            assert_eq!(event["transport"], "server_local");
+            assert_eq!(event["executor"]["kind"], "server_local");
+            assert_eq!(event["executor"]["executor_id"], "server-control-plane");
+            assert_eq!(event["workspace"]["kind"], "none");
+        }
     }
 }
 
@@ -375,6 +462,9 @@ pub(crate) fn projected_tool_start_event_fields(
     if metadata_is_request_scoped_mcp(base_metadata) {
         return Some(request_scoped_mcp_event_fields_from_metadata(base_metadata));
     }
+    if is_server_control_plane_tool(tool_name) {
+        return Some(server_control_plane_event_fields());
+    }
     if is_server_runtime_tool(tool_name) {
         return Some(server_runtime_event_fields());
     }
@@ -389,6 +479,9 @@ pub(crate) fn projected_tool_end_event_fields(
         if metadata_is_request_scoped_mcp(base_metadata) {
             return Some(request_scoped_mcp_event_fields_from_metadata(base_metadata));
         }
+        if is_server_control_plane_tool(tool_name) {
+            return Some(server_control_plane_event_fields());
+        }
         if is_server_runtime_tool(tool_name) {
             return Some(server_runtime_event_fields());
         }
@@ -397,6 +490,16 @@ pub(crate) fn projected_tool_end_event_fields(
         return Some(edge_ledger_event_fields_from_metadata(base_metadata));
     }
     None
+}
+
+fn server_control_plane_event_fields() -> Map<String, Value> {
+    let workspace = WorkspaceBinding {
+        kind: WorkspaceBindingKind::None,
+        display_name: "No file environment".to_string(),
+        cwd: None,
+        authority: WorkspaceAuthority::None,
+    };
+    binding_event_fields(&workspace, &ExecutorBinding::server_control_plane())
 }
 
 fn server_runtime_event_fields() -> Map<String, Value> {

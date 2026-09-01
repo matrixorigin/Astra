@@ -461,6 +461,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 .map(|ip| ip.prefix_messages.as_slice()),
             &user_message,
             force_reasoning_field,
+            &config.run_id,
         );
 
         if host.journal.is_some() {
@@ -476,15 +477,16 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
         let task_profile = infer_task_execution_profile(&config.task);
         let subrun_session_id = format!("delegate-{}-{}", config.run_id, profile.agent_id);
         let user_id = cli_user_id();
-        let step_recorder = StepRecorder::with_persistence(
+        let step_recorder = StepRecorder::with_persistence_for_run(
             &user_id,
             &subrun_session_id,
             &format!("{}-run", config.run_id),
+            &config.run_id,
         );
 
         let mut state = AgenticLoopState {
-            observation_store: None,
             observation_journal: Default::default(),
+            tool_ledger_receipt: Default::default(),
             messages,
             run_transcript_capture: None,
             volatile_pending: Vec::new(),
@@ -493,6 +495,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             session_memory_state: Default::default(),
             current_session_id: Some(config.session_id.clone()),
             current_run_id: Some(config.run_id.clone()),
+            current_run_owner_generation: None,
             inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
             context_manifest_pool: None,
             context_manifest_user_id: Some(user_id),
@@ -516,10 +519,8 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             has_any_usage: false,
             max_turns: DELEGATE_MAX_TURNS,
             remaining_turns: DELEGATE_MAX_TURNS,
-            turn_budget_hint_emitted_90: false,
-            turn_budget_hint_emitted_50: false,
-            turn_budget_hint_emitted_20: false,
             agentic_turn_budget: task_profile.agentic_turn_budget,
+            budget_is_explicit: true,
             current_round_index: 0,
             llm_rounds_completed: 0,
             last_request_message_count: None,
@@ -579,8 +580,11 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
                 flag: None,
                 pause_flag: config.pause_flag.clone(),
                 token: self.cancel_token.clone(),
+                execution_lease_lost: None,
+                resolved_origin: None,
             },
             error_recovery: Default::default(),
+            provider_adaptation: Default::default(),
             run_control: None,
             pipeline_session: Some(
                 astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
@@ -623,9 +627,7 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
-            max_cumulative_tokens: 0,
             thinking: child_thinking,
-            recent_file_reads: Vec::new(),
             permission_context: Some(permission_context),
             permission_handler: None,
             tactical_adapter: None,
@@ -641,8 +643,8 @@ impl SubRunExecutor for CliDelegateSubRunExecutor {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
-            bridge_turn_chain_id: None,
-            bridge_user_query_event_id: None,
+            canonical_turn_chain_id: Some(config.run_id.clone()),
+            root_user_query_event_id: Some(format!("{}:initial-user-query", config.run_id)),
             turn_event_buffer: None,
             harness: astra_runtime::turn::harness_adapter::HarnessSlot::empty(),
         };

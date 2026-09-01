@@ -145,6 +145,12 @@ pub trait SkillResolver: Send + Sync {
 
     /// List available skills for schema generation.
     fn available_skills(&self) -> Vec<SkillToolInfo>;
+
+    /// Closed workflow topology declared by trusted manifest metadata.
+    /// Instruction prose is intentionally not parsed for execution authority.
+    fn execution_topology(&self, _name: &str) -> Option<super::manifest::SkillExecutionTopology> {
+        None
+    }
 }
 
 // ── SkillInstaller ───────────────────────────────────────────────────────────

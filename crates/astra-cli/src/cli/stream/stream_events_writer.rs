@@ -1,22 +1,122 @@
 //! Structured JSONL event writer for `--stream-events` mode.
 //!
-//! When enabled, reads from the `StreamEventTx` channel and writes one
-//! JSON object per line to stderr.  Gateway reads these lines to drive
-//! progressive WeChat delivery (text deltas, tool status, thinking state).
+//! When enabled, reads from the `StreamEventTx` channel and writes one JSON
+//! object per line to an explicitly named machine-event file. stderr remains
+//! diagnostic output and can never contaminate this protocol.
 
 use crate::cli::chat_stream::{StreamEvent, StreamEventRx};
+use std::io::Write;
+use std::path::Path;
 
-pub(crate) fn spawn_stderr_writer(mut rx: StreamEventRx) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            let json = event_to_json(&event);
-            eprintln!("{json}");
+const THINKING_CHUNK_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const THINKING_CHUNK_FLUSH_BYTES: usize = 8 * 1024;
+
+pub(crate) fn spawn_file_writer(
+    mut rx: StreamEventRx,
+    path: &Path,
+) -> std::io::Result<tokio::task::JoinHandle<std::io::Result<()>>> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if !parent.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "stream-event parent directory does not exist",
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options.open(path)?;
+    Ok(tokio::spawn(async move {
+        let mut writer = std::io::BufWriter::new(file);
+        let mut write_error = None;
+        write_stream_events(&mut rx, |json, flush_after| {
+            if let Err(error) = writeln!(writer, "{json}") {
+                write_error = Some(error);
+                return false;
+            }
+            if flush_after && let Err(error) = writer.flush() {
+                write_error = Some(error);
+                return false;
+            }
+            true
+        })
+        .await;
+        if let Some(error) = write_error {
+            return Err(error);
         }
-    })
+        writer.flush()
+    }))
+}
+
+async fn write_stream_events(rx: &mut StreamEventRx, mut emit: impl FnMut(String, bool) -> bool) {
+    let mut thinking = String::new();
+    let mut flush = tokio::time::interval_at(
+        tokio::time::Instant::now() + THINKING_CHUNK_FLUSH_INTERVAL,
+        THINKING_CHUNK_FLUSH_INTERVAL,
+    );
+    flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            event = rx.recv() => {
+                let Some(event) = event else {
+                    if !thinking.is_empty() {
+                        let _ = emit(event_to_json(&StreamEvent::ThinkingChunk(std::mem::take(&mut thinking))), false);
+                    }
+                    break;
+                };
+                match event {
+                    StreamEvent::ThinkingChunk(chunk) => {
+                        thinking.push_str(&chunk);
+                        if thinking.len() >= THINKING_CHUNK_FLUSH_BYTES {
+                            if !emit(event_to_json(&StreamEvent::ThinkingChunk(std::mem::take(&mut thinking))), false) {
+                                break;
+                            }
+                        }
+                    }
+                    event => {
+                        // Preserve causal order at every structural/lifecycle
+                        // boundary while collapsing only adjacent preview
+                        // fragments.
+                        if !thinking.is_empty() {
+                            if !emit(event_to_json(&StreamEvent::ThinkingChunk(std::mem::take(&mut thinking))), false) {
+                                break;
+                            }
+                        }
+                        // Make lifecycle/structural evidence promptly visible
+                        // to timeout observers without turning token streaming
+                        // into one filesystem flush per model delta.
+                        let flush_after = !matches!(event, StreamEvent::Token(_));
+                        if !emit(event_to_json(&event), flush_after) {
+                            break;
+                        }
+                    }
+                }
+            }
+            _ = flush.tick(), if !thinking.is_empty() => {
+                if !emit(event_to_json(&StreamEvent::ThinkingChunk(std::mem::take(&mut thinking))), false) {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 fn event_to_json(event: &StreamEvent) -> String {
     let value = match event {
+        StreamEvent::SessionBound(session_id) => {
+            serde_json::json!({"type": "session_bound", "session_id": session_id})
+        }
+        StreamEvent::RunBound(run_id) => {
+            serde_json::json!({"type": "run_bound", "run_id": run_id})
+        }
         StreamEvent::ContextWindowPolicy {
             raw_window_tokens,
             usable_input_tokens,
@@ -45,6 +145,10 @@ fn event_to_json(event: &StreamEvent) -> String {
             "cache_read_tokens": usage.cache_read_tokens,
             "cache_creation_tokens": usage.cache_creation_tokens,
             "output_tokens": usage.output_tokens,
+        }),
+        StreamEvent::RuntimeFeedback(frame) => serde_json::json!({
+            "type": "runtime_feedback",
+            "runtime_feedback": frame,
         }),
         StreamEvent::Token(text) => {
             serde_json::json!({"type": "token", "text": text})
@@ -109,6 +213,10 @@ fn event_to_json(event: &StreamEvent) -> String {
                 "parent_tool_use_id": parent_tool_use_id,
             })
         }
+        StreamEvent::WorkTaskBoardUpdate(update) => serde_json::json!({
+            "type": astra_server_types::WORK_TASK_BOARD_UPDATE_EVENT_TYPE,
+            "task_board_update": update,
+        }),
         StreamEvent::AskUserPrompted { request_id, prompt } => {
             serde_json::json!({
                 "type": "ask_user_prompted",
@@ -174,6 +282,22 @@ fn event_to_json(event: &StreamEvent) -> String {
                 "content": content,
             })
         }
+        StreamEvent::UserIntentReturned {
+            intent_id,
+            delivery,
+            status,
+            event_index,
+            content,
+        } => {
+            serde_json::json!({
+                "type": "user_intent_returned",
+                "intent_id": intent_id,
+                "delivery": delivery,
+                "status": status,
+                "event_index": event_index,
+                "content": content,
+            })
+        }
         StreamEvent::AgentLive(event) => {
             serde_json::json!({
                 "type": "agent_live",
@@ -231,9 +355,78 @@ fn event_to_json(event: &StreamEvent) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{event_to_json, spawn_stderr_writer};
+    use super::{event_to_json, spawn_file_writer, write_stream_events};
     use crate::cli::chat_stream::StreamEvent;
     use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind};
+
+    #[tokio::test]
+    async fn adjacent_thinking_chunks_are_coalesced_before_structural_events() {
+        let (tx, mut rx) = crate::cli::chat_stream::stream_event_channel();
+        tx.send(StreamEvent::ThinkingChunk("a".into()))
+            .await
+            .unwrap();
+        tx.send(StreamEvent::ThinkingChunk("b".into()))
+            .await
+            .unwrap();
+        tx.send(StreamEvent::Thinking(false)).await.unwrap();
+        drop(tx);
+
+        let mut lines = Vec::new();
+        write_stream_events(&mut rx, |line, _| {
+            lines.push(line);
+            true
+        })
+        .await;
+
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        let chunk: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        let boundary: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
+        assert_eq!(chunk["type"], "thinking_chunk");
+        assert_eq!(chunk["text"], "ab");
+        assert_eq!(boundary["type"], "thinking");
+        assert_eq!(boundary["active"], false);
+    }
+
+    #[tokio::test]
+    async fn closed_optional_event_sink_stops_only_its_writer() {
+        let (tx, mut rx) = crate::cli::chat_stream::stream_event_channel();
+        tx.send(StreamEvent::Token("first".into())).await.unwrap();
+        tx.send(StreamEvent::Token("second".into())).await.unwrap();
+        drop(tx);
+
+        let mut writes = 0;
+        write_stream_events(&mut rx, |_, _| {
+            writes += 1;
+            false
+        })
+        .await;
+
+        assert_eq!(writes, 1, "a closed optional sink must not be retried");
+    }
+
+    fn runtime_feedback_frame() -> astra_turn_core::context_feedback::RuntimeFeedbackFrame {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 4,
+            "identity": {
+                "session_id": "session-live",
+                "run_id": "run-live",
+                "agent_id": "orchestrator",
+                "model_id": "deepseek-v4-flash",
+                "topology": "cli_server"
+            },
+            "progress": {
+                "session_turn": 1,
+                "agentic_round_index": 2,
+                "llm_rounds_completed": 3,
+                "slice_round_limit": 60,
+                "slice_rounds_remaining": 57
+            },
+            "context": {"compaction_tier": "normal"},
+            "was_truncated": false,
+            "policy_feedback": {"state": "not_evaluated"}
+        }))
+        .unwrap()
+    }
 
     #[test]
     fn token_event_serializes() {
@@ -241,6 +434,16 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["type"], "token");
         assert_eq!(v["text"], "hello");
+    }
+
+    #[test]
+    fn session_bound_event_serializes_server_identity() {
+        let json = event_to_json(&StreamEvent::SessionBound(
+            "550e8400-e29b-41d4-a716-446655440000".into(),
+        ));
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["type"], "session_bound");
+        assert_eq!(value["session_id"], "550e8400-e29b-41d4-a716-446655440000");
     }
 
     #[test]
@@ -280,6 +483,15 @@ mod tests {
         assert_eq!(lanes["cache_read_tokens"], 800);
         assert_eq!(lanes["cache_creation_tokens"], 100);
         assert_eq!(lanes["output_tokens"], 50);
+    }
+
+    #[test]
+    fn runtime_feedback_event_preserves_the_canonical_frame() {
+        let frame = runtime_feedback_frame();
+        let json = event_to_json(&StreamEvent::RuntimeFeedback(Box::new(frame.clone())));
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["type"], "runtime_feedback");
+        assert_eq!(value["runtime_feedback"], serde_json::json!(frame));
     }
 
     #[test]
@@ -463,13 +675,90 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_writer_drains_channel() {
+    async fn file_writer_drains_only_valid_json_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
         let (tx, rx) = crate::cli::chat_stream::stream_event_channel();
-        let handle = spawn_stderr_writer(rx);
-        tx.send(StreamEvent::Token("a".into())).await.unwrap();
-        tx.send(StreamEvent::Token("b".into())).await.unwrap();
+        let handle = spawn_file_writer(rx, &path).unwrap();
+        tx.send(StreamEvent::ToolStarted {
+            name: "bash".into(),
+            description: "dangerous command warning remains on stderr".into(),
+            tool_use_id: "call-1".into(),
+            parent_tool_use_id: None,
+        })
+        .await
+        .unwrap();
+        tx.send(StreamEvent::ToolCompleted {
+            name: "bash".into(),
+            description: "dangerous command was allowed by permissive mode".into(),
+            status: "completed".into(),
+            duration_ms: 1,
+            output_summary: Some("done".into()),
+            output: None,
+            tool_use_id: "call-1".into(),
+            parent_tool_use_id: None,
+        })
+        .await
+        .unwrap();
         drop(tx);
-        handle.await.unwrap();
+        handle.await.unwrap().unwrap();
+
+        let contents = std::fs::read_to_string(path).unwrap();
+        let lines = contents.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        for line in &lines {
+            let event: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert!(event.get("type").is_some());
+        }
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(lines[0]).unwrap()["tool_use_id"],
+            "call-1"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(lines[1]).unwrap()["tool_use_id"],
+            "call-1"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(dir.path().join("events.jsonl"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn file_writer_refuses_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        std::fs::write(&path, "user-owned").unwrap();
+        let (_tx, rx) = crate::cli::chat_stream::stream_event_channel();
+
+        let error = spawn_file_writer(rx, &path).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "user-owned");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_writer_refuses_symlink_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let path = dir.path().join("events.jsonl");
+        std::fs::write(&target, "user-owned").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let (_tx, rx) = crate::cli::chat_stream::stream_event_channel();
+
+        let error = spawn_file_writer(rx, &path).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "user-owned");
     }
 
     #[test]
@@ -589,5 +878,25 @@ mod tests {
         assert_eq!(v["event"]["agent_id"], "reviewer@abc12345");
         assert_eq!(v["event"]["kind"]["type"], "tool_completed");
         assert_eq!(v["event"]["kind"]["tool_use_id"], "tool-1");
+    }
+
+    #[test]
+    fn agent_live_thinking_delta_is_jsonl_safe() {
+        let json = event_to_json(&StreamEvent::AgentLive(
+            astra_turn_core::agent_live_event::AgentLiveEvent {
+                run_id: "child-run".into(),
+                agent_id: "reviewer@child-run".into(),
+                kind: astra_turn_core::agent_live_event::AgentLiveEventKind::ThinkingDelta(
+                    "checking the client boundary".into(),
+                ),
+            },
+        ));
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSONL event");
+        assert_eq!(value["type"], "agent_live");
+        assert_eq!(value["event"]["kind"]["type"], "thinking_delta");
+        assert_eq!(
+            value["event"]["kind"]["text"],
+            "checking the client boundary"
+        );
     }
 }

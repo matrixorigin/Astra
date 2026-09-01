@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::Value;
-use std::io::{BufRead, Write};
+use std::io::BufRead;
 use std::time::Duration;
 use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -23,7 +23,8 @@ use crate::cli::session::session_runtime;
 use crate::cli::stream::streaming_types::{StreamResult, format_background_agent_results};
 use crate::{ExplainMode, cli::chat_stream::BasicCliChatContext};
 
-type JsonWriter = Arc<Mutex<std::io::Stdout>>;
+#[derive(Clone, Debug, Default)]
+struct JsonWriter;
 
 #[derive(Clone)]
 struct ServerContext {
@@ -50,6 +51,99 @@ struct ActiveTurn {
 struct PendingApproval {
     turn_id: String,
     response_tx: oneshot::Sender<ApprovalResponse>,
+}
+
+const TURN_CONFLICT_CODE: &str = "turn_conflict";
+const SESSION_PERSISTENCE_FAILED_CODE: &str = "session_persistence_failed";
+const SESSION_PROJECTION_FAILED_CODE: &str = "session_projection_failed";
+const SESSION_COMMIT_UNKNOWN_CODE: &str = "session_commit_unknown";
+const TURN_FAILED_CODE: &str = "turn_failed";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AppServerFailure {
+    code: &'static str,
+    message: String,
+    retryable: bool,
+    committed: bool,
+    commit_unknown: bool,
+    projection_repair_required: bool,
+    canonical_session_id: Option<String>,
+}
+
+impl AppServerFailure {
+    fn turn_conflict(method: &str, active_turn_id: &str) -> Self {
+        Self {
+            code: TURN_CONFLICT_CODE,
+            message: format!(
+                "{method} conflicts with active turn `{active_turn_id}`; interrupt it or wait for settlement"
+            ),
+            retryable: true,
+            committed: false,
+            commit_unknown: false,
+            projection_repair_required: false,
+            canonical_session_id: None,
+        }
+    }
+
+    fn session_execution_conflict(session_id: &str) -> Self {
+        Self {
+            code: TURN_CONFLICT_CODE,
+            message: format!(
+                "thread `{session_id}` already has an active execution; wait for settlement"
+            ),
+            retryable: true,
+            committed: false,
+            commit_unknown: false,
+            projection_repair_required: false,
+            canonical_session_id: None,
+        }
+    }
+
+    fn session_persistence_failed(
+        settlement: crate::cli::command_router::HeadlessSessionSettlement,
+    ) -> Self {
+        use crate::cli::command_router::HeadlessCanonicalCommitStatus;
+
+        let committed = settlement.commit_status == HeadlessCanonicalCommitStatus::Committed;
+        let commit_unknown = settlement.commit_status == HeadlessCanonicalCommitStatus::Unknown;
+        Self {
+            code: match settlement.commit_status {
+                HeadlessCanonicalCommitStatus::Committed => SESSION_PROJECTION_FAILED_CODE,
+                HeadlessCanonicalCommitStatus::Unknown => SESSION_COMMIT_UNKNOWN_CODE,
+                HeadlessCanonicalCommitStatus::NotRequested
+                | HeadlessCanonicalCommitStatus::NotCommitted => SESSION_PERSISTENCE_FAILED_CODE,
+            },
+            message: settlement
+                .persistence_error
+                .unwrap_or_else(|| "session persistence did not settle".to_string()),
+            // Model/tool side effects already ran before local settlement. A
+            // business-turn retry is unsafe without end-to-end idempotency,
+            // even when readback proves that the canonical commit is absent.
+            retryable: false,
+            committed,
+            commit_unknown,
+            projection_repair_required: settlement.projection_repair_required,
+            canonical_session_id: settlement.canonical_session_id,
+        }
+    }
+
+    fn turn_failed(message: impl Into<String>) -> Self {
+        Self {
+            code: TURN_FAILED_CODE,
+            message: message.into(),
+            retryable: false,
+            committed: false,
+            commit_unknown: false,
+            projection_repair_required: false,
+            canonical_session_id: None,
+        }
+    }
+}
+
+impl From<String> for AppServerFailure {
+    fn from(message: String) -> Self {
+        Self::turn_failed(message)
+    }
 }
 
 struct TurnRequest {
@@ -83,7 +177,7 @@ pub(crate) async fn run_stdio_app_server(
         auto_approve,
     };
     let state = Arc::new(Mutex::new(AppState::default()));
-    let writer = Arc::new(Mutex::new(std::io::stdout()));
+    let writer = JsonWriter;
     let stdin = std::io::stdin();
     let lines = stdin.lock().lines();
 
@@ -134,13 +228,22 @@ pub(crate) async fn run_stdio_app_server(
                         continue;
                     }
                 };
-                let mut guard = state.lock().await;
-                let thread_id = requested
-                    .or_else(|| guard.thread_id.clone())
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                guard.thread_id = Some(thread_id.clone());
-                guard.developer_instructions = developer_instructions(&params);
-                drop(guard);
+                let thread_id = {
+                    let mut guard = state.lock().await;
+                    set_thread_if_idle(
+                        &mut guard,
+                        "thread/start",
+                        requested,
+                        developer_instructions(&params),
+                    )
+                };
+                let thread_id = match thread_id {
+                    Ok(thread_id) => thread_id,
+                    Err(failure) => {
+                        write_response_failure(&writer, id, &failure).await?;
+                        continue;
+                    }
+                };
                 write_response(
                     &writer,
                     id,
@@ -160,10 +263,22 @@ pub(crate) async fn run_stdio_app_server(
                         continue;
                     }
                 };
-                let mut guard = state.lock().await;
-                guard.thread_id = Some(thread_id.clone());
-                guard.developer_instructions = developer_instructions(&params);
-                drop(guard);
+                let thread_id = {
+                    let mut guard = state.lock().await;
+                    set_thread_if_idle(
+                        &mut guard,
+                        "thread/resume",
+                        Some(thread_id),
+                        developer_instructions(&params),
+                    )
+                };
+                let thread_id = match thread_id {
+                    Ok(thread_id) => thread_id,
+                    Err(failure) => {
+                        write_response_failure(&writer, id, &failure).await?;
+                        continue;
+                    }
+                };
                 write_response(
                     &writer,
                     id,
@@ -192,19 +307,22 @@ pub(crate) async fn run_stdio_app_server(
                         continue;
                     }
                 };
-                let (thread_id, turn_developer_instructions) = {
+                let admission = {
                     let mut guard = state.lock().await;
-                    let thread_id = requested
-                        .or_else(|| guard.thread_id.clone())
-                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                    let turn_developer_instructions = developer_instructions(&params)
-                        .or_else(|| guard.developer_instructions.clone());
-                    guard.thread_id = Some(thread_id.clone());
-                    guard.active_turn = Some(ActiveTurn {
-                        turn_id: turn_id.clone(),
-                        cancel: cancel.clone(),
-                    });
-                    (thread_id, turn_developer_instructions)
+                    begin_turn(
+                        &mut guard,
+                        requested,
+                        &turn_id,
+                        cancel.clone(),
+                        developer_instructions(&params),
+                    )
+                };
+                let (thread_id, turn_developer_instructions) = match admission {
+                    Ok(admission) => admission,
+                    Err(failure) => {
+                        write_response_failure(&writer, id, &failure).await?;
+                        continue;
+                    }
                 };
                 write_response(
                     &writer,
@@ -233,17 +351,21 @@ pub(crate) async fn run_stdio_app_server(
                         },
                     )
                     .await;
-                    if let Err(error) = result {
+                    if let Err(failure) = result {
+                        let terminal_thread_id = failure
+                            .canonical_session_id
+                            .as_deref()
+                            .unwrap_or(&task_thread_id);
                         let _ = write_notification(
                             &task_writer,
                             "error",
-                            serde_json::json!({"message": error}),
+                            turn_failure_params(&failure, &turn_id, terminal_thread_id),
                         )
                         .await;
                         let _ = write_notification(
                             &task_writer,
                             "turn/completed",
-                            turn_completed_params(&turn_id, &task_thread_id, "failed"),
+                            turn_failed_params(&turn_id, terminal_thread_id, &failure),
                         )
                         .await;
                     }
@@ -275,9 +397,8 @@ pub(crate) async fn run_stdio_app_server(
             "approval/respond" => {
                 let approval_id = match params
                     .get("approvalId")
-                    .or_else(|| params.get("id"))
                     .and_then(Value::as_str)
-                    .filter(|s| !s.trim().is_empty())
+                    .filter(|s| !s.is_empty())
                 {
                     Some(id) => id.to_string(),
                     None => {
@@ -314,7 +435,7 @@ async fn run_turn(
     ctx: ServerContext,
     writer: JsonWriter,
     request: TurnRequest,
-) -> Result<(), String> {
+) -> Result<(), AppServerFailure> {
     let TurnRequest {
         state,
         thread_id,
@@ -325,6 +446,21 @@ async fn run_turn(
         permission_mode,
         cancel,
     } = request;
+
+    let execution_lease =
+        match astra_services::session_journal::SessionExecutionLease::try_acquire(&thread_id) {
+            Ok(lease) => lease,
+            Err(astra_services::session_journal::SessionExecutionLeaseError::Conflict {
+                ..
+            }) => {
+                return Err(AppServerFailure::session_execution_conflict(&thread_id));
+            }
+            Err(error) => {
+                return Err(AppServerFailure::turn_failed(format!(
+                    "failed to acquire session execution lease for `{thread_id}`: {error}"
+                )));
+            }
+        };
 
     write_notification(
         &writer,
@@ -412,15 +548,6 @@ async fn run_turn(
     )
     .await;
     let spawner_for_drain = agent_spawner.clone();
-    let (chat_task_store, _chat_task_notify_tx) = session_runtime::resolve_task_store(
-        ctx.auth_profile.as_deref(),
-        Some(&ctx.api.api_origin()),
-    )
-    .await;
-    let chat_task_manager = Arc::new(crate::edge_tools::TaskManager::new(
-        thread_id.clone(),
-        chat_task_store,
-    ));
     let chat_ctx = BasicCliChatContext {
         api: &ctx.api,
         auth_profile: ctx.auth_profile.as_deref(),
@@ -436,8 +563,6 @@ async fn run_turn(
         unified_skill_registry,
         agent_spawner: Some(agent_spawner),
         root_agent_id: Some("gateway-root"),
-        task_manager: Some(chat_task_manager),
-        task_notify_tx: None,
         bg_task_commands: None,
         bg_task_list_cache: None,
         bash_detach_slot: None,
@@ -509,17 +634,78 @@ async fn run_turn(
     };
     sr.background_agent_results = background_agent_results;
     sr.integrate_background_agent_results();
-    persist_app_server_turn(
+    let next_thread_id = match persist_app_server_turn(
         ctx.auth_profile.as_deref(),
         model.as_deref(),
+        &thread_id,
         &message,
         &mut sr,
         turn_start,
-    );
-    let next_thread_id = next_thread_id_after_turn(&thread_id, sr.session_id.as_deref());
+        Some(&execution_lease),
+    ) {
+        Ok(next_thread_id) => next_thread_id,
+        Err(failure) => {
+            {
+                let mut guard = state.lock().await;
+                publish_committed_session_authority(&mut guard, &failure);
+            }
+            return Err(failure);
+        }
+    };
     state.lock().await.thread_id = Some(next_thread_id.clone());
     write_turn_result(&writer, &thread_id, &next_thread_id, &turn_id, &sr).await?;
     Ok(())
+}
+
+fn begin_turn(
+    state: &mut AppState,
+    requested_thread_id: Option<String>,
+    turn_id: &str,
+    cancel: Arc<CancellationToken>,
+    requested_developer_instructions: Option<String>,
+) -> Result<(String, Option<String>), AppServerFailure> {
+    if let Some(active) = state.active_turn.as_ref() {
+        return Err(AppServerFailure::turn_conflict(
+            "turn/start",
+            &active.turn_id,
+        ));
+    }
+
+    let thread_id = requested_thread_id
+        .or_else(|| state.thread_id.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let turn_developer_instructions =
+        requested_developer_instructions.or_else(|| state.developer_instructions.clone());
+    state.active_turn = Some(ActiveTurn {
+        turn_id: turn_id.to_string(),
+        cancel,
+    });
+    Ok((thread_id, turn_developer_instructions))
+}
+
+fn set_thread_if_idle(
+    state: &mut AppState,
+    method: &str,
+    requested_thread_id: Option<String>,
+    requested_developer_instructions: Option<String>,
+) -> Result<String, AppServerFailure> {
+    if let Some(active) = state.active_turn.as_ref() {
+        return Err(AppServerFailure::turn_conflict(method, &active.turn_id));
+    }
+    let thread_id = requested_thread_id
+        .or_else(|| state.thread_id.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    state.thread_id = Some(thread_id.clone());
+    state.developer_instructions = requested_developer_instructions;
+    Ok(thread_id)
+}
+
+fn publish_committed_session_authority(state: &mut AppState, failure: &AppServerFailure) {
+    if failure.committed
+        && let Some(session_id) = failure.canonical_session_id.as_ref()
+    {
+        state.thread_id = Some(session_id.clone());
+    }
 }
 
 async fn join_or_abort_app_server_task<T>(mut task: tokio::task::JoinHandle<T>, timeout: Duration) {
@@ -530,9 +716,6 @@ async fn join_or_abort_app_server_task<T>(mut task: tokio::task::JoinHandle<T>, 
 }
 
 fn extract_turn_message(params: &Value) -> Option<String> {
-    if let Some(text) = params.get("message").and_then(Value::as_str) {
-        return Some(text.to_string());
-    }
     let input = params.get("input")?.as_array()?;
     let mut parts = Vec::new();
     for item in input {
@@ -544,22 +727,14 @@ fn extract_turn_message(params: &Value) -> Option<String> {
 }
 
 fn requested_thread_id(params: &Value) -> Result<Option<String>, String> {
+    if params.get("sessionId").is_some() {
+        return Err("sessionId is not part of the app-server protocol; use threadId".to_string());
+    }
     let thread_id = params
         .get("threadId")
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty());
-    let session_id = params
-        .get("sessionId")
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty());
-    match (thread_id, session_id) {
-        (Some(thread_id), Some(session_id)) if thread_id != session_id => {
-            Err("threadId and sessionId must match when both are provided".to_string())
-        }
-        (Some(thread_id), _) => Ok(Some(thread_id.to_string())),
-        (None, Some(session_id)) => Ok(Some(session_id.to_string())),
-        (None, None) => Ok(None),
-    }
+    Ok(thread_id.map(str::to_string))
 }
 
 fn next_thread_id_after_turn(thread_id: &str, session_id: Option<&str>) -> String {
@@ -576,13 +751,27 @@ fn app_server_continuation(thread_id: &str) -> Option<SessionContinuation> {
 fn persist_app_server_turn(
     profile: Option<&str>,
     model: Option<&str>,
+    thread_id: &str,
     message: &str,
     result: &mut StreamResult,
     turn_start: std::time::Instant,
-) {
-    crate::cli::command_router::persist_headless_session_state(
-        profile, model, message, result, turn_start,
+    execution_lease: Option<&astra_services::session_journal::SessionExecutionLease>,
+) -> Result<String, AppServerFailure> {
+    let settlement = crate::cli::command_router::persist_headless_session_state(
+        profile,
+        model,
+        message,
+        result,
+        turn_start,
+        execution_lease,
     );
+    if settlement.persistence_error.is_some() {
+        return Err(AppServerFailure::session_persistence_failed(settlement));
+    }
+    Ok(next_thread_id_after_turn(
+        thread_id,
+        result.session_id.as_deref(),
+    ))
 }
 
 fn developer_instructions(params: &Value) -> Option<String> {
@@ -619,10 +808,13 @@ fn permission_mode_from_params(
     params: &Value,
     auto_approve: bool,
 ) -> Result<PermissionMode, String> {
-    let Some(raw) = params
-        .get("permissionMode")
-        .or_else(|| params.get("permission_mode"))
-    else {
+    if params.get("permission_mode").is_some() {
+        return Err(
+            "permission_mode is not part of the app-server protocol; use permissionMode"
+                .to_string(),
+        );
+    }
+    let Some(raw) = params.get("permissionMode") else {
         return Ok(PermissionMode::Auto);
     };
     let Some(raw) = raw.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
@@ -714,21 +906,13 @@ fn approval_notification_params(notification: ApprovalNotification<'_>) -> Value
 fn approval_response_from_params(params: &Value) -> Result<ApprovalResponse, String> {
     let decision = params
         .get("decision")
-        .or_else(|| params.get("response"))
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "approval/respond missing decision".to_string())?
-        .trim()
-        .to_ascii_lowercase();
-    match decision.as_str() {
-        "allow" | "approve" | "approved" | "allow_once" | "allow-once" | "once" => {
-            Ok(ApprovalResponse::AllowOnce)
-        }
-        "always" | "always_allow" | "always-allow" | "allow_always" | "allow-always" => {
-            Ok(ApprovalResponse::AlwaysAllow)
-        }
-        "deny" | "denied" | "reject" | "rejected" | "no" => Ok(ApprovalResponse::Deny),
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "approval/respond missing decision".to_string())?;
+    match decision {
+        "allow_once" => Ok(ApprovalResponse::AllowOnce),
+        "always" => Ok(ApprovalResponse::AlwaysAllow),
+        "deny" => Ok(ApprovalResponse::Deny),
         _ => Err(format!("unsupported approval decision `{decision}`")),
     }
 }
@@ -793,6 +977,22 @@ fn turn_completed_params(turn_id: &str, thread_id: &str, status: &str) -> Value 
     })
 }
 
+fn turn_failed_params(turn_id: &str, thread_id: &str, failure: &AppServerFailure) -> Value {
+    let mut params = turn_completed_params(turn_id, thread_id, "failed");
+    params["committed"] = Value::Bool(failure.committed);
+    params["commitUnknown"] = Value::Bool(failure.commit_unknown);
+    params["projectionRepairRequired"] = Value::Bool(failure.projection_repair_required);
+    params["error"] = serde_json::json!({
+        "code": failure.code,
+        "message": failure.message,
+        "retryable": failure.retryable,
+    });
+    if let Some(session_id) = failure.canonical_session_id.as_ref() {
+        params["sessionId"] = Value::String(session_id.clone());
+    }
+    params
+}
+
 async fn write_stream_notification(writer: &JsonWriter, event: StreamEvent) -> Result<(), String> {
     let Some((method, params)) = stream_event_notification(&event) else {
         return Ok(());
@@ -817,6 +1017,10 @@ fn stream_event_notification(event: &StreamEvent) -> Option<(&'static str, Value
         StreamEvent::ThinkingChunk(text) if !text.is_empty() => Some((
             "item/reasoning/textDelta",
             serde_json::json!({"delta": text}),
+        )),
+        StreamEvent::RuntimeFeedback(frame) => Some((
+            "turn/runtimeFeedback",
+            serde_json::json!({"runtimeFeedback": frame}),
         )),
         StreamEvent::ToolStarted {
             name, description, ..
@@ -882,6 +1086,22 @@ fn stream_event_notification(event: &StreamEvent) -> Option<(&'static str, Value
                 "content": content,
             }),
         )),
+        StreamEvent::UserIntentReturned {
+            intent_id,
+            delivery,
+            status,
+            event_index,
+            content,
+        } => Some((
+            "turn/userIntentReturned",
+            serde_json::json!({
+                "intentId": intent_id,
+                "delivery": delivery,
+                "status": status,
+                "eventIndex": event_index,
+                "content": content,
+            }),
+        )),
         _ => None,
     }
 }
@@ -908,6 +1128,52 @@ async fn write_response_error(writer: &JsonWriter, id: Value, error: &str) -> Re
     .await
 }
 
+async fn write_response_failure(
+    writer: &JsonWriter,
+    id: Value,
+    failure: &AppServerFailure,
+) -> Result<(), String> {
+    write_json_line(writer, response_failure_value(id, failure)).await
+}
+
+fn response_failure_value(id: Value, failure: &AppServerFailure) -> Value {
+    let mut value = serde_json::json!({
+        "id": id,
+        "error": {
+            "code": -32000,
+            "message": failure.message,
+            "data": {
+                "code": failure.code,
+                "retryable": failure.retryable,
+                "committed": failure.committed,
+                "commitUnknown": failure.commit_unknown,
+                "projectionRepairRequired": failure.projection_repair_required,
+            }
+        },
+    });
+    if let Some(session_id) = failure.canonical_session_id.as_ref() {
+        value["error"]["data"]["sessionId"] = Value::String(session_id.clone());
+    }
+    value
+}
+
+fn turn_failure_params(failure: &AppServerFailure, turn_id: &str, thread_id: &str) -> Value {
+    let mut params = serde_json::json!({
+        "code": failure.code,
+        "message": failure.message,
+        "retryable": failure.retryable,
+        "committed": failure.committed,
+        "commitUnknown": failure.commit_unknown,
+        "projectionRepairRequired": failure.projection_repair_required,
+        "turnId": turn_id,
+        "threadId": thread_id,
+    });
+    if let Some(session_id) = failure.canonical_session_id.as_ref() {
+        params["sessionId"] = Value::String(session_id.clone());
+    }
+    params
+}
+
 async fn write_notification(
     writer: &JsonWriter,
     method: &str,
@@ -924,31 +1190,71 @@ async fn write_notification(
 }
 
 async fn write_json_line(writer: &JsonWriter, value: Value) -> Result<(), String> {
+    let _ = writer;
     let line = serde_json::to_string(&value).map_err(|e| e.to_string())?;
-    let mut stdout = writer.lock().await;
-    stdout
-        .write_all(line.as_bytes())
-        .map_err(|e| format!("stdout write failed: {e}"))?;
-    stdout
-        .write_all(b"\n")
-        .map_err(|e| format!("stdout write failed: {e}"))?;
-    stdout
-        .flush()
-        .map_err(|e| format!("stdout flush failed: {e}"))
+    match crate::cli::stream::output_sink::write_stdout_line(&line)
+        .map_err(|error| format!("stdout write failed: {error}"))?
+    {
+        crate::cli::stream::output_sink::OutputWriteStatus::Written => Ok(()),
+        crate::cli::stream::output_sink::OutputWriteStatus::Closed => {
+            Err("stdout output transport closed by its consumer".to_string())
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        app_server_continuation, approval_response_from_params, explain_mode_from_params,
-        extract_turn_message, join_or_abort_app_server_task, next_thread_id_after_turn,
-        permission_mode_from_params, persist_app_server_turn, requested_thread_id,
-        stream_event_notification, thread_started_params, turn_completed_params,
+        AppServerFailure, AppState, SESSION_COMMIT_UNKNOWN_CODE, SESSION_PERSISTENCE_FAILED_CODE,
+        SESSION_PROJECTION_FAILED_CODE, TURN_CONFLICT_CODE, app_server_continuation,
+        approval_response_from_params, begin_turn, explain_mode_from_params, extract_turn_message,
+        join_or_abort_app_server_task, next_thread_id_after_turn, permission_mode_from_params,
+        persist_app_server_turn, publish_committed_session_authority, register_pending_approval,
+        requested_thread_id, response_failure_value, set_thread_if_idle, stream_event_notification,
+        thread_started_params, turn_completed_params, turn_failed_params, turn_failure_params,
     };
     use crate::ExplainMode;
     use crate::cli::chat_stream::{ApprovalResponse, StreamEvent};
+    use crate::cli::command_router::HeadlessCanonicalCommitStatus;
     use crate::cli::permission_manager::PermissionMode;
+    use std::sync::Arc;
     use std::time::Duration;
+    use tokio::sync::{Barrier, Mutex, oneshot};
+    use tokio_util::sync::CancellationToken;
+
+    fn runtime_feedback_frame() -> astra_turn_core::context_feedback::RuntimeFeedbackFrame {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 4,
+            "identity": {
+                "session_id": "session-desktop",
+                "run_id": "run-desktop",
+                "agent_id": "orchestrator",
+                "model_id": "deepseek-v4-flash",
+                "topology": "cli_server"
+            },
+            "progress": {
+                "session_turn": 1,
+                "agentic_round_index": 1,
+                "llm_rounds_completed": 2,
+                "slice_round_limit": 60,
+                "slice_rounds_remaining": 58
+            },
+            "context": {"compaction_tier": "normal"},
+            "was_truncated": false,
+            "policy_feedback": {"state": "not_evaluated"}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn app_server_projects_runtime_feedback_for_desktop_clients() {
+        let frame = runtime_feedback_frame();
+        let (method, params) =
+            stream_event_notification(&StreamEvent::RuntimeFeedback(Box::new(frame.clone())))
+                .expect("runtime feedback notification");
+        assert_eq!(method, "turn/runtimeFeedback");
+        assert_eq!(params["runtimeFeedback"], serde_json::json!(frame));
+    }
 
     #[test]
     #[serial_test::serial]
@@ -956,6 +1262,9 @@ mod tests {
         let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
         let _credentials_guard = crate::tests::isolate_credentials();
         let session_id = format!("app-server-activation-{}", uuid::Uuid::new_v4());
+        let lease =
+            astra_services::session_journal::SessionExecutionLease::try_acquire(&session_id)
+                .unwrap();
         let mut result = crate::tests::stub_stream_result("done");
         result.session_id = Some(session_id.clone());
         result.tools_used = vec!["github".to_string()];
@@ -965,13 +1274,22 @@ mod tests {
             serde_json::json!({"role": "assistant", "content": "done"}),
         ];
 
-        persist_app_server_turn(
+        let rebound_thread_id = persist_app_server_turn(
             None,
             Some("test-model"),
+            "client-thread",
             "list pull requests",
             &mut result,
             std::time::Instant::now(),
-        );
+            Some(&lease),
+        )
+        .expect("fully durable settlement");
+        assert_eq!(rebound_thread_id, session_id);
+
+        let csl = crate::cli::session::session_continuation::load_csl_continuation(&session_id)
+            .expect("exact CSL projection must parse")
+            .expect("exact CSL projection must exist");
+        assert_eq!(csl.activated_deferred_tool_names, vec!["github"]);
 
         let continuation =
             app_server_continuation(&session_id).expect("next app-server turn continuation");
@@ -1005,25 +1323,22 @@ mod tests {
     }
 
     #[test]
-    fn extract_turn_message_accepts_message_field() {
+    fn extract_turn_message_rejects_removed_message_field() {
         let params = serde_json::json!({"message": "hello"});
-        assert_eq!(extract_turn_message(&params).as_deref(), Some("hello"));
+        assert!(extract_turn_message(&params).is_none());
     }
 
     #[test]
-    fn requested_thread_id_prefers_turn_thread_id() {
+    fn requested_thread_id_rejects_removed_session_id_even_when_equal() {
         let params = serde_json::json!({
             "threadId": "thread-from-gateway",
             "sessionId": "thread-from-gateway"
         });
-        assert_eq!(
-            requested_thread_id(&params).unwrap().as_deref(),
-            Some("thread-from-gateway")
-        );
+        assert!(requested_thread_id(&params).is_err());
     }
 
     #[test]
-    fn requested_thread_id_rejects_conflicting_session_id() {
+    fn requested_thread_id_rejects_conflicting_removed_session_id() {
         let params = serde_json::json!({
             "threadId": "thread-from-gateway",
             "sessionId": "stale-session"
@@ -1032,12 +1347,9 @@ mod tests {
     }
 
     #[test]
-    fn requested_thread_id_accepts_session_id_fallback() {
+    fn requested_thread_id_rejects_session_id_fallback() {
         let params = serde_json::json!({"sessionId": "session-from-client"});
-        assert_eq!(
-            requested_thread_id(&params).unwrap().as_deref(),
-            Some("session-from-client")
-        );
+        assert!(requested_thread_id(&params).is_err());
     }
 
     #[test]
@@ -1071,6 +1383,408 @@ mod tests {
         assert_eq!(params["status"], "completed");
     }
 
+    #[tokio::test]
+    async fn overlapping_turn_start_is_typed_conflict_without_losing_first_turn_control() {
+        let state = Arc::new(Mutex::new(AppState {
+            thread_id: Some("thread-1".to_string()),
+            ..Default::default()
+        }));
+        let first_cancel = Arc::new(CancellationToken::new());
+        {
+            let mut guard = state.lock().await;
+            begin_turn(
+                &mut guard,
+                Some("thread-1".to_string()),
+                "turn-first",
+                first_cancel.clone(),
+                Some("first instructions".to_string()),
+            )
+            .expect("first turn admission");
+        }
+
+        let (approval_tx, approval_rx) = oneshot::channel();
+        assert!(
+            register_pending_approval(&state, "approval-first", "turn-first", approval_tx,).await
+        );
+
+        let second_cancel = Arc::new(CancellationToken::new());
+        let failure = {
+            let mut guard = state.lock().await;
+            begin_turn(
+                &mut guard,
+                Some("thread-1".to_string()),
+                "turn-second",
+                second_cancel.clone(),
+                Some("second instructions".to_string()),
+            )
+            .expect_err("overlap must fail closed")
+        };
+
+        assert_eq!(failure.code, TURN_CONFLICT_CODE);
+        assert!(failure.retryable);
+        let response = response_failure_value(serde_json::json!(2), &failure);
+        assert_eq!(response["error"]["code"], -32000);
+        assert_eq!(response["error"]["data"]["code"], TURN_CONFLICT_CODE);
+        assert_eq!(response["error"]["data"]["retryable"], true);
+
+        let pending = {
+            let mut guard = state.lock().await;
+            let active = guard.active_turn.as_ref().expect("first turn stays active");
+            assert_eq!(active.turn_id, "turn-first");
+            assert_eq!(guard.thread_id.as_deref(), Some("thread-1"));
+            assert_eq!(
+                guard.developer_instructions.as_deref(),
+                None,
+                "turn-scoped instructions must not overwrite thread defaults"
+            );
+            active.cancel.cancel();
+            guard
+                .pending_approvals
+                .remove("approval-first")
+                .expect("first approval stays addressable")
+        };
+        pending
+            .response_tx
+            .send(ApprovalResponse::AllowOnce)
+            .expect("first approval receiver remains alive");
+
+        assert!(
+            first_cancel.is_cancelled(),
+            "interrupt still targets first turn"
+        );
+        assert!(
+            !second_cancel.is_cancelled(),
+            "rejected turn never becomes interrupt authority"
+        );
+        assert_eq!(approval_rx.await.unwrap(), ApprovalResponse::AllowOnce);
+    }
+
+    #[tokio::test]
+    async fn concurrent_turn_starts_admit_exactly_one_active_turn() {
+        const CONTENDERS: usize = 24;
+        let state = Arc::new(Mutex::new(AppState {
+            thread_id: Some("thread-contended".to_string()),
+            ..Default::default()
+        }));
+        let barrier = Arc::new(Barrier::new(CONTENDERS));
+        let mut tasks = Vec::with_capacity(CONTENDERS);
+        for index in 0..CONTENDERS {
+            let state = state.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                let turn_id = format!("turn-{index}");
+                barrier.wait().await;
+                let result = {
+                    let mut guard = state.lock().await;
+                    begin_turn(
+                        &mut guard,
+                        Some("thread-contended".to_string()),
+                        &turn_id,
+                        Arc::new(CancellationToken::new()),
+                        None,
+                    )
+                };
+                (turn_id, result)
+            }));
+        }
+
+        let mut admitted = Vec::new();
+        let mut conflicts = 0;
+        for task in tasks {
+            let (turn_id, result) = task.await.unwrap();
+            match result {
+                Ok(_) => admitted.push(turn_id),
+                Err(failure) => {
+                    assert_eq!(failure.code, TURN_CONFLICT_CODE);
+                    conflicts += 1;
+                }
+            }
+        }
+
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(conflicts, CONTENDERS - 1);
+        assert_eq!(
+            state
+                .lock()
+                .await
+                .active_turn
+                .as_ref()
+                .map(|active| active.turn_id.as_str()),
+            Some(admitted[0].as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_thread_start_and_resume_conflict_without_mutating_active_thread() {
+        const CONTENDERS: usize = 24;
+        let state = Arc::new(Mutex::new(AppState {
+            thread_id: Some("thread-active".to_string()),
+            developer_instructions: Some("active instructions".to_string()),
+            ..Default::default()
+        }));
+        {
+            let mut guard = state.lock().await;
+            begin_turn(
+                &mut guard,
+                Some("thread-active".to_string()),
+                "turn-active",
+                Arc::new(CancellationToken::new()),
+                None,
+            )
+            .unwrap();
+        }
+
+        let barrier = Arc::new(Barrier::new(CONTENDERS));
+        let mut tasks = Vec::with_capacity(CONTENDERS);
+        for index in 0..CONTENDERS {
+            let state = state.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                let method = if index % 2 == 0 {
+                    "thread/start"
+                } else {
+                    "thread/resume"
+                };
+                barrier.wait().await;
+                let mut guard = state.lock().await;
+                set_thread_if_idle(
+                    &mut guard,
+                    method,
+                    Some(format!("thread-rebind-{index}")),
+                    Some(format!("instructions-{index}")),
+                )
+            }));
+        }
+
+        for task in tasks {
+            let failure = task
+                .await
+                .unwrap()
+                .expect_err("active turn owns thread authority");
+            assert_eq!(failure.code, TURN_CONFLICT_CODE);
+            assert_eq!(failure.committed, false);
+        }
+        let guard = state.lock().await;
+        assert_eq!(guard.thread_id.as_deref(), Some("thread-active"));
+        assert_eq!(
+            guard.developer_instructions.as_deref(),
+            Some("active instructions")
+        );
+        assert_eq!(
+            guard
+                .active_turn
+                .as_ref()
+                .map(|active| active.turn_id.as_str()),
+            Some("turn-active")
+        );
+    }
+
+    #[test]
+    fn admitted_turn_does_not_publish_requested_thread_before_durable_settlement() {
+        let mut state = AppState {
+            thread_id: Some("thread-before-turn".to_string()),
+            ..Default::default()
+        };
+        let (execution_thread_id, _) = begin_turn(
+            &mut state,
+            Some("thread-requested-for-turn".to_string()),
+            "turn-that-will-fail",
+            Arc::new(CancellationToken::new()),
+            None,
+        )
+        .expect("turn admission");
+
+        assert_eq!(execution_thread_id, "thread-requested-for-turn");
+        assert_eq!(
+            state.thread_id.as_deref(),
+            Some("thread-before-turn"),
+            "admission selects execution authority but persistence settlement owns pointer publication"
+        );
+    }
+
+    #[test]
+    fn uncommitted_journal_failure_is_non_retryable_without_session_authority() {
+        let failure = AppServerFailure::session_persistence_failed(
+            crate::cli::command_router::HeadlessSessionSettlement {
+                canonical_session_id: None,
+                commit_status: HeadlessCanonicalCommitStatus::NotCommitted,
+                projection_repair_required: false,
+                persistence_error: Some("journal append failed before commit".to_string()),
+            },
+        );
+
+        assert_eq!(failure.code, SESSION_PERSISTENCE_FAILED_CODE);
+        assert!(!failure.committed);
+        assert!(!failure.commit_unknown);
+        assert!(!failure.projection_repair_required);
+        assert!(!failure.retryable);
+        assert_eq!(failure.canonical_session_id, None);
+        let response = response_failure_value(serde_json::json!(8), &failure);
+        assert_eq!(response["error"]["data"]["committed"], false);
+        assert_eq!(response["error"]["data"]["commitUnknown"], false);
+        assert_eq!(response["error"]["data"]["retryable"], false);
+        assert!(response["error"]["data"].get("sessionId").is_none());
+        let error_params = turn_failure_params(&failure, "turn-1", "thread-before-failure");
+        assert_eq!(error_params["threadId"], "thread-before-failure");
+        assert!(error_params.get("sessionId").is_none());
+        let terminal_params = turn_failed_params("turn-1", "thread-before-failure", &failure);
+        assert_eq!(terminal_params["threadId"], "thread-before-failure");
+        assert!(terminal_params.get("sessionId").is_none());
+    }
+
+    #[test]
+    fn session_execution_lease_conflict_is_retryable_before_side_effects() {
+        let failure = AppServerFailure::session_execution_conflict("shared-thread");
+        assert_eq!(failure.code, TURN_CONFLICT_CODE);
+        assert!(failure.retryable);
+        assert!(!failure.committed);
+        assert!(!failure.commit_unknown);
+        assert_eq!(failure.canonical_session_id, None);
+        let response = response_failure_value(serde_json::json!(11), &failure);
+        assert_eq!(response["error"]["data"]["code"], TURN_CONFLICT_CODE);
+        assert_eq!(response["error"]["data"]["retryable"], true);
+        assert_eq!(response["error"]["data"]["committed"], false);
+    }
+
+    #[test]
+    fn unknown_journal_commit_is_non_retryable_and_publishes_no_session_authority() {
+        let failure = AppServerFailure::session_persistence_failed(
+            crate::cli::command_router::HeadlessSessionSettlement {
+                canonical_session_id: None,
+                commit_status: HeadlessCanonicalCommitStatus::Unknown,
+                projection_repair_required: false,
+                persistence_error: Some("canonical commit readback is uncertain".to_string()),
+            },
+        );
+
+        assert_eq!(failure.code, SESSION_COMMIT_UNKNOWN_CODE);
+        assert!(!failure.committed);
+        assert!(failure.commit_unknown);
+        assert!(!failure.retryable);
+        assert_eq!(failure.canonical_session_id, None);
+        let error_params = turn_failure_params(&failure, "turn-1", "thread-before-failure");
+        assert_eq!(error_params["threadId"], "thread-before-failure");
+        assert_eq!(error_params["commitUnknown"], true);
+        assert_eq!(error_params["retryable"], false);
+        assert!(error_params.get("sessionId").is_none());
+        let terminal_params = turn_failed_params("turn-1", "thread-before-failure", &failure);
+        assert_eq!(terminal_params["threadId"], "thread-before-failure");
+        assert_eq!(terminal_params["commitUnknown"], true);
+        assert!(terminal_params.get("sessionId").is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn committed_turn_with_projection_failure_publishes_non_retryable_session_authority() {
+        let _home = crate::tests::HomeGuard::temp();
+        let sessions = dirs::home_dir().unwrap().join(".astra").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let _journal_guard = astra_services::session_journal::JournalDirGuard::new(&sessions);
+        crate::cli::cli_config::cli_utils::persist_profile_last_session(
+            Some("default"),
+            "session-before-failure",
+        )
+        .unwrap();
+
+        let session_id = format!("app-server-csl-failure-{}", uuid::Uuid::new_v4());
+        let lease =
+            astra_services::session_journal::SessionExecutionLease::try_acquire(&session_id)
+                .unwrap();
+        let csl_path = crate::cli::session::session_recovery::io::csl_log_path_for(&session_id);
+        std::fs::create_dir_all(&csl_path).unwrap();
+        let mut result = crate::tests::stub_stream_result("answer without durable CSL");
+        result.session_id = Some(session_id.clone());
+        result.final_messages = vec![
+            serde_json::json!({"role": "user", "content": "persist this"}),
+            serde_json::json!({"role": "assistant", "content": "answer without durable CSL"}),
+        ];
+
+        let failure = persist_app_server_turn(
+            Some("default"),
+            Some("test-model"),
+            "thread-before-failure",
+            "persist this",
+            &mut result,
+            std::time::Instant::now(),
+            Some(&lease),
+        )
+        .expect_err("CSL failure must withhold completion authority");
+
+        assert_eq!(failure.code, SESSION_PROJECTION_FAILED_CODE);
+        assert!(failure.message.contains("canonical continuation"));
+        assert!(failure.committed);
+        assert!(!failure.commit_unknown);
+        assert!(failure.projection_repair_required);
+        assert!(!failure.retryable);
+        assert_eq!(
+            failure.canonical_session_id.as_deref(),
+            Some(session_id.as_str())
+        );
+
+        let mut state = AppState {
+            thread_id: Some("thread-before-failure".to_string()),
+            ..Default::default()
+        };
+        begin_turn(
+            &mut state,
+            Some("thread-before-failure".to_string()),
+            "turn-1",
+            Arc::new(CancellationToken::new()),
+            None,
+        )
+        .unwrap();
+        publish_committed_session_authority(&mut state, &failure);
+        assert_eq!(state.thread_id.as_deref(), Some(session_id.as_str()));
+        let duplicate = begin_turn(
+            &mut state,
+            Some(session_id.clone()),
+            "turn-duplicate",
+            Arc::new(CancellationToken::new()),
+            None,
+        )
+        .expect_err("committed active turn cannot be re-executed before terminal publication");
+        assert_eq!(duplicate.code, TURN_CONFLICT_CODE);
+
+        let response = response_failure_value(serde_json::json!(7), &failure);
+        assert_eq!(response["error"]["data"]["committed"], true);
+        assert_eq!(response["error"]["data"]["projectionRepairRequired"], true);
+        assert_eq!(response["error"]["data"]["retryable"], false);
+        assert_eq!(response["error"]["data"]["sessionId"], session_id);
+
+        let failure_params = turn_failure_params(&failure, "turn-1", &session_id);
+        assert_eq!(failure_params["code"], SESSION_PROJECTION_FAILED_CODE);
+        assert_eq!(failure_params["turnId"], "turn-1");
+        assert_eq!(failure_params["threadId"], session_id);
+        assert_eq!(failure_params["sessionId"], session_id);
+        assert_eq!(failure_params["committed"], true);
+        assert_eq!(failure_params["projectionRepairRequired"], true);
+        assert_eq!(failure_params["retryable"], false);
+
+        let terminal_params = turn_failed_params("turn-1", &session_id, &failure);
+        assert_eq!(terminal_params["status"], "failed");
+        assert_eq!(terminal_params["threadId"], session_id);
+        assert_eq!(terminal_params["sessionId"], session_id);
+        assert_eq!(terminal_params["committed"], true);
+        assert_eq!(terminal_params["projectionRepairRequired"], true);
+        assert_eq!(terminal_params["error"]["retryable"], false);
+        assert!(
+            astra_services::session_journal::read_journal(&session_id)
+                .unwrap()
+                .iter()
+                .any(|event| event.event_type
+                    == astra_services::session_journal::JournalEventType::Turn),
+            "the unhappy path must specifically exercise journal success followed by CSL failure"
+        );
+        assert_eq!(
+            crate::cli::cli_config::cli_utils::load_credentials()
+                .profiles
+                .get("default")
+                .and_then(|profile| profile.last_session_id.as_deref()),
+            Some("session-before-failure"),
+            "failed settlement must not publish a new durable session pointer"
+        );
+    }
+
     #[test]
     fn approval_response_accepts_gateway_decisions() {
         assert_eq!(
@@ -1091,6 +1805,20 @@ mod tests {
     fn approval_response_requires_explicit_decision() {
         assert!(approval_response_from_params(&serde_json::json!({})).is_err());
         assert!(approval_response_from_params(&serde_json::json!({"decision": ""})).is_err());
+        for retired in [
+            "allow",
+            "approve",
+            "approved",
+            "allow-once",
+            "always_allow",
+            "denied",
+        ] {
+            assert!(
+                approval_response_from_params(&serde_json::json!({"decision": retired})).is_err(),
+                "{retired}"
+            );
+        }
+        assert!(approval_response_from_params(&serde_json::json!({"response": "deny"})).is_err());
     }
 
     #[test]
@@ -1108,10 +1836,9 @@ mod tests {
                 .unwrap(),
             PermissionMode::Bypass
         );
-        assert_eq!(
+        assert!(
             permission_mode_from_params(&serde_json::json!({"permission_mode": "skip"}), false)
-                .unwrap(),
-            PermissionMode::Bypass
+                .is_err()
         );
     }
 

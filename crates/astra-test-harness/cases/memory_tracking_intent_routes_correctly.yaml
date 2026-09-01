@@ -23,27 +23,29 @@ cleanup_memory_records: true
 criteria:
   - type: exit_code
     code: 0
-  - type: any_of
-    criteria:
-      - type: tool_called
-        name: memory
-      - type: tool_called
-        name: memory
+  - type: journal_tool_call_count
+    name: memory
+    min: 1
+    max: 3
   - type: tools_count_between
     min: 1
     max: 6
   - type: turn_rounds_between
     min: 1
     max: 5
-  - type: judger
-    question: |
-      The user said "我关注oceanbase这个项目，帮我记住" which means
-      "I'm following/tracking the oceanbase project, please remember this."
-      This is a MEMORY routing intent, not a code search intent.
-      Did the agent:
-      1. Route to memory tools (memory (store or retrieve) to verify deduplication)? (required)
-      2. Avoid unnecessary codebase exploration (bash, grep, glob, list_dir)? (required)
-      3. Confirm the interest was captured (either newly stored, or acknowledging it was already stored)?
-      Score 1.0 if memory tool was used without exploration, 0.5 if also explored,
-      0.0 if only filesystem exploration without memory tool.
-    threshold: 0.6
+  - type: journal_tool_call_count
+    name: bash
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: grep
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: glob
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: list_dir
+    min: 0
+    max: 0

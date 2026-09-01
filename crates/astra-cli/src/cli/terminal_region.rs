@@ -8,8 +8,6 @@
 //! the terminal wraps it to multiple physical rows. This module tracks
 //! physical rows to ensure correct cursor positioning during updates.
 
-use std::io::{self, Write};
-
 use crossterm::{cursor, execute, terminal};
 
 /// A managed region of terminal output.
@@ -90,14 +88,14 @@ impl TerminalRegion {
             // First render — just print everything.
             let mut entries = Vec::with_capacity(new_len);
             for line in new_lines {
-                println!("{line}");
+                stdout_println!("{line}");
                 let rows = self.calc_physical_rows(&line);
                 entries.push(LineEntry {
                     content: line,
                     physical_rows: rows,
                 });
             }
-            let _ = io::stdout().flush();
+            let _ = crate::cli::stream::output_sink::flush_stdout();
             self.lines = entries;
             return;
         }
@@ -121,23 +119,25 @@ impl TerminalRegion {
             .map(|e| e.physical_rows)
             .sum();
         if rows_up > 0 {
-            execute!(io::stdout(), cursor::MoveUp(rows_up as u16)).ok();
+            let _ = crate::cli::stream::output_sink::write_stdout_operation(|stdout| {
+                execute!(stdout, cursor::MoveUp(rows_up as u16))
+            });
         }
-        execute!(io::stdout(), cursor::MoveToColumn(0)).ok();
+        let _ = crate::cli::stream::output_sink::write_stdout_operation(|stdout| {
+            execute!(stdout, cursor::MoveToColumn(0))
+        });
 
         // Clear from cursor down (removes all old content from first_diff onwards)
-        execute!(
-            io::stdout(),
-            terminal::Clear(terminal::ClearType::FromCursorDown)
-        )
-        .ok();
+        let _ = crate::cli::stream::output_sink::write_stdout_operation(|stdout| {
+            execute!(stdout, terminal::Clear(terminal::ClearType::FromCursorDown))
+        });
 
         // Truncate old lines to first_diff
         self.lines.truncate(first_diff);
 
         // Print new lines from first_diff onwards
         for line in &new_lines[first_diff..] {
-            println!("{line}");
+            stdout_println!("{line}");
             let rows = self.calc_physical_rows(line);
             self.lines.push(LineEntry {
                 content: line.clone(),
@@ -145,20 +145,20 @@ impl TerminalRegion {
             });
         }
 
-        let _ = io::stdout().flush();
+        let _ = crate::cli::stream::output_sink::flush_stdout();
     }
 
     /// Append lines without diffing (for content that only grows).
     pub(crate) fn append(&mut self, new_lines: &[String]) {
         for line in new_lines {
-            println!("{line}");
+            stdout_println!("{line}");
             let rows = self.calc_physical_rows(line);
             self.lines.push(LineEntry {
                 content: line.clone(),
                 physical_rows: rows,
             });
         }
-        let _ = io::stdout().flush();
+        let _ = crate::cli::stream::output_sink::flush_stdout();
     }
     /// Clear the entire region from the terminal.
     pub(crate) fn clear(&mut self) {
@@ -166,14 +166,15 @@ impl TerminalRegion {
         self.refresh_term_width();
         let rows = self.total_physical_rows();
         if rows > 0 {
-            execute!(
-                io::stdout(),
-                cursor::MoveUp(rows as u16),
-                cursor::MoveToColumn(0),
-                terminal::Clear(terminal::ClearType::FromCursorDown)
-            )
-            .ok();
-            let _ = io::stdout().flush();
+            let _ = crate::cli::stream::output_sink::write_stdout_operation(|stdout| {
+                execute!(
+                    stdout,
+                    cursor::MoveUp(rows as u16),
+                    cursor::MoveToColumn(0),
+                    terminal::Clear(terminal::ClearType::FromCursorDown)
+                )
+            });
+            let _ = crate::cli::stream::output_sink::flush_stdout();
             self.lines.clear();
         }
     }

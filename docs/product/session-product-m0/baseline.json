@@ -1,0 +1,548 @@
+{
+  "schema_version": "astra.session-product.m0.v1",
+  "as_of": "2026-08-03",
+  "status_vocabulary": ["proven", "partial", "missing", "obsolete"],
+  "levels": ["implemented", "integrated", "user_usable", "proven"],
+  "tracks": [
+    {
+      "id": "A",
+      "name": "original Phase 1-7 proof and convergence",
+      "gates": [
+        {
+          "id": "phase-1-live-continuity",
+          "status": "partial",
+          "levels": {"implemented": true, "integrated": true, "user_usable": true, "proven": false},
+          "evidence": [
+            {"kind": "source", "path": "crates/astra-cli/src/cli/turn/turn_post_commit.rs", "claim": "complete final messages are installed and persisted after a turn"},
+            {"kind": "source", "path": "crates/services/src/session_context_coordinator.rs", "claim": "canonical immutable segments and head are implemented"},
+            {"kind": "test", "path": "crates/services/tests/session_context_authority_db_it.rs", "symbol": "complete_turn_authority_renews_atomically_in_database", "command": "ASTRA_TEST_DB_IT=1 cargo nextest run -p astra-services --test session_context_authority_db_it --run-ignored all", "claim": "writer lease and canonical turn reservation renew atomically"}
+          ],
+          "gaps": ["repeatable live-versus-immediate-crash root equivalence proof across all CLI recovery entries", "healthy ordinary continuation proof that excludes lossy pair history as prompt authority"]
+        },
+        {
+          "id": "phase-2-causal-resume",
+          "status": "partial",
+          "levels": {"implemented": true, "integrated": true, "user_usable": true, "proven": false},
+          "evidence": [
+            {"kind": "source", "path": "crates/astra-turn-types/src/session_cursor.rs", "claim": "typed cursor and projection envelopes exist"},
+            {"kind": "source", "path": "crates/services/src/session_restore.rs", "claim": "server restore assembly exists"},
+            {"kind": "source", "path": "crates/astra-cli/src/cli/session/session_restore_client.rs", "claim": "CLI restore client consumes local and server state"}
+          ],
+          "gaps": ["one shared ResumeBundle generation-selection proof for every surface", "repair/rebuild journey proof for stale and corrupt projections", "degraded transcript recovery remains a product path"]
+        },
+        {
+          "id": "phase-3-shared-coordinator-topology-parity",
+          "status": "partial",
+          "levels": {"implemented": true, "integrated": false, "user_usable": false, "proven": false},
+          "evidence": [
+            {"kind": "source", "path": "crates/services/src/session_context_coordinator.rs", "claim": "the unique database coordinator owns CAS reservation, lease, fencing, segments, and manifests"},
+            {"kind": "test", "path": "crates/services/tests/session_context_authority_db_it.rs", "command": "ASTRA_TEST_DB_IT=1 cargo nextest run -p astra-services --test session_context_authority_db_it --run-ignored all", "claim": "database writer authority is owner-isolated and idempotent"},
+            {"kind": "test", "path": "crates/runtime/tests/system_matrix_http_e2e/journey_phase0_production_topologies.rs", "command": "make test-online", "claim": "external topology diagnostic exists"}
+          ],
+          "gaps": ["remote and embedded do not yet use one Server-owned loop", "embedded storage composition is not implemented", "100-tenant noisy-neighbor and no-affinity parity proof is incomplete"]
+        },
+        {
+          "id": "phase-4-cross-device-handoff",
+          "status": "partial",
+          "levels": {"implemented": true, "integrated": false, "user_usable": false, "proven": false},
+          "evidence": [
+            {"kind": "source", "path": "crates/services/src/session_handoff.rs", "claim": "read attachment and graceful/forced handoff state machine exist"},
+            {"kind": "source", "path": "crates/services/src/work/control_operation.rs", "claim": "Work branch control operation is durable and typed"},
+            {"kind": "source", "path": "web/app/(workspace)/works/[workId]/page.tsx", "claim": "Web Work control surface exists"}
+          ],
+          "gaps": ["Machine A to Server Only to Edge to Machine B journey is not a repeatable gate", "warm/cold delta transfer budgets are not measured", "local import remains a separate authority path"]
+        },
+        {
+          "id": "phase-5-durable-cow-fork",
+          "status": "partial",
+          "levels": {"implemented": true, "integrated": false, "user_usable": false, "proven": false},
+          "evidence": [
+            {"kind": "source", "path": "crates/services/src/work/branch_creation_operation.rs", "claim": "durable Work branch creation operation exists"},
+            {"kind": "source", "path": "crates/services/src/work/branch_comparison.rs", "claim": "typed deterministic branch comparison exists"},
+            {"kind": "test", "path": "crates/services/src/session_fork_coordinator.rs", "symbol": "million_token_scale_fork_stays_constant_size_and_within_latency_budget", "command": "ASTRA_TEST_DB_IT=1 cargo nextest run -p astra-services million_token_scale_fork_stays_constant_size_and_within_latency_budget --run-ignored all", "claim": "database fork stays constant-size at million-token scale"}
+          ],
+          "gaps": ["embedded Work branch creation is not integrated", "full snapshot/compaction boundary matrix is not one repeatable product proof", "durable fork DB proof is not a default release gate"]
+        },
+        {
+          "id": "phase-6-context-and-cache-efficiency",
+          "status": "partial",
+          "levels": {"implemented": true, "integrated": true, "user_usable": true, "proven": false},
+          "evidence": [
+            {"kind": "source", "path": "crates/astra-turn-core/src/context/assembly_trace.rs", "claim": "assembly and composition trace exists"},
+            {"kind": "benchmark", "path": "crates/runtime/benches/context_history.rs", "command": "cargo bench -p astra-runtime --bench context_history", "claim": "history hot paths have a benchmark lane"},
+            {"kind": "test", "path": "crates/runtime/tests/budget_factual_semantics.rs", "command": "cargo test -p astra-runtime --test budget_factual_semantics", "claim": "large model windows preserve factual usable budgets"}
+          ],
+          "gaps": ["fixed M0 cache-share baseline has not been captured", "compaction effectiveness and futile-loop gate are not proven across 128K/200K/1M", "warm-cache regression budget is not a blocking report"]
+        },
+        {
+          "id": "phase-7-product-observability",
+          "status": "partial",
+          "levels": {"implemented": true, "integrated": true, "user_usable": true, "proven": false},
+          "evidence": [
+            {"kind": "source", "path": "crates/astra-turn-core/src/introspect.rs", "claim": "typed introspection facts exist"},
+            {"kind": "source", "path": "crates/astra-turn-core/src/turn_trace_collector.rs", "claim": "turn trace collection exists"},
+            {"kind": "source", "path": "crates/astra-cli/src/tui/bottom_pane/context_panel_view.rs", "claim": "context diagnostics have a user surface"}
+          ],
+          "gaps": ["accepted provider request trace coverage is not proven at 100 percent", "metrics-only p95 overhead below one percent is not measured", "operators still need multiple raw sources for some resume/handoff/fork failures"]
+        }
+      ]
+    },
+    {
+      "id": "B",
+      "name": "Developer Workbench",
+      "gates": [
+        {
+          "id": "canonical-work-domain",
+          "status": "partial",
+          "levels": {"implemented": true, "integrated": true, "user_usable": true, "proven": false},
+          "evidence": [
+            {"kind": "source", "path": "crates/services/src/work/repository.rs", "claim": "fresh canonical Work genesis and revisions exist"},
+            {"kind": "source", "path": "crates/services/src/work/graph_repository.rs", "claim": "immutable graph/item/edge revisions exist"},
+            {"kind": "source", "path": "crates/services/src/work/evidence_repository.rs", "claim": "check evidence is separately authoritative"},
+            {"kind": "test", "path": "crates/services/tests/work_repository_db_it.rs", "command": "ASTRA_TEST_DB_IT=1 cargo test -p astra-services --test work_repository_db_it -- --ignored", "claim": "Work repository has live database contract tests"}
+          ],
+          "gaps": ["astra-plan, task service, and task contract readers remain", "fresh-schema absence gate is not complete"]
+        },
+        {
+          "id": "observation-and-sdk-read-slice",
+          "status": "partial",
+          "levels": {"implemented": true, "integrated": true, "user_usable": true, "proven": false},
+          "evidence": [
+            {"kind": "source", "path": "crates/services/src/work/observation.rs", "claim": "immutable hashed Work observation report exists"},
+            {"kind": "source", "path": "packages/sdk/src/work-wire.ts", "claim": "strict TypeScript Work decoder exists"},
+            {"kind": "test", "path": "packages/sdk/src/__tests__/work-contract.test.ts", "command": "npm --prefix packages/sdk test", "claim": "Rust/HTTP/SDK wire contract is tested"}
+          ],
+          "gaps": ["human and agent projections are not yet proven from one immutable report for every slice", "public SDK still exports legacy session/chat/plan surfaces"]
+        },
+        {
+          "id": "task-graph-evidence-delivery",
+          "status": "partial",
+          "levels": {"implemented": true, "integrated": true, "user_usable": true, "proven": false},
+          "evidence": [
+            {"kind": "source", "path": "crates/services/src/work/plan_context.rs", "claim": "declared tasks reconcile Run and Check facts"},
+            {"kind": "source", "path": "crates/runtime/src/server/tool_work_plan.rs", "claim": "typed plan proposal and exact-basis admission exist"},
+            {"kind": "source", "path": "web/app/(workspace)/works/[workId]/page.tsx", "claim": "Work overview and review surface exists"}
+          ],
+          "gaps": ["versioned real-repo decomposition quality corpus has no captured baseline", "cross-file feature and failing-CI journeys are not release gates", "embedded runtime journey remains"]
+        },
+        {
+          "id": "read-control-fork-and-delivery",
+          "status": "partial",
+          "levels": {"implemented": true, "integrated": true, "user_usable": true, "proven": false},
+          "evidence": [
+            {"kind": "source", "path": "crates/services/src/work/catalog_repository.rs", "claim": "bounded Now catalog and attention projection exist"},
+            {"kind": "source", "path": "crates/services/src/work/control_operation.rs", "claim": "branch control is a durable operation"},
+            {"kind": "source", "path": "crates/services/src/work/patch_materialization.rs", "claim": "exact-base patch materialization is durable"},
+            {"kind": "source", "path": "crates/services/src/work/patch_commit.rs", "claim": "reviewed patch commit is durable"}
+          ],
+          "gaps": ["single remote/embedded domain suite is absent", "GitHub PR delivery lacks an end-to-end capability and permission journey gate", "archive/delete/fence/GC destructive matrix is not one release proof"]
+        },
+        {
+          "id": "single-loop-and-clean-cut",
+          "status": "partial",
+          "levels": {"implemented": true, "integrated": true, "user_usable": true, "proven": false},
+          "evidence": [
+            {"kind": "source", "path": "crates/runtime/src/server/server_loop_host.rs", "claim": "the Server owns the multi-round loop"},
+            {"kind": "test", "path": "crates/runtime/tests/web_agent_e2e.rs", "symbol": "cli_thin_client_single_admission_completes_server_owned_multi_round_loop", "command": "cargo nextest run -p astra-runtime --features bridge-e2e-hooks --test web_agent_e2e cli_thin_client_single_admission_completes_server_owned_multi_round_loop", "claim": "a real thin client completes one Server-owned multi-round admission"}
+          ],
+          "gaps": ["embedded execution is not implemented", "legacy task and plan authorities remain", "remote/embedded cutover rehearsal is not available"]
+        }
+      ]
+    },
+    {
+      "id": "C",
+      "name": "Evidence-guided Reflection and Correction",
+      "gates": [
+        {
+          "id": "typed-observation-input",
+          "status": "partial",
+          "levels": {"implemented": true, "integrated": false, "user_usable": false, "proven": false},
+          "evidence": [
+            {"kind": "source", "path": "crates/services/src/work/observation.rs", "claim": "immutable source revisions, coverage gaps, and evidence refs exist"},
+            {"kind": "source", "path": "crates/astra-turn-core/src/introspect/observation.rs", "claim": "typed introspection observations exist"}
+          ],
+          "gaps": ["Reflection does not exclusively consume WorkObservationReport by ref", "operator/human/agent code parity is not proven"]
+        },
+        {
+          "id": "durable-reflection-lifecycle",
+          "status": "missing",
+          "levels": {"implemented": false, "integrated": false, "user_usable": false, "proven": false},
+          "evidence": [
+            {"kind": "source", "path": "crates/services/src/inference_execution.rs", "claim": "shared durable inference lifecycle can be reused"},
+            {"kind": "source", "path": "crates/astra-turn-core/src/hydrate_reflect.rs", "claim": "legacy reflection-related implementation remains to be replaced"}
+          ],
+          "gaps": ["no Work-scoped durable ReflectionOperation", "no pinned ObservationReportRef contract", "no proof that Reflection holds no writer or continuation authority"]
+        },
+        {
+          "id": "typed-trigger-dedupe-and-budget",
+          "status": "missing",
+          "levels": {"implemented": false, "integrated": false, "user_usable": false, "proven": false},
+          "evidence": [],
+          "gaps": ["typed milestone/check/coverage trigger keys are absent", "evidence-delta dedupe and correction budgets are absent", "stale proposal mailbox behavior is absent"]
+        },
+        {
+          "id": "rollout-and-quality-ab",
+          "status": "missing",
+          "levels": {"implemented": false, "integrated": false, "user_usable": false, "proven": false},
+          "evidence": [],
+          "gaps": ["shadow/advisory/user-confirmed/automatic classes are not independently proven", "no-reflection real-repo baseline has not been captured", "no automatic action class is eligible"]
+        }
+      ]
+    }
+  ],
+  "identity_and_authority": [
+    {
+      "domain": "Work",
+      "identity": "work_id",
+      "branch_identity": "work_id + branch_id",
+      "canonical_owner": "DatabaseWorkRepository",
+      "revision": "works.work_revision plus immutable resource revisions",
+      "mutation_owner": "WorkRepository exact-basis transactions",
+      "sources": ["crates/services/src/work.rs", "crates/services/src/work/repository.rs"]
+    },
+    {
+      "domain": "Goal and accepted Done-when",
+      "identity": "work_id + goal_revision or criterion_set_revision",
+      "canonical_owner": "WorkRepository",
+      "revision": "immutable goal and criterion-set revisions",
+      "mutation_owner": "typed user acceptance or admitted exact-basis command",
+      "sources": ["crates/services/src/work/criteria.rs", "crates/services/src/work/criteria_proposal.rs"]
+    },
+    {
+      "domain": "Declared task graph",
+      "identity": "work_id + branch_id + graph_revision",
+      "canonical_owner": "WorkBranch.current_graph_revision",
+      "revision": "immutable item/edge/graph revisions",
+      "mutation_owner": "accepted WorkPlanProposal CAS",
+      "sources": ["crates/services/src/work/graph.rs", "crates/services/src/work/graph_repository.rs", "crates/services/src/work/proposal.rs"]
+    },
+    {
+      "domain": "Execution",
+      "identity": "run_id and invocation identity bound to work/item attempt",
+      "canonical_owner": "agent_runs and invocation ledger",
+      "revision": "run_generation and event index",
+      "mutation_owner": "run lifecycle admission and executor",
+      "sources": ["crates/services/src/runs.rs", "crates/astra-turn-core/src/invocation_ledger.rs"]
+    },
+    {
+      "domain": "Verification and delivery",
+      "identity": "check_run_id or acceptance_decision_id",
+      "canonical_owner": "work_check_runs and work_acceptance_decisions",
+      "revision": "criterion/item/subject basis revisions",
+      "mutation_owner": "registered verifier and explicit acceptance command",
+      "sources": ["crates/services/src/work/evidence.rs", "crates/services/src/work/acceptance.rs"]
+    },
+    {
+      "domain": "Internal conversation",
+      "identity": "owner + session_id + branch_id",
+      "canonical_owner": "SessionContextCoordinator head",
+      "revision": "SessionCursorV1 plus writer epoch",
+      "mutation_owner": "fenced writer and reserved canonical turn",
+      "sources": ["crates/astra-turn-types/src/session_coordination.rs", "crates/services/src/session_context_coordinator.rs"]
+    },
+    {
+      "domain": "Permission and external capability",
+      "identity": "actor + action + target + scope + expiry",
+      "canonical_owner": "typed policy and server-side grant admission",
+      "revision": "authorization/device-trust/permission epochs and capability facts",
+      "mutation_owner": "authenticated user command and server verifier",
+      "sources": ["crates/astra-turn-core/src/permission/types.rs", "crates/astra-turn-core/src/permission/engine.rs", "crates/astra-turn-types/src/session_coordination.rs"]
+    },
+    {
+      "domain": "Reflection proposal",
+      "identity": "future reflection_operation_id + pinned observation hash",
+      "canonical_owner": "none at M0; non-authoritative proposal by design",
+      "revision": "must pin WorkObservationReport content hash",
+      "mutation_owner": "no direct mutation; canonical root mailbox and policy must readmit",
+      "sources": ["crates/services/src/work/observation.rs", "crates/services/src/inference_execution.rs"]
+    }
+  ],
+  "work_repository_manifest": {
+    "public_identity": "work_id",
+    "branch_identity": "work_id + branch_id",
+    "fork_lineage": "origin_branch_id + fork_cursor are atomically both present or both absent; a fork creates a new branch identity and never rewrites its origin",
+    "read_cursor": "user_id + work_id + last_seen_work_event_seq, advanced by monotonic max only",
+    "active_state_migration": "forbidden",
+    "resources": [
+      {"name": "Work", "identity": "work_id", "revision": "work_revision", "owner": "DatabaseWorkRepository", "path": "crates/services/src/work/repository.rs"},
+      {"name": "WorkBranch", "identity": "work_id + branch_id", "revision": "branch_revision", "owner": "DatabaseWorkRepository", "path": "crates/services/src/work.rs"},
+      {"name": "GoalRevision", "identity": "work_id + goal_revision", "revision": "immutable goal revision", "owner": "DatabaseWorkRepository", "path": "crates/services/src/work/repository.rs"},
+      {"name": "CriterionSetRevision", "identity": "work_id + criterion_set_revision", "revision": "immutable set and criterion revisions", "owner": "WorkCriteriaRepository", "path": "crates/services/src/work/criteria.rs"},
+      {"name": "GraphRevision", "identity": "work_id + branch_id + graph_revision", "revision": "immutable graph revision", "owner": "WorkGraphRepository", "path": "crates/services/src/work/graph_repository.rs"},
+      {"name": "ItemRevision", "identity": "work_id + branch_id + item_id + item_revision", "revision": "immutable item revision", "owner": "WorkGraphRepository", "path": "crates/services/src/work/graph.rs"},
+      {"name": "Edge", "identity": "work_id + branch_id + graph_revision + from_item_id + to_item_id", "revision": "owned by immutable graph revision", "owner": "WorkGraphRepository", "path": "crates/services/src/work/graph.rs"},
+      {"name": "CheckRun", "identity": "check_run_id", "revision": "pinned criterion, item, subject, and graph basis", "owner": "WorkEvidenceRepository", "path": "crates/services/src/work/evidence_repository.rs"},
+      {"name": "AcceptanceDecision", "identity": "acceptance_decision_id", "revision": "pinned goal, criteria, graph, check, and subject basis", "owner": "WorkEvidenceRepository", "path": "crates/services/src/work/acceptance.rs"},
+      {"name": "WorkEvent", "identity": "work_id + event_seq", "revision": "monotonic Work-scoped event_seq with source_ref/source_cursor", "owner": "Work event outbox/projector", "path": "crates/services/src/work/events.rs"},
+      {"name": "ReadReceipt", "identity": "user_id + work_id", "revision": "monotonic last_seen_work_event_seq and receipt revision", "owner": "WorkAttentionRepository", "path": "crates/services/src/work/attention_repository.rs"}
+    ]
+  },
+  "legacy_authority_matrix": [
+    {
+      "store": "astra-plan execution authority",
+      "current_identity": "plan_id + version with session binding",
+      "current_revision": "mutable version/progress projection",
+      "current_mutation_owner": "astra-plan repository/state transitions",
+      "reusable_invariants": ["explicit Plan Mode approval binding", "dependency validation", "explicit acceptance-check declarations", "resume must validate source state"],
+      "offline_archive": "render final plan/history as non-authoritative audit material",
+      "drop": "task execution repository, progress_pct completion inference, task-progress resume projection, and execution product API",
+      "replacement": "Work goal/criteria/graph proposals and immutable revisions; retain only a minimal session-scoped Plan Mode draft and trusted approval binding",
+      "sources": ["crates/astra-plan/src/repository.rs", "crates/astra-plan/src/state.rs", "crates/astra-plan/src/resume.rs"]
+    },
+    {
+      "store": "task contract",
+      "current_identity": "task contract identity and branch-local contract state",
+      "current_revision": "mutable contract and verification state",
+      "current_mutation_owner": "durable task contract and branch services",
+      "reusable_invariants": ["machine-executable criterion types", "subject-bound verification", "delivery gaps stay explicit"],
+      "offline_archive": "export contract and verification records as audit evidence only",
+      "drop": "contract/branch active-state schema and service APIs",
+      "replacement": "immutable Work criterion sets, CheckRun, and AcceptanceDecision",
+      "sources": ["crates/services/src/work.rs"]
+    },
+    {
+      "store": "child run",
+      "current_identity": "run_id with parent_run_id/root_run_id ancestry and optional Work item binding",
+      "current_revision": "run generation and append-only lifecycle/event indices",
+      "current_mutation_owner": "run admission/lifecycle and executor",
+      "reusable_invariants": ["run is execution fact, not declared-task authority", "parent/child ancestry", "terminal run does not imply verified task"],
+      "offline_archive": "retain run and invocation audit under existing retention policy",
+      "drop": "only task-authority projections inferred from run text or terminal status",
+      "replacement": "Run remains authoritative for execution and binds to a Work item attempt",
+      "sources": ["crates/services/src/runs.rs", "crates/services/src/state_projection.rs"]
+    },
+    {
+      "store": "checks",
+      "current_identity": "legacy inline acceptance checks or canonical check_run_id",
+      "current_revision": "legacy checks inherit mutable plan/contract state; Work checks pin immutable basis revisions",
+      "current_mutation_owner": "legacy plan/task services or canonical registered verifier",
+      "reusable_invariants": ["verifier outcome is independent of assistant narration", "evidence is subject- and revision-bound", "fresh evidence is required for hard claims"],
+      "offline_archive": "archive legacy verifier inputs/results without treating them as current acceptance",
+      "drop": "inline mutable check lists as completion authority",
+      "replacement": "Work CheckRun and explicit AcceptanceDecision",
+      "sources": ["crates/astra-plan/src/execution.rs", "crates/services/src/work/evidence.rs", "crates/services/src/work/acceptance.rs"]
+    }
+  ],
+  "topologies": [
+    {
+      "id": "cli-plus-server-current",
+      "writer": "database SessionContextCoordinator",
+      "loop_host": "thin CLI makes one admission to ServerAgenticLoopHost",
+      "prompt_assembly": "server canonical conversation assembly",
+      "provider": "server-selected model Offering and capability route",
+      "fallback": "typed failure; no DB-to-local authority fallback",
+      "status": "target_foundation",
+      "sources": ["crates/astra-thin-client/src/client.rs", "crates/runtime/src/server/server_loop_host.rs", "crates/runtime/tests/web_agent_e2e.rs"]
+    },
+    {
+      "id": "server-only-current",
+      "writer": "database SessionContextCoordinator",
+      "loop_host": "ServerAgenticLoopHost and run lifecycle",
+      "prompt_assembly": "server canonical conversation assembly",
+      "provider": "server model execution and managed/server capabilities",
+      "fallback": "typed degraded or blocked state",
+      "status": "target_foundation",
+      "sources": ["crates/runtime/src/server/server_loop_host.rs", "crates/runtime/src/server/run/lifecycle/mod.rs"]
+    },
+    {
+      "id": "edge-plus-server-current",
+      "writer": "database SessionContextCoordinator on Server",
+      "loop_host": "ServerAgenticLoopHost",
+      "prompt_assembly": "server canonical conversation assembly",
+      "provider": "typed Edge capability binding for eligible execution; Server retains conversation authority",
+      "fallback": "selected offline executor fails closed unless a typed alternative is admitted",
+      "status": "target_foundation",
+      "sources": ["crates/runtime/src/server/tool_admission.rs", "crates/astra-turn-core/src/edge_ledger.rs", "crates/runtime/src/server/server_loop_host.rs"]
+    },
+    {
+      "id": "offline-cli-current",
+      "writer": "file/local session state",
+      "loop_host": "CLI local loop",
+      "prompt_assembly": "CLI local assembly",
+      "provider": "local configured provider and local tools",
+      "fallback": "explicit offline mode only",
+      "status": "must_converge_to_embedded_server_runtime",
+      "sources": ["crates/astra-cli/src/cli/turn/turn_stream_runner.rs", "crates/services/src/session_context_coordinator.rs"]
+    }
+  ],
+  "control_semantics_audit": [
+    {
+      "capability": "introspect",
+      "fact_source": "typed runtime/session observations",
+      "revision_basis": "snapshot source revisions and current runtime facts",
+      "text_or_like_controls_behavior": false,
+      "evidence_refs": "typed observation and trace references",
+      "mutation_boundary": "read-only",
+      "status": "partial",
+      "sources": ["crates/astra-turn-core/src/introspect.rs", "crates/astra-turn-core/src/introspect/observation.rs"]
+    },
+    {
+      "capability": "trace",
+      "fact_source": "typed turn, tool, provider, authority, and Work events",
+      "revision_basis": "event identity, parent/causal identity, and source cursor",
+      "text_or_like_controls_behavior": false,
+      "evidence_refs": "event and artifact identifiers",
+      "mutation_boundary": "append-only audit; no product mutation authority",
+      "status": "partial",
+      "sources": ["crates/astra-turn-core/src/trace_event.rs", "crates/astra-turn-core/src/turn_trace_collector.rs"]
+    },
+    {
+      "capability": "policy",
+      "fact_source": "typed actor, action, target, capability, scope, and epoch facts",
+      "revision_basis": "authorization, device-trust, permission, and capability revisions",
+      "text_or_like_controls_behavior": false,
+      "evidence_refs": "typed admission decision and grant identifiers",
+      "mutation_boundary": "only explicit authenticated typed commands can change grants or policy",
+      "status": "partial",
+      "sources": ["crates/astra-turn-core/src/permission/engine.rs", "crates/astra-turn-core/src/permission/types.rs"]
+    },
+    {
+      "capability": "reflection",
+      "fact_source": "legacy session/event aggregation",
+      "revision_basis": "not consistently pinned to one immutable Work observation",
+      "text_or_like_controls_behavior": true,
+      "evidence_refs": "mixed legacy graph and session references",
+      "mutation_boundary": "legacy recommendations are non-canonical but the input classification is not acceptable for M7",
+      "status": "missing",
+      "sources": ["crates/services/src/reflect.rs", "crates/astra-turn-core/src/hydrate_reflect.rs"]
+    }
+  ],
+  "product_ia": {
+    "web_current": [
+      {"surface": "Home/Overview", "path": "web/app/(workspace)/overview/page.tsx", "finding": "separate overview remains"},
+      {"surface": "Now", "path": "web/app/(workspace)/now/page.tsx", "finding": "bounded cross-Work status surface exists"},
+      {"surface": "Projects", "path": "web/app/(workspace)/projects/[projectId]/page.tsx", "finding": "project surface exists"},
+      {"surface": "Chats", "path": "web/app/(workspace)/chats/[chatId]/page.tsx", "finding": "legacy chat-centered journey remains"},
+      {"surface": "Works", "path": "web/app/(workspace)/works/[workId]/page.tsx", "finding": "canonical Work review/control surface exists"}
+    ],
+    "tui_current": [
+      {"surface": "conversation", "path": "crates/astra-cli/src/tui/chat_widget/mod.rs", "finding": "primary foreground interaction"},
+      {"surface": "task board", "path": "crates/astra-cli/src/tui/task_board_observer.rs", "finding": "renders the canonical Work graph projection"},
+      {"surface": "context diagnostics", "path": "crates/astra-cli/src/tui/bottom_pane/context_panel_view.rs", "finding": "technical context facts are separately inspectable"},
+      {"surface": "session resume picker", "path": "crates/astra-cli/src/tui/session_picker/mod.rs", "finding": "session-centered resume control remains"}
+    ],
+    "duplicate_or_competing_surfaces": [
+      {"finding": "Chat-scoped tasks/agents/tools/insights compete with the canonical Work page", "sources": ["web/components/app/work-surface-panel.tsx", "web/app/(workspace)/works/[workId]/page.tsx"]},
+      {"finding": "Chat and Work both act as entry journeys while session remains visible as a product identity", "sources": ["web/app/(workspace)/chats/[chatId]/page.tsx", "web/app/(workspace)/works/[workId]/page.tsx", "crates/astra-cli/src/tui/session_picker/mod.rs"]}
+    ],
+    "implementation_terms_to_demote": ["session_id", "writer epoch", "manifest root", "topology name", "provider generation", "projection cursor"],
+    "broken_journeys": [
+      {"journey": "cross-device attach, observe, takeover, and continue", "break": "server primitives exist but Web/SDK/TUI do not expose one complete typed journey", "sources": ["crates/services/src/session_handoff.rs", "web/components/app/chat-actions-menu.tsx", "packages/sdk/src/index.ts"]},
+      {"journey": "fork an approach and compare or deliver it", "break": "durable Work branch operations exist but are not yet a complete CLI/Web action journey", "sources": ["crates/services/src/work/branch_creation_operation.rs", "web/app/(workspace)/works/[workId]/page.tsx"]},
+      {"journey": "understand What, Why, and What next", "break": "context, task, activity, and insights are split across technical or session-centered panels", "sources": ["web/components/app/work-surface-panel.tsx", "crates/astra-cli/src/tui/bottom_pane/context_panel_view.rs"]}
+    ],
+    "target": "Now and Project lead into one Work rail with Overview, Plan, Activity, and Results; Conversation remains communication rather than task or trace authority"
+  },
+  "support_envelope": {
+    "v1_tasks": ["cross-file feature", "failing-test or CI repair"],
+    "required_facts": ["authenticated owner", "Server-owned Work", "Git repository subject", "managed workspace or continuously connected authorized Edge", "configured model Offering", "discoverable or user-confirmed verifier"],
+    "degraded_when": ["secret unavailable", "network unavailable", "workspace revision unknown", "required capability offline", "reliable verifier unavailable"],
+    "degraded_behavior": "continue bounded analysis/planning when safe; expose coverage gaps; never claim verified delivery",
+    "user_interrupt_policy": "act on clear reversible work; interrupt only for missing acceptance, permission, unknown external side effect, or an exhausted evidence-producing recovery path",
+    "github_delivery": "explicit typed capability and policy action only; credential ownership, repository target, branch/ref, and external side effect are revalidated server-side; never infer permission from prompt text"
+  },
+  "quality_corpus": [
+    {"id": "cross-file-feature-v1", "task_class": "cross-file feature", "baseline": "no-reflection", "status": "protocol-fixed-results-not-yet-captured", "path": "docs/product/session-product-m0/quality-corpus.json", "required_scores": ["constraint coverage", "dependency precision", "check coverage", "over-decomposition", "fresh-evidence delivery"]},
+    {"id": "failing-ci-repair-v1", "task_class": "failing-test or CI repair", "baseline": "no-reflection", "status": "protocol-fixed-results-not-yet-captured", "path": "docs/product/session-product-m0/quality-corpus.json", "required_scores": ["failure localization", "unhappy-path coverage", "unrelated-change avoidance", "targeted rerun efficiency", "fresh-evidence delivery"]}
+  ],
+  "benchmark_manifest": {
+    "id": "session-product-reference-v1",
+    "status": "environment-and-matrix-fixed-results-not-yet-captured",
+    "commands": [
+      "cargo bench -p astra-runtime --bench context_history",
+      "cargo test -p astra-runtime --test perf_benchmarks -- --ignored --nocapture",
+      "ASTRA_PHASE0_MODELS_FILE=<absolute-models-yaml> ASTRA_PHASE0_SERVER_PORT=<unused-loopback-port> scripts/phase0-production-baseline.sh",
+      "npm --prefix web run test:e2e -- --project=chromium"
+    ],
+    "environment": {
+      "os": "Linux x86_64",
+      "cpu": "16 dedicated logical CPUs",
+      "memory_gib": 64,
+      "database": "dedicated local MatrixOne with an empty benchmark catalog",
+      "rust": "1.97.0 from rust-toolchain.toml",
+      "browser": "Playwright-managed Chromium from the checked-in web lockfile",
+      "network": {"rtt_ms": 30, "bandwidth_mbps": 100, "packet_loss_pct": 0},
+      "provider_correctness": "deterministic checked-in provider fixture",
+      "provider_distribution": "online provider lane reported separately and never used for correctness"
+    },
+    "fixtures": {
+      "seed": 7302026,
+      "owner_isolation": "every synthetic tenant has a distinct authenticated owner and no shared mutable session state",
+      "conversation": "canonical user/assistant/tool turns with deterministic payload bytes and manifest roots",
+      "active_frontier": "bounded current graph; 1K and 10K cases are historical task/event/check rows served by cursor pagination",
+      "large_context": "128K, 200K, and 1M refer to accepted canonical context bytes/tokens; provider upload bytes are reported separately",
+      "browser": "fixed viewport, visible-window graph/transcript rendering, stable focus and scroll-anchor assertions"
+    },
+    "matrix": {
+      "context_windows": [131072, 204800, 1000000],
+      "turn_counts": [10, 100],
+      "cache_states": ["cold", "warm"],
+      "tenants": [1, 100],
+      "history_frontiers": [1000, 10000],
+      "topologies": ["remote-server", "server-only", "edge-server", "embedded"],
+      "failure_worlds": ["slow-client", "projection-backlog", "provider-retry", "edge-replay", "writer-conflict"]
+    },
+    "metrics": ["load-head-p50-p95-p99", "commit-p50-p95-p99", "resume-bundle-latency", "cold-materialization-latency", "fork-latency-and-metadata-bytes", "handoff-latency-and-delta-bytes", "observation-and-task-page-latency", "projection-lag", "decoded-history-bytes", "request-send-bytes", "rss", "cpu", "cache-read-share", "trace-overhead", "tenant-victim-p95-and-error-rate"],
+    "targets": {
+      "load_head": {"p95_ms": 50, "p99_ms": 150},
+      "commit": {"p95_ms": 200, "p99_ms": 500},
+      "warm_resume_bundle_p95_ms": 300,
+      "cold_1m_materialization_p95_ms_excluding_provider_upload": 2000,
+      "idle_takeover_overhead_p95_ms": 2000,
+      "healthy_edge_rebind_p95_ms": 3000,
+      "decoded_history_multiplier_max": 1.5,
+      "request_send_multiplier_max": 2.5,
+      "projection_lag": {"p95_ms": 2000, "p99_ms": 10000},
+      "context_observability_overhead_pct_max": 1.0,
+      "composer_local_feedback_ms_max": 100,
+      "work_shell_same_region_p95_ms": 1000,
+      "recent_transcript_page_p95_ms": 1500,
+      "control_action_local_feedback_ms_max": 250,
+      "visible_100_node_graph_update_p95_ms": 100,
+      "noisy_tenant_victim_p95_increase_pct_max": 20,
+      "noisy_tenant_victim_error_rate_increase_percentage_points_max": 0.5,
+      "correctness_failures": 0
+    },
+    "scale_invariants": [
+      "100 concurrent 1M sessions do not retain 100 complete decoded histories",
+      "head, control, attention, and active Work queries are O(1) or bounded by active metadata",
+      "1K and 10K historical rows are cursor-paged and never treated as an active 10K-node graph",
+      "slow clients hold no canonical transaction or writer lease and cannot create an unbounded SSE buffer",
+      "warm handoff transfers delta only; cold bytes and provider upload bytes are reported without O(1) claims"
+    ],
+    "existing_lanes": ["crates/runtime/benches/context_history.rs", "crates/runtime/tests/perf_benchmarks.rs", "crates/runtime/tests/system_matrix_http_e2e/journey_phase0_production_baseline.rs", "crates/runtime/tests/system_matrix_http_e2e/journey_phase0_production_topologies.rs"]
+  },
+  "stage_validation": {
+    "deterministic_contract": {
+      "command": "cargo test -p astra-services --test session_product_m0_baseline",
+      "role": "M0 manifest structure, decision completeness, and repository-reference integrity"
+    },
+    "online_integration": {
+      "path": "docs/product/session-product-m0/online-validation.json",
+      "role": "DeepSeek Flash typed-tool and durable-journal integration evidence; never correctness authority"
+    }
+  },
+  "cutover_policy": {
+    "active_state_migrator": "forbidden",
+    "compatibility_adapter": "forbidden",
+    "dual_reader_or_writer": "forbidden",
+    "legacy_data_fallback": "forbidden",
+    "legacy_archive": "offline, immutable, explicitly requested audit export only; never a runtime input",
+    "rollback": "deploy the previous release and schema boundary; do not reactivate a legacy authority inside the new runtime"
+  },
+  "cleanup_manifest": [
+    {"id": "bridge-owned-loop", "status": "removed", "disposition": "delete", "owner_milestone": "M2", "replacement": "single Server-owned loop", "sources": ["crates/runtime/src/server/chat_handlers.rs", "crates/runtime/tests/runtime_refactor_guardrails.rs"], "absence_assertion": "runtime has no turn/bridge module and POST /chat/turn is not routable"},
+    {"id": "cli-owned-local-loop", "status": "removed", "disposition": "delete", "owner_milestone": "M2", "replacement": "single Server-owned loop with typed continuation authority", "sources": ["crates/astra-cli/src/cli/chat_stream/sse_loop/server_admission_host.rs", "crates/runtime/src/turn/agentic_loop/execution_phase.rs"], "absence_assertion": "the CLI has no CliAgenticLoopHost; a typed RemoteServer terminal cannot enter client settlement, reconciliation, or tool continuation"},
+    {"id": "file-session-context-coordinator", "status": "removed", "disposition": "delete", "owner_milestone": "M2", "replacement": "embedded Server runtime using the same coordinator domain contract", "sources": ["crates/services/src/session_context_coordinator.rs"], "absence_assertion": "services exports and implements only DatabaseSessionContextCoordinator"},
+    {"id": "local-session-fork", "status": "removed", "disposition": "delete", "owner_milestone": "M2", "replacement": "Work BranchCreationOperation", "sources": ["crates/services/src/work/branch_creation_operation.rs", "crates/runtime/tests/runtime_refactor_guardrails.rs"], "absence_assertion": "no local session_fork module, slash command, picker intent, or task-board fork_copy action exists"},
+    {"id": "client-owned-resume-selection", "status": "present", "disposition": "delete", "owner_milestone": "M2", "replacement": "one Server-produced ResumeBundle consumed by thin clients", "sources": ["crates/astra-cli/src/cli/session/session_restore_client.rs", "crates/astra-cli/src/tui/chat_widget/resume.rs"]},
+    {"id": "local-publish-import", "status": "present", "disposition": "delete", "owner_milestone": "M2", "replacement": "explicit embedded runtime and canonical Work branch operations", "sources": ["crates/astra-cli/src/cli/cloud_sync.rs"]},
+    {"id": "session-todos-authority", "status": "removed", "disposition": "delete", "owner_milestone": "M2", "replacement": "immutable Work graph revisions with a read-only CLI board projection", "sources": ["crates/astra-cli/src/tui/work_board_projection.rs"], "absence_assertion": "latest schema and runtime contain no session_todos tables, repository, writer, or reader"},
+    {"id": "astra-plan-completion-authority", "status": "present", "disposition": "archive-and-drop", "owner_milestone": "M2", "replacement": "Work proposal, graph, Check, and acceptance revisions; Plan Mode remains a separate explicit approval boundary", "sources": ["crates/astra-plan/src/state.rs", "crates/astra-plan/src/resume.rs"]},
+    {"id": "task-service-and-task-contract-authority", "status": "removed", "disposition": "delete", "owner_milestone": "M2", "replacement": "Work graph for declaration and Run/Check for execution/verification", "sources": ["crates/services/src/work.rs"], "absence_assertion": "services and CLI expose no TaskContract lifecycle, durable bridge, task_contracts table, or verification_results table"},
+    {"id": "chat-session-product-routes", "status": "present", "disposition": "delete", "owner_milestone": "M9", "replacement": "/v1/works resources", "sources": ["crates/runtime/src/server/router_builder/realtime.rs", "web/app/(workspace)/chats/[chatId]/page.tsx"]},
+    {"id": "surface-owned-status-inference", "status": "present", "disposition": "delete", "owner_milestone": "M9", "replacement": "bounded Server Work/Attention projections with typed reason and action codes", "sources": ["web/lib/work-surface.ts", "web/components/app/work-surface-panel.tsx", "crates/astra-cli/src/tui/task_board_observer.rs"]},
+    {"id": "legacy-sdk-session-plan-surface", "status": "present", "disposition": "delete", "owner_milestone": "M9", "replacement": "Work-only public SDK", "sources": ["packages/sdk/src/index.ts", "packages/sdk/src/client.ts"]},
+    {"id": "legacy-reflection-readers-and-text-evidence", "status": "present", "disposition": "delete", "owner_milestone": "M7", "replacement": "ObservationReportRef-backed durable ReflectionOperation", "sources": ["crates/astra-turn-core/src/hydrate_reflect.rs"]}
+  ]
+}

@@ -1,16 +1,15 @@
 //! Cross-turn observation journal for trend tracking and strategy verification.
 //!
 //! The [`ObservationJournal`] maintains a sliding window of per-turn metrics so the
-//! runtime (not core) can make informed budget and signal decisions. The companion
-//! [`ObservationStore`] trait provides an optional persistence layer; the in-memory
-//! journal remains the primary source of truth during a session.
+//! runtime (not core) can make informed budget and signal decisions. The bounded
+//! in-memory journal is the runtime source of truth; durable product evidence uses
+//! the canonical session journal rather than a second local file plane.
 //!
 //! # Separation of concerns
 //!
 //! * **Data layer** (`astra_core`): [`JournalFacts`] (pure factual snapshot —
 //!   counts, streaks, no judgments), [`ObservationJournal`] (ring buffer of
 //!   [`JournalEntry`] entries, trend computation, strategy verification),
-//!   [`ObservationStore`] (optional persistence trait).
 //! * **Policy layer** (`astra_runtime::turn::runtime_policy`): [`RuntimePolicy`]
 //!   reads [`JournalFacts`] and produces [`RuntimePolicyEvidence`]s. The core data
 //!   layer never decides — it only reports facts.
@@ -26,9 +25,6 @@
 //! 3. Before the next LLM round, the runtime calls
 //!    [`ObservationJournal::extract_facts`] to get a pure factual snapshot,
 //!    then passes it to the runtime policy layer for decision-making.
-//! 4. Optionally, after each turn the runtime may call
-//!    [`ObservationStore::save_entry`] to persist the turn's data beyond the
-//!    in-memory journal window.
 
 use std::fmt::Write;
 
@@ -55,10 +51,11 @@ pub struct BudgetSnapshot {
 /// Streak-related facts: consecutive outcome/non-outcome/read-only rounds.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StreakSnapshot {
-    /// Consecutive rounds where the agent produced at least one observable
-    /// outcome (mutation, test pass, build success).
+    /// Consecutive tool rounds where the agent produced at least one
+    /// successful observable result. Whether those results are read-only is
+    /// tracked independently by [`Self::consecutive_read_only`].
     pub consecutive_rounds_with_outcome: u32,
-    /// Consecutive rounds with zero observable outcome.
+    /// Consecutive executed-tool rounds where every call failed.
     pub consecutive_rounds_without_outcome: u32,
     /// Consecutive read-only rounds (no writes / edits).
     pub consecutive_read_only: u32,
@@ -96,16 +93,6 @@ pub struct StallSnapshot {
     pub stall_reason: Option<String>,
 }
 
-/// Task completion facts.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct TaskSnapshot {
-    /// Task completion ratio (0.0–1.0): fraction of the task board's
-    /// tasks that are completed. 1.0 = all done.
-    /// Populated by the execution phase (not computed in the journal).
-    #[serde(default)]
-    pub task_completion_ratio: f64,
-}
-
 /// Pure factual snapshot of the current state, extracted from the
 /// [`ObservationJournal`]. No scores, no judgments — only counts.
 ///
@@ -114,7 +101,6 @@ pub struct TaskSnapshot {
 /// - [`StreakSnapshot`]: consecutive outcome/non-outcome/read-only rounds
 /// - [`PerformanceSnapshot`]: tool calls, errors, cache, token pressure
 /// - [`StallSnapshot`]: stall detection
-/// - [`TaskSnapshot`]: task completion
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct JournalFacts {
     /// Budget-related facts.
@@ -129,9 +115,6 @@ pub struct JournalFacts {
     /// Stall detection facts.
     #[serde(default)]
     pub stall: StallSnapshot,
-    /// Task completion facts.
-    #[serde(default)]
-    pub task: TaskSnapshot,
 }
 
 /// A single turn's worth of key metrics stored in the journal.
@@ -470,7 +453,10 @@ impl ObservationJournal {
     /// consecutive rounds with/without outcome, total mutations, errors,
     /// read-only streaks, etc. No scores or judgments.
     ///
-    /// "Outcome" = at least one of: file mutation, test pass, build success.
+    /// "Outcome" here means at least one successfully executed tool call. A
+    /// successful read is observable progress even though it is not a
+    /// workspace mutation; read-only streaks remain available as a separate
+    /// fact for exploration/convergence policy.
     pub fn extract_facts(&self, budget_remaining: u32, budget_max: u32) -> JournalFacts {
         // total_tool_calls, total_errors, total_observation_calls are populated
         // by the execution phase from authoritative state, not from the journal
@@ -503,7 +489,14 @@ impl ObservationJournal {
             let abs_idx = self.entries.len().saturating_sub(1 + i);
             let past_strategy_boundary = abs_idx < streak_start;
 
-            let has_outcome = entry.write_ratio > 0.0;
+            // `write_ratio` answers whether the workspace changed, not whether
+            // the round made observable progress. Conflating the two makes
+            // successful investigation and verification rounds look like
+            // failures and can inject false "reflect" advisories into the next
+            // model request. Deferred/skipped calls never enter the journal, so
+            // a successful executed call is the most conservative generic
+            // outcome fact available at this layer.
+            let has_outcome = entry.total_tool_calls > entry.error_count;
             let is_read_only =
                 entry.write_ratio == 0.0 && entry.read_ratio > 0.0 && entry.total_tool_calls > 0;
 
@@ -531,7 +524,7 @@ impl ObservationJournal {
             if abs_idx < streak_start {
                 break;
             }
-            if entry.total_tool_calls > 0 && entry.write_ratio == 0.0 {
+            if entry.total_tool_calls > 0 && entry.error_count >= entry.total_tool_calls {
                 zero_streak += 1;
             } else {
                 break;
@@ -551,9 +544,8 @@ impl ObservationJournal {
             facts.performance.cache_hit_ratio = avg_cache_hit;
         }
 
-        // Note: token_pressure and task_completion_ratio are populated by
-        // the execution phase from authoritative state (token pressure and
-        // task board), not computed from journal entries.
+        // Token pressure is populated by the execution phase from the live
+        // context budget; it is not computed from journal entries.
 
         facts
     }
@@ -593,7 +585,6 @@ pub fn render_compact_status(
     token_pressure: f64,
     cache_hit_ratio: f64,
     turns_completed: u32,
-    turns_remaining: u32,
 ) -> String {
     let mut s = String::with_capacity(1024);
     s.push_str("\n## ⚡ Self-Status\n");
@@ -601,9 +592,7 @@ pub fn render_compact_status(
     // ── Core metrics ──
     let _ = write!(
         s,
-        "Turn {turns_completed}/{budget} | Token pressure: {pressure:.0}% | Cache: {cache:.0}%",
-        turns_completed = turns_completed,
-        budget = turns_completed.saturating_add(turns_remaining),
+        "Round {turns_completed} | Token pressure: {pressure:.0}% | Cache: {cache:.0}%",
         pressure = token_pressure * 100.0,
         cache = cache_hit_ratio * 100.0,
     );
@@ -681,121 +670,6 @@ pub fn render_compact_status(
     }
 
     s
-}
-
-// ── ObservationStore ─────────────────────────────────────────────────────────
-
-/// Optional persistence trait for the observation plane.
-///
-/// Implementations serialize per-turn observation data (metrics + journal facts)
-/// to a durable backend so the observation graph can be reconstructed across
-/// session boundaries. The in-memory [`ObservationJournal`] remains the primary
-/// source of truth during a session; the store is a write-through cache.
-///
-/// # Design
-///
-/// * **Write-through, not write-back**: entries are persisted *after* the
-///   in-memory journal has been updated. The journal is always consistent;
-///   store failures are logged but never block the session.
-/// * **Session-scoped**: every entry is tagged with a `session_id` so multiple
-///   concurrent or historical sessions can coexist in the same backend.
-/// * **Read-back is optional**: the store is primarily a sink. Query methods
-///   exist for cross-session analysis (via `reflect`), but the runtime never
-///   depends on historical data from the store to make decisions.
-///
-/// # Unhappy-path
-///
-/// All methods tolerate I/O failures. Backends must not panic on disk-full,
-/// permission-denied, or corrupt-file conditions. Callers should treat
-/// `save_entry` failures as non-fatal and never retry in a tight loop.
-pub trait ObservationStore: Send + Sync {
-    /// Persist a turn's metrics and journal facts under `session_id`.
-    ///
-    /// `turn_index` is the 0-based turn number within the session.
-    /// `metrics` and `facts` are serialized atomically as a single record.
-    ///
-    /// Returns `Ok(())` on success, or an error message on failure.
-    /// The error is informational; callers must not unwind.
-    fn save_entry(
-        &self,
-        session_id: &str,
-        turn_index: u32,
-        metrics: &TurnMetrics,
-        facts: &JournalFacts,
-    ) -> Result<(), String>;
-
-    /// Load all persisted entries for `session_id`, ordered by turn index.
-    ///
-    /// Returns an empty `Vec` if the session has no persisted data or the
-    /// backend cannot be read (e.g. file not found).
-    fn load_entries(&self, session_id: &str) -> Vec<StoredEntry>;
-
-    /// Return the number of persisted entries for `session_id`.
-    ///
-    /// Returns `0` if the session is unknown or the backend is unavailable.
-    fn entry_count(&self, session_id: &str) -> usize;
-
-    /// Delete all persisted entries for `session_id`.
-    ///
-    /// Returns `Ok(())` even if no entries existed (idempotent delete).
-    fn delete_session(&self, session_id: &str) -> Result<(), String>;
-}
-
-/// Tuning signal persistence backend — separate from observation CRUD.
-///
-/// Handles advisory tuning jobs (cache warming hints, context pressure signals, etc.)
-/// that are derived from analysis, not direct turn metrics.
-pub trait TuningStore: Send + Sync {
-    /// Save a tuning job entry as a raw JSON line.
-    ///
-    /// Tuning jobs are advisory and separate from turn metrics.
-    /// The `raw_json` is a pre-serialized [`TuningJob`] line.
-    fn save_tuning_entry(
-        &self,
-        session_id: &str,
-        turn_index: u32,
-        raw_json: &str,
-    ) -> Result<(), String>;
-
-    /// Load all tuning job entries for `session_id`.
-    ///
-    /// Each returned string is a raw JSON line (a serialized [`TuningJob`]).
-    /// Returns an empty `Vec` if the session has no tuning data.
-    fn load_tuning_entries(&self, session_id: &str) -> Vec<String>;
-
-    /// List all session IDs that have tuning data.
-    ///
-    /// Returns a sorted list of session IDs.
-    fn list_tuning_sessions(&self) -> Vec<String>;
-}
-
-/// A single persisted observation record, reconstructed from storage.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct StoredEntry {
-    pub session_id: String,
-    pub turn_index: u32,
-    /// Unix timestamp in milliseconds when the entry was persisted.
-    pub timestamp_unix_ms: u64,
-    /// Serialized [`TurnMetrics`] payload.
-    pub metrics_json: String,
-    /// Serialized [`JournalFacts`] payload.
-    pub facts_json: String,
-}
-
-impl StoredEntry {
-    /// Deserialize the metrics payload back into [`TurnMetrics`].
-    ///
-    /// Returns `None` if the stored JSON is corrupt (never panics).
-    pub fn metrics(&self) -> Option<TurnMetrics> {
-        serde_json::from_str(&self.metrics_json).ok()
-    }
-
-    /// Deserialize the facts payload back into [`JournalFacts`].
-    ///
-    /// Returns `None` if the stored JSON is corrupt (never panics).
-    pub fn facts(&self) -> Option<JournalFacts> {
-        serde_json::from_str(&self.facts_json).ok()
-    }
 }
 
 #[cfg(test)]
@@ -963,10 +837,10 @@ mod tests {
             0.45,
             0.30,
             3,
-            10,
         );
         assert!(status.contains("Self-Status"));
-        assert!(status.contains("Turn 3/13"));
+        assert!(status.contains("Round 3"));
+        assert!(!status.contains("remaining"));
         assert!(status.contains("test_alert"));
     }
 
@@ -1009,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_facts_breaks_outcome_streak_on_read_only() {
+    fn extract_facts_keeps_success_and_read_only_as_orthogonal_facts() {
         let mut journal = ObservationJournal::default();
         // write → write → read-only
         journal.record_turn(&make_write_metrics(0, 3, 1000));
@@ -1017,22 +891,48 @@ mod tests {
         journal.record_turn(&make_metrics(2, 5, 0, 1, 1100, vec![("read_file", 5)]));
 
         let facts = journal.extract_facts(7, 10);
-        // Last round is read-only → outcome streak should be 0
-        assert_eq!(facts.streaks.consecutive_rounds_with_outcome, 0);
-        assert_eq!(facts.streaks.consecutive_rounds_without_outcome, 1);
+        assert_eq!(facts.streaks.consecutive_rounds_with_outcome, 3);
+        assert_eq!(facts.streaks.consecutive_rounds_without_outcome, 0);
+        assert_eq!(facts.streaks.consecutive_read_only, 1);
     }
 
     #[test]
-    fn extract_facts_counts_zero_outcome_streak() {
+    fn extract_facts_counts_successful_read_rounds_as_outcomes() {
         let mut journal = ObservationJournal::default();
-        // 3 rounds, all read-only (no outcome)
+        // Evidence gathering is observable progress even though it is
+        // independently tracked as a read-only streak.
         journal.record_turn(&make_metrics(0, 5, 0, 1, 1000, vec![("read_file", 5)]));
         journal.record_turn(&make_metrics(1, 4, 0, 1, 1100, vec![("read_file", 4)]));
         journal.record_turn(&make_metrics(2, 6, 0, 2, 1200, vec![("grep", 6)]));
 
         let facts = journal.extract_facts(7, 10);
+        assert_eq!(facts.streaks.consecutive_rounds_without_outcome, 0);
+        assert_eq!(facts.streaks.consecutive_rounds_with_outcome, 3);
+        assert_eq!(facts.streaks.consecutive_read_only, 3);
+    }
+
+    #[test]
+    fn extract_facts_counts_only_all_failed_tool_rounds_as_zero_outcome() {
+        let mut journal = ObservationJournal::default();
+        journal.record_turn(&make_metrics(0, 3, 3, 0, 1000, vec![("bash", 3)]));
+        journal.record_turn(&make_metrics(1, 2, 2, 0, 1100, vec![("bash", 2)]));
+        journal.record_turn(&make_metrics(2, 4, 4, 0, 1200, vec![("bash", 4)]));
+
+        let facts = journal.extract_facts(7, 10);
         assert_eq!(facts.streaks.consecutive_rounds_without_outcome, 3);
         assert_eq!(facts.streaks.consecutive_rounds_with_outcome, 0);
+        assert_eq!(facts.streaks.consecutive_read_only, 0);
+    }
+
+    #[test]
+    fn one_success_breaks_an_all_failed_tool_streak() {
+        let mut journal = ObservationJournal::default();
+        journal.record_turn(&make_metrics(0, 3, 3, 0, 1000, vec![("bash", 3)]));
+        journal.record_turn(&make_metrics(1, 3, 2, 0, 1100, vec![("bash", 3)]));
+
+        let facts = journal.extract_facts(8, 10);
+        assert_eq!(facts.streaks.consecutive_rounds_without_outcome, 0);
+        assert_eq!(facts.streaks.consecutive_rounds_with_outcome, 1);
     }
 
     #[test]

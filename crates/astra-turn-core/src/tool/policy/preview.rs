@@ -20,7 +20,6 @@
 //! advertised in `astra-tools::schemas`). Retired separate names
 //! have been removed — the model now issues unified action-param
 //! calls (`git(action="show")`, `memory(action="retrieve")`,
-//! `task_board(action="create")`,
 //! `lsp(operation="hover")`) and we
 //! don't maintain preview code for dead paths.
 //!
@@ -170,13 +169,12 @@ pub fn render_preview(tool: &str, args: &Value, style: PreviewStyle, desc_budget
         "mo_query" => mo_query_preview(args, path_budget, verbose),
         "agent" => agent_preview(args, path_budget, verbose),
         "skill" => skill_preview(args, path_budget, verbose),
-        "task_board" => task_preview(args, path_budget, verbose),
         "task_output" => background_task_output_preview(args, path_budget, verbose),
         "task_stop" => background_task_stop_preview(args, path_budget, verbose),
         "task_list" => "List background tasks".to_string(),
         "tool_search" => {
             let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-            format!("Searching tools: \"{}\"", trunc(query, path_budget(17)))
+            format!("Activating tools: \"{}\"", trunc(query, path_budget(18)))
         }
 
         // ── Web ─────────────────────────────────────────────────────
@@ -205,6 +203,7 @@ pub fn render_preview(tool: &str, args: &Value, style: PreviewStyle, desc_budget
 
         // ── Misc ────────────────────────────────────────────────────
         "introspect" => "Introspecting…".to_string(),
+        "reflect" => "Reflecting…".to_string(),
         "notify" => {
             let msg = args.get("message").and_then(Value::as_str).unwrap_or("");
             format!("Notify: \"{}\"", trunc(msg, path_budget(10)))
@@ -543,76 +542,6 @@ fn skill_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: bo
                 .unwrap_or("unknown");
             format!("Running skill: {}", trunc(skill_name, 16))
         }
-    }
-}
-
-fn task_preview(args: &Value, path_budget: impl Fn(usize) -> usize, verbose: bool) -> String {
-    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
-    task_preview_for_action(action, args, path_budget, verbose)
-}
-
-fn task_preview_for_action(
-    action: &str,
-    args: &Value,
-    path_budget: impl Fn(usize) -> usize,
-    verbose: bool,
-) -> String {
-    let trunc = |s: &str, b: usize| -> String {
-        if verbose {
-            s.to_string()
-        } else {
-            truncate_line(s, path_budget(b))
-        }
-    };
-    match action {
-        "create" => {
-            let title = args.get("title").and_then(Value::as_str).unwrap_or("");
-            format!("Creating task: \"{}\"", trunc(title, 16))
-        }
-        "update" => {
-            let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
-            let status = args.get("new_status").and_then(Value::as_str);
-            let subtask = args.get("subtask_id").and_then(Value::as_str);
-            match (subtask, status) {
-                (Some(sub), Some(st)) => format!(
-                    "Updating subtask {}/{} -> {}",
-                    trunc(task_id, 10),
-                    trunc(sub, 10),
-                    trunc(st, 12),
-                ),
-                (None, Some(st)) => {
-                    format!("Updating task: {} -> {}", trunc(task_id, 14), trunc(st, 14),)
-                }
-                _ => format!("Updating task: {}", trunc(task_id, 14)),
-            }
-        }
-        "list" => {
-            let status = args.get("status_filter").and_then(Value::as_str);
-            match status {
-                Some(s) => format!("Listing tasks: {}", trunc(s, 15)),
-                None => "Listing tasks".to_string(),
-            }
-        }
-        "list_user" => {
-            let status = args
-                .get("user_status")
-                .and_then(Value::as_str)
-                .unwrap_or("active");
-            format!("Listing cross-session tasks: {}", trunc(status, 15))
-        }
-        "get" => {
-            let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
-            format!("Getting task: {}", trunc(task_id, 14))
-        }
-        "stop" => {
-            let task_id = args.get("task_id").and_then(Value::as_str).unwrap_or("");
-            let reason = args.get("reason").and_then(Value::as_str);
-            match reason {
-                Some(r) => format!("Stopping task {}: {}", trunc(task_id, 10), trunc(r, 14),),
-                None => format!("Stopping task: {}", trunc(task_id, 14)),
-            }
-        }
-        _ => format!("Task: {action}"),
     }
 }
 
@@ -1040,8 +969,8 @@ mod tests {
     #[test]
     fn tool_search_with_query() {
         assert_eq!(
-            p("tool_search", json!({"query": "github"})),
-            r#"Searching tools: "github""#
+            p("tool_search", json!({"query": "select:github"})),
+            r#"Activating tools: "select:github""#
         );
     }
 
@@ -1137,39 +1066,6 @@ mod tests {
     }
 
     #[test]
-    fn task_action_create() {
-        assert_eq!(
-            p(
-                "task_board",
-                json!({"action": "create", "title": "Fix renderer drift"})
-            ),
-            r#"Creating task: "Fix renderer drift""#
-        );
-    }
-
-    #[test]
-    fn task_update_status() {
-        assert_eq!(
-            p(
-                "task_board",
-                json!({"action": "update", "task_id": "render-pass", "new_status": "in_progress"})
-            ),
-            "Updating task: render-pass -> in_progress"
-        );
-    }
-
-    #[test]
-    fn task_list_with_filter() {
-        assert_eq!(
-            p(
-                "task_board",
-                json!({"action": "list", "status_filter": "active"})
-            ),
-            "Listing tasks: active"
-        );
-    }
-
-    #[test]
     fn mcp_unknown_tool_formats_as_server_toolname() {
         assert_eq!(
             p("mcp_github_search_issues", json!({})),
@@ -1185,6 +1081,11 @@ mod tests {
     #[test]
     fn introspect_is_standalone() {
         assert_eq!(p("introspect", json!({})), "Introspecting…");
+    }
+
+    #[test]
+    fn reflect_is_standalone() {
+        assert_eq!(p("reflect", json!({})), "Reflecting…");
     }
 
     #[test]
@@ -1333,43 +1234,6 @@ mod tests {
                 json!({"action": "get_issue", "owner": "o", "repo": "r", "issue_number": 99})
             ),
             "GitHub: issue #99 o/r"
-        );
-    }
-
-    #[test]
-    fn task_update_uses_canonical_new_status_field() {
-        assert_eq!(
-            p(
-                "task_board",
-                json!({"action": "update", "task_id": "t-1", "new_status": "completed"})
-            ),
-            "Updating task: t-1 -> completed"
-        );
-    }
-
-    #[test]
-    fn task_list_uses_canonical_status_filter_field() {
-        assert_eq!(
-            p(
-                "task_board",
-                json!({"action": "list", "status_filter": "pending"})
-            ),
-            "Listing tasks: pending"
-        );
-    }
-
-    #[test]
-    fn task_list_user_uses_canonical_user_status_field() {
-        assert_eq!(
-            p("task_board", json!({"action": "list_user"})),
-            "Listing cross-session tasks: active"
-        );
-        assert_eq!(
-            p(
-                "task_board",
-                json!({"action": "list_user", "user_status": "paused"})
-            ),
-            "Listing cross-session tasks: paused"
         );
     }
 

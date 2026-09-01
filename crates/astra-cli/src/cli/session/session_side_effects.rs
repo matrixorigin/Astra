@@ -145,157 +145,36 @@ pub(crate) fn enqueue_ingestion_for_immediate_drain_pub(
     enqueue_ingestion_batch_without_runtime(&owner_scope, std::slice::from_ref(event));
 }
 
-#[derive(Clone)]
-struct JournalPromptTurn {
-    model_id: String,
-    snapshot: astra_turn_core::cache_diagnostics::PromptStateSnapshot,
-    usage: astra_runtime::turn::token_usage::TokenUsage,
+#[derive(Debug)]
+pub(crate) struct OneShotJournalCommit {
+    pub(crate) turn: u32,
+    pub(crate) cursor: astra_turn_types::SessionCursorV1,
+    /// Present when append returned an error but exact readback proved that the
+    /// intended canonical commit exists. The commit is authoritative; derived
+    /// projections and durability health still require repair.
+    pub(crate) persistence_error: Option<String>,
 }
 
-pub(crate) fn build_bridge_pipeline_journal_events(
-    session_id: Option<&str>,
-    turn: u32,
-    model_id: &str,
-    current_turn_events: &[session_journal::JournalEvent],
-) -> Result<Vec<session_journal::JournalEvent>, String> {
-    let Some(session_id) = session_id.filter(|sid| !sid.is_empty()) else {
-        return Ok(Vec::new());
-    };
-    let mut events = match session_journal::read_journal(session_id) {
-        Ok(events) => events,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => {
-            return Err(format!(
-                "failed to read session journal for {session_id}: {error}"
-            ));
-        }
-    };
-    events.extend_from_slice(current_turn_events);
-    if events.iter().any(|event| {
-        event.turn == Some(turn)
-            && matches!(
-                event.event_type,
-                session_journal::JournalEventType::PipelineFeedback
-                    | session_journal::JournalEventType::PipelineAlert
-            )
-    }) {
-        return Ok(Vec::new());
-    }
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum OneShotJournalCommitError {
+    #[error("{0}")]
+    NotCommitted(String),
+    #[error("{0}")]
+    CommitUnknown(String),
+}
 
-    let turns = journal_prompt_turns(&events);
-    let Some(current) = turns.last() else {
-        return Ok(Vec::new());
-    };
-
-    let mut feedback = astra_turn_core::context_feedback::ContextFeedback::from_usage(
-        current.usage.input_tokens,
-        current.usage.cached_input_tokens,
-        current.usage.cache_creation_tokens,
-        current.usage.output_tokens,
-        false,
-    );
-
-    if let Some(previous) = turns.iter().rev().nth(1) {
-        let mut detector = astra_turn_core::cache_diagnostics::CacheBreakDetector::new();
-        let _ = detector.record_turn_for_source(
-            "bridge_inprocess",
-            previous.snapshot.clone(),
-            Some(previous.usage.cached_input_tokens),
-        );
-        if let Some(event) = detector.record_turn_for_source(
-            "bridge_inprocess",
-            current.snapshot.clone(),
-            Some(current.usage.cached_input_tokens),
-        ) {
-            feedback.attribute_cache_break(event.reason);
-        }
-    }
-
-    let prior_feedback_ratios: Vec<f64> = events
-        .iter()
-        .filter(|event| {
-            event.turn.unwrap_or(0) < turn
-                && event.event_type == session_journal::JournalEventType::PipelineFeedback
-        })
-        .filter_map(|event| {
-            let metadata = event.metadata.as_ref()?;
-            (metadata.get("model_id").and_then(serde_json::Value::as_str) == Some(model_id))
-                .then(|| {
-                    metadata
-                        .get("cache_hit_ratio")
-                        .and_then(serde_json::Value::as_f64)
-                })
-                .flatten()
-        })
-        .collect();
-    let prior_ratios = if prior_feedback_ratios.is_empty() {
-        turns
-            .iter()
-            .take(turns.len().saturating_sub(1))
-            .filter(|turn| turn.model_id == model_id)
-            .filter_map(|turn| {
-                let total_input = astra_turn_types::NormalizedPromptCacheUsage::new(
-                    turn.usage.input_tokens,
-                    turn.usage.cached_input_tokens,
-                    turn.usage.cache_creation_tokens,
-                )
-                .total_input_tokens();
-                (total_input > 0)
-                    .then_some(turn.usage.cached_input_tokens as f64 / total_input as f64)
-            })
-            .collect::<Vec<_>>()
+fn require_intended_conversation_commit(
+    event: &session_journal::JournalEvent,
+    intended: &astra_turn_types::ConversationCommitV1,
+    session_id: &str,
+) -> Result<(), OneShotJournalCommitError> {
+    if event.conversation_commit.as_ref() == Some(intended) {
+        Ok(())
     } else {
-        prior_feedback_ratios
-    };
-    let avg_cache_hit_ratio = if prior_ratios.is_empty() {
-        0.0
-    } else {
-        prior_ratios.iter().sum::<f64>() / prior_ratios.len() as f64
-    };
-    let mut stats = astra_turn_core::pipeline_stats::PipelineStats {
-        turns_executed: prior_ratios.len() as u32,
-        avg_cache_hit_ratio,
-        ..Default::default()
-    };
-    for ratio in &prior_ratios {
-        stats.record_cache_read_share_observation(model_id, "bridge_inprocess", *ratio);
+        Err(OneShotJournalCommitError::NotCommitted(format!(
+            "journal storage policy omitted the exact canonical conversation commit for {session_id}"
+        )))
     }
-    stats.record_cache_read_share_observation(
-        model_id,
-        "bridge_inprocess",
-        feedback.cache_hit_ratio,
-    );
-
-    let feedback_evt = astra_turn_core::pipeline_journal::PipelineJournalEvent::from_feedback(
-        turn, model_id, &feedback,
-    );
-    let mut journal_events = Vec::new();
-    if let Ok(payload) = serde_json::to_value(&feedback_evt) {
-        journal_events.push(session_journal::JournalEvent::pipeline_feedback(
-            Some(session_id),
-            turn,
-            payload,
-        ));
-    }
-
-    for alert in astra_turn_core::trace_alert::evaluate_alerts(
-        turn,
-        model_id,
-        "bridge_inprocess",
-        &feedback,
-        &stats,
-        &astra_turn_core::recovery_state::RecoveryState::default(),
-    ) {
-        let alert_evt = astra_turn_core::pipeline_journal::PipelineJournalEvent::from_alert(&alert);
-        if let Ok(payload) = serde_json::to_value(&alert_evt) {
-            journal_events.push(session_journal::JournalEvent::pipeline_alert(
-                Some(session_id),
-                turn,
-                payload,
-            ));
-        }
-    }
-    Ok(journal_events)
 }
 
 pub(crate) fn append_one_shot_journal_events(
@@ -304,19 +183,26 @@ pub(crate) fn append_one_shot_journal_events(
     line: &str,
     result: &StreamResult,
     turn_start: Instant,
-) -> Result<Option<u32>, String> {
+    execution_lease: Option<&session_journal::SessionExecutionLease>,
+) -> Result<Option<OneShotJournalCommit>, OneShotJournalCommitError> {
     let Some(session_id) = session_id.filter(|sid| !sid.is_empty()) else {
         return Ok(None);
     };
-    let existing_events = match session_journal::read_journal(session_id) {
-        Ok(events) => events,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => {
-            return Err(format!(
-                "failed to read session journal for {session_id}: {error}"
-            ));
-        }
-    };
+    let execution_lease = execution_lease.ok_or_else(|| {
+        OneShotJournalCommitError::NotCommitted(format!(
+            "one-shot canonical persistence requires an execution lease for {session_id}"
+        ))
+    })?;
+    let writer = session_journal::JournalWriter::new(session_id).map_err(|error| {
+        OneShotJournalCommitError::NotCommitted(format!(
+            "failed to create session journal for {session_id}: {error}"
+        ))
+    })?;
+    let existing_events = writer.complete_append_order_snapshot().map_err(|error| {
+        OneShotJournalCommitError::CommitUnknown(format!(
+            "failed to read complete append-order journal for {session_id}: {error}"
+        ))
+    })?;
 
     // A completed user turn is the primary durable fact. LLM request/response
     // snapshots are optional diagnostics, so their absence must not suppress
@@ -336,19 +222,18 @@ pub(crate) fn append_one_shot_journal_events(
         .unwrap_or(0)
         .saturating_add(1);
     if existing_events.iter().any(|event| {
-        event.turn == Some(turn) && event.event_type == session_journal::JournalEventType::Turn
+        event.turn == Some(turn)
+            && matches!(
+                event.event_type,
+                session_journal::JournalEventType::Turn
+                    | session_journal::JournalEventType::TurnError
+            )
     }) {
-        return Ok(Some(turn));
+        return Err(OneShotJournalCommitError::NotCommitted(format!(
+            "one-shot turn identity {turn} already exists for session {session_id}"
+        )));
     }
-    let writer = session_journal::JournalWriter::new(session_id)
-        .map_err(|error| format!("failed to create session journal for {session_id}: {error}"))?;
-
-    let mut append_events = build_bridge_pipeline_journal_events(
-        Some(session_id),
-        turn,
-        model_id.unwrap_or("unknown"),
-        &result.turn_observability_events,
-    )?;
+    let mut append_events = result.turn_observability_events.clone();
     // The stream keeps context assembly as a deferred sidecar so it is only
     // made durable alongside a settled turn. The interactive commit path does
     // this already; one-shot chat must preserve the same evidence or a later
@@ -361,167 +246,128 @@ pub(crate) fn append_one_shot_journal_events(
             trace_json.clone(),
         ));
     }
-    append_events.push(
-        session_journal::JournalEvent::turn(
-            Some(session_id),
-            turn,
-            model_id,
-            line,
-            &result.full_text,
-            result.tool_calls_count,
-            result.prompt_tokens,
-            result.completion_tokens,
-            turn_start.elapsed().as_millis() as u64,
+    let canonical_messages =
+        astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
+            result.final_messages.clone(),
         )
-        .with_tool_surface(
-            result.visible_tools.clone(),
-            result.selected_skills.clone(),
-            result.tools_used.clone(),
-            result.budget_used,
-        )
-        .with_tool_calls(result.tool_call_records.clone())
-        .with_run_id(result.run_id.as_deref())
-        .with_budget_pressure(result.budget_pressure)
-        .with_cache_tokens(result.cache_read_tokens, result.cache_creation_tokens),
-    );
-    if let Err(error) = writer.append_bulk(&append_events) {
-        return Err(format!(
-            "failed to append one-shot journal events for {session_id}: {error}"
-        ));
+        .map_err(|error| {
+            OneShotJournalCommitError::NotCommitted(format!(
+                "failed to validate canonical one-shot conversation: {error}"
+            ))
+        })?;
+    let commits = existing_events
+        .iter()
+        .filter_map(|event| event.conversation_commit.clone())
+        .collect::<Vec<_>>();
+    let account_owner_id = crate::cli::cli_config::cli_utils::cli_user_id();
+    let local_owner_id = astra_services::local_owner_scope().id().to_string();
+    let owner_id = commits
+        .first()
+        .map(|commit| commit.cursor.owner_id.clone())
+        .unwrap_or_else(|| account_owner_id.clone());
+    if owner_id != account_owner_id && owner_id != local_owner_id {
+        return Err(OneShotJournalCommitError::NotCommitted(format!(
+            "canonical one-shot conversation belongs to another owner: {owner_id}"
+        )));
     }
-    Ok(Some(turn))
-}
+    let expected_base_cursor = commits.last().map(|commit| commit.cursor.clone());
+    let active = astra_turn_core::active_conversation::ActiveConversation::replay(
+        &owner_id, session_id, commits,
+    )
+    .map_err(|error| {
+        OneShotJournalCommitError::NotCommitted(format!(
+            "failed to replay canonical one-shot conversation: {error}"
+        ))
+    })?
+    .unwrap_or(
+        astra_turn_core::active_conversation::ActiveConversation::empty(&owner_id, session_id)
+            .map_err(|error| {
+                OneShotJournalCommitError::NotCommitted(format!(
+                    "failed to initialize canonical one-shot conversation: {error}"
+                ))
+            })?,
+    );
+    let prepared = active
+        .prepare_commit(turn, None, canonical_messages)
+        .map_err(|error| {
+            OneShotJournalCommitError::NotCommitted(format!(
+                "failed to prepare canonical one-shot conversation: {error}"
+            ))
+        })?;
+    let intended_commit = prepared.commit.clone();
+    let cursor = prepared.commit.cursor.clone();
 
-fn journal_prompt_turns(events: &[session_journal::JournalEvent]) -> Vec<JournalPromptTurn> {
-    let mut pending_request: Option<(
-        String,
-        Vec<serde_json::Value>,
-        Vec<serde_json::Value>,
-        String,
-    )> = None;
-    let mut turns = Vec::new();
-
-    for event in events {
-        match event.event_type {
-            session_journal::JournalEventType::LlmRequestFull => {
-                let Some(metadata) = event.metadata.as_ref() else {
-                    continue;
-                };
-                let Some(request) = metadata
-                    .get("request")
-                    .and_then(serde_json::Value::as_object)
-                else {
-                    continue;
-                };
-                let messages = request
-                    .get("messages")
-                    .and_then(serde_json::Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                let tools = request
-                    .get("tools")
-                    .and_then(serde_json::Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                let model = metadata
-                    .get("model")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string();
-                let provider = metadata
-                    .get("provider")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string();
-                pending_request = Some((model, messages, tools, provider));
-            }
-            session_journal::JournalEventType::LlmResponseFull => {
-                let Some((model, messages, tools, provider)) = pending_request.take() else {
-                    continue;
-                };
-                let Some(usage) = journal_usage_from_response_event(event) else {
-                    continue;
-                };
-                let total_input = astra_turn_types::NormalizedPromptCacheUsage::new(
-                    usage.input_tokens,
-                    usage.cached_input_tokens,
-                    usage.cache_creation_tokens,
-                )
-                .total_input_tokens();
-                let Some(mut snapshot) = journal_prompt_snapshot_from_messages(
-                    &messages,
-                    &tools,
-                    &model,
-                    &provider,
-                    total_input,
-                ) else {
-                    continue;
-                };
-                snapshot.provider = provider;
-                turns.push(JournalPromptTurn {
-                    model_id: model,
-                    snapshot,
-                    usage,
-                });
-            }
-            _ => {}
+    let mut turn_event = session_journal::JournalEvent::turn(
+        Some(session_id),
+        turn,
+        model_id,
+        line,
+        &result.full_text,
+        result.tool_calls_count,
+        result.prompt_tokens,
+        result.completion_tokens,
+        turn_start.elapsed().as_millis() as u64,
+    )
+    .with_tool_surface(
+        result.visible_tools.clone(),
+        result.selected_skills.clone(),
+        result.tools_used.clone(),
+        result.budget_used,
+    )
+    .with_tool_calls(result.tool_call_records.clone())
+    .with_run_id(result.run_id.as_deref())
+    .with_budget_pressure(result.budget_pressure)
+    .with_cache_tokens(result.cache_read_tokens, result.cache_creation_tokens)
+    .with_conversation_commit(prepared.commit);
+    turn_event.llm_rounds = result.llm_rounds;
+    // Content redaction is allowed to suppress the embedded commit. Do not
+    // advertise a canonical settlement when the exact intended commit will
+    // not actually be part of the journal batch.
+    require_intended_conversation_commit(&turn_event, &intended_commit, session_id)?;
+    append_events.push(turn_event);
+    match writer.append_canonical_commit_cas(
+        execution_lease,
+        expected_base_cursor.as_ref(),
+        turn,
+        &intended_commit,
+        &append_events,
+    ) {
+        session_journal::CanonicalCommitCasOutcome::Committed {
+            persistence_warning,
+        } => Ok(Some(OneShotJournalCommit {
+            turn,
+            cursor,
+            persistence_error: persistence_warning,
+        })),
+        session_journal::CanonicalCommitCasOutcome::NotCommitted(reason)
+        | session_journal::CanonicalCommitCasOutcome::Conflict(reason) => {
+            Err(OneShotJournalCommitError::NotCommitted(format!(
+                "failed to append one-shot canonical journal commit for {session_id}: {reason}"
+            )))
+        }
+        session_journal::CanonicalCommitCasOutcome::Unknown(reason) => {
+            Err(OneShotJournalCommitError::CommitUnknown(format!(
+                "one-shot canonical journal commit is uncertain for {session_id}: {reason}"
+            )))
         }
     }
-    turns
-}
-
-fn journal_usage_from_response_event(
-    event: &session_journal::JournalEvent,
-) -> Option<astra_runtime::turn::token_usage::TokenUsage> {
-    let usage = event
-        .metadata
-        .as_ref()
-        .and_then(|meta| meta.get("response"))
-        .and_then(|response| response.get("response"))
-        .and_then(|response| response.get("usage"))
-        .and_then(serde_json::Value::as_object)?;
-    let canonical = astra_runtime::turn::token_usage::TokenUsage::from_partial_json_map(usage);
-    if !canonical.is_empty() {
-        return Some(canonical);
-    }
-    let provider = event
-        .metadata
-        .as_ref()
-        .and_then(|meta| meta.get("provider"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("openai");
-    astra_runtime::turn::token_usage::extract_usage(
-        astra_runtime::turn::token_usage::UsageDialect::for_provider(provider),
-        usage,
-    )
-}
-
-fn journal_prompt_snapshot_from_messages(
-    messages: &[serde_json::Value],
-    tools: &[serde_json::Value],
-    model: &str,
-    provider: &str,
-    cache_eligible_tokens: u64,
-) -> Option<astra_turn_core::cache_diagnostics::PromptStateSnapshot> {
-    astra_turn_core::cache_diagnostics::prompt_snapshot_from_messages(
-        messages,
-        tools,
-        provider,
-        model,
-        usize::try_from(cache_eligible_tokens).unwrap_or(usize::MAX),
-    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        append_one_shot_journal_events, build_bridge_pipeline_journal_events, enqueue_ingestion_pub,
+        OneShotJournalCommitError, append_one_shot_journal_events, enqueue_ingestion_pub,
+        require_intended_conversation_commit,
     };
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::time::Instant;
 
     use astra_services::session_journal;
+
+    fn execution_lease(session_id: &str) -> session_journal::SessionExecutionLease {
+        session_journal::SessionExecutionLease::try_acquire(session_id).unwrap()
+    }
 
     #[serial_test::serial]
     #[test]
@@ -559,22 +405,11 @@ mod tests {
     }
 
     #[test]
-    fn build_bridge_pipeline_journal_events_surfaces_unreadable_journal() {
-        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
-        let sid = format!("bridge-pipeline-unreadable-{}", uuid::Uuid::new_v4());
-        std::fs::create_dir_all(session_journal::journal_file_path(&sid)).unwrap();
-
-        let error = build_bridge_pipeline_journal_events(Some(&sid), 1, "test-model", &[])
-            .expect_err("directory journal path should surface an error");
-
-        assert!(error.contains("failed to read session journal"), "{error}");
-    }
-
-    #[test]
     fn append_one_shot_journal_events_surfaces_unreadable_journal() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("one-shot-unreadable-{}", uuid::Uuid::new_v4());
         std::fs::create_dir_all(session_journal::journal_file_path(&sid)).unwrap();
+        let lease = execution_lease(&sid);
 
         let error = append_one_shot_journal_events(
             Some(&sid),
@@ -582,10 +417,16 @@ mod tests {
             "continue",
             &crate::tests::stub_stream_result("answer"),
             Instant::now(),
+            Some(&lease),
         )
         .expect_err("directory journal path should surface an error");
 
-        assert!(error.contains("failed to read session journal"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to create session journal"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -593,6 +434,7 @@ mod tests {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("one-shot-primary-turn-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        let lease = execution_lease(&sid);
         writer
             .append(&session_journal::JournalEvent::session_start(
                 Some(&sid),
@@ -611,6 +453,7 @@ mod tests {
         );
         first.prompt_tokens = 11;
         first.completion_tokens = 7;
+        first.llm_rounds = Some(2);
         first.pending_context_assembly_trace = Some((
             41,
             serde_json::json!({
@@ -625,16 +468,21 @@ mod tests {
             "first question",
             &first,
             Instant::now(),
+            Some(&lease),
         )
         .unwrap();
 
-        let second = crate::tests::stub_stream_result("second answer");
+        let mut second = crate::tests::stub_stream_result("second answer");
+        second.tool_calls_count = 2;
+        second.tools_used = vec!["tool_search".to_string(), "agent".to_string()];
+        second.llm_rounds = Some(3);
         append_one_shot_journal_events(
             Some(&sid),
             Some("test-model"),
             "second question",
             &second,
             Instant::now(),
+            Some(&lease),
         )
         .unwrap();
 
@@ -656,6 +504,7 @@ mod tests {
         assert_eq!(turns[0].assistant_output.as_deref(), Some("first answer"));
         assert_eq!(turns[0].tokens_in, Some(11));
         assert_eq!(turns[0].tokens_out, Some(7));
+        assert_eq!(turns[0].llm_rounds, Some(2));
         assert_eq!(
             turns[0]
                 .tool_calls
@@ -666,6 +515,13 @@ mod tests {
         assert_eq!(turns[1].turn, Some(2));
         assert_eq!(turns[1].user_input.as_deref(), Some("second question"));
         assert_eq!(turns[1].assistant_output.as_deref(), Some("second answer"));
+        assert_eq!(turns[1].tool_count, Some(2));
+        assert_eq!(
+            turns[1].tools_used.as_deref(),
+            Some(["agent".to_string(), "tool_search".to_string()].as_slice())
+        );
+        assert!(turns[1].tool_calls.is_none());
+        assert_eq!(turns[1].llm_rounds, Some(3));
         let traces: Vec<_> = events
             .iter()
             .filter(|event| {
@@ -700,6 +556,7 @@ mod tests {
             "third question",
             &crate::tests::stub_stream_result("third answer"),
             Instant::now(),
+            Some(&lease),
         )
         .unwrap();
 
@@ -712,12 +569,113 @@ mod tests {
         assert_eq!(turns[2].turn, Some(3));
     }
 
+    #[test]
+    fn one_shot_replay_uses_physical_commit_order_when_timestamps_move_backwards() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let sid = format!("one-shot-append-order-{}", uuid::Uuid::new_v4());
+        let owner_id = crate::cli::cli_config::cli_utils::cli_user_id();
+        let first_messages = vec![
+            serde_json::json!({"role": "user", "content": "first"}),
+            serde_json::json!({"role": "assistant", "content": "first answer"}),
+        ];
+        let first =
+            astra_turn_core::active_conversation::ActiveConversation::empty(&owner_id, &sid)
+                .unwrap()
+                .prepare_commit(1, None, first_messages.clone())
+                .unwrap();
+        let mut second_messages = first_messages;
+        second_messages.extend([
+            serde_json::json!({"role": "user", "content": "second"}),
+            serde_json::json!({"role": "assistant", "content": "second answer"}),
+        ]);
+        let second = first
+            .next
+            .prepare_commit(2, None, second_messages.clone())
+            .unwrap();
+        let mut first_event = session_journal::JournalEvent::turn(
+            Some(&sid),
+            1,
+            Some("test-model"),
+            "first",
+            "first answer",
+            0,
+            0,
+            0,
+            1,
+        );
+        first_event.ts = "2030-01-01T00:00:00Z".to_string();
+        first_event.conversation_commit = Some(first.commit.clone());
+        let mut second_event = session_journal::JournalEvent::turn(
+            Some(&sid),
+            2,
+            Some("test-model"),
+            "second",
+            "second answer",
+            0,
+            0,
+            0,
+            1,
+        );
+        second_event.ts = "2020-01-01T00:00:00Z".to_string();
+        second_event.conversation_commit = Some(second.commit.clone());
+        let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        writer.append_bulk(&[first_event, second_event]).unwrap();
+        let lease = execution_lease(&sid);
+
+        let physical_commits = writer
+            .complete_append_order_snapshot()
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| event.conversation_commit)
+            .collect::<Vec<_>>();
+        assert_eq!(physical_commits, vec![first.commit, second.commit]);
+
+        let mut third_messages = second_messages;
+        third_messages.extend([
+            serde_json::json!({"role": "user", "content": "third"}),
+            serde_json::json!({"role": "assistant", "content": "third answer"}),
+        ]);
+        let mut result = crate::tests::stub_stream_result("third answer");
+        result.final_messages = third_messages;
+        append_one_shot_journal_events(
+            Some(&sid),
+            Some("test-model"),
+            "third",
+            &result,
+            Instant::now(),
+            Some(&lease),
+        )
+        .unwrap();
+
+        let commits = writer
+            .complete_append_order_snapshot()
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| event.conversation_commit)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            commits
+                .iter()
+                .map(|commit| commit.cursor.conversation_seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(
+            astra_turn_core::active_conversation::ActiveConversation::replay(
+                &owner_id, &sid, commits,
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn append_one_shot_journal_events_surfaces_append_failure() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("one-shot-append-fail-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
+        let lease = execution_lease(&sid);
         writer
             .append(&session_journal::JournalEvent::llm_request_full(
                 Some(&sid),
@@ -761,14 +719,60 @@ mod tests {
             "continue",
             &crate::tests::stub_stream_result("answer"),
             Instant::now(),
+            Some(&lease),
         )
         .expect_err("read-only journal should surface append failure");
 
+        assert!(matches!(error, OneShotJournalCommitError::CommitUnknown(_)));
         assert!(
-            error.contains("failed to append one-shot journal events"),
+            error
+                .to_string()
+                .contains("one-shot canonical journal commit is uncertain"),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("failed to open canonical journal CAS"),
             "{error}"
         );
 
         std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    fn intended_commit(session_id: &str) -> astra_turn_types::ConversationCommitV1 {
+        astra_turn_core::active_conversation::ActiveConversation::empty("owner-1", session_id)
+            .unwrap()
+            .prepare_commit(
+                1,
+                None,
+                vec![serde_json::json!({"role": "user", "content": "hello"})],
+            )
+            .unwrap()
+            .commit
+    }
+
+    #[test]
+    fn journal_policy_suppressed_commit_is_rejected_before_append() {
+        let sid = "redacted-canonical-commit";
+        let intended = intended_commit(sid);
+        // This is the event shape produced when the journal privacy policy
+        // suppresses the embedded canonical commit.
+        let event = session_journal::JournalEvent::turn(
+            Some(sid),
+            1,
+            Some("test-model"),
+            "hello",
+            "done",
+            0,
+            0,
+            0,
+            1,
+        );
+
+        let error = require_intended_conversation_commit(&event, &intended, sid)
+            .expect_err("a suppressed canonical commit must fail closed");
+        assert!(matches!(error, OneShotJournalCommitError::NotCommitted(_)));
+        assert!(error.to_string().contains("storage policy omitted"));
     }
 }

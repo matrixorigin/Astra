@@ -57,7 +57,6 @@ import {
   normalizeNextEventIndex,
   type ChatActiveRunRecord,
 } from "@/lib/api/active-run-merge";
-import { modelCache } from "@/lib/api/model-cache";
 import { settleRuntimeCancel } from "@/lib/api/runtime-cancel-settlement";
 
 type ChatRecord = ChatSummary & {
@@ -110,9 +109,7 @@ type StreamResult = {
 
 export type ModelOfferingSelectionErrorCode =
   | "invalid_selection"
-  | "authentication_required"
-  | "catalog_unavailable"
-  | "offering_unavailable";
+  | "authentication_required";
 
 export class ModelOfferingSelectionError extends Error {
   constructor(
@@ -2684,27 +2681,9 @@ export async function resolveModelOfferingSelection(
     );
   }
 
-  let modelsPromise = modelCache.get(accessToken);
-  if (!modelsPromise) {
-    modelsPromise = client.sdk.listModels();
-    modelCache.set(accessToken, modelsPromise);
-  }
-
-  const models = await modelsPromise.catch((error: unknown) => {
-    modelCache.invalidate(accessToken);
-    throw new ModelOfferingSelectionError(
-      "catalog_unavailable",
-      error instanceof Error ? error.message : "Model catalog is unavailable",
-    );
-  });
-  const matched = models.find(
-    (item) => item.offering_id === offeringId && item.is_active,
-  );
-  if (!matched) {
-    throw new ModelOfferingSelectionError(
-      "offering_unavailable",
-      `Model Offering '${offeringId}' is not available`,
-    );
-  }
+  // The server is the authority for Offering existence, activity, scope, and
+  // route revalidation at run admission. The SDK drains the complete
+  // paginated catalog for browsing, but this helper still never invents an
+  // admission allow-list: the exact Offering is revalidated at run admission.
   return { offeringId };
 }

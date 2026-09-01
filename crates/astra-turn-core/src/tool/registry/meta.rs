@@ -397,7 +397,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         scope: Scope::Local,
         requires: &[Capability::LSPServer],
         binding_validation: RuntimeBindingValidation::None,
-        schema_tokens: 90,
+        schema_tokens: 360,
     },
     ToolMeta {
         name: "git",
@@ -548,14 +548,74 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
         schema_tokens: 35,
     },
     ToolMeta {
-        name: "task_board",
-        description: "Durable session task board: create, update, list, get, stop, adopt, or archive task-board work.",
+        name: "start_work",
+        description: "Establish canonical Work around the current durable conversation",
         triggers: &[],
         intents: &[IntentType::CodeEdit, IntentType::Introspect],
-        scope: Scope::Local,
-        requires: &[],
+        scope: Scope::CrossSession,
+        requires: &[Capability::WorkLifecycle],
         binding_validation: RuntimeBindingValidation::None,
-        schema_tokens: 160,
+        schema_tokens: 90,
+    },
+    ToolMeta {
+        name: "run_next_work_item",
+        description: "Select and bind the next canonical Work task to the primary session",
+        triggers: &[],
+        intents: &[IntentType::CodeEdit, IntentType::Introspect],
+        scope: Scope::CrossSession,
+        requires: &[Capability::WorkLifecycle],
+        binding_validation: RuntimeBindingValidation::None,
+        schema_tokens: 70,
+    },
+    ToolMeta {
+        name: "settle_work_item",
+        description: "Record the typed outcome for the exact canonical Work task attempt; use delivered only when direct evidence covers every explicit expected-result requirement",
+        triggers: &[],
+        intents: &[IntentType::CodeEdit, IntentType::Introspect],
+        scope: Scope::CrossSession,
+        requires: &[Capability::WorkLifecycle],
+        binding_validation: RuntimeBindingValidation::None,
+        schema_tokens: 100,
+    },
+    ToolMeta {
+        name: "inspect_work_plan",
+        description: "Inspect the content-addressed canonical Work plan bound to this session",
+        triggers: &[],
+        intents: &[IntentType::CodeRead, IntentType::Introspect],
+        scope: Scope::CrossSession,
+        requires: &[Capability::WorkPlanning],
+        binding_validation: RuntimeBindingValidation::None,
+        schema_tokens: 80,
+    },
+    ToolMeta {
+        name: "propose_work_plan",
+        description: "Submit typed Work items and dependencies against an exact plan context",
+        triggers: &[],
+        intents: &[IntentType::CodeEdit, IntentType::Introspect],
+        scope: Scope::CrossSession,
+        requires: &[Capability::WorkPlanning],
+        binding_validation: RuntimeBindingValidation::None,
+        schema_tokens: 260,
+    },
+    ToolMeta {
+        name: "inspect_work_criteria",
+        description: "Inspect accepted Done-when criteria for the canonical Work branch",
+        triggers: &[],
+        intents: &[IntentType::CodeRead, IntentType::Introspect],
+        scope: Scope::CrossSession,
+        requires: &[Capability::WorkPlanning],
+        binding_validation: RuntimeBindingValidation::None,
+        schema_tokens: 90,
+    },
+    ToolMeta {
+        name: "propose_work_criteria",
+        description: "Submit a typed provisional Done-when set against an exact Work context",
+        triggers: &[],
+        intents: &[IntentType::CodeEdit, IntentType::Introspect],
+        scope: Scope::CrossSession,
+        requires: &[Capability::WorkPlanning],
+        binding_validation: RuntimeBindingValidation::None,
+        schema_tokens: 360,
     },
     ToolMeta {
         name: "mo_query",
@@ -593,7 +653,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
     },
     ToolMeta {
         name: "agent",
-        description: "Multi-agent operations: spawn one sub-agent, collect one background result, send messages, or execute a tool chain.",
+        description: "Single-agent lifecycle: spawn one child, collect one background result, send messages, or execute a tool chain. For two or more concurrent children, use agent_fanout instead.",
         triggers: &["agent", "spawn", "chain", "orchestrate", "代理"],
         intents: &[IntentType::CodeEdit],
         scope: Scope::External,
@@ -603,7 +663,7 @@ pub static TOOL_CATALOG: &[ToolMeta] = &[
     },
     ToolMeta {
         name: "agent_fanout",
-        description: "Atomic fixed-size parallel sub-agent fan-out: start a group, collect group results, or stop one slot.",
+        description: "Atomic fixed-size parallel sub-agent fan-out for same-turn multi-agent work: start a group, collect group results, or stop one slot. Do not establish durable Work unless the user asks for tracked continuation.",
         triggers: &[
             "fanout",
             "parallel agents",
@@ -868,15 +928,49 @@ mod tests {
     }
 
     #[test]
-    fn task_board_catalog_entry_does_not_use_text_triggers() {
-        let tool = TOOL_CATALOG
-            .iter()
-            .find(|tool| tool.name == "task_board")
-            .expect("task_board catalog entry");
+    fn direct_agent_contract_points_parallel_requests_to_fanout() {
+        let direct = tool_meta("agent").expect("agent catalog entry").description;
         assert!(
-            tool.triggers.is_empty(),
-            "task_board must be exposed by provider/schema policy, not prompt text matching"
+            direct.contains("Single-agent") && direct.contains("agent_fanout"),
+            "the deferred direct-agent schema must not invite repeated foreground spawns"
         );
+        let fanout = tool_meta("agent_fanout")
+            .expect("agent_fanout catalog entry")
+            .description;
+        assert!(
+            fanout.contains("same-turn multi-agent")
+                && fanout.contains("Do not establish durable Work"),
+            "the visible fanout schema must separate parallel topology from durable Work"
+        );
+    }
+
+    #[test]
+    fn work_catalog_entries_are_capability_declared_without_text_matching() {
+        for name in ["start_work", "run_next_work_item", "settle_work_item"] {
+            let tool = TOOL_CATALOG
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} catalog entry"));
+            assert!(tool.triggers.is_empty());
+            assert_eq!(tool.requires, &[Capability::WorkLifecycle]);
+        }
+
+        for name in [
+            "inspect_work_plan",
+            "propose_work_plan",
+            "inspect_work_criteria",
+            "propose_work_criteria",
+        ] {
+            let tool = TOOL_CATALOG
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("{name} catalog entry"));
+            assert!(
+                tool.triggers.is_empty(),
+                "{name} must be exposed only by validated typed Work binding"
+            );
+            assert_eq!(tool.requires, &[Capability::WorkPlanning]);
+        }
     }
 
     #[test]
@@ -920,12 +1014,7 @@ mod tests {
 
     #[test]
     fn catalog_includes_top_level_session_state_tools() {
-        for name in [
-            "introspect",
-            "compress_context",
-            "rollback_session_state",
-            "task_board",
-        ] {
+        for name in ["introspect", "compress_context", "rollback_session_state"] {
             let tool = TOOL_CATALOG
                 .iter()
                 .find(|tool| tool.name == name)

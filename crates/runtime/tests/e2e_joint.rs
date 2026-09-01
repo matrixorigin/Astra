@@ -293,8 +293,10 @@ fn durable_record(run_id: &str, session_id: &str, user_id: &str) -> DurableRunRe
         agent_binding_schema_version: None,
         model_offering_id: None,
         resolved_model_name: None,
+        capability_server_refs_json: None,
         runtime_profile: None,
-        provider_request_fingerprint: None,
+        start_request_fingerprint: None,
+        work_binding: None,
         events: vec![json!({"event_type": "run_started", "data": {"source": "joint_e2e"}})],
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
@@ -556,6 +558,7 @@ impl RunLifecycleService for JointRunLifecycle {
             workspace: None,
             executor: None,
             transport: None,
+            accounting: None,
         })
     }
 
@@ -596,13 +599,21 @@ impl RunLifecycleService for JointRunLifecycle {
         &self,
         run_id: String,
         user_id: String,
+        expected_session_id: String,
         request_id: String,
         kind: DurableRunInteractionKind,
         response_data: Value,
     ) -> Result<DurableRunInteractionResolveOutcome, (StatusCode, Json<ErrorResponse>)> {
-        self.store()
-            .await
-            .resolve_run_interaction(&user_id, &run_id, &request_id, kind, response_data)
+        let store = self.store().await;
+        store
+            .resolve_run_interaction(
+                &user_id,
+                &expected_session_id,
+                &run_id,
+                &request_id,
+                kind,
+                response_data,
+            )
             .await
             .map_err(service_unavailable)
     }
@@ -612,14 +623,20 @@ impl RunLifecycleService for JointRunLifecycle {
         run_id: String,
         user_id: String,
     ) -> Result<CancelRunRecord, (StatusCode, Json<ErrorResponse>)> {
-        self.store()
+        let store = self.store().await;
+        let run = store
+            .load_run(&user_id, &run_id)
             .await
-            .update_run_status(&user_id, &run_id, "cancelled", None, None)
+            .map_err(service_unavailable)?
+            .ok_or_else(|| not_found("run not found"))?;
+        store
+            .update_run_status(&user_id, &run.session_id, &run_id, "cancelled", None, None)
             .await
             .map_err(service_unavailable)?;
         Ok(CancelRunRecord {
             run_id,
             status: "cancelled".to_string(),
+            execution_settled: true,
         })
     }
 
@@ -664,6 +681,7 @@ impl RunLifecycleService for JointRunLifecycle {
             store
                 .append_event(
                     &user_id,
+                    &run.session_id,
                     &run_id,
                     json!({
                         "event_type": "user_intent",
@@ -682,6 +700,7 @@ impl RunLifecycleService for JointRunLifecycle {
             intent_id,
             status: astra_turn_types::UserIntentStatus::AcceptedRemote,
             duplicate,
+            event_index: 0,
         })
     }
 
@@ -690,9 +709,21 @@ impl RunLifecycleService for JointRunLifecycle {
         run_id: String,
         user_id: String,
     ) -> Result<RunMutationRecord, (StatusCode, Json<ErrorResponse>)> {
-        self.store()
+        let store = self.store().await;
+        let run = store
+            .load_run(&user_id, &run_id)
             .await
-            .update_run_status(&user_id, &run_id, "waiting", Some("user"), None)
+            .map_err(service_unavailable)?
+            .ok_or_else(|| not_found("run not found"))?;
+        store
+            .update_run_status(
+                &user_id,
+                &run.session_id,
+                &run_id,
+                "waiting",
+                Some("user"),
+                None,
+            )
             .await
             .map_err(service_unavailable)?;
         Ok(RunMutationRecord::applied(run_id, "waiting", "running"))
@@ -1371,6 +1402,7 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
         store
             .append_event(
                 &user_id,
+                &session_id,
                 &run_id,
                 json!({
                     "event_type": "assistant_delta",
@@ -1409,12 +1441,20 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
             let approval_id = id("approval");
             let store = shared_store.read().await.clone();
             store
-                .update_run_status(&user_id, &run_id, "waiting", Some("approval"), None)
+                .update_run_status(
+                    &user_id,
+                    &session_id,
+                    &run_id,
+                    "waiting",
+                    Some("approval"),
+                    None,
+                )
                 .await
                 .expect("S04 approval pause must persist waiting status");
             store
                 .append_event(
                     &user_id,
+                    &session_id,
                     &run_id,
                     json!({
                         "event_type": "approval_request",
@@ -1449,13 +1489,14 @@ async fn e2e_joint_2_s04_seventeen_sse_reconnects_survive_restart_and_approvals(
     store
         .append_event(
             &user_id,
+            &session_id,
             &run_id,
             json!({"event_type": "run_finished", "data": {"status": "completed"}}),
         )
         .await
         .expect("S04 final run_finished event must persist");
     store
-        .update_run_status(&user_id, &run_id, "completed", None, None)
+        .update_run_status(&user_id, &session_id, &run_id, "completed", None, None)
         .await
         .expect("S04 final completed status must persist");
     absorb_sse_events(
@@ -1546,6 +1587,7 @@ async fn server_only_interaction_callbacks_survive_disconnect_restart_and_cross_
     owner_store
         .append_event(
             &user_id,
+            &approval_session_id,
             &approval_run_id,
             json!({
                 "event_type": "approval_required",
@@ -1563,6 +1605,7 @@ async fn server_only_interaction_callbacks_survive_disconnect_restart_and_cross_
     owner_store
         .update_run_status(
             &user_id,
+            &approval_session_id,
             &approval_run_id,
             "waiting",
             Some("tool_approval"),
@@ -1695,6 +1738,7 @@ async fn server_only_interaction_callbacks_survive_disconnect_restart_and_cross_
     owner_store
         .append_event(
             &user_id,
+            &prompt_session_id,
             &prompt_run_id,
             json!({
                 "event_type": "ask_user_prompted",
@@ -1719,6 +1763,7 @@ async fn server_only_interaction_callbacks_survive_disconnect_restart_and_cross_
     owner_store
         .update_run_status(
             &user_id,
+            &prompt_session_id,
             &prompt_run_id,
             "waiting",
             Some("user_input"),
@@ -1823,6 +1868,7 @@ async fn server_only_interaction_callbacks_survive_disconnect_restart_and_cross_
     owner_store
         .append_event(
             &user_id,
+            &expired_session_id,
             &expired_run_id,
             json!({
                 "event_type": "approval_required",
@@ -1840,6 +1886,7 @@ async fn server_only_interaction_callbacks_survive_disconnect_restart_and_cross_
     owner_store
         .update_run_status(
             &user_id,
+            &expired_session_id,
             &expired_run_id,
             "waiting",
             Some("tool_approval"),
@@ -1850,6 +1897,7 @@ async fn server_only_interaction_callbacks_survive_disconnect_restart_and_cross_
     owner_store
         .resolve_run_interaction(
             &user_id,
+            &expired_session_id,
             &expired_run_id,
             &expired_request_id,
             DurableRunInteractionKind::Approval,
@@ -1915,13 +1963,21 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
         .await
         .expect("S07 durable run insert must succeed");
     store
-        .update_run_status(&user_id, &run_id, "waiting", Some("approval"), None)
+        .update_run_status(
+            &user_id,
+            &session_id,
+            &run_id,
+            "waiting",
+            Some("approval"),
+            None,
+        )
         .await
         .expect("S07 approval waiting status must persist");
     let approval_id = id("approval");
     store
         .append_event(
             &user_id,
+            &session_id,
             &run_id,
             json!({
                 "event_type": "approval_request",
@@ -2039,8 +2095,9 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
     let final_store = shared_store.read().await.clone();
     final_store
         .append_event(
-                    &user_id,
-                    &run_id,
+            &user_id,
+            &session_id,
+            &run_id,
             json!({"event_type": "pre_execute_check", "data": {"approval_id": approval_id, "condition_passed": true}}),
         )
         .await
@@ -2048,13 +2105,14 @@ async fn e2e_joint_3_s07_approval_survives_48h_restarts_and_migration() {
     final_store
         .append_event(
             &user_id,
+            &session_id,
             &run_id,
             json!({"event_type": "run_finished", "data": {"status": "completed"}}),
         )
         .await
         .expect("S07 run_finished must persist");
     final_store
-        .update_run_status(&user_id, &run_id, "completed", None, None)
+        .update_run_status(&user_id, &session_id, &run_id, "completed", None, None)
         .await
         .expect("S07 completed status must persist");
 
@@ -2447,6 +2505,7 @@ async fn e2e_joint_5_s14_8k_window_four_devices_and_lease_expiry() {
     store
         .append_event(
             &user_id,
+            &session_id,
             &run_id,
             json!({"event_type": "assistant_delta", "data": {"text": "active replay"}}),
         )

@@ -56,7 +56,7 @@ pub fn full_server_capabilities_for_tests() -> astra_turn_core::capability::Capa
 
 /// Production-truth `CapabilitySet` for an agentic-run lifecycle.
 pub fn lifecycle_server_capabilities(
-    _database_pool_present: bool,
+    database_pool_present: bool,
     reflect_service_configured: bool,
 ) -> astra_turn_core::capability::CapabilitySet {
     use astra_turn_core::capability::{Capability, CapabilitySet};
@@ -64,9 +64,35 @@ pub fn lifecycle_server_capabilities(
         .with(Capability::AgentSpawner)
         .with(Capability::MemoryService)
         .with(Capability::SkillsCatalog)
-        .with(Capability::GitHubAuth)
         .with(Capability::PlanLifecycle)
         .with_if(reflect_service_configured, Capability::ReflectService)
+        .with_if(database_pool_present, Capability::WorkPlanning)
+        .with_if(database_pool_present, Capability::WorkLifecycle)
+}
+
+/// Production capability set for a delegated child run.
+///
+/// A generic child shares the session and execution lineage with its parent,
+/// but it is not another controller for the session's canonical Work graph.
+/// Only an explicitly assigned WorkItem attempt receives that control-plane
+/// surface. This is derived from the typed spawn assignment rather than the
+/// child's task prose or a caller-maintained tool-name list.
+pub fn delegated_subrun_capabilities(
+    database_pool_present: bool,
+    reflect_service_configured: bool,
+    work_item_assigned: bool,
+) -> astra_turn_core::capability::CapabilitySet {
+    use astra_turn_core::capability::Capability;
+
+    let capabilities =
+        lifecycle_server_capabilities(database_pool_present, reflect_service_configured);
+    if work_item_assigned {
+        capabilities
+    } else {
+        capabilities
+            .without(Capability::WorkPlanning)
+            .without(Capability::WorkLifecycle)
+    }
 }
 
 /// Production-truth server `CapabilitySet` derived from [`crate::app_state::AppState`].
@@ -100,6 +126,7 @@ pub fn server_builtin_tool_schemas(
         schemas.retain(|s| tool_schema_name(s) != Some("reflect"));
     }
     retain_server_executable_schemas(&mut schemas);
+    astra_tools::schemas::project_action_schemas_for_surface(&mut schemas, "server");
     #[cfg(unix)]
     {
         astra_tools::schemas::narrow_run_script_for_server(&mut schemas);
@@ -152,7 +179,10 @@ pub fn cli_local_tool_schemas(
         })
         .collect::<Vec<_>>();
     pool.extend(mcp_provider_tool_schemas("cli-mcp", client_mcp));
-    astra_turn_core::tool_surface::resolve(CapabilitySurface::CliLocal, capabilities, &pool)
+    let mut schemas =
+        astra_turn_core::tool_surface::resolve(CapabilitySurface::CliLocal, capabilities, &pool);
+    astra_tools::schemas::project_action_schemas_for_surface(&mut schemas, "local");
+    schemas
 }
 
 /// Tool schemas for remote/thin CLI turns. Mirrors Web because execution
@@ -284,10 +314,16 @@ pub fn build_server_skill_registry(
 /// 2. Bundled dynamic skills compiled into the CLI.
 /// 3. Authenticated remote server catalog, which adds DB skills and API-server
 ///    HOME skills without overriding project-local skills of the same name.
+///
+/// `project_root` anchors the project-local filesystem provider. When `None`,
+/// the process current directory is used (legacy standalone behavior). Pass an
+/// explicit root when tool execution runs in a workspace that differs from the
+/// process cwd so that workspace skills stay visible.
 pub fn build_cli_local_skill_registry(
     remote_catalog: Option<RemoteSkillCatalogProvider>,
+    project_root: Option<&std::path::Path>,
 ) -> Arc<UnifiedSkillRegistry> {
-    let registry = cli_local_skill_registry(remote_catalog);
+    let registry = cli_local_skill_registry(remote_catalog, project_root);
     crate::skills::catalog::discover_registry_now(&registry);
     registry
 }
@@ -297,17 +333,22 @@ pub fn build_cli_local_skill_registry(
 /// registry asynchronously once their event loop is live.
 pub fn build_cli_local_skill_registry_bootstrap(
     remote_catalog: Option<RemoteSkillCatalogProvider>,
+    project_root: Option<&std::path::Path>,
 ) -> Arc<UnifiedSkillRegistry> {
-    let registry = cli_local_skill_registry(remote_catalog);
+    let registry = cli_local_skill_registry(remote_catalog, project_root);
     crate::skills::catalog::discover_local_registry_now(&registry);
     registry
 }
 
 fn cli_local_skill_registry(
     remote_catalog: Option<RemoteSkillCatalogProvider>,
+    project_root: Option<&std::path::Path>,
 ) -> Arc<UnifiedSkillRegistry> {
     let mut registry = UnifiedSkillRegistry::new();
-    registry.add_provider(Box::new(LocalSkillProvider::standard()));
+    match project_root {
+        Some(root) => registry.add_provider(Box::new(LocalSkillProvider::with_project_root(root))),
+        None => registry.add_provider(Box::new(LocalSkillProvider::standard())),
+    }
     registry.add_provider(Box::new(BundledSkillProvider::with_defaults()));
     if let Some(provider) = remote_catalog {
         registry.add_provider(Box::new(provider));
@@ -789,7 +830,7 @@ mod tests {
             .with(Capability::PlanLifecycle)
             .with(Capability::LocalBackgroundTasks);
 
-        // ── Durable task board: runtime backbone, not CLI-local ──
+        // Planning has no legacy checklist mutation surface on any topology.
         for (surface, names) in [
             ("web", names(resolve(Surface::Web, &server_caps, &pool))),
             (
@@ -802,8 +843,8 @@ mod tests {
             ),
         ] {
             assert!(
-                names.contains(&"task_board".to_string()),
-                "{surface} must expose the durable task-board backbone: {names:?}"
+                !names.contains(&"task_board".to_string()),
+                "{surface} must not expose retired task-board authority: {names:?}"
             );
         }
 
@@ -860,6 +901,68 @@ mod tests {
     }
 
     #[test]
+    fn agent_action_surface_matches_the_selected_execution_owner() {
+        use astra_turn_core::capability::CapabilitySet;
+
+        fn agent_schema(schemas: &[Value]) -> &Value {
+            schemas
+                .iter()
+                .find(|schema| tool_schema_name(schema) == Some("agent"))
+                .expect("agent schema")
+        }
+
+        fn actions(schema: &Value) -> Vec<&str> {
+            schema
+                .pointer("/function/parameters/properties/action/enum")
+                .and_then(Value::as_array)
+                .expect("agent action enum")
+                .iter()
+                .map(|action| action.as_str().expect("string action"))
+                .collect()
+        }
+
+        let capabilities = lifecycle_server_capabilities(true, true);
+        let server = server_builtin_tool_schemas(&capabilities);
+        let server_agent = agent_schema(&server);
+        assert_eq!(
+            actions(server_agent),
+            vec!["spawn", "get_result", "send_message"]
+        );
+        assert!(
+            server_agent
+                .pointer("/function/parameters/properties/steps")
+                .is_none()
+        );
+        assert!(
+            server_agent
+                .pointer("/function/parameters/x-astra-per-action-required/run_chain")
+                .is_none()
+        );
+        let server_description = server_agent
+            .pointer("/function/description")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(server_description.contains("start_work"));
+        assert!(!server_description.contains("run_chain"));
+
+        let local = cli_local_tool_schemas(
+            astra_tools::schemas::all_tool_schemas(),
+            Vec::new(),
+            &CapabilitySet::all(),
+        );
+        let local_agent = agent_schema(&local);
+        assert_eq!(
+            actions(local_agent),
+            vec!["spawn", "get_result", "run_chain", "send_message"]
+        );
+        assert!(
+            local_agent
+                .pointer("/function/parameters/properties/steps")
+                .is_some()
+        );
+    }
+
+    #[test]
     fn server_builtin_schema_pool_is_provider_declared_only() {
         let caps = full_server_capabilities_for_tests();
         let tool_names: std::collections::BTreeSet<String> =
@@ -870,7 +973,8 @@ mod tests {
         for visible in [
             "ask_user",
             "agent",
-            "task_board",
+            "inspect_work_plan",
+            "propose_work_plan",
             "session",
             "tool_search",
             "web_fetch",
@@ -920,6 +1024,7 @@ mod tests {
             "web_search",
             "read_file",
             "write_file",
+            "publish_artifact",
             "git",
             "run_script",
             "lsp",
@@ -929,6 +1034,18 @@ mod tests {
                 "{visible} should be available to explicit runtime/workspace providers"
             );
         }
+        let schemas = runtime_executor_tool_schemas(&caps);
+        let bash = schemas
+            .iter()
+            .find(|schema| tool_schema_name(schema) == Some("bash"))
+            .expect("runtime bash schema");
+        let properties = bash
+            .pointer("/function/parameters/properties")
+            .and_then(Value::as_object)
+            .expect("bash properties");
+        assert!(properties.get("run_in_background").is_none());
+        assert!(properties.get("ready_check").is_none());
+        assert!(properties.get("background_ttl").is_none());
         for hidden in ["powershell", "display_sixel"] {
             assert!(
                 !tool_names.contains(hidden),
@@ -1236,20 +1353,67 @@ mod tests {
         );
 
         // A database pool is an internal runtime dependency, not a default
-        // model-facing SQL capability. SQL/debug tools need an explicit
-        // admin/debug provider or policy gate instead of appearing in ordinary
-        // web/server agent surfaces.
+        // model-facing SQL capability. It declares Work-planning support, but
+        // RuntimeToolExecutor still hides those tools until the request's
+        // owner/session/branch binding has been validated.
         assert!(!lifecycle_server_capabilities(false, true).has(Capability::Database));
+        assert!(!lifecycle_server_capabilities(false, true).has(Capability::WorkPlanning));
+        assert!(!lifecycle_server_capabilities(false, true).has(Capability::WorkLifecycle));
+        assert!(caps.has(Capability::WorkPlanning));
+        assert!(caps.has(Capability::WorkLifecycle));
         assert!(!caps.has(Capability::Database));
+        assert!(
+            !caps.has(Capability::GitHubAuth),
+            "multi-tenant Server must not claim process-level GitHub authority"
+        );
         assert!(!lifecycle_server_capabilities(true, false).has(Capability::ReflectService));
         assert!(caps.has(Capability::ReflectService));
+
+        let generic_child = delegated_subrun_capabilities(true, true, false);
+        assert!(generic_child.has(Capability::AgentSpawner));
+        assert!(generic_child.has(Capability::ReflectService));
+        assert!(!generic_child.has(Capability::WorkPlanning));
+        assert!(!generic_child.has(Capability::WorkLifecycle));
+        let assigned_child = delegated_subrun_capabilities(true, true, true);
+        assert!(assigned_child.has(Capability::WorkPlanning));
+        assert!(assigned_child.has(Capability::WorkLifecycle));
 
         // Web resolve with lifecycle caps advertises agent tool
         let tool_names = names(server_builtin_tool_schemas(&caps));
         assert!(
+            !tool_names.contains(&"github".to_string()),
+            "GitHub must remain hidden until an owner-scoped provider binding exists"
+        );
+        assert!(
             tool_names.contains(&"agent".to_string()),
             "production lifecycle must advertise agent tool"
         );
+        assert!(tool_names.contains(&"start_work".to_string()));
+        assert!(tool_names.contains(&"run_next_work_item".to_string()));
+        assert!(tool_names.contains(&"inspect_work_plan".to_string()));
+        assert!(tool_names.contains(&"propose_work_plan".to_string()));
+        assert!(tool_names.contains(&"inspect_work_criteria".to_string()));
+        assert!(tool_names.contains(&"propose_work_criteria".to_string()));
+        let generic_child_tool_names = names(server_builtin_tool_schemas(&generic_child));
+        assert!(generic_child_tool_names.contains(&"agent".to_string()));
+        assert!(
+            generic_child_tool_names.iter().all(|name| {
+                astra_turn_core::tool::registry::meta::tool_meta(name).is_none_or(|meta| {
+                    !meta.requires.contains(&Capability::WorkPlanning)
+                        && !meta.requires.contains(&Capability::WorkLifecycle)
+                })
+            }),
+            "a generic delegated child must not receive any tool whose typed contract requires canonical Work: {generic_child_tool_names:?}"
+        );
+        let no_database_tool_names = names(server_builtin_tool_schemas(
+            &lifecycle_server_capabilities(false, true),
+        ));
+        assert!(!no_database_tool_names.contains(&"inspect_work_plan".to_string()));
+        assert!(!no_database_tool_names.contains(&"start_work".to_string()));
+        assert!(!no_database_tool_names.contains(&"run_next_work_item".to_string()));
+        assert!(!no_database_tool_names.contains(&"propose_work_plan".to_string()));
+        assert!(!no_database_tool_names.contains(&"inspect_work_criteria".to_string()));
+        assert!(!no_database_tool_names.contains(&"propose_work_criteria".to_string()));
 
         // full_server_capabilities_for_tests also includes AgentSpawner
         assert!(full_server_capabilities_for_tests().has(Capability::AgentSpawner));

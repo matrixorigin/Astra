@@ -9,7 +9,7 @@
 //!
 //! | Method | Purpose |
 //! |--------|---------|
-//! | `enrich_snapshot()` | Fill live-metric fields into `IntrospectSnapshot` |
+//! | `enrich_snapshot()` | Add live alerts/circuit state without rewriting canonical feedback |
 //! | `local_reflect_summary()` | Local-only reflect text from journal + live data |
 //! | `build_live_metrics()` | Return a pure-data `LiveMetrics` struct |
 //!
@@ -25,9 +25,7 @@
 //! it allocation-free on the hot path and allows the same provider instances to
 //! be shared with `RuntimePolicy::decide()` and `execution_phase`.
 
-use crate::turn::runtime_policy::TuningPolicy;
 use astra_core::ObservationFacet;
-use astra_core::observation::{TuningJob, TuningSignalType};
 use astra_turn_core::introspect::{
     CircuitBreakerSnapshot, IntrospectSnapshot, prompt_cache_fresh_input_tokens,
     prompt_cache_read_share_pct, turn_budget_label,
@@ -73,7 +71,6 @@ pub struct LiveMetrics {
     pub circuit_breaker_state: String,
     pub circuit_breaker_failures: u64,
     pub circuit_breaker_consecutive_failures: u64,
-    pub task_completion_ratio: f64,
     pub phase_label: &'static str,
     pub alerts: Vec<String>,
 }
@@ -110,13 +107,12 @@ impl InspectionService<'_> {
             circuit_breaker_state: cb_state.to_string(),
             circuit_breaker_failures: 0,             // filled by caller
             circuit_breaker_consecutive_failures: 0, // filled by caller
-            task_completion_ratio: self.session.task_completion_ratio(),
             phase_label: self.session.current_phase_label(),
             alerts,
         }
     }
 
-    /// Enrich an `IntrospectSnapshot` in-place with live provider data.
+    /// Enrich an `IntrospectSnapshot` with facts that are live by nature.
     ///
     /// Only fills fields that the providers are responsible for; structural
     /// fields (recent_rounds, volatile_pending, stall_state, tool_health,
@@ -124,9 +120,6 @@ impl InspectionService<'_> {
     /// untouched — those come from the raw `AgenticLoopState`.
     pub fn enrich_snapshot(&self, snapshot: &mut IntrospectSnapshot) {
         let metrics = self.build_live_metrics();
-        snapshot.token_pressure = metrics.token_pressure;
-        snapshot.cache_hit_ratio = metrics.cache_hit_ratio;
-        snapshot.turns_remaining = metrics.turns_remaining;
         snapshot.alerts.extend(metrics.alerts);
 
         // Circuit breaker enrichment (only if caller didn't already set it).
@@ -185,10 +178,6 @@ impl InspectionService<'_> {
                     facts.streaks.consecutive_rounds_without_outcome,
                 ));
 
-                // ── Task board ──
-                let task_ratio = self.session.task_completion_ratio();
-                lines.push(format!("tasks: completion={:.0}%", task_ratio * 100.0,));
-
                 // ── Circuit breaker ──
                 let cb_state = self.session.circuit_breaker_state();
                 lines.push(format!("circuit_breaker: {cb_state}"));
@@ -241,120 +230,6 @@ impl InspectionService<'_> {
 
         lines.join("\n")
     }
-
-    /// Generate tuning signals from live observation data using the given policy.
-    ///
-    /// This method analyzes the current observation state and emits
-    /// [`TuningJob`] entries when adaptation triggers are detected.
-    /// TuningJobs are advisory — they do not modify runtime state directly.
-    ///
-    /// # Trigger thresholds
-    ///
-    /// See [`TuningPolicy`] for configurable thresholds.
-    pub fn generate_tuning_signals(
-        &self,
-        turn_index: u32,
-        session_id: &str,
-        policy: &TuningPolicy,
-    ) -> Vec<TuningJob> {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        let mut signals: Vec<TuningJob> = Vec::new();
-
-        let pressure = self.live.token_pressure();
-        let error_rate = self.live.current_error_rate();
-        let cache_hit = self.live.cache_hit_ratio();
-        let task_ratio = self.session.task_completion_ratio();
-        let remaining = self.session.remaining_turns();
-        let max_budget = self.session.max_turns();
-        let turns_completed = max_budget.saturating_sub(remaining);
-
-        // 1. Token pressure — highest priority
-        if pressure > policy.token_pressure_critical {
-            signals.push(TuningJob {
-                signal: TuningSignalType::AggressiveCompaction,
-                trigger_value: pressure,
-                reason: format!(
-                    "token_pressure={:.0}% critical — aggressive compaction needed",
-                    pressure * 100.0
-                ),
-                created_at_ms: now_ms,
-                turn_index,
-                session_id: session_id.to_string(),
-                priority: 10,
-            });
-        } else if pressure > policy.token_pressure_high {
-            signals.push(TuningJob {
-                signal: TuningSignalType::PromptCompaction,
-                trigger_value: pressure,
-                reason: format!(
-                    "token_pressure={:.0}% — suggest prompt compaction",
-                    pressure * 100.0
-                ),
-                created_at_ms: now_ms,
-                turn_index,
-                session_id: session_id.to_string(),
-                priority: 7,
-            });
-        }
-
-        // 2. Error rate → circuit breaker tuning
-        if error_rate > policy.error_rate_high {
-            signals.push(TuningJob {
-                signal: TuningSignalType::CircuitBreakerTuning,
-                trigger_value: error_rate,
-                reason: format!(
-                    "error_rate={:.0}% — consider tightening circuit breaker",
-                    error_rate * 100.0
-                ),
-                created_at_ms: now_ms,
-                turn_index,
-                session_id: session_id.to_string(),
-                priority: 6,
-            });
-        }
-
-        // 3. Cache warming — low hit ratio after enough turns
-        if turns_completed > policy.cache_warming_min_turns && cache_hit < policy.cache_hit_low {
-            signals.push(TuningJob {
-                signal: TuningSignalType::CacheWarming,
-                trigger_value: cache_hit,
-                reason: format!(
-                    "cache_hit_ratio={:.0}% after {turns_completed} turns — suggest cache warming",
-                    cache_hit * 100.0
-                ),
-                created_at_ms: now_ms,
-                turn_index,
-                session_id: session_id.to_string(),
-                priority: 4,
-            });
-        }
-
-        // 4. Task decomposition — stalled for N+ consecutive turns
-        let facts = self.observation.extract_facts();
-        if task_ratio < 1.0
-            && facts.streaks.consecutive_rounds_without_outcome >= policy.stall_threshold
-        {
-            signals.push(TuningJob {
-                signal: TuningSignalType::TaskDecomposition,
-                trigger_value: task_ratio,
-                reason: format!(
-                    "task_completion={:.0}% stalled_for={} turns — suggest task decomposition",
-                    task_ratio * 100.0,
-                    facts.streaks.consecutive_rounds_without_outcome
-                ),
-                created_at_ms: now_ms,
-                turn_index,
-                session_id: session_id.to_string(),
-                priority: 3,
-            });
-        }
-
-        signals
-    }
 }
 
 // ─── Snapshot-based local reflect (for tool fallback) ────────────────────────
@@ -380,22 +255,43 @@ pub fn local_reflect_from_snapshot(
 
     match facet {
         ObservationFacet::Session | ObservationFacet::Overview => {
-            let pressure = snapshot.token_pressure;
-            lines.push(format!(
-                "live: pressure={:.0}% prompt_cache_read_share={:.0}% prompt_cache_scope=current_runtime_snapshot",
-                pressure * 100.0,
-                prompt_cache_read_share_pct(snapshot),
-            ));
-            lines.push(format!(
-                "prompt_tokens: input_total={} fresh={} cached_read={} cache_create={} output={}",
-                snapshot.total_input_tokens,
-                prompt_cache_fresh_input_tokens(snapshot),
-                snapshot.cache_read_tokens,
-                snapshot.cache_creation_tokens,
-                snapshot.total_output_tokens,
-            ));
-            lines.push(format!("turns: {}", turn_budget_label(snapshot)));
-            lines.push(format!("compaction: {}", snapshot.compaction_tier));
+            if let Some(frame) = snapshot.runtime_feedback.as_ref() {
+                let pressure = frame.context.token_pressure.map_or_else(
+                    || "unknown".to_string(),
+                    |value| format!("{:.0}%", value * 100.0),
+                );
+                let cache_share = prompt_cache_read_share_pct(snapshot)
+                    .map_or_else(|| "unknown".to_string(), |value| format!("{value:.0}%"));
+                lines.push(format!(
+                    "runtime: pressure={} prompt_cache_read_share={} prompt_cache_scope=current_runtime_snapshot",
+                    pressure,
+                    cache_share,
+                ));
+                if let Some(usage) = frame.run_usage {
+                    lines.push(format!(
+                        "prompt_tokens: input_total={} fresh={} cached_read={} cache_create={} output={}",
+                        usage.total_input(),
+                        prompt_cache_fresh_input_tokens(snapshot).unwrap_or_default(),
+                        usage.cache_read,
+                        usage.cache_creation,
+                        usage.completion,
+                    ));
+                } else {
+                    lines.push("prompt_tokens: unknown".to_string());
+                }
+                lines.push(format!("turns: {}", turn_budget_label(snapshot)));
+                lines.push(format!("compaction: {:?}", frame.context.compaction_tier));
+                lines.push(format!(
+                    "execution_topology: {}",
+                    frame.identity.topology.as_str()
+                ));
+                lines.push(format!(
+                    "runtime_policy_feedback: {}",
+                    frame.policy_feedback.inline_summary()
+                ));
+            } else {
+                lines.push("runtime_feedback=not_yet_observed".to_string());
+            }
             if !snapshot.alerts.is_empty() {
                 lines.push(format!("alerts: {}", snapshot.alerts.join(", ")));
             }
@@ -467,8 +363,55 @@ mod tests {
     use super::*;
     use crate::turn::agentic_loop::host::{self, AgenticLoopState};
     use crate::turn::local_provider::LocalSessionProvider;
-    use crate::turn::runtime_policy::{RuntimePolicy, TuningPolicy};
+    use crate::turn::runtime_policy::RuntimePolicy;
     use astra_turn_core::introspect::IntrospectSnapshot;
+
+    fn sample_frame(
+        session_turn: u32,
+        completed: u32,
+        remaining: u32,
+    ) -> astra_turn_core::context_feedback::RuntimeFeedbackFrame {
+        use astra_turn_core::context_feedback::{
+            RuntimeContextFeedback, RuntimeFeedbackFrame, RuntimeFeedbackIdentity,
+            RuntimeFeedbackProgress,
+        };
+        RuntimeFeedbackFrame {
+            schema_version: RuntimeFeedbackFrame::SCHEMA_VERSION,
+            identity: RuntimeFeedbackIdentity {
+                session_id: "session-1".into(),
+                run_id: "run-1".into(),
+                agent_id: "agent-1".into(),
+                model_id: "deepseek-v4-flash".into(),
+                topology: astra_services::ModelRequestTopology::ServerOnly,
+                request: None,
+            },
+            progress: RuntimeFeedbackProgress {
+                session_turn,
+                agentic_round_index: completed.saturating_sub(1),
+                llm_rounds_completed: completed,
+                slice_round_limit: completed.saturating_add(remaining),
+                slice_rounds_remaining: remaining,
+                absolute_round_ceiling: None,
+            },
+            context: RuntimeContextFeedback {
+                prompt_cache_identity: None,
+                model_context_window_tokens: Some(1_000_000),
+                effective_input_limit_tokens: Some(800_000),
+                estimated_input_tokens: Some(42_000),
+                token_pressure: Some(0.42),
+                compaction_tier: astra_turn_core::compaction_types::CompactionTier::TrimSchemas,
+            },
+            request_usage: Some(
+                astra_turn_core::token_accounting::TokenAccounting::from_fields(10, 88, 2, 5),
+            ),
+            run_usage: Some(
+                astra_turn_core::token_accounting::TokenAccounting::from_fields(10, 88, 2, 5),
+            ),
+            was_truncated: false,
+            cache_break_detected: None,
+            policy_feedback: Default::default(),
+        }
+    }
 
     /// Run a closure with a freshly-constructed `InspectionService`.
     ///
@@ -491,7 +434,6 @@ mod tests {
             assert!((metrics.token_pressure - 0.0).abs() < f64::EPSILON);
             assert!((metrics.cache_hit_ratio - 0.0).abs() < f64::EPSILON);
             assert!((metrics.current_error_rate - 0.0).abs() < f64::EPSILON);
-            assert!((metrics.task_completion_ratio - 0.0).abs() < f64::EPSILON);
             assert_eq!(metrics.phase_label, "execution");
             assert_eq!(metrics.circuit_breaker_state, "monitoring");
             assert!(metrics.alerts.is_empty());
@@ -510,14 +452,12 @@ mod tests {
     }
 
     #[test]
-    fn enrich_snapshot_fills_live_fields() {
+    fn enrich_snapshot_does_not_fabricate_runtime_feedback() {
         let state = host::make_test_loop_state();
         with_inspection(&state, |svc| {
             let mut snapshot = IntrospectSnapshot::default();
             svc.enrich_snapshot(&mut snapshot);
-            assert!(snapshot.token_pressure >= 0.0);
-            assert!(snapshot.cache_hit_ratio >= 0.0);
-            assert!(snapshot.turns_remaining > 0);
+            assert!(snapshot.runtime_feedback.is_none());
             assert!(snapshot.circuit_breaker.is_some());
         });
     }
@@ -543,7 +483,7 @@ mod tests {
     }
 
     #[test]
-    fn local_reflect_summary_session() {
+    fn local_reflect_summary_session_excludes_removed_task_progress_authority() {
         let state = host::make_test_loop_state();
         with_inspection(&state, |svc| {
             let summary = svc.local_reflect_summary(ObservationFacet::Session, 20);
@@ -551,7 +491,7 @@ mod tests {
             assert!(summary.contains("source=local_journal"));
             assert!(summary.contains("live:"));
             assert!(summary.contains("streaks:"));
-            assert!(summary.contains("tasks:"));
+            assert!(!summary.contains("tasks:"));
             assert!(summary.contains("circuit_breaker:"));
         });
     }
@@ -578,12 +518,8 @@ mod tests {
     #[test]
     fn local_reflect_from_snapshot_session() {
         let snapshot = IntrospectSnapshot {
-            token_pressure: 0.42,
-            cache_hit_ratio: 0.88,
-            turns_completed: 3,
-            turns_remaining: 7,
+            runtime_feedback: Some(sample_frame(3, 3, 7)),
             snapshot_age_turns: 2,
-            compaction_tier: "light".to_string(),
             alerts: vec!["test_alert".to_string()],
             circuit_breaker: Some(CircuitBreakerSnapshot {
                 state: "monitoring".to_string(),
@@ -600,30 +536,29 @@ mod tests {
         assert!(summary.contains("prompt_cache_scope=current_runtime_snapshot"));
         assert!(!summary.contains("cache=88%"));
         assert!(summary.contains("snapshot_age_turns=2"));
-        assert!(summary.contains("turns: 3/10"));
-        assert!(summary.contains("compaction: light"));
+        assert!(summary.contains("turns: session_turn=3 round=3/10 remaining=7"));
+        assert!(summary.contains("compaction: TrimSchemas"));
+        assert!(summary.contains("execution_topology: server_only"));
         assert!(summary.contains("test_alert"));
         assert!(summary.contains("circuit_breaker: monitoring"));
     }
 
     #[test]
-    fn local_reflect_from_snapshot_preserves_unlimited_turn_budget() {
+    fn local_reflect_from_snapshot_preserves_exhausted_slice() {
         let snapshot = IntrospectSnapshot {
-            turns_completed: 3,
-            turns_remaining: 0,
-            turn_budget_unlimited: true,
+            runtime_feedback: Some(sample_frame(3, 3, 0)),
             ..Default::default()
         };
 
         let summary = local_reflect_from_snapshot(&snapshot, ObservationFacet::Session);
 
         assert!(
-            summary.contains("turns: 3/∞"),
-            "local reflect fallback must not render unlimited as remaining=0: {summary}"
+            summary.contains("remaining=0"),
+            "local reflect fallback must expose exhausted slice state: {summary}"
         );
         assert!(
-            !summary.contains("remaining=0"),
-            "local reflect fallback should not expose ambiguous zero remaining turns: {summary}"
+            !summary.contains('∞'),
+            "local reflect fallback must not infer infinity from zero: {summary}"
         );
     }
 
@@ -646,279 +581,5 @@ mod tests {
         assert!(summary.contains("circuit_breaker: tripped"));
         assert!(summary.contains("consecutive_failures=5"));
         assert!(summary.contains("stall_nudge_count=3"));
-    }
-
-    // ── generate_tuning_signals tests ────────────────────────────────────
-
-    #[test]
-    fn tuning_aggressive_compaction_when_pressure_critical() {
-        let mut state = host::make_test_loop_state();
-        // estimate_tokens ≈ DEFAULT_SYSTEM_PROMPT_TOKENS (14_000) + pinned + 300
-        // With pinned=0: ≈14_300 / 14_500 ≈ 0.986 > 0.95
-        state.max_turn_input_tokens = 14_500;
-        state.pinned_tool_schema_tokens = 0;
-        with_inspection(&state, |svc| {
-            let jobs = svc.generate_tuning_signals(5, "test-session", &TuningPolicy::default());
-            assert_eq!(jobs.len(), 1, "expected 1 signal, got: {:?}", jobs);
-            assert_eq!(jobs[0].signal, TuningSignalType::AggressiveCompaction);
-            assert_eq!(jobs[0].priority, 10);
-            assert!(jobs[0].reason.contains("critical"));
-            assert!(jobs[0].trigger_value > 0.95);
-        });
-    }
-
-    #[test]
-    fn tuning_prompt_compaction_when_pressure_high() {
-        let mut state = host::make_test_loop_state();
-        // 14_300 / 16_500 ≈ 0.867 — between 0.80 and 0.95
-        state.max_turn_input_tokens = 16_500;
-        state.pinned_tool_schema_tokens = 0;
-        with_inspection(&state, |svc| {
-            let jobs = svc.generate_tuning_signals(5, "test-session", &TuningPolicy::default());
-            assert_eq!(jobs.len(), 1, "expected 1 signal, got: {:?}", jobs);
-            assert_eq!(jobs[0].signal, TuningSignalType::PromptCompaction);
-            assert_eq!(jobs[0].priority, 7);
-            assert!(jobs[0].trigger_value > 0.80);
-            assert!(jobs[0].trigger_value <= 0.95);
-        });
-    }
-
-    #[test]
-    fn tuning_no_compaction_when_pressure_low() {
-        let mut state = host::make_test_loop_state();
-        // 14_300 / 20_000 ≈ 0.715 — below 0.80
-        state.max_turn_input_tokens = 20_000;
-        state.pinned_tool_schema_tokens = 0;
-        with_inspection(&state, |svc| {
-            let jobs = svc.generate_tuning_signals(5, "test-session", &TuningPolicy::default());
-            // No compaction signals when pressure ≤ 0.80
-            assert!(
-                jobs.iter()
-                    .all(|j| j.signal != TuningSignalType::PromptCompaction
-                        && j.signal != TuningSignalType::AggressiveCompaction)
-            );
-        });
-    }
-
-    #[test]
-    fn tuning_empty_when_healthy() {
-        let state = host::make_test_loop_state();
-        with_inspection(&state, |svc| {
-            let jobs = svc.generate_tuning_signals(5, "test-session", &TuningPolicy::default());
-            // All default values → healthy → no tuning signals
-            assert!(jobs.is_empty());
-        });
-    }
-
-    #[test]
-    fn tuning_circuit_breaker_when_error_rate_high() {
-        let mut state = host::make_test_loop_state();
-        // Inject tool errors to raise error rate above 0.30
-        state.turn_guard.health.record_outcome(
-            "bash",
-            astra_turn_core::tool::health::ToolOutcome::new(false, 0, "error"),
-        );
-        state.turn_guard.health.record_outcome(
-            "read",
-            astra_turn_core::tool::health::ToolOutcome::new(false, 0, "error"),
-        );
-        // Add some tool call records for normalization
-        state.stall.tool_call_records = vec![
-            Default::default(),
-            Default::default(),
-            Default::default(),
-            Default::default(),
-        ];
-        with_inspection(&state, |svc| {
-            let jobs = svc.generate_tuning_signals(5, "test-session", &TuningPolicy::default());
-            let cb: Vec<_> = jobs
-                .iter()
-                .filter(|j| j.signal == TuningSignalType::CircuitBreakerTuning)
-                .collect();
-            assert_eq!(cb.len(), 1);
-            assert_eq!(cb[0].priority, 6);
-            assert!(cb[0].trigger_value > 0.30);
-            assert!(cb[0].reason.contains("circuit breaker"));
-        });
-    }
-
-    #[test]
-    fn tuning_circuit_breaker_not_triggered_when_error_rate_low() {
-        let mut state = host::make_test_loop_state();
-        // Inject just one error — rate stays low with many calls
-        state.turn_guard.health.record_outcome(
-            "bash",
-            astra_turn_core::tool::health::ToolOutcome::new(false, 0, "error"),
-        );
-        state.stall.tool_call_records = vec![Default::default(); 10];
-        with_inspection(&state, |svc| {
-            let jobs = svc.generate_tuning_signals(5, "test-session", &TuningPolicy::default());
-            assert!(
-                jobs.iter()
-                    .all(|j| j.signal != TuningSignalType::CircuitBreakerTuning)
-            );
-        });
-    }
-
-    #[test]
-    fn tuning_cache_warming_when_hit_ratio_low_after_many_turns() {
-        let mut state = host::make_test_loop_state();
-        // turns_completed = max_turns - remaining_turns = 30 - 15 = 15 > 10
-        state.max_turns = 30;
-        state.remaining_turns = 15;
-        // cache_hit_ratio = 0 (all zeros) < 0.30
-        with_inspection(&state, |svc| {
-            let jobs = svc.generate_tuning_signals(5, "test-session", &TuningPolicy::default());
-            let cw: Vec<_> = jobs
-                .iter()
-                .filter(|j| j.signal == TuningSignalType::CacheWarming)
-                .collect();
-            assert_eq!(cw.len(), 1);
-            assert_eq!(cw[0].priority, 4);
-            assert!(cw[0].reason.contains("cache warming"));
-        });
-    }
-
-    #[test]
-    fn tuning_cache_warming_not_triggered_when_few_turns() {
-        let mut state = host::make_test_loop_state();
-        // turns_completed = 10 - 5 = 5, not > 10
-        state.max_turns = 10;
-        state.remaining_turns = 5;
-        with_inspection(&state, |svc| {
-            let jobs = svc.generate_tuning_signals(5, "test-session", &TuningPolicy::default());
-            assert!(
-                jobs.iter()
-                    .all(|j| j.signal != TuningSignalType::CacheWarming)
-            );
-        });
-    }
-
-    #[test]
-    fn tuning_task_decomposition_when_stalled() {
-        let mut state = host::make_test_loop_state();
-        // Set up stalled journal: multiple turns with zero outcomes.
-        // record_turn skips entries with 0 tool calls, so we must set tool_calls_total > 0.
-        use astra_core::observation::TurnMetrics;
-        for _ in 0..6 {
-            let mut m = TurnMetrics::default();
-            m.tool_calls_total = 5; // non-zero to ensure entry is recorded
-            m.mutation_count = 0; // zero mutations → write_ratio = 0.0 → stalled
-            m.error_count = 0;
-            state.observation_journal.record_turn(&m);
-        }
-        // Set up task board: 1 pending task → task_ratio = 0.0
-        state.hooks.task_board_snapshot.tracked_count = 1;
-        state.hooks.task_board_snapshot.pending_count = 1;
-        state.hooks.task_board_snapshot.in_progress_count = 0;
-        state.hooks.task_board_snapshot.blocked_count = 0;
-        with_inspection(&state, |svc| {
-            let jobs = svc.generate_tuning_signals(5, "test-session", &TuningPolicy::default());
-            let td: Vec<_> = jobs
-                .iter()
-                .filter(|j| j.signal == TuningSignalType::TaskDecomposition)
-                .collect();
-            assert_eq!(td.len(), 1, "expected 1 TaskDecomposition, got {jobs:?}");
-            assert_eq!(td[0].priority, 3);
-            assert!(td[0].reason.contains("stalled"));
-            assert!(td[0].reason.contains("decomposition"));
-        });
-    }
-
-    #[test]
-    fn tuning_task_decomposition_not_triggered_when_progressing() {
-        let mut state = host::make_test_loop_state();
-        // Only 2 stalled turns (< 5 threshold)
-        use astra_core::observation::TurnMetrics;
-        for _ in 0..2 {
-            let mut m = TurnMetrics::default();
-            m.tool_calls_total = 5;
-            m.mutation_count = 0;
-            state.observation_journal.record_turn(&m);
-        }
-        state.hooks.task_board_snapshot.tracked_count = 1;
-        state.hooks.task_board_snapshot.pending_count = 1;
-        with_inspection(&state, |svc| {
-            let jobs = svc.generate_tuning_signals(5, "test-session", &TuningPolicy::default());
-            assert!(
-                jobs.iter()
-                    .all(|j| j.signal != TuningSignalType::TaskDecomposition)
-            );
-        });
-    }
-
-    #[test]
-    fn tuning_multiple_signals_fire_simultaneously() {
-        let mut state = host::make_test_loop_state();
-        // High pressure → AggressiveCompaction
-        state.max_turn_input_tokens = 14_500;
-        state.pinned_tool_schema_tokens = 0;
-        // Many turns → CacheWarming
-        state.max_turns = 30;
-        state.remaining_turns = 15; // 15 turns > 10
-        // Stalled journal → TaskDecomposition
-        use astra_core::observation::TurnMetrics;
-        for _ in 0..6 {
-            let mut m = TurnMetrics::default();
-            m.tool_calls_total = 5;
-            m.mutation_count = 0;
-            state.observation_journal.record_turn(&m);
-        }
-        state.hooks.task_board_snapshot.tracked_count = 1;
-        state.hooks.task_board_snapshot.pending_count = 1;
-        with_inspection(&state, |svc| {
-            let jobs = svc.generate_tuning_signals(5, "test-session", &TuningPolicy::default());
-            // Should have at least 3 signals: AggressiveCompaction + CacheWarming + TaskDecomposition
-            assert!(jobs.len() >= 3, "got {} jobs: {jobs:?}", jobs.len());
-            let signals: Vec<_> = jobs.iter().map(|j| j.signal).collect();
-            assert!(
-                signals.contains(&TuningSignalType::AggressiveCompaction),
-                "missing AggressiveCompaction in {signals:?}"
-            );
-            assert!(
-                signals.contains(&TuningSignalType::CacheWarming),
-                "missing CacheWarming in {signals:?}"
-            );
-            assert!(
-                signals.contains(&TuningSignalType::TaskDecomposition),
-                "missing TaskDecomposition in {signals:?}"
-            );
-        });
-    }
-
-    #[test]
-    fn tuning_signals_have_correct_session_and_turn() {
-        let mut state = host::make_test_loop_state();
-        state.max_turn_input_tokens = 1000;
-        state.pinned_tool_schema_tokens = 970;
-        with_inspection(&state, |svc| {
-            let jobs = svc.generate_tuning_signals(42, "my-session-id", &TuningPolicy::default());
-            for job in &jobs {
-                assert_eq!(job.turn_index, 42);
-                assert_eq!(job.session_id, "my-session-id");
-            }
-        });
-    }
-
-    #[test]
-    fn tuning_signals_have_valid_timestamps() {
-        let mut state = host::make_test_loop_state();
-        state.max_turn_input_tokens = 1000;
-        state.pinned_tool_schema_tokens = 970;
-        let before_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        with_inspection(&state, |svc| {
-            let jobs = svc.generate_tuning_signals(5, "test-session", &TuningPolicy::default());
-            let after_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
-            for job in &jobs {
-                assert!(job.created_at_ms >= before_ms);
-                assert!(job.created_at_ms <= after_ms + 100); // +100ms tolerance
-            }
-        });
     }
 }

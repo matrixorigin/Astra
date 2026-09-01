@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -12,6 +14,17 @@ import schema_inventory  # noqa: E402
 
 
 class SchemaInventoryTest(unittest.TestCase):
+    METADATA_FIELDS = (
+        "semantic_owner",
+        "state_class",
+        "primary_query",
+        "retention_policy",
+        "rebuildability",
+        "merge_guidance",
+        "migration_owner",
+        "product_owner",
+    )
+
     @classmethod
     def setUpClass(cls) -> None:
         cls.inventory = schema_inventory.build_inventory()
@@ -48,13 +61,298 @@ class SchemaInventoryTest(unittest.TestCase):
                 self.assertEqual(self.tables[table]["domain"], domain)
 
     def test_schema_source_manifest_covers_all_production_ddl_sources(self) -> None:
-        discovered = set(schema_inventory.discover_production_ddl_source_paths())
-        manifest = {source.path for source in schema_inventory.SCHEMA_SOURCES}
+        discovered = schema_inventory.discover_production_ddl_source_paths()
+        manifest = sorted(source.path for source in schema_inventory.SCHEMA_SOURCES)
+        manifest_paths = [source.path for source in schema_inventory.SCHEMA_SOURCES]
         self.assertEqual(
             discovered,
             manifest,
             "every production Rust src file with CREATE TABLE DDL must be declared in SCHEMA_SOURCES",
         )
+        self.assertEqual(
+            len(manifest_paths),
+            len(set(manifest_paths)),
+            "duplicate manifest source paths must not be hidden by set comparison",
+        )
+
+    def test_work_schema_source_and_exact_table_set(self) -> None:
+        work_source = next(
+            source
+            for source in schema_inventory.SCHEMA_SOURCES
+            if source.domain == "work"
+        )
+        self.assertEqual(work_source.owner, "astra_services::work")
+        self.assertEqual(work_source.path, "crates/services/src/work.rs")
+        self.assertEqual(
+            work_source.startup_owner,
+            "ensure_core_schema via crate::work::WORK_SCHEMA_TABLES",
+        )
+        self.assertIn("durable authority", work_source.state_class_hint)
+        self.assertIn("immutable history", work_source.state_class_hint)
+        self.assertIn("recovery-idempotency", work_source.state_class_hint)
+        self.assertIn("projection-sequence", work_source.hot_path_hint)
+        self.assertIn("hot coordination", work_source.hot_path_hint)
+
+        expected = {
+            "works",
+            "work_goal_revisions",
+            "work_criteria",
+            "work_criterion_revisions",
+            "work_criterion_sets",
+            "work_graph_revisions",
+            "work_graph_sequences",
+            "work_items",
+            "work_item_revisions",
+            "work_item_edges",
+            "work_branches",
+            "work_branch_creation_operations",
+            "work_branch_control_operations",
+            "work_branch_deletion_operations",
+            "work_branch_subjects",
+            "work_patch_artifacts",
+            "work_patch_materialization_operations",
+            "work_patch_commit_operations",
+            "work_proposal_sequences",
+            "work_proposals",
+            "work_check_runs",
+            "work_acceptance_decisions",
+            "work_current_gap_acceptances",
+            "work_event_sequences",
+            "work_attention_receipts",
+            "work_item_attempts",
+            "work_events",
+            "work_runtime_event_outbox",
+            "work_runtime_event_outbox_slots",
+        }
+        actual = {
+            row["table"] for row in self.inventory["tables"] if row["domain"] == "work"
+        }
+        self.assertEqual(expected, actual)
+        self.assertEqual(29, len(actual))
+
+    def test_storage_and_work_metadata_are_explicit_and_closed_world(self) -> None:
+        inventory_names = {row["table"] for row in self.inventory["tables"]}
+        self.assertEqual(inventory_names, set(schema_inventory.TABLE_METADATA))
+        for row in self.inventory["tables"]:
+            with self.subTest(table=row["table"]):
+                for field in self.METADATA_FIELDS:
+                    self.assertIsInstance(row[field], str)
+                    self.assertNotEqual(row[field], "")
+                    self.assertNotEqual(row[field], "unclassified")
+
+    def test_work_metadata_locks_authority_boundaries(self) -> None:
+        self.assertIn("current pointers", self.tables["works"]["merge_guidance"])
+        self.assertIn("immutable", self.tables["work_goal_revisions"]["state_class"])
+        self.assertIn("ordering authority", self.tables["work_graph_sequences"]["rebuildability"])
+        self.assertIn("idempotency/recovery", self.tables["work_branch_control_operations"]["merge_guidance"])
+        self.assertIn("evidence", self.tables["work_check_runs"]["merge_guidance"])
+        self.assertIn("canonical history", self.tables["work_events"]["state_class"])
+        self.assertIn("runtime event projection", self.tables["work_runtime_event_outbox"]["merge_guidance"])
+
+    def test_work_retention_and_runtime_coverage_metadata_is_explicit(self) -> None:
+        events = self.tables["work_events"]
+        self.assertIn("fixed retained window", events["state_class"])
+        self.assertIn("10,000", events["retention_policy"])
+        self.assertIn("fixed retention window", events["retention_policy"])
+        self.assertIn("payload_hash", events["rebuildability"])
+
+        sequences = self.tables["work_event_sequences"]
+        for field in ["state_class", "primary_query", "retention_policy"]:
+            self.assertIn("retained_from_event_seq", sequences[field])
+        self.assertIn("coverage floor", sequences["primary_query"])
+
+        for table in ["work_check_runs", "work_acceptance_decisions"]:
+            with self.subTest(table=table):
+                self.assertIn("source", self.tables[table]["retention_policy"])
+                self.assertIn("detail", self.tables[table]["retention_policy"])
+                self.assertIn("leaves the retention window", self.tables[table]["retention_policy"])
+        current = self.tables["work_current_gap_acceptances"]
+        self.assertIn("bounded current fact", current["retention_policy"])
+        self.assertIn("current acceptance", current["retention_policy"])
+
+        proposals = self.tables["work_proposals"]
+        self.assertIn("WORK_PROPOSAL_RETAINED_TERMINAL_PER_BRANCH=64", proposals["retention_policy"])
+        self.assertIn("prune terminal proposals", proposals["retention_policy"])
+
+        attempts = self.tables["work_item_attempts"]
+        self.assertIn("mutable durable", attempts["state_class"])
+        self.assertIn("settlement authority", attempts["state_class"])
+
+        outbox = self.tables["work_runtime_event_outbox"]
+        self.assertIn("Run transaction", outbox["state_class"])
+        self.assertIn("1024-row ring", outbox["retention_policy"])
+        self.assertIn("unprojected", outbox["retention_policy"])
+        self.assertIn("runtime_events_expired", outbox["retention_policy"])
+        self.assertIn("not rebuildable from work_events", outbox["rebuildability"])
+        slots = self.tables["work_runtime_event_outbox_slots"]
+        self.assertIn("enqueued/projected sequence", slots["state_class"])
+        self.assertIn("coverage", slots["state_class"])
+        self.assertIn("not generally rebuildable", slots["rebuildability"])
+
+    def test_context_head_and_branch_subject_authority_metadata(self) -> None:
+        heads = self.tables["session_context_heads"]
+        self.assertIn("mixed", heads["state_class"])
+        self.assertIn("current context projection", heads["state_class"])
+        self.assertIn("repairable", heads["rebuildability"])
+        self.assertIn("not safely rebuildable", heads["rebuildability"])
+        self.assertIn("writer_epoch", heads["rebuildability"])
+        self.assertIn("authority epochs", heads["rebuildability"])
+        self.assertIn("active writer", heads["merge_guidance"])
+        self.assertIn("reservation", heads["merge_guidance"])
+        self.assertIn("fencing", heads["merge_guidance"])
+
+        subjects = self.tables["work_branch_subjects"]
+        self.assertIn("branch-selected immutable subject authority", subjects["state_class"])
+        self.assertIn("workspace/materialization", subjects["rebuildability"])
+        self.assertNotIn("rebuildable from the current branch/work declarations", subjects["rebuildability"])
+
+    def test_closed_world_parser_handles_comments_nested_ddl_and_unclosed_body(self) -> None:
+        source = schema_inventory.SchemaSource(
+            owner="test::owner",
+            domain="test",
+            path="schema.rs",
+            startup_owner="test startup",
+            state_class_hint="test state",
+            hot_path_hint="test path",
+        )
+        text = """
+// CREATE TABLE IF NOT EXISTS ignored_line (id INT)
+/* CREATE TABLE IF NOT EXISTS ignored_block (id INT) */
+CREATE
+  TABLE IF NOT EXISTS `nested_table`
+  (
+    id VARCHAR(32) NOT NULL,
+    payload VARCHAR(128) NULL,
+    PRIMARY KEY (id),
+    CHECK (id IN ('a,b', 'c'))
+  )
+#[cfg(test)]
+mod tests {
+    const SQL: &str = "CREATE TABLE IF NOT EXISTS ignored_cfg (id INT)";
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / source.path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+            tables = schema_inventory.extract_tables_from_source(root, source)
+        self.assertEqual(["nested_table"], [table.table for table in tables])
+        self.assertEqual(["id"], tables[0].primary_key)
+        self.assertEqual(2, tables[0].column_count)
+        with self.assertRaises(ValueError):
+            schema_inventory.find_matching_paren("(id INT, CHECK (id > 0)", 0)
+
+    def test_scanner_handles_nested_block_comments_and_commented_cfg_markers(self) -> None:
+        source = schema_inventory.SchemaSource(
+            owner="test::owner",
+            domain="test",
+            path="schema.rs",
+            startup_owner="test startup",
+            state_class_hint="test state",
+            hot_path_hint="test path",
+        )
+        text = """
+/* outer comment
+   /* nested comment with CREATE TABLE IF NOT EXISTS ghost_nested (id INT) */
+   CREATE TABLE IF NOT EXISTS ghost_outer (id INT)
+*/
+/* #[cfg(test)] */
+const RAW_SQL: &str = r##"CREATE TABLE IF NOT EXISTS raw_table (
+    id INT NOT NULL PRIMARY KEY,
+    note VARCHAR(128) DEFAULT '/* not a comment */ // #[cfg(test)]'
+)"##;
+const BYTE_RAW_SQL: &str = br##"CREATE TABLE IF NOT EXISTS byte_raw_table (
+    id INT NOT NULL PRIMARY KEY,
+    note VARCHAR(128) DEFAULT '/* byte raw */ // #[cfg(test)]'
+)"##;
+CREATE TABLE IF NOT EXISTS live_table (id INT NOT NULL PRIMARY KEY)
+#[cfg(test)]
+mod tests {
+    const SQL: &str = "CREATE TABLE IF NOT EXISTS ignored_cfg (id INT)";
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / source.path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+            tables = schema_inventory.extract_tables_from_source(root, source)
+        self.assertEqual(
+            ["raw_table", "byte_raw_table", "live_table"],
+            [table.table for table in tables],
+        )
+
+    def test_scanner_does_not_treat_rust_lifetimes_or_char_literals_as_ddl_comments(self) -> None:
+        source = schema_inventory.SchemaSource(
+            owner="test::owner",
+            domain="test",
+            path="schema.rs",
+            startup_owner="test startup",
+            state_class_hint="test state",
+            hot_path_hint="test path",
+        )
+        text = """
+fn lifetime<'a>() {}
+fn char_literal() { let slash = '/'; }
+// CREATE TABLE IF NOT EXISTS ghost (id INT)
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / source.path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+            tables = schema_inventory.extract_tables_from_source(root, source)
+        self.assertEqual([], tables)
+        self.assertIsNone(schema_inventory.CREATE_TABLE_RE.search("CREATE TABLE ghost (id INT)"))
+
+    def test_duplicate_table_declarations_are_retained_for_global_audit(self) -> None:
+        source_a = schema_inventory.SchemaSource(
+            owner="test::owner_a",
+            domain="test_a",
+            path="schema_a.rs",
+            startup_owner="test startup",
+            state_class_hint="test state",
+            hot_path_hint="test path",
+        )
+        source_b = schema_inventory.SchemaSource(
+            owner="test::owner_b",
+            domain="test_b",
+            path="schema_b.rs",
+            startup_owner="test startup",
+            state_class_hint="test state",
+            hot_path_hint="test path",
+        )
+        text = "CREATE TABLE IF NOT EXISTS duplicate_table (id INT PRIMARY KEY)\n"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for source in (source_a, source_b):
+                path = root / source.path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+            inventory = schema_inventory.build_inventory(
+                root, sources=(source_a, source_b)
+            )
+            self.assertEqual(
+                {
+                    "duplicate_table": [
+                        "schema_a.rs:1",
+                        "schema_b.rs:1",
+                    ]
+                },
+                inventory["summary"]["duplicate_table_names"],
+            )
+            with patch.object(
+                schema_inventory,
+                "SCHEMA_SOURCES",
+                (source_a, source_b),
+            ):
+                self.assertEqual(
+                    2,
+                    schema_inventory.main(
+                        ["--repo-root", str(root), "--fail-on-duplicates"]
+                    ),
+                )
 
     def test_first_batch_tables_have_semantic_metadata(self) -> None:
         first_batch = {
@@ -159,9 +457,6 @@ class SchemaInventoryTest(unittest.TestCase):
             "session_device_lease_events",
             "session_state_items",
             "session_delegations",
-            "session_todos",
-            "session_todo_counters",
-            "session_todo_idempotency",
             "data_versioning_checkpoints",
             "sweeper_leases",
             "workspace_records",
@@ -210,18 +505,6 @@ class SchemaInventoryTest(unittest.TestCase):
         self.assertIn(
             "do not merge into agent_runs",
             self.tables["session_delegations"]["merge_guidance"],
-        )
-        self.assertIn(
-            "plan mirror",
-            self.tables["session_todos"]["merge_guidance"],
-        )
-        self.assertIn(
-            "deleted todos still reserve ids",
-            self.tables["session_todo_counters"]["merge_guidance"],
-        )
-        self.assertIn(
-            "queried directly",
-            self.tables["session_todo_idempotency"]["merge_guidance"],
         )
         self.assertIn(
             "DatabaseDataVersioningService reads and writes",
@@ -334,7 +617,6 @@ class SchemaInventoryTest(unittest.TestCase):
             "user_skill_evaluations",
             "agent_agents",
             "agent_bindings",
-            "agent_tasks",
         }
         for table in skill_agent_tables:
             with self.subTest(table=table):
@@ -404,11 +686,6 @@ class SchemaInventoryTest(unittest.TestCase):
             "idempotent creation semantics",
             self.tables["agent_bindings"]["merge_guidance"],
         )
-        self.assertIn(
-            "todos own user scratchpad tasks",
-            self.tables["agent_tasks"]["merge_guidance"],
-        )
-
     def test_session_workflow_coordination_tables_have_semantic_metadata(self) -> None:
         session_workflow_tables = {
             "agent_event_edges",
@@ -417,12 +694,8 @@ class SchemaInventoryTest(unittest.TestCase):
             "session_checkpoints",
             "user_preferences",
             "edge_agent_registry",
-            "task_leases",
-            "plan_templates",
             "plans",
             "plan_step_runs",
-            "task_contracts",
-            "verification_results",
             "wf_triggers",
             "infra_sandbox_metadata",
             "team_definitions",
@@ -474,28 +747,12 @@ class SchemaInventoryTest(unittest.TestCase):
             self.tables["edge_agent_registry"]["merge_guidance"],
         )
         self.assertIn(
-            "must lock before/with task rows",
-            self.tables["task_leases"]["merge_guidance"],
-        )
-        self.assertIn(
-            "reusable learned patterns",
-            self.tables["plan_templates"]["merge_guidance"],
-        )
-        self.assertIn(
             "current mutable plan state",
             self.tables["plans"]["merge_guidance"],
         )
         self.assertIn(
             "append-only attempt history",
             self.tables["plan_step_runs"]["merge_guidance"],
-        )
-        self.assertIn(
-            "contracts define expected criteria",
-            self.tables["task_contracts"]["merge_guidance"],
-        )
-        self.assertIn(
-            "evidence rows fan out",
-            self.tables["verification_results"]["merge_guidance"],
         )
         self.assertIn(
             "separate activation lifecycle",

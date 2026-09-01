@@ -25,7 +25,6 @@ mod agent_binding_skill_runtime;
 pub mod artifact_retention_sweeper;
 mod audit_handlers;
 mod auth_handlers;
-mod bridge_prep;
 mod capability_handlers;
 mod chat_handlers;
 mod cleanup_retry;
@@ -43,7 +42,6 @@ mod llm_trusted_domains_handlers;
 mod mcp_handlers;
 mod meta_handlers;
 mod model_execution_admission;
-mod plan_handlers;
 mod platform_handlers;
 mod preferences_handlers;
 mod product_harness_handlers;
@@ -66,7 +64,6 @@ pub(crate) mod session_turn;
 mod skillify_agent_executor;
 mod state_builder;
 pub mod sweeper_lease;
-mod task_handlers;
 pub mod team;
 pub(crate) mod tool_admission;
 pub(crate) mod tool_agent_info;
@@ -88,6 +85,11 @@ pub(crate) mod tool_invocation_decision;
 pub(crate) mod tool_invocation_runtime;
 pub(crate) mod tool_local_execution;
 pub(crate) mod tool_local_transport;
+mod work_branch_deletion_runtime;
+mod work_handlers;
+mod work_patch_commit_runtime;
+mod work_patch_export_runtime;
+mod work_patch_materialization_runtime;
 
 fn external_request_descriptor(
     method: &Method,
@@ -119,17 +121,23 @@ pub(crate) mod tool_session_config;
 pub(crate) mod tool_session_history;
 pub(crate) mod tool_session_runtime;
 pub(crate) mod tool_session_state_rollback;
-pub(crate) mod tool_task_runtime;
 pub mod tool_transport;
 pub(crate) mod tool_transport_errors;
 pub(crate) mod tool_transport_metadata;
 pub(crate) mod tool_transport_plan;
+pub(crate) mod tool_work_criteria;
+pub(crate) mod tool_work_lifecycle;
+pub(crate) mod tool_work_plan;
+pub(crate) mod tool_work_proposal;
 pub(crate) mod tool_work_surface_events;
 pub(crate) mod tool_workspace_path_guard;
 mod user_skill_handlers;
+pub(crate) mod work_context;
+#[cfg(test)]
+pub(crate) mod work_test_support;
 mod ws_handler;
 
-use self::{bridge_prep::prepare_chat_turn_bridge_body, http_helpers::*};
+use self::http_helpers::*;
 use astra_server_types::*;
 mod completions;
 
@@ -193,12 +201,8 @@ async fn finish_server_shutdown(
             "drained edge WebSocket connections"
         );
     }
-    // 1. Stop background sweepers and wait for them to exit.
-    bg_cancel.cancel();
-    for h in bg_handles {
-        let _ = h.await;
-    }
-    // 2. Drain in-flight agentic loop tasks (up to 30s).
+    // 1. Let already-admitted runs finish while provider admission and the
+    //    durable recovery workers are still available.
     if !run_lifecycle
         .drain_background_tasks(std::time::Duration::from_secs(30))
         .await
@@ -207,12 +211,40 @@ async fn finish_server_shutdown(
             target: "astra_runtime::serve",
             "graceful shutdown: some background tasks did not finish within 30s"
         );
+        if !run_lifecycle
+            .stop_background_tasks_for_shutdown(std::time::Duration::from_secs(10))
+            .await
+        {
+            tracing::error!(
+                target: "astra_runtime::serve",
+                "graceful shutdown: background tasks did not stop after checkpointed local abort"
+            );
+        }
     }
-    // 3. Drain Matrix ingestion + tracked session sync tasks.
+    // 2. Stop new provider admissions and let the fixed settlement workers
+    //    durably hand off every reserved terminal before database sweepers are
+    //    stopped. A timeout is reported as an unclean shutdown; it must never
+    //    be mistaken for a fully persisted drain.
+    if !crate::turn::llm::durable::drain_provider_settlement_coordinator(
+        std::time::Duration::from_secs(10),
+    )
+    .await
+    {
+        tracing::error!(
+            target: "astra_runtime::serve",
+            "graceful shutdown: durable provider settlements remain unconfirmed after 10s"
+        );
+    }
+    // 3. Stop background sweepers and wait for them to exit.
+    bg_cancel.cancel();
+    for h in bg_handles {
+        let _ = h.await;
+    }
+    // 4. Drain Matrix ingestion + tracked session sync tasks.
     if let Some(rt) = matrix_runtime {
         rt.shutdown_ingestion_and_wait().await;
     }
-    // 4. Flush OTLP exporter last so the prior shutdown work is observable.
+    // 5. Flush OTLP exporter last so the prior shutdown work is observable.
     astra_logging::shutdown_otel();
 }
 
@@ -276,6 +308,27 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
             state.metrics_registry(),
             bg_cancel.clone(),
         ));
+        bg_handles.push(astra_services::work::spawn_work_runtime_event_projector(
+            pool.clone(),
+            bg_cancel.clone(),
+        ));
+        bg_handles.push(
+            work_branch_deletion_runtime::spawn_work_branch_deletion_recovery(
+                pool.clone(),
+                state.execution.run_lifecycle_service.clone(),
+                bg_cancel.clone(),
+            ),
+        );
+        bg_handles.push(
+            work_patch_materialization_runtime::spawn_work_patch_materialization_recovery(
+                pool.clone(),
+                bg_cancel.clone(),
+            ),
+        );
+        bg_handles.push(work_patch_commit_runtime::spawn_work_patch_commit_recovery(
+            pool.clone(),
+            bg_cancel.clone(),
+        ));
         // Spawn background cleanup-debt retry task
         {
             let cleanup_store: std::sync::Arc<dyn astra_services::WorkspaceCleanupDebtStore> =
@@ -291,6 +344,11 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
             pool.clone(),
             state.session_fork_coordinator.clone(),
             bg_cancel.clone(),
+            state
+                .execution
+                .run_lifecycle_service
+                .execution_owner_pod_id()
+                .map(str::to_owned),
         ));
     }
 
@@ -299,6 +357,7 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
     let matrix_runtime = state.matrix_cloud_runtime.clone();
     let run_lifecycle = state.execution.run_lifecycle_service.clone();
     let edge_pool = state.edge_connection_pool.clone();
+    let database_pool_owner = state.clone();
 
     axum::serve(listener, build_app(state))
         .with_graceful_shutdown(http_shutdown_signal())
@@ -312,6 +371,7 @@ pub async fn serve(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
         edge_pool,
     )
     .await;
+    database_pool_owner.close_database_pools().await;
     Ok(())
 }
 
@@ -709,6 +769,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingRunLifecycleService {
         drain_calls: AtomicUsize,
+        stop_calls: AtomicUsize,
+        passive_drain_succeeds: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
@@ -765,6 +827,11 @@ mod tests {
 
         async fn drain_background_tasks(&self, _timeout: std::time::Duration) -> bool {
             self.drain_calls.fetch_add(1, Ordering::SeqCst);
+            self.passive_drain_succeeds.load(Ordering::SeqCst)
+        }
+
+        async fn stop_background_tasks_for_shutdown(&self, _timeout: std::time::Duration) -> bool {
+            self.stop_calls.fetch_add(1, Ordering::SeqCst);
             true
         }
     }
@@ -780,6 +847,9 @@ mod tests {
             completed_probe.fetch_add(1, Ordering::SeqCst);
         });
         let run_lifecycle = Arc::new(RecordingRunLifecycleService::default());
+        run_lifecycle
+            .passive_drain_succeeds
+            .store(true, Ordering::SeqCst);
 
         super::finish_server_shutdown(
             bg_cancel,
@@ -792,5 +862,24 @@ mod tests {
 
         assert_eq!(completed.load(Ordering::SeqCst), 1);
         assert_eq!(run_lifecycle.drain_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(run_lifecycle.stop_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_producers_before_settlement_workers_drain() {
+        let bg_cancel = tokio_util::sync::CancellationToken::new();
+        let run_lifecycle = Arc::new(RecordingRunLifecycleService::default());
+
+        super::finish_server_shutdown(
+            bg_cancel,
+            Vec::new(),
+            run_lifecycle.clone(),
+            None,
+            astra_server_types::edge_connection_pool::EdgeConnectionPool::new(),
+        )
+        .await;
+
+        assert_eq!(run_lifecycle.drain_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(run_lifecycle.stop_calls.load(Ordering::SeqCst), 1);
     }
 }

@@ -30,6 +30,8 @@ const TOOL_INVOCATION_RESULT_PROJECTION_CONTRACT_VERSION: &str = "tool-result-pr
 pub const TOOL_INVOCATION_CACHE_COMPLETION_CONTRACT_VERSION: &str =
     "tool-invocation-cache-completion-v1";
 pub const TOOL_INVOCATION_RUN_CLOSURE_CONTRACT_VERSION: &str = "tool-invocation-run-closure-v1";
+pub const TOOL_INVOCATION_GUIDANCE_COMPLETION_CONTRACT_VERSION: &str =
+    "tool-invocation-guidance-completion-v1";
 
 const INTERNAL_TRANSPORT_ARGUMENTS: [&str; 3] = ["_run_id", "_tool_call_id", "_turn_chain_id"];
 
@@ -666,6 +668,10 @@ pub enum ToolInvocationCompletionSource {
         contract_version: String,
         run_status: String,
     },
+    SupersededByGuidance {
+        contract_version: String,
+        user_intent_event_index: i64,
+    },
 }
 
 impl ToolInvocationCompletionSource {
@@ -686,6 +692,17 @@ impl ToolInvocationCompletionSource {
         let source = Self::RunClosure {
             contract_version: TOOL_INVOCATION_RUN_CLOSURE_CONTRACT_VERSION.to_string(),
             run_status: run_status.into(),
+        };
+        source.validate()?;
+        Ok(source)
+    }
+
+    pub fn superseded_by_guidance(
+        user_intent_event_index: i64,
+    ) -> Result<Self, ToolInvocationContractError> {
+        let source = Self::SupersededByGuidance {
+            contract_version: TOOL_INVOCATION_GUIDANCE_COMPLETION_CONTRACT_VERSION.to_string(),
+            user_intent_event_index,
         };
         source.validate()?;
         Ok(source)
@@ -729,6 +746,26 @@ impl ToolInvocationCompletionSource {
                 }
                 Ok(())
             }
+            Self::SupersededByGuidance {
+                contract_version,
+                user_intent_event_index,
+            } => {
+                if contract_version != TOOL_INVOCATION_GUIDANCE_COMPLETION_CONTRACT_VERSION {
+                    return Err(
+                        ToolInvocationContractError::UnsupportedGuidanceCompletionContractVersion(
+                            contract_version.clone(),
+                        ),
+                    );
+                }
+                if *user_intent_event_index < 0 {
+                    return Err(
+                        ToolInvocationContractError::InvalidGuidanceCompletionEventIndex(
+                            *user_intent_event_index,
+                        ),
+                    );
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -750,6 +787,10 @@ impl<'de> Deserialize<'de> for ToolInvocationCompletionSource {
                 contract_version: String,
                 run_status: String,
             },
+            SupersededByGuidance {
+                contract_version: String,
+                user_intent_event_index: i64,
+            },
         }
 
         let source = match RawSource::deserialize(deserializer)? {
@@ -768,6 +809,13 @@ impl<'de> Deserialize<'de> for ToolInvocationCompletionSource {
             } => Self::RunClosure {
                 contract_version,
                 run_status,
+            },
+            RawSource::SupersededByGuidance {
+                contract_version,
+                user_intent_event_index,
+            } => Self::SupersededByGuidance {
+                contract_version,
+                user_intent_event_index,
             },
         };
         source.validate().map_err(serde::de::Error::custom)?;
@@ -923,6 +971,15 @@ impl ToolInvocationRecord {
                 {
                     return Err(
                         ToolInvocationContractError::InvalidRunClosureCompletionState {
+                            state: self.state,
+                        },
+                    );
+                }
+                ToolInvocationCompletionSource::SupersededByGuidance { .. }
+                    if self.state != ToolInvocationState::Rejected =>
+                {
+                    return Err(
+                        ToolInvocationContractError::InvalidGuidanceCompletionState {
                             state: self.state,
                         },
                     );
@@ -1342,6 +1399,8 @@ pub enum ToolInvocationContractError {
     UnsupportedCacheCompletionContractVersion(String),
     #[error("unsupported tool invocation run-closure contract version '{0}'")]
     UnsupportedRunClosureContractVersion(String),
+    #[error("unsupported tool invocation guidance-completion contract version '{0}'")]
+    UnsupportedGuidanceCompletionContractVersion(String),
     #[error("tool invocation run-closure status is not terminal: '{0}'")]
     InvalidRunClosureStatus(String),
     #[error("tool invocation cache-completion {field} is not a canonical SHA-256 content ID")]
@@ -1350,6 +1409,10 @@ pub enum ToolInvocationContractError {
     InvalidCacheCompletionState { state: ToolInvocationState },
     #[error("run closure completion cannot produce ledger state {state:?}")]
     InvalidRunClosureCompletionState { state: ToolInvocationState },
+    #[error("guidance completion cannot produce ledger state {state:?}")]
+    InvalidGuidanceCompletionState { state: ToolInvocationState },
+    #[error("guidance completion event index must be non-negative, got {0}")]
+    InvalidGuidanceCompletionEventIndex(i64),
     #[error("a non-dispatch completion cannot have {attempt_count} provider dispatch attempts")]
     InvalidNonDispatchAttemptCount { attempt_count: u32 },
     #[error("a non-dispatch completion cannot retain a provider dispatch lease")]
@@ -1851,6 +1914,60 @@ mod tests {
         let mut non_terminal_status = encoded;
         non_terminal_status["completion_source"]["run_status"] = json!("running");
         assert!(serde_json::from_value::<ToolInvocationRecord>(non_terminal_status).is_err());
+    }
+
+    #[test]
+    fn guidance_supersession_is_terminal_without_fabricating_dispatch() {
+        let decision = decision();
+        let record = ToolInvocationRecord {
+            identity: identity("call-superseded"),
+            fingerprint: ToolInvocationFingerprint::new(
+                tool_ref(),
+                &json!({"command": "mutate"}),
+                &decision.decision_id,
+            )
+            .unwrap(),
+            decision,
+            state: ToolInvocationState::Rejected,
+            dispatch_certainty: DispatchCertainty::NotDispatched,
+            attempt_count: 0,
+            dispatch_lease: None,
+            outcome: Some(ToolInvocationTerminalOutcome::Rejected {
+                result: ToolInvocationResultPayload::new(
+                    "superseded by guidance".to_string(),
+                    BTreeMap::new(),
+                    None,
+                )
+                .unwrap(),
+                rejection_code: Some("superseded_by_guidance".to_string()),
+                retryable: false,
+            }),
+            completion_source: Some(
+                ToolInvocationCompletionSource::superseded_by_guidance(7).unwrap(),
+            ),
+        };
+        record.validate().unwrap();
+        let encoded = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            serde_json::from_value::<ToolInvocationRecord>(encoded.clone()).unwrap(),
+            record
+        );
+
+        let mut attempted = encoded.clone();
+        attempted["attempt_count"] = json!(1);
+        assert!(serde_json::from_value::<ToolInvocationRecord>(attempted).is_err());
+
+        let mut wrong_state = encoded.clone();
+        wrong_state["state"] = json!("succeeded");
+        wrong_state["outcome"] = json!({
+            "kind": "succeeded",
+            "result": {"output": "forged"}
+        });
+        assert!(serde_json::from_value::<ToolInvocationRecord>(wrong_state).is_err());
+
+        let mut invalid_event = encoded;
+        invalid_event["completion_source"]["user_intent_event_index"] = json!(-1);
+        assert!(serde_json::from_value::<ToolInvocationRecord>(invalid_event).is_err());
     }
 
     #[test]

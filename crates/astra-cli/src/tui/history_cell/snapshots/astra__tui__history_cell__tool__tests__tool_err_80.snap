@@ -4,4 +4,4 @@ expression: "render(&err_tool(\"bash\", \"false\", 10), 80, 3)"
 ---
 ● Failed Bash · 10ms
   ├ false
-  ├ Bash ended without a result payload: false.
+  ├ Bash reported failure without an error payload: false.

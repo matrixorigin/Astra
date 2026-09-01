@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use astra_services::multi_agent::EdgeDispatchIdentity;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(test)]
 use uuid::Uuid;
 
 /// Cap in-memory map size. New entries are REJECTED (not evicted) when this
@@ -28,7 +29,19 @@ pub const DEFAULT_POLL_INTERVAL_MS: u64 = 50;
 /// orphaned tool-result / approval entries (e.g. when a turn aborts after
 /// the edge POST landed) accumulate until they fill `LEDGER_MAX_ENTRIES`
 /// and force a wholesale eviction.
-pub const MAX_LEDGER_ENTRY_AGE: Duration = Duration::from_secs(300);
+/// Retain in-flight edge custody for the longest supported long-session tool
+/// execution plus its result-settlement grace. This must not expire before the
+/// execution deadline propagated to the edge connection pool, otherwise a
+/// legitimate late result is rejected after the server has already forgotten
+/// its durable waiter.
+pub const MAX_LEDGER_ENTRY_AGE: Duration = Duration::from_secs(1_810);
+
+/// A cancelled tool can finish its local cleanup just before the edge process
+/// observes the cancellation and posts its final acknowledgement.  Keep the
+/// exact callback custody for this short, terminal-only acknowledgement
+/// window.  This is deliberately much shorter than normal ledger retention:
+/// it is not another execution lease and never authorizes a completed result.
+pub const CANCELLED_CALLBACK_ACK_GRACE: Duration = Duration::from_secs(15);
 
 pub const MSG_TOOL_LEDGER_TIMEOUT: &str =
     "timed out waiting for edge POST /tools/result (§5.5 ledger)";
@@ -107,7 +120,50 @@ type CallbackLedger = tokio::sync::Mutex<HashMap<String, Value>>;
 
 struct LedgerExpectation {
     ledger: Weak<CallbackLedger>,
+    /// Exact executor selected before the request was exposed. Authentication
+    /// proves the user, not which of that user's Edge agents owns this call.
+    edge_agent_id: String,
     registered_at: Instant,
+    cancelled_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerExpectationError {
+    InvalidEdgeAgentId,
+    ConflictingExecutorCustody,
+    ExpectationRegistryUnavailable,
+}
+
+impl std::fmt::Display for LedgerExpectationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::InvalidEdgeAgentId => "selected edge agent id is invalid",
+            Self::ConflictingExecutorCustody => {
+                "callback identity is already bound to a different edge agent"
+            }
+            Self::ExpectationRegistryUnavailable => "callback expectation registry is unavailable",
+        })
+    }
+}
+
+impl std::error::Error for LedgerExpectationError {}
+
+fn valid_edge_agent_custody(edge_agent_id: &str) -> bool {
+    !edge_agent_id.is_empty()
+        && edge_agent_id.trim() == edge_agent_id
+        && edge_agent_id.len() <= 256
+        && !edge_agent_id.chars().any(char::is_control)
+}
+
+/// A short-lived receipt for a callback that was already consumed by the
+/// runtime. The active ledger is intentionally destructive, but HTTP retries
+/// can arrive after the waiter removes an entry. Keeping the exact payload
+/// lets the handler distinguish an idempotent replay from an unknown/spoofed
+/// callback without reopening the delivery lane.
+struct LedgerReplayReceipt {
+    ledger: Weak<CallbackLedger>,
+    value: Value,
+    consumed_at: Instant,
 }
 
 /// Process-local callback expectations, scoped to the exact ledger instance.
@@ -118,6 +174,88 @@ fn ledger_expectations() -> &'static StdMutex<HashMap<String, Vec<LedgerExpectat
     static EXPECTATIONS: std::sync::OnceLock<StdMutex<HashMap<String, Vec<LedgerExpectation>>>> =
         std::sync::OnceLock::new();
     EXPECTATIONS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn ledger_replays() -> &'static StdMutex<HashMap<String, Vec<LedgerReplayReceipt>>> {
+    static REPLAYS: std::sync::OnceLock<StdMutex<HashMap<String, Vec<LedgerReplayReceipt>>>> =
+        std::sync::OnceLock::new();
+    REPLAYS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn prune_ledger_replays(replays: &mut HashMap<String, Vec<LedgerReplayReceipt>>, now: Instant) {
+    for receipts in replays.values_mut() {
+        receipts.retain(|receipt| {
+            receipt.ledger.upgrade().is_some()
+                && now.saturating_duration_since(receipt.consumed_at) <= MAX_LEDGER_ENTRY_AGE
+        });
+    }
+    replays.retain(|_, receipts| !receipts.is_empty());
+
+    let mut total = replays.values().map(Vec::len).sum::<usize>();
+    while total > LEDGER_MAX_ENTRIES {
+        let oldest = replays
+            .iter()
+            .flat_map(|(key, receipts)| {
+                receipts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, receipt)| (key.clone(), index, receipt.consumed_at))
+            })
+            .min_by_key(|(_, _, consumed_at)| *consumed_at);
+        let Some((key, index, _)) = oldest else {
+            break;
+        };
+        if let Some(receipts) = replays.get_mut(&key) {
+            receipts.remove(index);
+            if receipts.is_empty() {
+                replays.remove(&key);
+            }
+        }
+        total -= 1;
+    }
+}
+
+fn remember_consumed_ledger_entry(ledger: &Arc<CallbackLedger>, key: &str, value: Value) {
+    let now = Instant::now();
+    if let Ok(mut replays) = ledger_replays().lock() {
+        prune_ledger_replays(&mut replays, now);
+        replays
+            .entry(key.to_string())
+            .or_default()
+            .push(LedgerReplayReceipt {
+                ledger: Arc::downgrade(ledger),
+                value,
+                consumed_at: now,
+            });
+        prune_ledger_replays(&mut replays, now);
+    }
+}
+
+/// Return whether a consumed callback is an exact replay (`Some(true)`) or a
+/// divergent reuse of an already-consumed callback key (`Some(false)`).
+/// `None` means this ledger has no consumed receipt for the key. Receipts are
+/// scoped to the exact ledger instance and expire with the normal ledger age.
+pub fn ledger_replay_status(
+    ledger: &Arc<CallbackLedger>,
+    key: &str,
+    value: &Value,
+) -> Option<bool> {
+    let now = Instant::now();
+    let mut replays = ledger_replays().lock().ok()?;
+    prune_ledger_replays(&mut replays, now);
+    let current = Arc::downgrade(ledger);
+    let receipts = replays.get(key)?;
+    let mut matching_ledger = false;
+    for receipt in receipts {
+        if !Weak::ptr_eq(&receipt.ledger, &current) {
+            continue;
+        }
+        matching_ledger = true;
+        if &receipt.value == value {
+            return Some(true);
+        }
+    }
+    matching_ledger.then_some(false)
 }
 
 fn clear_ledger_expectation(ledger: &Arc<CallbackLedger>, key: &str) {
@@ -292,9 +430,20 @@ pub fn on_ledger_insert(key: &str) {
 ///
 /// This is deliberately separate from event construction: formatting an SSE
 /// map must not authorize a callback unless the caller will also consume it.
-pub fn expect_ledger_entry(ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>, key: &str) {
+#[must_use]
+pub fn expect_ledger_entry(
+    ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
+    key: &str,
+    edge_agent_id: &str,
+) -> Result<(), LedgerExpectationError> {
+    if !valid_edge_agent_custody(edge_agent_id) {
+        return Err(LedgerExpectationError::InvalidEdgeAgentId);
+    }
     let ledger = Arc::downgrade(ledger);
-    if let Ok(mut expectations) = ledger_expectations().lock() {
+    {
+        let mut expectations = ledger_expectations()
+            .lock()
+            .map_err(|_| LedgerExpectationError::ExpectationRegistryUnavailable)?;
         let ledgers = expectations.entry(key.to_string()).or_default();
         let now = Instant::now();
         ledgers.retain(|candidate| {
@@ -305,11 +454,17 @@ pub fn expect_ledger_entry(ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value
             .iter_mut()
             .find(|candidate| Weak::ptr_eq(&candidate.ledger, &ledger))
         {
+            if candidate.edge_agent_id != edge_agent_id {
+                return Err(LedgerExpectationError::ConflictingExecutorCustody);
+            }
             candidate.registered_at = now;
+            candidate.cancelled_at = None;
         } else {
             ledgers.push(LedgerExpectation {
                 ledger,
+                edge_agent_id: edge_agent_id.to_string(),
                 registered_at: now,
+                cancelled_at: None,
             });
         }
     }
@@ -318,6 +473,7 @@ pub fn expect_ledger_entry(ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value
             .or_insert_with(LedgerEntryMeta::now);
         prune_ledger_meta(&mut meta);
     }
+    Ok(())
 }
 
 /// Withdraw an expectation when its request could not be committed and
@@ -337,7 +493,11 @@ pub fn cancel_expected_ledger_entry(
 pub fn ledger_entry_is_expected(
     ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
     key: &str,
+    edge_agent_id: &str,
 ) -> bool {
+    if !valid_edge_agent_custody(edge_agent_id) {
+        return false;
+    }
     let ledger = Arc::downgrade(ledger);
     ledger_expectations()
         .lock()
@@ -351,11 +511,86 @@ pub fn ledger_entry_is_expected(
                     && now.saturating_duration_since(candidate.registered_at)
                         <= MAX_LEDGER_ENTRY_AGE
             });
-            ledgers
-                .iter()
-                .any(|candidate| Weak::ptr_eq(&candidate.ledger, &ledger))
+            ledgers.iter().any(|candidate| {
+                Weak::ptr_eq(&candidate.ledger, &ledger)
+                    && candidate.edge_agent_id == edge_agent_id
+                    && candidate.cancelled_at.is_none()
+            })
         })
         .unwrap_or(false)
+}
+
+/// Convert a live callback custody record into a short-lived cancellation
+/// acknowledgement lease.  The associated entry is discarded because the
+/// runtime has already synthesized its cancellation result; a later exact
+/// `cancelled` callback is acknowledged but cannot re-open delivery.
+pub async fn discard_ledger_entry_for_cancelled_callback_ack(
+    ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
+    key: &str,
+) {
+    let weak = Arc::downgrade(ledger);
+    if let Ok(mut expectations) = ledger_expectations().lock() {
+        let now = Instant::now();
+        if let Some(candidates) = expectations.get_mut(key) {
+            candidates.retain(|candidate| {
+                candidate.ledger.upgrade().is_some()
+                    && now.saturating_duration_since(candidate.registered_at)
+                        <= MAX_LEDGER_ENTRY_AGE
+            });
+            for candidate in candidates.iter_mut() {
+                if Weak::ptr_eq(&candidate.ledger, &weak) {
+                    candidate.cancelled_at = Some(now);
+                }
+            }
+        }
+    }
+    ledger.lock().await.remove(key);
+    if let Ok(mut timestamps) = ledger_timestamps().lock() {
+        timestamps.remove(key);
+    }
+    if let Ok(mut meta) = ledger_meta().lock() {
+        meta.remove(key);
+    }
+}
+
+/// Consume the terminal-only cancellation acknowledgement authority for one
+/// exact edge executor.  Callers must additionally require `status=cancelled`
+/// before accepting a callback through this route.
+pub fn take_cancelled_callback_ack_expectation(
+    ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
+    key: &str,
+    edge_agent_id: &str,
+) -> bool {
+    if !valid_edge_agent_custody(edge_agent_id) {
+        return false;
+    }
+    let weak = Arc::downgrade(ledger);
+    let Ok(mut expectations) = ledger_expectations().lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    let Some(candidates) = expectations.get_mut(key) else {
+        return false;
+    };
+    candidates.retain(|candidate| {
+        candidate.ledger.upgrade().is_some()
+            && now.saturating_duration_since(candidate.registered_at) <= MAX_LEDGER_ENTRY_AGE
+            && candidate
+                .cancelled_at
+                .is_none_or(|at| now.saturating_duration_since(at) <= CANCELLED_CALLBACK_ACK_GRACE)
+    });
+    let Some(index) = candidates.iter().position(|candidate| {
+        Weak::ptr_eq(&candidate.ledger, &weak)
+            && candidate.edge_agent_id == edge_agent_id
+            && candidate.cancelled_at.is_some()
+    }) else {
+        return false;
+    };
+    candidates.remove(index);
+    if candidates.is_empty() {
+        expectations.remove(key);
+    }
+    true
 }
 
 /// ── File-based persistence ──────────────────────────────────────────
@@ -563,6 +798,7 @@ pub async fn take_ledger_entry(
         {
             let mut g = ledger.lock().await;
             if let Some(v) = g.remove(key) {
+                remember_consumed_ledger_entry(ledger, key, v.clone());
                 // Clean up metadata and timestamps.
                 clear_ledger_expectation(ledger, key);
                 if let Ok(mut ts) = ledger_timestamps().lock() {
@@ -582,7 +818,24 @@ pub async fn take_ledger_entry(
                 // lock. A callback handler takes the same lock before checking
                 // the expectation, so it cannot enqueue an orphan in the
                 // timeout check/return race window.
-                clear_ledger_expectation(ledger, key);
+                // The edge executor commonly learns about the same timeout a
+                // fraction later and posts its typed `cancelled` result.  The
+                // waiter has already made the timeout authoritative, so do
+                // not accept a late completion, but retain one exact
+                // cancellation acknowledgement lease.  Clearing custody here
+                // used to turn that normal race into a 404 callback failure
+                // and an empty CLI envelope.
+                let weak = Arc::downgrade(ledger);
+                if let Ok(mut expectations) = ledger_expectations().lock() {
+                    if let Some(candidates) = expectations.get_mut(key) {
+                        let now = Instant::now();
+                        for candidate in candidates.iter_mut() {
+                            if Weak::ptr_eq(&candidate.ledger, &weak) {
+                                candidate.cancelled_at = Some(now);
+                            }
+                        }
+                    }
+                }
                 if let Ok(mut ts) = ledger_timestamps().lock() {
                     ts.remove(key);
                 }
@@ -616,12 +869,15 @@ pub async fn acknowledge_ledger_entry(
 ) -> bool {
     let removed = {
         let mut entries = ledger.lock().await;
-        let removed = entries.remove(key).is_some();
+        let removed = entries.remove(key);
+        if let Some(value) = removed.as_ref() {
+            remember_consumed_ledger_entry(ledger, key, value.clone());
+        }
         // Keep expectation teardown under the ledger lock. Callback handlers
         // take the same lock before authorizing an insert, so a late duplicate
         // cannot race this acknowledgement into a new orphan entry.
         clear_ledger_expectation(ledger, key);
-        removed
+        removed.is_some()
     };
     if let Ok(mut timestamps) = ledger_timestamps().lock() {
         timestamps.remove(key);
@@ -633,24 +889,6 @@ pub async fn acknowledge_ledger_entry(
         let _ = persistence.write_op("remove", key);
     }
     removed
-}
-
-/// Fill missing, empty, or duplicate `id` on each tool call so SSE +
-/// `POST /tools/result` agree and the edge callback ledger never sees
-/// colliding keys (which would cause HTTP 409).
-pub fn ensure_tool_call_ids(tool_calls: &mut [Value]) {
-    let mut seen = std::collections::HashSet::with_capacity(tool_calls.len());
-    for tc in tool_calls.iter_mut() {
-        let Some(obj) = tc.as_object_mut() else {
-            continue;
-        };
-        let id = obj.get("id").and_then(Value::as_str).unwrap_or("");
-        if id.is_empty() || !seen.insert(id.to_string()) {
-            let new_id = Uuid::now_v7().to_string();
-            seen.insert(new_id.clone());
-            obj.insert("id".to_string(), Value::String(new_id));
-        }
-    }
 }
 
 pub fn tool_content_from_ledger_entry(entry: &Value) -> String {
@@ -687,7 +925,7 @@ pub fn tool_content_from_ledger_entry(entry: &Value) -> String {
     };
     if output.is_empty() {
         serde_json::to_string(&json!({"status": status})).unwrap_or_else(|_| status.to_string())
-    } else if status == "completed" {
+    } else if status == "completed" || serde_json::from_str::<Value>(&output).is_ok() {
         output
     } else {
         format!("status={status}\n{output}")
@@ -717,13 +955,12 @@ pub fn persist_value_for_ledger_tool_result(
     tc: &Value,
     ledger_entry: Option<&Value>,
     timed_out: bool,
-) -> Value {
+) -> Option<Value> {
     let id = tc
         .get("id")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+        .map(|s| s.to_string())?;
     let name = tc
         .get("function")
         .and_then(Value::as_object)
@@ -737,11 +974,11 @@ pub fn persist_value_for_ledger_tool_result(
     } else {
         "missing tool_call id".to_string()
     };
-    json!({
+    Some(json!({
         "tool_call_id": id,
         "name": name,
         "result": result,
-    })
+    }))
 }
 
 pub fn assistant_message_with_tool_calls(tool_calls: &[Value]) -> Value {
@@ -1016,18 +1253,6 @@ mod tests {
     }
 
     #[test]
-    fn ensure_tool_call_ids_fills_empty_and_skips_nonempty() {
-        let mut calls = vec![
-            json!({"id": "", "function": {"name": "x", "arguments": "{}"}}),
-            json!({"id": "keep-me", "function": {"name": "y", "arguments": "{}"}}),
-        ];
-        ensure_tool_call_ids(&mut calls);
-        let id0 = calls[0].get("id").and_then(Value::as_str).unwrap();
-        assert!(!id0.is_empty());
-        assert_eq!(calls[1].get("id").and_then(Value::as_str), Some("keep-me"));
-    }
-
-    #[test]
     fn tool_content_prefers_output_on_success_status() {
         let entry = json!({
             "kind": "tool_result",
@@ -1045,6 +1270,21 @@ mod tests {
             tool_content_from_ledger_entry(&entry),
             "status=failed\nboom"
         );
+    }
+
+    #[test]
+    fn tool_content_preserves_structured_terminal_error_without_text_prefix() {
+        let entry = json!({
+            "body": {
+                "status": "cancelled",
+                "output": r#"{"status":"cancelled","error_kind":"cancelled","retryable":false}"#
+            }
+        });
+        let content = tool_content_from_ledger_entry(&entry);
+        let value: Value = serde_json::from_str(&content).expect("structured cancellation");
+        assert_eq!(value["status"], "cancelled");
+        assert_eq!(value["error_kind"], "cancelled");
+        assert_eq!(value["retryable"], false);
     }
 
     #[test]
@@ -1098,33 +1338,16 @@ mod tests {
     }
 
     #[test]
-    fn ensure_tool_call_ids_deduplicates_non_empty_ids() {
-        let mut calls = vec![
-            json!({"id": "read_file:0", "function": {"name": "read_file", "arguments": "{}"}}),
-            json!({"id": "read_file:0", "function": {"name": "read_file", "arguments": "{}"}}),
-            json!({"id": "bash:0", "function": {"name": "bash", "arguments": "{}"}}),
-        ];
-        ensure_tool_call_ids(&mut calls);
-        let id0 = calls[0].get("id").and_then(Value::as_str).unwrap();
-        let id1 = calls[1].get("id").and_then(Value::as_str).unwrap();
-        let id2 = calls[2].get("id").and_then(Value::as_str).unwrap();
-        // First occurrence keeps its ID
-        assert_eq!(id0, "read_file:0");
-        // Duplicate gets a new unique ID
-        assert_ne!(id1, "read_file:0");
-        assert!(!id1.is_empty());
-        // Non-duplicate keeps its ID
-        assert_eq!(id2, "bash:0");
-        // All IDs are unique
-        assert_ne!(id0, id1);
-        assert_ne!(id1, id2);
+    fn persist_value_matches_timeout_constant() {
+        let tc = json!({"id": "i", "function": {"name": "n", "arguments": "{}"}});
+        let v = persist_value_for_ledger_tool_result(&tc, None, true).unwrap();
+        assert_eq!(v["result"].as_str().unwrap(), MSG_TOOL_LEDGER_TIMEOUT);
     }
 
     #[test]
-    fn persist_value_matches_timeout_constant() {
-        let tc = json!({"id": "i", "function": {"name": "n", "arguments": "{}"}});
-        let v = persist_value_for_ledger_tool_result(&tc, None, true);
-        assert_eq!(v["result"].as_str().unwrap(), MSG_TOOL_LEDGER_TIMEOUT);
+    fn persist_value_rejects_missing_tool_call_identity() {
+        let tc = json!({"function": {"name": "n", "arguments": "{}"}});
+        assert!(persist_value_for_ledger_tool_result(&tc, None, true).is_none());
     }
 
     #[tokio::test]
@@ -1136,6 +1359,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got["k"], 1);
+        assert_eq!(
+            ledger_replay_status(&ledger, &key, &json!({"k": 1})),
+            Some(true)
+        );
+        assert_eq!(
+            ledger_replay_status(&ledger, &key, &json!({"k": 2})),
+            Some(false)
+        );
+        let independent_ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        assert_eq!(
+            ledger_replay_status(&independent_ledger, &key, &json!({"k": 1})),
+            None,
+            "consumed receipts must not cross independent ledger instances"
+        );
         let again = take_ledger_entry(&ledger, &key, Duration::from_millis(80)).await;
         assert!(again.is_none());
     }
@@ -1144,7 +1381,7 @@ mod tests {
     async fn continuation_acknowledgement_consumes_receipt_and_authorization() {
         let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let key = tool_callback_key("u", "continuation");
-        expect_ledger_entry(&ledger, &key);
+        expect_ledger_entry(&ledger, &key, "edge-a").unwrap();
         ledger
             .lock()
             .await
@@ -1152,7 +1389,7 @@ mod tests {
 
         assert!(acknowledge_ledger_entry(&ledger, &key).await);
         assert!(!ledger.lock().await.contains_key(&key));
-        assert!(!ledger_entry_is_expected(&ledger, &key));
+        assert!(!ledger_entry_is_expected(&ledger, &key, "edge-a"));
         assert!(!acknowledge_ledger_entry(&ledger, &key).await);
     }
 
@@ -1183,16 +1420,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn callback_expectation_is_cleared_at_timeout_boundary() {
+    async fn timeout_retains_only_one_exact_cancelled_callback_acknowledgement() {
         let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let independent_ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let key = tool_callback_key("u", &Uuid::now_v7().to_string());
 
-        assert!(!ledger_entry_is_expected(&ledger, &key));
-        expect_ledger_entry(&ledger, &key);
-        assert!(ledger_entry_is_expected(&ledger, &key));
+        assert!(!ledger_entry_is_expected(&ledger, &key, "edge-a"));
+        expect_ledger_entry(&ledger, &key, "edge-a").unwrap();
+        assert!(ledger_entry_is_expected(&ledger, &key, "edge-a"));
         assert!(
-            !ledger_entry_is_expected(&independent_ledger, &key),
+            !ledger_entry_is_expected(&independent_ledger, &key, "edge-a"),
             "the same callback key must not cross independent server states"
         );
 
@@ -1202,8 +1439,16 @@ mod tests {
                 .is_none()
         );
         assert!(
-            !ledger_entry_is_expected(&ledger, &key),
-            "a timed-out waiter must stop authorizing future callbacks"
+            !ledger_entry_is_expected(&ledger, &key, "edge-a"),
+            "a timed-out waiter must not authorize normal future callbacks"
+        );
+        assert!(
+            take_cancelled_callback_ack_expectation(&ledger, &key, "edge-a"),
+            "the exact executor may acknowledge the timeout once"
+        );
+        assert!(
+            !take_cancelled_callback_ack_expectation(&ledger, &key, "edge-a"),
+            "the terminal acknowledgement lease is one-shot"
         );
     }
 
@@ -1212,10 +1457,26 @@ mod tests {
         let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let key = tool_callback_key("u", &Uuid::now_v7().to_string());
 
-        expect_ledger_entry(&ledger, &key);
-        assert!(ledger_entry_is_expected(&ledger, &key));
+        expect_ledger_entry(&ledger, &key, "edge-a").unwrap();
+        assert!(ledger_entry_is_expected(&ledger, &key, "edge-a"));
         cancel_expected_ledger_entry(&ledger, &key);
-        assert!(!ledger_entry_is_expected(&ledger, &key));
+        assert!(!ledger_entry_is_expected(&ledger, &key, "edge-a"));
+    }
+
+    #[test]
+    fn callback_expectation_is_bound_to_one_exact_edge_executor() {
+        let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let key = tool_callback_key("u", &Uuid::now_v7().to_string());
+
+        expect_ledger_entry(&ledger, &key, "edge-a").unwrap();
+        assert!(ledger_entry_is_expected(&ledger, &key, "edge-a"));
+        assert!(!ledger_entry_is_expected(&ledger, &key, "edge-b"));
+        assert_eq!(
+            expect_ledger_entry(&ledger, &key, "edge-b"),
+            Err(LedgerExpectationError::ConflictingExecutorCustody)
+        );
+        assert!(ledger_entry_is_expected(&ledger, &key, "edge-a"));
+        assert!(!ledger_entry_is_expected(&ledger, &key, "edge-b"));
     }
 
     #[test]

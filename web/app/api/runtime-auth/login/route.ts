@@ -8,8 +8,44 @@ type LoginBody = {
   password: string;
 };
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 export async function POST(request: NextRequest) {
-  const body = (await request.json()) as LoginBody;
+  let rawBody: unknown;
+  try {
+    rawBody = await request.json();
+  } catch {
+    return NextResponse.json({ error: 'invalid JSON body' }, { status: 400 });
+  }
+
+  if (!isRecord(rawBody)) {
+    return NextResponse.json(
+      { error: 'request body must be a JSON object' },
+      { status: 400 },
+    );
+  }
+
+  const body = rawBody as Partial<LoginBody>;
+  if (body.username === undefined || body.password === undefined) {
+    return NextResponse.json(
+      { error: 'username and password are required.' },
+      { status: 400 },
+    );
+  }
+
+  if (
+    (body.apiUrl !== undefined && typeof body.apiUrl !== 'string') ||
+    typeof body.username !== 'string' ||
+    typeof body.password !== 'string'
+  ) {
+    return NextResponse.json(
+      { error: 'apiUrl, username, and password must be strings' },
+      { status: 400 },
+    );
+  }
+
   const apiUrl = body.apiUrl?.trim() || DEFAULT_API_URL;
 
   if (!body.username || !body.password) {

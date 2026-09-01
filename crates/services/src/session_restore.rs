@@ -17,6 +17,7 @@ use astra_core::is_duplicate_key_error;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use sqlx::Row;
 use std::collections::BTreeMap;
 
 use astra_core::canonical_names::{append_unique_names, normalize_name_list};
@@ -29,9 +30,9 @@ pub const COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND: &str = "composite_snapshot_ind
 pub const COMPOSITE_SNAPSHOT_INDEX_PROJECTION_ID: &str = "projection:composite-snapshot-index";
 const SESSION_STATE_SYNC_METADATA_MARKER: &str = "_session_state_sync";
 const CLOUD_CHECKPOINTS_SELECT_SQL: &str = "\
-    SELECT number, turn, title, summary, total_tokens, contract_state_json \
+    SELECT number, turn, title, summary, total_tokens \
     FROM ( \
-        SELECT number, turn, title, summary, total_tokens, contract_state_json \
+        SELECT number, turn, title, summary, total_tokens \
         FROM session_checkpoints \
         WHERE user_id = ? AND session_id = ? AND state_json IS NULL \
         ORDER BY number DESC \
@@ -44,9 +45,9 @@ const CLOUD_CHECKPOINT_COUNT_SQL: &str = "\
     WHERE user_id = ? AND session_id = ? AND state_json IS NULL";
 pub const MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS: i64 = 80;
 pub const PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL: &str = "\
-    SELECT role, content \
+    SELECT role, content, run_id, run_status \
     FROM ( \
-        SELECT sti.item_seq, sti.role, sti.content \
+        SELECT sti.item_seq, sti.role, sti.content, sti.run_id, r.status AS run_status \
         FROM session_transcript_items sti \
         LEFT JOIN agent_runs r \
           ON r.user_id = sti.user_id \
@@ -55,6 +56,7 @@ pub const PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL: &str = "\
         WHERE sti.session_id = ? \
           AND sti.user_id = ? \
           AND sti.role IN ('user', 'assistant', 'system') \
+          AND TRIM(sti.content) <> '' \
           AND ( \
               sti.run_id IS NULL \
               OR (r.run_id IS NOT NULL AND r.parent_run_id IS NULL) \
@@ -63,6 +65,47 @@ pub const PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL: &str = "\
         LIMIT ? \
     ) recent_prompt_history \
     ORDER BY item_seq";
+
+/// Prompt-facing closure for a durable root run whose transcript contains a
+/// user request but no assistant response. Without this typed boundary, a new
+/// turn can interpret a cancelled/failed request as a second still-active
+/// objective and resume it after completing the latest request.
+pub fn prompt_history_terminal_boundary(status: &str) -> Option<String> {
+    let status = match status {
+        "cancelled" => "cancelled before completion",
+        "failed" => "failed before completion",
+        "paused" | "waiting" => "paused before completion",
+        "delegated" => "handed off to delegated execution",
+        "completed" => "completed without a prompt-facing assistant response",
+        _ => return None,
+    };
+    Some(format!(
+        "[Runtime turn boundary: the preceding request {status}. It is not an active objective; continue it only when the latest user request explicitly asks to do so.]"
+    ))
+}
+
+pub fn prompt_history_role_is_provider_safe(role: &str, has_prompt_content: bool) -> bool {
+    has_prompt_content && matches!(role, "user" | "assistant" | "system")
+}
+
+pub fn prompt_history_boundary_after_message(
+    role: &str,
+    has_prompt_content: bool,
+    run_id: Option<&str>,
+    next_run_id: Option<&str>,
+    run_status: Option<&str>,
+) -> Option<String> {
+    // A cancelled turn can contain non-provider-safe tool evidence after its
+    // user request. The bounded fallback excludes that evidence, so close at
+    // the last prompt-facing row when the next safe row belongs elsewhere. A
+    // terminal assistant response already closes the objective naturally and
+    // must not gain a synthetic suffix.
+    let can_end_unfinished_turn = role != "assistant" || !has_prompt_content;
+    if !can_end_unfinished_turn || run_id.is_none() || run_id == next_run_id {
+        return None;
+    }
+    prompt_history_terminal_boundary(run_status?)
+}
 pub const PROMPT_HISTORY_TRANSCRIPT_EXISTS_SQL: &str = "\
     SELECT 1 AS present \
     FROM session_transcript_items sti \
@@ -72,7 +115,8 @@ pub const PROMPT_HISTORY_TRANSCRIPT_EXISTS_SQL: &str = "\
      AND r.run_id = sti.run_id \
     WHERE sti.session_id = ? \
       AND sti.user_id = ? \
-      AND sti.role IN ('user', 'assistant', 'system') \
+          AND sti.role IN ('user', 'assistant', 'system') \
+          AND TRIM(sti.content) <> '' \
       AND ( \
           sti.run_id IS NULL \
           OR (r.run_id IS NOT NULL AND r.parent_run_id IS NULL) \
@@ -154,8 +198,6 @@ struct CloudRestoreTimings {
     transcript_ms: u64,
     context_trace_ms: u64,
     recent_tools_ms: u64,
-    contract_ms: u64,
-    checkpoint_fallback_ms: u64,
     total_ms: u64,
 }
 
@@ -170,8 +212,6 @@ impl CloudRestoreTimings {
             transcript_ms = self.transcript_ms,
             context_trace_ms = self.context_trace_ms,
             recent_tools_ms = self.recent_tools_ms,
-            contract_ms = self.contract_ms,
-            checkpoint_fallback_ms = self.checkpoint_fallback_ms,
             total_ms = self.total_ms,
             "cloud session restore timings"
         );
@@ -349,24 +389,6 @@ pub struct RestoredSession {
     /// Serialized context pipeline state (stats + latches + recovery).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline_state: Option<serde_json::Value>,
-    /// Active plan being executed (JSON-serialized TaskPlan).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub executing_plan_json: Option<String>,
-    /// Goal text for the executing plan.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_goal: Option<String>,
-    /// Plan execution config (JSON-serialized PlanExecutionConfig).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_config_json: Option<String>,
-    /// Number of parallel execution rounds completed.
-    #[serde(default)]
-    pub plan_execution_rounds: usize,
-    /// Active durable task contract (JSON-serialized TaskContract).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub contract_json: Option<String>,
-    /// Operator corrections stacked during plan pause (restored for crash recovery).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub plan_corrections: Vec<String>,
     /// Latest structured context-trace signal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_context_trace: Option<super::session_workspace::ContextTraceSignal>,
@@ -378,15 +400,14 @@ pub struct RestoredSession {
 impl RestoredSession {
     /// Return the one selected conversation payload.
     ///
-    /// Versioned responses carry it in `resume_bundle`; the legacy field is
-    /// read only for generation-zero restore data. Keeping this accessor as
-    /// the read path prevents cloud responses from serializing the same long
-    /// history twice.
+    /// Only a causally selected, versioned bundle may drive continuation.
+    /// The standalone message field is informational and never executable
+    /// resume authority.
     pub fn resume_messages(&self) -> &[serde_json::Value] {
         self.resume_bundle
             .as_ref()
             .map(|bundle| bundle.conversation_messages.as_slice())
-            .unwrap_or(self.conversation_messages.as_slice())
+            .unwrap_or_default()
     }
 }
 
@@ -397,10 +418,6 @@ pub struct ResumableSessionsResponse {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SessionMetadataState {
-    pub executing_plan_json: Option<String>,
-    pub plan_goal: Option<String>,
-    pub plan_config_json: Option<String>,
-    pub plan_execution_rounds: usize,
     pub git_branch: Option<String>,
     pub model: Option<String>,
     pub permission_mode: Option<String>,
@@ -428,9 +445,6 @@ pub struct RestoredCheckpoint {
     pub title: String,
     pub summary: String,
     pub total_tokens: u64,
-    /// Contract state at this checkpoint (for verification context restore).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub contract_state_json: Option<String>,
 }
 
 /// Result of restoring from a composite snapshot.
@@ -619,15 +633,11 @@ impl HybridRestoreService {
                 checkpoint_number, session_id
             ));
         };
-        let contract_json = session
-            .contract_json
-            .or_else(|| ckpt.contract_state_json.clone());
         Ok(Some(RestoredSession {
             turn_count: ckpt.turn,
             total_tokens_in: ckpt.total_tokens,
             total_tokens_out: 0,
             checkpoint_count: checkpoint_number,
-            contract_json,
             ..session
         }))
     }
@@ -894,7 +904,7 @@ impl HybridRestoreService {
               FROM agent_sessions s \
               LEFT JOIN ( \
                 SELECT user_id, session_id, \
-                       COALESCE(MAX(turn_seq), 0) AS turn_count, \
+                       COALESCE(MAX(CASE WHEN parent_run_id IS NULL THEN turn_seq END), 0) AS turn_count, \
                        CAST(COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
                          THEN COALESCE(token_input, 0) ELSE 0 END), 0) AS SIGNED) AS total_tokens_in, \
                        CAST(COALESCE(SUM(CASE WHEN event_type IN ('user_query', 'llm_response') AND token_usage IS NOT NULL \
@@ -916,7 +926,8 @@ impl HybridRestoreService {
                   SELECT user_id, session_id, llm_model_used, \
                          ROW_NUMBER() OVER (PARTITION BY user_id, session_id ORDER BY created_at DESC, event_id DESC) AS rn \
                   FROM agent_events \
-                  WHERE llm_model_used IS NOT NULL AND llm_model_used != '' \
+                  WHERE parent_run_id IS NULL \
+                    AND llm_model_used IS NOT NULL AND llm_model_used != '' \
                 ) ranked_models \
                 WHERE rn = 1 \
               ) latest_model \
@@ -975,36 +986,12 @@ impl HybridRestoreService {
                 // query and then splice its result into this generation.
                 let recent_tools_ms = 0;
 
-                let latest_model = astra_core::model_override::normalize_model_override_owned(
-                    mysql_optional_string(&row, "restore_cloud_session", "latest_model")?,
-                );
-                let model = metadata_state.model.clone().or(latest_model);
-
-                // Load active contract from task_contracts table
-                let contract_started_at = std::time::Instant::now();
-                let mut contract_json =
-                    Self::load_cloud_contract(pool, user_id, session_id).await?;
-                let contract_ms = elapsed_ms(contract_started_at);
-
-                // Fallback: try latest checkpoint's contract state
-                let checkpoint_fallback_started_at = std::time::Instant::now();
-                if contract_json.is_none() {
-                    let ckpts = self.cloud_checkpoints(user_id, session_id).await?;
-                    contract_json = ckpts
-                        .iter()
-                        .rev()
-                        .find_map(|c| c.contract_state_json.clone());
-                }
-                let checkpoint_fallback_ms = elapsed_ms(checkpoint_fallback_started_at);
-
                 CloudRestoreTimings {
                     session_query_ms,
                     heavy_checkpoint_ms,
                     transcript_ms,
                     context_trace_ms,
                     recent_tools_ms,
-                    contract_ms,
-                    checkpoint_fallback_ms,
                     total_ms: elapsed_ms(started_at),
                 }
                 .emit(session_id, true);
@@ -1028,26 +1015,9 @@ impl HybridRestoreService {
                 let resume_bundle = build_resume_bundle(
                     user_id,
                     session_id,
-                    completed_turn,
                     conversation_messages,
                     conversation_from_checkpoint,
                     heavy_state.as_ref(),
-                    ResumeBundleSupplementalProjections {
-                        task: astra_turn_types::ResumeTaskProjectionV1 {
-                            executing_plan_json: metadata_state.executing_plan_json.clone(),
-                            plan_goal: metadata_state.plan_goal.clone(),
-                            plan_config_json: metadata_state.plan_config_json.clone(),
-                            plan_execution_rounds: metadata_state.plan_execution_rounds,
-                            contract_json: contract_json.clone(),
-                        },
-                        provider: astra_turn_types::ResumeProviderProjectionV1 {
-                            model: model.clone(),
-                            permission_mode: metadata_state.permission_mode.clone(),
-                            config_version_id: heavy_state
-                                .as_ref()
-                                .and_then(|state| state.config_version_id.clone()),
-                        },
-                    },
                 )?;
                 let mut restored = RestoredSession {
                     session_id: session_id.to_string(),
@@ -1099,76 +1069,6 @@ impl HybridRestoreService {
                 .emit(session_id, false);
                 Ok(None)
             }
-        }
-    }
-
-    /// Load the active contract for this session from cloud task_contracts table.
-    /// Returns the contract as serialized JSON (matching local workspace format).
-    async fn load_cloud_contract(
-        pool: &sqlx::Pool<sqlx::MySql>,
-        user_id: &str,
-        session_id: &str,
-    ) -> Result<Option<String>, String> {
-        let row = sqlx::query(
-            "SELECT contract_id, task_id, goal, \
-             CAST(scope_json AS CHAR) AS scope_json, \
-             CAST(subtasks_json AS CHAR) AS subtasks_json, \
-             CAST(criteria_json AS CHAR) AS criteria_json, \
-             version, status, \
-             CAST(created_at AS CHAR) AS created_at, \
-             CAST(updated_at AS CHAR) AS updated_at \
-             FROM task_contracts \
-             WHERE session_id = ? AND user_id = ? AND status = 'active' \
-             ORDER BY updated_at DESC LIMIT 1",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| format!("load_cloud_contract: {e}"))?;
-
-        match row {
-            Some(row) => {
-                // Reconstruct contract as JSON matching TaskContract serde format
-                let contract_id = mysql_string(&row, "load_cloud_contract", "contract_id")?;
-                let task_id = mysql_string(&row, "load_cloud_contract", "task_id")?;
-                let goal = mysql_string(&row, "load_cloud_contract", "goal")?;
-                let version = mysql_i32(&row, "load_cloud_contract", "version")?;
-                let status = mysql_string(&row, "load_cloud_contract", "status")?;
-                let created_at = mysql_string(&row, "load_cloud_contract", "created_at")?;
-                let updated_at = mysql_string(&row, "load_cloud_contract", "updated_at")?;
-                let scope_json = mysql_optional_string(&row, "load_cloud_contract", "scope_json")?;
-                let subtasks_json = mysql_string(&row, "load_cloud_contract", "subtasks_json")?;
-                let criteria_json = mysql_string(&row, "load_cloud_contract", "criteria_json")?;
-
-                // Parse sub-objects so serde round-trips correctly
-                let scope: serde_json::Value = match scope_json.as_deref() {
-                    Some(json) if !json.trim().is_empty() => {
-                        serde_json::from_str(json).map_err(|e| format!("parse scope: {e}"))?
-                    }
-                    _ => serde_json::json!({}),
-                };
-                let subtasks: serde_json::Value = serde_json::from_str(&subtasks_json)
-                    .map_err(|e| format!("parse subtasks: {e}"))?;
-                let criteria: serde_json::Value = serde_json::from_str(&criteria_json)
-                    .map_err(|e| format!("parse criteria: {e}"))?;
-
-                let contract = serde_json::json!({
-                    "contract_id": contract_id,
-                    "task_id": task_id,
-                    "goal": goal,
-                    "scope": scope,
-                    "subtasks": subtasks,
-                    "global_verification": criteria,
-                    "version": version,
-                    "status": status,
-                    "created_at": created_at,
-                    "updated_at": updated_at,
-                });
-
-                Ok(Some(contract.to_string()))
-            }
-            None => Ok(None),
         }
     }
 
@@ -1248,18 +1148,40 @@ impl HybridRestoreService {
             .map_err(|e| format!("restore_cloud_transcript_messages: {e}"))?;
 
         let mut messages = Vec::new();
-        for row in &rows {
+        for (index, row) in rows.iter().enumerate() {
             let role = mysql_string(row, "restore_cloud_transcript_messages", "role")?;
             let content = mysql_string(row, "restore_cloud_transcript_messages", "content")?;
-            if content.trim().is_empty() {
-                continue;
-            }
-            match role.as_str() {
-                "user" | "assistant" | "system" | "tool" => messages.push(serde_json::json!({
+            let has_prompt_content = !content.trim().is_empty();
+            // This fallback restores only prompt-safe rows. Canonical
+            // transcript restoration owns complete assistant/tool-call
+            // reconstruction; bare tool evidence never consumes this bounded
+            // provider-history quota.
+            if prompt_history_role_is_provider_safe(&role, has_prompt_content) {
+                messages.push(serde_json::json!({
                     "role": role,
                     "content": content,
-                })),
-                _ => {}
+                }));
+            }
+            let run_id = row
+                .try_get::<Option<String>, _>("run_id")
+                .map_err(|e| format!("restore_cloud_transcript_messages.run_id: {e}"))?;
+            let next_run_id = rows
+                .get(index + 1)
+                .and_then(|next| next.try_get::<Option<String>, _>("run_id").ok().flatten());
+            let run_status = row
+                .try_get::<Option<String>, _>("run_status")
+                .map_err(|e| format!("restore_cloud_transcript_messages.run_status: {e}"))?;
+            if let Some(boundary) = prompt_history_boundary_after_message(
+                &role,
+                has_prompt_content,
+                run_id.as_deref(),
+                next_run_id.as_deref(),
+                run_status.as_deref(),
+            ) {
+                messages.push(serde_json::json!({
+                    "role": "system",
+                    "content": boundary,
+                }));
             }
         }
         if astra_core::history_work::instrumentation_enabled() {
@@ -1320,11 +1242,6 @@ impl HybridRestoreService {
                         "cloud_checkpoints",
                         "total_tokens",
                     )?,
-                    contract_state_json: mysql_optional_string(
-                        row,
-                        "cloud_checkpoints",
-                        "contract_state_json",
-                    )?,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -1344,18 +1261,6 @@ impl HybridRestoreService {
             .map_err(|e| format!("cloud_checkpoint_count: {e}"))?;
         let count = mysql_i64(&row, "cloud_checkpoint_count", "checkpoint_count")?;
         non_negative_i64_to_u32(count, "cloud_checkpoint_count", "checkpoint_count")
-    }
-}
-
-fn cloud_projection_envelope<T>(
-    source_cursor: Option<&astra_turn_types::SessionCursorV1>,
-    payload: T,
-) -> astra_turn_types::CausalProjectionEnvelopeV1<T> {
-    match source_cursor {
-        Some(cursor) => {
-            astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(cursor.clone(), payload)
-        }
-        None => astra_turn_types::CausalProjectionEnvelopeV1::unversioned(payload),
     }
 }
 
@@ -1385,49 +1290,29 @@ fn validate_resume_cursor_identity(
     Ok(())
 }
 
-struct ResumeBundleSupplementalProjections {
-    task: astra_turn_types::ResumeTaskProjectionV1,
-    provider: astra_turn_types::ResumeProviderProjectionV1,
-}
-
 fn build_resume_bundle(
     owner_id: &str,
     session_id: &str,
-    completed_turn: u32,
     messages: Vec<serde_json::Value>,
     conversation_from_checkpoint: bool,
     heavy: Option<&CloudHeavyCheckpointState>,
-    supplemental: ResumeBundleSupplementalProjections,
 ) -> Result<Option<astra_turn_types::ResumeBundleV1>, String> {
     if messages.is_empty() {
         return Ok(None);
     }
-    let source = if conversation_from_checkpoint {
-        astra_turn_types::ResumeSourceV1::Checkpoint
-    } else {
-        astra_turn_types::ResumeSourceV1::TranscriptProjection
-    };
-    let cursor = conversation_from_checkpoint
-        .then(|| heavy.and_then(|state| state.conversation_cursor.clone()))
-        .flatten()
-        .unwrap_or_else(|| {
-            astra_turn_types::legacy_resume_cursor(owner_id, session_id, completed_turn, &messages)
-        });
-    validate_resume_cursor_identity(owner_id, session_id, &cursor)?;
-    let mut degraded_reasons = if conversation_from_checkpoint {
-        vec![astra_turn_types::ResumeDegradedReasonV1::CheckpointFallback]
-    } else {
-        vec![astra_turn_types::ResumeDegradedReasonV1::TranscriptOnly]
-    };
-    if cursor.schema_version == 0 {
-        degraded_reasons.extend([
-            astra_turn_types::ResumeDegradedReasonV1::LegacyCursorUnknown,
-            astra_turn_types::ResumeDegradedReasonV1::ProjectionCursorMissing,
-        ]);
+    if !conversation_from_checkpoint {
+        return Ok(None);
     }
-    let checkpoint = heavy.map(|state| {
-        cloud_projection_envelope(
-            state.conversation_cursor.as_ref(),
+    let Some(cursor) = heavy.and_then(|state| state.conversation_cursor.clone()) else {
+        return Ok(None);
+    };
+    let source = astra_turn_types::ResumeSourceV1::Checkpoint;
+    validate_resume_cursor_identity(owner_id, session_id, &cursor)?;
+    let degraded_reasons = vec![astra_turn_types::ResumeDegradedReasonV1::CheckpointFallback];
+    let checkpoint = heavy.and_then(|state| {
+        let source_cursor = state.conversation_cursor.as_ref()?;
+        let projection = astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
+            source_cursor.clone(),
             astra_turn_types::ResumeCheckpointProjectionV1 {
                 blocked_tools: state.blocked_tools.clone(),
                 recent_tools: state.recent_tools.clone(),
@@ -1436,26 +1321,19 @@ fn build_resume_bundle(
                 compaction_state: state.compaction_state.clone(),
                 pipeline_state: state.pipeline_state.clone(),
             },
-        )
+        );
+        projection.is_admissible_at(&cursor).then_some(projection)
     });
-    let activation = heavy.map(|state| {
-        cloud_projection_envelope(
-            state.conversation_cursor.as_ref(),
+    let activation = heavy.and_then(|state| {
+        let source_cursor = state.conversation_cursor.as_ref()?;
+        let projection = astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
+            source_cursor.clone(),
             astra_turn_types::ResumeActivationProjectionV1 {
                 deferred_tool_names: state.activated_deferred_tool_names.clone(),
             },
-        )
+        );
+        projection.is_admissible_at(&cursor).then_some(projection)
     });
-    let task = (!supplemental.task.is_empty())
-        .then(|| astra_turn_types::CausalProjectionEnvelopeV1::unversioned(supplemental.task));
-    let provider = (!supplemental.provider.is_empty())
-        .then(|| astra_turn_types::CausalProjectionEnvelopeV1::unversioned(supplemental.provider));
-    if (task.is_some() || provider.is_some())
-        && !degraded_reasons
-            .contains(&astra_turn_types::ResumeDegradedReasonV1::ProjectionCursorMissing)
-    {
-        degraded_reasons.push(astra_turn_types::ResumeDegradedReasonV1::ProjectionCursorMissing);
-    }
     let candidate = astra_turn_types::ResumeCandidateV1 {
         source,
         cursor,
@@ -1468,8 +1346,7 @@ fn build_resume_bundle(
         ],
         projections: astra_turn_types::ResumeProjectionSetV1 {
             checkpoint,
-            task,
-            provider,
+            provider: None,
             activation,
         },
     };
@@ -1494,14 +1371,6 @@ fn merge_exact_resume_projections(
                 cursor.clone(),
                 payload.clone(),
             ));
-    }
-    if current.projections.task_at(&cursor).is_none()
-        && let Some(payload) = other.projections.task_at(&cursor)
-    {
-        current.projections.task = Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
-            cursor.clone(),
-            payload.clone(),
-        ));
     }
     if current.projections.provider_at(&cursor).is_none()
         && let Some(payload) = other.projections.provider_at(&cursor)
@@ -1536,42 +1405,22 @@ fn merge_exact_resume_projections(
 
 fn apply_selected_resume_bundle(session: &mut RestoredSession) {
     let Some(bundle) = session.resume_bundle.as_ref() else {
+        session.activated_deferred_tool_names.clear();
+        session.recent_tools.clear();
+        session.blocked_tools.clear();
+        session.approval_overrides = None;
+        session.interruption = None;
+        session.compaction_state = None;
+        session.pipeline_state = None;
+        session.model = None;
+        session.permission_mode = None;
+        session.last_context_trace = None;
+        session.workspace = None;
         return;
     };
     let cursor = bundle.cursor.clone();
     let checkpoint = bundle.projections.checkpoint_at(&cursor).cloned();
-    let permits_degraded_projection_fallback = bundle.source.is_degraded()
-        && bundle
-            .degraded_reasons
-            .contains(&astra_turn_types::ResumeDegradedReasonV1::ProjectionCursorMissing);
-    let task = bundle.projections.task_at(&cursor).cloned().or_else(|| {
-        permits_degraded_projection_fallback
-            .then_some(bundle.projections.task.as_ref())
-            .flatten()
-            .filter(|projection| {
-                projection.schema_version
-                    == astra_turn_types::CAUSAL_PROJECTION_ENVELOPE_SCHEMA_VERSION
-                    && projection.source_cursor.is_none()
-                    && projection.verified_through_root.is_none()
-            })
-            .map(|projection| projection.payload.clone())
-    });
-    let provider = bundle
-        .projections
-        .provider_at(&cursor)
-        .cloned()
-        .or_else(|| {
-            permits_degraded_projection_fallback
-                .then_some(bundle.projections.provider.as_ref())
-                .flatten()
-                .filter(|projection| {
-                    projection.schema_version
-                        == astra_turn_types::CAUSAL_PROJECTION_ENVELOPE_SCHEMA_VERSION
-                        && projection.source_cursor.is_none()
-                        && projection.verified_through_root.is_none()
-                })
-                .map(|projection| projection.payload.clone())
-        });
+    let provider = bundle.projections.provider_at(&cursor).cloned();
     let activated_deferred_tool_names = bundle.activated_deferred_tool_names().to_vec();
 
     session.activated_deferred_tool_names = activated_deferred_tool_names;
@@ -1595,27 +1444,12 @@ fn apply_selected_resume_bundle(session: &mut RestoredSession) {
     session.pipeline_state = checkpoint
         .as_ref()
         .and_then(|projection| projection.pipeline_state.clone());
-    session.executing_plan_json = task
-        .as_ref()
-        .and_then(|projection| projection.executing_plan_json.clone());
-    session.plan_goal = task
-        .as_ref()
-        .and_then(|projection| projection.plan_goal.clone());
-    session.plan_config_json = task
-        .as_ref()
-        .and_then(|projection| projection.plan_config_json.clone());
-    session.plan_execution_rounds = task
-        .as_ref()
-        .map(|projection| projection.plan_execution_rounds)
-        .unwrap_or_default();
-    session.contract_json = task.and_then(|projection| projection.contract_json);
     session.model = provider
         .as_ref()
         .and_then(|projection| projection.model.clone());
     session.permission_mode = provider.and_then(|projection| projection.permission_mode);
 
     // These runtime-bearing legacy projections have no cursor envelope.
-    session.plan_corrections.clear();
     session.last_context_trace = None;
     session.workspace = None;
 }
@@ -1625,95 +1459,18 @@ fn apply_selected_resume_bundle(session: &mut RestoredSession) {
 /// own envelope proves the same causal boundary.
 pub fn install_canonical_resume_bundle(
     session: &mut RestoredSession,
-    mut bundle: astra_turn_types::ResumeBundleV1,
+    bundle: astra_turn_types::ResumeBundleV1,
 ) -> Result<(), String> {
     if bundle.source != astra_turn_types::ResumeSourceV1::CanonicalJournal
         || !bundle.validates_root()
     {
         return Err("canonical resume bundle does not validate its materialized content".into());
     }
-    if let Some(legacy) = session.resume_bundle.as_ref()
-        && resume_materializations_are_equivalent(legacy, &bundle)
-    {
-        transplant_equivalent_resume_projections(legacy, &mut bundle);
-    }
     session.turn_count = bundle.cursor.completed_turn;
     session.conversation_messages.clear();
     session.resume_bundle = Some(bundle);
     apply_selected_resume_bundle(session);
     Ok(())
-}
-
-fn resume_materializations_are_equivalent(
-    legacy: &astra_turn_types::ResumeBundleV1,
-    canonical: &astra_turn_types::ResumeBundleV1,
-) -> bool {
-    let legacy_materialized_root =
-        astra_turn_types::canonical_conversation_root(&legacy.conversation_messages);
-    legacy.validates_root()
-        && legacy.cursor.owner_id == canonical.cursor.owner_id
-        && legacy.cursor.session_id == canonical.cursor.session_id
-        && legacy.cursor.branch_id == canonical.cursor.branch_id
-        && legacy.cursor.completed_turn == canonical.cursor.completed_turn
-        && canonical.materialized_conversation_root_hash.as_deref()
-            == Some(legacy_materialized_root.as_str())
-}
-
-fn transplant_equivalent_resume_projections(
-    legacy: &astra_turn_types::ResumeBundleV1,
-    canonical: &mut astra_turn_types::ResumeBundleV1,
-) {
-    let cursor = canonical.cursor.clone();
-    if canonical.projections.checkpoint.is_none()
-        && let Some(payload) = equivalent_projection_payload(legacy, &legacy.projections.checkpoint)
-    {
-        canonical.projections.checkpoint = Some(
-            astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(cursor.clone(), payload),
-        );
-    }
-    if canonical.projections.task.is_none()
-        && let Some(payload) = equivalent_projection_payload(legacy, &legacy.projections.task)
-    {
-        canonical.projections.task = Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
-            cursor.clone(),
-            payload,
-        ));
-    }
-    if canonical.projections.provider.is_none()
-        && let Some(payload) = equivalent_projection_payload(legacy, &legacy.projections.provider)
-    {
-        canonical.projections.provider = Some(
-            astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(cursor.clone(), payload),
-        );
-    }
-    if canonical.projections.activation.is_none()
-        && let Some(payload) = equivalent_projection_payload(legacy, &legacy.projections.activation)
-    {
-        canonical.projections.activation = Some(
-            astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(cursor, payload),
-        );
-    }
-}
-
-fn equivalent_projection_payload<T: Clone>(
-    bundle: &astra_turn_types::ResumeBundleV1,
-    projection: &Option<astra_turn_types::CausalProjectionEnvelopeV1<T>>,
-) -> Option<T> {
-    let projection = projection.as_ref()?;
-    if projection.is_admissible_at(&bundle.cursor)
-        || (bundle.source.is_degraded()
-            && bundle
-                .degraded_reasons
-                .contains(&astra_turn_types::ResumeDegradedReasonV1::ProjectionCursorMissing)
-            && projection.schema_version
-                == astra_turn_types::CAUSAL_PROJECTION_ENVELOPE_SCHEMA_VERSION
-            && projection.source_cursor.is_none()
-            && projection.verified_through_root.is_none())
-    {
-        Some(projection.payload.clone())
-    } else {
-        None
-    }
 }
 
 /// Reconcile two restore projections without combining history from different
@@ -1812,66 +1569,8 @@ fn reconcile_restored_session_candidates(
     }
 
     if same_generation && current.resume_bundle.is_none() {
-        append_unique_names(
-            &mut current.activated_deferred_tool_names,
-            other
-                .activated_deferred_tool_names
-                .iter()
-                .map(String::as_str),
-        );
-        if current.model.is_none() {
-            current.model = other.model.clone();
-        }
-        if current.permission_mode.is_none() {
-            current.permission_mode = other.permission_mode.clone();
-        }
-        if current.recent_tools.is_empty() {
-            current.recent_tools = other.recent_tools;
-        }
         if current.conversation_messages.is_empty() {
             current.conversation_messages = other.conversation_messages;
-        }
-        if current.blocked_tools.is_empty() {
-            current.blocked_tools = other.blocked_tools;
-        }
-        if current.approval_overrides.is_none() {
-            current.approval_overrides = other.approval_overrides;
-        }
-        if current.interruption.is_none() {
-            current.interruption = other.interruption;
-        }
-        if current.compaction_state.is_none() {
-            current.compaction_state = other.compaction_state;
-        }
-        if current.pipeline_state.is_none() {
-            current.pipeline_state = other.pipeline_state;
-        }
-        if current.executing_plan_json.is_none() {
-            current.executing_plan_json = other.executing_plan_json;
-        }
-        if current.plan_goal.is_none() {
-            current.plan_goal = other.plan_goal;
-        }
-        if current.plan_config_json.is_none() {
-            current.plan_config_json = other.plan_config_json;
-        }
-        current.plan_execution_rounds = current
-            .plan_execution_rounds
-            .max(other.plan_execution_rounds);
-        if current.contract_json.is_none() {
-            current.contract_json = other.contract_json;
-        }
-        if current.plan_corrections.is_empty() {
-            current.plan_corrections = other.plan_corrections;
-        }
-        if current.last_context_trace.is_none() {
-            current.last_context_trace = other.last_context_trace;
-        }
-        if current.workspace.is_none() {
-            current.workspace = other.workspace;
-        }
-        if current.last_status.is_empty() {
-            current.last_status = other.last_status;
         }
     }
 
@@ -1935,7 +1634,7 @@ pub async fn persist_remote_composite_snapshot_index(
     let record = composite_snapshot_index_to_remote_artifact_record(session_id, user_id, index)
         .map_err(|error| error.to_string())?;
     store
-        .upsert_json_artifact_projection(record)
+        .merge_composite_snapshot_index_projection(record)
         .await
         .map_err(|error| error.to_string())
 }
@@ -1944,31 +1643,7 @@ fn merge_composite_snapshot_indexes(
     local: astra_core::composite_snapshot::CompositeSnapshotIndex,
     remote: astra_core::composite_snapshot::CompositeSnapshotIndex,
 ) -> astra_core::composite_snapshot::CompositeSnapshotIndex {
-    let mut merged = BTreeMap::new();
-    for snapshot in local.snapshots {
-        merged.insert(snapshot.snapshot_id.clone(), snapshot);
-    }
-    for snapshot in remote.snapshots {
-        merged.insert(snapshot.snapshot_id.clone(), snapshot);
-    }
-    let mut snapshots: Vec<_> = merged.into_values().collect();
-    snapshots.sort_by(|left, right| {
-        (
-            left.version == 0,
-            left.version,
-            left.created_at.as_str(),
-            left.snapshot_id.as_str(),
-        )
-            .cmp(&(
-                right.version == 0,
-                right.version,
-                right.created_at.as_str(),
-                right.snapshot_id.as_str(),
-            ))
-    });
-    let mut index = astra_core::composite_snapshot::CompositeSnapshotIndex { snapshots };
-    index.normalize_versions();
-    index
+    local.merge_by_identity(remote)
 }
 
 fn merge_composite_snapshot_sources(
@@ -2022,7 +1697,6 @@ fn parse_local_checkpoint_entries(local_entries: &[String]) -> Vec<RestoredCheck
                     title,
                     summary: String::new(),
                     total_tokens: 0,
-                    contract_state_json: None,
                 })
             } else {
                 None
@@ -2214,12 +1888,6 @@ fn restored_session_from_workspace(
         permission_mode,
         title: None,
         restored_from_cloud,
-        executing_plan_json: ws.executing_plan_json.clone(),
-        plan_goal: ws.plan_goal.clone(),
-        plan_config_json: ws.plan_config_json.clone(),
-        plan_execution_rounds: ws.plan_execution_rounds,
-        contract_json: ws.contract_json.clone(),
-        plan_corrections: ws.plan_corrections.clone(),
         last_context_trace: ws.last_context_trace.clone(),
         workspace: Some(workspace),
         ..Default::default()
@@ -2366,7 +2034,7 @@ impl SessionRestoreService for HybridRestoreService {
          latest_model.llm_model_used AS latest_model \
          FROM agent_sessions s \
          LEFT JOIN ( \
-           SELECT user_id, session_id, COALESCE(MAX(turn_seq), 0) AS turn_count \
+           SELECT user_id, session_id, COALESCE(MAX(CASE WHEN parent_run_id IS NULL THEN turn_seq END), 0) AS turn_count \
            FROM agent_events \
            GROUP BY user_id, session_id \
          ) event_summary \
@@ -2377,7 +2045,8 @@ impl SessionRestoreService for HybridRestoreService {
              SELECT user_id, session_id, llm_model_used, \
                     ROW_NUMBER() OVER (PARTITION BY user_id, session_id ORDER BY created_at DESC, event_id DESC) AS rn \
              FROM agent_events \
-             WHERE llm_model_used IS NOT NULL AND llm_model_used != '' \
+             WHERE parent_run_id IS NULL \
+               AND llm_model_used IS NOT NULL AND llm_model_used != '' \
            ) ranked_models \
            WHERE rn = 1 \
          ) latest_model \
@@ -2578,13 +2247,7 @@ impl crate::state_sync::MatrixOneSyncService {
         let checkpoint_id = uuid::Uuid::new_v4().to_string();
         let tools_json = checkpoint_tools_json(checkpoint);
 
-        let payload_size = checkpoint.title.len()
-            + checkpoint.summary.len()
-            + tools_json.len()
-            + checkpoint
-                .contract_state_json
-                .as_ref()
-                .map_or(0, |s| s.len());
+        let payload_size = checkpoint.title.len() + checkpoint.summary.len() + tools_json.len();
 
         let log_result = |status: &str, error_msg: Option<&str>| {
             log_checkpoint_sync(
@@ -2619,7 +2282,7 @@ impl crate::state_sync::MatrixOneSyncService {
         let updated = match sqlx::query(
             "UPDATE session_checkpoints SET \
                 turn = ?, title = ?, summary = ?, tools_json = ?, total_tokens = ?, \
-                had_stalls = ?, error_count = ?, contract_state_json = ? \
+                had_stalls = ?, error_count = ? \
              WHERE user_id = ? AND session_id = ? AND number = ?",
         )
         .bind(checkpoint.turn as i32)
@@ -2629,7 +2292,6 @@ impl crate::state_sync::MatrixOneSyncService {
         .bind(checkpoint.total_tokens as i64)
         .bind(if checkpoint.had_stalls { 1i32 } else { 0 })
         .bind(checkpoint.error_count as i32)
-        .bind(&checkpoint.contract_state_json)
         .bind(user_id)
         .bind(session_id)
         .bind(checkpoint.number as i32)
@@ -2648,8 +2310,8 @@ impl crate::state_sync::MatrixOneSyncService {
             let inserted = sqlx::query(
                 "INSERT INTO session_checkpoints \
                  (checkpoint_id, session_id, user_id, number, turn, title, summary, \
-                  tools_json, total_tokens, had_stalls, error_count, contract_state_json, created_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
+                  tools_json, total_tokens, had_stalls, error_count, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())",
             )
             .bind(&checkpoint_id)
             .bind(session_id)
@@ -2662,7 +2324,6 @@ impl crate::state_sync::MatrixOneSyncService {
             .bind(checkpoint.total_tokens as i64)
             .bind(if checkpoint.had_stalls { 1i32 } else { 0 })
             .bind(checkpoint.error_count as i32)
-            .bind(&checkpoint.contract_state_json)
             .execute(&self.pool)
             .await;
 
@@ -2671,7 +2332,7 @@ impl crate::state_sync::MatrixOneSyncService {
                     let retry = sqlx::query(
                         "UPDATE session_checkpoints SET \
                             turn = ?, title = ?, summary = ?, tools_json = ?, total_tokens = ?, \
-                            had_stalls = ?, error_count = ?, contract_state_json = ? \
+                            had_stalls = ?, error_count = ? \
              WHERE user_id = ? AND session_id = ? AND number = ?",
                     )
                     .bind(checkpoint.turn as i32)
@@ -2681,7 +2342,6 @@ impl crate::state_sync::MatrixOneSyncService {
                     .bind(checkpoint.total_tokens as i64)
                     .bind(if checkpoint.had_stalls { 1i32 } else { 0 })
                     .bind(checkpoint.error_count as i32)
-                    .bind(&checkpoint.contract_state_json)
                     .bind(user_id)
                     .bind(session_id)
                     .bind(checkpoint.number as i32)
@@ -2846,15 +2506,10 @@ impl crate::state_sync::MatrixOneSyncService {
     }
 
     /// Push resumable session state to cloud via the agent_sessions.metadata JSON column.
-    #[allow(clippy::too_many_arguments)]
     pub async fn push_session_state(
         &self,
         session_id: &str,
         user_id: &str,
-        executing_plan_json: Option<&str>,
-        plan_goal: Option<&str>,
-        plan_config_json: Option<&str>,
-        plan_execution_rounds: usize,
         git_branch: Option<&str>,
         model: Option<&str>,
     ) -> Result<(), String> {
@@ -2880,15 +2535,8 @@ impl crate::state_sync::MatrixOneSyncService {
                 .await?;
         }
 
-        let metadata_json = merge_session_state_metadata(
-            existing_metadata_json.as_deref(),
-            executing_plan_json,
-            plan_goal,
-            plan_config_json,
-            plan_execution_rounds,
-            git_branch,
-            model,
-        )?;
+        let metadata_json =
+            merge_session_state_metadata(existing_metadata_json.as_deref(), git_branch, model)?;
         let payload_size = metadata_json.len();
 
         let result: Result<(), String> = async {
@@ -2985,6 +2633,13 @@ impl crate::state_sync::MatrixOneSyncService {
                 return Err(err);
             }
         };
+        if let Err(e) =
+            crate::storage::admit_session_event_write(&mut tx, session_id, user_id, true).await
+        {
+            let err = format!("push_context_trace_signal session admission: {e}");
+            log_result("error", Some(&err));
+            return Err(err);
+        }
 
         let insert_result = match sqlx::query(
             "INSERT INTO agent_events \
@@ -3059,8 +2714,6 @@ impl crate::state_sync::MatrixOneSyncService {
         Ok(())
     }
 }
-
-pub type ExtractedPlanMetadata = (Option<String>, Option<String>, Option<String>, usize);
 
 fn checkpoint_tools_json(checkpoint: &super::session_checkpoint::Checkpoint) -> String {
     let tools_used = normalize_name_list(checkpoint.tools_used.iter().map(String::as_str));
@@ -3150,10 +2803,6 @@ fn cloud_step_checkpoint_number(checkpoint_number: u32) -> Result<i32, String> {
 
 fn merge_session_state_metadata(
     existing_metadata_json: Option<&str>,
-    executing_plan_json: Option<&str>,
-    plan_goal: Option<&str>,
-    plan_config_json: Option<&str>,
-    plan_execution_rounds: usize,
     git_branch: Option<&str>,
     model: Option<&str>,
 ) -> Result<String, String> {
@@ -3162,42 +2811,6 @@ fn merge_session_state_metadata(
         SESSION_STATE_SYNC_METADATA_MARKER.to_string(),
         serde_json::Value::Bool(true),
     );
-
-    if let Some(plan) = executing_plan_json {
-        metadata.insert(
-            "executing_plan".to_string(),
-            serde_json::Value::String(plan.to_string()),
-        );
-    } else {
-        metadata.remove("executing_plan");
-    }
-
-    if let Some(goal) = plan_goal {
-        metadata.insert(
-            "plan_goal".to_string(),
-            serde_json::Value::String(goal.to_string()),
-        );
-    } else {
-        metadata.remove("plan_goal");
-    }
-
-    if let Some(config) = plan_config_json {
-        metadata.insert(
-            "plan_config".to_string(),
-            serde_json::Value::String(config.to_string()),
-        );
-    } else {
-        metadata.remove("plan_config");
-    }
-
-    if plan_execution_rounds > 0 {
-        metadata.insert(
-            "plan_execution_rounds".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(plan_execution_rounds)),
-        );
-    } else {
-        metadata.remove("plan_execution_rounds");
-    }
 
     if let Some(branch) = git_branch {
         metadata.insert(
@@ -3262,8 +2875,6 @@ fn value_type_name(value: &serde_json::Value) -> &'static str {
     }
 }
 
-/// Extract plan state from the metadata JSON returned by agent_sessions.
-/// Returns (executing_plan_json, plan_goal, plan_config_json, plan_execution_rounds).
 pub fn extract_session_state_from_metadata(
     metadata_json: &str,
 ) -> Result<SessionMetadataState, String> {
@@ -3290,32 +2901,7 @@ pub fn extract_session_state_from_metadata(
             return Err("session metadata JSON must be an object".to_string());
         }
     };
-    let plan_execution_rounds = match obj.get("plan_execution_rounds") {
-        Some(value) => {
-            let rounds = value.as_u64().ok_or_else(|| {
-                "session metadata `plan_execution_rounds` must be a u64".to_string()
-            })?;
-            usize::try_from(rounds).map_err(|_| {
-                format!("session metadata `plan_execution_rounds` exceeds usize::MAX: {rounds}")
-            })?
-        }
-        None => 0,
-    };
-
     Ok(SessionMetadataState {
-        executing_plan_json: obj
-            .get("executing_plan")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        plan_goal: obj
-            .get("plan_goal")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        plan_config_json: obj
-            .get("plan_config")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        plan_execution_rounds,
         git_branch: obj
             .get("git_branch")
             .and_then(|v| v.as_str())
@@ -3330,16 +2916,6 @@ pub fn extract_session_state_from_metadata(
             .and_then(|v| v.as_str())
             .map(str::to_string),
     })
-}
-
-pub fn extract_plan_from_metadata(metadata_json: &str) -> Result<ExtractedPlanMetadata, String> {
-    let state = extract_session_state_from_metadata(metadata_json)?;
-    Ok((
-        state.executing_plan_json,
-        state.plan_goal,
-        state.plan_config_json,
-        state.plan_execution_rounds,
-    ))
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -3583,8 +3159,6 @@ mod tests {
             transcript_ms: 3,
             context_trace_ms: 4,
             recent_tools_ms: 5,
-            contract_ms: 6,
-            checkpoint_fallback_ms: 7,
             total_ms: 8,
         };
 
@@ -3593,8 +3167,6 @@ mod tests {
         assert_eq!(timings.transcript_ms, 3);
         assert_eq!(timings.context_trace_ms, 4);
         assert_eq!(timings.recent_tools_ms, 5);
-        assert_eq!(timings.contract_ms, 6);
-        assert_eq!(timings.checkpoint_fallback_ms, 7);
         assert_eq!(timings.total_ms, 8);
     }
 
@@ -3696,14 +3268,7 @@ mod tests {
 
     #[test]
     fn metadata_json_state_fails_loudly_on_corrupt_present_metadata() {
-        for (metadata, expected) in [
-            ("not json", "parse failed"),
-            ("[]", "must be an object"),
-            (
-                r#"{"plan_execution_rounds":"three"}"#,
-                "plan_execution_rounds",
-            ),
-        ] {
+        for (metadata, expected) in [("not json", "parse failed"), ("[]", "must be an object")] {
             let error = metadata_json_state(Some(metadata)).expect_err("metadata should fail");
             assert!(
                 error.contains(expected),
@@ -3785,7 +3350,6 @@ mod tests {
             title: "Phase A complete".into(),
             summary: "Finished token efficiency work".into(),
             total_tokens: 50000,
-            contract_state_json: None,
         };
         let json = serde_json::to_string(&c).unwrap();
         let loaded: RestoredCheckpoint = serde_json::from_str(&json).unwrap();
@@ -4127,7 +3691,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_restore_reconciliation_keeps_the_selected_generation_together() {
+    fn legacy_restore_reconciliation_keeps_messages_but_discards_unversioned_authority() {
         let local_projection = RestoredSession {
             session_id: "session-1".into(),
             turn_count: 1,
@@ -4161,7 +3725,7 @@ mod tests {
                 .unwrap();
 
         assert_eq!(restored.turn_count, 4);
-        assert_eq!(restored.model.as_deref(), Some("cloud-model"));
+        assert_eq!(restored.model, None);
         assert_eq!(restored.total_tokens_in, 500);
         assert_eq!(restored.total_cache_read_tokens, 400);
         assert!(restored.restored_from_cloud);
@@ -4176,11 +3740,7 @@ mod tests {
                 .all(|message| message["content"] != "stale local answer"),
             "history from an older turn must not be combined with a newer turn count"
         );
-        assert_eq!(
-            restored.activated_deferred_tool_names,
-            vec!["web_fetch"],
-            "unversioned activation state from another generation must not be spliced in"
-        );
+        assert!(restored.activated_deferred_tool_names.is_empty());
     }
 
     #[test]
@@ -4195,7 +3755,6 @@ mod tests {
                 "stale local",
             )),
             blocked_tools: vec!["stale-block".into()],
-            executing_plan_json: Some(r#"{"goal":"stale"}"#.into()),
             activated_deferred_tool_names: vec!["stale-provider".into()],
             total_tokens_in: 900,
             ..Default::default()
@@ -4218,7 +3777,6 @@ mod tests {
         assert_eq!(restored.turn_count, 10);
         assert_eq!(restored.resume_messages()[0]["content"], "current cloud");
         assert!(restored.blocked_tools.is_empty());
-        assert!(restored.executing_plan_json.is_none());
         assert!(restored.activated_deferred_tool_names.is_empty());
     }
 
@@ -4373,118 +3931,77 @@ mod tests {
             ..Default::default()
         };
 
-        let error = build_resume_bundle(
-            "owner-1",
-            "corrupt-session",
-            3,
-            messages,
-            true,
-            Some(&heavy),
-            ResumeBundleSupplementalProjections {
-                task: astra_turn_types::ResumeTaskProjectionV1::default(),
-                provider: astra_turn_types::ResumeProviderProjectionV1::default(),
-            },
-        )
-        .unwrap_err();
+        let error = build_resume_bundle("owner-1", "corrupt-session", messages, true, Some(&heavy))
+            .unwrap_err();
         assert!(error.contains("no valid resume candidate"), "{error}");
     }
 
     #[test]
-    fn degraded_cloud_resume_preserves_its_own_unversioned_session_snapshot() {
+    fn cursorless_cloud_history_cannot_restore_session_authority() {
         let messages = vec![serde_json::json!({"role": "user", "content": "resume"})];
-        let cursor = typed_resume_bundle_from_messages(
-            "owner-1",
-            "legacy-cloud-session",
-            3,
-            messages.clone(),
-        )
-        .cursor;
         let heavy = CloudHeavyCheckpointState {
-            conversation_cursor: Some(cursor),
+            conversation_cursor: None,
             messages: messages.clone(),
+            blocked_tools: vec!["write".into()],
+            approval_overrides: Some(serde_json::json!({"bash": "allow"})),
+            activated_deferred_tool_names: vec!["dangerous-skill".into()],
             ..Default::default()
         };
         let bundle = build_resume_bundle(
             "owner-1",
-            "legacy-cloud-session",
-            3,
-            messages,
+            "cursorless-cloud-session",
+            messages.clone(),
             true,
             Some(&heavy),
-            ResumeBundleSupplementalProjections {
-                task: astra_turn_types::ResumeTaskProjectionV1 {
-                    executing_plan_json: Some(r#"{"goal":"resume"}"#.into()),
-                    contract_json: Some(r#"{"state":"active"}"#.into()),
-                    ..Default::default()
-                },
-                provider: astra_turn_types::ResumeProviderProjectionV1 {
-                    model: Some("model-a".into()),
-                    permission_mode: Some("plan".into()),
-                    config_version_id: None,
-                },
-            },
         )
-        .unwrap()
         .unwrap();
-        assert!(bundle.projections.task_at(&bundle.cursor).is_none());
-        assert!(
-            bundle
-                .degraded_reasons
-                .contains(&astra_turn_types::ResumeDegradedReasonV1::ProjectionCursorMissing)
-        );
+        assert!(bundle.is_none());
 
         let mut restored = RestoredSession {
-            session_id: "legacy-cloud-session".into(),
-            resume_bundle: Some(bundle),
+            session_id: "cursorless-cloud-session".into(),
+            conversation_messages: messages.clone(),
+            model: Some("model-a".into()),
+            permission_mode: Some("plan".into()),
+            blocked_tools: heavy.blocked_tools.clone(),
+            approval_overrides: heavy.approval_overrides.clone(),
+            activated_deferred_tool_names: heavy.activated_deferred_tool_names.clone(),
             ..Default::default()
         };
         apply_selected_resume_bundle(&mut restored);
 
-        assert_eq!(restored.model.as_deref(), Some("model-a"));
-        assert_eq!(restored.permission_mode.as_deref(), Some("plan"));
-        assert_eq!(
-            restored.executing_plan_json.as_deref(),
-            Some(r#"{"goal":"resume"}"#)
-        );
-        assert_eq!(
-            restored.contract_json.as_deref(),
-            Some(r#"{"state":"active"}"#)
-        );
+        assert_eq!(restored.conversation_messages, messages);
+        assert!(restored.resume_messages().is_empty());
+        assert_eq!(restored.model, None);
+        assert_eq!(restored.permission_mode, None);
+        assert!(restored.blocked_tools.is_empty());
+        assert_eq!(restored.approval_overrides, None);
+        assert!(restored.activated_deferred_tool_names.is_empty());
     }
 
     #[test]
-    fn canonical_resume_transplants_side_state_only_for_equivalent_materialization() {
+    fn canonical_resume_never_restamps_side_state_from_an_older_materialization() {
         let messages = vec![serde_json::json!({"role": "user", "content": "resume"})];
+        let source_cursor =
+            typed_resume_bundle_from_messages("owner-1", "canonical-session", 3, messages.clone())
+                .cursor;
         let heavy = CloudHeavyCheckpointState {
+            conversation_cursor: Some(source_cursor),
             messages: messages.clone(),
             blocked_tools: vec!["write".into()],
             ..Default::default()
         };
-        let legacy = build_resume_bundle(
+        let checkpoint_bundle = build_resume_bundle(
             "owner-1",
             "canonical-session",
-            3,
             messages.clone(),
             true,
             Some(&heavy),
-            ResumeBundleSupplementalProjections {
-                task: astra_turn_types::ResumeTaskProjectionV1 {
-                    executing_plan_json: Some(r#"{"goal":"resume"}"#.into()),
-                    contract_json: Some(r#"{"state":"active"}"#.into()),
-                    ..Default::default()
-                },
-                provider: astra_turn_types::ResumeProviderProjectionV1 {
-                    model: Some("model-a".into()),
-                    permission_mode: Some("plan".into()),
-                    config_version_id: None,
-                },
-            },
         )
         .unwrap()
         .unwrap();
-        let legacy_cursor = legacy.cursor.clone();
+        let checkpoint_cursor = checkpoint_bundle.cursor.clone();
         let canonical_bundle = |materialized_messages: Vec<serde_json::Value>| {
-            let mut cursor = legacy_cursor.clone();
+            let mut cursor = checkpoint_cursor.clone();
             cursor.schema_version = astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION;
             cursor.projection_schema =
                 astra_turn_types::SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION;
@@ -4508,21 +4025,17 @@ mod tests {
 
         let mut equivalent = RestoredSession {
             session_id: "canonical-session".into(),
-            resume_bundle: Some(legacy.clone()),
+            resume_bundle: Some(checkpoint_bundle.clone()),
             ..Default::default()
         };
         install_canonical_resume_bundle(&mut equivalent, canonical_bundle(messages)).unwrap();
-        assert_eq!(equivalent.model.as_deref(), Some("model-a"));
-        assert_eq!(equivalent.permission_mode.as_deref(), Some("plan"));
-        assert_eq!(
-            equivalent.executing_plan_json.as_deref(),
-            Some(r#"{"goal":"resume"}"#)
-        );
-        assert_eq!(equivalent.blocked_tools, ["write"]);
+        assert_eq!(equivalent.model, None);
+        assert_eq!(equivalent.permission_mode, None);
+        assert!(equivalent.blocked_tools.is_empty());
 
         let mut divergent = RestoredSession {
             session_id: "canonical-session".into(),
-            resume_bundle: Some(legacy),
+            resume_bundle: Some(checkpoint_bundle),
             model: Some("must-be-cleared".into()),
             ..Default::default()
         };
@@ -4535,7 +4048,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(divergent.model, None);
-        assert!(divergent.executing_plan_json.is_none());
         assert!(divergent.blocked_tools.is_empty());
     }
 
@@ -4557,24 +4069,13 @@ mod tests {
         let bundle = build_resume_bundle(
             "owner-1",
             "transcript-session",
-            4,
             transcript,
             false,
             Some(&heavy),
-            ResumeBundleSupplementalProjections {
-                task: astra_turn_types::ResumeTaskProjectionV1::default(),
-                provider: astra_turn_types::ResumeProviderProjectionV1::default(),
-            },
         )
-        .unwrap()
         .unwrap();
 
-        assert_eq!(
-            bundle.source,
-            astra_turn_types::ResumeSourceV1::TranscriptProjection
-        );
-        assert_eq!(bundle.cursor.schema_version, 0);
-        assert!(bundle.projections.checkpoint_at(&bundle.cursor).is_none());
+        assert!(bundle.is_none());
     }
 
     #[test]
@@ -4586,7 +4087,6 @@ mod tests {
                 title: "First".into(),
                 summary: String::new(),
                 total_tokens: 1000,
-                contract_state_json: None,
             },
             RestoredCheckpoint {
                 number: 2,
@@ -4594,7 +4094,6 @@ mod tests {
                 title: "Second".into(),
                 summary: String::new(),
                 total_tokens: 3000,
-                contract_state_json: None,
             },
         ];
         assert!(ckpts[0].turn < ckpts[1].turn);
@@ -4621,7 +4120,6 @@ mod tests {
             title: "Local title".into(),
             summary: String::new(),
             total_tokens: 0,
-            contract_state_json: None,
         }];
         let cloud = vec![RestoredCheckpoint {
             number: 3,
@@ -4629,7 +4127,6 @@ mod tests {
             title: "Cloud title".into(),
             summary: "Rich summary".into(),
             total_tokens: 1234,
-            contract_state_json: Some("{\"contract\":true}".into()),
         }];
 
         let merged = merge_checkpoints(local, cloud);
@@ -4637,10 +4134,6 @@ mod tests {
         assert_eq!(merged[0].title, "Cloud title");
         assert_eq!(merged[0].summary, "Rich summary");
         assert_eq!(merged[0].total_tokens, 1234);
-        assert_eq!(
-            merged[0].contract_state_json.as_deref(),
-            Some("{\"contract\":true}")
-        );
     }
 
     #[test]
@@ -4828,7 +4321,7 @@ mod tests {
             "outer query must restore ascending checkpoint order for callers"
         );
         assert!(
-            !CLOUD_CHECKPOINT_COUNT_SQL.contains("contract_state_json"),
+            !CLOUD_CHECKPOINT_COUNT_SQL.contains("summary"),
             "checkpoint count must not read LONGTEXT checkpoint bodies"
         );
         assert!(
@@ -4886,6 +4379,106 @@ mod tests {
             MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS, 80,
             "transcript fallback is not the canonical log; keep it bounded"
         );
+    }
+
+    #[test]
+    fn dangling_terminal_user_request_gets_a_typed_prompt_boundary() {
+        assert!(
+            !PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL.contains("'tool'")
+                && PROMPT_HISTORY_TRANSCRIPT_SELECT_SQL.contains("TRIM(sti.content) <> ''"),
+            "bare tool/empty assistant evidence must not consume the provider-safe history quota"
+        );
+        assert!(
+            prompt_history_boundary_after_message(
+                "user",
+                true,
+                Some("run-old"),
+                Some("run-old"),
+                Some("cancelled"),
+            )
+            .is_none(),
+            "an assistant or later intent in the same run still owns closure"
+        );
+        let boundary = prompt_history_boundary_after_message(
+            "user",
+            true,
+            Some("run-old"),
+            Some("run-new"),
+            Some("cancelled"),
+        )
+        .expect("cancelled dangling request must be closed");
+        assert!(boundary.contains("cancelled before completion"));
+        assert!(boundary.contains("not an active objective"));
+        assert!(
+            prompt_history_boundary_after_message(
+                "tool",
+                true,
+                Some("run-old"),
+                Some("run-new"),
+                Some("cancelled"),
+            )
+            .is_some(),
+            "partial side effects remain evidence but must not keep the old objective active"
+        );
+        assert!(
+            prompt_history_boundary_after_message(
+                "assistant",
+                true,
+                Some("run-old"),
+                Some("run-new"),
+                Some("cancelled"),
+            )
+            .is_none()
+        );
+        assert!(
+            prompt_history_boundary_after_message(
+                "assistant",
+                false,
+                Some("run-old"),
+                Some("run-new"),
+                Some("cancelled"),
+            )
+            .is_some(),
+            "an empty assistant tool-call tail does not naturally close a cancelled request"
+        );
+        assert!(prompt_history_role_is_provider_safe("assistant", true));
+        assert!(
+            !prompt_history_role_is_provider_safe("tool", true),
+            "a bare tool row without tool_call_id/pairing must never enter provider history"
+        );
+        assert!(
+            prompt_history_boundary_after_message(
+                "user",
+                true,
+                Some("run-old"),
+                Some("run-new"),
+                Some("running"),
+            )
+            .is_none(),
+            "a live run must not be sealed by a restore projection"
+        );
+    }
+
+    #[test]
+    fn tool_heavy_terminal_tail_cannot_evict_provider_safe_history_quota() {
+        let mut newest_first = (0..MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS)
+            .map(|index| ("tool", format!("tool-result-{index}")))
+            .collect::<Vec<_>>();
+        newest_first.extend(
+            (0..MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS)
+                .map(|index| ("user", format!("prompt-{index}"))),
+        );
+
+        let selected = newest_first
+            .into_iter()
+            .filter(|(role, content)| {
+                prompt_history_role_is_provider_safe(role, !content.trim().is_empty())
+            })
+            .take(MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS as usize)
+            .collect::<Vec<_>>();
+
+        assert_eq!(selected.len(), MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS as usize);
+        assert!(selected.iter().all(|(role, _)| *role == "user"));
     }
 
     static SESSION_RESTORE_DB: tokio::sync::OnceCell<astra_core::MatrixOneSettings> =
@@ -4955,6 +4548,7 @@ mod tests {
         run_id: &str,
         parent_run_id: Option<&str>,
         depth: i32,
+        status: &str,
     ) {
         let root_run_id = parent_run_id.unwrap_or(run_id);
         let ancestor_path = match parent_run_id {
@@ -4964,7 +4558,7 @@ mod tests {
         sqlx::query(
             "INSERT INTO agent_runs
              (run_id, user_id, session_id, parent_run_id, root_run_id, ancestor_path, depth, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'completed')",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(run_id)
         .bind(user_id)
@@ -4973,6 +4567,7 @@ mod tests {
         .bind(root_run_id)
         .bind(ancestor_path)
         .bind(depth)
+        .bind(status)
         .execute(pool.get())
         .await
         .expect("insert restore fixture run");
@@ -5015,8 +4610,16 @@ mod tests {
         cleanup_prompt_history_restore_fixture(&pool, &user_id, &session_id).await;
 
         insert_prompt_history_restore_session(&pool, &user_id, &session_id).await;
-        insert_prompt_history_restore_run(&pool, &user_id, &session_id, &root_run_id, None, 0)
-            .await;
+        insert_prompt_history_restore_run(
+            &pool,
+            &user_id,
+            &session_id,
+            &root_run_id,
+            None,
+            0,
+            "cancelled",
+        )
+        .await;
         insert_prompt_history_restore_run(
             &pool,
             &user_id,
@@ -5024,6 +4627,7 @@ mod tests {
             &child_run_id,
             Some(&root_run_id),
             1,
+            "completed",
         )
         .await;
         for seq in 1..=90 {
@@ -5058,6 +4662,18 @@ mod tests {
             "session-note",
         )
         .await;
+        for offset in 0..MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS {
+            insert_prompt_history_restore_transcript(
+                &pool,
+                &user_id,
+                &session_id,
+                1_000 + offset,
+                Some(&root_run_id),
+                "tool",
+                &format!("tool-tail-{offset}"),
+            )
+            .await;
+        }
 
         let service = HybridRestoreService::new(pool.get().clone());
         let messages = service
@@ -5067,14 +4683,27 @@ mod tests {
 
         cleanup_prompt_history_restore_fixture(&pool, &user_id, &session_id).await;
 
-        assert_eq!(messages.len(), MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS as usize);
+        assert_eq!(
+            messages.len(),
+            MAX_PROMPT_HISTORY_TRANSCRIPT_ROWS as usize + 1,
+            "the bounded durable rows may add one synthetic terminal boundary"
+        );
         assert_eq!(messages.first().unwrap()["content"], "root-12");
         assert_eq!(messages.last().unwrap()["content"], "session-note");
+        assert!(messages.iter().any(|message| {
+            message["role"] == "system"
+                && message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("cancelled before completion"))
+        }));
         assert!(
             messages.iter().all(|message| {
                 message["content"].as_str() != Some("child-output-must-not-be-prompt-history")
+                    && !message["content"]
+                        .as_str()
+                        .is_some_and(|content| content.starts_with("tool-tail-"))
             }),
-            "child run transcript rows are work-unit output, not main prompt history"
+            "child output and bare tool rows are not main prompt history"
         );
     }
 
@@ -5164,7 +4793,6 @@ mod tests {
             total_tokens: 50_000,
             had_stalls: true,
             error_count: 1,
-            contract_state_json: Some(r#"{"contract_id":"c1"}"#.to_string()),
         };
         assert_eq!(ckpt.number, 3);
         assert_eq!(ckpt.turn, 15);
@@ -5181,7 +4809,6 @@ mod tests {
             title: "Checkpoint after refactor".into(),
             summary: "All tests passing after auth refactor".into(),
             total_tokens: 120_000,
-            contract_state_json: None,
         };
         // Verify the fields needed for /rewind from cloud
         assert_eq!(ckpt.number, 7);
@@ -5215,60 +4842,10 @@ mod tests {
         assert!(rewound.turn_count < original.turn_count);
     }
 
-    // ── Plan state cloud sync ──
-
-    #[test]
-    fn extract_plan_from_metadata_full() {
-        let metadata = r#"{
-            "executing_plan": "{\"subtasks\":[{\"id\":\"s1\",\"title\":\"task\"}]}",
-            "plan_goal": "Build feature X",
-            "plan_config": "{\"step_by_step\":true}",
-            "plan_execution_rounds": 3
-        }"#;
-        let (plan, goal, config, rounds) = extract_plan_from_metadata(metadata).unwrap();
-        assert!(plan.is_some());
-        assert!(plan.unwrap().contains("subtasks"));
-        assert_eq!(goal, Some("Build feature X".to_string()));
-        assert!(config.is_some());
-        assert_eq!(rounds, 3);
-    }
-
-    #[test]
-    fn extract_plan_from_metadata_empty() {
-        let (plan, goal, config, rounds) = extract_plan_from_metadata("{}").unwrap();
-        assert!(plan.is_none());
-        assert!(goal.is_none());
-        assert!(config.is_none());
-        assert_eq!(rounds, 0);
-    }
-
-    #[test]
-    fn extract_plan_from_metadata_invalid_json_fails_loudly() {
-        let error = extract_plan_from_metadata("not json").expect_err("invalid JSON must fail");
-        assert!(
-            error.contains("parse failed"),
-            "invalid metadata should fail loudly: {error}"
-        );
-    }
-
-    #[test]
-    fn extract_plan_from_metadata_partial() {
-        let metadata = r#"{"plan_goal": "Fix bug", "plan_execution_rounds": 1}"#;
-        let (plan, goal, config, rounds) = extract_plan_from_metadata(metadata).unwrap();
-        assert!(plan.is_none());
-        assert_eq!(goal, Some("Fix bug".to_string()));
-        assert!(config.is_none());
-        assert_eq!(rounds, 1);
-    }
-
     #[test]
     fn merge_session_state_metadata_preserves_unrelated_fields() {
         let merged = merge_session_state_metadata(
             Some(r#"{"agent_id":"astra-server","note":"keep me"}"#),
-            Some("{\"subtasks\":[]}"),
-            Some("finish migration"),
-            None,
-            2,
             Some("main"),
             Some("gpt-5.4"),
         )
@@ -5279,14 +4856,6 @@ mod tests {
             Some("astra-server")
         );
         assert_eq!(parsed.get("note").and_then(|v| v.as_str()), Some("keep me"));
-        assert_eq!(
-            parsed.get("plan_goal").and_then(|v| v.as_str()),
-            Some("finish migration")
-        );
-        assert_eq!(
-            parsed.get("plan_execution_rounds").and_then(|v| v.as_u64()),
-            Some(2)
-        );
         assert_eq!(
             parsed.get("git_branch").and_then(|v| v.as_str()),
             Some("main")
@@ -5316,10 +4885,6 @@ mod tests {
         let merged = merge_session_state_metadata(
             Some(r#"{"agent_id":"astra-server"}"#),
             None,
-            None,
-            None,
-            0,
-            None,
             Some(" default "),
         )
         .unwrap();
@@ -5328,37 +4893,8 @@ mod tests {
     }
 
     #[test]
-    fn merge_session_state_metadata_clears_absent_plan_fields() {
-        let merged = merge_session_state_metadata(
-            Some(
-                r#"{"agent_id":"astra-server","executing_plan":"{}","plan_goal":"stale","plan_config":"{}","plan_execution_rounds":3,"git_branch":"stale-branch","model":"stale-model"}"#,
-            ),
-            None,
-            None,
-            None,
-            0,
-            None,
-            None,
-        )
-        .unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&merged).unwrap();
-        assert_eq!(
-            parsed.get("agent_id").and_then(|v| v.as_str()),
-            Some("astra-server")
-        );
-        assert!(parsed.get("executing_plan").is_none());
-        assert!(parsed.get("plan_goal").is_none());
-        assert!(parsed.get("plan_config").is_none());
-        assert!(parsed.get("plan_execution_rounds").is_none());
-        assert!(parsed.get("git_branch").is_none());
-        assert!(parsed.get("model").is_none());
-    }
-
-    #[test]
     fn merge_session_state_metadata_fails_loudly_on_corrupt_existing_metadata() {
-        let error =
-            merge_session_state_metadata(Some("{not-json"), None, None, None, 0, None, None)
-                .unwrap_err();
+        let error = merge_session_state_metadata(Some("{not-json"), None, None).unwrap_err();
 
         assert!(
             error.contains("session metadata JSON parse failed before merge"),
@@ -5372,8 +4908,7 @@ mod tests {
 
     #[test]
     fn merge_session_state_metadata_fails_loudly_on_non_object_existing_metadata() {
-        let error =
-            merge_session_state_metadata(Some("[]"), None, None, None, 0, None, None).unwrap_err();
+        let error = merge_session_state_metadata(Some("[]"), None, None).unwrap_err();
 
         assert!(
             error.contains("session metadata JSON must be an object before merge"),
@@ -5403,8 +4938,6 @@ mod tests {
             }
         }"#;
         let state = extract_session_state_from_metadata(metadata).unwrap();
-        assert!(state.executing_plan_json.is_some());
-        assert_eq!(state.plan_execution_rounds, 0);
         assert_eq!(state.git_branch.as_deref(), Some("feature/cloud-sync"));
         assert_eq!(state.model.as_deref(), Some("gpt-5.4"));
     }
@@ -5429,24 +4962,6 @@ mod tests {
         assert!(super::parse_heavy_checkpoint_number("000005-light.json").is_none());
     }
 
-    #[test]
-    fn restored_session_plan_fields_roundtrip() {
-        let s = RestoredSession {
-            session_id: "plan-sess".into(),
-            executing_plan_json: Some(r#"{"subtasks":[]}"#.into()),
-            plan_goal: Some("Cloud sync".into()),
-            plan_config_json: Some(r#"{"step_by_step":false}"#.into()),
-            plan_execution_rounds: 5,
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&s).unwrap();
-        let loaded: RestoredSession = serde_json::from_str(&json).unwrap();
-        assert_eq!(loaded.executing_plan_json, s.executing_plan_json);
-        assert_eq!(loaded.plan_goal, s.plan_goal);
-        assert_eq!(loaded.plan_config_json, s.plan_config_json);
-        assert_eq!(loaded.plan_execution_rounds, 5);
-    }
-
     // -----------------------------------------------------------------------
     // Unhappy-path / edge-case tests
     // -----------------------------------------------------------------------
@@ -5464,8 +4979,6 @@ mod tests {
         assert_eq!(s.turn_count, 0);
         assert!(s.conversation_messages.is_empty());
         assert!(s.blocked_tools.is_empty());
-        assert!(s.plan_corrections.is_empty());
-        assert_eq!(s.plan_execution_rounds, 0);
     }
 
     fn minimal_session_json(extra: &str) -> String {
@@ -5505,24 +5018,12 @@ mod tests {
             title: "Phase 1 complete".into(),
             summary: "Implemented auth module".into(),
             total_tokens: 50000,
-            contract_state_json: Some(r#"{"id":"c1"}"#.into()),
         };
         let json = serde_json::to_string(&ckpt).unwrap();
         let loaded: RestoredCheckpoint = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.number, 5);
         assert_eq!(loaded.turn, 10);
         assert_eq!(loaded.title, "Phase 1 complete");
-        assert_eq!(
-            loaded.contract_state_json.as_deref(),
-            Some(r#"{"id":"c1"}"#)
-        );
-    }
-
-    #[test]
-    fn restored_checkpoint_missing_contract_state() {
-        let json = r#"{"number":1,"turn":2,"title":"t","summary":"s","total_tokens":100}"#;
-        let ckpt: RestoredCheckpoint = serde_json::from_str(json).unwrap();
-        assert!(ckpt.contract_state_json.is_none());
     }
 
     #[test]
@@ -5602,17 +5103,15 @@ mod tests {
     }
 
     #[test]
-    fn restored_session_blocked_tools_and_corrections() {
+    fn restored_session_blocked_tools_roundtrip() {
         let s = RestoredSession {
             session_id: "s1".into(),
             blocked_tools: vec!["dangerous_tool".into()],
-            plan_corrections: vec!["skip step 3".into(), "add validation".into()],
             ..Default::default()
         };
         let json = serde_json::to_string(&s).unwrap();
         let loaded: RestoredSession = serde_json::from_str(&json).unwrap();
         assert_eq!(loaded.blocked_tools, vec!["dangerous_tool"]);
-        assert_eq!(loaded.plan_corrections.len(), 2);
     }
 
     #[test]
@@ -5622,7 +5121,6 @@ mod tests {
         // Empty vecs should not appear in serialized JSON
         assert!(!json.contains("conversation_messages"));
         assert!(!json.contains("blocked_tools"));
-        assert!(!json.contains("plan_corrections"));
     }
 
     #[test]

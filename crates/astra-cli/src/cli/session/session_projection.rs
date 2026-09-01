@@ -1,17 +1,8 @@
-use std::time::Duration;
-
 use astra_text_utils::str_preview::truncate_str;
-use astra_tools::task_mgmt::{SessionTask, unresolved_task_blocker_ids};
 
 use crate::cli::session::session_state::{ContinuationAnchor, SessionState};
 use crate::cli::stream::streaming_types::StreamResult;
-use crate::cli::surface::session_task_surface::session_task_active_priority;
 use astra_services::session_journal;
-
-/// The task board is useful continuation context, not part of the turn's
-/// durable commit. In Edge+Server it is an HTTP projection and must never
-/// leave the user waiting for the request timeout after model output arrived.
-const ACTIVE_TASK_ANCHOR_REFRESH_BUDGET: Duration = Duration::from_millis(250);
 
 fn summarize_assistant_for_anchor(full_text: &str) -> Option<String> {
     let mut lines = Vec::new();
@@ -108,84 +99,6 @@ fn summarize_event_anchor_artifacts(event: Option<&session_journal::JournalEvent
     lines
 }
 
-fn prioritize_active_tasks_for_anchor(tasks: Vec<SessionTask>) -> Vec<SessionTask> {
-    let mut active = tasks
-        .iter()
-        .filter(|task| task.status.is_open_work())
-        .map(|task| {
-            let mut projected = task.clone();
-            projected.blocked_by = unresolved_task_blocker_ids(&tasks, task);
-            projected
-        })
-        .collect::<Vec<_>>();
-    active.sort_by_key(|task| {
-        (
-            session_task_active_priority(task.status),
-            !task.blocked_by.is_empty(),
-        )
-    });
-    active
-}
-
-fn compact_blocker_ids(blockers: &[String]) -> String {
-    const MAX_IDS: usize = 3;
-    let mut ids = blockers.iter().take(MAX_IDS).cloned().collect::<Vec<_>>();
-    if blockers.len() > MAX_IDS {
-        ids.push(format!("+{} more", blockers.len() - MAX_IDS));
-    }
-    ids.join(", ")
-}
-
-fn active_task_anchor_items(active_tasks: &[SessionTask]) -> Vec<String> {
-    active_tasks
-        .iter()
-        .take(3)
-        .map(|task| {
-            let blocked = if task.blocked_by.is_empty() {
-                String::new()
-            } else {
-                format!(" [blocked by: {}]", compact_blocker_ids(&task.blocked_by))
-            };
-            format!(
-                "[{}] {}: {}{}",
-                task.status,
-                task.id,
-                truncate_str(&task.title, 120),
-                blocked
-            )
-        })
-        .collect()
-}
-
-fn active_task_anchor_section(active_tasks: &[SessionTask]) -> Option<String> {
-    if active_tasks.is_empty() {
-        return None;
-    }
-    let items = active_task_anchor_items(active_tasks);
-    let mut lines = active_task_anchor_section_from_items(&items)?
-        .lines()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    if active_tasks.len() > 3 {
-        lines.push(format!(
-            "- ... {} more active task(s)",
-            active_tasks.len() - 3
-        ));
-    }
-    Some(lines.join("\n"))
-}
-
-fn active_task_anchor_section_from_items(items: &[String]) -> Option<String> {
-    if items.is_empty() {
-        return None;
-    }
-    let mut lines = vec!["Active task board:".to_string()];
-    for item in items {
-        lines.push(format!("- {item}"));
-    }
-    Some(lines.join("\n"))
-}
-
 fn extract_session_memory_section(md: &str, section_name: &str) -> Option<String> {
     let header = format!("## {section_name}");
     let start = md.find(&header)?;
@@ -260,7 +173,6 @@ pub(crate) fn merge_continuation_anchor_with_session_memory(
                     anchor.recent_user_input,
                     anchor.objective_context,
                     anchor.assistant_direction,
-                    anchor.active_task_board,
                 )
                 .with_session_memory_recap(),
             );
@@ -268,14 +180,8 @@ pub(crate) fn merge_continuation_anchor_with_session_memory(
         _ => format!("[Session memory recap]\n{recap}"),
     };
     Some(
-        ContinuationAnchor::from_parts(
-            truncate_str(&merged, 900),
-            None,
-            Vec::new(),
-            None,
-            Vec::new(),
-        )
-        .with_session_memory_recap(),
+        ContinuationAnchor::from_parts(truncate_str(&merged, 900), None, Vec::new(), None)
+            .with_session_memory_recap(),
     )
 }
 
@@ -286,7 +192,7 @@ fn objective_context_for_anchor(state: &SessionState, result: &StreamResult) -> 
         Ok(projected) => projected,
         Err(error) => {
             tracing::warn!(
-                session_id = %state.task_manager.session_id(),
+                session_id = state.session_id.as_deref().unwrap_or("<unbound>"),
                 error = %error,
                 "invalid typed objective metadata in completed turn; preserving previous continuation objective"
             );
@@ -360,7 +266,7 @@ pub(crate) fn seed_continuation_objective_from_messages(
         Ok(items) => render_objective_context_items(items),
         Err(error) => {
             tracing::warn!(
-                session_id = %state.task_manager.session_id(),
+                session_id = state.session_id.as_deref().unwrap_or("<unbound>"),
                 error = %error,
                 "invalid typed objective metadata in restored session; preserving existing continuation objective"
             );
@@ -379,7 +285,6 @@ pub(crate) fn seed_continuation_objective_from_messages(
                 None,
                 objective_context,
                 None,
-                Vec::new(),
             ));
         }
     }
@@ -389,19 +294,10 @@ fn objective_context_section(items: &[String]) -> Option<String> {
     (!items.is_empty()).then(|| format!("Current objective context:\n- {}", items.join("\n- ")))
 }
 
-async fn load_active_tasks_for_anchor(state: &SessionState) -> Result<Vec<SessionTask>, String> {
-    state
-        .task_manager
-        .load_tasks()
-        .await
-        .map(prioritize_active_tasks_for_anchor)
-}
-
-fn build_continuation_anchor_with_active_tasks(
+pub(crate) fn build_continuation_anchor(
     state: &SessionState,
     line: &str,
     result: &StreamResult,
-    active_tasks: &[SessionTask],
 ) -> Option<ContinuationAnchor> {
     let user_line = line.trim();
     if user_line.is_empty() {
@@ -417,11 +313,6 @@ fn build_continuation_anchor_with_active_tasks(
     if let Some(user_summary) = recent_user_input.as_deref() {
         sections.push(format!("Recent user input: {user_summary}"));
     }
-    let active_task_board = active_task_anchor_items(active_tasks);
-    if let Some(task_section) = active_task_anchor_section(active_tasks) {
-        sections.push(task_section);
-    }
-
     let assistant_summary = summarize_assistant_for_anchor(&result.full_text);
     let assistant_direction = assistant_summary
         .as_deref()
@@ -443,33 +334,11 @@ fn build_continuation_anchor_with_active_tasks(
             recent_user_input,
             objective_context,
             assistant_direction,
-            active_task_board,
         ))
     }
 }
 
-pub(crate) fn build_continuation_anchor(
-    state: &SessionState,
-    line: &str,
-    result: &StreamResult,
-) -> Option<ContinuationAnchor> {
-    build_continuation_anchor_with_active_tasks(state, line, result, &[])
-}
-
-fn rebuild_continuation_anchor_from_state_with_active_tasks(
-    state: &mut SessionState,
-    active_tasks: &[SessionTask],
-) {
-    rebuild_continuation_anchor_from_state_with_active_task_items(
-        state,
-        active_task_anchor_items(active_tasks),
-    );
-}
-
-fn rebuild_continuation_anchor_from_state_with_active_task_items(
-    state: &mut SessionState,
-    active_task_board: Vec<String>,
-) {
+fn rebuild_continuation_anchor_from_state(state: &mut SessionState) {
     state.last_response = state.history.last().map(|(_, assistant)| assistant.clone());
 
     let objective_context = state
@@ -483,17 +352,8 @@ fn rebuild_continuation_anchor_from_state_with_active_task_items(
         if let Some(objective_section) = objective_context_section(&objective_context) {
             sections.push(objective_section);
         }
-        if let Some(task_section) = active_task_anchor_section_from_items(&active_task_board) {
-            sections.push(task_section);
-        }
         state.continuation_anchor = (!sections.is_empty()).then(|| {
-            ContinuationAnchor::from_parts(
-                sections.join("\n"),
-                None,
-                objective_context,
-                None,
-                active_task_board,
-            )
+            ContinuationAnchor::from_parts(sections.join("\n"), None, objective_context, None)
         });
         return;
     };
@@ -510,10 +370,6 @@ fn rebuild_continuation_anchor_from_state_with_active_task_items(
     if let Some(user_summary) = recent_user_input.as_deref() {
         sections.push(format!("Recent user input: {user_summary}"));
     }
-    if let Some(task_section) = active_task_anchor_section_from_items(&active_task_board) {
-        sections.push(task_section);
-    }
-
     let assistant_summary = summarize_assistant_for_anchor(assistant_text);
     let assistant_direction = assistant_summary
         .as_deref()
@@ -530,48 +386,11 @@ fn rebuild_continuation_anchor_from_state_with_active_task_items(
         recent_user_input,
         objective_context,
         assistant_direction,
-        active_task_board,
     ));
 }
 
-pub(crate) async fn rebuild_continuation_anchor_from_live_state(state: &mut SessionState) {
-    let preserved_task_board = state
-        .continuation_anchor
-        .as_ref()
-        .map(|anchor| anchor.active_task_board.clone())
-        .unwrap_or_default();
-    match tokio::time::timeout(
-        ACTIVE_TASK_ANCHOR_REFRESH_BUDGET,
-        load_active_tasks_for_anchor(state),
-    )
-    .await
-    {
-        Ok(Ok(active_tasks)) => {
-            rebuild_continuation_anchor_from_state_with_active_tasks(state, &active_tasks);
-        }
-        Ok(Err(error)) => {
-            tracing::warn!(
-                session_id = %state.task_manager.session_id(),
-                error = %error,
-                "failed to refresh active task board for continuation anchor; preserving previous anchor task board"
-            );
-            rebuild_continuation_anchor_from_state_with_active_task_items(
-                state,
-                preserved_task_board,
-            );
-        }
-        Err(_) => {
-            tracing::warn!(
-                session_id = %state.task_manager.session_id(),
-                budget_ms = ACTIVE_TASK_ANCHOR_REFRESH_BUDGET.as_millis() as u64,
-                "active task board refresh exceeded post-output budget; preserving previous anchor task board"
-            );
-            rebuild_continuation_anchor_from_state_with_active_task_items(
-                state,
-                preserved_task_board,
-            );
-        }
-    }
+pub(crate) fn rebuild_continuation_anchor_from_live_state(state: &mut SessionState) {
+    rebuild_continuation_anchor_from_state(state);
 }
 
 pub(crate) fn history_as_messages(history: &[(String, String)]) -> Vec<serde_json::Value> {
@@ -624,6 +443,10 @@ pub(crate) fn build_full_session_state_compact(
             .as_ref()
             .map(|conversation| conversation.cursor().clone()),
         recent_tools: state.recent_tools.clone(),
+        // Recent file identities are server-owned continuity state. The CLI
+        // projection must explicitly leave this field empty rather than
+        // dropping the struct field at compile time or inventing local
+        // evidence that the server did not authorize.
         activated_deferred_tool_names: state.activated_deferred_tool_names.clone(),
         blocked_tools: Vec::new(),
         approval_overrides: None,
@@ -641,8 +464,7 @@ mod tests {
     use super::{
         CslCheckpointFields, build_continuation_anchor, build_full_session_state_compact,
         history_as_messages, merge_continuation_anchor_with_session_memory,
-        rebuild_continuation_anchor_from_live_state,
-        rebuild_continuation_anchor_from_state_with_active_task_items,
+        rebuild_continuation_anchor_from_live_state, rebuild_continuation_anchor_from_state,
         seed_continuation_objective_from_messages,
     };
     use crate::cli::session::session_input::prepare_input;
@@ -720,7 +542,6 @@ mod tests {
                 None,
                 Vec::new(),
                 None,
-                Vec::new(),
             )),
             ..SessionState::default()
         };
@@ -738,7 +559,6 @@ mod tests {
                 Some("fix tool closure telemetry".into()),
                 vec!["objective: fix tool closure telemetry".into()],
                 None,
-                Vec::new(),
             )),
             ..SessionState::default()
         };
@@ -815,7 +635,7 @@ mod tests {
         state.history.push(("继续".into(), "Continuing.".into()));
 
         seed_continuation_objective_from_messages(&mut state, &messages);
-        rebuild_continuation_anchor_from_state_with_active_task_items(&mut state, Vec::new());
+        rebuild_continuation_anchor_from_state(&mut state);
 
         let anchor = state.continuation_anchor.expect("resumed anchor");
         assert_eq!(
@@ -826,243 +646,28 @@ mod tests {
         assert!(anchor.contains("Recent user input: 继续"));
     }
 
-    #[tokio::test]
-    async fn rebuild_continuation_anchor_from_live_state_includes_active_task_board() {
-        let mut state = SessionState::default();
-        state.task_manager.rebind("sess-anchor");
-        state.history.push((
-            "继续".into(),
-            "Patched slash parsing and prepared tests.".into(),
-        ));
-        let create = state
-            .task_manager
-            .create(&serde_json::json!({"title": "Finish slash command repair"}))
-            .await;
-        assert!(!create.starts_with("Error:"), "{create}");
-        let task_id = state
-            .task_manager
-            .snapshot()
-            .await
-            .unwrap()
-            .into_iter()
-            .next()
-            .expect("task")
-            .id;
-        let update = state
-            .task_manager
-            .update(&serde_json::json!({"task_id": task_id, "new_status": "in_progress"}))
-            .await;
-        assert!(!update.starts_with("Error:"), "{update}");
-
-        rebuild_continuation_anchor_from_live_state(&mut state).await;
-
-        let anchor = state.continuation_anchor.expect("anchor");
-        assert!(anchor.contains("Active task board:"), "{anchor}");
-        assert!(anchor.contains("Finish slash command repair"), "{anchor}");
-        assert!(anchor.contains("[in_progress]"), "{anchor}");
-    }
-
-    #[tokio::test]
-    async fn continuation_anchor_does_not_call_completed_dependency_blocked() {
-        let mut state = SessionState::default();
-        state.task_manager.rebind("sess-anchor-resolved");
-        state
-            .history
-            .push(("继续".into(), "Finished the prerequisite.".into()));
-        state
-            .task_manager
-            .create(&serde_json::json!({"title": "prerequisite"}))
-            .await;
-        state
-            .task_manager
-            .update(&serde_json::json!({
-                "task_id": "task-1",
-                "new_status": "completed"
-            }))
-            .await;
-        state
-            .task_manager
-            .create(&serde_json::json!({
-                "title": "ready dependent",
-                "add_blocked_by": ["task-1"]
-            }))
-            .await;
-
-        rebuild_continuation_anchor_from_live_state(&mut state).await;
-
-        let anchor = state.continuation_anchor.expect("anchor");
-        assert!(anchor.contains("ready dependent"), "{anchor}");
-        assert!(
-            !anchor.contains("blocked by"),
-            "completed edges are history, not active blockers: {anchor}"
-        );
-    }
-
-    #[tokio::test]
-    async fn rebuild_continuation_anchor_from_live_state_includes_paused_open_work() {
-        let mut state = SessionState::default();
-        state.task_manager.rebind("sess-anchor-paused");
-        state.history.push((
-            "继续".into(),
-            "Paused investigation for operator input.".into(),
-        ));
-        let create = state
-            .task_manager
-            .create(&serde_json::json!({"title": "Wait for API credentials"}))
-            .await;
-        assert!(!create.starts_with("Error:"), "{create}");
-        let task_id = state
-            .task_manager
-            .snapshot()
-            .await
-            .unwrap()
-            .into_iter()
-            .next()
-            .expect("task")
-            .id;
-        let update = state
-            .task_manager
-            .update(&serde_json::json!({"task_id": task_id, "new_status": "paused"}))
-            .await;
-        assert!(!update.starts_with("Error:"), "{update}");
-
-        rebuild_continuation_anchor_from_live_state(&mut state).await;
-
-        let anchor = state.continuation_anchor.expect("anchor");
-        assert!(anchor.contains("Active task board:"), "{anchor}");
-        assert!(anchor.contains("Wait for API credentials"), "{anchor}");
-        assert!(anchor.contains("[paused]"), "{anchor}");
-    }
-
-    #[tokio::test]
-    async fn rebuild_continuation_anchor_preserves_previous_task_board_when_load_fails() {
-        struct LoadFailsTaskStore;
-
-        #[async_trait::async_trait]
-        impl astra_tools::task_mgmt::TaskStore for LoadFailsTaskStore {
-            async fn load(
-                &self,
-                _session_id: &str,
-            ) -> Result<Vec<astra_tools::task_mgmt::SessionTask>, String> {
-                Err("forced active-task load failure".to_string())
-            }
-
-            async fn save(
-                &self,
-                _session_id: &str,
-                _tasks: Vec<astra_tools::task_mgmt::SessionTask>,
-            ) -> Result<(), String> {
-                Ok(())
-            }
-
-            async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {
-                Ok(1)
-            }
-
-            async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
-                Ok(1)
-            }
-        }
-
+    #[test]
+    fn continuation_anchor_does_not_preserve_legacy_task_text() {
         let mut state = SessionState {
-            task_manager: std::sync::Arc::new(crate::edge_tools::TaskManager::new(
-                "sess-anchor-fail",
-                std::sync::Arc::new(LoadFailsTaskStore),
-            )),
             continuation_anchor: Some(ContinuationAnchor::from_parts(
-                "Latest user input: 继续\nActive task board:\n- [in_progress] task-1: Preserve me",
+                "Latest user input: old\nActive task board:\n- [in_progress] task-1: stale",
                 Some("继续".into()),
                 Vec::new(),
                 None,
-                vec!["[in_progress] task-1: Preserve me".into()],
             )),
             ..SessionState::default()
         };
-        state.history.push((
-            "继续".into(),
-            "Kept working on the task board recovery path.".into(),
-        ));
+        state
+            .history
+            .push(("继续".into(), "Continued canonical Work execution.".into()));
 
-        rebuild_continuation_anchor_from_live_state(&mut state).await;
-
-        let anchor = state.continuation_anchor.expect("anchor");
-        assert!(anchor.contains("Active task board:"), "{anchor}");
-        assert!(
-            anchor.contains("[in_progress] task-1: Preserve me"),
-            "{anchor}"
-        );
-        assert_eq!(
-            anchor.active_task_board,
-            vec!["[in_progress] task-1: Preserve me".to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn rebuild_continuation_anchor_does_not_wait_for_a_stalled_remote_task_board() {
-        struct StalledTaskStore;
-
-        #[async_trait::async_trait]
-        impl astra_tools::task_mgmt::TaskStore for StalledTaskStore {
-            async fn load(
-                &self,
-                _session_id: &str,
-            ) -> Result<Vec<astra_tools::task_mgmt::SessionTask>, String> {
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                Ok(Vec::new())
-            }
-
-            async fn save(
-                &self,
-                _session_id: &str,
-                _tasks: Vec<astra_tools::task_mgmt::SessionTask>,
-            ) -> Result<(), String> {
-                Ok(())
-            }
-
-            async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {
-                Ok(1)
-            }
-
-            async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
-                Ok(1)
-            }
-        }
-
-        let mut state = SessionState {
-            task_manager: std::sync::Arc::new(crate::edge_tools::TaskManager::new(
-                "sess-anchor-stalled",
-                std::sync::Arc::new(StalledTaskStore),
-            )),
-            continuation_anchor: Some(ContinuationAnchor::from_parts(
-                "Latest user input: finish durable transcript loading\nActive task board:\n- [in_progress] task-1: Preserve live work",
-                Some("finish durable transcript loading".into()),
-                Vec::new(),
-                None,
-                vec!["[in_progress] task-1: Preserve live work".into()],
-            )),
-            ..SessionState::default()
-        };
-        state.history.push((
-            "继续".into(),
-            "The durable transcript remains available while the task service recovers.".into(),
-        ));
-
-        let completed = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            rebuild_continuation_anchor_from_live_state(&mut state),
-        )
-        .await;
-        assert!(
-            completed.is_ok(),
-            "continuation context must not wait for the remote task-store timeout"
-        );
+        rebuild_continuation_anchor_from_live_state(&mut state);
 
         let anchor = state.continuation_anchor.expect("anchor");
-        assert_eq!(
-            anchor.active_task_board,
-            vec!["[in_progress] task-1: Preserve live work".to_string()]
-        );
-        assert!(anchor.contains("task-1: Preserve live work"), "{anchor}");
+        assert!(anchor.contains("Recent user input: 继续"), "{anchor}");
+        assert!(anchor.contains("canonical Work execution"), "{anchor}");
+        assert!(!anchor.contains("Active task board"), "{anchor}");
+        assert!(!anchor.contains("task-1: stale"), "{anchor}");
     }
 
     #[test]

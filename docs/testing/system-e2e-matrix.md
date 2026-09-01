@@ -2,13 +2,16 @@
 
 This document maps **user-visible capabilities** to **HTTP routes**, **persistence (MatrixOne tables or in-process stores)**, and the **integration tests** that assert them. It complements `router_builder.rs` unit tests (route registration only).
 
-**Layout (system E2E plan):** the integration binary is `crates/runtime/tests/system_matrix_http_e2e/main.rs` with shared **`harness.rs`** (env gate, HTTP, `sqlx`, `bootstrap`) and journey modules such as **`journey_full.rs`**, **`journey_tasks_runs.rs`**, **`journey_extended.rs`**, **`journey_branches_matrix.rs`**, **`journey_delegate_http_matrix.rs`**, **`journey_admin_smoke_matrix.rs`**, and other `journey_*.rs` files. `Cargo.toml` names the test target `system_matrix_http_e2e` and enables `bridge-e2e-hooks`.
+**Layout (system E2E plan):** the integration binary is `crates/runtime/tests/system_matrix_http_e2e/main.rs` with shared **`harness.rs`** (env gate, HTTP, `sqlx`, `bootstrap`) and journey modules such as **`journey_full.rs`**, **`journey_tasks_runs.rs`**, **`journey_extended.rs`**, **`journey_branches_matrix.rs`**, **`journey_delegate_http_matrix.rs`**, **`journey_admin_smoke_matrix.rs`**, and other `journey_*.rs` files. Every active chat admission in this matrix uses one server-owned `POST /chat/stream` loop; edge callbacks are correlated back to that run. `Cargo.toml` names the test target `system_matrix_http_e2e` and enables `bridge-e2e-hooks`.
 
 ## How to run
 
 ```bash
 ASTRA_TEST_DB_IT=1 \
 ASTRA_TEST_BRIDGE_SECRET=system-matrix-e2e-secret \
+ASTRA_BACKEND_SERVICE_KEY=test-service-key-e2e \
+ASTRA_LLM_RETRY_BASE_MS=10 ASTRA_DEFAULT_RETRY_AFTER_MS=10 ASTRA_BCRYPT_COST=4 \
+RUST_MIN_STACK=16777216 \
 cargo test -p astra-runtime --test system_matrix_http_e2e --features bridge-e2e-hooks -- \
   --ignored --nocapture
 ```
@@ -20,7 +23,10 @@ Requires the same environment as `astra-server`: `MATRIXONE_*`, `ASTRA_JWT_SECRE
 | Variable | Role | Notes |
 |----------|------|--------|
 | `ASTRA_TEST_DB_IT` | **Gate** | Must be `1` or ignored tests panic in `require_system_e2e_env` |
-| `ASTRA_TEST_BRIDGE_SECRET` | `/chat/turn` E2E | Injected before parallel runs; must match bridge hook expectations in full journey |
+| `ASTRA_TEST_BRIDGE_SECRET` | Legacy mock-inference hook | Injected before tests that use `context.test_llm_rounds`; this is not route authorization |
+| `ASTRA_BACKEND_SERVICE_KEY` | Service-edge fixture | Non-empty test-only key for `/service/edges/status` authentication coverage |
+| `ASTRA_LLM_RETRY_BASE_MS`, `ASTRA_DEFAULT_RETRY_AFTER_MS`, `ASTRA_BCRYPT_COST` | Deterministic test timing | Runner-owned low-latency values; the E2E harness never changes process environment |
+| `RUST_MIN_STACK` | Tokio test worker stack | Set to `16777216` so the E2E runtime matches Astra's production process runtime |
 | `MATRIXONE_HOST` | DB | Default `localhost` |
 | `MATRIXONE_PORT` | DB | Default `6001` |
 | `MATRIXONE_USER` | DB | Default `root` |
@@ -30,7 +36,7 @@ Requires the same environment as `astra-server`: `MATRIXONE_*`, `ASTRA_JWT_SECRE
 | `ASTRA_JWT_SECRET` | Auth tokens | Default dev string if unset (not for production) |
 | `ASTRA_TOKEN_ENCRYPTION_KEY` | Token encryption | Default dev string if unset |
 | `MEMORIA_EMBEDDING_*` | Embeddings config | `MEMORIA_EMBEDDING_DIM` may be required for unknown models |
-| `ASTRA_BRIDGE_SECRET` | Bridge | Default dev string; align with deployment if using real bridge |
+| `ASTRA_BRIDGE_SECRET` | Legacy bridge integration | Only needed by separate legacy bridge/journal coverage, not by the server-owned stream route |
 | `ASTRA_TEST_DB_IT_TEST_THREADS` | Makefile only | Set to `1` to run `system_matrix_http_e2e` with `--test-threads=1` (serial) |
 
 Evaluation **read** routes in the full journey use `x-user-id` without bearer (see `journey_full`). Other authenticated calls use the JWT from `bootstrap`.
@@ -43,24 +49,20 @@ Ignored tests in `system_matrix_http_e2e` avoid overlap with the full journey (e
 
 | Test name | File / module | Scope |
 |-----------|---------------|-------|
-| `product_matrix_api_journey_hits_multiple_tables` | `journey_full.rs` | Full journey: sessions (list/get/put, close/resume, activity, **platform snapshot**), agents, events, context, decisions, memory proxy, edge, jobs, sandbox, triggers, skills, introspection, reflect/decision-trace, evaluation reads, marketplace probe, `chat/turn` SSE + `agent_events`, audit/replay, logout |
-| `e2e_matrix_tasks_lease_and_db_assertions` | `journey_tasks_runs.rs` | `POST /tasks`, `GET /tasks`, `GET /tasks/{id}`, `GET .../progress`, `agent_tasks`; edge register; lease claim / `GET` lease / renew / release; `task_leases`; `PUT /tasks/{id}/status` |
+| `product_matrix_api_journey_hits_multiple_tables` | `journey_full.rs` | Full journey: sessions (list/get/put, close/resume, activity, **platform snapshot**), agents, events, context, decisions, memory proxy, edge, jobs, sandbox, triggers, skills, introspection, reflect/decision-trace, evaluation reads, marketplace probe, server-owned `chat/stream` SSE + `agent_events`, audit/replay fail-closed guardrail, logout |
 | `e2e_matrix_chat_run_pause_resume_http` | `journey_tasks_runs.rs` | `POST /chat` (background run), `POST .../pause`, `GET /chat/runs/{id}`, `POST .../resume` |
 | `e2e_matrix_session_cancel_delete` | `journey_extended.rs` | `POST /sessions/{id}/cancel` + `agent_sessions.status`, `DELETE /sessions/{id}` |
 | `e2e_matrix_chat_stream_session_info` | `journey_extended.rs` | `POST /chat/stream` SSE → `session_info` + `run_id` |
-| `e2e_matrix_cli_bridge_session_views_remain_consistent` | `journey_bridge_session_state.rs` | Real MatrixOne + mock LLM: one human `/chat/turn` and one runtime reconciliation; cross-check `agent_events`, `agent_sessions.event_count`, events API, audit summary/turns, and root transcript with exact content/token/role assertions |
 | `e2e_matrix_approval_respond_invalid_session_id` | `journey_extended.rs` | `POST /approval/respond` with an unsafe `session_id`; assert `400` rejects invalid journal path components |
 | `e2e_matrix_edge_callback_http_boundary_failures` | `journey_extended.rs` | `POST /tools/result` and `/approval/respond` without auth or with malformed payloads; assert auth/client errors at the HTTP boundary |
-| `e2e_matrix_duplicate_tool_result_idempotency` | `journey_extended.rs` | Start `POST /chat/turn`, then `POST /tools/result` twice for the same `request_id`; assert the initial SSE handoff still emits one `tool_request` and ends with `has_tool_calls=true` |
+| `e2e_matrix_duplicate_tool_result_idempotency` | `journey_extended.rs` | Start one server-owned `POST /chat/stream`, then `POST /tools/result` twice for the same `request_id`; assert one request, one durable result, final model text, and exactly one terminal with `continuation_owner=server` |
 | `e2e_matrix_duplicate_approval_response_idempotency` | `journey_extended.rs` | `POST /approval/respond` twice for the same `request_id` + `session_id`; assert one persisted `approval_decision` in the session journal |
-| `e2e_matrix_chat_turn_partial_batch_failure` | `journey_extended.rs` | Start one `POST /chat/turn` round that emits two `tool_request`s; reply with one success and one failure, then assert the initial SSE handoff still ends with `has_tool_calls=true` |
-| `e2e_matrix_chat_turn_out_of_order_tool_results` | `journey_extended.rs` | Start one `POST /chat/turn` round that emits two `tool_request`s; send the second callback result before the first and assert the initial SSE handoff still ends with `has_tool_calls=true` |
-| `e2e_matrix_same_session_concurrent_turns_isolated` | `journey_extended.rs` | Launch two concurrent `POST /chat/turn` requests against the same session; assert both SSE responses complete and persisted `llm_response` rows keep distinct `event_id` / `causal_chain_id` values |
-| `e2e_matrix_same_session_waiting_turn_overlap_isolated` | `journey_extended.rs` | Start one same-session tool-backed `POST /chat/turn`, finish a second same-session plain turn while the first is still in handoff, then assert the two SSE streams do not leak each other’s content |
+| `e2e_matrix_server_stream_partial_batch_failure` | `journey_extended.rs` | Start one server-owned stream that emits two `tool_request`s; reply with one success and one failure, then assert the same stream reaches final model text and exactly one server terminal |
+| `e2e_matrix_server_stream_out_of_order_tool_results` | `journey_extended.rs` | Start one server-owned stream that emits two callbacks; send the second result before the first, assert request-identity correlation, one durable effect per callback, final model text, and one server terminal |
 | `e2e_matrix_auth_session_negative_paths` | `journey_extended.rs` | `GET /sessions` without auth (401); duplicate register + bad login + successful login after negative calls |
 | `e2e_matrix_memory_proxy_user_isolation` | `journey_extended.rs` | Unauthenticated `POST /memory/store` (401); spoofed `user_id`/`session_id` in body → forwarder receives JWT `user_id` for both fields |
 | `e2e_matrix_models_admin_crud` | `journey_extended.rs` | SQL `astra_admin` role grant + `POST/PUT/DELETE /models` with DB checks |
-| `e2e_matrix_audit_cross_session_analytics_http` | `journey_audit_cross_session.rs` | Seed `agent_sessions` / `agent_events` / `ctx_decision_audits`; `GET /audit/stats`, `GET /audit/mutations`, `GET /audit/promotions` JSON assertions |
+| `e2e_matrix_saas_events_and_audit_cross_user_isolation` | `journey_saas_platform_matrix.rs` | Foreign-user `GET /events`, session audit, and activity return 404; filtered global events do not leak the foreign session |
 | `e2e_matrix_team_crud_and_db` | `journey_team_crud_matrix.rs` | Team CRUD + upsert via second `POST /teams`, empty `GET .../executions`, SQL `team_definitions` |
 | `e2e_matrix_team_snapshots_and_db` | `journey_team_snapshots_matrix.rs` | `POST/GET .../snapshots`, `DELETE /teams/snapshots/{id}`, SQL `team_snapshots` |
 | `e2e_matrix_team_http_negative_paths` | `journey_team_http_negatives_matrix.rs` | Auth 401, GET/DELETE 404, validation 400 (empty members, duplicate roles, bad budget, adversarial size) |
@@ -70,12 +72,12 @@ Ignored tests in `system_matrix_http_e2e` avoid overlap with the full journey (e
 | `e2e_matrix_session_http_db` | `journey_session_http_db_matrix.rs` | `GET`/`PUT /sessions/{id}` vs `agent_sessions` (`title`, `user_id`) |
 | `e2e_matrix_evaluation_reads` | `journey_evaluation_reads_matrix.rs` | Evaluation GET smoke (`x-user-id`), seed agent for trust/SLO/observability |
 | `e2e_matrix_context_decision_chain` | `journey_context_decision_chain_matrix.rs` | Event → context → decision chain + `ctx_snapshots` / `ctx_decision_audits` SQL |
-| `e2e_matrix_models` | `journey_models_matrix.rs` | `GET /models`, `GET /model-access` |
+| `e2e_matrix_models` | `journey_models_matrix.rs` | paginated `GET /models` + cursor continuation, global-count `GET /model-access`, stable revision/default semantics |
 | `e2e_matrix_branches_cost_estimate_http` | `journey_branches_matrix.rs` | `POST /branches/cost-estimate` (+ 401 without auth); no DDL branch/create |
 | `e2e_matrix_delegate_http_boundaries` | `journey_delegate_http_matrix.rs` | `POST /chat` → `run_id`; `GET /chat/runs/{id}/delegations`; `POST .../delegate` validation `400` |
-| `e2e_matrix_admin_tokens_smoke` | `journey_admin_smoke_matrix.rs` | `GET /admin/tokens`: `403` → grant `astra_admin` → `200` JSON array |
+| `e2e_matrix_saas_admin_tokens_rbac_smoke` | `journey_saas_platform_matrix.rs` | `GET /admin/tokens`: `403` → grant `astra_admin` → `200` JSON array |
 
-Shared helpers: `tests/system_matrix_http_e2e/harness.rs` (`bootstrap`, `grant_astra_admin_role`, `revoke_astra_admin_role`, HTTP helpers, `cleanup_*`, row getters, SSE helpers, `wait_for_agent_event_types` — polls `agent_events` after `chat/turn` instead of a fixed sleep).
+Shared helpers: `tests/system_matrix_http_e2e/harness.rs` (`bootstrap`, `grant_astra_admin_role`, `revoke_astra_admin_role`, HTTP helpers, `cleanup_*`, row getters, SSE helpers, `wait_for_agent_event_types` — polls `agent_events` after server-owned `chat/stream` instead of a fixed sleep).
 
 ## Database isolation
 
@@ -93,14 +95,14 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 | Meta | P0 | `GET /health`, `GET /` | — | `product_matrix_*`, `e2e_matrix_meta_health` |
 | Auth | P0 | `/auth/register`, `/login`, `/refresh`, `/me`, `/logout` | `auth_users` | Every test uses `bootstrap` (register/login); `product_matrix_*` also hits `/auth/refresh` and `/logout` |
 | Sessions | P0 | `/sessions`, `.../close`, `.../resume`, `.../cancel`, `DELETE ...`, `.../activity` | `agent_sessions` | `product_matrix_*` + `e2e_matrix_session_cancel_delete` + `e2e_matrix_session_http_db` |
-| Session audit | P0 | `/sessions/{id}/audit/*`, `/audit/*` | `agent_events` + HTTP cross-check | `product_matrix_*`; `e2e_matrix_cli_bridge_session_views_remain_consistent` (summary/turn counts and token totals); `e2e_matrix_audit_cross_session_analytics_http` (`/audit/stats`, `/audit/mutations`, `/audit/promotions` + DB seed) |
+| Session audit | P0 | `/sessions/{id}/audit/*`, `/audit/*` | `agent_events` + HTTP cross-check | `product_matrix_*` (summary/turn counts and token totals); `e2e_matrix_saas_events_and_audit_cross_user_isolation` (foreign-user events/audit/activity isolation) |
 | Agents | P0 | `/agents` CRUD | `agent_agents` | `product_matrix_*` |
 | Models | P1 | `GET /models`, admin `POST/PUT/DELETE /models` | `infra_llm_models` | `product_matrix_*` (list), `e2e_matrix_models` (list/access); `e2e_matrix_models_admin_crud` (admin CRUD + DB) |
 | Events | P0 | `/events`, causal chain, session events | `agent_events` | `product_matrix_*` |
 | Context | P0 | `/context` | `ctx_snapshots` | `product_matrix_*`, `e2e_matrix_context_decision_chain` |
 | Decisions | P0 | `/decisions`, audit | `ctx_decision_audits` | `product_matrix_*`, `e2e_matrix_context_decision_chain` |
 | Memory proxy | P1 | `/memory/*` | Memoria stub calls | `product_matrix_*` |
-| Edge §5.5 | P0 | `/agents/edge`, `/tools/result`, `/approval/respond` | `edge_agent_registry` | `product_matrix_*`, tasks lease (edge register), `e2e_matrix_approval_respond_invalid_session_id`, `e2e_matrix_edge_callback_http_boundary_failures`, `e2e_matrix_duplicate_tool_result_idempotency`, `e2e_matrix_duplicate_approval_response_idempotency` |
+| Edge §5.5 | P0 | `/agents/edge`, `/tools/result`, `/approval/respond` | `edge_agent_registry`, durable run events | `product_matrix_*`, `e2e_matrix_approval_respond_invalid_session_id`, `e2e_matrix_edge_callback_http_boundary_failures`, `e2e_matrix_saas_edge_tool_result_success_path`, duplicate/mixed/out-of-order server-stream callback journeys, `e2e_matrix_duplicate_approval_response_idempotency`; legacy Task Lease claim/renew/release routes are not registered by runtime, so no live E2E is claimed |
 | Jobs | P1 | `/jobs`, `/jobs/webhook` | service persistence | `product_matrix_*` |
 | Sandbox | P1 | `/sandbox` | `infra_sandbox_metadata` | `product_matrix_*` |
 | Triggers | P1 | `/triggers`, fire, delete | `wf_triggers` | `product_matrix_*` |
@@ -108,15 +110,14 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 | Evaluation | P1 | `/evaluation/*` reads | — | `product_matrix_*`, `e2e_matrix_evaluation_reads` |
 | Evaluation (writes) | P1 | `POST` gate/validate, drift/run, loop | — | — (no system E2E; add when implementations return success) |
 | Marketplace | P1 | quality report, stats, search | marketplace stats tables | `product_matrix_*` |
-| Chat turn (SSE) | P0 | `POST /chat/turn` + bridge secret | `agent_events`, `session_transcript_items`, audit/session projections | `product_matrix_*`, `e2e_matrix_cli_bridge_session_views_remain_consistent`, `e2e_matrix_edge_callback_http_boundary_failures`, `e2e_matrix_duplicate_tool_result_idempotency`, `e2e_matrix_duplicate_approval_response_idempotency`, `e2e_matrix_chat_turn_partial_batch_failure`, `e2e_matrix_chat_turn_out_of_order_tool_results`, `e2e_matrix_same_session_concurrent_turns_isolated`, `e2e_matrix_same_session_waiting_turn_overlap_isolated` |
+| Chat (server-owned SSE) | P0 | `POST /chat/stream` | `agent_events`, `session_transcript_items`, audit/session projections | `product_matrix_*`, `e2e_matrix_chat_stream_session_info`, `e2e_matrix_edge_callback_http_boundary_failures`, `e2e_matrix_saas_edge_tool_result_success_path`, duplicate/mixed/out-of-order callback journeys |
 | Chat / runs | P0 | `POST /chat`, `/chat/stream`, `/chat/runs/*` | **In-memory** run store in `build_server_state` (not Matrix table today) | `e2e_matrix_chat_run_pause_resume_http`, `e2e_matrix_chat_stream_session_info` |
-| Tasks | P0 | `/tasks`, `GET` list/get/progress, `/tasks/{id}/lease/*`, `.../status` | `agent_tasks`, `task_leases` | `e2e_matrix_tasks_lease_and_db_assertions` |
 | Platform | P1 | `GET /platform/snapshot` | — | `product_matrix_*` |
 | Workflows | P1 | `GET /workflows` | — | `product_matrix_*` |
 | Data versioning | P1 | lineage GETs | — | `product_matrix_*` |
-| Replay | P1 | `/sessions/{id}/replay/compare` | — | `product_matrix_*` |
+| Replay | P1 | `/sessions/{id}/replay` + `/sessions/{id}/replay/compare` | No replay rows or summary mutation; owned 501 / foreign or missing 404 | `product_matrix_*` + `e2e_matrix_saas_session_replay_*_unavailable_guardrail` |
 | Branches | P1 | `/branches/cost-estimate` (HTTP; no DDL in this journey) | — | `e2e_matrix_branches_cost_estimate_http` |
-| Admin | P1 | `GET /admin/tokens` | — | `e2e_matrix_admin_tokens_smoke` |
+| Admin | P1 | `GET /admin/tokens` | — | `e2e_matrix_saas_admin_tokens_rbac_smoke` |
 | WebSocket | — | `/chat/ws` | — | — |
 | Delegation | P1 | `GET .../delegations`, `POST .../delegate` (validation-only path) | **In-memory** tracker | `e2e_matrix_delegate_http_boundaries` |
 | Team | P1 | `/teams`, `/teams/{name}`, `/teams/{name}/executions`, `/teams/.../snapshots` (+ HTTP negatives, DB fidelity, user isolation) | `team_definitions`, `team_snapshots` | `e2e_matrix_team_crud_and_db`, `e2e_matrix_team_snapshots_and_db`, `e2e_matrix_team_http_negative_paths`, `e2e_matrix_team_http_db_fidelity`, `e2e_matrix_team_cross_user_isolation`; **`POST .../execute`** stays offline (**`team_execute_http_integration`**, mock `SubRunExecutor`) |
@@ -124,7 +125,7 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 ## CI
 
 - **PR** (`.github/workflows/test.yml`): MatrixOne + Redis service containers; single `make test` step with `ASTRA_TEST_DB_IT`, `ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS`, and `ASTRA_TEST_DB_IT` set for ignored **`system_matrix_http_e2e`** and **`multi_agent_integration`**. See also [`coverage-matrix.md`](./coverage-matrix.md).
-- **Manual / nightly**: `.github/workflows/e2e-matrix-nightly.yml` — `workflow_dispatch` with optional **test name filter** (substring) to run a subset (e.g. `e2e_matrix_tasks`) or leave empty for all ignored tests in the binary.
+- **Manual / nightly**: `.github/workflows/e2e-matrix-nightly.yml` — `workflow_dispatch` with optional **test name filter** (substring) to run a subset (e.g. `e2e_matrix_chat_run_pause_resume_http`) or leave empty for all ignored tests in the binary.
 
 ## Router groups alignment
 
@@ -133,9 +134,9 @@ Same prefixes as [`router_builder` `all_api_groups_have_routes`](../../crates/ru
 | Group (`router_builder`) | Prefix | System E2E | Notes |
 |--------------------------|--------|------------|--------|
 | auth | `/auth/` | Yes | `auth_users` in bootstrap / `product_matrix_*` |
-| chat | `/chat` | Partial | `/chat/turn` + SSE + `agent_events` in `product_matrix_*`, plus callback HTTP-boundary failures in `e2e_matrix_edge_callback_http_boundary_failures`, duplicate callback handoff coverage in `e2e_matrix_duplicate_tool_result_idempotency` / `e2e_matrix_duplicate_approval_response_idempotency`, mixed-success handoff coverage in `e2e_matrix_chat_turn_partial_batch_failure`, out-of-order callback handoff coverage in `e2e_matrix_chat_turn_out_of_order_tool_results`, concurrent same-session isolation in `e2e_matrix_same_session_concurrent_turns_isolated`, and waiting-turn overlap isolation in `e2e_matrix_same_session_waiting_turn_overlap_isolated`; `POST /chat` + run pause/resume in `e2e_matrix_chat_run_pause_resume_http`; `/chat/stream` smoke in `e2e_matrix_chat_stream_session_info`; delegation list + `POST .../delegate` validation boundary in `e2e_matrix_delegate_http_boundaries`; no `/chat/ws` E2E |
+| chat | `/chat` | Partial | Server-owned `/chat/stream` SSE + `agent_events` in `product_matrix_*`, callback HTTP-boundary and duplicate/mixed/out-of-order callback journeys, SaaS success-path correlation, `POST /chat` + run pause/resume in `e2e_matrix_chat_run_pause_resume_http`, and delegation list + `POST .../delegate` validation boundary in `e2e_matrix_delegate_http_boundaries`; no `/chat/ws` E2E |
 | sessions | `/sessions` | Yes | CRUD/close/resume/activity + DB |
-| admin | `/admin/` | Partial | `GET /admin/tokens` smoke in `e2e_matrix_admin_tokens_smoke` |
+| admin | `/admin/` | Partial | `GET /admin/tokens` smoke in `e2e_matrix_saas_admin_tokens_rbac_smoke` |
 | agents | `/agents` | Yes | Includes edge register path |
 | events | `/events` | Yes | |
 | skills | `/skills` | Partial | List/status; not publish/config/resources E2E |
@@ -147,10 +148,18 @@ Same prefixes as [`router_builder` `all_api_groups_have_routes`](../../crates/ru
 | workflows | `/workflows` | Partial | `GET /workflows` only |
 | platform | `/platform/` | Partial | `GET /platform/snapshot` in `product_matrix_*` |
 | runs | `/runs` | Partial | List in `product_matrix_*`; lifecycle in `e2e_matrix_chat_run_pause_resume_http` |
-| tasks | `/tasks` | Yes | `e2e_matrix_tasks_lease_and_db_assertions` |
 | teams | `/teams` | Partial | CRUD + snapshots + negatives + `team_definitions` / `team_snapshots` in `e2e_matrix_team_*`; `POST .../execute` still covered only in offline `team_execute_http_integration` (mock executor) — not in system E2E |
 
-Additional route families in `router_builder` not named above: **memory** (`/memory/*`), **context** (`/context`), **decisions** (`/decisions`), **models** (`/models`), **jobs** (`/jobs`), **triggers** (`/triggers`), **data-versioning** (`/data-versioning`), **replay** (`/sessions/.../replay`), **reflect** (`/chat/session/.../reflect`), **completions** (`/v1/chat/completions`) — see the P0/P1 table above for E2E status.
+Additional route families in `router_builder` not named above: **memory** (`/memory/*`), **context** (`/context`), **decisions** (`/decisions`), **models** (`/models`), **jobs** (`/jobs`), **triggers** (`/triggers`), **data-versioning** (`/data-versioning`), **replay guardrails** (`/sessions/.../replay`), **reflect** (`/chat/session/.../reflect`), **completions** (`/v1/chat/completions`) — see the P0/P1 table above for E2E status.
+
+## Explicit coverage gaps
+
+- Client-disconnect behavior for streamed tool-call artifacts is intentionally
+  not registered in this matrix; the retained `server_loop_*` artifact tests
+  cover block-parse, transport, idle-timeout, and rate-limit outcomes only.
+- Malformed streamed tool-call artifact handling is not registered here. Keep
+  that provider/parser contract in focused server-loop tests until a stable
+  streamed fixture can prove durable partial state without a second admission.
 
 ## Future work
 

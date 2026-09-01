@@ -39,7 +39,9 @@ pub(crate) struct EdgeBoundExecutionPlan {
 
 impl EdgeBoundExecutionPlan {
     const DEFAULT_TIMEOUT_SECS: u64 = 300;
-    const WAIT_GRACE_SECS: u64 = 10;
+    const MIN_TIMEOUT_SECS: u64 = 1;
+    const MAX_TIMEOUT_SECS: u64 = astra_server_types::MAX_EDGE_TOOL_TIMEOUT_SECS;
+    const WAIT_GRACE_SECS: u64 = astra_server_types::EDGE_TOOL_RESULT_GRACE_SECS;
 
     pub(crate) fn try_from_request_with_binding(
         request: &ToolExecutionRequest,
@@ -121,6 +123,12 @@ impl EdgeBoundExecutionPlan {
         Duration::from_secs(self.timeout_secs.saturating_add(Self::WAIT_GRACE_SECS))
     }
 
+    /// Deadline sent to the edge executor.  Keep this distinct from the
+    /// server-side wait grace so every layer agrees on the execution window.
+    pub(crate) fn execution_timeout_secs(&self) -> u64 {
+        self.timeout_secs
+    }
+
     fn dispatch_message(&self) -> astra_server_types::edge_ws_protocol::EdgeServerMessage {
         astra_server_types::edge_ws_protocol::EdgeServerMessage::ToolRequest {
             request_id: self.dispatch_request_id.clone(),
@@ -168,7 +176,10 @@ fn timeout_secs_from_policy(binding: &astra_runtime_env::RunBinding) -> Option<u
     if !seconds.is_finite() {
         return None;
     }
-    Some(seconds.max(0.0).ceil().min(u64::MAX as f64) as u64)
+    Some((seconds.ceil().min(u64::MAX as f64) as u64).clamp(
+        EdgeBoundExecutionPlan::MIN_TIMEOUT_SECS,
+        EdgeBoundExecutionPlan::MAX_TIMEOUT_SECS,
+    ))
 }
 
 pub(crate) fn edge_executor_id(request: &ToolExecutionRequest) -> Option<&str> {

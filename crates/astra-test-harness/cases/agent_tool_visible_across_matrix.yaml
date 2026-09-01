@@ -1,9 +1,10 @@
 name: agent_tool_visible_across_matrix
 description: |
-  **What**: Run agent across three different model families (DeepSeek, Anthropic, MiniMax) and verify all can discover and use it.
-  **Tests**: Cross-model tool surface visibility — `agent` (formerly spawn_agent) must be visible regardless of model family.
-  **Why**: G3 regression for a bug where spawn_agent had no surface entry, making it invisible to some models; the fix must work across all families.
-  **Pass means**: All three model families discovered the agent tool and used it, proving the surface contract is universal.
+  **What**: Run the canonical agent surface and verify the selected model can discover and use it.
+  **Tests**: Agent tool visibility plus lossless child-result transport.
+  **Why**: G3 regression for a bug where the agent tool had no surface entry, making it invisible to some models; the fix must work across all families.
+  **Pass means**: The selected model discovers the agent tool, receives a completed child
+  result, and surfaces the marker; child punctuation remains provider data.
   **Fail means**: Tool surface regression — `agent` is hidden from one or more model families.
 prompt: |
   Use the `agent` tool with action `spawn` to start one foreground child:
@@ -17,11 +18,29 @@ models:
   - us.anthropic.claude-sonnet-4-6
   - MiniMax-M2.7
 timeout_seconds: 180
+debug_log: true
 criteria:
   - type: exit_code
     code: 0
   - type: tool_called
     name: agent
+  - type: journal_tool_call_count
+    name: agent
+    min: 1
+    max: 1
+    document: arguments
+    path: /action
+    equals: spawn
+  - type: journal_tool_json
+    name: agent
+    document: result
+    path: /status
+    equals: completed
+  - type: journal_tool_json_contains
+    name: agent
+    document: result
+    path: /result
+    contains: G3-matrix-ok
   - type: tools_count_between
     min: 1
     max: 4

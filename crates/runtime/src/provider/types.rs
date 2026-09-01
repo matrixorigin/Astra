@@ -88,7 +88,6 @@ impl ToolCategory {
             | "compress_context"
             | "memory"
             | "session"
-            | "task_board"
             | "mo_query"
             | "rollback_database_snapshots"
             | "rollback_session_state" => Some(Self::StateManagement),
@@ -136,15 +135,12 @@ mod tests {
             ToolCategory::for_tool_name("ask_user"),
             Some(ToolCategory::StateManagement)
         );
-        assert_eq!(
-            ToolCategory::for_tool_name("task_board"),
-            Some(ToolCategory::StateManagement)
-        );
+        assert_eq!(ToolCategory::for_tool_name("task_board"), None);
         for local_background_tool in ["task_output", "task_stop", "task_list"] {
             assert_eq!(
                 ToolCategory::for_tool_name(local_background_tool),
                 Some(ToolCategory::BackgroundTaskProcess),
-                "{local_background_tool} must not be confused with the durable task board"
+                "{local_background_tool} must remain execution control, not Work planning"
             );
         }
         assert_eq!(

@@ -30,8 +30,9 @@
 //!   when the host supports it. [`RunScriptConfig::strict_defaults`]
 //!   enables 512 MiB memory + 1 CPU core by default; runaway scripts get
 //!   a SIGKILL from the kernel OOM killer before they exhaust the host.
-//!   Silent fallback on hosts without cgroup v2 write access — the
-//!   script still runs, just without resource ceilings.
+//!   If no invocation-owned process scope can be established, dispatch is
+//!   refused before the child starts; this prevents an unowned descendant
+//!   from changing the bound workspace after the tool result is published.
 //!
 //! **Not enforced here**: filesystem scope beyond HOME, network access,
 //! syscall filtering, PID/mount/network namespaces. The Python script
@@ -53,10 +54,11 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 use crate::ToolExecutor;
 use crate::rpc_bridge::{
-    AuthToken, RpcOutcome, RpcPolicy, STDOUT_HEAD_RATIO, handle_rpc_connection, kill_process_group,
+    AuthToken, RpcOutcome, RpcPolicy, handle_rpc_connection_with_cancel, kill_process_group,
 };
 
 // Re-export only what external callers need. The char-boundary helpers are
@@ -112,6 +114,12 @@ pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 256 * 1_024;
 /// plus a little room for context lines.
 pub const STDERR_CAP_BYTES: usize = 10_000;
 
+/// A descendant that keeps an inherited stdout/stderr pipe open must not be
+/// able to hold the workspace writer forever. Once this bound expires the
+/// invocation is treated as unsettled and the workspace observer remains
+/// quarantined.
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
 // Note: we don't need a secret-substring env filter because we `env_clear()`
 // the child and only set a fixed, hand-curated allowlist (see
 // `build_child_env`). If the allowlist is ever widened to pass-through
@@ -146,8 +154,8 @@ pub struct RunScriptConfig {
     /// HOME available and accept the script can read `~/.ssh/*`, etc.
     pub isolate_home: bool,
     /// cgroup v2 memory ceiling for the script process (bytes). Zero
-    /// means no limit. Silently falls back to no-limit if cgroup v2 is
-    /// unavailable on the host.
+    /// means no resource limit, but an invocation-owned process scope is
+    /// still required before dispatch.
     ///
     /// A runaway `run_script` could allocate until the host OOMs
     /// (especially Project mode, which inherits the user's env). Setting
@@ -191,7 +199,8 @@ impl RunScriptConfig {
     /// - `ExecutionMode::Strict` (no venv inheritance, minimal PATH)
     /// - `isolate_home = true`
     /// - `allowed_tools` = [`RPC_ALLOWED_TOOLS`] minus [`UNSAFE_IN_STRICT`]
-    /// - `memory_limit_bytes` = 512 MiB (cgroup v2, silent fallback if unavailable)
+    /// - `memory_limit_bytes` = 512 MiB (cgroup v2; dispatch fails closed if
+    ///   an invocation-owned scope is unavailable)
     /// - `cpu_quota` = 1.0 (one full core)
     ///
     /// Use this constructor when the script source is not trusted (e.g.
@@ -227,6 +236,9 @@ pub enum RunScriptError {
     #[error("Script timed out after {0:?}")]
     Timeout(Duration),
 
+    #[error("Script cancelled")]
+    Cancelled,
+
     #[error("Script exceeded maximum tool call limit ({0})")]
     TooManyToolCalls(usize),
 
@@ -257,16 +269,32 @@ pub enum RunScriptError {
     /// from script-level failures so callers can route differently.
     #[error("task-join error: {0}")]
     TaskJoin(#[from] tokio::task::JoinError),
+
+    /// The host could not provide an invocation-owned process scope. Running
+    /// a Python script in that state would let a daemonized child outlive the
+    /// workspace writer epoch, so dispatch is rejected before spawn.
+    #[error("run_script requires an invocation-owned process scope; no process was started")]
+    OwnershipUnavailable,
+
+    /// The invocation was started but its process scope could not be proven
+    /// empty at termination. The workspace is quarantined and the result is
+    /// never presented as a successful script completion.
+    #[error("run_script process ownership did not settle; workspace state is unverified")]
+    OwnershipUnsettled,
+
+    #[error("run_script output pipes did not settle within {0:?}")]
+    OutputDrainTimeout(Duration),
 }
 
 /// Build a bounded preview of a stream for error `Display`. Uses the
 /// same UTF-8-safe head+tail truncation the rest of the module uses,
 /// so multi-byte chars at the split point never panic or mangle.
 fn preview_stream(s: &str) -> String {
-    if s.len() <= ERROR_STREAM_PREVIEW_BYTES {
-        s.to_string()
+    let (safe, _) = crate::credential_redaction::redact_credentials_for_display(s);
+    if safe.len() <= ERROR_STREAM_PREVIEW_BYTES {
+        safe
     } else {
-        truncate_head_tail(s, ERROR_STREAM_PREVIEW_BYTES)
+        crate::credential_redaction::truncate_redacted_head_tail(&safe, ERROR_STREAM_PREVIEW_BYTES)
     }
 }
 
@@ -819,6 +847,16 @@ pub async fn run_script(
     config: &RunScriptConfig,
     tool_executor: &dyn ToolExecutor,
 ) -> Result<String, RunScriptError> {
+    run_script_with_cancel(script, config, tool_executor, None).await
+}
+
+async fn run_script_with_cancel(
+    script: &str,
+    config: &RunScriptConfig,
+    tool_executor: &dyn ToolExecutor,
+    cancel_token: Option<&CancellationToken>,
+) -> Result<String, RunScriptError> {
+    let workspace_root = tool_executor.workspace_root().to_path_buf();
     let tmp_dir = tempfile::tempdir().map_err(|e| io_context("run_script tmpdir", e))?;
     let tmp_path = tmp_dir.path().to_path_buf();
 
@@ -877,15 +915,34 @@ pub async fn run_script(
         });
     }
 
-    // Attach cgroup v2 limits before spawn. The guard must stay alive
-    // until the child has exited and been waited on — otherwise Drop
-    // tries to remove a non-empty cgroup directory. Silent fallback when
-    // cgroup v2 is unavailable: the guard is inactive and does nothing.
-    let cgroup_guard = astra_sandbox::apply_cgroup(config.memory_limit_bytes, config.cpu_quota);
+    // Attach one invocation-owned cgroup before spawn. When resource limits
+    // are requested, that cgroup carries them; otherwise use an ownership-only
+    // scope. A single cgroup is intentional: a process can only belong to one
+    // cgroup in this hierarchy, and combining separate resource/ownership
+    // guards would silently leave one of them unenforced. Hosts without cgroup
+    // write access fall back to the private process group established below.
+    let cgroup_guard = if config.memory_limit_bytes > 0 || config.cpu_quota > 0.0 {
+        astra_sandbox::apply_cgroup(config.memory_limit_bytes, config.cpu_quota)
+    } else {
+        astra_sandbox::apply_process_scope()
+    };
+    // A process-group fallback is useful cleanup, but it cannot own a child
+    // that creates a new session.  Refuse to dispatch before spawn when no
+    // delegated scope is available; otherwise a late write could be
+    // attributed to a later Bash window. Ordinary Bash remains available.
+    if !cgroup_guard.ownership_guaranteed() {
+        return Err(RunScriptError::OwnershipUnavailable);
+    }
+    cgroup_guard.attach_child(&mut cmd);
 
     let mut child = cmd
         .spawn()
         .map_err(|e| io_context("run_script spawn python", e))?;
+    // Keep the leader PID after `Child::wait` reaps it. The process group is
+    // still the only available ownership boundary on hosts where cgroup
+    // creation is unavailable, and descendants must be terminated before the
+    // workspace writer epoch is released.
+    let leader_pid = child.id();
 
     // Post-spawn: join child to cgroup by writing its real PID.
     if let Some(pid) = child.id()
@@ -893,35 +950,75 @@ pub async fn run_script(
     {
         let _ = child.kill().await;
         let _ = child.wait().await;
+        settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
         return Err(io_context("cgroup join_child", e).into());
+    }
+    if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+        kill_process_group(&child);
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
+        return Err(RunScriptError::Cancelled);
     }
 
     let stdout = child.stdout.take().expect("stdout piped");
     let max_stdout = config.max_stdout_bytes;
-    let stdout_handle =
+    let mut stdout_handle =
         tokio::spawn(async move { collect_stdout_head_tail(stdout, max_stdout).await });
 
     let stderr = child.stderr.take().expect("stderr piped");
-    let stderr_handle = tokio::spawn(async move { collect_stderr_with_notice(stderr).await });
+    let mut stderr_handle = tokio::spawn(async move { collect_stderr_with_notice(stderr).await });
 
     let policy = config.rpc_policy();
     let timeout_result = tokio::time::timeout(config.timeout, async {
         loop {
             tokio::select! {
+                _ = async {
+                    if let Some(token) = cancel_token {
+                        token.cancelled().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "run_script cancelled",
+                    ));
+                }
                 accept = listener.accept() => {
                     match accept {
                         Ok((stream, _)) => {
-                            let outcome = handle_rpc_connection(
+                            let outcome = handle_rpc_connection_with_cancel(
                                 stream,
                                 tool_executor,
                                 &call_count,
                                 &policy,
                                 &auth_token,
-                            ).await;
+                                cancel_token,
+                            )
+                            .await;
                             if matches!(outcome, RpcOutcome::ExceededCallLimit) {
                                 kill_process_group(&child);
                                 let _ = child.kill().await;
-                                return child.wait().await;
+                                let result = child.wait().await;
+                                let scope_settled = settle_run_script_scope(
+                                    &cgroup_guard,
+                                    leader_pid,
+                                    &workspace_root,
+                                );
+                                return if scope_settled {
+                                    result
+                                } else {
+                                    Err(std::io::Error::other(
+                                        "run_script process ownership did not settle",
+                                    ))
+                                };
+                            }
+                            if matches!(outcome, RpcOutcome::Cancelled) {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::Interrupted,
+                                    "run_script RPC cancelled",
+                                ));
                             }
                             // IoError and Ok both just loop.
                         }
@@ -938,10 +1035,15 @@ pub async fn run_script(
 
     match timeout_result {
         Ok(Ok(status)) => {
-            // Await both IO tasks concurrently so one panicking doesn't leak
-            // the other. try_join! short-circuits on first Err; the
-            // #[from] JoinError impl does the structured wrap.
-            let (stdout_content, stderr_content) = tokio::try_join!(stdout_handle, stderr_handle)?;
+            let scope_settled = settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
+            // Await both IO tasks concurrently, but never let an inherited
+            // pipe from an escaped descendant hold the writer epoch forever.
+            let (stdout_content, stderr_content) =
+                collect_run_script_streams(&mut stdout_handle, &mut stderr_handle).await?;
+
+            if !scope_settled {
+                return Err(RunScriptError::OwnershipUnsettled);
+            }
 
             if !status.success() {
                 let code = status.code().unwrap_or(-1);
@@ -958,18 +1060,67 @@ pub async fn run_script(
             Ok(stdout_content)
         }
         Ok(Err(e)) => {
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
+                let _ = collect_run_script_streams(&mut stdout_handle, &mut stderr_handle).await;
+                return Err(RunScriptError::Cancelled);
+            }
             kill_process_group(&child);
             let _ = child.kill().await;
-            let (_stdout_content, _stderr_content) =
-                tokio::try_join!(stdout_handle, stderr_handle)?;
+            let _ = child.wait().await;
+            settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
+            let _ = collect_run_script_streams(&mut stdout_handle, &mut stderr_handle).await;
             Err(RunScriptError::Io(e))
         }
         Err(_) => {
             kill_process_group(&child);
             let _ = child.kill().await;
-            let (_stdout_content, _stderr_content) =
-                tokio::try_join!(stdout_handle, stderr_handle)?;
+            let _ = child.wait().await;
+            settle_run_script_scope(&cgroup_guard, leader_pid, &workspace_root);
+            let _ = collect_run_script_streams(&mut stdout_handle, &mut stderr_handle).await;
             Err(RunScriptError::Timeout(config.timeout))
+        }
+    }
+}
+
+/// Finish an invocation-owned process scope before the workspace writer epoch
+/// can be released. A scope that cannot be proven empty quarantines future
+/// observations rather than allowing a late descendant write to look like a
+/// later Bash mutation.
+fn settle_run_script_scope(
+    cgroup_guard: &astra_sandbox::CgroupGuard,
+    leader_pid: Option<u32>,
+    workspace_root: &Path,
+) -> bool {
+    let settled = cgroup_guard.terminate_all_for(leader_pid);
+    if !settled {
+        let _ = crate::workspace_observation::mark_workspace_observation_unsettled(workspace_root);
+        tracing::warn!(
+            workspace = %workspace_root.display(),
+            "run_script process ownership was not provably settled; workspace observation quarantined"
+        );
+    }
+    settled
+}
+
+/// Join stdout/stderr collectors under a hard bound. Borrowing the handles
+/// lets a timeout abort the underlying tasks instead of detaching them.
+async fn collect_run_script_streams(
+    stdout_handle: &mut tokio::task::JoinHandle<String>,
+    stderr_handle: &mut tokio::task::JoinHandle<String>,
+) -> Result<(String, String), RunScriptError> {
+    match tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, async {
+        tokio::try_join!(&mut *stdout_handle, &mut *stderr_handle)
+    })
+    .await
+    {
+        Ok(result) => Ok(result?),
+        Err(_) => {
+            stdout_handle.abort();
+            stderr_handle.abort();
+            Err(RunScriptError::OutputDrainTimeout(OUTPUT_DRAIN_TIMEOUT))
         }
     }
 }
@@ -1030,85 +1181,221 @@ fn build_child_env(
 
 // ─── Stdout collector (head + tail, UTF-8 safe) ───────────────────────────
 
-async fn collect_stdout_head_tail(stdout: tokio::process::ChildStdout, max_bytes: usize) -> String {
-    if max_bytes == 0 {
-        let mut reader = BufReader::new(stdout);
-        let mut sink = [0u8; 4096];
-        let mut total = 0usize;
-        loop {
-            match reader.read(&mut sink).await {
-                Ok(0) => break,
-                Ok(n) => total += n,
-                Err(_) => break,
-            }
+// Keep a bounded safety window beyond the user-visible budget so a credential
+// that straddles the output cap is still seen as a whole before presentation
+// truncation.  The hard ceiling is an availability bound, not a secret
+// pattern: output beyond it is drained but never exposed as a raw tail.
+const CREDENTIAL_SCAN_OVERHEAD_BYTES: usize = 128 * 1024;
+const MAX_SAFE_STREAM_CAPTURE_BYTES: usize = 4 * 1024 * 1024;
+const PEM_SCAN_OVERLAP_BYTES: usize = 256;
+const MAX_TRACKED_PEM_HEADERS: usize = 4096;
+
+fn pem_block_is_open_at(
+    headers: &[(usize, usize, String)],
+    ends: &[(usize, usize, String)],
+    offset: usize,
+) -> bool {
+    let mut events = Vec::with_capacity(headers.len() + ends.len());
+    events.extend(
+        headers
+            .iter()
+            .map(|(start, end, kind)| (*start, *end, true, kind.as_str())),
+    );
+    events.extend(
+        ends.iter()
+            .map(|(start, end, kind)| (*start, *end, false, kind.as_str())),
+    );
+    events.sort_by_key(|(start, _end, is_header, _kind)| (*start, !*is_header));
+
+    let mut open: Vec<(&str, usize)> = Vec::new();
+    for (start, end, is_header, kind) in events {
+        if start >= offset {
+            break;
         }
-        return if total > 0 {
-            format!("... [OUTPUT TRUNCATED — {total} bytes omitted out of {total} total] ...")
-        } else {
-            String::new()
-        };
+        if is_header {
+            // A header whose own marker crosses the boundary is itself
+            // incomplete in the retained view, so keep the block open.
+            open.push((kind, end));
+        } else if end <= offset
+            && let Some(index) = open.iter().rposition(|(open_kind, _)| *open_kind == kind)
+        {
+            open.remove(index);
+        }
     }
+    !open.is_empty()
+}
 
-    let head_bytes = (max_bytes as f64 * STDOUT_HEAD_RATIO) as usize;
-    let tail_bytes = max_bytes - head_bytes;
+fn safe_stream_capture_limit(max_bytes: usize) -> usize {
+    max_bytes
+        .saturating_add(CREDENTIAL_SCAN_OVERHEAD_BYTES)
+        .clamp(256 * 1024, MAX_SAFE_STREAM_CAPTURE_BYTES)
+}
 
+async fn collect_stdout_head_tail(stdout: tokio::process::ChildStdout, max_bytes: usize) -> String {
     let mut reader = BufReader::new(stdout);
-    let mut head_buf = Vec::with_capacity(head_bytes.min(8192));
-    let mut tail_ring = Vec::with_capacity(tail_bytes.min(8192));
+    let capture_limit = safe_stream_capture_limit(max_bytes);
+    let head_limit = capture_limit / 2;
+    let tail_limit = capture_limit.saturating_sub(head_limit);
+    let mut head = Vec::with_capacity(head_limit.min(8192));
+    let mut tail = Vec::with_capacity(tail_limit.min(8192));
+    let mut head_full = head_limit == 0;
     let mut total_bytes = 0usize;
-    let mut head_full = head_bytes == 0;
-
+    // Keep only marker positions, never the surrounding stream.  This lets
+    // us distinguish a normal tail from a tail whose omitted prefix may have
+    // contained a PEM BEGIN line, including when the marker crosses a read
+    // chunk boundary.
+    let mut pem_headers: Vec<(usize, usize, String)> = Vec::new();
+    let mut pem_ends: Vec<(usize, usize, String)> = Vec::new();
+    let mut pem_scan_overlap = Vec::new();
     let mut chunk = vec![0u8; 4096];
     loop {
         match reader.read(&mut chunk).await {
             Ok(0) => break,
             Ok(n) => {
-                let mut data = &chunk[..n];
-                total_bytes += n;
-
-                if !head_full {
-                    let remaining = head_bytes - head_buf.len();
-                    if data.len() <= remaining {
-                        head_buf.extend_from_slice(data);
-                        continue;
-                    } else {
-                        head_buf.extend_from_slice(&data[..remaining]);
-                        head_full = true;
-                        data = &data[remaining..];
-                        if data.is_empty() {
-                            continue;
+                let chunk_start = total_bytes;
+                let mut scan = Vec::with_capacity(pem_scan_overlap.len() + n);
+                scan.extend_from_slice(&pem_scan_overlap);
+                scan.extend_from_slice(&chunk[..n]);
+                let scan_base = chunk_start.saturating_sub(pem_scan_overlap.len());
+                for (start, end, kind) in
+                    crate::credential_redaction::private_key_header_markers_bytes(&scan)
+                {
+                    if pem_headers.len() < MAX_TRACKED_PEM_HEADERS {
+                        let absolute = (
+                            scan_base.saturating_add(start),
+                            scan_base.saturating_add(end),
+                            kind,
+                        );
+                        if pem_headers.last().map(|item| item.0) != Some(absolute.0) {
+                            pem_headers.push(absolute);
                         }
                     }
                 }
-
-                tail_ring.extend_from_slice(data);
-                if tail_ring.len() > tail_bytes {
-                    let excess = tail_ring.len() - tail_bytes;
-                    tail_ring.drain(..excess);
+                for (start, end, kind) in
+                    crate::credential_redaction::private_key_end_markers_bytes(&scan)
+                {
+                    if pem_ends.len() < MAX_TRACKED_PEM_HEADERS {
+                        let absolute = (
+                            scan_base.saturating_add(start),
+                            scan_base.saturating_add(end),
+                            kind,
+                        );
+                        if pem_ends.last().map(|item| item.0) != Some(absolute.0) {
+                            pem_ends.push(absolute);
+                        }
+                    }
+                }
+                if n >= PEM_SCAN_OVERLAP_BYTES {
+                    pem_scan_overlap.clear();
+                    pem_scan_overlap
+                        .extend_from_slice(&chunk[n.saturating_sub(PEM_SCAN_OVERLAP_BYTES)..n]);
+                } else {
+                    let keep = PEM_SCAN_OVERLAP_BYTES.saturating_sub(n);
+                    let start = pem_scan_overlap.len().saturating_sub(keep);
+                    let mut next = pem_scan_overlap[start..].to_vec();
+                    next.extend_from_slice(&chunk[..n]);
+                    pem_scan_overlap = next;
+                }
+                total_bytes += n;
+                let mut remainder = &chunk[..n];
+                if !head_full {
+                    let remaining = head_limit.saturating_sub(head.len());
+                    let take = remaining.min(remainder.len());
+                    head.extend_from_slice(&remainder[..take]);
+                    remainder = &remainder[take..];
+                    head_full = head.len() >= head_limit;
+                }
+                if !remainder.is_empty() && tail_limit > 0 {
+                    tail.extend_from_slice(remainder);
+                    if tail.len() > tail_limit {
+                        let excess = tail.len() - tail_limit;
+                        tail.drain(..excess);
+                    }
                 }
             }
             Err(_) => break,
         }
     }
 
-    let head = String::from_utf8_lossy(&head_buf).into_owned();
-    let tail = String::from_utf8_lossy(&tail_ring).into_owned();
-
-    if total_bytes > max_bytes && !tail.is_empty() {
-        let omitted = total_bytes.saturating_sub(head.len() + tail.len());
-        format!(
-            "{head}\n\n... [OUTPUT TRUNCATED — {omitted} bytes omitted out of {total_bytes} total] ...\n\n{tail}"
-        )
-    } else {
-        format!("{head}{tail}")
+    if total_bytes == 0 {
+        return String::new();
     }
+
+    // When the stream was capped, do not publish an incomplete boundary line:
+    // a credential split at that boundary would no longer match the complete
+    // source pattern.  The actual final stderr/diagnostic stream is retained
+    // independently; stdout still keeps both useful head and tail context.
+    let (safe, _) = if total_bytes > capture_limit {
+        let head_text = String::from_utf8_lossy(&head);
+        let tail_text = String::from_utf8_lossy(&tail);
+        let head = complete_head_lines(&head_text);
+        let omitted_start = head_limit;
+        let omitted_end = total_bytes.saturating_sub(tail_limit);
+        let omitted_pem_header = pem_headers.len() >= MAX_TRACKED_PEM_HEADERS
+            || pem_block_is_open_at(&pem_headers, &pem_ends, omitted_end)
+            || pem_headers.iter().any(|(start, header_end, kind)| {
+                // Retain the conservative intersection check for malformed
+                // event streams: a header crossing the omitted boundary must
+                // never make the tail look independently trustworthy.
+                *start < omitted_end
+                    && *header_end > omitted_start
+                    && !pem_ends.iter().any(|(end_start, end_end, end_kind)| {
+                        *end_start >= *header_end && *end_end <= omitted_end && end_kind == kind
+                    })
+            });
+        if omitted_pem_header {
+            // The block begins in the omitted middle, so the captured tail
+            // has no trustworthy context for deciding where key material
+            // ends.  Drop it rather than exposing an arbitrary body suffix.
+            let safe_head = crate::credential_redaction::redact_credentials_for_display(head).0;
+            (format!("{safe_head}\n\n[REDACTED:PRIVATE_KEY]"), 0)
+        } else {
+            let tail = complete_tail_lines(&tail_text);
+            // The head starts at byte zero and can use complete-input PEM
+            // semantics. The tail may begin inside an omitted block, so it
+            // gets the explicitly conservative partial-input semantics. Do
+            // not concatenate first: an orphan END in the tail must not make
+            // an unrelated documentation footer in the head disappear.
+            let safe_head = crate::credential_redaction::redact_credentials_for_display(head).0;
+            let safe_tail =
+                crate::credential_redaction::redact_credentials_for_display_partial(tail).0;
+            (format!("{safe_head}\n\n{safe_tail}"), 0)
+        }
+    } else {
+        let mut full = String::from_utf8_lossy(&head).into_owned();
+        full.push_str(&String::from_utf8_lossy(&tail));
+        crate::credential_redaction::redact_credentials_for_display(&full)
+    };
+    // Redact before the user-visible head/tail budget is selected.  The
+    // complete-line boundary above prevents a cross-cap token from becoming
+    // an unrecognisable raw suffix.
+    let mut output = crate::credential_redaction::truncate_redacted_head_tail(&safe, max_bytes);
+    if total_bytes > capture_limit {
+        output.push_str(&format!(
+            "\n\n... [OUTPUT CAPTURE TRUNCATED — {} bytes omitted out of {total_bytes} total] ...",
+            total_bytes.saturating_sub(capture_limit)
+        ));
+    }
+    output
+}
+
+fn complete_head_lines(text: &str) -> &str {
+    text.rfind('\n').map(|index| &text[..=index]).unwrap_or("")
+}
+
+fn complete_tail_lines(text: &str) -> &str {
+    let start = text.find('\n').map(|index| index + 1).unwrap_or(text.len());
+    let text = &text[start..];
+    let end = text.rfind('\n').map(|index| index + 1).unwrap_or(0);
+    &text[..end]
 }
 
 /// Drain stderr, keeping up to `STDERR_CAP_BYTES` and appending a truncation
 /// notice when more was produced. Always fully drains the pipe so the child
 /// never blocks on a full buffer.
 async fn collect_stderr_with_notice(stderr: tokio::process::ChildStderr) -> String {
-    let mut buf: Vec<u8> = Vec::new();
+    let capture_limit = safe_stream_capture_limit(STDERR_CAP_BYTES);
+    let mut buf: Vec<u8> = Vec::with_capacity(capture_limit.min(8192));
     let mut reader = BufReader::new(stderr);
     let mut total = 0usize;
     let mut chunk = vec![0u8; 4096];
@@ -1117,15 +1404,17 @@ async fn collect_stderr_with_notice(stderr: tokio::process::ChildStderr) -> Stri
             Ok(0) => break,
             Ok(n) => {
                 total += n;
-                if buf.len() < STDERR_CAP_BYTES {
-                    let take = (STDERR_CAP_BYTES - buf.len()).min(n);
+                if buf.len() < capture_limit {
+                    let take = (capture_limit - buf.len()).min(n);
                     buf.extend_from_slice(&chunk[..take]);
                 }
             }
             Err(_) => break,
         }
     }
-    let mut out = String::from_utf8_lossy(&buf).into_owned();
+    let (safe, _) =
+        crate::credential_redaction::redact_credentials_for_display(&String::from_utf8_lossy(&buf));
+    let mut out = crate::credential_redaction::truncate_redacted_output(safe, STDERR_CAP_BYTES);
     if total > STDERR_CAP_BYTES {
         let omitted = total.saturating_sub(STDERR_CAP_BYTES);
         // Ensure a blank line before the notice — stderr sometimes lacks a
@@ -1147,6 +1436,15 @@ pub async fn handle_run_script(
     tool_executor: &dyn ToolExecutor,
     config: RunScriptConfig,
 ) -> crate::ToolResult {
+    handle_run_script_with_cancel(args, tool_executor, config, None).await
+}
+
+pub async fn handle_run_script_with_cancel(
+    args: &Value,
+    tool_executor: &dyn ToolExecutor,
+    config: RunScriptConfig,
+    cancel_token: Option<&CancellationToken>,
+) -> crate::ToolResult {
     let script = match args.get("script").and_then(Value::as_str) {
         Some(s) => s,
         None => {
@@ -1159,13 +1457,45 @@ pub async fn handle_run_script(
     let timeout = resolve_timeout(args.get("timeout"), config.timeout);
     let config = RunScriptConfig { timeout, ..config };
 
-    match run_script(script, &config, tool_executor).await {
+    if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+        return crate::cancelled_tool_result("run_script", false);
+    }
+    match run_script_with_cancel(script, &config, tool_executor, cancel_token).await {
         Ok(output) => {
             if output.is_empty() {
                 crate::ToolResult::text("(script completed with no output)".into())
             } else {
                 crate::ToolResult::text(output)
             }
+        }
+        Err(RunScriptError::Cancelled) => crate::cancelled_tool_result("run_script", true),
+        Err(error @ RunScriptError::OwnershipUnavailable) => {
+            let mut result = crate::ToolResult::error(format!("Error: {error}"));
+            result.metadata = Some(serde_json::Map::from_iter([
+                (
+                    "error_kind".to_string(),
+                    Value::String("ownership_unavailable".to_string()),
+                ),
+                ("execution_started".to_string(), Value::Bool(false)),
+                ("retryable".to_string(), Value::Bool(false)),
+            ]));
+            result
+        }
+        Err(error @ RunScriptError::OwnershipUnsettled) => {
+            let mut result = crate::ToolResult::error(format!("Error: {error}"));
+            result.metadata = Some(serde_json::Map::from_iter([
+                (
+                    "error_kind".to_string(),
+                    Value::String("ownership_unsettled".to_string()),
+                ),
+                ("execution_started".to_string(), Value::Bool(true)),
+                ("retryable".to_string(), Value::Bool(false)),
+                (
+                    "workspace_observation_quarantined".to_string(),
+                    Value::Bool(true),
+                ),
+            ]));
+            result
         }
         Err(e) => crate::ToolResult::error(format!("Error: {e}")),
     }
@@ -1549,6 +1879,109 @@ mod tests {
         } else {
             unreachable!();
         }
+    }
+
+    #[tokio::test]
+    async fn stdout_capture_drops_cross_cap_secret_lines_but_keeps_tail_context() {
+        let secret = "AWS_SECRET_ACCESS_KEY=abcdefghijklmnopqrstuvwxyz0123456789";
+        let script = format!(
+            "dd if=/dev/zero bs=131060 count=1 2>/dev/null; printf '{secret}\\n'; dd if=/dev/zero bs=131100 count=1 2>/dev/null; printf '\\nTAIL_DIAGNOSTIC\\n'"
+        );
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("shell should be available for the bounded collector test");
+        let stdout = child.stdout.take().expect("stdout should be piped");
+        let output = collect_stdout_head_tail(stdout, 64).await;
+        let _ = child.wait().await;
+        assert!(!output.contains(secret));
+        assert!(!output.contains("abcdefghijklmnopqrstuvwxyz0123456789"));
+        assert!(
+            output.contains("TAIL_DIAGNOSTIC"),
+            "tail context was lost: {output:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stdout_capture_does_not_expose_a_pem_body_split_across_cap() {
+        let script = "dd if=/dev/zero bs=131060 count=1 2>/dev/null; printf '%s\\n' '-----BEGIN RSA PRIVATE KEY-----' 'PEM_BODY_SENTINEL' '-----END RSA PRIVATE KEY-----'; dd if=/dev/zero bs=131100 count=1 2>/dev/null; printf '\\nPEM_TAIL_DIAGNOSTIC\\n'";
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("shell should be available for the bounded collector test");
+        let stdout = child.stdout.take().expect("stdout should be piped");
+        let output = collect_stdout_head_tail(stdout, 64).await;
+        let _ = child.wait().await;
+        assert!(!output.contains("PEM_BODY_SENTINEL"));
+        assert!(
+            output.contains("PEM_TAIL_DIAGNOSTIC"),
+            "tail context was lost: {output:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stdout_capture_hides_tail_when_pem_begin_is_in_omitted_middle() {
+        let script = "dd if=/dev/zero bs=180000 count=1 2>/dev/null; printf '%s\\n' '-----BEGIN RSA PRIVATE KEY-----'; dd if=/dev/zero bs=160000 count=1 2>/dev/null; printf '%s\\n' 'PEM_BODY_SENTINEL_MIDDLE'; printf '%s\\n' 'TAIL_AFTER_UNCLOSED_PEM'";
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("shell should be available for the bounded collector test");
+        let stdout = child.stdout.take().expect("stdout should be piped");
+        let output = collect_stdout_head_tail(stdout, 64).await;
+        let _ = child.wait().await;
+        assert!(!output.contains("PEM_BODY_SENTINEL_MIDDLE"), "{output:?}");
+        assert!(!output.contains("TAIL_AFTER_UNCLOSED_PEM"), "{output:?}");
+        assert!(output.contains("PRIVATE_KEY"), "{output:?}");
+    }
+
+    #[tokio::test]
+    async fn stdout_capture_uses_raw_offsets_before_an_invalid_utf8_pem_middle() {
+        let script = "dd if=/dev/zero bs=140000 count=1 2>/dev/null; dd if=/dev/zero bs=40000 count=1 2>/dev/null | tr '\\000' '\\377'; printf '%s\\n' '-----BEGIN RSA PRIVATE KEY-----'; dd if=/dev/zero bs=160000 count=1 2>/dev/null; printf '%s\\n' 'PEM_INVALID_UTF8_BODY_SENTINEL'; printf '%s\\n' 'TAIL_AFTER_UNCLOSED_PEM'";
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("shell should be available for the bounded collector test");
+        let stdout = child.stdout.take().expect("stdout should be piped");
+        let output = collect_stdout_head_tail(stdout, 64).await;
+        let _ = child.wait().await;
+        assert!(
+            !output.contains("PEM_INVALID_UTF8_BODY_SENTINEL"),
+            "{output:?}"
+        );
+        assert!(!output.contains("TAIL_AFTER_UNCLOSED_PEM"), "{output:?}");
+        assert!(output.contains("PRIVATE_KEY"), "{output:?}");
+    }
+
+    #[tokio::test]
+    async fn stdout_capture_hides_tail_when_pem_begins_in_retained_head() {
+        let script = "dd if=/dev/zero bs=131000 count=1 2>/dev/null; printf '%s\\n' '-----BEGIN RSA PRIVATE KEY-----'; dd if=/dev/zero bs=200000 count=1 2>/dev/null; printf '%s\\n' 'PEM_BODY_SENTINEL_AFTER_HEAD'";
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("shell should be available for the bounded collector test");
+        let stdout = child.stdout.take().expect("stdout should be piped");
+        let output = collect_stdout_head_tail(stdout, 64).await;
+        let _ = child.wait().await;
+        assert!(
+            !output.contains("PEM_BODY_SENTINEL_AFTER_HEAD"),
+            "{output:?}"
+        );
+        assert!(output.contains("PRIVATE_KEY"), "{output:?}");
     }
 
     // ── Schema generation ────────────────────────────────────────────────
@@ -2251,7 +2684,7 @@ mod tests {
     #[tokio::test]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn live_happy_path_multiple_rpc_calls() {
-        if !python3_available() {
+        if !python3_available() || !astra_sandbox::process_scope_available() {
             return;
         }
         let exec = MockToolExecutor::new();
@@ -2276,11 +2709,57 @@ print(f"{r1}|{r2}")
         assert_eq!(exec.call_count(), 2);
     }
 
+    /// A successful script may still have launched a detached-looking child
+    /// with its stdio closed. The tool result must not be considered terminal
+    /// until the invocation-owned process boundary has been cleaned up; a
+    /// delayed workspace write after this function returns would otherwise
+    /// outlive the writer epoch and be attributed to a later tool call.
+    #[tokio::test]
+    #[cfg(unix)]
+    #[cfg_attr(not(feature = "python_tests"), ignore)]
+    async fn live_success_kills_child_before_releasing_invocation() {
+        if !python3_available() || !astra_sandbox::process_scope_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("late-run-script-marker");
+        let marker_literal = serde_json::to_string(marker.to_str().unwrap()).unwrap();
+        let child_code = format!(
+            "import time; time.sleep(0.4); open({}, 'w').write('late')",
+            marker_literal
+        );
+        let child_code_literal = serde_json::to_string(&child_code).unwrap();
+        let script = format!(
+            r#"
+import subprocess, sys
+subprocess.Popen([
+    sys.executable, "-c",
+    {child_code_literal},
+], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+print("done")
+"#
+        );
+        let exec = MockToolExecutor::new();
+        let config = RunScriptConfig {
+            timeout: Duration::from_secs(10),
+            mode: ExecutionMode::Strict,
+            ..Default::default()
+        };
+        let output = run_script(&script, &config, &exec).await.unwrap();
+        assert!(output.contains("done"), "script did not finish: {output}");
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(
+            !marker.exists(),
+            "run_script returned while a child was still alive: {}",
+            marker.display()
+        );
+    }
+
     // C9: stdout before raise must be preserved in the error report.
     #[tokio::test]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn live_script_partial_stdout_preserved_on_error() {
-        if !python3_available() {
+        if !python3_available() || !astra_sandbox::process_scope_available() {
             return;
         }
         let exec = MockToolExecutor::new();
@@ -2323,7 +2802,7 @@ raise ValueError("boom")
     #[tokio::test]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn live_scripts_run_concurrently_without_cross_talk() {
-        if !python3_available() {
+        if !python3_available() || !astra_sandbox::process_scope_available() {
             return;
         }
 
@@ -2356,7 +2835,7 @@ raise ValueError("boom")
     #[tokio::test]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn live_run_script_empty_source_returns_empty_ok() {
-        if !python3_available() {
+        if !python3_available() || !astra_sandbox::process_scope_available() {
             return;
         }
         let exec = MockToolExecutor::new();
@@ -2375,7 +2854,7 @@ raise ValueError("boom")
     #[tokio::test]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn handle_run_script_empty_source_returns_notice() {
-        if !python3_available() {
+        if !python3_available() || !astra_sandbox::process_scope_available() {
             return;
         }
         let exec = MockToolExecutor::new();
@@ -2400,7 +2879,7 @@ raise ValueError("boom")
     #[tokio::test]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn live_bash_returns_plain_text_string() {
-        if !python3_available() {
+        if !python3_available() || !astra_sandbox::process_scope_available() {
             return;
         }
         let exec = MockToolExecutor::new();
@@ -2425,7 +2904,7 @@ print(result, end="")
     #[tokio::test]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn live_script_stderr_only_nonzero_exit() {
-        if !python3_available() {
+        if !python3_available() || !astra_sandbox::process_scope_available() {
             return;
         }
         let exec = MockToolExecutor::new();
@@ -2461,7 +2940,7 @@ sys.exit(7)
     #[tokio::test]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn live_script_failed_exit_still_caps_stdout() {
-        if !python3_available() {
+        if !python3_available() || !astra_sandbox::process_scope_available() {
             return;
         }
         let exec = MockToolExecutor::new();
@@ -2494,7 +2973,7 @@ raise RuntimeError("after noise")
     #[tokio::test]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn live_script_stderr_truncation_notice_present() {
-        if !python3_available() {
+        if !python3_available() || !astra_sandbox::process_scope_available() {
             return;
         }
         let exec = MockToolExecutor::new();
@@ -2541,7 +3020,7 @@ sys.exit(2)
     #[tokio::test]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn live_script_exceeded_call_limit_kills_child_fast() {
-        if !python3_available() {
+        if !python3_available() || !astra_sandbox::process_scope_available() {
             return;
         }
         let exec = MockToolExecutor::new();
@@ -2583,7 +3062,7 @@ print("LEAK: should not have reached here")
     #[serial]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn live_script_secret_env_not_visible_to_child() {
-        if !python3_available() {
+        if !python3_available() || !astra_sandbox::process_scope_available() {
             return;
         }
         let _guard = EnvGuard::set("MY_SUPER_SECRET", "should-not-leak");
@@ -2611,7 +3090,7 @@ print(os.environ.get("MY_SUPER_SECRET", "UNSET"))
     #[serial]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn live_script_home_is_isolated_by_default() {
-        if !python3_available() {
+        if !python3_available() || !astra_sandbox::process_scope_available() {
             return;
         }
         let _guard = EnvGuard::set("HOME", "/tmp/sentinel-parent-home");
@@ -2650,7 +3129,7 @@ print(os.environ["HOME"])
     #[tokio::test]
     #[cfg_attr(not(feature = "cgroup_tests"), ignore)]
     async fn live_script_cgroup_memory_limit_kills_runaway() {
-        if !python3_available() {
+        if !python3_available() || !astra_sandbox::process_scope_available() {
             return;
         }
         let exec = MockToolExecutor::new();

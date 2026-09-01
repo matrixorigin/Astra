@@ -8,18 +8,61 @@ mod common;
 
 use astra_services::runtime_maintenance::{RuntimeMaintenancePolicy, maintain_runtime_storage};
 use astra_services::{
-    InferenceInvocationInput, InferenceInvocationPlan, InferenceInvocationTerminal,
-    InferenceProviderAttemptPlan, InferenceProviderWireIdentity, InferenceTerminalStatus,
-    InferenceUsage, ModelAccessKind, ModelExecutionPlacement, ServiceErrorKind,
+    InferenceInvocationAdmissionResolution, InferenceInvocationInput, InferenceInvocationPlan,
+    InferenceInvocationTerminal, InferenceProviderAttemptPlan, InferenceProviderDeliveryState,
+    InferenceProviderWireIdentity, InferenceRunAdmissionAuthority,
+    InferenceSettlementReconcileOutcome, InferenceTerminalStatus, InferenceUsage,
+    InferenceUsageStatus, ModelAccessKind, ModelExecutionPlacement, ServiceErrorKind,
     admit_inference_invocation, admit_inference_invocation_with_first_provider_attempt,
-    begin_inference_provider_attempt, declare_inference_settlement, finish_inference_invocation,
-    finish_inference_provider_attempt, plan_inference_invocation, plan_inference_provider_attempt,
-    reconcile_inference_settlements,
+    begin_inference_provider_attempt, declare_inference_attempt_settlement,
+    declare_inference_settlement, finish_inference_invocation, finish_inference_provider_attempt,
+    next_inference_logical_attempt_pair_base, plan_inference_invocation,
+    plan_inference_provider_attempt, reconcile_inference_settlement,
+    reconcile_inference_settlements, renew_inference_invocation_owner,
+    settle_uncertain_inference_admission,
 };
 use astra_turn_types::{InferenceInvocationScope, InferencePurpose};
 use serial_test::serial;
 use sqlx::Row;
 use uuid::Uuid;
+
+const TEST_INFERENCE_OWNER_POD_ID: &str = "inference-db-it-owner";
+
+fn run_authority() -> Option<InferenceRunAdmissionAuthority> {
+    Some(InferenceRunAdmissionAuthority {
+        expected_owner_generation: 0,
+        expected_owner_pod_id: TEST_INFERENCE_OWNER_POD_ID.to_string(),
+        expected_control_epoch: -1,
+    })
+}
+
+fn run_input(
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    round: u32,
+    operation_id: &str,
+) -> InferenceInvocationInput {
+    InferenceInvocationInput {
+        user_id: user_id.to_string(),
+        scope: InferenceInvocationScope::Run {
+            session_id: session_id.to_string(),
+            run_id: run_id.to_string(),
+            turn: 1,
+            round,
+            operation_id: operation_id.to_string(),
+            logical_attempt: 0,
+        },
+        offering_id: "owner-lease-offering".to_string(),
+        resolved_model_name: "owner-lease-model".to_string(),
+        upstream_model_name: "owner-lease-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::PrimaryAgent,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+        run_authority: run_authority(),
+    }
+}
 
 fn provider_attempt(
     plan: &InferenceInvocationPlan,
@@ -52,10 +95,12 @@ async fn seed_run(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &st
     sqlx::query(
         "INSERT INTO agent_runs
          (run_id, user_id, session_id, root_run_id, ancestor_path, depth, retry_scope,
-          status, execution_mode, run_generation, last_event_idx, retry_count,
+          status, execution_mode, owner_pod_id, owner_lease_expires_at,
+          run_generation, last_event_idx, retry_count,
           total_prompt_tokens, total_completion_tokens, total_tool_calls,
           created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, 0, 'node', 'running', 'web_agent', 0, -1, 0,
+         VALUES (?, ?, ?, ?, ?, 0, 'node', 'running', 'web_agent', ?,
+                 TIMESTAMPADD(MINUTE, 5, NOW(6)), 0, -1, 0,
                  0, 0, 0, NOW(6), NOW(6))",
     )
     .bind(run_id)
@@ -63,9 +108,328 @@ async fn seed_run(pool: &sqlx::Pool<sqlx::MySql>, user_id: &str, session_id: &st
     .bind(session_id)
     .bind(run_id)
     .bind(run_id)
+    .bind(TEST_INFERENCE_OWNER_POD_ID)
     .execute(pool)
     .await
     .expect("seed inference run");
+}
+
+async fn append_run_control_event(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    event_index: i64,
+    event_type: &str,
+) {
+    let mut tx = pool.begin().await.expect("begin inference control event");
+    let updated = sqlx::query(
+        "UPDATE agent_runs SET last_event_idx = ?
+         WHERE user_id = ? AND run_id = ? AND last_event_idx = ?",
+    )
+    .bind(event_index)
+    .bind(user_id)
+    .bind(run_id)
+    .bind(event_index - 1)
+    .execute(&mut *tx)
+    .await
+    .expect("advance inference run event index");
+    assert_eq!(updated.rows_affected(), 1);
+    let event_id = format!("{event_type}-{event_index}-{run_id}");
+    let payload = serde_json::json!({
+        "event_type": event_type,
+        "idempotency_key": event_id,
+        "data": {},
+    });
+    sqlx::query(
+        "INSERT INTO agent_run_events
+         (id, run_id, event_idx, user_id, session_id, event_type, event_id,
+          idempotency_key, event_hash, producer_pod_id, payload_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(run_id)
+    .bind(event_index)
+    .bind(user_id)
+    .bind(session_id)
+    .bind(event_type)
+    .bind(&event_id)
+    .bind(&event_id)
+    .bind(format!("{:064x}", event_index + 1))
+    .bind(TEST_INFERENCE_OWNER_POD_ID)
+    .bind(payload.to_string())
+    .execute(&mut *tx)
+    .await
+    .expect("insert inference control event");
+    tx.commit().await.expect("commit inference control event");
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn uncertain_admission_recovery_is_scope_fenced_and_atomic() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("admission-recovery-user-{suffix}");
+    let session_id = format!("admission-recovery-session-{suffix}");
+    let run_id = format!("admission-recovery-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+    let input = InferenceInvocationInput {
+        user_id: user_id.clone(),
+        scope: InferenceInvocationScope::Run {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn: 1,
+            round: 1,
+            operation_id: "uncertain_logical_admission".to_string(),
+            logical_attempt: 0,
+        },
+        offering_id: "admission-recovery-offering".to_string(),
+        resolved_model_name: "admission-recovery-model".to_string(),
+        upstream_model_name: "admission-recovery-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::PrimaryAgent,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+        run_authority: run_authority(),
+    };
+    let plan = plan_inference_invocation(input.clone()).expect("plan uncertain admission");
+    let terminal = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Cancelled,
+        usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
+        provider_response_id: None,
+        error_kind: Some("cancelled".to_string()),
+        error_message: Some("provider delivery was never authorized".to_string()),
+    };
+
+    let mut scope_owner = pool.begin().await.expect("begin scope lock");
+    sqlx::query(
+        "SELECT 1 FROM agent_sessions
+         WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(&mut *scope_owner)
+    .await
+    .expect("hold the same first scope lock as admission");
+    let recovery_pool = shared_pool.clone();
+    let recovery_plan = plan.clone();
+    let recovery_terminal = terminal.clone();
+    let recovery = tokio::spawn(async move {
+        settle_uncertain_inference_admission(&recovery_pool, &recovery_plan, &recovery_terminal)
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !recovery.is_finished(),
+        "recovery must wait behind the canonical scope transaction lock"
+    );
+    scope_owner.rollback().await.expect("release scope lock");
+    assert_eq!(
+        recovery
+            .await
+            .expect("join recovery")
+            .expect("recover rollback"),
+        InferenceInvocationAdmissionResolution::Settled
+    );
+
+    let atomic = sqlx::query(
+        "SELECT invocation.status,
+                (SELECT COUNT(*) FROM inference_invocation_settlement_debts AS debt
+                 WHERE debt.user_id = invocation.user_id
+                   AND debt.invocation_id = invocation.invocation_id
+                   AND debt.terminal_status = 'cancelled') AS debt_count
+         FROM inference_invocations AS invocation
+         WHERE invocation.user_id = ? AND invocation.invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load atomic recovery pair");
+    assert_eq!(atomic.get::<String, _>("status"), "admitted");
+    assert_eq!(atomic.get::<i64, _>("debt_count"), 1);
+
+    let initial_delivery_state = sqlx::query_scalar::<_, String>(
+        "SELECT provider_delivery_state
+         FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load atomic recovery delivery authority");
+    assert_eq!(initial_delivery_state, "pre_delivery");
+    declare_inference_settlement(&shared_pool, &plan, &terminal)
+        .await
+        .expect("generic terminal replay must preserve stronger delivery authority");
+    let replayed_delivery_state = sqlx::query_scalar::<_, String>(
+        "SELECT provider_delivery_state
+         FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load replayed recovery delivery authority");
+    assert_eq!(replayed_delivery_state, "pre_delivery");
+
+    let mut unknown_input = input.clone();
+    unknown_input.scope = InferenceInvocationScope::Run {
+        session_id: session_id.clone(),
+        run_id: run_id.clone(),
+        turn: 1,
+        round: 2,
+        operation_id: "unknown_then_pre_delivery".to_string(),
+        logical_attempt: 0,
+    };
+    let unknown_plan =
+        plan_inference_invocation(unknown_input).expect("plan unknown delivery settlement");
+    admit_inference_invocation(&shared_pool, &unknown_plan)
+        .await
+        .expect("admit unknown delivery settlement");
+    declare_inference_settlement(&shared_pool, &unknown_plan, &terminal)
+        .await
+        .expect("declare generic logical settlement");
+    let unknown_delivery_state = sqlx::query_scalar::<_, String>(
+        "SELECT provider_delivery_state
+         FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(unknown_plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load generic delivery authority");
+    assert_eq!(unknown_delivery_state, "unknown");
+    assert_eq!(
+        settle_uncertain_inference_admission(&shared_pool, &unknown_plan, &terminal)
+            .await
+            .expect("strengthen generic debt to pre-delivery"),
+        InferenceInvocationAdmissionResolution::Settled
+    );
+    let strengthened_delivery_state = sqlx::query_scalar::<_, String>(
+        "SELECT provider_delivery_state
+         FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(unknown_plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load strengthened delivery authority");
+    assert_eq!(strengthened_delivery_state, "pre_delivery");
+
+    let conflicting = plan_inference_invocation(input).expect("plan competing token");
+    assert_eq!(conflicting.invocation_id(), plan.invocation_id());
+    assert_eq!(
+        settle_uncertain_inference_admission(&shared_pool, &conflicting, &terminal)
+            .await
+            .expect("classify competing admission owner"),
+        InferenceInvocationAdmissionResolution::ConflictingIdentity
+    );
+    let debt_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("conflict must not duplicate or replace debt");
+    assert_eq!(debt_count, 1);
+
+    reconcile_inference_settlements(&shared_pool, 8)
+        .await
+        .expect("restart-style sweeper converges the atomic debt");
+    let status = sqlx::query_scalar::<_, String>(
+        "SELECT status FROM inference_invocations WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load recovered terminal");
+    assert_eq!(status, "cancelled");
+    let strengthened_status = sqlx::query_scalar::<_, String>(
+        "SELECT status FROM inference_invocations WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(unknown_plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load strengthened terminal");
+    assert_eq!(strengthened_status, "cancelled");
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn concurrent_physical_attempts_authorize_exactly_one_provider_delivery() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("attempt-race-user-{suffix}");
+    let session_id = format!("attempt-race-session-{suffix}");
+    let run_id = format!("attempt-race-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+    let plan = plan_inference_invocation(InferenceInvocationInput {
+        user_id: user_id.clone(),
+        scope: InferenceInvocationScope::Run {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn: 1,
+            round: 0,
+            operation_id: "concurrent_physical_attempts".to_string(),
+            logical_attempt: 0,
+        },
+        offering_id: "attempt-race-offering".to_string(),
+        resolved_model_name: "attempt-race-model".to_string(),
+        upstream_model_name: "attempt-race-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::PrimaryAgent,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+        run_authority: run_authority(),
+    })
+    .expect("plan attempt race");
+    admit_inference_invocation(&shared_pool, &plan)
+        .await
+        .expect("admit attempt race");
+    let first = provider_attempt(&plan, 0);
+    let second = provider_attempt(&plan, 1);
+    let (first_outcome, second_outcome) = tokio::join!(
+        begin_inference_provider_attempt(&shared_pool, &first),
+        begin_inference_provider_attempt(&shared_pool, &second),
+    );
+    let outcomes = [first_outcome, second_outcome];
+    assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| outcome
+                .as_ref()
+                .is_err_and(|error| error.kind == ServiceErrorKind::Conflict))
+            .count(),
+        1
+    );
+    let started: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_provider_attempts
+         WHERE user_id = ? AND invocation_id = ? AND status = 'started'",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("count open provider attempts");
+    assert_eq!(started, 1);
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
 }
 
 #[tokio::test]
@@ -97,6 +461,7 @@ async fn combined_first_attempt_admission_is_atomic_and_replay_safe() {
         purpose: InferencePurpose::PrimaryAgent,
         execution_placement: ModelExecutionPlacement::Server,
         access_kind: ModelAccessKind::SelfHosted,
+        run_authority: run_authority(),
     })
     .expect("plan combined admission");
     let attempt = provider_attempt(&plan, 0);
@@ -174,6 +539,7 @@ async fn bounded_settlement_recovery_processes_only_one_batch() {
             purpose: InferencePurpose::PrimaryAgent,
             execution_placement: ModelExecutionPlacement::Server,
             access_kind: ModelAccessKind::SelfHosted,
+            run_authority: run_authority(),
         })
         .expect("plan targeted recovery invocation");
         admit_inference_invocation(&shared_pool, &plan)
@@ -188,10 +554,8 @@ async fn bounded_settlement_recovery_processes_only_one_batch() {
             &attempt,
             &InferenceInvocationTerminal::succeeded(
                 InferenceUsage {
-                    input_tokens: 3,
+                    input: astra_turn_types::NormalizedPromptCacheUsage::new(3, 0, 0),
                     output_tokens: 2,
-                    cache_read_tokens: 0,
-                    cache_creation_tokens: 0,
                 },
                 Some(format!("targeted-response-{round}")),
             ),
@@ -200,8 +564,6 @@ async fn bounded_settlement_recovery_processes_only_one_batch() {
         .expect("persist targeted recovery attempt");
         plans.push(plan);
     }
-    plans.sort_by(|left, right| left.invocation_id().cmp(right.invocation_id()));
-
     reconcile_inference_settlements(&shared_pool, 1)
         .await
         .expect("reconcile one bounded invocation batch");
@@ -221,23 +583,129 @@ async fn bounded_settlement_recovery_processes_only_one_batch() {
     .await
     .expect("load targeted recovery outcomes");
     assert_eq!(rows.len(), 2);
+    let mut completed = 0;
+    let mut pending = 0;
     for row in rows {
-        let invocation_id = row.get::<String, _>("invocation_id");
         let status = row.get::<String, _>("status");
         let debt_count = row.get::<i64, _>("debt_count");
-        if invocation_id == plans[0].invocation_id() {
-            assert_eq!(status, "succeeded");
-            assert_eq!(debt_count, 0);
-        } else {
-            assert_eq!(invocation_id, plans[1].invocation_id());
-            assert_eq!(status, "admitted");
-            assert_eq!(debt_count, 1);
+        match (status.as_str(), debt_count) {
+            ("succeeded", 0) => completed += 1,
+            ("admitted", 1) => pending += 1,
+            unexpected => panic!("unexpected bounded recovery state: {unexpected:?}"),
         }
     }
+    assert_eq!((completed, pending), (1, 1));
 
     reconcile_inference_settlements(&shared_pool, 1)
         .await
         .expect("drain the second invocation before cleanup");
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn deferred_settlement_does_not_consume_another_users_bounded_batch_slot() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("deferred-recovery-user-{suffix}");
+    let session_id = format!("deferred-recovery-session-{suffix}");
+    let run_id = format!("deferred-recovery-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+    let cancelled = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Cancelled,
+        usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
+        provider_response_id: None,
+        error_kind: Some("cancelled".to_string()),
+        error_message: Some("provider delivery was never authorized".to_string()),
+    };
+    let mut plans = Vec::new();
+    for round in 0..2 {
+        let plan = plan_inference_invocation(InferenceInvocationInput {
+            user_id: user_id.clone(),
+            scope: InferenceInvocationScope::Run {
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                turn: 2,
+                round,
+                operation_id: "deferred_settlement_fairness".to_string(),
+                logical_attempt: 0,
+            },
+            offering_id: "deferred-recovery-offering".to_string(),
+            resolved_model_name: "deferred-recovery-model".to_string(),
+            upstream_model_name: "deferred-recovery-model".to_string(),
+            provider: "openai".to_string(),
+            purpose: InferencePurpose::PrimaryAgent,
+            execution_placement: ModelExecutionPlacement::Server,
+            access_kind: ModelAccessKind::SelfHosted,
+            run_authority: run_authority(),
+        })
+        .expect("plan deferred recovery invocation");
+        admit_inference_invocation(&shared_pool, &plan)
+            .await
+            .expect("admit deferred recovery invocation");
+        declare_inference_attempt_settlement(
+            &shared_pool,
+            &plan,
+            &provider_attempt(&plan, 0),
+            &cancelled,
+            InferenceProviderDeliveryState::PreDelivery,
+        )
+        .await
+        .expect("record deferred recovery settlement");
+        plans.push(plan);
+    }
+    sqlx::query(
+        "UPDATE inference_invocation_settlement_debts
+         SET next_retry_at = DATE_ADD(NOW(6), INTERVAL 1 HOUR)
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plans[0].invocation_id())
+    .execute(pool)
+    .await
+    .expect("defer one owner's retry eligibility");
+
+    assert_eq!(
+        reconcile_inference_settlements(&shared_pool, 1)
+            .await
+            .expect("eligible settlement behind a deferred row remains recoverable"),
+        1
+    );
+    let statuses = sqlx::query(
+        "SELECT invocation_id, status FROM inference_invocations
+         WHERE user_id = ? AND invocation_id IN (?, ?)",
+    )
+    .bind(&user_id)
+    .bind(plans[0].invocation_id())
+    .bind(plans[1].invocation_id())
+    .fetch_all(pool)
+    .await
+    .expect("load deferred fairness outcomes");
+    for row in statuses {
+        let invocation_id = row.get::<String, _>("invocation_id");
+        let expected = if invocation_id == plans[0].invocation_id() {
+            "admitted"
+        } else {
+            "cancelled"
+        };
+        assert_eq!(row.get::<String, _>("status"), expected);
+    }
+
+    sqlx::query(
+        "UPDATE inference_invocation_settlement_debts SET next_retry_at = NOW(6)
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plans[0].invocation_id())
+    .execute(pool)
+    .await
+    .expect("make deferred row eligible for cleanup");
+    reconcile_inference_settlements(&shared_pool, 1)
+        .await
+        .expect("reconcile deferred row after its retry window");
     cleanup(pool, &user_id, &session_id, &run_id).await;
 }
 
@@ -272,6 +740,7 @@ async fn recovery_discards_unproven_success_without_blocking_later_settlement() 
             purpose: InferencePurpose::PrimaryAgent,
             execution_placement: ModelExecutionPlacement::Server,
             access_kind: ModelAccessKind::SelfHosted,
+            run_authority: run_authority(),
         })
         .expect("plan recovery isolation invocation");
         admit_inference_invocation(&shared_pool, &plan)
@@ -365,6 +834,7 @@ async fn authoritative_settlement_debt_converges_an_orphaned_open_attempt() {
         purpose: InferencePurpose::PrimaryAgent,
         execution_placement: ModelExecutionPlacement::Server,
         access_kind: ModelAccessKind::SelfHosted,
+        run_authority: run_authority(),
     })
     .expect("plan orphan-attempt invocation");
     admit_inference_invocation(&shared_pool, &plan)
@@ -381,6 +851,7 @@ async fn authoritative_settlement_debt_converges_an_orphaned_open_attempt() {
         &InferenceInvocationTerminal {
             status: InferenceTerminalStatus::Failed,
             usage: InferenceUsage::default(),
+            usage_status: InferenceUsageStatus::Unavailable,
             provider_response_id: None,
             error_kind: Some("provider_unavailable".to_string()),
             error_message: Some("logical retry policy exhausted".to_string()),
@@ -433,6 +904,562 @@ async fn authoritative_settlement_debt_converges_an_orphaned_open_attempt() {
     .await
     .expect("load recovered settlement debt");
     assert_eq!(debt_count, 0);
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn exact_attempt_debt_recovers_success_without_degrading_provider_facts() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("exact-attempt-debt-user-{suffix}");
+    let session_id = format!("exact-attempt-debt-session-{suffix}");
+    let run_id = format!("exact-attempt-debt-run-{suffix}");
+    let provider = format!("exact-attempt-provider-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let plan = plan_inference_invocation(InferenceInvocationInput {
+        user_id: user_id.clone(),
+        scope: InferenceInvocationScope::Run {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn: 1,
+            round: 0,
+            operation_id: "exact_attempt_debt".to_string(),
+            logical_attempt: 0,
+        },
+        offering_id: "exact-attempt-offering".to_string(),
+        resolved_model_name: "exact-attempt-model".to_string(),
+        upstream_model_name: "exact-attempt-model".to_string(),
+        provider: provider.clone(),
+        purpose: InferencePurpose::PrimaryAgent,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+        run_authority: run_authority(),
+    })
+    .expect("plan exact-attempt invocation");
+    admit_inference_invocation(&shared_pool, &plan)
+        .await
+        .expect("admit exact-attempt invocation");
+    let attempt = provider_attempt(&plan, 0);
+    begin_inference_provider_attempt(&shared_pool, &attempt)
+        .await
+        .expect("begin exact-attempt provider request");
+    let terminal = InferenceInvocationTerminal::succeeded(
+        InferenceUsage {
+            input: astra_turn_types::NormalizedPromptCacheUsage::new(11, 7, 3),
+            output_tokens: 5,
+        },
+        Some("exact-provider-response".to_string()),
+    );
+
+    // Model the response-complete / terminal-COMMIT-ack-lost boundary: the
+    // runtime knows the exact terminal but only its durable debt is confirmed.
+    declare_inference_attempt_settlement(
+        &shared_pool,
+        &plan,
+        &attempt,
+        &terminal,
+        InferenceProviderDeliveryState::DeliveryAuthorized,
+    )
+    .await
+    .expect("record exact physical settlement debt");
+    reconcile_inference_settlements(&shared_pool, 256)
+        .await
+        .expect("sweeper applies exact physical and logical terminal");
+
+    let attempt_row = sqlx::query(
+        "SELECT status, terminal_fingerprint, input_tokens, output_tokens,
+                cache_read_tokens, cache_creation_tokens, provider_response_id
+         FROM inference_provider_attempts WHERE user_id = ? AND attempt_id = ?",
+    )
+    .bind(&user_id)
+    .bind(attempt.attempt_id())
+    .fetch_one(pool)
+    .await
+    .expect("load exact recovered provider attempt");
+    assert_eq!(attempt_row.get::<String, _>("status"), "succeeded");
+    assert!(
+        attempt_row
+            .get::<Option<String>, _>("terminal_fingerprint")
+            .is_some()
+    );
+    assert_eq!(attempt_row.get::<i64, _>("input_tokens"), 11);
+    assert_eq!(attempt_row.get::<i64, _>("output_tokens"), 5);
+    assert_eq!(attempt_row.get::<i64, _>("cache_read_tokens"), 7);
+    assert_eq!(attempt_row.get::<i64, _>("cache_creation_tokens"), 3);
+    assert_eq!(
+        attempt_row.get::<Option<String>, _>("provider_response_id"),
+        Some("exact-provider-response".to_string())
+    );
+    let invocation_status: String = sqlx::query_scalar(
+        "SELECT status FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load exact recovered logical invocation");
+    assert_eq!(invocation_status, "succeeded");
+    let context_rows = sqlx::query(
+        "SELECT event_stage, terminal_status, input_tokens, output_tokens,
+                cache_read_tokens, cache_creation_tokens
+         FROM model_request_context_events
+         WHERE user_id = ? AND attempt_id = ? ORDER BY event_stage",
+    )
+    .bind(&user_id)
+    .bind(attempt.attempt_id())
+    .fetch_all(pool)
+    .await
+    .expect("load recovered request-context evidence");
+    assert_eq!(context_rows.len(), 2);
+    let terminal_context = context_rows
+        .iter()
+        .find(|row| row.get::<String, _>("event_stage") == "terminal")
+        .expect("recovery emits terminal request-context evidence");
+    assert_eq!(
+        terminal_context.get::<Option<String>, _>("terminal_status"),
+        Some("succeeded".to_string())
+    );
+    assert_eq!(
+        terminal_context.get::<Option<i64>, _>("input_tokens"),
+        Some(21)
+    );
+    assert_eq!(
+        terminal_context.get::<Option<i64>, _>("output_tokens"),
+        Some(5)
+    );
+    assert_eq!(
+        terminal_context.get::<Option<i64>, _>("cache_read_tokens"),
+        Some(7)
+    );
+    assert_eq!(
+        terminal_context.get::<Option<i64>, _>("cache_creation_tokens"),
+        Some(3)
+    );
+    let metric = astra_services::aggregate_model_request_metrics(&shared_pool)
+        .await
+        .expect("load recovered exact-attempt metrics")
+        .into_iter()
+        .find(|row| row.provider == provider && row.terminal_status == "succeeded")
+        .expect("exact-attempt recovery updates its metric shard once");
+    assert_eq!(metric.requests, 1);
+    assert_eq!(metric.input_tokens, 21);
+    assert_eq!(metric.output_tokens, 5);
+    assert_eq!(metric.cache_read_tokens, 7);
+    assert_eq!(metric.cache_creation_tokens, 3);
+    let debt_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load exact attempt debt after recovery");
+    assert_eq!(debt_count, 0);
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn conflicting_exact_attempt_debt_is_retained_without_promoting_logical_success() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("exact-conflict-user-{suffix}");
+    let session_id = format!("exact-conflict-session-{suffix}");
+    let run_id = format!("exact-conflict-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let plan = plan_inference_invocation(InferenceInvocationInput {
+        user_id: user_id.clone(),
+        scope: InferenceInvocationScope::Run {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn: 1,
+            round: 0,
+            operation_id: "exact_attempt_conflict".to_string(),
+            logical_attempt: 0,
+        },
+        offering_id: "exact-conflict-offering".to_string(),
+        resolved_model_name: "exact-conflict-model".to_string(),
+        upstream_model_name: "exact-conflict-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::PrimaryAgent,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+        run_authority: run_authority(),
+    })
+    .expect("plan exact-conflict invocation");
+    admit_inference_invocation(&shared_pool, &plan)
+        .await
+        .expect("admit exact-conflict invocation");
+    let attempt = provider_attempt(&plan, 0);
+    begin_inference_provider_attempt(&shared_pool, &attempt)
+        .await
+        .expect("begin exact-conflict provider request");
+    let physical_failure = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Failed,
+        usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
+        provider_response_id: Some("conflicting-provider-response".to_string()),
+        error_kind: Some("server_error".to_string()),
+        error_message: Some("provider rejected the request".to_string()),
+    };
+    finish_inference_provider_attempt(&shared_pool, &attempt, &physical_failure)
+        .await
+        .expect("persist the physical failure");
+
+    let conflicting_success = InferenceInvocationTerminal::succeeded(
+        InferenceUsage::default(),
+        Some("impossible-success".to_string()),
+    );
+    declare_inference_attempt_settlement(
+        &shared_pool,
+        &plan,
+        &attempt,
+        &conflicting_success,
+        InferenceProviderDeliveryState::DeliveryAuthorized,
+    )
+    .await
+    .expect("record the contradictory exact debt for reconciliation testing");
+    assert_eq!(
+        reconcile_inference_settlement(&shared_pool, &plan, &conflicting_success)
+            .await
+            .expect("conflict is a durable incident, not a transient retry"),
+        InferenceSettlementReconcileOutcome::PermanentlyQuarantined
+    );
+
+    let invocation_status: String = sqlx::query_scalar(
+        "SELECT status FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load conflicting logical invocation");
+    assert_eq!(invocation_status, "admitted");
+    let physical_status: String = sqlx::query_scalar(
+        "SELECT status FROM inference_provider_attempts
+         WHERE user_id = ? AND attempt_id = ?",
+    )
+    .bind(&user_id)
+    .bind(attempt.attempt_id())
+    .fetch_one(pool)
+    .await
+    .expect("load conflicting physical attempt");
+    assert_eq!(physical_status, "failed");
+    let debt = sqlx::query(
+        "SELECT reconciliation_status, quarantine_reason
+         FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ? AND provider_attempt_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .bind(attempt.attempt_id())
+    .fetch_one(pool)
+    .await
+    .expect("load quarantined exact-attempt conflict");
+    assert_eq!(
+        debt.get::<String, _>("reconciliation_status"),
+        "quarantined",
+        "the only recovery authority must be isolated, not erased"
+    );
+    assert!(
+        debt.get::<Option<String>, _>("quarantine_reason")
+            .is_some_and(|reason| reason.contains("conflicts"))
+    );
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn pre_delivery_missing_attempt_cancels_without_fabricating_physical_accounting() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("pre-delivery-user-{suffix}");
+    let session_id = format!("pre-delivery-session-{suffix}");
+    let run_id = format!("pre-delivery-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+    let plan = plan_inference_invocation(InferenceInvocationInput {
+        user_id: user_id.clone(),
+        scope: InferenceInvocationScope::Run {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn: 1,
+            round: 0,
+            operation_id: "pre_delivery_missing_attempt".to_string(),
+            logical_attempt: 0,
+        },
+        offering_id: "pre-delivery-offering".to_string(),
+        resolved_model_name: "pre-delivery-model".to_string(),
+        upstream_model_name: "pre-delivery-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::PrimaryAgent,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+        run_authority: run_authority(),
+    })
+    .expect("plan pre-delivery invocation");
+    admit_inference_invocation(&shared_pool, &plan)
+        .await
+        .expect("admit pre-delivery invocation");
+    let planned_attempt = provider_attempt(&plan, 0);
+    let cancelled = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Cancelled,
+        usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
+        provider_response_id: None,
+        error_kind: Some("cancelled".to_string()),
+        error_message: Some("provider delivery was never authorized".to_string()),
+    };
+    declare_inference_attempt_settlement(
+        &shared_pool,
+        &plan,
+        &planned_attempt,
+        &cancelled,
+        InferenceProviderDeliveryState::PreDelivery,
+    )
+    .await
+    .expect("record pre-delivery cancellation");
+    assert_eq!(
+        reconcile_inference_settlements(&shared_pool, 1)
+            .await
+            .expect("reconcile absent pre-delivery attempt"),
+        1
+    );
+
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM inference_invocations WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load pre-delivery logical terminal");
+    assert_eq!(status, "cancelled");
+    let physical_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_provider_attempts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("count physical attempts");
+    assert_eq!(physical_count, 0);
+    let context_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM model_request_context_events
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("count request accounting evidence");
+    assert_eq!(
+        context_count, 0,
+        "a request that was never admitted or delivered must not fabricate usage evidence"
+    );
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn quarantined_missing_authorized_attempt_does_not_starve_pending_users() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let bad_user = format!("000-authorized-missing-{suffix}");
+    let bad_session = format!("authorized-missing-session-{suffix}");
+    let bad_run = format!("authorized-missing-run-{suffix}");
+    seed_run(pool, &bad_user, &bad_session, &bad_run).await;
+    let bad_plan = plan_inference_invocation(InferenceInvocationInput {
+        user_id: bad_user.clone(),
+        scope: InferenceInvocationScope::Run {
+            session_id: bad_session.clone(),
+            run_id: bad_run.clone(),
+            turn: 1,
+            round: 0,
+            operation_id: "authorized_missing_attempt".to_string(),
+            logical_attempt: 0,
+        },
+        offering_id: "authorized-missing-offering".to_string(),
+        resolved_model_name: "authorized-missing-model".to_string(),
+        upstream_model_name: "authorized-missing-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::PrimaryAgent,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+        run_authority: run_authority(),
+    })
+    .expect("plan missing authorized invocation");
+    admit_inference_invocation(&shared_pool, &bad_plan)
+        .await
+        .expect("admit missing authorized invocation");
+    let missing_attempt = provider_attempt(&bad_plan, 0);
+    let delivery_unknown = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::DeliveryUnknown,
+        usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
+        provider_response_id: None,
+        error_kind: Some("stream_transport".to_string()),
+        error_message: Some(
+            "delivery was authorized but admission evidence is missing".to_string(),
+        ),
+    };
+    declare_inference_attempt_settlement(
+        &shared_pool,
+        &bad_plan,
+        &missing_attempt,
+        &delivery_unknown,
+        InferenceProviderDeliveryState::DeliveryAuthorized,
+    )
+    .await
+    .expect("record missing authorized exact debt");
+    assert_eq!(
+        reconcile_inference_settlements(&shared_pool, 1)
+            .await
+            .expect("quarantine impossible authorized state"),
+        0
+    );
+    let quarantine_status: String = sqlx::query_scalar(
+        "SELECT reconciliation_status FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&bad_user)
+    .bind(bad_plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load authorized-missing quarantine");
+    assert_eq!(quarantine_status, "quarantined");
+
+    let good_user = format!("zzz-pre-delivery-{suffix}");
+    let good_session = format!("good-pre-delivery-session-{suffix}");
+    let good_run = format!("good-pre-delivery-run-{suffix}");
+    seed_run(pool, &good_user, &good_session, &good_run).await;
+    let good_plan = plan_inference_invocation(InferenceInvocationInput {
+        user_id: good_user.clone(),
+        scope: InferenceInvocationScope::Run {
+            session_id: good_session.clone(),
+            run_id: good_run.clone(),
+            turn: 1,
+            round: 0,
+            operation_id: "good_pre_delivery".to_string(),
+            logical_attempt: 0,
+        },
+        offering_id: "good-pre-delivery-offering".to_string(),
+        resolved_model_name: "good-pre-delivery-model".to_string(),
+        upstream_model_name: "good-pre-delivery-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::PrimaryAgent,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+        run_authority: run_authority(),
+    })
+    .expect("plan later recoverable invocation");
+    admit_inference_invocation(&shared_pool, &good_plan)
+        .await
+        .expect("admit later recoverable invocation");
+    let good_attempt = provider_attempt(&good_plan, 0);
+    let cancelled = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Cancelled,
+        usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
+        provider_response_id: None,
+        error_kind: Some("cancelled".to_string()),
+        error_message: Some("provider delivery was never authorized".to_string()),
+    };
+    declare_inference_attempt_settlement(
+        &shared_pool,
+        &good_plan,
+        &good_attempt,
+        &cancelled,
+        InferenceProviderDeliveryState::PreDelivery,
+    )
+    .await
+    .expect("record later recoverable settlement");
+    assert_eq!(
+        reconcile_inference_settlements(&shared_pool, 1)
+            .await
+            .expect("quarantine must not consume active batch capacity"),
+        1
+    );
+    let good_status: String = sqlx::query_scalar(
+        "SELECT status FROM inference_invocations WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&good_user)
+    .bind(good_plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load later recoverable logical invocation");
+    assert_eq!(good_status, "cancelled");
+
+    cleanup(pool, &bad_user, &bad_session, &bad_run).await;
+    cleanup(pool, &good_user, &good_session, &good_run).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn orphaned_settlement_debt_is_quarantined_out_of_the_active_batch() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("orphaned-settlement-user-{suffix}");
+    let session_id = format!("orphaned-settlement-session-{suffix}");
+    let run_id = format!("orphaned-settlement-run-{suffix}");
+    let invocation_id = format!("orphaned-settlement-invocation-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    sqlx::query(
+        "INSERT INTO inference_invocation_settlement_debts
+         (user_id, invocation_id, session_id, harness_run_id,
+          terminal_status, terminal_fingerprint, usage_status,
+          provider_delivery_state)
+         VALUES (?, ?, ?, NULL, 'failed', REPEAT('e', 64), 'unavailable', 'unknown')",
+    )
+    .bind(&user_id)
+    .bind(&invocation_id)
+    .bind(&session_id)
+    .execute(pool)
+    .await
+    .expect("seed an orphaned durable settlement incident");
+
+    assert_eq!(
+        reconcile_inference_settlements(&shared_pool, 1)
+            .await
+            .expect("orphaned debt is a semantic incident, not a transient batch error"),
+        0
+    );
+    let row = sqlx::query(
+        "SELECT reconciliation_status, quarantine_reason
+         FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&invocation_id)
+    .fetch_one(pool)
+    .await
+    .expect("load quarantined orphaned settlement");
+    assert_eq!(row.get::<String, _>("reconciliation_status"), "quarantined");
+    assert!(
+        row.get::<Option<String>, _>("quarantine_reason")
+            .is_some_and(|reason| reason.contains("logical invocation"))
+    );
 
     cleanup(pool, &user_id, &session_id, &run_id).await;
 }
@@ -506,6 +1533,7 @@ async fn context_expiry_and_delayed_terminal_never_split_an_attempt() {
         purpose: InferencePurpose::PrimaryAgent,
         execution_placement: ModelExecutionPlacement::Server,
         access_kind: ModelAccessKind::SelfHosted,
+        run_authority: run_authority(),
     })
     .expect("plan context expiry invocation");
     admit_inference_invocation(&shared_pool, &plan)
@@ -529,6 +1557,7 @@ async fn context_expiry_and_delayed_terminal_never_split_an_attempt() {
     let terminal = InferenceInvocationTerminal {
         status: InferenceTerminalStatus::Failed,
         usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
         provider_response_id: None,
         error_kind: Some("provider_unavailable".to_string()),
         error_message: Some("delayed terminal after diagnostic retention".to_string()),
@@ -598,6 +1627,7 @@ async fn context_expiry_skips_an_old_attempt_with_a_fresh_terminal() {
     let failure = InferenceInvocationTerminal {
         status: InferenceTerminalStatus::Failed,
         usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
         provider_response_id: None,
         error_kind: Some("provider_unavailable".to_string()),
         error_message: Some("retention candidate fixture".to_string()),
@@ -619,6 +1649,7 @@ async fn context_expiry_skips_an_old_attempt_with_a_fresh_terminal() {
         purpose: InferencePurpose::PrimaryAgent,
         execution_placement: ModelExecutionPlacement::Server,
         access_kind: ModelAccessKind::SelfHosted,
+        run_authority: run_authority(),
     })
     .expect("plan protected context attempt");
     admit_inference_invocation(&shared_pool, &protected_plan)
@@ -659,6 +1690,7 @@ async fn context_expiry_skips_an_old_attempt_with_a_fresh_terminal() {
         purpose: InferencePurpose::PrimaryAgent,
         execution_placement: ModelExecutionPlacement::Server,
         access_kind: ModelAccessKind::SelfHosted,
+        run_authority: run_authority(),
     })
     .expect("plan eligible context attempt");
     admit_inference_invocation(&shared_pool, &eligible_plan)
@@ -748,6 +1780,7 @@ async fn provider_attempt_terminal_fails_closed_on_durable_wire_identity_drift()
         purpose: InferencePurpose::PrimaryAgent,
         execution_placement: ModelExecutionPlacement::Server,
         access_kind: ModelAccessKind::SelfHosted,
+        run_authority: run_authority(),
     })
     .expect("plan wire-drift invocation");
     admit_inference_invocation(&shared_pool, &plan)
@@ -775,6 +1808,7 @@ async fn provider_attempt_terminal_fails_closed_on_durable_wire_identity_drift()
         &InferenceInvocationTerminal {
             status: InferenceTerminalStatus::DeliveryUnknown,
             usage: InferenceUsage::default(),
+            usage_status: InferenceUsageStatus::Unavailable,
             provider_response_id: None,
             error_kind: Some("stream_transport".to_string()),
             error_message: Some("partial delivery".to_string()),
@@ -840,9 +1874,13 @@ async fn deleting_session_fences_new_run_and_session_inference_admission() {
         },
     ];
     for scope in scopes {
+        let authority = matches!(&scope, InferenceInvocationScope::Run { .. })
+            .then(run_authority)
+            .flatten();
         let plan = plan_inference_invocation(InferenceInvocationInput {
             user_id: user_id.clone(),
             scope,
+            run_authority: authority,
             offering_id: "deleting-admission-offering".to_string(),
             resolved_model_name: "deleting-admission-model".to_string(),
             upstream_model_name: "deleting-admission-model".to_string(),
@@ -877,6 +1915,538 @@ async fn deleting_session_fences_new_run_and_session_inference_admission() {
         durable_rows, 0,
         "rejected admission must leave no route or invocation"
     );
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn run_inference_admission_fences_generation_owner_lease_guidance_and_cancel() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("inference-authority-user-{suffix}");
+    let session_id = format!("inference-authority-session-{suffix}");
+    let run_id = format!("inference-authority-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+    let base_input = InferenceInvocationInput {
+        user_id: user_id.clone(),
+        scope: InferenceInvocationScope::Run {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn: 1,
+            round: 0,
+            operation_id: "authority_base".to_string(),
+            logical_attempt: 0,
+        },
+        run_authority: run_authority(),
+        offering_id: "inference-authority-offering".to_string(),
+        resolved_model_name: "inference-authority-model".to_string(),
+        upstream_model_name: "inference-authority-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::PrimaryAgent,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+    };
+    let plan_for = |operation_id: &str, authority: InferenceRunAdmissionAuthority| {
+        let mut input = base_input.clone();
+        if let InferenceInvocationScope::Run {
+            operation_id: operation,
+            ..
+        } = &mut input.scope
+        {
+            *operation = operation_id.to_string();
+        }
+        input.run_authority = Some(authority);
+        plan_inference_invocation(input).expect("plan fenced invocation")
+    };
+    let exact = run_authority().expect("run authority fixture");
+
+    let mut wrong_generation = exact.clone();
+    wrong_generation.expected_owner_generation = 1;
+    let error = admit_inference_invocation(
+        &shared_pool,
+        &plan_for("wrong_generation", wrong_generation),
+    )
+    .await
+    .expect_err("stale generation cannot admit provider work");
+    assert_eq!(error.kind, ServiceErrorKind::NotFound);
+
+    let mut wrong_owner = exact.clone();
+    wrong_owner.expected_owner_pod_id = "other-inference-owner".to_string();
+    let error = admit_inference_invocation(&shared_pool, &plan_for("wrong_owner", wrong_owner))
+        .await
+        .expect_err("stale owner cannot admit provider work");
+    assert_eq!(error.kind, ServiceErrorKind::NotFound);
+
+    sqlx::query("UPDATE agent_runs SET status = 'completed' WHERE user_id = ? AND run_id = ?")
+        .bind(&user_id)
+        .bind(&run_id)
+        .execute(pool)
+        .await
+        .expect("terminalize inference owner run");
+    let error = admit_inference_invocation(&shared_pool, &plan_for("terminal_run", exact.clone()))
+        .await
+        .expect_err("terminal run cannot admit provider work");
+    assert_eq!(error.kind, ServiceErrorKind::NotFound);
+    sqlx::query("UPDATE agent_runs SET status = 'running' WHERE user_id = ? AND run_id = ?")
+        .bind(&user_id)
+        .bind(&run_id)
+        .execute(pool)
+        .await
+        .expect("restore running inference owner fixture");
+
+    sqlx::query(
+        "UPDATE agent_runs SET owner_lease_expires_at = TIMESTAMPADD(SECOND, -1, NOW(6))
+         WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&run_id)
+    .execute(pool)
+    .await
+    .expect("expire inference owner lease");
+    let error = admit_inference_invocation(&shared_pool, &plan_for("expired_lease", exact.clone()))
+        .await
+        .expect_err("expired lease cannot admit provider work");
+    assert_eq!(error.kind, ServiceErrorKind::NotFound);
+    sqlx::query(
+        "UPDATE agent_runs SET owner_lease_expires_at = TIMESTAMPADD(MINUTE, 5, NOW(6))
+         WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&run_id)
+    .execute(pool)
+    .await
+    .expect("restore inference owner lease");
+
+    append_run_control_event(pool, &user_id, &session_id, &run_id, 0, "user_intent").await;
+    let error = admit_inference_invocation(
+        &shared_pool,
+        &plan_for("unobserved_guidance", exact.clone()),
+    )
+    .await
+    .expect_err("newer guidance cannot race provider admission");
+    assert_eq!(error.kind, ServiceErrorKind::NotFound);
+
+    let mut observed_guidance = exact.clone();
+    observed_guidance.expected_control_epoch = 0;
+    admit_inference_invocation(
+        &shared_pool,
+        &plan_for("observed_guidance", observed_guidance.clone()),
+    )
+    .await
+    .expect("applied guidance may admit under the same exact owner");
+
+    sqlx::query(
+        "UPDATE agent_runs SET cancellation_requested_at = NOW(6)
+         WHERE user_id = ? AND session_id = ? AND run_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&run_id)
+    .execute(pool)
+    .await
+    .expect("record run-level user cancellation marker");
+    let error =
+        admit_inference_invocation(&shared_pool, &plan_for("cancelled_run", observed_guidance))
+            .await
+            .expect_err("cancellation fences provider admission even when observed");
+    assert_eq!(error.kind, ServiceErrorKind::NotFound);
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn uncertain_admission_rejects_a_different_terminal_fingerprint_without_provider_attempt() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("terminal-fingerprint-user-{suffix}");
+    let session_id = format!("terminal-fingerprint-session-{suffix}");
+    let run_id = format!("terminal-fingerprint-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+    let plan = plan_inference_invocation(InferenceInvocationInput {
+        user_id: user_id.clone(),
+        scope: InferenceInvocationScope::Run {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn: 1,
+            round: 0,
+            operation_id: "terminal_fingerprint_conflict".to_string(),
+            logical_attempt: 0,
+        },
+        run_authority: run_authority(),
+        offering_id: "terminal-fingerprint-offering".to_string(),
+        resolved_model_name: "terminal-fingerprint-model".to_string(),
+        upstream_model_name: "terminal-fingerprint-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::PrimaryAgent,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+    })
+    .expect("plan terminal fingerprint conflict");
+    admit_inference_invocation(&shared_pool, &plan)
+        .await
+        .expect("admit terminal fingerprint conflict");
+    sqlx::query(
+        "UPDATE inference_invocations
+         SET status = 'cancelled', terminal_fingerprint = REPEAT('b', 64), terminal_at = NOW(6)
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .execute(pool)
+    .await
+    .expect("seed a different authoritative terminal");
+    let recovery_terminal = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Cancelled,
+        usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
+        provider_response_id: None,
+        error_kind: Some("cancelled".to_string()),
+        error_message: Some("provider delivery was never authorized".to_string()),
+    };
+
+    assert_eq!(
+        settle_uncertain_inference_admission(&shared_pool, &plan, &recovery_terminal)
+            .await
+            .expect("classify different terminal fingerprint"),
+        InferenceInvocationAdmissionResolution::ConflictingIdentity
+    );
+    let attempt_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_provider_attempts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(plan.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("count forbidden provider attempts");
+    assert_eq!(attempt_count, 0);
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn provider_attempt_revalidates_scope_authority_after_logical_admission() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("attempt-authority-user-{suffix}");
+    let session_id = format!("attempt-authority-session-{suffix}");
+    let run_id = format!("attempt-authority-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+    let exact = run_authority().expect("run authority fixture");
+    let plan_for = |operation_id: &str, authority: InferenceRunAdmissionAuthority| {
+        plan_inference_invocation(InferenceInvocationInput {
+            user_id: user_id.clone(),
+            scope: InferenceInvocationScope::Run {
+                session_id: session_id.clone(),
+                run_id: run_id.clone(),
+                turn: 1,
+                round: 0,
+                operation_id: operation_id.to_string(),
+                logical_attempt: 0,
+            },
+            run_authority: Some(authority),
+            offering_id: "attempt-authority-offering".to_string(),
+            resolved_model_name: "attempt-authority-model".to_string(),
+            upstream_model_name: "attempt-authority-model".to_string(),
+            provider: "openai".to_string(),
+            purpose: InferencePurpose::PrimaryAgent,
+            execution_placement: ModelExecutionPlacement::Server,
+            access_kind: ModelAccessKind::SelfHosted,
+        })
+        .expect("plan provider attempt authority fixture")
+    };
+
+    let expired = plan_for("attempt_after_lease_expiry", exact.clone());
+    admit_inference_invocation(&shared_pool, &expired)
+        .await
+        .expect("admit before lease expires");
+    sqlx::query(
+        "UPDATE agent_runs SET owner_lease_expires_at = TIMESTAMPADD(SECOND, -1, NOW(6))
+         WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&run_id)
+    .execute(pool)
+    .await
+    .expect("expire owner lease after logical admission");
+    assert_eq!(
+        begin_inference_provider_attempt(&shared_pool, &provider_attempt(&expired, 0))
+            .await
+            .expect_err("expired authority cannot authorize physical delivery")
+            .kind,
+        ServiceErrorKind::NotFound
+    );
+
+    sqlx::query(
+        "UPDATE agent_runs SET owner_lease_expires_at = TIMESTAMPADD(MINUTE, 5, NOW(6))
+         WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&run_id)
+    .execute(pool)
+    .await
+    .expect("restore lease");
+    let transferred = plan_for("attempt_after_owner_transfer", exact.clone());
+    admit_inference_invocation(&shared_pool, &transferred)
+        .await
+        .expect("admit before owner transfer");
+    sqlx::query(
+        "UPDATE agent_runs SET owner_pod_id = 'new-owner', run_generation = run_generation + 1
+         WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&run_id)
+    .execute(pool)
+    .await
+    .expect("transfer owner after logical admission");
+    assert_eq!(
+        begin_inference_provider_attempt(&shared_pool, &provider_attempt(&transferred, 0))
+            .await
+            .expect_err("stale generation and owner cannot authorize physical delivery")
+            .kind,
+        ServiceErrorKind::NotFound
+    );
+
+    sqlx::query(
+        "UPDATE agent_runs SET owner_pod_id = ?, run_generation = 0
+         WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(TEST_INFERENCE_OWNER_POD_ID)
+    .bind(&user_id)
+    .bind(&run_id)
+    .execute(pool)
+    .await
+    .expect("restore exact owner");
+    let guided = plan_for("attempt_after_guidance", exact.clone());
+    admit_inference_invocation(&shared_pool, &guided)
+        .await
+        .expect("admit before newer guidance");
+    append_run_control_event(pool, &user_id, &session_id, &run_id, 0, "user_intent").await;
+    assert_eq!(
+        begin_inference_provider_attempt(&shared_pool, &provider_attempt(&guided, 0))
+            .await
+            .expect_err("new guidance cannot race physical delivery")
+            .kind,
+        ServiceErrorKind::NotFound
+    );
+
+    let mut observed = exact;
+    observed.expected_control_epoch = 0;
+    let cancelled = plan_for("attempt_after_cancellation", observed);
+    admit_inference_invocation(&shared_pool, &cancelled)
+        .await
+        .expect("admit after applying guidance");
+    sqlx::query(
+        "UPDATE agent_runs SET cancellation_requested_at = NOW(6)
+         WHERE user_id = ? AND session_id = ? AND run_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .bind(&run_id)
+    .execute(pool)
+    .await
+    .expect("record run-level user cancellation marker");
+    assert_eq!(
+        begin_inference_provider_attempt(&shared_pool, &provider_attempt(&cancelled, 0))
+            .await
+            .expect_err("cancellation cannot race physical delivery")
+            .kind,
+        ServiceErrorKind::NotFound
+    );
+
+    let attempt_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_provider_attempts WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&run_id)
+    .fetch_one(pool)
+    .await
+    .expect("count physical attempts rejected after authority loss");
+    assert_eq!(
+        attempt_count, 0,
+        "provider HTTP has no durable authorization"
+    );
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn durable_logical_attempt_cursor_skips_complete_pairs_and_fails_closed_on_overflow() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("logical-cursor-user-{suffix}");
+    let session_id = format!("logical-cursor-session-{suffix}");
+    let run_id = format!("logical-cursor-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+    let base_input = InferenceInvocationInput {
+        user_id: user_id.clone(),
+        scope: InferenceInvocationScope::Run {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn: 1,
+            round: 1,
+            operation_id: "durable_summary_cursor".to_string(),
+            logical_attempt: 0,
+        },
+        offering_id: "logical-cursor-offering".to_string(),
+        resolved_model_name: "logical-cursor-model".to_string(),
+        upstream_model_name: "logical-cursor-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::Introspection,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+        run_authority: run_authority(),
+    };
+    let terminal = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Cancelled,
+        usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
+        provider_response_id: None,
+        error_kind: Some("cancelled".to_string()),
+        error_message: Some("cursor test terminal".to_string()),
+    };
+    assert_eq!(
+        next_inference_logical_attempt_pair_base(&shared_pool, &base_input)
+            .await
+            .expect("empty cursor"),
+        0
+    );
+
+    for (attempt, expected_next_pair) in [(0, 2), (1, 2), (2, 4)] {
+        let input = InferenceInvocationInput {
+            scope: base_input.scope.with_logical_attempt(attempt),
+            ..base_input.clone()
+        };
+        let plan = plan_inference_invocation(input).expect("plan cursor invocation");
+        admit_inference_invocation(&shared_pool, &plan)
+            .await
+            .expect("admit cursor invocation");
+        finish_inference_invocation(&shared_pool, &plan, &terminal)
+            .await
+            .expect("finish cursor invocation");
+        assert_eq!(
+            next_inference_logical_attempt_pair_base(&shared_pool, &base_input)
+                .await
+                .expect("advance durable cursor"),
+            expected_next_pair
+        );
+    }
+    let provider_attempts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM inference_provider_attempts WHERE user_id = ?")
+            .bind(&user_id)
+            .fetch_one(pool)
+            .await
+            .expect("count cursor provider attempts");
+    assert_eq!(provider_attempts, 0);
+
+    let overflow_input = InferenceInvocationInput {
+        scope: InferenceInvocationScope::Run {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn: 1,
+            round: 1,
+            operation_id: "durable_summary_cursor_overflow".to_string(),
+            logical_attempt: u32::MAX,
+        },
+        ..base_input.clone()
+    };
+    let overflow_plan = plan_inference_invocation(overflow_input.clone()).expect("plan overflow");
+    admit_inference_invocation(&shared_pool, &overflow_plan)
+        .await
+        .expect("admit overflow identity");
+    let overflow = next_inference_logical_attempt_pair_base(&shared_pool, &overflow_input)
+        .await
+        .expect_err("cursor overflow must fail closed");
+    assert_eq!(overflow.kind, ServiceErrorKind::Conflict);
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn concurrent_logical_cursor_readers_have_one_admission_winner_and_zero_provider_attempts() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("logical-cursor-race-user-{suffix}");
+    let session_id = format!("logical-cursor-race-session-{suffix}");
+    let run_id = format!("logical-cursor-race-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+    let input = InferenceInvocationInput {
+        user_id: user_id.clone(),
+        scope: InferenceInvocationScope::Run {
+            session_id: session_id.clone(),
+            run_id: run_id.clone(),
+            turn: 1,
+            round: 1,
+            operation_id: "durable_summary_cursor_race".to_string(),
+            logical_attempt: 0,
+        },
+        offering_id: "logical-cursor-race-offering".to_string(),
+        resolved_model_name: "logical-cursor-race-model".to_string(),
+        upstream_model_name: "logical-cursor-race-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::Introspection,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+        run_authority: run_authority(),
+    };
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let mut readers = Vec::new();
+    for _ in 0..2 {
+        let shared_pool = shared_pool.clone();
+        let input = input.clone();
+        let barrier = barrier.clone();
+        readers.push(tokio::spawn(async move {
+            let pair_base = next_inference_logical_attempt_pair_base(&shared_pool, &input)
+                .await
+                .expect("read empty durable cursor");
+            barrier.wait().await;
+            let plan = plan_inference_invocation(InferenceInvocationInput {
+                scope: input.scope.with_logical_attempt(pair_base),
+                ..input
+            })
+            .expect("plan cursor race invocation");
+            let admission = admit_inference_invocation(&shared_pool, &plan).await;
+            (pair_base, admission)
+        }));
+    }
+    let mut successes = 0;
+    let mut conflicts = 0;
+    for reader in readers {
+        let (pair_base, admission) = reader.await.expect("join cursor reader");
+        assert_eq!(pair_base, 0);
+        match admission {
+            Ok(()) => successes += 1,
+            Err(error) if error.kind == ServiceErrorKind::Conflict => conflicts += 1,
+            Err(error) => panic!("unexpected cursor race error: {error}"),
+        }
+    }
+    assert_eq!((successes, conflicts), (1, 1));
+    assert_eq!(
+        next_inference_logical_attempt_pair_base(&shared_pool, &input)
+            .await
+            .expect("loser re-reads durable cursor"),
+        2
+    );
+    let provider_attempts: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM inference_provider_attempts WHERE user_id = ?")
+            .bind(&user_id)
+            .fetch_one(pool)
+            .await
+            .expect("count cursor-race provider attempts");
+    assert_eq!(provider_attempts, 0);
 
     cleanup(pool, &user_id, &session_id, &run_id).await;
 }
@@ -925,6 +2495,7 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
         purpose: InferencePurpose::PrimaryAgent,
         execution_placement: ModelExecutionPlacement::Server,
         access_kind: ModelAccessKind::SelfHosted,
+        run_authority: run_authority(),
     };
     let plan = plan_inference_invocation(input.clone()).expect("plan invocation");
 
@@ -989,6 +2560,7 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
     let first_failure = InferenceInvocationTerminal {
         status: InferenceTerminalStatus::Failed,
         usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
         provider_response_id: Some("provider-429".to_string()),
         error_kind: Some("rate_limit".to_string()),
         error_message: Some("rate limited".to_string()),
@@ -1038,10 +2610,8 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
         .expect("begin retry as a distinct physical request");
     let success = InferenceInvocationTerminal::succeeded(
         InferenceUsage {
-            input_tokens: 120,
+            input: astra_turn_types::NormalizedPromptCacheUsage::new(120, 80, 10),
             output_tokens: 24,
-            cache_read_tokens: 80,
-            cache_creation_tokens: 10,
         },
         Some("provider-ok".to_string()),
     );
@@ -1182,8 +2752,9 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
             .usage
             .as_ref()
             .expect("terminal usage")
+            .input
             .fresh_input_tokens,
-        30
+        120
     );
     assert_eq!(
         astra_services::model_request_trace_coverage(&shared_pool, &user_id, &session_id,)
@@ -1215,7 +2786,7 @@ async fn inference_admission_attempts_and_terminal_state_form_one_durable_contra
         });
     assert_eq!(
         metric_totals,
-        [2, 120, 24, 80, 10],
+        [2, 210, 24, 80, 10],
         "aggregate metrics must decode MatrixOne count/sum values and reconcile all outcomes: {metric_rows:?}"
     );
 
@@ -1316,6 +2887,7 @@ async fn inference_settlement_and_retry_are_serialized_by_logical_invocation() {
         purpose: InferencePurpose::PrimaryAgent,
         execution_placement: ModelExecutionPlacement::Server,
         access_kind: ModelAccessKind::SelfHosted,
+        run_authority: run_authority(),
     })
     .expect("plan race invocation");
     admit_inference_invocation(&shared_pool, &plan)
@@ -1328,6 +2900,7 @@ async fn inference_settlement_and_retry_are_serialized_by_logical_invocation() {
     let failure = InferenceInvocationTerminal {
         status: InferenceTerminalStatus::Failed,
         usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
         provider_response_id: None,
         error_kind: Some("retryable".to_string()),
         error_message: Some("provider retry decision racing final settlement".to_string()),
@@ -1401,6 +2974,7 @@ async fn bounded_recovery_recovers_success_without_closing_retryable_attempts() 
         purpose: InferencePurpose::PrimaryAgent,
         execution_placement: ModelExecutionPlacement::Server,
         access_kind: ModelAccessKind::SelfHosted,
+        run_authority: run_authority(),
     })
     .expect("plan reconciliation invocation");
     admit_inference_invocation(&shared_pool, &plan)
@@ -1412,10 +2986,8 @@ async fn bounded_recovery_recovers_success_without_closing_retryable_attempts() 
         .expect("begin successful provider attempt");
     let succeeded = InferenceInvocationTerminal::succeeded(
         InferenceUsage {
-            input_tokens: 9,
+            input: astra_turn_types::NormalizedPromptCacheUsage::new(9, 2, 1),
             output_tokens: 4,
-            cache_read_tokens: 2,
-            cache_creation_tokens: 1,
         },
         Some("provider-reconciled".to_string()),
     );
@@ -1468,6 +3040,7 @@ async fn bounded_recovery_recovers_success_without_closing_retryable_attempts() 
         purpose: InferencePurpose::PrimaryAgent,
         execution_placement: ModelExecutionPlacement::Server,
         access_kind: ModelAccessKind::SelfHosted,
+        run_authority: run_authority(),
     })
     .expect("plan failed reconciliation invocation");
     admit_inference_invocation(&shared_pool, &failed_plan)
@@ -1480,6 +3053,7 @@ async fn bounded_recovery_recovers_success_without_closing_retryable_attempts() 
     let failed = InferenceInvocationTerminal {
         status: InferenceTerminalStatus::Failed,
         usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
         provider_response_id: None,
         error_kind: Some("provider_unavailable".to_string()),
         error_message: Some("provider failed after delivery".to_string()),
@@ -1604,6 +3178,7 @@ async fn session_scoped_auxiliary_inference_is_attributable_without_a_fake_run()
         purpose: InferencePurpose::MemoryExtraction,
         execution_placement: ModelExecutionPlacement::Server,
         access_kind: ModelAccessKind::SelfHosted,
+        run_authority: None,
     })
     .expect("plan session-scoped inference");
     admit_inference_invocation(&shared_pool, &plan)
@@ -1628,10 +3203,8 @@ async fn session_scoped_auxiliary_inference_is_attributable_without_a_fake_run()
         .expect("begin provider attempt");
     let terminal = InferenceInvocationTerminal::succeeded(
         InferenceUsage {
-            input_tokens: 20,
+            input: astra_turn_types::NormalizedPromptCacheUsage::new(20, 0, 0),
             output_tokens: 4,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
         },
         Some("provider-memory".to_string()),
     );
@@ -1641,6 +3214,86 @@ async fn session_scoped_auxiliary_inference_is_attributable_without_a_fake_run()
     finish_inference_invocation(&shared_pool, &plan, &terminal)
         .await
         .expect("finish logical invocation");
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn concurrent_run_and_session_admission_preserve_variant_owner_shapes() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("mixed-scope-user-{suffix}");
+    let session_id = format!("mixed-scope-session-{suffix}");
+    let run_id = format!("mixed-scope-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let run_plan = plan_inference_invocation(run_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        0,
+        "primary_agent",
+    ))
+    .expect("plan run-scoped inference");
+    let session_plan = plan_inference_invocation(InferenceInvocationInput {
+        user_id: user_id.clone(),
+        scope: InferenceInvocationScope::Session {
+            session_id: session_id.clone(),
+            turn: 1,
+            round: 0,
+            operation_id: "turn_intent_judge".to_string(),
+            logical_attempt: 0,
+        },
+        offering_id: "offer-judge".to_string(),
+        resolved_model_name: "judge-model".to_string(),
+        upstream_model_name: "judge-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::VerificationJudge,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+        run_authority: None,
+    })
+    .expect("plan session-scoped judge inference");
+
+    let (run_result, session_result) = tokio::join!(
+        admit_inference_invocation(&shared_pool, &run_plan),
+        admit_inference_invocation(&shared_pool, &session_plan),
+    );
+    run_result.expect("concurrent run-scoped admission");
+    session_result.expect("concurrent session-scoped admission");
+
+    let rows = sqlx::query(
+        "SELECT scope_kind, session_id, run_id, harness_run_id
+         FROM inference_routes
+         WHERE user_id = ? AND route_id IN (?, ?)
+         ORDER BY scope_kind",
+    )
+    .bind(&user_id)
+    .bind(run_plan.route_id())
+    .bind(session_plan.route_id())
+    .fetch_all(pool)
+    .await
+    .expect("load concurrent mixed-scope routes");
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        let scope_kind = row.get::<String, _>("scope_kind");
+        assert_eq!(
+            row.get::<Option<String>, _>("session_id").as_deref(),
+            Some(session_id.as_str())
+        );
+        assert_eq!(row.get::<Option<String>, _>("harness_run_id"), None);
+        match scope_kind.as_str() {
+            "run" => assert_eq!(
+                row.get::<Option<String>, _>("run_id").as_deref(),
+                Some(run_id.as_str())
+            ),
+            "session" => assert_eq!(row.get::<Option<String>, _>("run_id"), None),
+            other => panic!("unexpected mixed-scope route {other}"),
+        }
+    }
 
     cleanup(pool, &user_id, &session_id, &run_id).await;
 }
@@ -1670,6 +3323,7 @@ async fn harness_inference_is_owned_without_fabricated_session_coordinates() {
         purpose: InferencePurpose::SkillSynthesis,
         execution_placement: ModelExecutionPlacement::Server,
         access_kind: ModelAccessKind::SelfHosted,
+        run_authority: None,
     };
 
     let mut wrong_owner_input = input.clone();
@@ -1725,4 +3379,586 @@ async fn harness_inference_is_owned_without_fabricated_session_coordinates() {
         .execute(pool)
         .await
         .expect("cleanup harness owner");
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn harness_inference_requires_running_authority_at_admission_and_provider_boundary() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("harness-state-user-{suffix}");
+    let input_for = |harness_run_id: &str, logical_attempt: u32| InferenceInvocationInput {
+        user_id: user_id.clone(),
+        scope: InferenceInvocationScope::HarnessRun {
+            harness_run_id: harness_run_id.to_string(),
+            operation_id: "skillify_state_fence".to_string(),
+            logical_attempt,
+        },
+        offering_id: "offer-skillify-state".to_string(),
+        resolved_model_name: "skillify-model".to_string(),
+        upstream_model_name: "skillify-model".to_string(),
+        provider: "openai".to_string(),
+        purpose: InferencePurpose::SkillSynthesis,
+        execution_placement: ModelExecutionPlacement::Server,
+        access_kind: ModelAccessKind::SelfHosted,
+        run_authority: None,
+    };
+
+    let mut harness_run_ids = Vec::new();
+    for (logical_attempt, status) in ["completed", "waiting_for_review", "reviewed", "failed"]
+        .into_iter()
+        .enumerate()
+    {
+        let harness_run_id = format!("harness-closed-{logical_attempt}-{suffix}");
+        seed_harness_run(pool, &user_id, &harness_run_id).await;
+        sqlx::query(
+            "UPDATE harness_runs SET status = ?, updated_at = NOW(6)
+             WHERE user_id = ? AND harness_run_id = ?",
+        )
+        .bind(status)
+        .bind(&user_id)
+        .bind(&harness_run_id)
+        .execute(pool)
+        .await
+        .expect("close harness before inference admission");
+        let plan = plan_inference_invocation(input_for(
+            &harness_run_id,
+            u32::try_from(logical_attempt).expect("bounded logical attempt"),
+        ))
+        .expect("plan closed harness inference");
+        assert_eq!(
+            admit_inference_invocation(&shared_pool, &plan)
+                .await
+                .expect_err("non-running harness must not admit inference")
+                .kind,
+            ServiceErrorKind::NotFound
+        );
+        harness_run_ids.push(harness_run_id);
+    }
+
+    let boundary_run_id = format!("harness-boundary-{suffix}");
+    seed_harness_run(pool, &user_id, &boundary_run_id).await;
+    let boundary_plan =
+        plan_inference_invocation(input_for(&boundary_run_id, 10)).expect("boundary plan");
+    admit_inference_invocation(&shared_pool, &boundary_plan)
+        .await
+        .expect("running harness admits logical inference");
+    sqlx::query(
+        "UPDATE harness_runs SET status = 'completed', updated_at = NOW(6)
+         WHERE user_id = ? AND harness_run_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&boundary_run_id)
+    .execute(pool)
+    .await
+    .expect("close harness before provider boundary");
+    assert_eq!(
+        begin_inference_provider_attempt(&shared_pool, &provider_attempt(&boundary_plan, 0))
+            .await
+            .expect_err("terminal harness must fence provider I/O")
+            .kind,
+        ServiceErrorKind::NotFound
+    );
+    harness_run_ids.push(boundary_run_id);
+
+    for table in [
+        "model_request_context_events",
+        "inference_invocation_settlement_debts",
+        "inference_provider_attempts",
+        "inference_invocations",
+        "inference_routes",
+    ] {
+        let statement = format!("DELETE FROM {table} WHERE user_id = ?");
+        sqlx::query(&statement)
+            .bind(&user_id)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|error| panic!("cleanup `{statement}`: {error}"));
+    }
+    for harness_run_id in harness_run_ids {
+        sqlx::query("DELETE FROM harness_runs WHERE user_id = ? AND harness_run_id = ?")
+            .bind(&user_id)
+            .bind(&harness_run_id)
+            .execute(pool)
+            .await
+            .expect("cleanup harness state owner");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn expired_inference_owner_recovers_every_sigkill_shape_without_old_owner_reentry() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("owner-kill-user-{suffix}");
+    let session_id = format!("owner-kill-session-{suffix}");
+    let run_id = format!("owner-kill-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let pre_delivery = plan_inference_invocation(run_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        10,
+        "kill_after_admission",
+    ))
+    .expect("plan pre-delivery orphan");
+    admit_inference_invocation(&shared_pool, &pre_delivery)
+        .await
+        .expect("admit pre-delivery orphan");
+    sqlx::query(
+        "UPDATE inference_invocations
+         SET owner_lease_expires_at = TIMESTAMPADD(SECOND, -1, NOW(6))
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(pre_delivery.invocation_id())
+    .execute(pool)
+    .await
+    .expect("expire pre-delivery owner");
+    assert_eq!(
+        reconcile_inference_settlements(&shared_pool, 4)
+            .await
+            .expect("recover pre-delivery orphan"),
+        1
+    );
+    let pre_delivery_fact = sqlx::query(
+        "SELECT status, usage_status, provider_delivery_state, owner_generation
+         FROM inference_invocations WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(pre_delivery.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load pre-delivery recovery");
+    assert_eq!(pre_delivery_fact.get::<String, _>("status"), "cancelled");
+    assert_eq!(
+        pre_delivery_fact.get::<String, _>("usage_status"),
+        "unavailable"
+    );
+    assert_eq!(
+        pre_delivery_fact.get::<String, _>("provider_delivery_state"),
+        "pre_delivery"
+    );
+    assert_eq!(pre_delivery_fact.get::<i64, _>("owner_generation"), 2);
+    assert_eq!(
+        renew_inference_invocation_owner(&shared_pool, &pre_delivery)
+            .await
+            .expect_err("old pre-delivery owner cannot renew after recovery")
+            .kind,
+        ServiceErrorKind::Conflict
+    );
+
+    let delivery_unknown = plan_inference_invocation(run_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        11,
+        "kill_after_provider_send",
+    ))
+    .expect("plan delivered orphan");
+    admit_inference_invocation(&shared_pool, &delivery_unknown)
+        .await
+        .expect("admit delivered orphan");
+    let open_attempt = provider_attempt(&delivery_unknown, 0);
+    begin_inference_provider_attempt(&shared_pool, &open_attempt)
+        .await
+        .expect("authorize provider delivery");
+    sqlx::query(
+        "UPDATE inference_invocations
+         SET owner_lease_expires_at = TIMESTAMPADD(SECOND, -1, NOW(6))
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(delivery_unknown.invocation_id())
+    .execute(pool)
+    .await
+    .expect("expire delivered owner");
+    reconcile_inference_settlements(&shared_pool, 4)
+        .await
+        .expect("recover delivered orphan");
+    let delivered_fact = sqlx::query(
+        "SELECT invocation.status, invocation.provider_delivery_state,
+                attempt.status AS attempt_status,
+                (SELECT COUNT(*) FROM model_request_context_events AS context
+                 WHERE context.user_id = invocation.user_id
+                   AND context.invocation_id = invocation.invocation_id
+                   AND context.event_stage = 'terminal') AS terminal_contexts
+         FROM inference_invocations AS invocation
+         JOIN inference_provider_attempts AS attempt
+           ON attempt.user_id = invocation.user_id
+          AND attempt.invocation_id = invocation.invocation_id
+         WHERE invocation.user_id = ? AND invocation.invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(delivery_unknown.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load delivery-unknown recovery");
+    assert_eq!(
+        delivered_fact.get::<String, _>("status"),
+        "delivery_unknown"
+    );
+    assert_eq!(
+        delivered_fact.get::<String, _>("provider_delivery_state"),
+        "delivery_authorized"
+    );
+    assert_eq!(
+        delivered_fact.get::<String, _>("attempt_status"),
+        "delivery_unknown"
+    );
+    assert_eq!(delivered_fact.get::<i64, _>("terminal_contexts"), 1);
+    let late_terminal = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Failed,
+        usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
+        provider_response_id: None,
+        error_kind: Some("late_old_owner".to_string()),
+        error_message: Some("late terminal must lose".to_string()),
+    };
+    assert_eq!(
+        finish_inference_provider_attempt(&shared_pool, &open_attempt, &late_terminal)
+            .await
+            .expect_err("old owner terminal must lose to recovered generation")
+            .kind,
+        ServiceErrorKind::Conflict
+    );
+
+    let exact_terminal = plan_inference_invocation(run_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        12,
+        "kill_after_physical_terminal",
+    ))
+    .expect("plan exact-terminal orphan");
+    admit_inference_invocation(&shared_pool, &exact_terminal)
+        .await
+        .expect("admit exact-terminal orphan");
+    let exact_attempt = provider_attempt(&exact_terminal, 0);
+    begin_inference_provider_attempt(&shared_pool, &exact_attempt)
+        .await
+        .expect("begin exact-terminal attempt");
+    let physical_terminal = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Failed,
+        usage: InferenceUsage {
+            input: astra_turn_types::NormalizedPromptCacheUsage::new(7, 3, 2),
+            output_tokens: 5,
+        },
+        usage_status: InferenceUsageStatus::ProviderPartial,
+        provider_response_id: Some("response-before-kill".to_string()),
+        error_kind: Some("provider_error".to_string()),
+        error_message: Some("physical terminal committed before kill".to_string()),
+    };
+    finish_inference_provider_attempt(&shared_pool, &exact_attempt, &physical_terminal)
+        .await
+        .expect("commit physical terminal before kill");
+    sqlx::query(
+        "UPDATE inference_invocations
+         SET owner_lease_expires_at = TIMESTAMPADD(SECOND, -1, NOW(6))
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(exact_terminal.invocation_id())
+    .execute(pool)
+    .await
+    .expect("expire owner after physical terminal");
+    reconcile_inference_settlements(&shared_pool, 4)
+        .await
+        .expect("mirror exact physical terminal");
+    let exact_fact = sqlx::query(
+        "SELECT invocation.status, invocation.terminal_fingerprint,
+                invocation.usage_status, invocation.input_tokens, invocation.output_tokens,
+                invocation.cache_read_tokens, invocation.cache_creation_tokens,
+                attempt.terminal_fingerprint AS attempt_fingerprint
+         FROM inference_invocations AS invocation
+         JOIN inference_provider_attempts AS attempt
+           ON attempt.user_id = invocation.user_id
+          AND attempt.invocation_id = invocation.invocation_id
+         WHERE invocation.user_id = ? AND invocation.invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(exact_terminal.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load mirrored physical terminal");
+    assert_eq!(exact_fact.get::<String, _>("status"), "failed");
+    assert_eq!(
+        exact_fact.get::<String, _>("usage_status"),
+        "provider_partial"
+    );
+    assert_eq!(exact_fact.get::<i64, _>("input_tokens"), 7);
+    assert_eq!(exact_fact.get::<i64, _>("output_tokens"), 5);
+    assert_eq!(exact_fact.get::<i64, _>("cache_read_tokens"), 3);
+    assert_eq!(exact_fact.get::<i64, _>("cache_creation_tokens"), 2);
+    assert_eq!(
+        exact_fact.get::<String, _>("terminal_fingerprint"),
+        exact_fact.get::<String, _>("attempt_fingerprint")
+    );
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn heartbeat_and_expiry_finish_race_have_one_durable_owner() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("owner-race-user-{suffix}");
+    let session_id = format!("owner-race-session-{suffix}");
+    let run_id = format!("owner-race-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let live = plan_inference_invocation(run_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        20,
+        "heartbeat_survives_sweeps",
+    ))
+    .expect("plan heartbeat invocation");
+    admit_inference_invocation(&shared_pool, &live)
+        .await
+        .expect("admit heartbeat invocation");
+    for _ in 0..3 {
+        renew_inference_invocation_owner(&shared_pool, &live)
+            .await
+            .expect("renew live owner");
+        reconcile_inference_settlements(&shared_pool, 8)
+            .await
+            .expect("sweep around live heartbeat");
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT status FROM inference_invocations WHERE user_id = ? AND invocation_id = ?",
+        )
+        .bind(&user_id)
+        .bind(live.invocation_id())
+        .fetch_one(pool)
+        .await
+        .expect("load live heartbeat status"),
+        "admitted"
+    );
+
+    let raced = plan_inference_invocation(run_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        21,
+        "expiry_vs_late_finish",
+    ))
+    .expect("plan expiry race");
+    admit_inference_invocation(&shared_pool, &raced)
+        .await
+        .expect("admit expiry race");
+    let attempt = provider_attempt(&raced, 0);
+    begin_inference_provider_attempt(&shared_pool, &attempt)
+        .await
+        .expect("begin raced attempt");
+    sqlx::query(
+        "UPDATE inference_invocations
+         SET owner_lease_expires_at = TIMESTAMPADD(SECOND, -1, NOW(6))
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(raced.invocation_id())
+    .execute(pool)
+    .await
+    .expect("expire raced owner");
+    let late = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Failed,
+        usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
+        provider_response_id: None,
+        error_kind: Some("late_finish".to_string()),
+        error_message: Some("old pod woke after lease expiry".to_string()),
+    };
+    let (sweep, late_finish) = tokio::join!(
+        reconcile_inference_settlements(&shared_pool, 8),
+        finish_inference_provider_attempt(&shared_pool, &attempt, &late),
+    );
+    sweep.expect("expiry recovery wins race");
+    assert_eq!(
+        late_finish
+            .expect_err("expired owner cannot win a late terminal race")
+            .kind,
+        ServiceErrorKind::Conflict
+    );
+    let raced_fact = sqlx::query(
+        "SELECT status, owner_generation, provider_delivery_state
+         FROM inference_invocations WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(&user_id)
+    .bind(raced.invocation_id())
+    .fetch_one(pool)
+    .await
+    .expect("load expiry race winner");
+    assert_eq!(raced_fact.get::<String, _>("status"), "delivery_unknown");
+    assert_eq!(raced_fact.get::<i64, _>("owner_generation"), 2);
+    assert_eq!(
+        raced_fact.get::<String, _>("provider_delivery_state"),
+        "delivery_authorized"
+    );
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn expired_owner_batch_is_bounded_and_fair_across_300_plus_invocations() {
+    let started = std::time::Instant::now();
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_prefix = format!("lease-fair-{suffix}");
+    let noisy_user = format!("{user_prefix}-noisy");
+    let mut tx = pool.begin().await.expect("begin fair orphan seed");
+    for index in 0..320_u32 {
+        let user_id = if index < 256 {
+            noisy_user.clone()
+        } else {
+            format!("{user_prefix}-quiet-{index}")
+        };
+        let session_id = format!("fair-session-{index}-{suffix}");
+        let route_id = format!("fair-route-{index}-{suffix}");
+        let invocation_id = format!("fair-inv-{index}-{suffix}");
+        sqlx::query(
+            "INSERT INTO inference_routes
+             (route_id, user_id, session_id, scope_kind, run_id, harness_run_id,
+              offering_id, resolved_model_name, upstream_model_name, provider,
+              execution_placement, access_kind, purpose, created_at)
+             VALUES (?, ?, ?, 'session', NULL, NULL, 'fair-offering', 'fair-model',
+                     'fair-model', 'openai', 'server', 'self_hosted',
+                     'primary_agent', NOW(6))",
+        )
+        .bind(&route_id)
+        .bind(&user_id)
+        .bind(&session_id)
+        .execute(&mut *tx)
+        .await
+        .expect("seed fair route");
+        sqlx::query(
+            "INSERT INTO inference_invocations
+             (invocation_id, route_id, user_id, session_id, scope_kind, run_id,
+              harness_run_id, admission_token, owner_token, owner_generation,
+              owner_lease_expires_at, turn_index, round_index, operation_id,
+              logical_attempt, purpose, status, terminal_fingerprint, usage_status,
+              provider_delivery_state, created_at, terminal_at)
+             VALUES (?, ?, ?, ?, 'session', NULL, NULL, ?, ?, 1,
+                     TIMESTAMPADD(SECOND, -1, NOW(6)), 1, ?, 'fair_recovery', 0,
+                     'primary_agent', 'admitted', NULL, 'unavailable', 'unknown',
+                     NOW(6), NULL)",
+        )
+        .bind(&invocation_id)
+        .bind(&route_id)
+        .bind(&user_id)
+        .bind(&session_id)
+        .bind(Uuid::new_v4().simple().to_string())
+        .bind(Uuid::new_v4().simple().to_string())
+        .bind(i64::from(index))
+        .execute(&mut *tx)
+        .await
+        .expect("seed fair expired invocation");
+    }
+    tx.commit().await.expect("commit fair orphan seed");
+
+    assert_eq!(
+        reconcile_inference_settlements(&shared_pool, 256)
+            .await
+            .expect("recover first bounded fair batch"),
+        128
+    );
+    let quiet_recovered = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM inference_invocations
+         WHERE user_id LIKE ? AND user_id <> ? AND status = 'cancelled'",
+    )
+    .bind(format!("{user_prefix}-quiet-%"))
+    .bind(&noisy_user)
+    .fetch_one(pool)
+    .await
+    .expect("count quiet owners in first recovery batch");
+    assert_eq!(
+        quiet_recovered, 64,
+        "one noisy user must not starve any quiet owner in the bounded batch"
+    );
+    let total_recovered = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM inference_invocations
+         WHERE user_id LIKE ? AND status = 'cancelled'",
+    )
+    .bind(format!("{user_prefix}%"))
+    .fetch_one(pool)
+    .await
+    .expect("count first bounded recovery batch");
+    assert_eq!(total_recovered, 128);
+
+    let mut converged = total_recovered;
+    let mut productive_sweeps = 1_u32;
+    for _ in 0..4 {
+        let recovered = reconcile_inference_settlements(&shared_pool, 256)
+            .await
+            .expect("converge remaining fair recovery backlog");
+        converged += i64::try_from(recovered).expect("bounded recovery count");
+        if recovered == 0 {
+            break;
+        }
+        productive_sweeps = productive_sweeps.saturating_add(1);
+    }
+    assert_eq!(
+        converged, 320,
+        "the bounded fair backlog must fully converge"
+    );
+    let terminal_count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM inference_invocations
+         WHERE user_id LIKE ? AND status = 'cancelled'",
+    )
+    .bind(format!("{user_prefix}%"))
+    .fetch_one(pool)
+    .await
+    .expect("count fully converged fair backlog");
+    assert_eq!(terminal_count, 320);
+    let non_terminal = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM inference_invocations
+         WHERE user_id LIKE ?
+           AND (status = 'admitted' OR terminal_fingerprint IS NULL)",
+    )
+    .bind(format!("{user_prefix}%"))
+    .fetch_one(pool)
+    .await
+    .expect("count residual logical orphans");
+    assert_eq!(non_terminal, 0);
+    let started_attempts = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM inference_provider_attempts
+         WHERE user_id LIKE ? AND status = 'started'",
+    )
+    .bind(format!("{user_prefix}%"))
+    .fetch_one(pool)
+    .await
+    .expect("count residual physical orphans");
+    assert_eq!(started_attempts, 0);
+    eprintln!(
+        "fair owner recovery converged 320 invocations in {productive_sweeps} productive sweeps over {:?}",
+        started.elapsed()
+    );
+
+    for table in [
+        "model_request_context_events",
+        "inference_invocation_settlement_debts",
+        "inference_provider_attempts",
+        "inference_invocations",
+        "inference_routes",
+    ] {
+        let statement = format!("DELETE FROM {table} WHERE user_id LIKE ?");
+        sqlx::query(&statement)
+            .bind(format!("{user_prefix}%"))
+            .execute(pool)
+            .await
+            .unwrap_or_else(|error| panic!("cleanup `{statement}`: {error}"));
+    }
 }

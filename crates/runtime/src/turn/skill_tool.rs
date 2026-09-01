@@ -62,6 +62,9 @@ pub struct SkillContext {
     pub session_dir: Option<String>,
     /// Current working directory of the agent.
     pub work_dir: Option<String>,
+    /// Current user task. Used as the semantic target when the model invokes a
+    /// skill without repeating an optional `task` argument.
+    pub current_task: Option<String>,
     /// Names of tools available to the agent in this turn.
     pub available_tools: Vec<String>,
     /// Current nested agent/sub-run depth of the caller.
@@ -101,6 +104,7 @@ impl fmt::Debug for SkillContext {
             .field("session_id", &self.session_id)
             .field("session_dir", &self.session_dir)
             .field("work_dir", &self.work_dir)
+            .field("current_task_present", &self.current_task.is_some())
             .field("available_tools", &self.available_tools)
             .field("recursion_depth", &self.recursion_depth)
             .field(
@@ -167,11 +171,29 @@ pub struct InvokedSkill {
     /// Used to escalate the short-circuit message so repeated re-entry is
     /// treated as a hard stop signal, not a passive dedup.
     pub reentry_count: u32,
+    /// Closed topology authority copied from trusted skill manifest metadata.
+    pub execution_topology: Option<astra_services::WorkExecutionTopology>,
 }
 
 // ─── Tool schema ─────────────────────────────────────────────────────────────
 
 pub const SKILL_TOOL_NAME: &str = "skill";
+
+pub fn declared_execution_topology(
+    resolver: &dyn SkillResolver,
+    name: &str,
+) -> Option<astra_services::WorkExecutionTopology> {
+    resolver
+        .execution_topology(name)
+        .map(|topology| match topology {
+            astra_skills::manifest::SkillExecutionTopology::Primary => {
+                astra_services::WorkExecutionTopology::Primary
+            }
+            astra_skills::manifest::SkillExecutionTopology::ParallelSubruns => {
+                astra_services::WorkExecutionTopology::ParallelSubruns
+            }
+        })
+}
 
 /// Second-stage discovery tool for skill search.
 pub const DISCOVER_SKILLS_TOOL_NAME: &str = "discover_skills";
@@ -345,6 +367,21 @@ impl SkillResolver for PolicyScopedSkillResolver {
 
     fn available_skills(&self) -> Vec<SkillToolInfo> {
         self.visible_skills.clone()
+    }
+
+    fn execution_topology(
+        &self,
+        name: &str,
+    ) -> Option<astra_skills::manifest::SkillExecutionTopology> {
+        let requested = name.trim().to_ascii_lowercase();
+        self.visible_skills
+            .iter()
+            .find(|skill| normalized_skill_names(*skill).contains(&requested))
+            .and_then(|skill| {
+                self.inner
+                    .execution_topology(name)
+                    .or_else(|| self.inner.execution_topology(skill.primary_name()))
+            })
     }
 }
 
@@ -715,12 +752,13 @@ pub fn selected_skill_names_from_tool_calls(tool_calls: &[Value]) -> Vec<String>
 /// This is the simplified entry point for the cloud/SSE path where
 /// tool calls are executed during stream consumption (before the
 /// agentic loop's step 3c interception). Takes the raw `args` Value
-/// from the tool call and returns the skill instructions as text.
+/// from the tool call and preserves the typed success signal; callers must not
+/// infer successful loading from human-readable output.
 pub async fn execute_skill_inline(
     resolver: &dyn SkillResolver,
     _tool_name: &str,
     args: &Value,
-) -> String {
+) -> SkillCallResult {
     let skill_name = args.get("skill_name").and_then(Value::as_str).unwrap_or("");
     let task_hint = args.get("task").and_then(Value::as_str).unwrap_or("");
     execute_skill(
@@ -732,7 +770,6 @@ pub async fn execute_skill_inline(
         &SkillContext::default(),
     )
     .await
-    .output
 }
 
 pub async fn execute_skill_direct(
@@ -985,13 +1022,17 @@ pub async fn partition_and_execute_skills(
                 let task_hint = args.get("task").and_then(Value::as_str).unwrap_or("");
 
                 let start = std::time::Instant::now();
+                let mut invocation_skill_ctx = skill_ctx.clone();
+                invocation_skill_ctx
+                    .extra
+                    .insert("__astra_invocation_id".to_string(), call_id.clone());
                 let r = execute_skill(
                     resolver,
                     executor,
                     skill_name,
                     task_hint,
                     composition_ctx,
-                    skill_ctx,
+                    &invocation_skill_ctx,
                 )
                 .await;
                 let duration_ms = start.elapsed().as_millis() as u64;
@@ -1161,13 +1202,20 @@ async fn execute_pipeline(
             None
         };
 
+        let mut step_skill_ctx = skill_ctx.clone();
+        if let Some(parent_invocation_id) = skill_ctx.extra.get("__astra_invocation_id") {
+            step_skill_ctx.extra.insert(
+                "__astra_invocation_id".to_string(),
+                format!("{parent_invocation_id}:step:{i}"),
+            );
+        }
         let r = execute_skill(
             resolver,
             executor,
             &step.skill,
             &threaded_task,
             ctx_ref,
-            skill_ctx,
+            &step_skill_ctx,
         )
         .await;
         let SkillCallResult {
@@ -1702,6 +1750,14 @@ fn execute_skill<'a>(
     skill_ctx: &'a SkillContext,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = SkillCallResult> + Send + 'a>> {
     Box::pin(async move {
+        // The public skill schema permits omitting `task` so a skill can act
+        // on the current conversation. Resolve that semantic default here,
+        // before every inline, forked, remote, and composed execution path.
+        let task_hint = if task_hint.trim().is_empty() {
+            skill_ctx.current_task.as_deref().unwrap_or(task_hint)
+        } else {
+            task_hint
+        };
         if let Some(ctx) = composition_ctx {
             // Depth check
             if let Err(e) = ctx.check_depth() {
@@ -1887,7 +1943,19 @@ fn execute_skill<'a>(
                         };
                         let ctx = SkillExecutionContext {
                             task: task_hint.to_string(),
-                            arguments: HashMap::new(),
+                            arguments: [
+                                "__astra_invocation_id",
+                                "__astra_expected_control_epoch",
+                                "__astra_parent_turn_chain_id",
+                            ]
+                            .into_iter()
+                            .filter_map(|key| {
+                                skill_ctx
+                                    .extra
+                                    .get(key)
+                                    .map(|value| (key.to_string(), value.clone()))
+                            })
+                            .collect(),
                             recursion_depth: skill_ctx.recursion_depth,
                         };
                         match exec.execute(&loaded, &ctx).await {
@@ -2370,6 +2438,52 @@ mod tests {
     }
 
     #[test]
+    fn restricted_skill_policy_preserves_visible_manifest_topology() {
+        struct TopologyResolver;
+        impl SkillResolver for TopologyResolver {
+            fn resolve(&self, name: &str) -> Result<ResolvedSkill, crate::skills::SkillError> {
+                Err(crate::skills::SkillError::NotFound(name.to_string()))
+            }
+
+            fn available_skills(&self) -> Vec<SkillToolInfo> {
+                vec![SkillToolInfo {
+                    name: "parallel-review".into(),
+                    aliases: vec!["review-many".into()],
+                    description: "parallel review".into(),
+                    source: SkillSourceKind::Local,
+                    ..Default::default()
+                }]
+            }
+
+            fn execution_topology(
+                &self,
+                name: &str,
+            ) -> Option<astra_skills::manifest::SkillExecutionTopology> {
+                matches!(name, "parallel-review" | "review-many")
+                    .then_some(astra_skills::manifest::SkillExecutionTopology::ParallelSubruns)
+            }
+        }
+
+        let policy = SkillSurfacingPolicy {
+            allowed_names: Some(HashSet::from(["review-many".to_string()])),
+            allowed_sources: Some(HashSet::from([SkillSourceKind::Local])),
+        };
+        let resolver = apply_skill_surfacing_policy(Some(Arc::new(TopologyResolver)), &policy)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            resolver.execution_topology("review-many"),
+            Some(astra_skills::manifest::SkillExecutionTopology::ParallelSubruns)
+        );
+        assert_eq!(
+            resolver.execution_topology("parallel-review"),
+            Some(astra_skills::manifest::SkillExecutionTopology::ParallelSubruns)
+        );
+        assert_eq!(resolver.execution_topology("hidden"), None);
+    }
+
+    #[test]
     fn visible_skills_omit_already_invoked_entries() {
         let skills = vec![
             SkillToolInfo {
@@ -2399,6 +2513,7 @@ mod tests {
                 content: "# Skill: review-changes".into(),
                 invoked_at_turn: 1,
                 reentry_count: 0,
+                execution_topology: None,
             },
         )]);
 
@@ -2439,6 +2554,7 @@ mod tests {
                     content: "# Skill: review-changes".into(),
                     invoked_at_turn: 1,
                     reentry_count: 0,
+                    execution_topology: None,
                 },
             ),
             (
@@ -2448,6 +2564,7 @@ mod tests {
                     content: "# Skill: analyze-session".into(),
                     invoked_at_turn: 1,
                     reentry_count: 0,
+                    execution_topology: None,
                 },
             ),
         ]);
@@ -2818,6 +2935,22 @@ mod tests {
         )
         .await;
         assert!(r.output.contains("**Task context:** Review auth module"));
+    }
+
+    #[tokio::test]
+    async fn execute_skill_inherits_current_task_when_task_argument_is_omitted() {
+        let resolver = stub_resolver();
+        let ctx = SkillContext {
+            current_task: Some("Review https://github.com/example/project/pull/42".to_string()),
+            ..Default::default()
+        };
+        let r = execute_skill(&resolver, None, "code-review", "", None, &ctx).await;
+
+        assert!(
+            r.output
+                .contains("**Task context:** Review https://github.com/example/project/pull/42"),
+            "skill must retain the current user target when optional task is absent"
+        );
     }
 
     #[tokio::test]
@@ -3752,6 +3885,7 @@ mod tests {
             session_id: Some("sess-42".into()),
             session_dir: Some("/tmp/sessions/42".into()),
             work_dir: Some("/home/user/project".into()),
+            current_task: None,
             available_tools: vec!["bash".into(), "read_file".into()],
             recursion_depth: 0,
             forward_headers: HashMap::new(),

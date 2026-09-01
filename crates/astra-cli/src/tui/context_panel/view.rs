@@ -1242,6 +1242,13 @@ fn append_memory_focus(out: &mut Vec<Line<'static>>, focus: &super::model::Memor
             Span::raw(format!("\"{}\"", truncate_preview(&focus.query, 120))),
         ]));
     }
+    if focus.outcome.was_attempted() {
+        out.push(Line::from(vec![
+            Span::raw("    └ "),
+            Span::styled("status: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(focus.outcome.as_str()),
+        ]));
+    }
     if focus.candidates_considered > 0 || focus.retrieval_latency_ms > 0 {
         let mut spans = vec![Span::raw("    └ ")];
         if focus.candidates_considered > 0 {
@@ -1440,13 +1447,6 @@ fn append_session_section(
 
     let mut line2: Vec<Span<'static>> = vec![Span::raw("    └ ")];
     line2.push(Span::raw(format!("cost ${:.4}", s.total_cost)));
-    if s.max_budget > 0.0 {
-        let pct = s.total_cost / s.max_budget * 100.0;
-        line2.push(Span::styled(
-            format!(" / ${:.2}  ({:.0}%)", s.max_budget, pct),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
     out.push(Line::from(line2));
 
     out.push(Line::from(vec![
@@ -2871,7 +2871,6 @@ mod tests {
             turn: 5,
             model: Some("test-model-x".into()),
             total_cost: 0.12,
-            max_budget: 1.0,
             prompt_tokens: 1200,
             completion_tokens: 300,
             cache_read_tokens: 800,
@@ -2928,7 +2927,6 @@ mod tests {
         assert!(text.contains("turn 5"));
         assert!(text.contains("test-model-x"));
         assert!(text.contains("$0.1200"));
-        assert!(text.contains("/ $1.00"));
         assert!(
             text.contains(
                 "canonical cursor · turn 5 · journal/conversation 17/13 · compaction gen 3 · journal"
@@ -2963,7 +2961,6 @@ mod tests {
             turn: 4,
             model: Some("model-known".into()),
             total_cost: 0.02,
-            max_budget: 1.0,
             prompt_tokens: 1_000,
             completion_tokens: 200,
             cache_read_tokens: 300,
@@ -3271,7 +3268,6 @@ mod tests {
             turn: 4,
             model: Some("model-local".into()),
             total_cost: 0.02,
-            max_budget: 1.0,
             prompt_tokens: 1_200,
             completion_tokens: 800,
             cache_read_tokens: 300,

@@ -230,6 +230,26 @@ pub struct PromptStateSnapshot {
 }
 
 impl PromptStateSnapshot {
+    /// Replace candidate tool fingerprints with the exact provider-wire
+    /// schemas after runtime stabilization and cache annotation.
+    ///
+    /// Prompt assembly may prune or retain schemas after the context pipeline
+    /// has produced its candidate set. Diagnostics must describe the request
+    /// that was actually sent, otherwise lifecycle projection appears as a
+    /// cache break even when the wire prefix stayed byte-stable.
+    pub fn replace_tool_schemas(&mut self, tool_schemas: &[serde_json::Value]) {
+        let replacement = Self::capture_with_hashes(
+            self.system_prompt_hash,
+            self.system_blocks.clone(),
+            tool_schemas,
+            &self.provider,
+            &self.model,
+            self.cache_eligible_tokens,
+        );
+        self.tools_hash = replacement.tools_hash;
+        self.per_tool_hashes = replacement.per_tool_hashes;
+    }
+
     /// Create a snapshot from the current prompt state.
     pub fn capture(
         system_prompt_text: &str,
@@ -837,6 +857,22 @@ impl CacheBreakDetector {
                 removed,
                 changed,
             });
+        }
+
+        // Fingerprint drift identifies a possible invalidation cause, not an
+        // observed cache miss. Provider usage is the stronger authority: if
+        // this request reports at least as many cached tokens as the entire
+        // prefix tracked by this snapshot, attributing a cache break (and the
+        // corresponding token impact) would contradict the measured result.
+        // Keep partial/absent usage fail-closed so real or unobservable
+        // structural losses are still diagnosed.
+        if !reasons.is_empty()
+            && actual_cache_read.is_some_and(|cache_read| {
+                curr.cache_eligible_tokens == 0
+                    || cache_read >= u64::try_from(curr.cache_eligible_tokens).unwrap_or(u64::MAX)
+            })
+        {
+            return None;
         }
 
         // 4. If hashes match but API says cache miss → TTL expiry / unexplained cold start.
@@ -1625,6 +1661,32 @@ mod tests {
     }
 
     #[test]
+    fn provider_cache_read_covering_tracked_prefix_disproves_structural_break() {
+        let baseline = snap("prompt", &make_tools(&["bash"]), "claude");
+        let changed = snap(
+            "prompt",
+            &make_tools(&["bash", "inspect_work_plan"]),
+            "claude",
+        );
+        let tracked_prefix = changed.cache_eligible_tokens as u64;
+
+        let mut warm = CacheBreakDetector::new();
+        warm.record_turn(baseline.clone(), None);
+        assert!(
+            warm.record_turn(changed.clone(), Some(tracked_prefix))
+                .is_none(),
+            "measured cache reuse covering the tracked prefix must outrank a structural hypothesis"
+        );
+
+        let mut cold = CacheBreakDetector::new();
+        cold.record_turn(baseline, None);
+        assert!(matches!(
+            cold.record_turn(changed, Some(0)).map(|event| event.reason),
+            Some(CacheBreakReason::ToolSchemasChanged { .. })
+        ));
+    }
+
+    #[test]
     fn detect_tool_schema_content_change_same_name() {
         // Regression test: a tool whose name is unchanged but whose schema
         // JSON content differs (e.g., a dynamic description) must be reported
@@ -2022,6 +2084,30 @@ mod tests {
         assert_eq!(snap.per_tool_hashes[0].0, "bash");
         assert_eq!(snap.per_tool_hashes[1].0, "str_replace");
         assert_eq!(snap.per_tool_hashes[2].0, "grep");
+    }
+
+    #[test]
+    fn replacing_candidate_tools_makes_diagnostics_match_provider_wire() {
+        let candidate = vec![json!({
+            "type": "function",
+            "function": {"name": "candidate", "parameters": {"type": "object"}}
+        })];
+        let wire = vec![json!({
+            "type": "function",
+            "function": {"name": "wire", "parameters": {"type": "object"}}
+        })];
+        let mut snapshot = PromptStateSnapshot::capture("system", &candidate, "model", 100);
+        let system_hash = snapshot.system_prompt_hash;
+
+        snapshot.replace_tool_schemas(&wire);
+
+        assert_eq!(snapshot.system_prompt_hash, system_hash);
+        assert_eq!(snapshot.per_tool_hashes.len(), 1);
+        assert_eq!(snapshot.per_tool_hashes[0].0, "wire");
+        assert_eq!(
+            snapshot.tools_hash,
+            PromptStateSnapshot::capture("system", &wire, "model", 100).tools_hash
+        );
     }
 
     #[test]

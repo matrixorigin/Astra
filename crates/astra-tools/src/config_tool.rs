@@ -29,10 +29,6 @@ pub fn config_tool(global_limit: usize, tool_limit: usize, args: &Value) -> Stri
             "auto_approve",
             "Auto-approve tools (env: ASTRA_CLI_AUTO_APPROVE)",
         ),
-        (
-            "turn_limit",
-            "Max turns per conversation (env: ASTRA_CLI_MAX_TURNS)",
-        ),
         ("list", "Show all available settings"),
     ];
 
@@ -65,15 +61,6 @@ pub fn config_tool(global_limit: usize, tool_limit: usize, args: &Value) -> Stri
                 "setting": "auto_approve",
                 "value": current,
                 "env_var": "ASTRA_CLI_AUTO_APPROVE"
-            })
-            .to_string()
-        }
-        "turn_limit" => {
-            let current = std::env::var("ASTRA_CLI_MAX_TURNS").unwrap_or_else(|_| "50".to_string());
-            json!({
-                "setting": "turn_limit",
-                "value": current,
-                "env_var": "ASTRA_CLI_MAX_TURNS"
             })
             .to_string()
         }

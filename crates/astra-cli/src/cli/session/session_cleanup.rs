@@ -38,8 +38,6 @@ pub(crate) enum SessionExit {
     /// session is saved (and resumable via the hint) but
     /// `last_session_id` stays put so the next launch can still offer `/resume`.
     Interrupt,
-    /// `--max-budget` reached during a turn.
-    BudgetLimit,
     /// SIGTERM / SIGHUP received.
     Shutdown(ShutdownSignal),
     /// The TUI loop bailed with an error (terminal draw failure, etc.).
@@ -117,39 +115,11 @@ fn should_clear_last_session_id(reason: SessionExit) -> bool {
 
 /// Finalize a session: journal end event, persist state, extract learnings.
 pub(crate) async fn finalize_session(state: &mut SessionState) {
-    // 0. Drain any background session-memory extraction worker still in
-    //    flight from the final turn, then forget per-session debounce
-    //    state so the service doesn't leak it. Without the drain, the
-    //    tokio::spawn() task gets killed when the CLI process exits:
-    //    the gate said Run, but Memoria never receives the L1 write
-    //    and the `session_memory_extraction` event never fires. 10s is
-    //    generous — the worker's internal LLM_TIMEOUT is 30s but real
-    //    selector calls return in well under 5s.
+    // 0. Drain CLI-owned history-edit refreshes, then run session-end
+    //    governance. Per-turn extraction belongs to the canonical Server loop;
+    //    shutdown must not enqueue a second extraction of the same final turn.
     let mut typed_memory_governance_ran = false;
     if let Some(svc) = state.session_memory_extractor.as_ref() {
-        if let Some(session_id) = state.session_id.as_deref().filter(|sid| !sid.is_empty()) {
-            let _ =
-                svc.maybe_spawn_shutdown_flush(astra_runtime::session_memory::ExtractionRequest {
-                    inference_scope: astra_turn_types::InferenceInvocationScope::Session {
-                        session_id: session_id.to_string(),
-                        turn: state.turn,
-                        round: 0,
-                        operation_id: "memory_extraction_shutdown".to_string(),
-                        logical_attempt: 0,
-                    },
-                    messages: super::session_projection::history_as_messages_for(
-                        astra_core::history_work::HistoryWorkSite::CliSessionMemoryShutdownMaterialization,
-                        &state.history,
-                    ),
-                    session_facts: shutdown_session_facts(state),
-                    had_error: state
-                        .last_turn_event
-                        .as_ref()
-                        .and_then(|event| event.error.as_ref())
-                        .is_some(),
-                    reanchors_current_objective: false,
-                });
-        }
         let leftover = svc
             .wait_for_pending(std::time::Duration::from_secs(10))
             .await;
@@ -454,7 +424,6 @@ mod tests {
         assert!(should_show_resume_hint(SessionExit::Command));
         assert!(should_show_resume_hint(SessionExit::Eof));
         assert!(should_show_resume_hint(SessionExit::Interrupt));
-        assert!(should_show_resume_hint(SessionExit::BudgetLimit));
         assert!(should_show_resume_hint(SessionExit::Shutdown(
             ShutdownSignal::Sigterm
         )));
@@ -469,7 +438,6 @@ mod tests {
         assert!(should_clear_last_session_id(SessionExit::Eof));
         assert!(!should_clear_last_session_id(SessionExit::Interrupt));
         assert!(!should_clear_last_session_id(SessionExit::Command));
-        assert!(!should_clear_last_session_id(SessionExit::BudgetLimit));
         assert!(!should_clear_last_session_id(SessionExit::Shutdown(
             ShutdownSignal::Sigterm
         )));

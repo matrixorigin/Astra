@@ -137,17 +137,22 @@ pub(crate) fn translate(ev: TuiAppEvent, ctx: TurnContext) -> Option<AppEvent> {
         TuiAppEvent::Compaction(event) => Some(AppEvent::wire(WireEvent::Compaction(event))),
         // Bottom-pane-only events — ChatWidget doesn't care.
         TuiAppEvent::ContextWindowPolicy { .. }
+        | TuiAppEvent::SessionBound(_)
+        | TuiAppEvent::RunBound(_)
+        | TuiAppEvent::WorkTaskBoardUpdate(_)
         | TuiAppEvent::ContextWindowEstimated(_)
         | TuiAppEvent::ContextSystemPromptTokens(_)
         | TuiAppEvent::ContextWindowMeasured(_)
         | TuiAppEvent::RequestTokenUsage(_)
         | TuiAppEvent::AssistantOutputSettled
         | TuiAppEvent::TurnStreamClosed
+        | TuiAppEvent::TurnProjectionDrained
         | TuiAppEvent::ThinkingStarted
         | TuiAppEvent::WaitingForModel
         | TuiAppEvent::ModelResponding
         | TuiAppEvent::StatusLine(_)
         | TuiAppEvent::UserIntentApplied { .. }
+        | TuiAppEvent::UserIntentReturned { .. }
         | TuiAppEvent::PermissionAutoApproved { .. } => None,
     }
 }

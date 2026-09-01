@@ -4954,10 +4954,7 @@ mod tests {
             "bypass".parse::<PermissionMode>().unwrap(),
             PermissionMode::Bypass
         );
-        assert_eq!(
-            "skip".parse::<PermissionMode>().unwrap(),
-            PermissionMode::Bypass
-        );
+        assert!("skip".parse::<PermissionMode>().is_err());
         assert!("yolo".parse::<PermissionMode>().is_err());
         assert!("bypass-safety".parse::<PermissionMode>().is_err());
         assert_eq!(
@@ -4976,10 +4973,7 @@ mod tests {
             "deny".parse::<PermissionMode>().unwrap(),
             PermissionMode::Deny
         );
-        assert_eq!(
-            "AUTO".parse::<PermissionMode>().unwrap(),
-            PermissionMode::Auto
-        );
+        assert!("AUTO".parse::<PermissionMode>().is_err());
         assert!("accept-edits".parse::<PermissionMode>().is_err());
         assert!("invalid".parse::<PermissionMode>().is_err());
     }
@@ -6821,7 +6815,9 @@ mod tests {
     #[test]
     fn read_only_allowlisted_handles_pipes() {
         // Previously rejected all pipes; now delegates to runtime classifier.
-        assert!(is_read_only_allowlisted("cargo check 2>&1 | head -50"));
+        // `cargo check` may execute build scripts/proc macros and therefore
+        // remains approval-gated even when its output pipeline is harmless.
+        assert!(!is_read_only_allowlisted("cargo check 2>&1 | head -50"));
         assert!(is_read_only_allowlisted("git diff | head -100"));
         assert!(is_read_only_allowlisted("ls -la | grep foo"));
         assert!(is_read_only_allowlisted(
@@ -6833,7 +6829,7 @@ mod tests {
 
     #[test]
     fn read_only_allowlisted_handles_fd_redirects() {
-        assert!(is_read_only_allowlisted("cargo check 2>&1"));
+        assert!(!is_read_only_allowlisted("cargo check 2>&1"));
         assert!(is_read_only_allowlisted("git status 2>/dev/null"));
     }
 
@@ -6883,6 +6879,7 @@ mod tests {
 
     // ── record_approval: content-aware fingerprints ───────────────────────────
 
+    #[serial_test::serial]
     #[test]
     fn record_approval_with_match_target_trusts_safe_writes_across_workspace() {
         let dir = tempfile::tempdir().unwrap();

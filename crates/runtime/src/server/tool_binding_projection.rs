@@ -1089,7 +1089,6 @@ mod tests {
 
         for expected in [
             "ask_user",
-            "task_board",
             "session",
             "tool_search",
             "memory",
@@ -1116,7 +1115,7 @@ mod tests {
     fn binding_projection_hides_control_plane_tools_when_provider_is_unbound() {
         let names = schema_names(capability_filter_tool_schemas_for_binding_with_context(
             vec![
-                schema("task_board"),
+                schema("session"),
                 schema("introspect"),
                 schema("reflect"),
                 schema("agent_fanout"),
@@ -1147,13 +1146,7 @@ mod tests {
 
         assert!(names.contains("read_file"), "{names:?}");
         assert!(names.contains("bash"), "{names:?}");
-        for hidden in [
-            "task_board",
-            "introspect",
-            "reflect",
-            "agent_fanout",
-            "memory",
-        ] {
+        for hidden in ["session", "introspect", "reflect", "agent_fanout", "memory"] {
             assert!(
                 !names.contains(hidden),
                 "{hidden} must not be prompt-visible without a bound provider: {names:?}"
@@ -1416,7 +1409,6 @@ mod tests {
         ));
 
         for expected in [
-            "task_board",
             "session",
             "introspect",
             "reflect",

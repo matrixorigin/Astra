@@ -8,7 +8,6 @@ use crate::cli::cloud_sync::{
     should_append_cloud_pull_journal, try_cloud_pull, try_cloud_pull_preferences,
     try_cloud_push_preferences,
 };
-use crate::cli::plan::plan_monitor::{format_duration_short, format_plan_progress};
 use crate::cli::session::session_side_effects::enqueue_ingestion_pub;
 use crate::cli::session::session_state::SessionState;
 use crate::cli::slash::{slash_health, slash_router::handle_slash_command};
@@ -325,7 +324,10 @@ fn append_cloud_pull_sync_journal_writes_sync_marker_jsonl() {
         cp.get("reachable_empty_ack").and_then(|v| v.as_bool()),
         Some(false)
     );
-    let outbox = SyncOutboxStore::local().status().expect("outbox status");
+    let outbox = SyncOutboxStore::for_owner(&owner_scope)
+        .expect("owner-scoped outbox")
+        .status()
+        .expect("outbox status");
     assert_eq!(outbox.pending, 1);
     assert_eq!(outbox.ready, 1);
     assert_eq!(outbox.poisoned, 0);
@@ -367,7 +369,10 @@ fn append_cloud_pull_post_login_reachable_empty_writes_marker() {
         cp.get("reachable_empty_ack").and_then(|v| v.as_bool()),
         Some(true)
     );
-    let outbox = SyncOutboxStore::local().status().expect("outbox status");
+    let outbox = SyncOutboxStore::for_owner(&owner_scope)
+        .expect("owner-scoped outbox")
+        .status()
+        .expect("outbox status");
     assert_eq!(outbox.pending, 1);
     assert_eq!(outbox.ready, 1);
     assert_eq!(outbox.poisoned, 0);
@@ -377,16 +382,22 @@ fn append_cloud_pull_post_login_reachable_empty_writes_marker() {
 fn enqueue_ingestion_does_not_patch_missing_session_id_from_state() {
     let temp = tempfile::tempdir().expect("tempdir");
     let _guard = JournalDirGuard::new(temp.path());
-    let state = SessionState {
-        session_id: Some("state-session".to_string()),
-        ..Default::default()
-    };
+    let state = session_state_with_journal("state-session".to_string());
+    let owner_scope = state
+        .journal
+        .as_ref()
+        .expect("live session journal")
+        .owner_scope()
+        .clone();
     let mut event = session_journal::JournalEvent::config_change(None, "model", "gpt-5");
     event.ts = "2026-07-08T00:00:00Z".to_string();
 
     enqueue_ingestion_pub(&state, &event);
 
-    let outbox = SyncOutboxStore::local().status().expect("outbox status");
+    let outbox = SyncOutboxStore::for_owner(&owner_scope)
+        .expect("owner-scoped outbox")
+        .status()
+        .expect("outbox status");
     assert_eq!(outbox.total, 0);
     assert_eq!(outbox.pending, 0);
     assert_eq!(outbox.skipped, 1);
@@ -744,77 +755,4 @@ async fn try_cloud_push_preferences_is_noop_without_matrixone() {
     let state = SessionState::default();
     // Should not panic (was the original bug)
     try_cloud_push_preferences(&state).await;
-}
-
-#[test]
-fn format_duration_short_zero() {
-    assert_eq!(
-        format_duration_short(std::time::Duration::from_secs(0)),
-        "0s"
-    );
-}
-
-#[test]
-fn format_duration_short_seconds() {
-    assert_eq!(
-        format_duration_short(std::time::Duration::from_secs(45)),
-        "45s"
-    );
-}
-
-#[test]
-fn format_duration_short_minutes() {
-    assert_eq!(
-        format_duration_short(std::time::Duration::from_secs(92)),
-        "1m32s"
-    );
-}
-
-#[test]
-fn format_duration_short_hours() {
-    assert_eq!(
-        format_duration_short(std::time::Duration::from_secs(7500)),
-        "2h5m"
-    );
-}
-
-#[test]
-fn format_plan_progress_empty() {
-    let s = format_plan_progress(0, 0, None, std::time::Duration::from_secs(0));
-    assert!(s.contains("0/0 (0%)"));
-    assert!(s.contains("0s elapsed"));
-}
-
-#[test]
-fn format_plan_progress_first_subtask() {
-    let s = format_plan_progress(0, 5, None, std::time::Duration::from_secs(10));
-    assert!(s.contains("0/5 (0%)"));
-    assert!(s.contains("10s elapsed"));
-    // No ETA when done==0
-    assert!(!s.contains("remaining"));
-}
-
-#[test]
-fn format_plan_progress_midway_with_eta() {
-    let avg = Some(std::time::Duration::from_secs(60));
-    let s = format_plan_progress(3, 7, avg, std::time::Duration::from_secs(180));
-    assert!(s.contains("3/7 (42%)"));
-    assert!(s.contains("3m0s elapsed"));
-    assert!(s.contains("~4m0s remaining")); // 4 remaining × 60s avg
-}
-
-#[test]
-fn format_plan_progress_complete() {
-    let avg = Some(std::time::Duration::from_secs(30));
-    let s = format_plan_progress(5, 5, avg, std::time::Duration::from_secs(150));
-    assert!(s.contains("5/5 (100%)"));
-    // 0 remaining → "~0s remaining"
-    assert!(s.contains("remaining"));
-}
-
-#[test]
-fn format_plan_progress_bar_fills() {
-    // At 50% with 16-width bar, should have 8 filled + 8 empty
-    let s = format_plan_progress(3, 6, None, std::time::Duration::from_secs(0));
-    assert!(s.contains("████████░░░░░░░░"));
 }

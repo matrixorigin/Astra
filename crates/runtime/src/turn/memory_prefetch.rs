@@ -1,21 +1,27 @@
 //! Memory prefetch utilities for LLM prompt augmentation.
 //!
-//! Provides hybrid retrieval (full message + entity-keyword) from Memoria HTTP API,
-//! merging and deduplicating results into a structured section for injection into
-//! the system prompt.
+//! Provides one semantic retrieval of the complete user message from Memoria,
+//! admitting only typed results into the system prompt.
 //!
 //! Ranking: Memoria's server-side `final_score` already tier-weights
 //! via confidence decay (half-life T1=365d … T4=30d) — we trust it and
-//! only re-sort the merged hybrid results by that score so the output
+//! only re-sort the returned results by that score so the output
 //! is deterministic. No client-side tier multiplier: doing one here
 //! would double-count what the server already did.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use astra_turn_core::context_sources::MemoryEntry as ContextMemoryEntry;
 use astra_turn_types::RankableMemory;
 
 use super::cloud::memoria_compact::{MemoriaMemory, MemoriaPort};
+
+/// Prompt recall is optional context, never an admission dependency for a
+/// model turn.  A single unhealthy memory replica must not consume the
+/// interactive first-response budget (the transport-level Memoria timeout is
+/// deliberately much longer because persistence and maintenance operations
+/// have different latency semantics).
+pub(crate) const INTERACTIVE_MEMORY_READ_DEADLINE: Duration = Duration::from_millis(750);
 
 /// Result of a memory prefetch operation.
 #[derive(Debug, Default)]
@@ -24,10 +30,20 @@ pub struct MemoryPrefetchResult {
     pub items: usize,
     pub preview: Vec<String>,
     pub fetch_ms: i64,
+    pub outcome: astra_turn_types::MemoryRetrievalOutcome,
 }
 
-/// Prefetch memories relevant to the user message via hybrid retrieval.
-/// Sends two queries (full message + entity tokens), merges and deduplicates.
+#[derive(Default)]
+struct RankableRetrieval {
+    memories: Vec<RankableMemory>,
+    outcome: astra_turn_types::MemoryRetrievalOutcome,
+}
+
+/// Prefetch memories relevant to the complete user message.
+///
+/// Memoria owns semantic retrieval. Deriving a second query by splitting ASCII
+/// words here both doubled interactive load and behaved inconsistently across
+/// languages; it was not a durable entity boundary.
 /// Provider-neutral prompt recall. All deployment forms route through this
 /// function; only the `MemoriaPort` implementation differs.
 pub async fn prefetch_memories_with_client(
@@ -41,29 +57,10 @@ pub async fn prefetch_memories_with_client(
         return MemoryPrefetchResult::default();
     }
     let started = Instant::now();
-    let entity_query = extract_entity_tokens(user_msg);
     let trimmed_msg = user_msg.trim();
-
-    // Parallel fetch: full message retrieval + entity-keyword retrieval via tokio::join!
-    // Each fetch returns structured memories (content + memory_type +
-    // retrieval_score + trust_tier) so the merge step can re-rank by
-    // composite score instead of flat vector similarity.
-    let do_entity = !entity_query.is_empty() && entity_query != trimmed_msg;
-    let (full_result, entity_result) = tokio::join!(
-        retrieve_rankable(client, trimmed_msg, user_id, session_id, top_k),
-        async {
-            if do_entity {
-                retrieve_rankable(client, &entity_query, user_id, session_id, top_k).await
-            } else {
-                Vec::new()
-            }
-        }
-    );
-    // Merge by memory_id (dedup across the two parallel queries), then
-    // re-sort by server-side retrieval_score (already tier-weighted),
-    // then cap at top_k*2 (heuristic: we want enough to pick from
-    // downstream but not 100s).
-    let mut merged_records = merge_structured_results(full_result, entity_result);
+    let result = retrieve_rankable(client, trimmed_msg, user_id, session_id, top_k).await;
+    let outcome = result.outcome;
+    let mut merged_records = merge_structured_results(result.memories, Vec::new());
     astra_turn_types::sort_by_retrieval_score(&mut merged_records);
     let ranked_cap = (top_k as usize).saturating_mul(2).max(top_k as usize);
     merged_records.truncate(ranked_cap);
@@ -88,6 +85,7 @@ pub async fn prefetch_memories_with_client(
         items,
         preview,
         fetch_ms,
+        outcome,
     }
 }
 
@@ -97,19 +95,40 @@ async fn retrieve_rankable(
     user_id: &str,
     session_id: &str,
     top_k: u32,
-) -> Vec<RankableMemory> {
-    match client
-        .retrieve_for_prompt(query, user_id, session_id, top_k as usize)
-        .await
-    {
-        Ok(memories) => memories.into_iter().map(rankable_from_memoria).collect(),
-        Err(error) => {
+) -> RankableRetrieval {
+    let started = Instant::now();
+    let retrieval = tokio::time::timeout(
+        INTERACTIVE_MEMORY_READ_DEADLINE,
+        client.retrieve_for_prompt(query, user_id, session_id, top_k as usize),
+    )
+    .await;
+    match retrieval {
+        Ok(Ok(memories)) => RankableRetrieval {
+            memories: memories.into_iter().map(rankable_from_memoria).collect(),
+            outcome: astra_turn_types::MemoryRetrievalOutcome::Complete,
+        },
+        Ok(Err(error)) => {
             tracing::warn!(
                 target: "astra_runtime::memory_prefetch",
                 error = %error,
                 "prompt memory recall degraded; continuing without this retrieval result"
             );
-            Vec::new()
+            RankableRetrieval {
+                memories: Vec::new(),
+                outcome: astra_turn_types::MemoryRetrievalOutcome::Unavailable,
+            }
+        }
+        Err(_) => {
+            tracing::warn!(
+                target: "astra_runtime::memory_prefetch",
+                deadline_ms = INTERACTIVE_MEMORY_READ_DEADLINE.as_millis(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "prompt memory recall exceeded its interactive budget; continuing without this retrieval result"
+            );
+            RankableRetrieval {
+                memories: Vec::new(),
+                outcome: astra_turn_types::MemoryRetrievalOutcome::Unavailable,
+            }
         }
     }
 }
@@ -134,12 +153,13 @@ fn rankable_from_memoria(memory: MemoriaMemory) -> RankableMemory {
 pub struct SessionStartPrefetchResult {
     pub entries: Vec<ContextMemoryEntry>,
     pub fetch_ms: i64,
+    pub outcome: astra_turn_types::MemoryRetrievalOutcome,
 }
 
 /// Prefetch session-start memories: profile + recent episodes. Intended
 /// to run **only on the first turn** of a session — the caller decides
 /// based on `turn_number`. On non-first turns we rely on
-/// [`prefetch_memories_with_client`] (hybrid per-turn recall) to surface relevant
+/// [`prefetch_memories_with_client`] (per-turn semantic recall) to surface relevant
 /// memory.
 ///
 /// Both fetches run in parallel; any fetch failure is treated as "no
@@ -177,11 +197,14 @@ pub async fn prefetch_session_start_memories_with_client(
         ),
     );
 
+    let outcome = profile_raw.outcome.combine(episode_raw.outcome);
     let mut profile: Vec<RankableMemory> = profile_raw
+        .memories
         .into_iter()
         .filter(|m| m.memory_type == "profile")
         .collect();
     let mut recent_episodes: Vec<RankableMemory> = episode_raw
+        .memories
         .into_iter()
         .filter(|m| m.memory_type == "episodic")
         .collect();
@@ -197,6 +220,7 @@ pub async fn prefetch_session_start_memories_with_client(
     SessionStartPrefetchResult {
         entries,
         fetch_ms: started.elapsed().as_millis() as i64,
+        outcome,
     }
 }
 
@@ -312,26 +336,6 @@ fn memory_dedup_key(trimmed: &str) -> String {
         .to_lowercase()
 }
 
-/// Extract non-CJK, non-punctuation tokens from a message for keyword-based retrieval.
-pub(crate) fn extract_entity_tokens(msg: &str) -> String {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    for ch in msg.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-            current.push(ch);
-        } else {
-            if current.len() >= 3 {
-                tokens.push(current.clone());
-            }
-            current.clear();
-        }
-    }
-    if current.len() >= 3 {
-        tokens.push(current);
-    }
-    tokens.join(" ")
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -364,6 +368,49 @@ mod tests {
     struct ScriptedClient {
         calls: Mutex<Vec<(String, String, String, usize)>>,
         responses: Mutex<VecDeque<Result<Vec<MemoriaMemory>, String>>>,
+    }
+
+    #[derive(Default)]
+    struct NeverRespondingClient {
+        calls: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl MemoriaPort for NeverRespondingClient {
+        async fn retrieve_for_prompt(
+            &self,
+            _query: &str,
+            _user_id: &str,
+            _session_id: &str,
+            _top_k: usize,
+        ) -> Result<Vec<MemoriaMemory>, String> {
+            *self.calls.lock().expect("calls") += 1;
+            std::future::pending().await
+        }
+
+        async fn retrieve_ext(
+            &self,
+            _query: &str,
+            _session_id: Option<&str>,
+            _top_k: usize,
+            _filter_session: bool,
+        ) -> Result<Vec<MemoriaMemory>, String> {
+            panic!("prompt recall must use retrieve_for_prompt")
+        }
+
+        async fn store(
+            &self,
+            _content: &str,
+            _memory_type: &str,
+            _session_id: Option<&str>,
+            _trust_tier: Option<&str>,
+        ) -> Result<String, String> {
+            Ok(String::new())
+        }
+
+        async fn purge_working(&self, _session_id: &str) -> Result<u64, String> {
+            Ok(0)
+        }
     }
 
     #[async_trait::async_trait]
@@ -411,13 +458,6 @@ mod tests {
         async fn purge_working(&self, _session_id: &str) -> Result<u64, String> {
             Ok(0)
         }
-    }
-
-    #[test]
-    fn entity_query_is_a_deterministic_secondary_signal() {
-        assert_eq!(extract_entity_tokens("memoria 最新的ci?"), "memoria");
-        assert_eq!(extract_entity_tokens("hello.world!foo"), "hello world foo");
-        assert_eq!(extract_entity_tokens("a bc"), "");
     }
 
     #[test]
@@ -509,47 +549,38 @@ mod tests {
     #[tokio::test]
     async fn provider_neutral_recall_preserves_scope_and_returns_typed_entries() {
         let client = ScriptedClient {
-            responses: Mutex::new(VecDeque::from([
-                Ok(vec![
-                    typed_memory(
-                        "shared",
-                        astra_prompts::memory_proto::NS_KNOWLEDGE,
-                        "semantic",
-                        "Runtime recall preserves typed evidence across deployment modes",
-                        0.8,
-                    ),
-                    typed_memory(
-                        "high",
-                        astra_prompts::memory_proto::NS_PREF,
-                        "profile",
-                        "The user prefers behavior tests over source text matching",
-                        0.95,
-                    ),
-                ]),
-                Ok(vec![typed_memory(
+            responses: Mutex::new(VecDeque::from([Ok(vec![
+                typed_memory(
                     "shared",
                     astra_prompts::memory_proto::NS_KNOWLEDGE,
                     "semantic",
                     "Runtime recall preserves typed evidence across deployment modes",
                     0.8,
-                )]),
-            ])),
+                ),
+                typed_memory(
+                    "high",
+                    astra_prompts::memory_proto::NS_PREF,
+                    "profile",
+                    "The user prefers behavior tests over source text matching",
+                    0.95,
+                ),
+            ])])),
             ..Default::default()
         };
 
-        let result = prefetch_memories_with_client(
-            &client,
-            "review astra memory #42",
-            "user-7",
-            "session-9",
-            5,
-        )
-        .await;
+        let result =
+            prefetch_memories_with_client(&client, "复核 astra 记忆 #42", "user-7", "session-9", 5)
+                .await;
 
         assert_eq!(result.items, 2);
+        assert_eq!(
+            result.outcome,
+            astra_turn_types::MemoryRetrievalOutcome::Complete
+        );
         assert_eq!(result.entries[0].memory_id.as_deref(), Some("high"));
         let calls = client.calls.lock().expect("calls");
-        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "复核 astra 记忆 #42");
         assert!(calls.iter().all(|(_, user, session, top_k)| {
             user == "user-7" && session == "session-9" && *top_k == 5
         }));
@@ -594,22 +625,67 @@ mod tests {
             .filter_map(|entry| entry.memory_id.as_deref())
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["profile", "episode"]);
+        assert_eq!(
+            result.outcome,
+            astra_turn_types::MemoryRetrievalOutcome::Complete
+        );
         assert_eq!(client.calls.lock().expect("calls").len(), 2);
     }
 
     #[tokio::test]
     async fn recall_failure_is_soft_evidence_absence() {
         let client = ScriptedClient {
-            responses: Mutex::new(VecDeque::from([
-                Err("backend unavailable".into()),
-                Err("backend unavailable".into()),
-            ])),
+            responses: Mutex::new(VecDeque::from([Err("backend unavailable".into())])),
             ..Default::default()
         };
         let result =
             prefetch_memories_with_client(&client, "review memory #42", "user", "session", 5).await;
         assert!(result.entries.is_empty());
         assert_eq!(result.items, 0);
+        assert_eq!(
+            result.outcome,
+            astra_turn_types::MemoryRetrievalOutcome::Unavailable
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prompt_recall_deadline_makes_a_blackholed_backend_soft_absence() {
+        let client = NeverRespondingClient::default();
+        let result = prefetch_memories_with_client(
+            &client,
+            "retrieve the durable architecture notes",
+            "user",
+            "session",
+            5,
+        )
+        .await;
+
+        // The paused clock reaches the retrieval budget without wall-clock
+        // waiting. Without the timeout above this test would never complete.
+        assert!(result.entries.is_empty());
+        assert_eq!(result.items, 0);
+        assert_eq!(
+            result.outcome,
+            astra_turn_types::MemoryRetrievalOutcome::Unavailable
+        );
+        assert_eq!(*client.calls.lock().expect("calls"), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_start_recall_uses_the_same_interactive_deadline() {
+        let client = NeverRespondingClient::default();
+        let result = prefetch_session_start_memories_with_client(&client, "user", "session").await;
+
+        assert!(result.entries.is_empty());
+        assert_eq!(
+            result.outcome,
+            astra_turn_types::MemoryRetrievalOutcome::Unavailable
+        );
+        assert_eq!(
+            *client.calls.lock().expect("calls"),
+            2,
+            "profile and episodic recall are independent but both must be bounded"
+        );
     }
 
     #[test]
@@ -640,6 +716,10 @@ mod tests {
         let result = prefetch_memories_with_client(&client, "   ", "user", "session", 5).await;
         assert!(result.entries.is_empty());
         assert!(client.calls.lock().expect("calls").is_empty());
+        assert_eq!(
+            result.outcome,
+            astra_turn_types::MemoryRetrievalOutcome::NotAttempted
+        );
     }
 
     #[test]
@@ -649,5 +729,9 @@ mod tests {
         assert_eq!(result.items, 0);
         assert!(result.preview.is_empty());
         assert_eq!(result.fetch_ms, 0);
+        assert_eq!(
+            result.outcome,
+            astra_turn_types::MemoryRetrievalOutcome::NotAttempted
+        );
     }
 }

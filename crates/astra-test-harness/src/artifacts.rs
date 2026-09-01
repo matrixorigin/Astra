@@ -72,7 +72,7 @@ mod tests {
         let report = CaseRunReport {
             case_name: "test/case".into(),
             model: "my.model".into(),
-            passed: true,
+            status: crate::report::CaseRunStatus::Passed,
             run_index: 0,
             capability: None,
             weight: 1.0,
@@ -80,6 +80,7 @@ mod tests {
             outcome: RunOutcome::new("my.model").with_text("hello"),
             criteria: vec![],
             steps: vec![],
+            attempts: Vec::new(),
             session: None,
             reproducer: None,
             digest: None,

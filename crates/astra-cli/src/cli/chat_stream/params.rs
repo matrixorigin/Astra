@@ -4,6 +4,7 @@ use astra_turn_core::turn_event_sink::IncrementalTurnState;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::{ExplainMode, cli::permission_manager::PermissionManager};
@@ -12,6 +13,55 @@ use crate::{ExplainMode, cli::permission_manager::PermissionManager};
 /// The CLI uses a 1-based turn index so journal entries and rollback
 /// scopes are clearly scoped to the user-visible turn.
 pub(crate) const DEFAULT_TURN_INDEX: u32 = 1;
+
+/// Monotonic source for the request-local execution-time budget sent to the
+/// Server. The source retains the original process deadline; callers must not
+/// rebuild it from a previously published `remaining_seconds` snapshot because
+/// retries and later model rounds would then be able to extend the budget.
+#[derive(Clone, Debug)]
+pub(crate) struct ExecutionTimeBudgetClock {
+    terminal_deadline: tokio::time::Instant,
+    terminal_reserve: Duration,
+    request_safety_margin: Duration,
+    last_published_seconds: Arc<AtomicU64>,
+}
+
+impl ExecutionTimeBudgetClock {
+    pub(crate) fn new(
+        terminal_deadline: tokio::time::Instant,
+        terminal_reserve: Duration,
+        request_safety_margin: Duration,
+    ) -> Self {
+        Self {
+            terminal_deadline,
+            terminal_reserve,
+            request_safety_margin,
+            last_published_seconds: Arc::new(AtomicU64::new(u64::MAX)),
+        }
+    }
+
+    /// Snapshot the execution slice still available at this request boundary.
+    /// Flooring to whole seconds is deliberate: the wire value is an upper
+    /// bound for new work, so a partial second must not be rounded up.
+    pub(crate) fn remaining(&self) -> astra_services::runs::ExecutionTimeBudget {
+        self.remaining_at(tokio::time::Instant::now())
+    }
+
+    fn remaining_at(&self, now: tokio::time::Instant) -> astra_services::runs::ExecutionTimeBudget {
+        let available = self
+            .terminal_deadline
+            .saturating_duration_since(now)
+            .saturating_sub(self.terminal_reserve)
+            .saturating_sub(self.request_safety_margin)
+            .as_secs();
+        let previous = self
+            .last_published_seconds
+            .fetch_min(available, Ordering::AcqRel);
+        astra_services::runs::ExecutionTimeBudget {
+            remaining_seconds: available.min(previous),
+        }
+    }
+}
 
 /// Atomic counter pair published by streaming tools (currently
 /// bash) while they run. Consumers read `lines` / `bytes` on a
@@ -59,6 +109,15 @@ impl ToolProgressSink {
 /// without plan-specific context (subtask IDs, etc.).
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
+    /// The server assigned the canonical session identity for this execution.
+    ///
+    /// This is emitted only from an accepted SSE session binding. Consumers
+    /// must never synthesize a session id before this fact arrives.
+    SessionBound(String),
+    /// The server assigned the durable run that owns the current continuation
+    /// loop. Active-run guidance must target this identity, never the CLI's
+    /// local orchestration id.
+    RunBound(String),
     /// Catalog-backed raw window and the exact usable input ceiling after
     /// deterministic output/summary/protocol reserves.
     ContextWindowPolicy {
@@ -79,6 +138,10 @@ pub enum StreamEvent {
     /// Provider-normalized lanes for the same physical request as
     /// `ContextWindowMeasured`.
     RequestTokenUsage(astra_turn_types::RequestTokenUsage),
+    /// Canonical, bounded runtime observation produced after one provider
+    /// round. Consumers may display or persist it, but never treat this live
+    /// projection as policy authority.
+    RuntimeFeedback(Box<astra_turn_core::context_feedback::RuntimeFeedbackFrame>),
     /// LLM token chunk.
     Token(String),
     /// Model thinking/reasoning started or stopped.
@@ -121,6 +184,11 @@ pub enum StreamEvent {
         tool_use_id: String,
         parent_tool_use_id: Option<String>,
     },
+    /// Server-issued projection of a durable canonical Work mutation. This is
+    /// a dedicated protocol event rather than an inference from a tool card,
+    /// so a remote server-owned lifecycle change reaches the foreground as
+    /// soon as it commits.
+    WorkTaskBoardUpdate(serde_json::Value),
     /// Dedicated ask_user lifecycle event emitted when the native
     /// questionnaire UI is presented to the user.
     AskUserPrompted {
@@ -166,6 +234,15 @@ pub enum StreamEvent {
     StatusLine(String),
     /// A mid-turn input reached the runtime's next safe model boundary.
     UserIntentApplied {
+        intent_id: String,
+        delivery: astra_turn_types::UserIntentDelivery,
+        status: astra_turn_types::UserIntentStatus,
+        event_index: usize,
+        content: String,
+    },
+    /// The run terminated before applying a remotely accepted intent. The
+    /// server has durably returned ownership to the client.
+    UserIntentReturned {
         intent_id: String,
         delivery: astra_turn_types::UserIntentDelivery,
         status: astra_turn_types::UserIntentStatus,
@@ -457,19 +534,28 @@ pub(crate) struct ChatTurnParams<'a> {
         &'a std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
     /// When true, this turn is executing a plan subtask — `when: task_completed` stop hooks apply.
     pub(crate) is_plan_subtask: bool,
-    /// Sent on `/chat/turn` JSON so cloud can classify the turn like local `is_plan_subtask`.
+    /// Sent on `/chat/stream` JSON so cloud can classify the turn like local `is_plan_subtask`.
     pub(crate) plan_subtask_id: Option<&'a str>,
     /// Optional delegation engine for multi-agent coordination with verification gates.
     pub(crate) delegation_engine:
         Option<Arc<astra_runtime::server::delegation::engine::DelegationEngine>>,
     /// Optional cancellation token for interrupting SSE streaming mid-flight.
     pub(crate) cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
+    /// Original-deadline-backed wall-clock budget source. Each physical Server
+    /// request snapshots it immediately before POST; it is never rendered into
+    /// the static runtime system prompt or another cache-stable prompt prefix.
+    pub(crate) execution_time_budget: Option<ExecutionTimeBudgetClock>,
     /// Optional run-control provider for the active turn. CLI/TUI uses this
     /// to feed in-process deferred user input into the runtime loop.
     pub(crate) run_control: Option<Arc<dyn astra_runtime::turn::run_control::RunControlProvider>>,
     /// Incremental turn state for surviving interruptions.
     /// Written during streaming; snapped on force-exit to recover partial data.
     pub(crate) incremental_state: Option<Arc<IncrementalTurnState>>,
+    /// Request-scoped execution authority. Headless fresh-session calls bind
+    /// this from the first accepted Server session identity before any edge
+    /// tool can execute, then retain it through canonical local persistence.
+    pub(crate) request_session_execution_lease:
+        Option<Arc<crate::cli::session::session_execution_lease::RequestSessionExecutionLease>>,
     /// Plan-only: set to `true` after HTTP 200 so the payload-phase stderr line spinner can exit
     /// before SSE (`Waiting for model` / reasoning preview).
     pub(crate) plan_assemble_line_release: Option<Arc<AtomicBool>>,
@@ -545,10 +631,6 @@ pub(crate) struct ChatTurnParams<'a> {
     /// bounded self-mod/task rollback across turns.
     pub(crate) session_state_journal:
         Option<std::sync::Arc<std::sync::Mutex<crate::edge_tools::SessionStateRollbackJournal>>>,
-    /// Session-scoped task manager so task mutations survive across turns.
-    pub(crate) task_manager: Option<std::sync::Arc<crate::edge_tools::TaskManager>>,
-    /// Broadcast sender for the HttpTaskStore observer notification.
-    pub(crate) task_notify_tx: Option<tokio::sync::broadcast::Sender<String>>,
     /// Shared command queue for the TUI's BackgroundTaskRegistry.
     /// When present, tool executor pushes spawn/kill/output commands here.
     pub(crate) bg_task_commands:
@@ -572,17 +654,16 @@ pub(crate) struct ChatTurnParams<'a> {
     pub(crate) compaction_state: Option<serde_json::Value>,
     /// Restored consecutive context-window failures from a checkpoint.
     pub(crate) consecutive_context_window_errors: u32,
+    /// Sticky workspace-observation safety state restored from a checkpoint.
+    /// It is advisory safety state, never tool replay authority.
+    pub(crate) workspace_observation_quarantine:
+        Option<astra_pipeline::step_protocol::WorkspaceObservationQuarantineV1>,
     /// Restored tool replay guard rebuilt from step events on resume.
     pub(crate) idempotency_cache: Option<astra_pipeline::step_protocol::InMemoryIdempotencyCache>,
     /// When present, these are used instead of converting history pairs.
     pub(crate) pre_loaded_messages: Option<Vec<serde_json::Value>>,
     /// Extra context appended to the system prompt (gateway injects cron/session context here).
     pub(crate) append_system_prompt: Option<String>,
-    /// Background session-memory.md extraction coordinator. Cloned
-    /// from `SessionState::session_memory_extractor`. `None` keeps
-    /// extraction disabled (one-shot `chat -m`, plan subtasks, tests).
-    pub(crate) session_memory_extractor:
-        Option<std::sync::Arc<astra_runtime::session_memory::MemoryExtractionService>>,
     /// Shared harness snapshot sink for /inspect command.
     #[cfg(feature = "harness")]
     pub(crate) harness_sink: Option<std::sync::Arc<astra_harness::InMemorySnapshotSink>>,
@@ -627,11 +708,6 @@ pub(crate) struct BasicCliChatContext<'a> {
     /// Passed through to `sse_loop::mod` for `AgentActionContext`
     /// wiring. When `agent_spawner` is None this is ignored.
     pub root_agent_id: Option<&'a str>,
-    /// Session-scoped task manager used by one-shot/headless paths that still
-    /// need the model-visible task board.
-    pub task_manager: Option<std::sync::Arc<crate::edge_tools::TaskManager>>,
-    /// Broadcast sender for the HttpTaskStore observer notification.
-    pub task_notify_tx: Option<tokio::sync::broadcast::Sender<String>>,
     /// Shared command queue for the TUI's BackgroundTaskRegistry.
     pub bg_task_commands:
         Option<std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>>,
@@ -703,8 +779,10 @@ impl<'a> ChatTurnParams<'a> {
             plan_subtask_id: None,
             delegation_engine: None,
             cancel_token: None,
+            execution_time_budget: None,
             run_control: None,
             incremental_state: None,
+            request_session_execution_lease: None,
             plan_assemble_line_release: None,
             stream_event_tx: ctx.stream_event_tx.clone(),
             stream_json_emitter: ctx.stream_json_emitter.clone(),
@@ -728,8 +806,6 @@ impl<'a> ChatTurnParams<'a> {
             git_commit_journal: None,
             git_worktree_journal: None,
             session_state_journal: None,
-            task_manager: ctx.task_manager.clone(),
-            task_notify_tx: ctx.task_notify_tx.clone(),
             bg_task_commands: ctx.bg_task_commands.clone(),
             bg_task_list_cache: ctx.bg_task_list_cache.clone(),
             bash_detach_slot: ctx.bash_detach_slot.clone(),
@@ -737,10 +813,10 @@ impl<'a> ChatTurnParams<'a> {
             pipeline_state: None,
             compaction_state: None,
             consecutive_context_window_errors: 0,
+            workspace_observation_quarantine: None,
             idempotency_cache: None,
             pre_loaded_messages: None,
             append_system_prompt: None,
-            session_memory_extractor: None,
             #[cfg(feature = "harness")]
             harness_sink: ctx.harness_sink.clone(),
             #[cfg(feature = "harness")]
@@ -753,7 +829,71 @@ impl<'a> ChatTurnParams<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{InteractiveRequestEnqueueError, enqueue_interactive_request};
+    use super::{
+        ExecutionTimeBudgetClock, InteractiveRequestEnqueueError, enqueue_interactive_request,
+    };
+
+    #[test]
+    fn execution_time_budget_decreases_from_original_monotonic_deadline() {
+        let start = tokio::time::Instant::now();
+        let clock = ExecutionTimeBudgetClock::new(
+            start + std::time::Duration::from_secs(100),
+            std::time::Duration::from_secs(20),
+            std::time::Duration::from_secs(2),
+        );
+
+        assert_eq!(clock.remaining_at(start).remaining_seconds, 78);
+        assert_eq!(
+            clock
+                .remaining_at(start + std::time::Duration::from_secs(11))
+                .remaining_seconds,
+            67
+        );
+    }
+
+    #[test]
+    fn execution_time_budget_is_monotonic_across_clones_and_observation_order() {
+        let start = tokio::time::Instant::now();
+        let clock = ExecutionTimeBudgetClock::new(
+            start + std::time::Duration::from_secs(100),
+            std::time::Duration::from_secs(20),
+            std::time::Duration::from_secs(2),
+        );
+        let retry = clock.clone();
+
+        assert_eq!(clock.remaining_at(start).remaining_seconds, 78);
+        assert_eq!(
+            retry
+                .remaining_at(start + std::time::Duration::from_secs(40))
+                .remaining_seconds,
+            38
+        );
+        assert_eq!(
+            clock
+                .remaining_at(start + std::time::Duration::from_secs(10))
+                .remaining_seconds,
+            38,
+            "an out-of-order retry observation must not replenish time"
+        );
+    }
+
+    #[test]
+    fn execution_time_budget_saturates_at_zero_when_reserves_consume_deadline() {
+        let start = tokio::time::Instant::now();
+        let clock = ExecutionTimeBudgetClock::new(
+            start + std::time::Duration::from_secs(21),
+            std::time::Duration::from_secs(20),
+            std::time::Duration::from_secs(2),
+        );
+
+        assert_eq!(clock.remaining_at(start).remaining_seconds, 0);
+        assert_eq!(
+            clock
+                .remaining_at(start + std::time::Duration::from_secs(30))
+                .remaining_seconds,
+            0
+        );
+    }
 
     #[test]
     fn interactive_request_queue_is_bounded_and_reports_delivery_state() {

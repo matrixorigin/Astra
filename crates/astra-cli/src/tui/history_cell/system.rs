@@ -31,6 +31,7 @@ enum SystemPresentation {
     Standard,
     BackgroundTask,
     RuntimeWork,
+    RuntimeControl,
 }
 
 impl SystemCell {
@@ -75,6 +76,20 @@ impl SystemCell {
             message: message.into(),
             level: SystemLevel::Info,
             presentation: SystemPresentation::RuntimeWork,
+            ts: None,
+            durable: true,
+        }
+    }
+
+    /// A factual receipt for control sent to the currently executing run.
+    /// Mutable delivery/apply state belongs in the bottom pane; persisting a
+    /// future-tense "waiting" row makes an already-applied intent look stuck
+    /// forever after terminal scrollback has flushed it.
+    pub fn runtime_control(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            level: SystemLevel::Info,
+            presentation: SystemPresentation::RuntimeControl,
             ts: None,
             durable: true,
         }
@@ -172,6 +187,11 @@ impl HistoryCell for SystemCell {
             ),
             SystemPresentation::RuntimeWork => (
                 "↳ Work · ",
+                Style::default().fg(theme.gutter).bold(),
+                Style::default().fg(theme.fg),
+            ),
+            SystemPresentation::RuntimeControl => (
+                "↳ Run · ",
                 Style::default().fg(theme.gutter).bold(),
                 Style::default().fg(theme.fg),
             ),
@@ -338,6 +358,26 @@ mod tests {
     }
 
     #[test]
+    fn active_run_guidance_renders_a_factual_run_receipt() {
+        let cell = SystemCell::runtime_control(
+            "Guidance accepted; not yet applied. It replaces stale work before next unstarted action.",
+        );
+        let out = render(&cell, 100, 1);
+
+        assert!(out.starts_with("↳ Run · "), "label missing: {out:?}");
+        assert!(out.contains("not yet applied"), "{out}");
+        assert!(out.contains("before next unstarted action"), "{out}");
+        assert!(
+            !out.contains("waiting"),
+            "durable history must not retain future state: {out}"
+        );
+        assert!(
+            !out.contains("↳ Work"),
+            "run control is not canonical Work: {out}"
+        );
+    }
+
+    #[test]
     fn response_continuation_lines_hang_indent() {
         // Multi-line responses must keep the label only on row 0 and
         // align continuation lines under the body so the block reads
@@ -381,6 +421,10 @@ mod tests {
             ),
             (SystemCell::info("a") as SystemCell, SystemLevel::Info),
             (SystemCell::background_task("bg"), SystemLevel::Info),
+            (
+                SystemCell::runtime_control("guidance accepted"),
+                SystemLevel::Info,
+            ),
             (SystemCell::response("d"), SystemLevel::Response),
             (SystemCell::warning("b"), SystemLevel::Warning),
             (SystemCell::error("c"), SystemLevel::Error),

@@ -75,6 +75,43 @@ fn known_run_finished_still_passes_through() {
 }
 
 #[test]
+fn runtime_feedback_projects_only_the_server_authored_frame() {
+    let frame = json!({
+        "schema_version": 4,
+        "identity": {
+            "session_id": "session-1",
+            "run_id": "run-1",
+            "topology": "cli_server"
+        }
+    });
+    let out = transform_run_event_for_client(json!({
+        "type": "runtime_feedback",
+        "runtime_feedback": frame,
+        "internal_diagnostic": "must not cross the client boundary"
+    }));
+    assert_eq!(
+        out,
+        json!({
+            "type": "runtime_feedback",
+            "runtime_feedback": frame,
+        })
+    );
+
+    assert!(
+        transform_run_event_for_client(json!({"type": "runtime_feedback"})).is_null(),
+        "a missing canonical frame must not become an empty public observation"
+    );
+    assert!(
+        transform_run_event_for_client(json!({
+            "type": "runtime_feedback",
+            "runtime_feedback": "not-a-frame"
+        }))
+        .is_null(),
+        "a non-object frame must fail closed at the public boundary"
+    );
+}
+
+#[test]
 fn known_agent_interrupted_still_passes_through() {
     let ok = json!({
         "type": "agent_interrupted",

@@ -17,7 +17,7 @@ Then write a <summary> block with the actual summary. The <analysis> block will 
 Think step by step:\n\
 1. What is the user's primary goal and current sub-task?\n\
 2. What key decisions were made and WHY?\n\
-3. What files are actively being worked on? What are the exact current contents/state?\n\
+3. What files are actively being worked on? What paths, symbols, values, and short excerpts were actually observed?\n\
 4. What approaches were tried? Which succeeded, which failed, and why?\n\
 5. What errors occurred and how were they fixed (or are they still open)?\n\
 6. What tasks remain and what is the immediate next step?\n\
@@ -25,7 +25,7 @@ Think step by step:\n\
 <summary>\n\
 ### Primary Request\nThe user's original task/goal in 1-2 sentences.\n\n\
 ### Key Technical Concepts\nDomain knowledge, architecture decisions, constraints discovered.\n\n\
-### Files & Code Modified\nFile paths and what changed. Include brief code snippets for actively-edited sections. One bullet per file.\n\n\
+### Files & Code Modified\nFile paths and what changed. Preserve observed symbols, values, signatures, errors, and brief code excerpts needed to continue. One bullet per file.\n\n\
 ### Problem Solving\nApproaches tried, what worked, what failed, and why. Include specific error messages that led to pivots.\n\n\
 ### Errors & Fixes\nErrors encountered and how they were resolved (or still open).\n\n\
 ### All User Messages\nEvery user intent/instruction, preserving their exact meaning.\n\n\
@@ -35,7 +35,9 @@ Think step by step:\n\
 </summary>\n\n\
 ## Rules\n\
 - Be dense and factual. No filler.\n\
-- Paraphrase tool outputs, don't reproduce verbatim.\n\
+- Summarize tool outputs densely, but preserve exact paths, identifiers, values, error text, and short code excerpts when they are necessary to continue correctly.\n\
+- Treat file content as a historical observation from the summarized conversation, never as a claim about the live workspace.\n\
+- If continuation needs exact or current workspace bytes that are not retained, use the ordinary admitted read tool; never imply that compaction refreshed a file.\n\
 - For ### Files & Code Modified and ### Current Work, include brief code snippets when they help \
 the reader understand the current state (function signatures, struct definitions, key logic).\n\
 - Omit superseded decisions unless the failure is informative.\n\
@@ -529,6 +531,9 @@ mod tests {
         for s in &sections {
             assert!(COMPACT_SYSTEM_PROMPT.contains(s), "missing section: {s}");
         }
+        assert!(COMPACT_SYSTEM_PROMPT.contains("historical observation"));
+        assert!(COMPACT_SYSTEM_PROMPT.contains("ordinary admitted read tool"));
+        assert!(COMPACT_SYSTEM_PROMPT.contains("never imply that compaction refreshed a file"));
     }
 
     #[test]

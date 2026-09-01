@@ -19,6 +19,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Validate Terminal-Bench harness contracts
+        run: |
+          bash -n scripts/harness/local_gateway_contract.sh scripts/harness/test_local_gateway_contract.sh scripts/harness/run_terminal_bench_current.sh
+          bash scripts/harness/test_local_gateway_contract.sh
       - uses: ./.github/actions/rust-setup
         with:
           shared-key: ci-check

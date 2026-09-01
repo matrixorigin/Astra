@@ -233,16 +233,22 @@ fn communication_target(target: &MessageTarget) -> astra_turn_types::AgentCommun
 
 fn communication_payload_evidence(
     payload: &MessagePayload,
-) -> (String, Option<String>, Option<bool>, Option<String>) {
+) -> (
+    astra_turn_types::AgentCommunicationPayloadKind,
+    Option<String>,
+    Option<bool>,
+    Option<String>,
+) {
+    use astra_turn_types::AgentCommunicationPayloadKind as Kind;
     match payload {
         MessagePayload::Text { content, .. } => (
-            "text".into(),
+            Kind::Text,
             Some(bounded_communication_summary(content)),
             None,
             None,
         ),
         MessagePayload::Progress { status, detail, .. } => (
-            "progress".into(),
+            Kind::Progress,
             Some(bounded_communication_summary(
                 &detail
                     .as_deref()
@@ -252,7 +258,7 @@ fn communication_payload_evidence(
             None,
         ),
         MessagePayload::Request { request_type, .. } => (
-            "request".into(),
+            Kind::Request,
             Some(bounded_communication_summary(&format!("{request_type:?}"))),
             None,
             None,
@@ -262,20 +268,20 @@ fn communication_payload_evidence(
             accepted,
             ..
         } => (
-            "response".into(),
+            Kind::Response,
             None,
             Some(*accepted),
             Some(request_id.clone()),
         ),
         MessagePayload::Signal(signal) => (
-            "signal".into(),
+            Kind::Signal,
             Some(bounded_communication_summary(&format!("{signal:?}"))),
             None,
             None,
         ),
-        MessagePayload::Ack { message_id } => ("ack".into(), None, None, Some(message_id.clone())),
+        MessagePayload::Ack { message_id } => (Kind::Ack, None, None, Some(message_id.clone())),
         MessagePayload::Nack { message_id, reason } => (
-            "nack".into(),
+            Kind::Nack,
             reason.as_deref().map(bounded_communication_summary),
             None,
             Some(message_id.clone()),
@@ -663,7 +669,10 @@ mod tests {
         assert_eq!(evidence.observed_by.run_id, "run-reviewer");
         assert_eq!(evidence.observed_by.agent_id, "reviewer");
         assert_eq!(evidence.from.run_id, "run-coder");
-        assert_eq!(evidence.payload_kind, "text");
+        assert_eq!(
+            evidence.payload_kind,
+            astra_turn_types::AgentCommunicationPayloadKind::Text
+        );
         assert!(evidence.requires_ack);
         let summary = evidence.summary.expect("text evidence summary");
         assert_eq!(summary.chars().count(), 1_001);

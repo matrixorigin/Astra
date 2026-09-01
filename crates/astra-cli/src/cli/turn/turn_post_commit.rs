@@ -7,7 +7,6 @@ use crate::cli::notifications;
 use crate::cli::session::session_projection::{
     CslCheckpointFields, build_full_session_state_compact,
 };
-use crate::cli::session::session_runtime;
 use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::streaming_types::StreamResult;
 
@@ -15,15 +14,8 @@ use crate::cli::stream::streaming_types::StreamResult;
 /// durability boundary. It runs on the post-commit worker, so latency must not
 /// turn into cancellation: dropping an in-flight projection creates an
 /// avoidable continuation gap on the next resume.
-const PLAN_MIRROR_SYNC_BUDGET: Duration = Duration::from_millis(750);
 const SIDECAR_PROJECTION_MAX_ATTEMPTS: usize = 3;
 const SIDECAR_PROJECTION_RETRY_BASE: Duration = Duration::from_millis(25);
-
-struct PlanMirrorRefresh {
-    api: astra_thin_client::ThinClient,
-    token: String,
-    session_id: String,
-}
 
 /// Fully owned work handed from turn settlement to a serialized worker. No
 /// mutable `SessionState` crosses this boundary, so a slow disk or server can
@@ -38,7 +30,6 @@ pub(crate) struct TurnPostCommitJob {
     csl_state: astra_turn_core::conversation_log::SessionStateCompact,
     csl_manager: Option<astra_turn_core::conversation_log::manager::CslManager>,
     deferred_sidecars: Option<DeferredTurnSidecarWork>,
-    plan_mirror: Option<PlanMirrorRefresh>,
     notification: Option<(notifications::NotificationConfig, Duration)>,
     /// Keeps observed full-history payload residency accounted while this job
     /// is waiting in the post-commit queue.
@@ -54,14 +45,13 @@ pub(crate) struct TurnPostCommitCompletion {
     attachment_epoch: u64,
     expected_cursor: Option<astra_turn_types::SessionCursorV1>,
     pub(crate) csl_manager: Option<astra_turn_core::conversation_log::manager::CslManager>,
-    plan_mirror: Option<Result<Option<astra_runtime::plan::PlanModeState>, String>>,
     pub(crate) errors: Vec<String>,
 }
 
 pub(crate) fn prepare_turn_post_commit_job(
     state: &mut SessionState,
-    api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
+    _api: &astra_thin_client::ThinClient,
+    _profile: Option<&str>,
     final_messages: Vec<serde_json::Value>,
     csl_checkpoint_fields: CslCheckpointFields,
     turn_start: Instant,
@@ -82,21 +72,6 @@ pub(crate) fn prepare_turn_post_commit_job(
         .map(|previous| build_full_session_state_compact(state, csl_checkpoint_fields, &previous))
         .unwrap_or_default();
     let notification = notification_for_turn(state, turn_start.elapsed());
-    let plan_mirror = state
-        .plan_mode_active()
-        .then(|| {
-            state
-                .session_id
-                .as_deref()
-                .filter(|session_id| !session_id.trim().is_empty())
-                .zip(session_runtime::current_access_token(profile))
-                .map(|(session_id, token)| PlanMirrorRefresh {
-                    api: api.clone(),
-                    token,
-                    session_id: session_id.to_string(),
-                })
-        })
-        .flatten();
     // The active session keeps its manager while this job is queued. The
     // worker receives a fresh manager and reconciles from durable CSL state,
     // which keeps rapid consecutive turns ordered without leaving a temporary
@@ -116,7 +91,6 @@ pub(crate) fn prepare_turn_post_commit_job(
         csl_state,
         csl_manager,
         deferred_sidecars: None,
-        plan_mirror,
         notification,
         _queue_bytes: None,
     }
@@ -226,35 +200,6 @@ pub(crate) async fn execute_turn_post_commit_job(
     };
     let csl_ms = csl_started.elapsed().as_millis() as u64;
 
-    let plan_mirror_started = Instant::now();
-    let plan_mirror = match job.plan_mirror.take() {
-        None => None,
-        Some(refresh) => Some(
-            match tokio::time::timeout(
-                PLAN_MIRROR_SYNC_BUDGET,
-                crate::cli::plan::plan_lifecycle::fetch_remote_plan_mode_state(
-                    &refresh.api,
-                    &refresh.token,
-                    &refresh.session_id,
-                ),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(format!(
-                    "plan mirror sync exceeded {}ms",
-                    PLAN_MIRROR_SYNC_BUDGET.as_millis()
-                )),
-            },
-        ),
-    };
-    let plan_mirror_ms = plan_mirror_started.elapsed().as_millis() as u64;
-    if let Some(Err(error)) = plan_mirror.as_ref() {
-        errors.push(format!(
-            "plan mirror refresh failed; local plan remains usable: {error}"
-        ));
-    }
-
     let notification_started = Instant::now();
     if let Some((config, elapsed)) = job.notification.take() {
         if tokio::time::timeout(
@@ -277,7 +222,6 @@ pub(crate) async fn execute_turn_post_commit_job(
             total_ms,
             sidecar_ms,
             csl_ms,
-            plan_mirror_ms,
             notification_ms,
             error_count = errors.len(),
             "deferred turn projection completed slowly"
@@ -290,7 +234,6 @@ pub(crate) async fn execute_turn_post_commit_job(
             total_ms,
             sidecar_ms,
             csl_ms,
-            plan_mirror_ms,
             notification_ms,
             error_count = errors.len(),
             "deferred turn projection completed"
@@ -302,7 +245,6 @@ pub(crate) async fn execute_turn_post_commit_job(
         attachment_epoch,
         expected_cursor,
         csl_manager,
-        plan_mirror,
         errors,
     }
 }
@@ -341,17 +283,6 @@ pub(crate) fn apply_turn_post_commit_completion(
         // The worker is serialized. Replacing an older manager with its newer
         // completion preserves the latest CSL sequence after rapid turns.
         state.csl_manager = Some(manager);
-    }
-    if state.plan_mode_active() {
-        if let Some(plan_mirror) = completion.plan_mirror {
-            match plan_mirror {
-                Ok(plan) => {
-                    state.cloud_plan_mirror = plan;
-                    state.plan_mode_sync_error = None;
-                }
-                Err(error) => state.plan_mode_sync_error = Some(error),
-            }
-        }
     }
     if !completion.errors.is_empty() {
         state.session_persistence_error = Some(completion.errors.join("; "));
@@ -617,7 +548,6 @@ mod tests {
             attachment_epoch: 6,
             expected_cursor: Some(expected_cursor),
             csl_manager: None,
-            plan_mirror: None,
             errors: vec!["stale projection error".to_string()],
         };
 

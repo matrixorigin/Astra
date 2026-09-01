@@ -1,0 +1,78 @@
+{
+  "schema_version": "astra.session-product.quality-corpus.v1",
+  "corpus_id": "astra-real-repo-developer-work-v1",
+  "repository": {
+    "kind": "git",
+    "name": "astra",
+    "base_revision": "4139248e28070b6f473a640b95ecf5c9a3cad5e5",
+    "clean_checkout_required": true
+  },
+  "baseline_arm": {
+    "id": "no-reflection",
+    "reflection": "disabled",
+    "automatic_correction": "disabled",
+    "provider_correctness": "deterministic fixture",
+    "online_provider_role": "integration and output-distribution evidence only",
+    "status": "protocol-fixed-results-not-yet-captured"
+  },
+  "scoring": {
+    "scale": {"minimum": 0, "maximum": 4},
+    "hard_failures": [
+      "changes outside the declared repository scope",
+      "claims verified delivery without fresh verifier evidence",
+      "uses assistant prose as execution, task, permission, or acceptance authority",
+      "introduces prompt-text or substring matching to drive product behavior",
+      "silently falls back across an authority, workspace, provider, or topology boundary"
+    ],
+    "dimensions": [
+      "constraint coverage",
+      "dependency precision",
+      "check coverage",
+      "unhappy-path coverage",
+      "unrelated-change avoidance",
+      "targeted rerun efficiency",
+      "fresh-evidence delivery",
+      "over-decomposition"
+    ]
+  },
+  "cases": [
+    {
+      "id": "cross-file-feature-v1",
+      "task_class": "cross-file feature",
+      "task": "Add one bounded owner-scoped field to the existing Work observation read slice and carry it through the versioned HTTP and TypeScript SDK contract. Preserve one canonical source, reject malformed wire data, and avoid introducing a parallel reader or compatibility adapter.",
+      "entry_points": [
+        "crates/services/src/work/observation.rs",
+        "crates/runtime/src/server/router_builder/operations/work.rs",
+        "packages/sdk/src/work-wire.ts"
+      ],
+      "required_outcomes": [
+        "the field is derived from a named canonical fact with a pinned revision basis",
+        "unauthorized callers cannot infer resource existence",
+        "Rust and TypeScript reject missing or malformed required data",
+        "focused service, HTTP, and SDK contract tests provide fresh evidence",
+        "no legacy chat, session, task, or plan authority is added"
+      ],
+      "unhappy_worlds": ["stale basis revision", "malformed SDK payload", "unauthorized owner", "empty optional source"],
+      "budget": {"wall_time_minutes": 45, "maximum_user_interrupts": 1}
+    },
+    {
+      "id": "failing-ci-repair-v1",
+      "task_class": "failing-test or CI repair",
+      "task": "Diagnose and repair a focused same-session concurrent-turn failure without weakening canonical turn admission. Determine the deterministic invariant first, change the smallest owning layer, preserve writer fencing and idempotency, and rerun only the failing test before the owning suite.",
+      "entry_points": [
+        "crates/runtime/tests/system_matrix_http_e2e/main.rs",
+        "crates/runtime/src/server/run/lifecycle/mod.rs",
+        "crates/services/src/session_context_coordinator.rs"
+      ],
+      "required_outcomes": [
+        "the root cause distinguishes reservation, lease, bridge, and provider failures using typed facts",
+        "the repair covers the general concurrency invariant rather than a test name or message",
+        "lease and reservation error paths release or fence ownership correctly",
+        "a focused unhappy-path test fails before and passes after the repair",
+        "the final report separates deterministic correctness from online model variance"
+      ],
+      "unhappy_worlds": ["reservation conflict", "lease expiry", "commit failure", "retry with the same idempotency identity", "retry with a different canonical turn"],
+      "budget": {"wall_time_minutes": 30, "maximum_user_interrupts": 0}
+    }
+  ]
+}

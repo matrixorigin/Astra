@@ -4,7 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use astra_services::task_orchestrator::TaskPlan;
+use crate::TaskPlan;
 
 /// Plan lifecycle phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

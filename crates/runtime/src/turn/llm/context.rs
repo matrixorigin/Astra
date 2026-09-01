@@ -237,6 +237,11 @@ impl<'a> ToolSurfacePlan<'a> {
         self.deferred_tools_block = block;
         self
     }
+
+    pub(crate) fn with_required_tools(mut self, tools: &'a [Value]) -> Self {
+        self.required_tools = tools;
+        self
+    }
 }
 
 /// Normalized runtime prompt signals for one LLM call.
@@ -245,6 +250,8 @@ impl<'a> ToolSurfacePlan<'a> {
 pub(crate) struct RuntimeSignals<'a> {
     pub edge_profile: &'a Map<String, Value>,
     pub plan_resume_hint: Option<String>,
+    pub extra_stable_sections: &'a [crate::prompts::PromptSection],
+    pub extra_volatile_sections: &'a [crate::prompts::PromptSection],
     pub memory_entries: &'a [astra_turn_core::context_sources::MemoryEntry],
     pub memory_provider_source: Option<&'a str>,
     pub session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
@@ -258,10 +265,22 @@ impl<'a> RuntimeSignals<'a> {
         Self {
             edge_profile,
             plan_resume_hint,
+            extra_stable_sections: &[],
+            extra_volatile_sections: &[],
             memory_entries: &[],
             memory_provider_source: None,
             session_memory_entry: None,
         }
+    }
+
+    pub(crate) fn with_extra_sections(
+        mut self,
+        stable: &'a [crate::prompts::PromptSection],
+        volatile: &'a [crate::prompts::PromptSection],
+    ) -> Self {
+        self.extra_stable_sections = stable;
+        self.extra_volatile_sections = volatile;
+        self
     }
 
     pub(crate) fn with_session_memory_entry(
@@ -473,11 +492,10 @@ pub(crate) fn augment_manifest_trace_with_provider_attempts(
                         "provider_response_id": terminal
                             .and_then(|terminal| terminal.provider_response_id.as_deref()),
                         "terminal_status": terminal.map(|terminal| terminal.status.as_str()),
+                        "usage_status": terminal.map(|terminal| terminal.usage_status.as_str()),
                         "usage": terminal.map(|terminal| json!({
-                            "input_tokens": terminal.usage.input_tokens,
+                            "input": terminal.usage.input,
                             "output_tokens": terminal.usage.output_tokens,
-                            "cache_read_tokens": terminal.usage.cache_read_tokens,
-                            "cache_creation_tokens": terminal.usage.cache_creation_tokens,
                         })),
                         "error_kind": terminal
                             .and_then(|terminal| terminal.error_kind.as_deref()),
@@ -564,6 +582,75 @@ pub(crate) fn context_meta_event_with_compactions(
     event
 }
 
+pub(crate) fn context_meta_event_with_tool_surface(
+    breakdown: &astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
+    context_manifest_trace: Option<&Value>,
+    compactions: &[astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation],
+    visible_tools: &[Value],
+) -> Value {
+    let mut event =
+        context_meta_event_with_compactions(breakdown, context_manifest_trace, compactions);
+    let mut names = visible_tools
+        .iter()
+        .filter_map(tool_name)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let mut seen = HashSet::new();
+    names.retain(|name| seen.insert(name.clone()));
+    event["visible_tools"] = json!(names);
+    event["visible_tool_actions"] = json!(visible_tool_action_surface(visible_tools));
+    event
+}
+
+/// Return the action union from the exact schemas sent to the provider.
+/// Names alone are insufficient for audit: a tool can remain visible while a
+/// hard authority projection removes its `start`/`write` branch. Keep this
+/// projection deterministic and bounded so it can be persisted alongside the
+/// round without retaining the full (potentially sensitive) schemas.
+pub(crate) fn visible_tool_action_surface(
+    visible_tools: &[Value],
+) -> BTreeMap<String, Vec<String>> {
+    visible_tools
+        .iter()
+        .filter_map(|schema| {
+            let name = tool_name(schema)?;
+            let mut actions = schema
+                .pointer("/function/parameters/properties/action/enum")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            for branch in schema
+                .pointer("/function/parameters/oneOf")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(action) = branch
+                    .pointer("/properties/action/const")
+                    .and_then(Value::as_str)
+                {
+                    actions.push(action.to_string());
+                }
+                actions.extend(
+                    branch
+                        .pointer("/properties/action/enum")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string),
+                );
+            }
+            actions.sort();
+            actions.dedup();
+            (!actions.is_empty()).then(|| (name.to_string(), actions))
+        })
+        .collect::<BTreeMap<_, _>>()
+}
+
 fn cache_control_count(value: &Value) -> usize {
     match value {
         Value::Object(map) => {
@@ -614,22 +701,6 @@ fn message_role(message: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string()
-}
-
-/// Bridge-facing context assembly input.
-///
-/// The bridge still has a per-request lifecycle and a few bridge-specific
-/// source lanes, so this adapter preserves current behavior while routing the
-/// call through the shared context boundary. The implementation delegates to
-/// the existing bridge pipeline helper until the bridge source collection is
-/// fully normalized into [`LlmContextAssemblyInput`].
-pub(crate) struct BridgeContextAssemblyInput<'a> {
-    /// Current conversation working set. It is optimized by the same pipeline
-    /// that selects the system sections and tool surface.
-    pub conversation_messages: &'a [Value],
-    pub tool_surface: ToolSurfacePlan<'a>,
-    pub runtime_signals: BridgeRuntimeSignals<'a>,
-    pub session: BridgeSessionContextInput<'a>,
 }
 
 fn tool_name(schema: &Value) -> Option<&str> {
@@ -689,117 +760,17 @@ fn filter_restricted_tool_schemas(
         .collect()
 }
 
-pub(crate) struct BridgeRuntimeSignals<'a> {
-    pub extra_stable_sections: &'a [crate::prompts::PromptSection],
-    pub extra_volatile_sections: &'a [crate::prompts::PromptSection],
-    pub memory_entries: &'a [astra_turn_core::context_sources::MemoryEntry],
-    pub memory_provider_source: Option<&'a str>,
-    pub session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
-    pub system_override: Option<&'a str>,
-}
-
-impl<'a> BridgeRuntimeSignals<'a> {
-    pub(crate) fn new(
-        extra_stable_sections: &'a [crate::prompts::PromptSection],
-        extra_volatile_sections: &'a [crate::prompts::PromptSection],
-        memory_entries: &'a [astra_turn_core::context_sources::MemoryEntry],
-        session_memory_entry: Option<astra_turn_core::context_sources::MemoryEntry>,
-        system_override: Option<&'a str>,
-    ) -> Self {
-        Self {
-            extra_stable_sections,
-            extra_volatile_sections,
-            memory_entries,
-            memory_provider_source: None,
-            session_memory_entry,
-            system_override,
-        }
-    }
-
-    pub(crate) fn with_memory_provider_source(mut self, source: Option<&'a str>) -> Self {
-        self.memory_provider_source = source;
-        self
-    }
-}
-
-pub(crate) struct BridgeSessionContextInput<'a> {
-    pub cache_cfg: &'a PromptCacheConfig,
-    pub cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
-    pub session_id: &'a str,
-    pub model_id: &'a str,
-    pub context_window: Option<u32>,
-    pub max_completion_tokens: Option<u32>,
-    pub provider: &'a str,
-    pub edge_profile_cwd: Option<&'a str>,
-    pub edge_profile_git_branch: Option<&'a str>,
-    pub project_context: Option<&'a str>,
-    pub current_date: &'a str,
-    pub skill_listing_block: &'a str,
-}
-
-impl<'a> BridgeSessionContextInput<'a> {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        cache_cfg: &'a PromptCacheConfig,
-        cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
-        session_id: &'a str,
-        model_id: &'a str,
-        provider: &'a str,
-        edge_profile_cwd: Option<&'a str>,
-        edge_profile_git_branch: Option<&'a str>,
-        project_context: Option<&'a str>,
-        current_date: &'a str,
-    ) -> Self {
-        Self {
-            cache_cfg,
-            cache_capability,
-            session_id,
-            model_id,
-            context_window: None,
-            max_completion_tokens: None,
-            provider,
-            edge_profile_cwd,
-            edge_profile_git_branch,
-            project_context,
-            current_date,
-            skill_listing_block: "",
-        }
-    }
-
-    pub(crate) fn with_skill_listing_block(mut self, skill_listing_block: &'a str) -> Self {
-        self.skill_listing_block = skill_listing_block;
-        self
-    }
-
-    pub(crate) fn with_context_window(mut self, context_window: Option<u32>) -> Self {
-        self.context_window = context_window;
-        self
-    }
-
-    pub(crate) fn with_max_completion_tokens(mut self, max_completion_tokens: Option<u32>) -> Self {
-        self.max_completion_tokens = max_completion_tokens;
-        self
-    }
-}
-
-pub(crate) struct BridgeContextAssemblyOutput {
-    pub primary_system: Value,
-    pub dynamic_system: Option<Value>,
-    pub messages: Vec<Value>,
-    pub prompt_sections: Vec<crate::prompts::PromptSection>,
-    pub tier: astra_turn_core::compaction_types::CompactionTier,
-    pub tool_schemas: Vec<Value>,
-    pub manifest_trace: LlmContextManifestTrace,
-}
-
 /// Input for the final wire-message stitching phase.
 pub(crate) struct LlmWireAssemblyInput<'a> {
     pub system_messages: Vec<Value>,
     pub volatile_preamble: Vec<Value>,
     pub compacted_messages: Vec<Value>,
     pub state: &'a mut AgenticLoopState,
+    /// A real compaction boundary rewrote the history for this stateless
+    /// request. Re-emit the active-turn frame. Requests without a boundary
+    /// retain the ordinary stable prompt path.
+    pub compaction_boundary_hit: bool,
     pub thinking: &'a astra_turn_core::thinking_config::ThinkingConfig,
-    pub edge_profile: &'a Map<String, Value>,
     pub session_id: &'a str,
     pub provider: &'a str,
     pub model_name: &'a str,
@@ -1137,134 +1108,6 @@ pub(crate) fn build_context_manifest_projection(
     }
 }
 
-/// Assemble bridge context through the shared context boundary.
-///
-/// This is an intentional compatibility adapter. It lets the CLI/HTTP bridge
-/// stop calling prompt-cache internals directly before we collapse bridge
-/// source collection into the same normalized input used by server/web agent
-/// sessions.
-pub(crate) fn assemble_bridge_context(
-    input: BridgeContextAssemblyInput<'_>,
-) -> BridgeContextAssemblyOutput {
-    let effective_tool_schemas = input.tool_surface.effective_tools();
-    let effective_tool_names: Vec<&str> = effective_tool_schemas
-        .iter()
-        .filter_map(tool_name)
-        .collect();
-    let mut extra_volatile_sections = input.runtime_signals.extra_volatile_sections.to_vec();
-    if effective_tool_names.contains(&"memory")
-        && let Some(selection) = astra_tools::memoria::MemoriaToolGateway::latest_selection_context(
-            input.session.session_id,
-        )
-    {
-        extra_volatile_sections.push(crate::prompts::PromptSection::dynamic(
-            selection,
-            crate::prompts::PromptTokenBucket::Environment,
-        ));
-    }
-    // The typed AvailableSkills channel is the catalog's canonical owner.
-    // Older bridge callers also placed the exact same section in the generic
-    // stable lane. Filter that structurally identical copy at the ownership
-    // boundary so one logical context source cannot be serialized twice.
-    let typed_skill_catalog = input.session.skill_listing_block.trim();
-    let extra_stable_sections = input
-        .runtime_signals
-        .extra_stable_sections
-        .iter()
-        .filter(|section| {
-            typed_skill_catalog.is_empty() || section.text.trim() != typed_skill_catalog
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let _tool_surface_metadata = (
-        input.tool_surface.visible_tools.len(),
-        input.tool_surface.always_load_tools.len(),
-        input.tool_surface.dynamic_tools.len(),
-        input.tool_surface.required_tools.len(),
-        input.tool_surface.restricted_tools.len(),
-    );
-    let window_policy = crate::prompts::budget_for_model_with_metadata(
-        Some(input.session.model_id),
-        input.session.context_window,
-        input.session.max_completion_tokens,
-    )
-    .window_policy();
-    let outcome = crate::turn::prompt_cache::assemble_bridge_pipeline_outcome_with_messages(
-        &effective_tool_names,
-        &effective_tool_schemas,
-        &extra_stable_sections,
-        &extra_volatile_sections,
-        input.runtime_signals.memory_entries,
-        input.runtime_signals.session_memory_entry.as_ref(),
-        input.runtime_signals.system_override,
-        input.session.cache_cfg,
-        input.session.cache_capability,
-        input.session.session_id,
-        input.session.model_id,
-        u32::try_from(window_policy.usable_input_limit_tokens).ok(),
-        u32::try_from(window_policy.reserved_output_tokens).unwrap_or(u32::MAX),
-        input.session.provider,
-        input.session.edge_profile_cwd,
-        input.session.edge_profile_git_branch,
-        input.session.project_context,
-        input.tool_surface.deferred_tools_block,
-        input.session.skill_listing_block,
-        input.session.current_date,
-        input.conversation_messages,
-    );
-    let system_prompt_tokens = estimate_json_tokens(&outcome.primary_system).saturating_add(
-        outcome
-            .dynamic_system
-            .as_ref()
-            .map(estimate_json_tokens)
-            .unwrap_or(0),
-    );
-    let stable_system_message_count = 1;
-    let volatile_preamble_count = usize::from(outcome.dynamic_system.is_some());
-    let tool_schema_count = outcome.tool_schemas.len();
-    let compaction_tier = format!("{:?}", outcome.tier);
-    let model_context_window_tokens =
-        u32::try_from(window_policy.raw_context_window_tokens).unwrap_or(u32::MAX);
-    BridgeContextAssemblyOutput {
-        primary_system: outcome.primary_system,
-        dynamic_system: outcome.dynamic_system,
-        messages: outcome.messages,
-        prompt_sections: outcome.prompt_sections,
-        tier: outcome.tier,
-        tool_schemas: outcome.tool_schemas,
-        manifest_trace: LlmContextManifestTrace {
-            source: "llm_context_bridge",
-            provider: input.session.provider.to_string(),
-            model_name: input.session.model_id.to_string(),
-            model_context_window_tokens,
-            context_window_policy: window_policy,
-            compaction_tier,
-            system_prompt_tokens,
-            stable_system_message_count,
-            volatile_preamble_count,
-            tool_schema_count,
-            runtime_manifest: runtime_manifest_with_memory_context(
-                Some(json!({
-                    "schema_version": "astra_runtime_manifest.v1",
-                    "selected_model": {
-                        "model": input.session.model_id,
-                    },
-                    "model_resolution": {
-                        "source": "bridge_request",
-                        "model": input.session.model_id,
-                        "provider": input.session.provider,
-                        "resolved": true,
-                    },
-                    "runtime_profile": astra_runtime_env::CapacityProviderType::CliLocal.as_str(),
-                })),
-                input.runtime_signals.memory_provider_source,
-                input.runtime_signals.memory_entries.len(),
-                input.runtime_signals.session_memory_entry.is_some(),
-            ),
-        },
-    }
-}
-
 /// Run the shared context pipeline and split stable/volatile system content
 /// according to the provider's cache behavior.
 pub(crate) fn assemble_context_pipeline(
@@ -1321,6 +1164,16 @@ pub(crate) fn assemble_context_pipeline(
     external
         .memory_entries
         .extend(input.runtime_signals.memory_entries.iter().cloned());
+    external
+        .extra_stable_sections
+        .extend(input.runtime_signals.extra_stable_sections.iter().cloned());
+    external.extra_dynamic_sections.extend(
+        input
+            .runtime_signals
+            .extra_volatile_sections
+            .iter()
+            .cloned(),
+    );
     if tool_names.contains(&"memory")
         && let Some(selection) =
             astra_tools::memoria::MemoriaToolGateway::latest_selection_context(input.session_id)
@@ -1412,13 +1265,33 @@ pub(crate) fn assemble_context_pipeline(
         )
     };
 
-    let pipeline_output = match pipeline_result {
+    let mut pipeline_output = match pipeline_result {
         Ok(out) => out,
         Err(abort) => {
             record_pipeline_abort(state, &abort);
             return Err(classify_pipeline_abort(abort));
         }
     };
+    // Adaptive optimization may remove optional schemas, but an explicitly
+    // required request/delegation capability is part of the executable wire
+    // contract. Restore only those already admitted and restriction-filtered
+    // schemas after optimization; this cannot widen authority and keeps a
+    // narrow child from losing its sole useful tool.
+    let mut optimized_tool_names = pipeline_output
+        .optimized
+        .tool_schemas
+        .iter()
+        .filter_map(tool_name)
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    for schema in input.tool_surface.required_tools {
+        let Some(name) = tool_name(schema) else {
+            continue;
+        };
+        if optimized_tool_names.insert(name.to_string()) {
+            pipeline_output.optimized.tool_schemas.push(schema.clone());
+        }
+    }
 
     let plain = astra_turn_core::context_serializer::flatten_serialized_system_blocks(
         &pipeline_output.serialized,
@@ -1476,9 +1349,29 @@ pub(crate) fn assemble_context_pipeline(
             let preamble = runtime_system_messages_from_text(volatile_text, inject_volatile);
             (system, preamble)
         }
-        VolatilePlacement::TailSuffix
-        | VolatilePlacement::CurrentUserOnly
-        | VolatilePlacement::Free => {
+        VolatilePlacement::CurrentUserOnly => {
+            let mut stable_text = String::new();
+            let mut volatile_text = String::new();
+            for block in &pipeline_output.serialized.system_blocks {
+                // Strict-history providers suppress ordinary volatile text to
+                // keep prior messages byte-stable. Deferred-tool discovery is
+                // different: it is a control-plane contract the model must
+                // see in order to activate a tool. Keep that typed block in
+                // the stable lane; changing it intentionally starts a new
+                // cache epoch instead of silently hiding a capability.
+                if block.scope != CacheScope::None
+                    || block.kind == astra_turn_core::section_types::SectionKind::DeferredTools
+                {
+                    stable_text.push_str(&block.text);
+                } else {
+                    volatile_text.push_str(&block.text);
+                }
+            }
+            let system = vec![json!({"role": "system", "content": stable_text})];
+            let preamble = volatile_preamble_from_text(volatile_text, inject_volatile);
+            (system, preamble)
+        }
+        VolatilePlacement::TailSuffix | VolatilePlacement::Free => {
             let mut stable_text = String::new();
             let mut volatile_text = String::new();
             for block in &pipeline_output.serialized.system_blocks {
@@ -1512,6 +1405,22 @@ pub(crate) fn assemble_context_pipeline(
         &required_runtime_texts.join("\n\n"),
     ) {
         volatile_preamble.push(required_text);
+    }
+    let decision_feedback =
+        astra_turn_core::chat_turn_edge_profile::edge_profile_runtime_volatile_injections(
+            input.runtime_signals.edge_profile,
+        )
+        .into_iter()
+        .filter(|injection| {
+            injection.delivery_class
+                == astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::DecisionFeedback
+        })
+        .filter_map(|injection| injection.render_for_prompt())
+        .collect::<Vec<_>>();
+    if let Some(feedback) = crate::turn::wire_assembly::decision_feedback_preamble_message(
+        &decision_feedback.join("\n\n"),
+    ) {
+        volatile_preamble.push(feedback);
     }
     let stable_system_message_count = system_messages.len();
     let volatile_preamble_count = volatile_preamble.len();
@@ -1555,6 +1464,16 @@ pub(crate) fn assemble_context_pipeline(
     })
 }
 
+fn volatile_preamble_from_text(text: String, inject: bool) -> Vec<Value> {
+    if !inject || text.is_empty() {
+        return Vec::new();
+    }
+    vec![json!({
+        "role": "user",
+        "content": crate::turn::wire_assembly::system_reminder_wrapped_text(&text),
+    })]
+}
+
 fn runtime_system_messages_from_text(text: String, inject: bool) -> Vec<Value> {
     if !inject || text.is_empty() {
         return Vec::new();
@@ -1583,7 +1502,8 @@ fn record_pipeline_abort(
                     state.current_session_id.as_deref(),
                     turn,
                     payload,
-                ),
+                )
+                .with_producer_scope(state.current_run_id.as_deref()),
             );
         }
     }
@@ -1615,7 +1535,14 @@ fn classify_pipeline_abort(
 /// paths can share the same message ordering and cache-sensitive volatile
 /// placement instead of each host rebuilding this logic.
 pub(crate) fn assemble_wire_messages(input: LlmWireAssemblyInput<'_>) -> Vec<Value> {
-    queue_active_turn_frame(input.state);
+    // The real user message is already in prompt history after the first
+    // boundary. Repeating the full goal plus a changing round id on every
+    // tool round creates an avoidable uncached suffix. Re-emit it for a
+    // genuine compaction boundary so a rewritten history still has an
+    // explicit current-turn anchor.
+    if input.state.current_round_index == 0 || input.compaction_boundary_hit {
+        queue_active_turn_frame(input.state);
+    }
     let drained = input.state.take_volatile_pending();
 
     let mut skills: Vec<_> = input.state.skills.invoked.values().collect();
@@ -1627,11 +1554,7 @@ pub(crate) fn assemble_wire_messages(input: LlmWireAssemblyInput<'_>) -> Vec<Val
             content: skill.content.as_str(),
         })
         .collect();
-    let attachments = crate::turn::wire_assembly::PostCompactAttachments {
-        invoked_skills,
-        recent_file_reads: &input.state.recent_file_reads,
-        cwd: input.edge_profile.get("cwd").and_then(Value::as_str),
-    };
+    let attachments = crate::turn::wire_assembly::PostCompactAttachments { invoked_skills };
 
     crate::turn::wire_assembly::assemble_llm_messages_with_cache_capability(
         input.system_messages,
@@ -1653,17 +1576,62 @@ fn queue_active_turn_frame(state: &mut AgenticLoopState) {
     if latest_user_message.is_empty() {
         return;
     }
-    let frame = json!({
+    let prior_user_request = immediate_prior_user_request(&state.messages, latest_user_message);
+    let mut frame = json!({
         "latest_user_message": latest_user_message,
         "active_goal": latest_user_message,
         "turn_id": state.session_turn,
         "round_id": state.llm_rounds_completed,
-        "instruction": "Answer the latest user message first. History, memory, and tool results are evidence for this goal; do not finish with an answer to an older question."
+        "instruction": "Answer the latest user message first. For a short, elliptical, or deictic follow-up, resolve its subject from the immediately preceding user-assistant exchange by default, and do not mention unrelated older topics. Expand to an older topic or the whole session only when the user explicitly asks for that broader scope. History, memory, and tool results are evidence, not competing requests; do not finish with an answer to an older question."
     });
+    if let Some(prior_user_request) = prior_user_request {
+        frame["immediate_prior_user_request"] = Value::String(prior_user_request);
+    }
     state.push_volatile_payload(
         crate::turn::agentic_loop::host::VolatileKind::ActiveTurnFrame,
         frame,
     );
+}
+
+fn immediate_prior_user_request(messages: &[Value], latest_user_message: &str) -> Option<String> {
+    let user_messages = messages
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .filter_map(prompt_message_text)
+        .collect::<Vec<_>>();
+    let prior_index = match user_messages
+        .iter()
+        .rposition(|text| text.trim() == latest_user_message)
+    {
+        Some(current) => current.checked_sub(1),
+        None => user_messages.len().checked_sub(1),
+    };
+    prior_index.map(|index| truncate_focus_text(user_messages[index].trim(), 600))
+}
+
+fn prompt_message_text(message: &Value) -> Option<String> {
+    match message.get("content")? {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(blocks) => {
+            let text = blocks
+                .iter()
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.trim().is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+fn truncate_focus_text(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let prefix = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
 }
 
 /// Apply provider-specific cache annotations to the final visible tool schemas.
@@ -1781,16 +1749,27 @@ pub(crate) fn stabilize_tool_schemas_for_cache(
     }
 
     let visible_names: HashSet<&str> = visible_tool_schemas.iter().filter_map(tool_name).collect();
-    let current_names: HashSet<&str> = current_tool_schemas.iter().filter_map(tool_name).collect();
+    let current_by_name = current_tool_schemas
+        .iter()
+        .filter_map(|schema| tool_name(schema).map(|name| (name, schema)))
+        .collect::<BTreeMap<_, _>>();
     let mut stabilized = Vec::new();
     let mut seen = HashSet::new();
 
-    for schema in previous_tool_schemas {
-        let Some(name) = tool_name(schema) else {
+    // Previous declarations contribute ordering only. Their JSON schema is
+    // not authority: a same-named tool may have lost an action or parameter
+    // branch since the preceding request. Reusing the old value would put a
+    // forbidden action back on the provider wire merely to preserve cache
+    // bytes, while the terminal admission gate correctly rejects it. Keep the
+    // stable name order but always publish the current authoritative schema.
+    for previous_schema in previous_tool_schemas {
+        let Some(name) = tool_name(previous_schema) else {
             continue;
         };
-        if visible_names.contains(name) && current_names.contains(name) {
-            push_unique_tool(&mut stabilized, &mut seen, schema);
+        if visible_names.contains(name)
+            && let Some(current_schema) = current_by_name.get(name)
+        {
+            push_unique_tool(&mut stabilized, &mut seen, current_schema);
         }
     }
     for schema in current_tool_schemas {
@@ -1809,181 +1788,6 @@ pub(crate) fn stabilize_tool_schemas_for_cache(
             &stabilized,
         );
         stabilized
-    }
-}
-
-pub(crate) fn apply_bridge_message_cache_metadata(
-    messages: &mut [Value],
-    synthetic_tail_prefix_end: Option<usize>,
-    cache_cfg: &PromptCacheConfig,
-    session_id: &str,
-) {
-    if let Some(prefix_end) = synthetic_tail_prefix_end {
-        crate::turn::prompt_cache::apply_anthropic_cache_metadata(
-            &mut messages[..prefix_end],
-            cache_cfg,
-            session_id,
-        );
-    } else {
-        crate::turn::prompt_cache::apply_anthropic_cache_metadata(messages, cache_cfg, session_id);
-    }
-}
-
-pub(crate) struct BridgeRetryWireRebuildInput<'a> {
-    pub previous_messages: &'a [Value],
-    pub compacted_messages: Vec<Value>,
-    pub boundary_present: bool,
-    pub volatile_runtime_text: Option<String>,
-    pub required_runtime_text: Option<String>,
-    pub provider: &'a str,
-    pub model_name: &'a str,
-    pub thinking: &'a astra_turn_core::thinking_config::ThinkingConfig,
-    pub cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
-    pub cache_cfg: &'a PromptCacheConfig,
-    pub session_id: &'a str,
-}
-
-pub(crate) fn bridge_retry_compaction_history(messages: &[Value]) -> Vec<Value> {
-    let compactable_history = messages
-        .iter()
-        .filter(|message| !crate::turn::wire_assembly::is_runtime_system_context(message))
-        .cloned()
-        .map(|mut message| {
-            crate::turn::wire_assembly::strip_runtime_context_from_tool_message(&mut message);
-            message
-        })
-        .collect::<Vec<_>>();
-    astra_core::history_work::record_serialized_value(
-        astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
-        &compactable_history,
-    );
-    compactable_history
-}
-
-pub(crate) fn rebuild_bridge_retry_wire_messages(
-    input: BridgeRetryWireRebuildInput<'_>,
-) -> Vec<Value> {
-    let system_prefix_count = input
-        .previous_messages
-        .iter()
-        .take_while(|message| message.get("role").and_then(Value::as_str) == Some("system"))
-        .count();
-    let retained_system_prefix = input.previous_messages[..system_prefix_count]
-        .iter()
-        .filter(|message| !crate::turn::wire_assembly::is_runtime_system_context(message))
-        .cloned()
-        .collect::<Vec<_>>();
-    astra_core::history_work::record_serialized_value(
-        astra_core::history_work::HistoryWorkSite::CompactionHistoryClone,
-        &retained_system_prefix,
-    );
-    let mut messages = retained_system_prefix;
-    let mut compacted_messages = input.compacted_messages;
-    crate::turn::wire_assembly::maybe_append_continuation_prompt(
-        &mut compacted_messages,
-        input.boundary_present,
-    );
-    messages.extend(compacted_messages);
-    let synthetic_tail_prefix_end = finalize_bridge_wire_messages(
-        &mut messages,
-        input.volatile_runtime_text,
-        input.required_runtime_text,
-        input.provider,
-        input.model_name,
-        input.thinking,
-        input.cache_capability,
-    );
-    apply_bridge_message_cache_metadata(
-        &mut messages,
-        synthetic_tail_prefix_end,
-        input.cache_cfg,
-        input.session_id,
-    );
-    astra_core::history_work::record_serialized_value(
-        astra_core::history_work::HistoryWorkSite::ProviderRetryRetention,
-        &messages,
-    );
-    messages
-}
-
-/// Finalize bridge wire messages after bridge-specific compaction and context
-/// release have run.
-///
-/// The bridge currently compacts and mutates its message vector inline. This
-/// helper centralizes the runtime-authority rule shared with
-/// [`assemble_wire_messages`]: model-visible runtime context keeps `system`
-/// authority and uses the provider's cache-aware placement. Canonical
-/// user/tool history is never rewritten.
-pub(crate) fn finalize_bridge_wire_messages(
-    llm_messages: &mut Vec<Value>,
-    volatile_text: Option<String>,
-    required_runtime_text: Option<String>,
-    provider: &str,
-    model_name: &str,
-    thinking: &astra_turn_core::thinking_config::ThinkingConfig,
-    cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
-) -> Option<usize> {
-    let reasoning_policy = astra_turn_core::edge_ledger::ReasoningReplayPolicy::infer(
-        llm_messages,
-        thinking,
-        provider,
-        model_name,
-    );
-    astra_turn_core::edge_ledger::strip_stale_reasoning_with_policy(
-        llm_messages,
-        &reasoning_policy,
-    );
-    let cache_cap =
-        astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider_model(
-            cache_capability,
-            provider,
-            model_name,
-        );
-    let suppress_volatile = matches!(
-        cache_cap.volatile_placement,
-        astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly
-    );
-    let carried_runtime =
-        crate::turn::wire_assembly::take_runtime_system_context_messages(llm_messages);
-    let mut runtime_messages = Vec::new();
-    for message in carried_runtime {
-        let is_required = crate::turn::wire_assembly::is_required_runtime_preamble(&message);
-        if suppress_volatile && !is_required {
-            continue;
-        }
-        runtime_messages.push(message);
-    }
-    if let Some(text) = required_runtime_text
-        && !text.trim().is_empty()
-        && let Some(message) =
-            crate::turn::wire_assembly::runtime_system_context_message(&text, true)
-    {
-        runtime_messages.push(message);
-    }
-    if !suppress_volatile
-        && let Some(text) = volatile_text
-        && !text.trim().is_empty()
-        && let Some(message) =
-            crate::turn::wire_assembly::runtime_system_context_message(&text, false)
-    {
-        runtime_messages.push(message);
-    }
-    if runtime_messages.is_empty() {
-        return None;
-    }
-    if matches!(
-        cache_cap.volatile_placement,
-        astra_turn_core::cache_placement::VolatilePlacement::MarkerIsolated
-    ) {
-        let index = llm_messages.len();
-        llm_messages.extend(runtime_messages);
-        Some(index)
-    } else {
-        crate::turn::wire_assembly::insert_runtime_system_context(
-            llm_messages,
-            runtime_messages,
-            cache_cap.volatile_placement,
-        )
     }
 }
 
@@ -2222,6 +2026,7 @@ mod context_cache_contract_tests {
     fn pipeline_abort_journal_event_uses_session_turn() {
         let mut state = crate::turn::agentic_loop::host::tests::make_state();
         state.current_session_id = Some("session-1".to_string());
+        state.current_run_id = Some("run-1".to_string());
         state.session_turn = 9;
         state.llm_rounds_completed = 1;
         state.turn_event_buffer = Some(
@@ -2248,6 +2053,13 @@ mod context_cache_contract_tests {
             })
             .expect("pipeline alert event");
         assert_eq!(alert_event.turn, Some(9));
+        assert_eq!(
+            alert_event
+                .producer_scope
+                .as_ref()
+                .map(|scope| scope.run_id.as_str()),
+            Some("run-1")
+        );
         assert_eq!(
             alert_event
                 .metadata
@@ -2481,6 +2293,16 @@ mod context_cache_contract_tests {
             !primary_text.contains("must be suppressed"),
             "ordinary volatile content must stay out of strict-history stable prompt: {primary_text}"
         );
+        assert!(
+            primary_text.contains("## Tool Availability Protocol"),
+            "strict-history providers must retain the generic typed availability contract: {primary_text}"
+        );
+        assert!(
+            !primary_text.contains("<deferred-tools>")
+                && !primary_text.contains("## Durable Work")
+                && !primary_text.contains("`start_work` is the first tool call"),
+            "the prompt must not advertise deferred or Work capabilities absent from the admitted tool surface: {primary_text}"
+        );
         assert_eq!(output.volatile_preamble.len(), 1);
         assert!(crate::turn::wire_assembly::is_required_runtime_preamble(
             &output.volatile_preamble[0]
@@ -2621,7 +2443,6 @@ mod context_cache_contract_tests {
             json!({"role": "user", "content": "相关的测试够硬核吗？"}),
         ];
         let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
-        let edge_profile = Map::new();
         let cache_cfg = PromptCacheConfig::latch("openai", "gpt-4");
 
         let messages = assemble_wire_messages(LlmWireAssemblyInput {
@@ -2629,8 +2450,8 @@ mod context_cache_contract_tests {
             volatile_preamble: Vec::new(),
             compacted_messages: state.messages.clone(),
             state: &mut state,
+            compaction_boundary_hit: false,
             thinking: &thinking,
-            edge_profile: &edge_profile,
             session_id: "sid",
             provider: "openai",
             model_name: "gpt-4",
@@ -2662,157 +2483,181 @@ mod context_cache_contract_tests {
     }
 
     #[test]
-    fn assemble_bridge_context_reports_configured_context_window() {
-        let cache_cfg = PromptCacheConfig {
-            cache_enabled: false,
-            is_anthropic: false,
-        };
-        let visible_tools: Vec<Value> = Vec::new();
-        let restricted_tools = HashSet::new();
-        let memory_entries = vec![
-            astra_turn_core::context_sources::MemoryEntry::scored(
-                "typed bridge memory evidence",
-                0.9,
-            )
-            .with_memory_identity("bridge-memory-1", "semantic"),
+    fn active_turn_frame_anchors_elliptical_follow_up_to_immediate_exchange() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.message = "问题总结？".to_string();
+        state.session_turn = 9;
+        state.messages = vec![
+            json!({"role": "user", "content": "分析整个 task 系统"}),
+            json!({"role": "assistant", "content": "旧话题分析"}),
+            json!({"role": "user", "content": "不要修改，只读 review uncommitted changes"}),
+            json!({"role": "assistant", "content": "发现 cursor pagination 和测试覆盖问题"}),
+            json!({"role": "user", "content": "问题总结？"}),
+        ];
+        let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+        let messages = assemble_wire_messages(LlmWireAssemblyInput {
+            system_messages: vec![json!({"role": "system", "content": "sys"})],
+            volatile_preamble: Vec::new(),
+            compacted_messages: state.messages.clone(),
+            state: &mut state,
+            compaction_boundary_hit: false,
+            thinking: &thinking,
+            session_id: "sid",
+            provider: "openai",
+            model_name: "deepseek-v4-flash",
+            cache_capability: None,
+            cache_cfg: &PromptCacheConfig::latch("openai", "deepseek-v4-flash"),
+        });
+
+        assert_eq!(
+            messages.last(),
+            Some(&json!({"role": "user", "content": "问题总结？"})),
+            "runtime focus context must not be appended to user speech"
+        );
+        let frame = messages
+            .iter()
+            .rev()
+            .find(|message| {
+                message.get("role").and_then(Value::as_str) == Some("system")
+                    && message_text(message).contains("<runtime-required-context>")
+            })
+            .map(message_text)
+            .expect("typed active-turn frame");
+        assert!(frame.contains("不要修改，只读 review uncommitted changes"));
+        assert!(!frame.contains("immediate_prior_user_request\":\"分析整个 task 系统"));
+        assert!(frame.contains("whole session only when the user explicitly asks"));
+    }
+
+    #[test]
+    fn immediate_prior_user_request_uses_position_when_text_repeats() {
+        let messages = vec![
+            json!({"role": "user", "content": "问题总结？"}),
+            json!({"role": "assistant", "content": "first"}),
+            json!({"role": "user", "content": "CURSOR-BETA review"}),
+            json!({"role": "assistant", "content": "second"}),
+            json!({"role": "user", "content": "问题总结？"}),
         ];
 
-        let output = assemble_bridge_context(BridgeContextAssemblyInput {
-            conversation_messages: &[],
-            tool_surface: ToolSurfacePlan::from_visible_tools(&visible_tools, &restricted_tools),
-            runtime_signals: BridgeRuntimeSignals::new(&[], &[], &memory_entries, None, None)
-                .with_memory_provider_source(Some("request_binding")),
-            session: BridgeSessionContextInput::new(
-                &cache_cfg,
-                None,
-                "sid-bridge-context-window",
-                "deepseek-v4-pro-official",
-                "openai",
-                None,
-                None,
-                None,
-                "2026-07-01",
-            )
-            .with_context_window(Some(1_000_000)),
-        });
-
         assert_eq!(
-            output.manifest_trace.to_json()["model_context_window_tokens"],
-            json!(1_000_000),
-            "bridge context assembly must preserve the resolved model context_window"
-        );
-        assert_eq!(
-            output.manifest_trace.to_json()["runtime_manifest"]["runtime_profile"],
-            astra_runtime_env::CapacityProviderType::CliLocal.as_str(),
-            "the /chat/turn adapter must surface CLI local capacity, not an implementation class name"
-        );
-        assert_eq!(
-            output.manifest_trace.to_json()["runtime_manifest"]["memory_context"],
-            json!({
-                "provider_source": "request_binding",
-                "prompt_entry_count": 1,
-                "session_snapshot_injected": false,
-                "delivery": "typed_runtime_dynamic",
-            })
+            immediate_prior_user_request(&messages, "问题总结？").as_deref(),
+            Some("CURSOR-BETA review")
         );
     }
 
     #[test]
-    fn assemble_bridge_context_emits_typed_skill_catalog_once() {
-        let cache_cfg = PromptCacheConfig {
-            cache_enabled: true,
-            is_anthropic: true,
-        };
-        let catalog = "<available_skills><skill><name>review</name></skill></available_skills>";
-        let legacy_generic_copy = [crate::prompts::PromptSection::stable(
-            catalog,
-            crate::prompts::CacheScope::Session,
-        )];
-        let visible_tools: Vec<Value> = Vec::new();
-        let restricted_tools = HashSet::new();
-
-        let output = assemble_bridge_context(BridgeContextAssemblyInput {
-            conversation_messages: &[],
-            tool_surface: ToolSurfacePlan::from_visible_tools(&visible_tools, &restricted_tools),
-            runtime_signals: BridgeRuntimeSignals::new(&legacy_generic_copy, &[], &[], None, None),
-            session: BridgeSessionContextInput::new(
-                &cache_cfg,
-                None,
-                "sid-single-skill-catalog",
-                "deepseek-v4-flash-anthropic",
-                "anthropic",
-                Some("/tmp/project"),
-                Some("main"),
-                None,
-                "2026-07-24",
-            )
-            .with_skill_listing_block(catalog),
+    fn later_tool_round_does_not_repeat_the_current_goal_frame() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.message = "continue the current investigation".to_string();
+        state.session_turn = 7;
+        state.current_round_index = 1;
+        state.messages = vec![
+            json!({"role": "user", "content": state.message.clone()}),
+            json!({"role": "assistant", "content": "", "tool_calls": []}),
+            json!({"role": "tool", "content": "evidence", "tool_call_id": "c1"}),
+        ];
+        let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+        let messages = assemble_wire_messages(LlmWireAssemblyInput {
+            system_messages: vec![json!({"role": "system", "content": "sys"})],
+            volatile_preamble: Vec::new(),
+            compacted_messages: state.messages.clone(),
+            state: &mut state,
+            compaction_boundary_hit: false,
+            thinking: &thinking,
+            session_id: "sid",
+            provider: "openai",
+            model_name: "gpt-4",
+            cache_capability: None,
+            cache_cfg: &PromptCacheConfig::latch("openai", "gpt-4"),
         });
 
-        let system_text = message_text(&output.primary_system);
-        assert_eq!(
-            system_text.matches("<available_skills>").count(),
-            1,
-            "the typed AvailableSkills channel must be the catalog's single owner: {system_text}"
+        assert!(
+            messages
+                .iter()
+                .all(|message| !message_text(message).contains("active_turn_frame")),
+            "the current goal is already in history; later rounds must not append a duplicate volatile frame"
         );
+        assert!(state.volatile_pending.is_empty());
     }
 
     #[test]
-    fn bridge_context_carries_the_latest_resource_selection_only_with_its_tool() {
-        let session_id = "bridge-resource-selection";
-        astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(session_id);
-        astra_tools::memoria::MemoriaToolGateway::record_recall_for_producer(
-            session_id,
-            "bridge-turn",
-            3,
-            vec!["memory-1".to_string(), "memory-2".to_string()],
+    fn compaction_boundary_reanchors_goal_without_workspace_io() {
+        let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
+        state.message = "continue".to_string();
+        state.current_round_index = 1;
+        let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+        let cache_cfg = PromptCacheConfig::latch("openai", "gpt-4");
+
+        let without_boundary = assemble_wire_messages(LlmWireAssemblyInput {
+            system_messages: vec![json!({"role": "system", "content": "sys"})],
+            volatile_preamble: Vec::new(),
+            compacted_messages: vec![json!({"role": "user", "content": "continue"})],
+            state: &mut state,
+            compaction_boundary_hit: false,
+            thinking: &thinking,
+            session_id: "sid",
+            provider: "openai",
+            model_name: "gpt-4",
+            cache_capability: None,
+            cache_cfg: &cache_cfg,
+        });
+        assert!(
+            !without_boundary
+                .iter()
+                .any(|message| { message_text(message).contains("Post-compaction context: file") })
         );
-        let cache_cfg = PromptCacheConfig {
-            cache_enabled: false,
-            is_anthropic: false,
-        };
-        let memory_tool = vec![tool("memory")];
-        let unrestricted = HashSet::new();
-        let assemble = |restricted_tools: &HashSet<String>| {
-            assemble_bridge_context(BridgeContextAssemblyInput {
-                conversation_messages: &[],
-                tool_surface: ToolSurfacePlan::from_visible_tools(&memory_tool, restricted_tools),
-                runtime_signals: BridgeRuntimeSignals::new(&[], &[], &[], None, None),
-                session: BridgeSessionContextInput::new(
-                    &cache_cfg,
-                    None,
-                    session_id,
-                    "test-model",
-                    "openai",
-                    None,
-                    None,
-                    None,
-                    "2026-07-20",
-                ),
+
+        let with_boundary = assemble_wire_messages(LlmWireAssemblyInput {
+            system_messages: vec![json!({"role": "system", "content": "sys"})],
+            volatile_preamble: Vec::new(),
+            compacted_messages: vec![json!({"role": "user", "content": "continue"})],
+            state: &mut state,
+            compaction_boundary_hit: true,
+            thinking: &thinking,
+            session_id: "sid",
+            provider: "openai",
+            model_name: "gpt-4",
+            cache_capability: None,
+            cache_cfg: &cache_cfg,
+        });
+        assert!(
+            with_boundary.iter().any(|message| {
+                message_text(message).contains("\"kind\":\"active_turn_frame\"")
             })
-        };
-
-        let visible = assemble(&unrestricted);
-        let selection = visible
-            .prompt_sections
-            .iter()
-            .filter_map(|section| serde_json::from_str::<serde_json::Value>(&section.text).ok())
-            .find(|section| section["schema"] == "astra.resource_selection.v1")
-            .expect("typed selection section");
-        assert_eq!(selection["resource_kind"], "memory");
-        assert_eq!(
-            selection["identities"],
-            serde_json::json!(["memory-1", "memory-2"])
+        );
+        assert!(
+            with_boundary
+                .iter()
+                .all(|message| !message_text(message).contains("Post-compaction context: file"))
         );
 
-        let restricted = HashSet::from(["memory".to_string()]);
-        let hidden = assemble(&restricted);
-        assert!(hidden.prompt_sections.iter().all(|section| {
-            serde_json::from_str::<serde_json::Value>(&section.text)
-                .ok()
-                .is_none_or(|value| value["schema"] != "astra.resource_selection.v1")
-        }));
-        astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(session_id);
+        // A second stateless request may cross another real boundary in the
+        // same user turn. Its compacted history is independent of the first
+        // request, so the current-turn frame must be present again. Compaction
+        // itself stays workspace-I/O-free; fresh bytes require an ordinary
+        // governed read_file call.
+        let with_second_boundary = assemble_wire_messages(LlmWireAssemblyInput {
+            system_messages: vec![json!({"role": "system", "content": "sys"})],
+            volatile_preamble: Vec::new(),
+            compacted_messages: vec![json!({"role": "user", "content": "continue"})],
+            state: &mut state,
+            compaction_boundary_hit: true,
+            thinking: &thinking,
+            session_id: "sid",
+            provider: "openai",
+            model_name: "gpt-4",
+            cache_capability: None,
+            cache_cfg: &cache_cfg,
+        });
+        assert!(
+            with_second_boundary.iter().any(|message| {
+                message_text(message).contains("\"kind\":\"active_turn_frame\"")
+            })
+        );
+        assert!(
+            with_second_boundary
+                .iter()
+                .all(|message| !message_text(message).contains("Post-compaction context: file"))
+        );
     }
 
     #[test]
@@ -2837,6 +2682,51 @@ mod context_cache_contract_tests {
         );
 
         assert_eq!(tool_names(&stabilized), vec!["bash", "read_file"]);
+    }
+
+    #[test]
+    fn stabilize_tool_schemas_never_restores_a_pruned_action_branch() {
+        let previous = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "agent_fanout",
+                "description": "fanout",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["start", "get_results"]}
+                    }
+                }
+            }
+        })];
+        let current = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "agent_fanout",
+                "description": "fanout",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["get_results"]}
+                    }
+                }
+            }
+        })];
+
+        let stabilized = stabilize_tool_schemas_for_cache(
+            &current,
+            &previous,
+            &current,
+            strict_history_cache_capability(),
+            1,
+        );
+
+        assert_eq!(stabilized, current);
+        assert_eq!(
+            stabilized[0]["function"]["parameters"]["properties"]["action"]["enum"],
+            json!(["get_results"]),
+            "cache stabilization may preserve order, never stale execution authority"
+        );
     }
 
     #[test]
@@ -2903,6 +2793,44 @@ mod context_cache_contract_tests {
         assert_eq!(event["type"], "context_meta");
         assert_eq!(event["system_prompt_tokens"], 123);
         assert_eq!(event["context_manifest_trace"], trace);
+    }
+
+    #[test]
+    fn context_meta_event_reports_exact_provider_tool_surface() {
+        let breakdown = astra_turn_core::context_assembly_trace::SystemPromptBreakdown::default();
+        let action_tool = json!({
+            "type": "function",
+            "function": {
+                "name": "agent_fanout",
+                "parameters": {
+                    "type": "object",
+                    "oneOf": [
+                        {"properties": {"action": {"const": "get_results"}}},
+                        {"properties": {"action": {"enum": ["stop_slot", "stop_group"]}}}
+                    ]
+                }
+            }
+        });
+        let event = context_meta_event_with_tool_surface(
+            &breakdown,
+            None,
+            &[],
+            &[
+                tool("start_work"),
+                tool("agent"),
+                tool("agent"),
+                action_tool,
+            ],
+        );
+
+        assert_eq!(
+            event["visible_tools"],
+            json!(["start_work", "agent", "agent_fanout"])
+        );
+        assert_eq!(
+            event["visible_tool_actions"]["agent_fanout"],
+            json!(["get_results", "stop_group", "stop_slot"])
+        );
     }
 
     #[test]
@@ -3189,10 +3117,8 @@ mod context_cache_contract_tests {
                 astra_services::InferenceTerminalStatus::DeliveryUnknown,
                 "provider-partial",
                 astra_services::InferenceUsage {
-                    input_tokens: 200,
+                    input: astra_turn_types::NormalizedPromptCacheUsage::new(200, 800, 100),
                     output_tokens: 50,
-                    cache_read_tokens: 800,
-                    cache_creation_tokens: 100,
                 },
                 Some("stream_transport"),
                 Some("provider stream ended after partial delivery"),
@@ -3203,10 +3129,8 @@ mod context_cache_contract_tests {
                 astra_services::InferenceTerminalStatus::Succeeded,
                 "provider-success",
                 astra_services::InferenceUsage {
-                    input_tokens: 120,
+                    input: astra_turn_types::NormalizedPromptCacheUsage::new(120, 400, 20),
                     output_tokens: 30,
-                    cache_read_tokens: 400,
-                    cache_creation_tokens: 20,
                 },
                 None,
                 None,
@@ -3237,6 +3161,11 @@ mod context_cache_contract_tests {
                 terminal: Some(astra_services::InferenceInvocationTerminal {
                     status,
                     usage,
+                    usage_status: if status == astra_services::InferenceTerminalStatus::Succeeded {
+                        astra_services::InferenceUsageStatus::ProviderExact
+                    } else {
+                        astra_services::InferenceUsageStatus::ProviderPartial
+                    },
                     provider_response_id: Some(response_id.to_string()),
                     error_kind: error_kind.map(str::to_string),
                     error_message: error_message.map(str::to_string),
@@ -3269,16 +3198,22 @@ mod context_cache_contract_tests {
             "delivery_unknown"
         );
         assert_eq!(
+            trace["provider_request_attempts"][0]["usage_status"],
+            "provider_partial"
+        );
+        assert_eq!(
             trace["provider_request_attempts"][0]["provider_response_id"],
             "provider-partial"
         );
         assert_eq!(
             trace["provider_request_attempts"][0]["usage"],
             json!({
-                "input_tokens": 200,
+                "input": {
+                    "fresh_input_tokens": 200,
+                    "cache_read_tokens": 800,
+                    "cache_creation_tokens": 100,
+                },
                 "output_tokens": 50,
-                "cache_read_tokens": 800,
-                "cache_creation_tokens": 100,
             })
         );
         assert_eq!(
@@ -3294,12 +3229,18 @@ mod context_cache_contract_tests {
             "succeeded"
         );
         assert_eq!(
+            trace["provider_request_attempts"][1]["usage_status"],
+            "provider_exact"
+        );
+        assert_eq!(
             trace["provider_request_attempts"][1]["usage"],
             json!({
-                "input_tokens": 120,
+                "input": {
+                    "fresh_input_tokens": 120,
+                    "cache_read_tokens": 400,
+                    "cache_creation_tokens": 20,
+                },
                 "output_tokens": 30,
-                "cache_read_tokens": 400,
-                "cache_creation_tokens": 20,
             })
         );
         assert!(trace["provider_request_attempts"][1]["error_kind"].is_null());
@@ -3486,6 +3427,61 @@ mod context_cache_contract_tests {
     }
 
     #[test]
+    fn topology_changes_surface_attribution_not_assembled_request_facts() {
+        let trace = json!({
+            "context_window_policy": {
+                "raw_context_window_tokens": 1_000_000,
+                "usable_input_limit_tokens": 910_000,
+                "reserved_output_tokens": 64_000,
+                "reserved_summary_tokens": 24_000,
+                "reserved_protocol_tokens": 2_000,
+                "auto_compact_trigger_tokens": 728_000,
+                "hard_input_limit_tokens": 934_000
+            },
+            "system_prompt_tokens": 12_000,
+            "compaction_tier": "normal",
+            "wire": {
+                "budget": {"estimated_input_tokens": 700_000},
+                "fingerprint": {
+                    "prompt_cache_identity": {
+                        "cache_layout": "provider-prefix-v1",
+                        "content_id": "sha256:stable"
+                    }
+                }
+            }
+        });
+
+        let cli = model_request_context_seed_from_manifest(
+            astra_services::ModelRequestTopology::CliServer,
+            Some(&trace),
+        );
+        let server = model_request_context_seed_from_manifest(
+            astra_services::ModelRequestTopology::ServerOnly,
+            Some(&trace),
+        );
+        let edge = model_request_context_seed_from_manifest(
+            astra_services::ModelRequestTopology::EdgeServer,
+            Some(&trace),
+        );
+
+        for candidate in [&server, &edge] {
+            assert_eq!(candidate.rollout_stage, cli.rollout_stage);
+            assert_eq!(candidate.model_family, cli.model_family);
+            assert_eq!(candidate.lineage, cli.lineage);
+            assert_eq!(candidate.budget, cli.budget);
+            assert_eq!(candidate.composition, cli.composition);
+            assert_eq!(candidate.cache, cli.cache);
+            assert_eq!(candidate.compaction, cli.compaction);
+        }
+        assert_eq!(cli.interaction_owner, "cli");
+        assert_eq!(server.interaction_owner, "server");
+        assert_eq!(edge.interaction_owner, "edge");
+        assert_eq!(cli.loop_owner, "server");
+        assert_eq!(server.loop_owner, "server");
+        assert_eq!(edge.loop_owner, "server");
+    }
+
+    #[test]
     fn prompt_cache_identity_excludes_volatile_tail_and_invalidates_schema_changes() {
         let messages = vec![
             json!({
@@ -3602,330 +3598,6 @@ mod context_cache_contract_tests {
                 .unwrap(),
             baseline_tool_hash
         );
-    }
-
-    #[test]
-    fn finalize_bridge_wire_messages_places_tail_suffix_after_complete_tool_group() {
-        let mut messages = vec![
-            json!({"role": "user", "content": "original user"}),
-            json!({"role": "assistant", "content": ""}),
-            json!({"role": "tool", "content": "tool output", "tool_call_id": "c1"}),
-        ];
-
-        finalize_bridge_wire_messages(
-            &mut messages,
-            Some("volatile".to_string()),
-            None,
-            "openai",
-            "gpt-4",
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
-            None,
-        );
-
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0]["content"], "original user");
-        assert_eq!(messages[1]["role"], "assistant");
-        assert_eq!(messages[2]["role"], "tool");
-        assert!(messages[2]["content"].to_string().contains("tool output"));
-        assert_eq!(messages[3]["role"], "system");
-        assert_eq!(messages[3]["content"], "volatile");
-    }
-
-    #[test]
-    fn bridge_cache_annotation_marks_conversation_before_runtime_system() {
-        let mut messages = vec![
-            json!({"role": "system", "content": "stable"}),
-            json!({"role": "user", "content": "Analyze the journal"}),
-            json!({"role": "assistant", "content": Value::Null}),
-            json!({
-                "role": "tool",
-                "content": "tool output",
-                "tool_call_id": "tooluse_QN9FlElvUeRXS3lbPNtp08",
-                "_tool_name": "read_file",
-                "_round_index": 0
-            }),
-        ];
-        let cache_cfg = crate::turn::prompt_cache::PromptCacheConfig {
-            cache_enabled: true,
-            is_anthropic: true,
-        };
-        let synthetic_tail_prefix_end = finalize_bridge_wire_messages(
-            &mut messages,
-            Some("volatile".to_string()),
-            None,
-            "bedrock",
-            "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
-            None,
-        );
-        apply_bridge_message_cache_metadata(
-            &mut messages,
-            synthetic_tail_prefix_end,
-            &cache_cfg,
-            "sess",
-        );
-
-        assert_eq!(synthetic_tail_prefix_end, Some(4));
-        assert!(
-            astra_turn_core::context_serializer::message_has_cache_control(&messages[3]),
-            "the last conversation message must receive the cache boundary",
-        );
-        assert!(
-            !astra_turn_core::context_serializer::message_has_cache_control(&messages[4]),
-            "dynamic runtime system context must remain after the cache boundary",
-        );
-        assert_eq!(messages[4]["role"], "system");
-        assert_eq!(message_text(&messages[4]), "volatile");
-        assert!(messages[3]["content"].to_string().contains("tool output"));
-    }
-
-    #[test]
-    fn bridge_retry_compaction_history_excludes_runtime_system_context() {
-        let required_tail =
-            crate::turn::wire_assembly::required_runtime_preamble_message("required runtime")
-                .expect("required runtime tail");
-        let messages = vec![
-            json!({"role": "user", "content": "keep"}),
-            required_tail,
-            json!({"role": "assistant", "content": "keep too"}),
-            json!({
-                "role": "tool",
-                "tool_call_id": "call-1",
-                "content": "tool evidence\n\n<runtime-context-after-tool>\nold runtime\n</runtime-context-after-tool>"
-            }),
-        ];
-
-        let history = bridge_retry_compaction_history(&messages);
-
-        assert_eq!(history.len(), 3);
-        assert_eq!(history[0]["content"], "keep");
-        assert_eq!(history[1]["content"], "keep too");
-        assert_eq!(history[2]["content"], "tool evidence");
-        assert!(
-            history
-                .iter()
-                .all(|message| !crate::turn::wire_assembly::is_runtime_system_context(message)),
-            "retry compaction input must not preserve prior runtime system context"
-        );
-    }
-
-    #[test]
-    fn rebuild_bridge_retry_wire_messages_reapplies_runtime_system_and_cache_metadata() {
-        let previous_messages = vec![
-            json!({"role": "system", "content": "stable"}),
-            json!({"role": "user", "content": "oversized history"}),
-            crate::turn::wire_assembly::required_runtime_preamble_message("old runtime")
-                .expect("old runtime tail"),
-        ];
-        let cache_cfg = crate::turn::prompt_cache::PromptCacheConfig {
-            cache_enabled: true,
-            is_anthropic: true,
-        };
-
-        let messages = rebuild_bridge_retry_wire_messages(BridgeRetryWireRebuildInput {
-            previous_messages: &previous_messages,
-            compacted_messages: vec![json!({"role": "user", "content": "compacted retry"})],
-            boundary_present: false,
-            volatile_runtime_text: Some("optional retry runtime".to_string()),
-            required_runtime_text: Some("required retry runtime".to_string()),
-            provider: "bedrock",
-            model_name: "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-            thinking: &astra_turn_core::thinking_config::ThinkingConfig::Off,
-            cache_capability: None,
-            cache_cfg: &cache_cfg,
-            session_id: "sess",
-        });
-
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0]["role"], "system");
-        assert_eq!(messages[1]["role"], "user");
-        assert_eq!(message_text(&messages[1]), "compacted retry");
-        assert_eq!(messages[2]["role"], "system");
-        assert_eq!(messages[2]["content"], "required retry runtime");
-        assert_eq!(messages[3]["role"], "system");
-        assert_eq!(messages[3]["content"], "optional retry runtime");
-        assert!(
-            astra_turn_core::context_serializer::message_has_cache_control(&messages[1]),
-            "retry wire rebuild must mark compacted conversation before runtime context"
-        );
-        assert!(
-            messages[2..].iter().all(|message| {
-                !astra_turn_core::context_serializer::message_has_cache_control(message)
-            }),
-            "runtime system context must stay outside the cache-marked prefix"
-        );
-    }
-
-    #[test]
-    fn finalize_bridge_wire_messages_inserts_runtime_system_before_user() {
-        let mut messages = vec![json!({"role": "user", "content": "original user"})];
-
-        let synthetic_tail_prefix_end = finalize_bridge_wire_messages(
-            &mut messages,
-            Some("volatile".to_string()),
-            None,
-            "openai",
-            "gpt-4",
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
-            None,
-        );
-
-        assert_eq!(synthetic_tail_prefix_end, Some(0));
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0]["role"], "system");
-        assert_eq!(messages[0]["content"], "volatile");
-        assert_eq!(
-            messages[1],
-            json!({"role": "user", "content": "original user"})
-        );
-    }
-
-    #[test]
-    fn finalize_bridge_wire_messages_preserves_literal_system_reminder_in_user_input() {
-        let literal_user = "translate <system-reminder> literally";
-        let mut messages = vec![json!({"role": "user", "content": literal_user})];
-
-        finalize_bridge_wire_messages(
-            &mut messages,
-            Some("runtime evidence".to_string()),
-            None,
-            "openai",
-            "gpt-4",
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
-            None,
-        );
-
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0]["role"], "system");
-        assert_eq!(
-            messages[1],
-            json!({"role": "user", "content": literal_user})
-        );
-    }
-
-    #[test]
-    fn finalize_bridge_wire_messages_preserves_block_array_required_context() {
-        let blocks = json!([
-            {"type": "text", "text": "required policy"},
-            {"type": "text", "text": "structured evidence"}
-        ]);
-        let mut messages = vec![
-            json!({"role": "system", "content": "stable"}),
-            json!({
-                "role": "system",
-                "content": blocks.clone(),
-                crate::turn::wire_assembly::RUNTIME_SYSTEM_CONTEXT_MARKER: true,
-                crate::turn::wire_assembly::REQUIRED_RUNTIME_PREAMBLE_MARKER: true,
-            }),
-            json!({"role": "user", "content": "original user"}),
-        ];
-
-        finalize_bridge_wire_messages(
-            &mut messages,
-            None,
-            None,
-            "openai",
-            "gpt-4",
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
-            None,
-        );
-
-        assert_eq!(messages.len(), 3);
-        assert_eq!(messages[1]["role"], "system");
-        assert_eq!(messages[1]["content"], blocks);
-        assert!(crate::turn::wire_assembly::is_required_runtime_preamble(
-            &messages[1]
-        ));
-        assert_eq!(messages[2]["content"], "original user");
-    }
-
-    #[test]
-    fn finalize_bridge_wire_messages_noops_when_volatile_text_is_absent() {
-        let mut messages = vec![json!({"role": "assistant", "content": "stable"})];
-
-        let synthetic_tail_prefix_end = finalize_bridge_wire_messages(
-            &mut messages,
-            None,
-            None,
-            "openai",
-            "gpt-4",
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
-            None,
-        );
-
-        assert!(synthetic_tail_prefix_end.is_none());
-        assert_eq!(
-            messages,
-            vec![json!({"role": "assistant", "content": "stable"})]
-        );
-    }
-
-    #[test]
-    fn finalize_bridge_wire_messages_skips_current_user_only_models() {
-        let mut messages = vec![json!({"role": "user", "content": "original user"})];
-
-        let synthetic_tail_prefix_end = finalize_bridge_wire_messages(
-            &mut messages,
-            Some("volatile".to_string()),
-            None,
-            "openai",
-            "deepseek-v4-flash",
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
-            None,
-        );
-
-        assert!(synthetic_tail_prefix_end.is_none());
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0]["content"], "original user");
-    }
-
-    #[test]
-    fn finalize_bridge_wire_messages_keeps_required_context_for_current_user_only_models() {
-        let mut messages = vec![json!({"role": "user", "content": "original user"})];
-
-        let synthetic_tail_prefix_end = finalize_bridge_wire_messages(
-            &mut messages,
-            Some("best effort volatile".to_string()),
-            Some("required resume context".to_string()),
-            "openai",
-            "deepseek-v4-flash",
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
-            None,
-        );
-
-        assert_eq!(synthetic_tail_prefix_end, Some(0));
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0]["role"], "system");
-        assert_eq!(messages[0]["content"], "required resume context");
-        assert_eq!(
-            messages[1],
-            json!({"role": "user", "content": "original user"})
-        );
-        assert!(!message_text(&messages[0]).contains("best effort volatile"));
-    }
-
-    #[test]
-    fn finalize_bridge_wire_messages_uses_explicit_cache_capability() {
-        let mut messages = vec![json!({"role": "user", "content": "original user"})];
-        let explicit = astra_turn_core::cache_placement::CacheCapability {
-            protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
-            volatile_placement:
-                astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
-            reuse_scope: Some(astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns),
-        };
-
-        let synthetic_tail_prefix_end = finalize_bridge_wire_messages(
-            &mut messages,
-            Some("volatile".to_string()),
-            None,
-            "openai",
-            "gpt-4o",
-            &astra_turn_core::thinking_config::ThinkingConfig::Off,
-            Some(explicit),
-        );
-
-        assert!(synthetic_tail_prefix_end.is_none());
-        assert_eq!(messages[0]["content"], "original user");
     }
 
     #[test]

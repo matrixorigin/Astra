@@ -9,15 +9,20 @@
 //! and cancellation token.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, atomic::AtomicBool};
 
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
 use astra_core::SharedPool;
 use astra_runtime_env::validate_workspace_id;
-use astra_services::{AdmittedModelExecution, ReflectService, UnconfiguredReflectService};
+use astra_services::{
+    AdmittedModelExecution, ReflectService, SessionArtifactJsonRecord, SessionArtifactJsonStore,
+    SessionArtifactReference, SessionArtifactReferenceKind, SessionArtifactStore,
+    UnconfiguredReflectService, runs::RequestedTurnInteractionMode,
+};
 
 use crate::FernetTokenEncryptor;
 use crate::MatrixOneSettings;
@@ -27,8 +32,11 @@ use crate::turn::agentic_loop::host::{
 };
 use astra_pipeline::step_protocol::InMemoryIdempotencyCache;
 use astra_pipeline::step_recorder::StepRecorder;
-use astra_skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
+use astra_skills::executor::isolated::{SkillSubRunExecutor, SubRunOutcome, SubRunResult};
 use astra_text_utils::semantic_dedup::SemanticDedup;
+use astra_turn_types::{
+    DurableToolReference, ToolInvocationDecision, ToolInvocationFingerprint, ToolInvocationIdentity,
+};
 
 use crate::server::tool_execution_service::ToolExecutionService;
 use astra_turn_core::chat_turn_heuristics::infer_task_execution_profile;
@@ -37,11 +45,103 @@ use astra_turn_core::turn_guard::TurnGuard;
 use super::server_loop_host::ServerAgenticLoopHostBuilder;
 use super::tool_transport::ExecutionBindingSnapshot;
 
-/// Maximum turns for a skill sub-run (matches CLI's SUBRUN_MAX_TURNS).
-pub const SUBRUN_MAX_TURNS: usize = 30;
+fn skill_subrun_turn_chain_id(
+    parent_run_id: &str,
+    parent_turn_chain_id: &str,
+    invocation_id: &str,
+    _skill_name: &str,
+    _instructions: &str,
+    _task_context: &str,
+    _allowed_tools: &[String],
+    _parent_recursion_depth: u8,
+) -> String {
+    format!(
+        "{parent_run_id}:skill:{:x}",
+        Sha256::digest(
+            astra_core::canonical_json_string(&json!({
+                "parent_turn_chain_id": parent_turn_chain_id,
+                "invocation_id": invocation_id,
+            }))
+            .as_bytes()
+        )
+    )
+}
 
-/// Maximum cumulative tokens for a skill sub-run.
-pub const SUBRUN_MAX_CUMULATIVE_TOKENS: u64 = 500_000;
+const INLINE_OUTER_SKILL_RESULT_MAX_BYTES: usize = 96 * 1024;
+
+fn outer_skill_result_value(result: &SubRunResult) -> Value {
+    json!({
+        "output": result.output,
+        "tokens_used": result.tokens_used,
+        "turns": result.turns,
+        "outcome": result.outcome.label(),
+        "detail": result.outcome.detail(),
+    })
+}
+
+fn decode_outer_skill_result_value(value: &Value) -> Result<SubRunResult, String> {
+    let text = value
+        .get("output")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "durable fork skill replay is missing output".to_string())?
+        .to_string();
+    let tokens_used = value
+        .get("tokens_used")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| "durable fork skill replay has invalid token usage".to_string())?;
+    let turns = value
+        .get("turns")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| "durable fork skill replay has invalid turn count".to_string())?;
+    let detail = value
+        .get("detail")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let outcome = match value.get("outcome").and_then(Value::as_str) {
+        Some("completed") => SubRunOutcome::Completed,
+        Some("interrupted") => SubRunOutcome::Interrupted {
+            finish_reason: detail,
+        },
+        Some("cancelled") => SubRunOutcome::Cancelled { reason: detail },
+        Some("failed") => SubRunOutcome::Failed { error: detail },
+        _ => return Err("durable fork skill replay has invalid outcome".to_string()),
+    };
+    Ok(SubRunResult {
+        output: text,
+        tokens_used,
+        turns,
+        outcome,
+    })
+}
+
+struct OuterSkillDispatchGuard {
+    ledger: crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger,
+    identity: ToolInvocationIdentity,
+    owner_id: String,
+    heartbeat: Option<crate::server::tool_invocation_runtime::DispatchLeaseHeartbeat>,
+    settled: bool,
+}
+
+impl Drop for OuterSkillDispatchGuard {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let ledger = self.ledger.clone();
+        let identity = self.identity.clone();
+        let owner_id = self.owner_id.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(error) = ledger.mark_outcome_unknown(&identity, &owner_id).await {
+                    tracing::warn!(%error, "aborted fork skill could not mark its outer invocation outcome unknown");
+                }
+            });
+        }
+    }
+}
 
 /// Server-side implementation of [`SkillSubRunExecutor`].
 ///
@@ -81,6 +181,13 @@ pub struct ServerSkillSubRunExecutor {
     request_constraints: RequestConstraints,
     /// Session ID for the parent run.
     session_id: String,
+    /// Parent durable run authority. A forked skill is an isolated model loop,
+    /// not an ungoverned run; all side effects remain fenced by this identity.
+    parent_run_id: Option<String>,
+    parent_owner_generation: Option<u64>,
+    parent_owner_pod_id: Option<String>,
+    execution_lease_lost: Option<Arc<AtomicBool>>,
+    invocation_ledger: Option<crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger>,
     /// Edge connection pool for routing tool calls to connected edges.
     edge_connection_pool: Option<astra_server_types::edge_connection_pool::EdgeConnectionPool>,
     /// Durable dispatch authority required before any direct Edge socket send.
@@ -107,6 +214,10 @@ pub struct ServerSkillSubRunExecutor {
     reflect_service: Arc<dyn ReflectService>,
     /// Request-level permissions inherited from the parent server run.
     inherited_permissions: crate::orchestration::InheritedPermissions,
+    /// Effective interaction policy inherited from the parent run. Forked
+    /// skills share the parent's approval owner and must never invent a
+    /// separate default that can wait without a UI.
+    interaction_mode: RequestedTurnInteractionMode,
     /// Parent run's durable interaction authority. Skill forks are isolated
     /// model loops, not independent durable runs, so approvals and client-tool
     /// requests remain owned by the parent run.
@@ -138,6 +249,11 @@ impl ServerSkillSubRunExecutor {
             forward_headers: HashMap::new(),
             request_constraints: Default::default(),
             session_id,
+            parent_run_id: None,
+            parent_owner_generation: None,
+            parent_owner_pod_id: None,
+            execution_lease_lost: None,
+            invocation_ledger: None,
             edge_connection_pool: None,
             edge_dispatch_service: None,
             edge_registry_service: None,
@@ -148,6 +264,7 @@ impl ServerSkillSubRunExecutor {
             memory_extraction_service: None,
             reflect_service: Arc::new(UnconfiguredReflectService),
             inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
+            interaction_mode: RequestedTurnInteractionMode::Headless,
             interaction_sink: None,
         }
     }
@@ -268,6 +385,36 @@ impl ServerSkillSubRunExecutor {
         self
     }
 
+    pub(crate) fn with_interaction_mode(
+        mut self,
+        interaction_mode: RequestedTurnInteractionMode,
+    ) -> Self {
+        self.interaction_mode = interaction_mode;
+        self
+    }
+
+    pub(crate) fn with_parent_invocation_authority(
+        mut self,
+        parent_run_id: String,
+        parent_owner_generation: u64,
+        parent_owner_pod_id: String,
+        invocation_ledger: crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger,
+    ) -> Self {
+        self.parent_run_id = Some(parent_run_id);
+        self.parent_owner_generation = Some(parent_owner_generation);
+        self.parent_owner_pod_id = Some(parent_owner_pod_id);
+        self.invocation_ledger = Some(invocation_ledger);
+        self
+    }
+
+    pub(crate) fn with_execution_lease_lost(
+        mut self,
+        execution_lease_lost: Option<Arc<AtomicBool>>,
+    ) -> Self {
+        self.execution_lease_lost = execution_lease_lost;
+        self
+    }
+
     pub(crate) fn with_interaction_sink(
         mut self,
         sink: Arc<dyn super::server_loop_host::HostInteractionSink>,
@@ -345,6 +492,246 @@ impl ServerSkillSubRunExecutor {
             .map_err(|error| format!("failed to create skill sub-run workspace: {error}"))?;
         Ok(workspace)
     }
+
+    fn build_runtime_tool_executor(
+        &self,
+        skill_name: &str,
+        presentation_session_id: &str,
+        invocation_ledger: crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger,
+    ) -> Result<super::runtime_tool_executor::RuntimeToolExecutor, String> {
+        let workspace = self.provision_skill_workspace(skill_name, presentation_session_id)?;
+        let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
+        let mut builder = ToolExecutionService::builder();
+        if let Some(pool) = &self.edge_connection_pool {
+            builder = builder.edge_connection_pool(pool.clone());
+        }
+        if let Some(service) = &self.edge_dispatch_service {
+            builder = builder.edge_dispatch_service(Arc::clone(service));
+        }
+        if let Some(service) = &self.edge_registry_service {
+            builder = builder.edge_registry_service(Arc::clone(service));
+        }
+        let mut executor = super::runtime_tool_executor::RuntimeToolExecutor::new(
+            workspace,
+            self.user_id.clone(),
+            // The fork is a model-loop/presentation child, not an independent
+            // durable run. Its tool identity therefore inherits the exact
+            // parent session bound to `parent_run_id`.
+            self.session_id.clone(),
+            memoria_base,
+            None,
+        )
+        .with_reflect_service(Arc::clone(&self.reflect_service))
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            self.shared_pool.is_some(),
+            self.reflect_service.is_configured(),
+        ))
+        .with_cancel_token(self.cancel_token.clone())
+        .with_runtime_process_authorization(self.runtime_process_authorization.clone())
+        .with_runtime_edge_dispatch_authorization(self.runtime_edge_dispatch_authorization.clone())
+        .with_tool_execution_service(builder.build());
+        self.apply_execution_binding_snapshot(&mut executor);
+        executor.set_invocation_ledger(invocation_ledger);
+        if let Some(pool) = &self.shared_pool {
+            executor.set_context_manifest_pool(pool.clone());
+        }
+        Ok(executor)
+    }
+
+    async fn persist_outer_skill_result(
+        &self,
+        identity: &ToolInvocationIdentity,
+        result: &SubRunResult,
+    ) -> Result<String, String> {
+        let value = outer_skill_result_value(result);
+        let canonical = astra_core::canonical_json_string(&value);
+        let content_hash = format!("{:x}", Sha256::digest(canonical.as_bytes()));
+        let content_len = canonical.len();
+        if content_len <= INLINE_OUTER_SKILL_RESULT_MAX_BYTES {
+            return Ok(json!({
+                "version": 1,
+                "storage": "inline",
+                "sha256": content_hash,
+                "length": content_len,
+                "content": value,
+            })
+            .to_string());
+        }
+
+        if let Some(pool) = self.shared_pool.as_ref() {
+            let store = astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone())
+                .with_pool(pool.clone());
+            let stored = store
+                .persist_json_artifact(SessionArtifactJsonRecord {
+                    artifact_id: String::new(),
+                    session_id: self.session_id.clone(),
+                    user_id: self.user_id.clone(),
+                    artifact_kind: "fork_skill_result".to_string(),
+                    source: Some("server_fork_skill".to_string()),
+                    turn: None,
+                    round: None,
+                    content: value,
+                    metadata: Some(json!({
+                        "invocation_identity": identity.storage_key(),
+                        "sha256": content_hash,
+                        "length": content_len,
+                    })),
+                    references: vec![SessionArtifactReference {
+                        kind: SessionArtifactReferenceKind::InvocationLedger,
+                        reference_id: identity.storage_key(),
+                    }],
+                })
+                .await
+                .map_err(|error| format!("persist durable fork result artifact: {error}"))?;
+            return Ok(json!({
+                "version": 1,
+                "storage": "artifact",
+                "artifact_id": stored.artifact_id,
+                "sha256": content_hash,
+                "length": content_len,
+            })
+            .to_string());
+        }
+
+        // Process-local run authority is process-local by definition. Keep a
+        // full owner/session-scoped artifact instead of feeding a large JSON
+        // result through ToolResult's bounded textual projection.
+        let owner = astra_services::OwnerScope::user(self.user_id.clone())?;
+        let relative =
+            std::path::PathBuf::from("fork-skill-results").join(format!("{content_hash}.json"));
+        let path = astra_services::local_session_artifact_store().session_path_for_owner(
+            &owner,
+            &self.session_id,
+            &relative,
+        )?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| "fork result artifact path has no parent".to_string())?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| format!("create fork result artifact directory: {error}"))?;
+        let temporary = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+        tokio::fs::write(&temporary, canonical.as_bytes())
+            .await
+            .map_err(|error| format!("write fork result artifact: {error}"))?;
+        tokio::fs::rename(&temporary, &path)
+            .await
+            .map_err(|error| format!("commit fork result artifact: {error}"))?;
+        Ok(json!({
+            "version": 1,
+            "storage": "local",
+            "sha256": content_hash,
+            "length": content_len,
+        })
+        .to_string())
+    }
+
+    async fn replay_outer_skill_result(
+        &self,
+        identity: &ToolInvocationIdentity,
+        envelope: &str,
+    ) -> Result<SubRunResult, String> {
+        let envelope: Value = serde_json::from_str(envelope)
+            .map_err(|error| format!("durable fork skill envelope is malformed: {error}"))?;
+        if envelope.get("version").and_then(Value::as_u64) != Some(1) {
+            return Err("durable fork skill envelope has unsupported version".to_string());
+        }
+        let expected_hash = envelope
+            .get("sha256")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "durable fork skill envelope is missing hash".to_string())?;
+        let expected_len = envelope
+            .get("length")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| "durable fork skill envelope has invalid length".to_string())?;
+        let value =
+            match envelope.get("storage").and_then(Value::as_str) {
+                Some("inline") => envelope
+                    .get("content")
+                    .cloned()
+                    .ok_or_else(|| "inline fork skill envelope is missing content".to_string())?,
+                Some("artifact") => {
+                    let artifact_id = envelope
+                        .get("artifact_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| "fork skill envelope is missing artifact id".to_string())?;
+                    let pool = self.shared_pool.as_ref().ok_or_else(|| {
+                        "database fork result artifact has no shared pool".to_string()
+                    })?;
+                    let store =
+                        astra_services::DatabaseSessionArtifactStore::new(self.matrixone.clone())
+                            .with_pool(pool.clone());
+                    let stored = store
+                        .load_json_artifact(&self.user_id, &self.session_id, artifact_id)
+                        .await
+                        .map_err(|error| format!("load durable fork result artifact: {error}"))?
+                        .ok_or_else(|| "durable fork result artifact is missing".to_string())?;
+                    let expected_identity = identity.storage_key();
+                    if stored.artifact_kind != "fork_skill_result"
+                        || stored
+                            .metadata
+                            .as_ref()
+                            .and_then(|metadata| metadata.get("invocation_identity"))
+                            .and_then(Value::as_str)
+                            != Some(expected_identity.as_str())
+                    {
+                        return Err(
+                            "durable fork result artifact is bound to another invocation"
+                                .to_string(),
+                        );
+                    }
+                    stored.content
+                }
+                Some("local") => {
+                    let owner = astra_services::OwnerScope::user(self.user_id.clone())?;
+                    let relative = std::path::PathBuf::from("fork-skill-results")
+                        .join(format!("{expected_hash}.json"));
+                    let path = astra_services::local_session_artifact_store()
+                        .session_path_for_owner(&owner, &self.session_id, relative)?;
+                    let bytes = tokio::fs::read(path)
+                        .await
+                        .map_err(|error| format!("read local fork result artifact: {error}"))?;
+                    serde_json::from_slice(&bytes)
+                        .map_err(|error| format!("decode local fork result artifact: {error}"))?
+                }
+                _ => return Err("durable fork skill envelope has invalid storage".to_string()),
+            };
+        let canonical = astra_core::canonical_json_string(&value);
+        let actual_hash = format!("{:x}", Sha256::digest(canonical.as_bytes()));
+        if canonical.len() != expected_len || actual_hash != expected_hash {
+            return Err(
+                "durable fork skill result artifact failed hash/length validation".to_string(),
+            );
+        }
+        decode_outer_skill_result_value(&value)
+    }
+
+    fn resolve_execution_policy(
+        &self,
+        task_profile: astra_turn_core::chat_turn_heuristics::TaskExecutionProfile,
+        effective_model: Option<&str>,
+    ) -> Result<
+        (
+            astra_turn_core::chat_turn_heuristics::AgenticTurnBudget,
+            u64,
+        ),
+        String,
+    > {
+        let limits = astra_core::RuntimeLimits::global();
+        let turn_budget =
+            astra_turn_core::chat_turn_heuristics::resolve_isolated_agentic_turn_budget(
+                task_profile,
+                limits.max_turns,
+            );
+        let admitted_context_window = self
+            .admitted_model_execution
+            .as_ref()
+            .and_then(|execution| execution.context_window);
+        let max_turn_input_tokens =
+            limits.require_admitted_model_input_tokens(effective_model, admitted_context_window)?;
+        Ok((turn_budget, max_turn_input_tokens))
+    }
 }
 
 #[async_trait]
@@ -354,17 +741,138 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         skill_name: &str,
         instructions: &str,
         task_context: &str,
-        _max_tokens: Option<u32>,
+        max_tokens: Option<u32>,
         allowed_tools: &[String],
         parent_recursion_depth: u8,
         effort: Option<&str>,
         agent_type: Option<&str>,
+        invocation_id: Option<&str>,
+        expected_control_epoch: Option<i64>,
+        parent_turn_chain_id: Option<&str>,
     ) -> Result<SubRunResult, String> {
         let child_recursion_depth =
             astra_turn_core::agentic_recursion_guard::checked_child_recursion_depth(
                 parent_recursion_depth,
             )?;
+        let parent_run_id = self.parent_run_id.as_deref().ok_or_else(|| {
+            "forked skill execution is missing parent run invocation authority".to_string()
+        })?;
+        let parent_owner_generation = self.parent_owner_generation.ok_or_else(|| {
+            "forked skill execution is missing parent owner generation".to_string()
+        })?;
+        let parent_owner_pod_id = self.parent_owner_pod_id.as_deref().ok_or_else(|| {
+            "forked skill execution is missing parent owner pod authority".to_string()
+        })?;
+        let invocation_ledger = self.invocation_ledger.clone().ok_or_else(|| {
+            "forked skill execution is missing the lifecycle invocation ledger".to_string()
+        })?;
+        let invocation_id = invocation_id
+            .filter(|value| !value.is_empty() && value.trim() == *value)
+            .ok_or_else(|| {
+                "forked skill execution is missing its parent tool invocation identity".to_string()
+            })?;
+        let expected_control_epoch = expected_control_epoch
+            .filter(|value| *value >= 0)
+            .ok_or_else(|| {
+                "forked skill execution is missing its selection-time control epoch".to_string()
+            })?;
+        let inherited_user_intent_cursor = usize::try_from(expected_control_epoch)
+            .map_err(|_| "forked skill control epoch exceeds process limits".to_string())?;
+        let parent_turn_chain_id = parent_turn_chain_id
+            .filter(|value| !value.is_empty() && value.trim() == *value)
+            .ok_or_else(|| {
+                "forked skill execution is missing its parent turn-chain authority".to_string()
+            })?;
+        let outer_identity = ToolInvocationIdentity::new(
+            &self.user_id,
+            &self.session_id,
+            parent_run_id,
+            parent_turn_chain_id,
+            invocation_id,
+        )
+        .map_err(|error| error.to_string())?;
+        let outer_decision = ToolInvocationDecision::new(&json!({
+            "route": "fork_skill",
+            "contract": "v1",
+        }))
+        .map_err(|error| error.to_string())?;
+        let outer_fingerprint = ToolInvocationFingerprint::new(
+            DurableToolReference::built_in("skill", "fork-v1")
+                .map_err(|error| error.to_string())?,
+            &json!({
+                "skill_name": skill_name,
+                "instructions": instructions,
+                "task_context": task_context,
+                "max_tokens": max_tokens,
+                "allowed_tools": allowed_tools,
+                "parent_recursion_depth": parent_recursion_depth,
+                "effort": effort,
+                "agent_type": agent_type,
+            }),
+            &outer_decision.decision_id,
+        )
+        .map_err(|error| error.to_string())?;
+        match invocation_ledger
+            .prepare_for_execution(&outer_identity, &outer_fingerprint, &outer_decision, |_| {
+                Ok(())
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            crate::server::tool_invocation_runtime::InvocationPrepareDisposition::Return(
+                replay,
+            ) => {
+                return self
+                    .replay_outer_skill_result(&outer_identity, &replay.output)
+                    .await;
+            }
+            crate::server::tool_invocation_runtime::InvocationPrepareDisposition::Superseded {
+                user_intent_event_index,
+                ..
+            } => {
+                return Err(format!(
+                    "forked skill execution was superseded by user intent event {user_intent_event_index}"
+                ));
+            }
+            crate::server::tool_invocation_runtime::InvocationPrepareDisposition::Prepared {
+                ..
+            } => {}
+        }
+        let outer_owner_id = match invocation_ledger
+            .dispatch_prepared_with_admission(
+                &outer_identity,
+                Some(
+                    crate::server::tool_invocation_runtime::DurableDispatchAdmission {
+                        expected_control_epoch,
+                        expected_owner_generation: parent_owner_generation,
+                    },
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            crate::server::tool_invocation_runtime::InvocationBeginDisposition::Execute {
+                owner_id,
+                ..
+            } => owner_id,
+            crate::server::tool_invocation_runtime::InvocationBeginDisposition::Return(replay) => {
+                return self
+                    .replay_outer_skill_result(&outer_identity, &replay.output)
+                    .await;
+            }
+        };
+        let mut outer_guard = OuterSkillDispatchGuard {
+            heartbeat: Some(
+                invocation_ledger
+                    .start_lease_heartbeat(outer_identity.clone(), outer_owner_id.clone()),
+            ),
+            ledger: invocation_ledger.clone(),
+            identity: outer_identity.clone(),
+            owner_id: outer_owner_id.clone(),
+            settled: false,
+        };
 
+        let execution_result: Result<SubRunResult, String> = async {
         let effective_model = self.default_model.clone();
         let compact_strategy = astra_turn_core::microcompact::CompactStrategy::from_provider_hint(
             effective_model.as_deref().unwrap_or(""),
@@ -382,6 +890,16 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 .unwrap_or_default()
                 .as_micros()
         );
+        let child_turn_chain_id = skill_subrun_turn_chain_id(
+            parent_run_id,
+            parent_turn_chain_id,
+            invocation_id,
+            skill_name,
+            instructions,
+            task_context,
+            allowed_tools,
+            parent_recursion_depth,
+        );
 
         // Resolve per-model workflow-guard policy before `effective_model` is
         // consumed by `.with_model(...)` below.
@@ -394,17 +912,22 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             self.matrixone.clone(),
             self.encryptor.clone(),
             self.user_id.clone(),
-            subrun_session_id.clone(),
+            // Edge callback custody and durable tool admission are scoped to
+            // the parent run's exact session. The random subrun identity is
+            // presentation/workspace isolation only.
+            self.session_id.clone(),
         )
         .with_model(effective_model.clone())
         .with_admitted_model_execution(self.admitted_model_execution.clone())
+        .with_inference_owner_pod_id(Some(parent_owner_pod_id.to_string()))
         .with_edge_tools(self.edge_tools.clone())
         .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
             self.shared_pool.is_some(),
             self.reflect_service.is_configured(),
         ))
         .with_edge_profile(self.edge_profile.clone())
-        .with_edge_callback_ledger(Arc::new(TokioMutex::new(HashMap::new())));
+        .with_edge_callback_ledger(Arc::new(TokioMutex::new(HashMap::new())))
+        .with_interaction_mode(Some(self.interaction_mode));
 
         if let Some(snapshot) = &self.execution_binding_snapshot {
             builder = builder.with_execution_binding_snapshot(snapshot.clone());
@@ -465,6 +988,9 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         ];
 
         let task_profile = infer_task_execution_profile(task_context);
+        let (agentic_turn_budget, max_turn_input_tokens) =
+            self.resolve_execution_policy(task_profile, effective_model.as_deref())?;
+        let initial_turns = agentic_turn_budget.initial_turns;
         let workspace_root_hint = self
             .edge_profile
             .get("cwd")
@@ -486,7 +1012,8 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             current_session_id: Some(self.session_id.clone()),
-            current_run_id: None,
+            current_run_id: Some(parent_run_id.to_string()),
+            current_run_owner_generation: Some(parent_owner_generation),
             inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
             context_manifest_pool: None,
             context_manifest_user_id: Some(self.user_id.clone()),
@@ -502,14 +1029,13 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             total_cache_creation: 0,
             total_tool_calls: 0,
             total_observation_tool_calls: 0,
+            tool_ledger_receipt: Default::default(),
             has_any_usage: false,
             last_finish_reason: None,
-            max_turns: SUBRUN_MAX_TURNS,
-            remaining_turns: SUBRUN_MAX_TURNS,
-            turn_budget_hint_emitted_90: false,
-            turn_budget_hint_emitted_50: false,
-            turn_budget_hint_emitted_20: false,
-            agentic_turn_budget: task_profile.agentic_turn_budget,
+            max_turns: initial_turns,
+            remaining_turns: initial_turns,
+            agentic_turn_budget,
+            budget_is_explicit: true,
             budget_policy: None,
             current_round_index: 0,
             llm_rounds_completed: 0,
@@ -554,10 +1080,17 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
                 flag: None,
                 pause_flag: None,
                 token: self.cancel_token.clone(),
+                execution_lease_lost: self.execution_lease_lost.clone(),
+                resolved_origin: None,
             },
             messaging: Default::default(),
-            user_intents: Default::default(),
+            user_intents: {
+                let mut user_intents = crate::turn::agentic_loop::host::UserIntentState::default();
+                user_intents.commit_observed_cursor(inherited_user_intent_cursor);
+                user_intents
+            },
             error_recovery: Default::default(),
+            provider_adaptation: Default::default(),
             run_control: None,
             pipeline_session: Some(
                 astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
@@ -582,7 +1115,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             delegation_engine: None,
             delegations_this_turn: 0,
             delegation_chain: Vec::new(),
-            self_agent_id: "orchestrator".to_string(),
+            self_agent_id: "main".to_string(),
             project_context: None,
             checkpoint_gate: None,
             last_llm_context_manifest_trace: None,
@@ -594,16 +1127,14 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             compaction_effectiveness: Default::default(),
             pinned_tool_schema_tokens: 0,
             sticky_tool_schemas: Vec::new(),
-            max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
+            max_turn_input_tokens,
             budget_wrapup_injected: false,
             context_compression_triggered: false,
             canonical_rewrite_state: Default::default(),
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
-            max_cumulative_tokens: SUBRUN_MAX_CUMULATIVE_TOKENS,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
-            recent_file_reads: Vec::new(),
             permission_context: Some(permission_context),
             permission_handler: None,
             tactical_adapter: None,
@@ -615,15 +1146,14 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             session_facts: Default::default(),
             memory_extraction_service: self.memory_extraction_service.clone(),
             observation_journal: Default::default(),
-            observation_store: None,
             session_memory_state: Default::default(),
             compact_strategy,
             approval_overrides: None,
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
-            bridge_turn_chain_id: None,
-            bridge_user_query_event_id: None,
+            canonical_turn_chain_id: Some(child_turn_chain_id),
+            root_user_query_event_id: None,
             turn_event_buffer: None,
             harness: {
                 #[cfg(feature = "harness")]
@@ -644,42 +1174,11 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
 
         // ── Wire RuntimeToolExecutor for skill sub-run tool execution ────
         {
-            let workspace = self.provision_skill_workspace(skill_name, &subrun_session_id)?;
-            let memoria_base = Some(astra_core::MemoriaSettings::from_env().base_url);
-
-            let mut builder = ToolExecutionService::builder();
-            if let Some(pool) = &self.edge_connection_pool {
-                builder = builder.edge_connection_pool(pool.clone());
-            }
-            if let Some(service) = &self.edge_dispatch_service {
-                builder = builder.edge_dispatch_service(Arc::clone(service));
-            }
-            if let Some(service) = &self.edge_registry_service {
-                builder = builder.edge_registry_service(Arc::clone(service));
-            }
-
-            let mut executor = super::runtime_tool_executor::RuntimeToolExecutor::new(
-                workspace,
-                self.user_id.clone(),
-                subrun_session_id.clone(),
-                memoria_base,
-                None,
-            )
-            .with_reflect_service(Arc::clone(&self.reflect_service))
-            .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
-                self.shared_pool.is_some(),
-                self.reflect_service.is_configured(),
-            ))
-            .with_cancel_token(self.cancel_token.clone())
-            .with_runtime_process_authorization(self.runtime_process_authorization.clone())
-            .with_runtime_edge_dispatch_authorization(
-                self.runtime_edge_dispatch_authorization.clone(),
-            )
-            .with_tool_execution_service(builder.build());
-            self.apply_execution_binding_snapshot(&mut executor);
-            if let Some(pool) = &self.shared_pool {
-                executor.set_context_manifest_pool(pool.clone());
-            }
+            let executor = self.build_runtime_tool_executor(
+                skill_name,
+                &subrun_session_id,
+                invocation_ledger.clone(),
+            )?;
             state.runtime_tool_executor = Some(std::sync::Arc::new(executor));
         }
 
@@ -687,8 +1186,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         let loop_result = host.settle_loop_outcome(loop_result);
         let outcome = project_skill_subrun_outcome(&loop_result, &state);
 
-        // audit-#8: avoid underflow if remaining_turns somehow exceeds the cap.
-        let turns = SUBRUN_MAX_TURNS.saturating_sub(state.remaining_turns) as u32;
+        let turns = state.llm_rounds_completed;
         let tokens_used = state.provider_total_tokens().min(u32::MAX as u64) as u32;
 
         Ok(SubRunResult {
@@ -697,6 +1195,49 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             turns,
             outcome,
         })
+        }
+        .await;
+
+        match execution_result {
+            Ok(result) => {
+                let envelope = self
+                    .persist_outer_skill_result(&outer_identity, &result)
+                    .await?;
+                let durable = invocation_ledger
+                    .finish(
+                        &outer_identity,
+                        &outer_owner_id,
+                        astra_tools::ToolResult::text(envelope),
+                    )
+                    .await;
+                if let Some(heartbeat) = outer_guard.heartbeat.take() {
+                    heartbeat.stop().await;
+                }
+                if durable.is_error {
+                    return Err(format!(
+                        "forked skill completed but its outer invocation could not settle: {}",
+                        durable.output
+                    ));
+                }
+                outer_guard.settled = true;
+                Ok(result)
+            }
+            Err(error) => {
+                let settlement = invocation_ledger
+                    .mark_outcome_unknown(&outer_identity, &outer_owner_id)
+                    .await;
+                if let Some(heartbeat) = outer_guard.heartbeat.take() {
+                    heartbeat.stop().await;
+                }
+                settlement.map_err(|settlement_error| {
+                        format!(
+                            "forked skill failed ({error}); outer outcome settlement also failed: {settlement_error}"
+                        )
+                    })?;
+                outer_guard.settled = true;
+                Err(error)
+            }
+        }
     }
 }
 
@@ -766,6 +1307,10 @@ mod tests {
             executor.inherited_permissions.mode,
             crate::orchestration::PermissionMode::Auto
         );
+        assert_eq!(
+            executor.interaction_mode,
+            RequestedTurnInteractionMode::Headless
+        );
         assert!(
             !executor.reflect_service.is_configured(),
             "skill sub-runs must fail closed until the parent reflect service is injected"
@@ -781,6 +1326,7 @@ mod tests {
             "test-session".to_string(),
         )
         .with_default_model(Some("claude-sonnet-4-20250514".to_string()))
+        .with_interaction_mode(RequestedTurnInteractionMode::Auto)
         .with_admitted_model_execution(Some(AdmittedModelExecution::from_endpoint(
             "offer-skill".to_string(),
             "claude-sonnet-4-20250514".to_string(),
@@ -788,6 +1334,7 @@ mod tests {
             "http://catalog:8081/api/v1/chat/completions".to_string(),
             "Bearer test".to_string(),
             Some(2500),
+            128_000,
         )))
         .with_edge_tools(vec![
             json!({"type": "function", "function": {"name": "bash"}}),
@@ -802,10 +1349,70 @@ mod tests {
 
         assert!(executor.default_model.is_some());
         assert!(executor.admitted_model_execution.is_some());
+        assert_eq!(
+            executor.interaction_mode,
+            RequestedTurnInteractionMode::Auto
+        );
         assert_eq!(executor.edge_tools.len(), 1);
         assert!(executor.edge_dispatch_service.is_some());
         assert!(executor.edge_registry_service.is_some());
         assert!(executor.cancel_token.is_some());
+    }
+
+    #[test]
+    fn execution_policy_is_identical_for_server_and_edge_bindings() {
+        let edge_execution = AdmittedModelExecution::from_endpoint(
+            "offer-skill".to_string(),
+            "test-model".to_string(),
+            "openai".to_string(),
+            "http://127.0.0.1/model-gateway".to_string(),
+            "Bearer test".to_string(),
+            None,
+            128_000,
+        );
+        let mut server_execution = edge_execution.clone();
+        server_execution.execution_placement = astra_services::ModelExecutionPlacement::Server;
+
+        let build = |execution| {
+            ServerSkillSubRunExecutor::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "test-user".to_string(),
+                "test-session".to_string(),
+            )
+            .with_admitted_model_execution(Some(execution))
+        };
+        let server = build(server_execution)
+            .resolve_execution_policy(
+                astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default(),
+                Some("test-model"),
+            )
+            .expect("Server execution policy");
+        let edge = build(edge_execution)
+            .with_execution_binding_snapshot(edge_runtime_snapshot())
+            .resolve_execution_policy(
+                astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default(),
+                Some("test-model"),
+            )
+            .expect("Edge+Server execution policy");
+
+        assert_eq!(server, edge);
+        assert!(server.1 > 0);
+
+        let missing = ServerSkillSubRunExecutor::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "test-user".to_string(),
+            "test-session".to_string(),
+        )
+        .resolve_execution_policy(
+            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default(),
+            Some("test-model"),
+        );
+        assert!(
+            missing.is_err(),
+            "missing admitted context must fail closed"
+        );
     }
 
     #[test]
@@ -939,6 +1546,9 @@ mod tests {
                 crate::turn::agentic_recursion_guard::ABSOLUTE_MAX_AGENT_RECURSION_DEPTH,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap_err();
@@ -949,14 +1559,371 @@ mod tests {
         );
     }
 
-    /// audit-#8: turn-count math must not underflow when `remaining_turns`
-    /// briefly exceeds the cap (race conditions, future refactors, etc.).
     #[test]
-    fn turn_count_subtraction_uses_saturating_sub() {
-        // Saturating semantics: max < remaining → 0, max == remaining → 0.
-        let max = SUBRUN_MAX_TURNS;
-        assert_eq!(max.saturating_sub(max + 5), 0);
-        assert_eq!(max.saturating_sub(max), 0);
-        assert_eq!(max.saturating_sub(max - 3), 3);
+    fn fork_skill_turn_chain_is_retry_stable_and_invocation_distinct() {
+        let tools = vec!["bash".to_string()];
+        let first = skill_subrun_turn_chain_id(
+            "parent-run",
+            "parent-chain",
+            "skill-call-1",
+            "review",
+            "Review it",
+            "task",
+            &tools,
+            0,
+        );
+        assert_eq!(
+            first,
+            skill_subrun_turn_chain_id(
+                "parent-run",
+                "parent-chain",
+                "skill-call-1",
+                "review",
+                "Review it",
+                "task",
+                &tools,
+                0,
+            ),
+            "retry of one fork invocation must reuse its inner ledger namespace"
+        );
+        assert_eq!(
+            first,
+            skill_subrun_turn_chain_id(
+                "parent-run",
+                "parent-chain",
+                "skill-call-1",
+                "review-v2",
+                "Changed manifest instructions",
+                "changed reconstructed context",
+                &["notify".to_string()],
+                3,
+            ),
+            "rebuild-time manifest/context changes must not change one outer invocation namespace"
+        );
+        assert_ne!(
+            first,
+            skill_subrun_turn_chain_id(
+                "parent-run",
+                "parent-chain",
+                "skill-call-2",
+                "review",
+                "Review it",
+                "task",
+                &tools,
+                0,
+            ),
+            "two legitimate same-argument fork calls must not alias"
+        );
+        assert_ne!(
+            first,
+            skill_subrun_turn_chain_id(
+                "parent-run",
+                "different-parent-chain",
+                "skill-call-1",
+                "review",
+                "Review it",
+                "task",
+                &tools,
+                0,
+            ),
+            "identical provider call ids in distinct parent turn chains must not alias"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_runtime_tool_uses_parent_session_run_and_shared_ledger_authority() {
+        use crate::server::tool_execution_binding::{
+            ToolPermissionGrantSnapshot, ToolPermissionGrantSource,
+        };
+
+        let run_engine = crate::server::run::engine::RunEngine::new(Arc::new(
+            astra_services::runs::InMemoryRunStateStore::new(),
+        ));
+        run_engine
+            .start_run("fork-parent-run", "test-user", "test-session")
+            .await
+            .unwrap();
+        run_engine
+            .append_events_batch(
+                "test-user",
+                "test-session",
+                "fork-parent-run",
+                &(1..=7)
+                    .map(|index| json!({"event_type": "agent_progress", "data": {"index": index}}))
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .unwrap();
+        let ledger =
+            crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new_process_local(
+                run_engine.clone(),
+            )
+            .unwrap();
+        let executor = ServerSkillSubRunExecutor::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "test-user".to_string(),
+            "test-session".to_string(),
+        )
+        .with_parent_invocation_authority(
+            "fork-parent-run".to_string(),
+            0,
+            "test-inference-owner".to_string(),
+            ledger.clone(),
+        );
+        let runtime = executor
+            .build_runtime_tool_executor(
+                "fork-authority",
+                "subrun-fork-authority-test",
+                ledger.clone(),
+            )
+            .unwrap();
+        let grant = ToolPermissionGrantSnapshot {
+            source: ToolPermissionGrantSource::ImplicitPolicy,
+            reason: None,
+            updates_hash: None,
+        };
+        let deferred = runtime
+            .execute_invocation_before_governance(
+                "fork-parent-run",
+                "fork-chain",
+                "fork-inner-call",
+                "notify",
+                &json!({"message": "fork child authority probe"}),
+                None,
+                Some(&grant),
+                Some(
+                    crate::server::tool_invocation_runtime::DurableDispatchAdmission {
+                        expected_control_epoch: 7,
+                        expected_owner_generation: 0,
+                    },
+                ),
+            )
+            .await;
+        assert!(
+            !deferred.result.is_error,
+            "fork child server tool must pass parent authority admission: {:?}",
+            deferred.result
+        );
+        assert!(deferred.pending.is_some(), "dispatch must be ledger-owned");
+        assert_eq!(
+            deferred.dispatch_control,
+            crate::server::runtime_tool_executor::RuntimeToolDispatchControl::Continue
+        );
+        run_engine
+            .append_event(
+                "test-user",
+                "test-session",
+                "fork-parent-run",
+                json!({
+                    "event_type": "user_intent",
+                    "idempotency_key": "user_intent:fork-newer",
+                    "data": {"intent_id": "fork-newer", "input": {"text": "stop"}}
+                }),
+            )
+            .await
+            .unwrap();
+        let stale = runtime
+            .execute_invocation_before_governance(
+                "fork-parent-run",
+                "fork-chain",
+                "fork-stale-inner-call",
+                "notify",
+                &json!({"message": "must not dispatch after newer intent"}),
+                None,
+                Some(&grant),
+                Some(
+                    crate::server::tool_invocation_runtime::DurableDispatchAdmission {
+                        expected_control_epoch: 7,
+                        expected_owner_generation: 0,
+                    },
+                ),
+            )
+            .await;
+        assert!(stale.pending.is_none());
+        assert!(matches!(
+            stale.dispatch_control,
+            crate::server::runtime_tool_executor::RuntimeToolDispatchControl::Superseded {
+                user_intent_event_index: 8
+            }
+        ));
+        let identity = astra_turn_types::ToolInvocationIdentity::new(
+            "test-user",
+            "test-session",
+            "fork-parent-run",
+            "fork-chain",
+            "fork-inner-call",
+        )
+        .unwrap();
+        assert_eq!(
+            ledger.get(&identity).await.unwrap().unwrap().state,
+            astra_turn_types::ToolInvocationState::Dispatched
+        );
+        let presentation_identity = astra_turn_types::ToolInvocationIdentity::new(
+            "test-user",
+            "subrun-fork-authority-test",
+            "fork-parent-run",
+            "fork-chain",
+            "fork-inner-call",
+        )
+        .unwrap();
+        assert!(ledger.get(&presentation_identity).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn fork_outer_large_utf8_result_replays_from_verified_full_artifact() {
+        let session_id = format!("fork-large-{}", uuid::Uuid::new_v4());
+        let executor = ServerSkillSubRunExecutor::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "test-user".to_string(),
+            session_id.clone(),
+        );
+        let identity = ToolInvocationIdentity::new(
+            "test-user",
+            &session_id,
+            "parent-run",
+            "parent-chain",
+            "outer-call",
+        )
+        .unwrap();
+        let result = SubRunResult {
+            output: "完整结果🙂".repeat(50_000),
+            tokens_used: 42,
+            turns: 3,
+            outcome: SubRunOutcome::Completed,
+        };
+
+        let envelope = executor
+            .persist_outer_skill_result(&identity, &result)
+            .await
+            .unwrap();
+        assert!(
+            envelope.len() < INLINE_OUTER_SKILL_RESULT_MAX_BYTES,
+            "ledger envelope must remain bounded"
+        );
+        let replay = executor
+            .replay_outer_skill_result(&identity, &envelope)
+            .await
+            .unwrap();
+        assert_eq!(replay.output, result.output);
+        assert_eq!(replay.tokens_used, result.tokens_used);
+        assert_eq!(replay.turns, result.turns);
+        assert_eq!(replay.outcome, result.outcome);
+
+        let envelope: Value = serde_json::from_str(&envelope).unwrap();
+        let hash = envelope["sha256"].as_str().unwrap();
+        let owner = astra_services::OwnerScope::user("test-user").unwrap();
+        let path = astra_services::local_session_artifact_store()
+            .session_path_for_owner(
+                &owner,
+                &session_id,
+                std::path::PathBuf::from("fork-skill-results").join(format!("{hash}.json")),
+            )
+            .unwrap();
+        tokio::fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fork_outer_abort_is_unknown_and_duplicate_or_changed_identity_never_reexecutes() {
+        let run_engine = crate::server::run::engine::RunEngine::new(Arc::new(
+            astra_services::runs::InMemoryRunStateStore::new(),
+        ));
+        run_engine
+            .start_run("fork-outer-run", "test-user", "test-session")
+            .await
+            .unwrap();
+        let ledger =
+            crate::server::tool_invocation_runtime::RuntimeToolInvocationLedger::new_process_local(
+                run_engine,
+            )
+            .unwrap();
+        let identity = ToolInvocationIdentity::new(
+            "test-user",
+            "test-session",
+            "fork-outer-run",
+            "parent-chain",
+            "outer-call",
+        )
+        .unwrap();
+        let decision = ToolInvocationDecision::new(&json!({"route": "fork_skill"})).unwrap();
+        let fingerprint = ToolInvocationFingerprint::new(
+            DurableToolReference::built_in("skill", "fork-v1").unwrap(),
+            &json!({"task": "original"}),
+            &decision.decision_id,
+        )
+        .unwrap();
+        ledger
+            .prepare_for_execution(&identity, &fingerprint, &decision, |_| Ok(()))
+            .await
+            .unwrap();
+        let owner_id = match ledger
+            .dispatch_prepared_with_admission(
+                &identity,
+                Some(
+                    crate::server::tool_invocation_runtime::DurableDispatchAdmission {
+                        expected_control_epoch: 0,
+                        expected_owner_generation: 0,
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+        {
+            crate::server::tool_invocation_runtime::InvocationBeginDisposition::Execute {
+                owner_id,
+                ..
+            } => owner_id,
+            _ => panic!("first outer invocation must execute"),
+        };
+        assert!(matches!(
+            ledger
+                .prepare_for_execution(&identity, &fingerprint, &decision, |_| Ok(()))
+                .await
+                .unwrap(),
+            crate::server::tool_invocation_runtime::InvocationPrepareDisposition::Return(_)
+        ));
+        assert_eq!(
+            ledger.get(&identity).await.unwrap().unwrap().attempt_count,
+            1
+        );
+
+        drop(OuterSkillDispatchGuard {
+            ledger: ledger.clone(),
+            identity: identity.clone(),
+            owner_id,
+            heartbeat: None,
+            settled: false,
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if ledger.get(&identity).await.unwrap().unwrap().state
+                    == astra_turn_types::ToolInvocationState::OutcomeUnknown
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aborted outer fork must converge to outcome unknown");
+
+        let changed = ToolInvocationFingerprint::new(
+            DurableToolReference::built_in("skill", "fork-v1").unwrap(),
+            &json!({"task": "changed"}),
+            &decision.decision_id,
+        )
+        .unwrap();
+        assert!(
+            ledger
+                .prepare_for_execution(&identity, &changed, &decision, |_| Ok(()))
+                .await
+                .is_err(),
+            "same outer call id with changed manifest/input must fail closed"
+        );
+        assert_eq!(
+            ledger.get(&identity).await.unwrap().unwrap().attempt_count,
+            1
+        );
     }
 }

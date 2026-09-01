@@ -1,9 +1,13 @@
 use serde_json::{Map, Value};
 
 use astra_core::work_unit::{WORK_UNIT_OBSERVATION_FIELD, WorkUnitObservation};
+use astra_turn_core::orchestration::agent_result_wire::{
+    agent_fanout_result_looks_like, agent_fanout_structured_result_class,
+    agent_tool_result_looks_like, agent_tool_structured_result_class,
+};
 
 use super::tool_transport_metadata::{
-    TOOL_ERROR_KIND_AGENT_WAITING, TOOL_ERROR_KIND_APPROVAL_TIMEOUT, TOOL_ERROR_KIND_CANCELLED,
+    TOOL_ERROR_KIND_AGENT_WAITING, TOOL_ERROR_KIND_APPROVAL_TIMEOUT,
     TOOL_ERROR_KIND_EXECUTOR_OFFLINE, TOOL_ERROR_KIND_TOOL_TIMEOUT,
     TOOL_ERROR_KIND_TRANSPORT_DISCONNECTED, TOOL_ERROR_KIND_WORKSPACE_PATH_MISMATCH,
 };
@@ -84,6 +88,15 @@ fn execution_boundary_wait_error_kind(reason: &str) -> Option<&'static str> {
 
 pub(crate) fn agent_tool_result_from_output(output: String) -> astra_tools::ToolResult {
     let parsed = serde_json::from_str::<Value>(&output).ok();
+    let result_class = parsed.as_ref().and_then(|value| {
+        if agent_fanout_result_looks_like(value) {
+            agent_fanout_structured_result_class(value)
+        } else if agent_tool_result_looks_like(value) {
+            agent_tool_structured_result_class(value)
+        } else {
+            None
+        }
+    });
     let interrupted_agent = parsed.as_ref().and_then(|value| {
         let status = value.get("status").and_then(Value::as_str)?;
         if !matches!(status, "waiting" | "interrupted") {
@@ -104,7 +117,14 @@ pub(crate) fn agent_tool_result_from_output(output: String) -> astra_tools::Tool
     });
 
     let Some((agent_status, reason)) = interrupted_agent else {
-        return tool_result_from_output(output);
+        let mut result = tool_result_from_output(output);
+        if let Some(result_class) = result_class {
+            result.metadata.get_or_insert_with(Map::new).insert(
+                "result_class".to_string(),
+                Value::String(result_class.to_string()),
+            );
+        }
+        return result;
     };
 
     let normalized_reason = normalized_wait_reason(reason);
@@ -133,6 +153,12 @@ pub(crate) fn agent_tool_result_from_output(output: String) -> astra_tools::Tool
         metadata.insert("agent_id".to_string(), Value::String(agent_id.to_string()));
     }
     insert_parsed_work_unit_observation(parsed.as_ref(), &mut metadata);
+    if let Some(result_class) = result_class {
+        metadata.insert(
+            "result_class".to_string(),
+            Value::String(result_class.to_string()),
+        );
+    }
     result.metadata = Some(metadata);
     result
 }
@@ -186,17 +212,8 @@ pub(crate) fn annotate_default_executor_cancel_if_needed(
     if result.output != cancelled_before && result.output != not_executed {
         return;
     }
-    result.metadata = Some(Map::from_iter([
-        (
-            "error_kind".to_string(),
-            Value::String(TOOL_ERROR_KIND_CANCELLED.to_string()),
-        ),
-        (
-            "reason".to_string(),
-            Value::String(TOOL_ERROR_KIND_CANCELLED.to_string()),
-        ),
-        ("cancelled".to_string(), Value::Bool(true)),
-    ]));
+    let execution_started = result.output == cancelled_before;
+    *result = astra_tools::cancelled_tool_result(tool_name, execution_started);
 }
 
 pub(crate) fn workspace_path_mismatch_tool_result(message: String) -> astra_tools::ToolResult {
@@ -310,5 +327,30 @@ mod tests {
         assert_eq!(observation.id, "future-agent-1");
         assert_eq!(observation.status, WorkUnitStatus::WaitingForInput);
         assert_eq!(observation.mode, WorkUnitObservationMode::Wait);
+    }
+
+    #[test]
+    fn fanout_partial_completion_retains_typed_result_class() {
+        let result = agent_tool_result_from_output(
+            serde_json::json!({
+                "status": "completed_with_issues",
+                "group_id": "fanout-1",
+                "results": [],
+                "target_count": 3,
+                "completed": 2,
+                "interrupted": 1,
+                "incomplete_results": 1
+            })
+            .to_string(),
+        );
+
+        assert!(
+            !result.is_error,
+            "partial evidence remains usable by the model"
+        );
+        assert_eq!(
+            result_metadata_str(&result, "result_class"),
+            Some("fanout_incomplete")
+        );
     }
 }

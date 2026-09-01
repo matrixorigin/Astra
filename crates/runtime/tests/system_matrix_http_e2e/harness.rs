@@ -1,16 +1,21 @@
 //! Shared harness for **system** Matrix HTTP E2E (Phase A: env gate, HTTP helpers, `sqlx` cleanup /
-//! row assertions, [`bootstrap`] / [`MatrixE2eCtx`]).
+//! row assertions, [`bootstrap`] / [`MatrixE2eCtx`]). All chat admissions in
+//! this matrix use the server-owned `/chat/stream` loop; callback helpers only
+//! post identity-bound edge results back to that live run.
 //!
 //! This module is the extracted equivalent of the historical monolithic
 //! `tests/system_matrix_http_e2e.rs` setup; journey logic lives in `journey_*.rs`. See
 //! `docs/testing/system-e2e-matrix.md` for the capability ↔ route ↔ test mapping.
 
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use astra_core::SharedPool;
 use astra_core::config::AppSettings;
 use astra_runtime::{DatabaseEvaluationService, MemoriaForwarder, build_app, build_server_state};
+use astra_services::runs::{
+    AtomicRunInteractionBatchRegistrationRequest, AtomicRunInteractionWaitRequest,
+    DurableRunInteractionKind, DurableRunInteractionWaitOutcome,
+};
 use astra_services::{
     DatabaseRunStateStore, DatabaseSessionService, DurableRunRecord, RunStateStore, SessionService,
 };
@@ -32,7 +37,8 @@ use tokio::sync::Mutex;
 use tower::util::ServiceExt;
 use uuid::Uuid;
 
-static E2E_ENV_INIT: OnceLock<()> = OnceLock::new();
+const INTERRUPTED_MATRIX_E2E_MIN_AGE_MINUTES: u64 = 15;
+const MATRIX_E2E_HEARTBEAT_INTERVAL_SECONDS: u64 = 30;
 
 pub fn require_system_e2e_env() {
     assert_eq!(
@@ -40,26 +46,19 @@ pub fn require_system_e2e_env() {
         Ok("1"),
         "set ASTRA_TEST_DB_IT=1 to run this ignored test"
     );
-    E2E_ENV_INIT.get_or_init(|| {
-        let secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET")
-            .unwrap_or_else(|_| "system-matrix-e2e-secret".to_string());
-        // SAFETY: These tests MUST run under nextest (per-process isolation).
-        // Under `cargo test` with shared threads this is technically UB on
-        // Rust 2024 edition. OnceLock guarantees this block runs exactly once
-        // before any test logic reads the env vars.
-        unsafe {
-            std::env::set_var("ASTRA_TEST_BRIDGE_SECRET", &secret);
-            if std::env::var_os("ASTRA_LLM_RETRY_BASE_MS").is_none() {
-                std::env::set_var("ASTRA_LLM_RETRY_BASE_MS", "10");
-            }
-            if std::env::var_os("ASTRA_DEFAULT_RETRY_AFTER_MS").is_none() {
-                std::env::set_var("ASTRA_DEFAULT_RETRY_AFTER_MS", "10");
-            }
-            if std::env::var_os("ASTRA_BCRYPT_COST").is_none() {
-                std::env::set_var("ASTRA_BCRYPT_COST", "4");
-            }
-        }
-    });
+    assert!(
+        std::env::var("ASTRA_TEST_BRIDGE_SECRET").is_ok_and(|secret| !secret.trim().is_empty()),
+        "set ASTRA_TEST_BRIDGE_SECRET explicitly; system E2E never mutates process environment"
+    );
+    let required_stack = astra_core::process_runtime::PROCESS_WORKER_STACK_BYTES;
+    let configured_stack = std::env::var("RUST_MIN_STACK")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_default();
+    assert!(
+        configured_stack >= required_stack,
+        "set RUST_MIN_STACK to at least {required_stack} so the Tokio test runtime matches Astra's production runtime"
+    );
 }
 
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
@@ -521,19 +520,6 @@ pub async fn cleanup_edge_registry(pool: &sqlx::MySqlPool, user_id: &str, edge_a
         .await;
 }
 
-pub async fn cleanup_task_rows(pool: &sqlx::MySqlPool, user_id: &str, task_id: &str) {
-    let _ = sqlx::query("DELETE FROM task_leases WHERE user_id = ? AND task_id = ?")
-        .bind(user_id)
-        .bind(task_id)
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM agent_tasks WHERE user_id = ? AND task_id = ?")
-        .bind(user_id)
-        .bind(task_id)
-        .execute(pool)
-        .await;
-}
-
 pub fn row_get_str(r: &MySqlRow, col: &str) -> String {
     r.try_get::<String, _>(col)
         .unwrap_or_else(|_| panic!("missing string column {col}"))
@@ -548,7 +534,7 @@ pub fn row_get_opt_i64(r: &MySqlRow, col: &str) -> Option<i64> {
 }
 
 /// Poll until `agent_events` has at least one row per `event_type` for this session, or `timeout`.
-/// Avoids fixed `sleep` after `/chat/turn` SSE (faster on hot DB, less flaky on cold).
+/// Avoids fixed `sleep` after server-owned `/chat/stream` SSE (faster on hot DB, less flaky on cold).
 pub async fn wait_for_agent_event_types(
     pool: &sqlx::MySqlPool,
     user_id: &str,
@@ -632,7 +618,7 @@ pub async fn wait_for_run_status(
         }
         if tokio::time::Instant::now() >= deadline {
             panic!(
-                "timeout ({timeout:?}) waiting for run {run_id} to reach status '{target_status}'"
+                "timeout ({timeout:?}) waiting for run {run_id} to reach status '{target_status}'; last observation: http_status={st}, body={body}"
             );
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -655,6 +641,63 @@ pub struct MatrixE2eCtx {
     pub edge_agent_id: String,
     pub model_offering_id: String,
     pub suffix: String,
+    fixture_heartbeat: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    fixture_heartbeat_error: Arc<Mutex<Option<String>>>,
+}
+
+impl MatrixE2eCtx {
+    async fn stop_fixture_heartbeat(&self) {
+        if let Some(heartbeat) = self.fixture_heartbeat.lock().await.take() {
+            heartbeat.abort();
+            match heartbeat.await {
+                Err(error) if error.is_cancelled() => {}
+                outcome => outcome.expect("join Matrix E2E fixture heartbeat task"),
+            }
+        }
+    }
+
+    /// Turn this live fixture into deterministic interrupted state so the
+    /// online cleanup regression can cover both sides of the lease fence.
+    pub async fn expire_fixture_lease_for_test(&self) {
+        self.stop_fixture_heartbeat().await;
+        sqlx::query(
+            "UPDATE auth_users
+             SET created_at = DATE_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 DAY),
+                 last_login_at = DATE_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 DAY)
+             WHERE user_id = ?",
+        )
+        .bind(&self.user_id)
+        .execute(&self.pool)
+        .await
+        .expect("expire Matrix E2E fixture lease");
+    }
+
+    /// Release every pool owned by one in-process app. Closing only the SQL
+    /// assertion pool leaks the `SharedPool` global connection reservation
+    /// across subsequent journeys in the same system-E2E binary.
+    pub async fn close(&self) {
+        self.stop_fixture_heartbeat().await;
+        let _ = self
+            .app_state
+            .stop_background_runs(std::time::Duration::from_secs(2))
+            .await;
+        cleanup_session_data(&self.shared_pool, &self.user_id, &self.session_id).await;
+        cleanup_edge_registry(&self.pool, &self.user_id, &self.edge_agent_id).await;
+        // Each bootstrap creates an isolated mock Offering. Remove it before
+        // closing the pool so later memory-extraction/model-resolution paths
+        // do not fan out across every stale E2E fixture left in MatrixOne.
+        let offering_cleanup = sqlx::query("DELETE FROM infra_llm_models WHERE model_id = ?")
+            .bind(&self.model_offering_id)
+            .execute(&self.pool)
+            .await;
+        astra_services::models::invalidate_active_llm_model_resolution_cache();
+        self.pool.close().await;
+        self.app_state.close_database_pools().await;
+        offering_cleanup.expect("remove Matrix E2E mock Offering");
+        if let Some(error) = self.fixture_heartbeat_error.lock().await.take() {
+            panic!("Matrix E2E fixture heartbeat failed before cleanup: {error}");
+        }
+    }
 }
 
 pub struct BootstrapResult {
@@ -674,7 +717,9 @@ pub async fn seed_pending_approval(
     approval_kind: &str,
 ) {
     let now = chrono::Utc::now().to_rfc3339();
-    let store = DatabaseRunStateStore::new(ctx.shared_pool.clone());
+    let owner_pod_id = "system-matrix-approval-fixture";
+    let owner_lease_expires_at = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+    let store = DatabaseRunStateStore::new(ctx.shared_pool.clone()).with_owner_pod_id(owner_pod_id);
     store
         .insert_run(DurableRunRecord {
             run_id: run_id.to_string(),
@@ -685,13 +730,13 @@ pub async fn seed_pending_approval(
             ancestor_path: Some(run_id.to_string()),
             depth: 0,
             delegation_id: None,
-            agent_id: Some("system-matrix-approval-fixture".to_string()),
+            agent_id: Some(owner_pod_id.to_string()),
             retry_of: None,
             retry_scope: Some("node".to_string()),
-            status: "waiting".to_string(),
-            waiting_for: Some("tool_approval".to_string()),
-            owner_pod_id: None,
-            owner_lease_expires_at: None,
+            status: "running".to_string(),
+            waiting_for: None,
+            owner_pod_id: Some(owner_pod_id.to_string()),
+            owner_lease_expires_at: Some(owner_lease_expires_at),
             run_generation: 0,
             last_event_idx: -1,
             checkpoint_version: None,
@@ -708,24 +753,57 @@ pub async fn seed_pending_approval(
             model_offering_id: None,
             resolved_model_name: None,
             runtime_profile: None,
-            provider_request_fingerprint: None,
-            events: vec![
-                json!({"event_type": "run_started", "data": {}}),
-                json!({
-                    "event_type": "approval_required",
-                    "data": {
-                        "request_id": request_id,
-                        "tool": tool,
-                        "approval_kind": approval_kind,
-                        "delivery": "durable",
-                    }
-                }),
-            ],
+            start_request_fingerprint: None,
+            work_binding: None,
+            events: vec![json!({"event_type": "run_started", "data": {}})],
             created_at: now.clone(),
             updated_at: now,
         })
         .await
         .expect("seed durable pending approval");
+
+    // Keep this fixture on the production registration path.  In particular,
+    // an approval is not just an append-only event: its batch receipt and
+    // immutable owner/control authority must be established atomically before
+    // a user response can be accepted.
+    let required = json!({
+        "event_type": "approval_required",
+        "idempotency_key": format!("approval:{request_id}:required"),
+        "data": {
+            "request_id": request_id,
+            "session_id": ctx.session_id,
+            "tool": tool,
+            "approval_kind": approval_kind,
+            "delivery": "durable",
+        }
+    });
+    store
+        .register_guarded_interaction_batch(AtomicRunInteractionBatchRegistrationRequest {
+            user_id: &ctx.user_id,
+            run_id,
+            expected_session_id: &ctx.session_id,
+            // `run_started` is the durable control frontier at registration.
+            expected_control_epoch: 0,
+            expected_owner_generation: 0,
+            events: std::slice::from_ref(&required),
+        })
+        .await
+        .expect("register durable pending approval");
+    assert!(matches!(
+        store
+            .begin_run_interaction_wait(AtomicRunInteractionWaitRequest {
+                user_id: &ctx.user_id,
+                run_id,
+                expected_session_id: &ctx.session_id,
+                request_id,
+                kind: DurableRunInteractionKind::Approval,
+                expected_control_epoch: 0,
+                expected_owner_generation: 0,
+            })
+            .await
+            .expect("open durable pending approval wait"),
+        DurableRunInteractionWaitOutcome::Waiting
+    ));
 }
 
 pub async fn load_durable_interaction_event(
@@ -807,10 +885,6 @@ pub async fn revoke_astra_admin_role(pool: &sqlx::MySqlPool, user_id: &str) {
 
 /// Build app, connect pool, register user, refresh token, create session (with cleanup of stale rows).
 pub async fn bootstrap() -> BootstrapResult {
-    // Use low bcrypt cost in tests to avoid multi-second hashing in debug builds.
-    // SAFETY: set before any code reads this variable; the tokio runtime has
-    // worker threads but none are reading ASTRA_BCRYPT_COST yet.
-    unsafe { std::env::set_var("ASTRA_BCRYPT_COST", "4") };
     let memoria = Arc::new(E2eMemoriaStub::default());
     let (state, matrixone_database, url) = build_state(memoria.clone()).await;
 
@@ -820,17 +894,21 @@ pub async fn bootstrap() -> BootstrapResult {
         .await
         .expect("connect MatrixOne for assertions");
 
-    let matrixone_settings = AppSettings::from_env()
-        .expect("AppSettings::from_env (see astra-server env)")
-        .matrixone;
-    let evaluation_pool = SharedPool::new(&matrixone_settings)
-        .await
-        .expect("connect MatrixOne shared pool for evaluation");
-    let session_lifecycle_pool = evaluation_pool.clone();
+    cleanup_interrupted_matrix_e2e_sessions(&state).await;
+
+    // Reuse the server's database pool. A separate 80-connection evaluation
+    // pool per in-process app made a serial journey suite reserve twice the
+    // production capacity and obscured genuine leaks behind the global cap.
+    let session_lifecycle_pool = state
+        .shared_pool
+        .as_ref()
+        .expect("build_server_state wires a shared MatrixOne pool")
+        .clone();
+    let matrixone_settings = session_lifecycle_pool.settings().clone();
     let memoria_health_base_url = start_mock_memoria_health().await;
     let state = state.with_evaluation_service(Arc::new(
         DatabaseEvaluationService::new(matrixone_settings)
-            .with_pool(evaluation_pool)
+            .with_pool(session_lifecycle_pool.clone())
             .with_memoria_config(
                 memoria_health_base_url,
                 Some("system-e2e-mock-master-key".to_string()),
@@ -955,6 +1033,41 @@ pub async fn bootstrap() -> BootstrapResult {
     .await;
     assert_eq!(st_mdl, StatusCode::CREATED, "seed mock model: {model}");
     let model_offering_id = offering_id_from_model_response(&model).to_string();
+    let heartbeat_pool = pool.clone();
+    let heartbeat_user_id = user_id.clone();
+    let fixture_heartbeat_error = Arc::new(Mutex::new(None));
+    let heartbeat_error = fixture_heartbeat_error.clone();
+    let fixture_heartbeat = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            MATRIX_E2E_HEARTBEAT_INTERVAL_SECONDS,
+        ));
+        loop {
+            interval.tick().await;
+            let refresh = sqlx::query(
+                "UPDATE auth_users
+                 SET last_login_at = CURRENT_TIMESTAMP(6)
+                 WHERE user_id = ? AND is_active = 1",
+            )
+            .bind(&heartbeat_user_id)
+            .execute(&heartbeat_pool)
+            .await;
+            match refresh {
+                Ok(result) if result.rows_affected() == 1 => {}
+                Ok(_) => {
+                    *heartbeat_error.lock().await = Some(format!(
+                        "fixture lease was lost for active user {heartbeat_user_id}"
+                    ));
+                    break;
+                }
+                Err(error) => {
+                    let mut first_error = heartbeat_error.lock().await;
+                    if first_error.is_none() {
+                        *first_error = Some(error.to_string());
+                    }
+                }
+            }
+        }
+    });
 
     BootstrapResult {
         ctx: MatrixE2eCtx {
@@ -970,8 +1083,83 @@ pub async fn bootstrap() -> BootstrapResult {
             edge_agent_id,
             model_offering_id,
             suffix,
+            fixture_heartbeat: Mutex::new(Some(fixture_heartbeat)),
+            fixture_heartbeat_error,
         },
         auth_header,
         refresh_token,
     }
+}
+
+/// Reclaim only this suite's session fixtures after a developer interrupt or
+/// crashed test process. Session deletion also removes the corresponding
+/// distributed weighted-admission lease, so a stale E2E run cannot deny the
+/// next user's otherwise valid request with a 429.
+async fn cleanup_interrupted_matrix_e2e_sessions(state: &astra_runtime::AppState) {
+    let pool = state
+        .shared_pool
+        .as_ref()
+        .expect("build_server_state wires a shared MatrixOne pool");
+    // A completed journey removes its own session and Offering. This sweep is
+    // only crash recovery: a recent fixture may belong to another test in the
+    // same binary or a parallel nextest process and is therefore live. The
+    // lease fence is deliberately much longer than the heartbeat interval.
+    let users = sqlx::query(&format!(
+        "SELECT user_id, is_active FROM auth_users
+         WHERE username LIKE 'prod_matrix_%'
+           AND (is_active = 1 OR display_name = 'e2e-cleaning')
+           AND COALESCE(last_login_at, created_at) <
+               DATE_SUB(CURRENT_TIMESTAMP(), INTERVAL {} MINUTE)",
+        INTERRUPTED_MATRIX_E2E_MIN_AGE_MINUTES
+    ))
+    .fetch_all(pool.get())
+    .await
+    .expect("list old interrupted matrix E2E users");
+    for row in users {
+        let user_id: String = row.try_get("user_id").expect("fixture user_id");
+        let is_active: i64 = row.try_get("is_active").expect("fixture is_active");
+        if is_active == 1 && !try_claim_interrupted_matrix_e2e_fixture(pool, &user_id).await {
+            continue;
+        }
+        let sessions = sqlx::query("SELECT session_id FROM agent_sessions WHERE user_id = ?")
+            .bind(&user_id)
+            .fetch_all(pool.get())
+            .await
+            .expect("list old interrupted Matrix E2E sessions");
+        for session in sessions {
+            let session_id: String = session.try_get("session_id").expect("fixture session_id");
+            cleanup_session_data(pool, &user_id, &session_id).await;
+        }
+        sqlx::query("DELETE FROM infra_llm_models WHERE created_by = ?")
+            .bind(&user_id)
+            .execute(pool.get())
+            .await
+            .expect("remove old interrupted Matrix E2E Offerings");
+        sqlx::query(
+            "UPDATE auth_users SET display_name = 'e2e-cleaned'
+             WHERE user_id = ? AND is_active = 0 AND display_name = 'e2e-cleaning'",
+        )
+        .bind(&user_id)
+        .execute(pool.get())
+        .await
+        .expect("mark interrupted Matrix E2E fixture cleaned");
+    }
+}
+
+/// Atomically cross the expiry fence. A heartbeat that renewed after the
+/// candidate SELECT wins this CAS, so cleanup cannot act on a stale snapshot.
+pub async fn try_claim_interrupted_matrix_e2e_fixture(pool: &SharedPool, user_id: &str) -> bool {
+    let claim = sqlx::query(&format!(
+        "UPDATE auth_users
+         SET is_active = 0, display_name = 'e2e-cleaning'
+         WHERE user_id = ? AND is_active = 1
+           AND COALESCE(last_login_at, created_at) <
+               DATE_SUB(CURRENT_TIMESTAMP(), INTERVAL {} MINUTE)",
+        INTERRUPTED_MATRIX_E2E_MIN_AGE_MINUTES
+    ))
+    .bind(user_id)
+    .execute(pool.get())
+    .await
+    .expect("claim old interrupted Matrix E2E fixture");
+    claim.rows_affected() == 1
 }

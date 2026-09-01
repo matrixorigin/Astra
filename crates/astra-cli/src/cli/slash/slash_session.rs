@@ -4,7 +4,7 @@ use astra_services::introspection::{
     IntentDriftAssessmentStatus, IntentDriftCheckResponseV2, IntentDriftLevel, IntentDriftVerdict,
 };
 use astra_services::session_restore::RestoredSession;
-use astra_services::{ForkSessionOptions, fork_local_session, session_journal, session_workspace};
+use astra_services::{session_journal, session_workspace};
 use chrono::{DateTime, Utc};
 
 use crate::cli::permission_manager::PermissionMode;
@@ -23,11 +23,10 @@ use crate::cli::tool_call_groups;
 use crate::cli::{
     cli_config::cli_utils::{
         SessionResumePreflight, clear_profile_last_session_if_matches_or_warn,
-        get_profile_and_token, normalize_model_override, persist_profile_last_session_or_warn,
+        normalize_model_override, persist_profile_last_session_or_warn,
         preflight_remote_resume_session,
     },
-    durable_bridge,
-    session::session_state::{ContinuationAnchor, SessionState},
+    session::session_state::SessionState,
     session::{session_continuation, session_projection, session_startup, session_state},
     slash::slash_stats,
     stream::stream_render,
@@ -474,44 +473,6 @@ async fn load_resumable_session_candidates(
     })
 }
 
-/// Resolve parent session id and optional label for `/session fork`.
-fn parse_fork_source(arg: &str, state: &SessionState) -> Result<(String, Option<String>), String> {
-    let arg = arg.trim();
-    if arg.is_empty() {
-        return state
-            .session_id
-            .clone()
-            .filter(|s| !s.is_empty())
-            .map(|s| Ok((s, None)))
-            .unwrap_or_else(|| {
-                Err(
-                    "no active session — use `/session fork <parent_session_id> [label]`"
-                        .to_string(),
-                )
-            });
-    }
-    let parts: Vec<&str> = arg.split_whitespace().collect();
-    let head = parts[0];
-    let tail = if parts.len() > 1 {
-        Some(parts[1..].join(" "))
-    } else {
-        None
-    };
-    match session_journal::resolve_session_id(head) {
-        Ok(sid) => Ok((sid, tail)),
-        Err(_) => state
-            .session_id
-            .clone()
-            .filter(|s| !s.is_empty())
-            .map(|sid| Ok((sid, Some(arg.to_string()))))
-            .unwrap_or_else(|| {
-                Err(format!(
-                    "unknown session id or prefix '{head}' (and no active session to fork from)"
-                ))
-            }),
-    }
-}
-
 fn ellipsize(s: &str, max_chars: usize) -> String {
     let t: String = s.chars().take(max_chars).collect();
     if s.chars().count() > max_chars {
@@ -602,20 +563,6 @@ fn print_workspace_metadata(ws: &session_workspace::WorkspaceMetadata, sid: &str
             ws.turn_count.to_string().magenta(),
             format_u64_grouped(ws.total_tokens_in).as_str().magenta(),
             format_u64_grouped(ws.total_tokens_out).as_str().magenta(),
-        );
-    }
-    if let Some(ref goal) = ws.plan_goal {
-        eprintln!(
-            "  {:<16} {}",
-            "plan goal:".dim(),
-            ellipsize(goal, 72).magenta()
-        );
-    }
-    if ws.plan_execution_rounds > 0 {
-        eprintln!(
-            "  {:<16} {}",
-            "plan rounds:".dim(),
-            ws.plan_execution_rounds.to_string().magenta()
         );
     }
     if let Some(ref trace) = ws.last_context_trace {
@@ -1169,51 +1116,10 @@ pub(crate) async fn handle_session_command(
             eprintln!();
             eprintln!(
                 "  {}",
-                "Subcommands: history · context · errors · export · list [--here|--project|--active|search] · fork · cleanup · verify · drift"
+                "Subcommands: history · context · errors · export · list [--here|--project|--active|search] · cleanup · verify · drift"
                     .dim()
             );
             eprintln!();
-        }
-
-        "fork" => {
-            let (parent_id, label) = match parse_fork_source(sub_arg, state) {
-                Ok(x) => x,
-                Err(msg) => {
-                    eprintln!("{}", msg.red());
-                    return;
-                }
-            };
-            match fork_session_into_state(&parent_id, label, api, profile, state).await {
-                Ok(outcome) => {
-                    eprintln!(
-                        "  {} New session {} (fork of {})",
-                        theme::icon_ok(),
-                        outcome.new_session_id.as_str().magenta(),
-                        parent_id.as_str().dim()
-                    );
-                    eprintln!(
-                        "  {}",
-                        format!(
-                            "{} journal events copied (excl. session end/start)",
-                            outcome.events_copied
-                        )
-                        .dim()
-                    );
-                    eprintln!(
-                        "  {}",
-                        "REPL context is now the forked session (same history; new cloud lineage)."
-                            .dim()
-                    );
-                    if outcome.preserved_existing_child_task_board {
-                        eprintln!(
-                            "  {}",
-                            "Forked child already has a task board; preserved child tasks and skipped copying the parent board."
-                                .yellow()
-                        );
-                    }
-                }
-                Err(error) => eprintln!("{}", format!("  ✗ {error}").red()),
-            }
         }
         "history" => {
             // Read journal for this session or a specified session
@@ -1344,6 +1250,15 @@ pub(crate) async fn handle_session_command(
                                     theme::icon_err(),
                                     evt.turn.unwrap_or(0),
                                     evt.error.as_deref().unwrap_or("(no details)").red(),
+                                );
+                                eprintln!(
+                                    "      {} fresh + {} cache-read + {} cache-write → {} out · {} tools · {:.1}s",
+                                    evt.tokens_in.unwrap_or(0),
+                                    evt.cache_read_tokens.unwrap_or(0),
+                                    evt.cache_creation_tokens.unwrap_or(0),
+                                    evt.tokens_out.unwrap_or(0),
+                                    evt.tool_count.unwrap_or(0),
+                                    evt.duration_ms.unwrap_or(0) as f64 / 1000.0,
                                 );
                             }
                             session_journal::JournalEventType::Compact => {
@@ -2259,7 +2174,36 @@ pub(crate) async fn handle_session_command(
                                     detail,
                                 );
                             }
+                            session_journal::JournalEventType::SubsystemDiagnostic => {
+                                let meta = evt.metadata.as_ref();
+                                let severity = meta
+                                    .and_then(|m| m.get("severity"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("warning");
+                                let subsystem = meta
+                                    .and_then(|m| m.get("subsystem"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+                                let operation = meta
+                                    .and_then(|m| m.get("operation"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+                                let code = meta
+                                    .and_then(|m| m.get("code"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+                                eprintln!(
+                                    "  {} ⚠ T{} {} {}.{}: {}",
+                                    ts_short.dim(),
+                                    evt.turn.unwrap_or(0),
+                                    severity,
+                                    subsystem,
+                                    operation,
+                                    code,
+                                );
+                            }
                             session_journal::JournalEventType::PipelineFeedback
+                            | session_journal::JournalEventType::SubsystemSettled
                             | session_journal::JournalEventType::PipelineAlert
                             | session_journal::JournalEventType::PipelineCompactionAudit
                             | session_journal::JournalEventType::Bootstrap
@@ -2329,10 +2273,56 @@ pub(crate) async fn handle_session_command(
                                 == session_journal::JournalEventType::ExecutionBoundaryAborted
                         })
                         .count();
-                    let total_tokens_in: u64 = turns.iter().filter_map(|e| e.tokens_in).sum();
-                    let total_tokens_out: u64 = turns.iter().filter_map(|e| e.tokens_out).sum();
-                    let total_tools: u32 = turns.iter().filter_map(|e| e.tool_count).sum();
-                    let total_ms: u64 = turns.iter().filter_map(|e| e.duration_ms).sum();
+                    // Keep `/session history`, `/session analyze`, and
+                    // `journal digest` on one attempt accounting contract.
+                    // Failed attempts consumed provider/tool resources too;
+                    // filtering them out makes the most important incident
+                    // sessions misleadingly display zero work.
+                    let digest = crate::cli::journal_digest::build_digest(
+                        &target_sid,
+                        crate::cli::journal_digest::DigestFocus::Summary,
+                    )
+                    .ok();
+                    let total_tokens_in = digest
+                        .as_ref()
+                        .map(|digest| digest.aggregates.total_provider_input_tokens)
+                        .unwrap_or_else(|| {
+                            turns
+                                .iter()
+                                .chain(errors.iter())
+                                .filter_map(|event| event.tokens_in)
+                                .sum()
+                        });
+                    let total_tokens_out = digest
+                        .as_ref()
+                        .map(|digest| digest.aggregates.total_tokens_out)
+                        .unwrap_or_else(|| {
+                            turns
+                                .iter()
+                                .chain(errors.iter())
+                                .filter_map(|event| event.tokens_out)
+                                .sum()
+                        });
+                    let total_tools = digest
+                        .as_ref()
+                        .map(|digest| digest.aggregates.total_tool_calls)
+                        .unwrap_or_else(|| {
+                            turns
+                                .iter()
+                                .chain(errors.iter())
+                                .filter_map(|event| event.tool_count.map(u64::from))
+                                .sum()
+                        });
+                    let total_ms = digest
+                        .as_ref()
+                        .map(|digest| digest.aggregates.total_duration_ms)
+                        .unwrap_or_else(|| {
+                            turns
+                                .iter()
+                                .chain(errors.iter())
+                                .filter_map(|event| event.duration_ms)
+                                .sum()
+                        });
                     eprintln!(
                         "\n  {} {} turns, {} errors, {}+{} tokens, {} tool calls, {:.1}s total",
                         "Summary:".bold(),
@@ -2987,9 +2977,15 @@ pub(crate) fn build_export_markdown(
             }
             session_journal::JournalEventType::TurnError => {
                 md.push_str(&format!(
-                    "### Turn {} ❌ Error\n- **Time:** {ts_short}\n- **Error:** {}\n\n---\n\n",
+                    "### Turn {} ❌ Error\n- **Time:** {ts_short}\n- **Error:** {}\n- **Tokens:** {} fresh + {} cache-read + {} cache-write → {} out\n- **Tools:** {}\n- **Duration:** {:.1}s\n\n---\n\n",
                     evt.turn.unwrap_or(0),
                     evt.error.as_deref().unwrap_or("(no details)"),
+                    evt.tokens_in.unwrap_or(0),
+                    evt.cache_read_tokens.unwrap_or(0),
+                    evt.cache_creation_tokens.unwrap_or(0),
+                    evt.tokens_out.unwrap_or(0),
+                    evt.tool_count.unwrap_or(0),
+                    evt.duration_ms.unwrap_or(0) as f64 / 1000.0,
                 ));
             }
             session_journal::JournalEventType::Compact => {
@@ -3974,12 +3970,71 @@ fn handle_session_analyze(arg: &str, state: &SessionState) {
         .and_then(|w| w.model.as_deref())
         .or_else(|| events.first().and_then(|e| e.model.as_deref()))
         .unwrap_or("unknown");
-    let total_tok_in: u64 = turns.iter().filter_map(|t| t.tokens_in).sum();
-    let total_tok_out: u64 = turns.iter().filter_map(|t| t.tokens_out).sum();
-    let total_ms: u64 = turns.iter().filter_map(|t| t.duration_ms).sum();
-    let total_tools: u32 = turns.iter().filter_map(|t| t.tool_count).sum();
-    let total_cache_read: u64 = turns.iter().filter_map(|t| t.cache_read_tokens).sum();
-    let total_cache_create: u64 = turns.iter().filter_map(|t| t.cache_creation_tokens).sum();
+    let digest = crate::cli::journal_digest::build_digest(
+        &target_sid,
+        crate::cli::journal_digest::DigestFocus::Summary,
+    )
+    .ok();
+    let total_tok_in = digest
+        .as_ref()
+        .map(|digest| digest.aggregates.total_tokens_in)
+        .unwrap_or_else(|| {
+            turns
+                .iter()
+                .chain(errors.iter())
+                .filter_map(|event| event.tokens_in)
+                .sum()
+        });
+    let total_tok_out = digest
+        .as_ref()
+        .map(|digest| digest.aggregates.total_tokens_out)
+        .unwrap_or_else(|| {
+            turns
+                .iter()
+                .chain(errors.iter())
+                .filter_map(|event| event.tokens_out)
+                .sum()
+        });
+    let total_ms = digest
+        .as_ref()
+        .map(|digest| digest.aggregates.total_duration_ms)
+        .unwrap_or_else(|| {
+            turns
+                .iter()
+                .chain(errors.iter())
+                .filter_map(|event| event.duration_ms)
+                .sum()
+        });
+    let total_tools = digest
+        .as_ref()
+        .map(|digest| digest.aggregates.total_tool_calls)
+        .unwrap_or_else(|| {
+            turns
+                .iter()
+                .chain(errors.iter())
+                .filter_map(|event| event.tool_count.map(u64::from))
+                .sum()
+        });
+    let total_cache_read = digest
+        .as_ref()
+        .map(|digest| digest.aggregates.total_cache_read_tokens)
+        .unwrap_or_else(|| {
+            turns
+                .iter()
+                .chain(errors.iter())
+                .filter_map(|event| event.cache_read_tokens)
+                .sum()
+        });
+    let total_cache_create = digest
+        .as_ref()
+        .map(|digest| digest.aggregates.total_cache_creation_tokens)
+        .unwrap_or_else(|| {
+            turns
+                .iter()
+                .chain(errors.iter())
+                .filter_map(|event| event.cache_creation_tokens)
+                .sum()
+        });
 
     eprintln!("  {:<16} {}", "model:".dim(), model.magenta());
     if let Some(error) = workspace_error.as_ref() {
@@ -4899,12 +4954,6 @@ fn persist_resumed_workspace_metadata(
     if restored.permission_mode.is_some() {
         ws.permission_mode = restored.permission_mode.clone();
     }
-    ws.executing_plan_json = restored.executing_plan_json.clone();
-    ws.plan_goal = restored.plan_goal.clone();
-    ws.plan_config_json = restored.plan_config_json.clone();
-    ws.plan_execution_rounds = restored.plan_execution_rounds;
-    ws.contract_json = restored.contract_json.clone();
-    ws.plan_corrections = restored.plan_corrections.clone();
     ws.last_context_trace = restored.last_context_trace.clone();
     astra_services::session_workspace::write_workspace(&ws)
         .map_err(|e| format!("write workspace during resume: {e}"))
@@ -5062,141 +5111,24 @@ fn apply_restored_cloud_heavy_state(
     );
 }
 
-struct PreparedForkRestore {
+struct PreparedSessionHistory {
     history: Vec<(String, String)>,
     active_conversation: Option<astra_turn_core::active_conversation::ActiveConversation>,
     resume: Option<astra_turn_types::ResumeDescriptorV1>,
     recent_tools: Vec<String>,
     activated_deferred_tool_names: Vec<String>,
     csl_manager: Option<astra_turn_core::conversation_log::manager::CslManager>,
-    journal_state: session_runtime::RestoredSessionState,
-    last_turn_event: Option<session_journal::JournalEvent>,
 }
 
-#[derive(Debug, Clone)]
-struct CloudTaskBoardCopy {
-    cloud_base: String,
-    token: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ForkTaskBoardRestore {
-    Copied,
-    PreservedExistingChild,
-}
-
-struct ForkStateSnapshot {
-    session_id: Option<String>,
-    root_mailbox: Option<astra_messaging::router::AgentMailbox>,
-    turn: u32,
-    total_prompt_tokens: u64,
-    total_completion_tokens: u64,
-    total_cache_read_tokens: u64,
-    total_cache_creation_tokens: u64,
-    last_turn_event: Option<session_journal::JournalEvent>,
-    run_id: Option<String>,
-    history: Vec<(String, String)>,
-    active_conversation: Option<astra_turn_core::active_conversation::ActiveConversation>,
-    recent_tools: Vec<String>,
-    activated_deferred_tool_names: Vec<String>,
-    csl_manager: Option<astra_turn_core::conversation_log::manager::CslManager>,
-    last_response: Option<String>,
-    continuation_anchor: Option<ContinuationAnchor>,
-}
-
-impl ForkStateSnapshot {
-    fn capture(state: &mut SessionState) -> Self {
-        Self {
-            session_id: state.session_id.clone(),
-            root_mailbox: state.root_mailbox.take(),
-            turn: state.turn,
-            total_prompt_tokens: state.total_prompt_tokens,
-            total_completion_tokens: state.total_completion_tokens,
-            total_cache_read_tokens: state.total_cache_read_tokens,
-            total_cache_creation_tokens: state.total_cache_creation_tokens,
-            last_turn_event: state.last_turn_event.clone(),
-            run_id: state.run_id.clone(),
-            history: crate::cli::history_work::clone_pair_history(
-                astra_core::history_work::HistoryWorkSite::CliSlashForkRollbackSnapshot,
-                &state.history,
-            ),
-            active_conversation: state.active_conversation.clone(),
-            recent_tools: state.recent_tools.clone(),
-            activated_deferred_tool_names: state.activated_deferred_tool_names.clone(),
-            csl_manager: state.csl_manager.take(),
-            last_response: state.last_response.clone(),
-            continuation_anchor: state.continuation_anchor.clone(),
-        }
-    }
-
-    fn restore(self, state: &mut SessionState) {
-        match self.session_id {
-            Some(session_id) => {
-                state.set_session_id(session_id.clone());
-                session_startup::initialize_journal_pub(state, &session_id);
-            }
-            None => {
-                state.clear_session_id();
-                state.journal = None;
-            }
-        }
-        state.turn = self.turn;
-        state.total_prompt_tokens = self.total_prompt_tokens;
-        state.total_completion_tokens = self.total_completion_tokens;
-        state.total_cache_read_tokens = self.total_cache_read_tokens;
-        state.total_cache_creation_tokens = self.total_cache_creation_tokens;
-        state.last_turn_event = self.last_turn_event;
-        state.run_id = self.run_id;
-        state.history = self.history;
-        state.active_conversation = self.active_conversation;
-        state.recent_tools = self.recent_tools;
-        state.activated_deferred_tool_names = self.activated_deferred_tool_names;
-        state.csl_manager = self.csl_manager;
-        state.root_mailbox = self.root_mailbox;
-        state.last_response = self.last_response;
-        state.continuation_anchor = self.continuation_anchor;
-    }
-}
-
-struct ForkStateGuard<'a> {
-    state: &'a mut SessionState,
-    snapshot: Option<ForkStateSnapshot>,
-}
-
-impl<'a> ForkStateGuard<'a> {
-    fn new(state: &'a mut SessionState) -> Self {
-        Self {
-            snapshot: Some(ForkStateSnapshot::capture(state)),
-            state,
-        }
-    }
-
-    fn state(&mut self) -> &mut SessionState {
-        self.state
-    }
-
-    fn commit(mut self) {
-        self.snapshot = None;
-    }
-}
-
-impl Drop for ForkStateGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(snapshot) = self.snapshot.take() {
-            snapshot.restore(self.state);
-        }
-    }
-}
-
-fn materialize_prepared_fork_restore(
+fn materialize_prepared_session_history(
     mgr: astra_turn_core::conversation_log::manager::CslManager,
     mat: Option<astra_turn_core::conversation_log::MaterializedState>,
     restored_journal: session_runtime::RestoredJournalState,
     session_id: &str,
-) -> PreparedForkRestore {
+) -> PreparedSessionHistory {
     let has_csl_materialization = mat.is_some();
     let mut history = crate::cli::history_work::clone_pair_history(
-        astra_core::history_work::HistoryWorkSite::CliSlashForkJournalHistoryClone,
+        astra_core::history_work::HistoryWorkSite::CliSessionRestoreJournalHistoryClone,
         &restored_journal.session.history,
     );
     let mut recent_tools = restored_journal.session.recent_tools.clone();
@@ -5205,7 +5137,7 @@ fn materialize_prepared_fork_restore(
     if let Some(ref materialized) = mat {
         let canonical_messages = session_continuation::sanitize_continuation_messages(
             session_continuation::materialize_cli_continuation_messages(
-                astra_core::history_work::HistoryWorkSite::CliSlashForkCanonicalHistoryClone,
+                astra_core::history_work::HistoryWorkSite::CliSessionRestoreCanonicalHistoryClone,
                 &materialized.messages,
             ),
         );
@@ -5230,39 +5162,17 @@ fn materialize_prepared_fork_restore(
                 .clone(),
         );
     }
-    PreparedForkRestore {
+    PreparedSessionHistory {
         history,
         active_conversation,
         resume: None,
         recent_tools,
         activated_deferred_tool_names,
         csl_manager: has_csl_materialization.then_some(mgr),
-        journal_state: restored_journal.session,
-        last_turn_event: restored_journal.last_turn_event,
     }
 }
 
-fn prepared_fork_restore_from_restored_journal(
-    restored_journal: session_runtime::RestoredJournalState,
-) -> PreparedForkRestore {
-    PreparedForkRestore {
-        history: crate::cli::history_work::clone_pair_history(
-            astra_core::history_work::HistoryWorkSite::CliSlashForkJournalHistoryClone,
-            &restored_journal.session.history,
-        ),
-        active_conversation: None,
-        resume: None,
-        recent_tools: restored_journal.session.recent_tools.clone(),
-        activated_deferred_tool_names: Vec::new(),
-        csl_manager: None,
-        journal_state: restored_journal.session,
-        last_turn_event: restored_journal.last_turn_event,
-    }
-}
-
-async fn prepared_fork_restore_from_journal(
-    session_id: &str,
-) -> Result<PreparedForkRestore, String> {
+async fn prepare_session_history(session_id: &str) -> Result<PreparedSessionHistory, String> {
     let restored_journal = session_runtime::restored_journal_state(session_id)?;
     // Try CSL first — full-fidelity message history via CslManager.
     let base_dir = session_journal::local_owner_sessions_dir();
@@ -5277,7 +5187,7 @@ async fn prepared_fork_restore_from_journal(
     .map_err(|e| format!("initialize CSL state for session {session_id}: {e}"))?;
     let mut prepared = match mgr.load().await {
         Ok(materialized) => {
-            materialize_prepared_fork_restore(mgr, materialized, restored_journal, session_id)
+            materialize_prepared_session_history(mgr, materialized, restored_journal, session_id)
         }
         Err(e) => {
             return Err(format!("load CSL state for session {session_id}: {e}"));
@@ -5301,227 +5211,11 @@ async fn prepared_fork_restore_from_journal(
     Ok(prepared)
 }
 
-async fn load_prepared_fork_restore(
-    parent_id: &str,
-    new_sid: &str,
-    forked_at_turn: u32,
-) -> Result<PreparedForkRestore, String> {
-    let restored_journal = session_runtime::restored_journal_state(new_sid)?;
-    if !restored_journal.exists {
-        return Err(format!(
-            "missing session journal for forked child {new_sid}"
-        ));
-    }
-    astra_services::session_fork::verify_local_fork_basis(parent_id, new_sid, forked_at_turn)
-        .map_err(|error| format!("verify forked child basis before activation: {error}"))?;
-    let base_dir = session_journal::local_owner_sessions_dir();
-    let store = std::sync::Arc::new(
-        astra_turn_core::conversation_log::file_store::FileCslStore::new(base_dir),
-    );
-    match astra_turn_core::conversation_log::manager::CslManager::new(
-        store,
-        parent_id.to_string(),
-        Default::default(),
-    ) {
-        Ok(parent_mgr) => match parent_mgr.fork(new_sid, forked_at_turn).await {
-            Ok((child_mgr, child_mat)) => Ok(materialize_prepared_fork_restore(
-                child_mgr,
-                child_mat,
-                restored_journal,
-                new_sid,
-            )),
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "CSL fork failed, child will use journal fallback"
-                );
-                Ok(prepared_fork_restore_from_restored_journal(
-                    restored_journal,
-                ))
-            }
-        },
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "CSL manager creation failed, child will use journal fallback"
-            );
-            Ok(prepared_fork_restore_from_restored_journal(
-                restored_journal,
-            ))
-        }
-    }
-}
-
-async fn apply_prepared_fork_restore(
-    state: &mut SessionState,
-    parent_id: &str,
-    new_sid: &str,
-    restored_child: PreparedForkRestore,
-    cloud_task_board_copy: Option<CloudTaskBoardCopy>,
-) -> Result<ForkTaskBoardRestore, String> {
-    let task_restore_plan = if state.task_notify_tx.is_none() {
-        let store = state.task_manager.store();
-        let child_snapshot = store.load_snapshot_state(new_sid).await.map_err(|error| {
-            format!("load existing task board for forked child {new_sid}: {error}")
-        })?;
-        if child_snapshot.tasks.is_empty() {
-            let parent_snapshot = store
-                .load_snapshot_state(parent_id)
-                .await
-                .map_err(|error| {
-                    format!("load parent task board for forked child {new_sid}: {error}")
-                })?;
-            let mut snapshot = astra_tools::task_mgmt::TaskManagerSnapshot {
-                tasks: parent_snapshot.tasks,
-                next_task_id: parent_snapshot.next_task_id,
-                version: child_snapshot.version,
-                restore_version: Some(child_snapshot.version),
-            };
-            snapshot = astra_tools::task_mgmt::prepare_task_snapshot_for_fork(snapshot);
-            Some(snapshot)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let preserved_existing_child = state.task_notify_tx.is_none() && task_restore_plan.is_none();
-    let cloud_task_board_restore = if state.task_notify_tx.is_some() {
-        let copy = cloud_task_board_copy.ok_or_else(|| {
-            "cloud task board fork copy is unavailable: missing cloud endpoint configuration"
-                .to_string()
-        })?;
-        let status = crate::cli::session::session_todo_client::copy_todos_for_fork(
-            &copy.cloud_base,
-            copy.token.as_deref(),
-            parent_id,
-            new_sid,
-        )
-        .await?;
-        match status {
-            crate::cli::session::session_todo_client::ForkTaskBoardCopyStatus::Copied => {
-                Some(ForkTaskBoardRestore::Copied)
-            }
-            crate::cli::session::session_todo_client::ForkTaskBoardCopyStatus::PreservedExistingChild => {
-                Some(ForkTaskBoardRestore::PreservedExistingChild)
-            }
-        }
-    } else {
-        None
-    };
-
-    state.set_session_id(new_sid.to_string());
-    session_startup::initialize_journal_pub(state, new_sid);
-    state.turn = restored_child.journal_state.turn;
-    state.total_prompt_tokens = restored_child.journal_state.total_prompt_tokens;
-    state.total_completion_tokens = restored_child.journal_state.total_completion_tokens;
-    state.total_cache_read_tokens = restored_child.journal_state.total_cache_read_tokens;
-    state.total_cache_creation_tokens = restored_child.journal_state.total_cache_creation_tokens;
-    state.last_turn_event = restored_child.last_turn_event;
-    state.run_id = None;
-    state.history = restored_child.history;
-    state.active_conversation = restored_child.active_conversation;
-    state.recent_tools = restored_child.recent_tools;
-    state.activated_deferred_tool_names = restored_child.activated_deferred_tool_names;
-    state.csl_manager = restored_child.csl_manager;
-    state.last_response = state.history.last().map(|(_, resp)| resp.clone());
-    state.continuation_anchor = None;
-    state.turns_since_task_use = 0;
-    state.turns_since_task_reminder = 0;
-    let task_board_restore = if let Some(task_snapshot) = task_restore_plan {
-        state.task_manager.restore_snapshot(&task_snapshot).await?;
-        ForkTaskBoardRestore::Copied
-    } else if let Some(task_board_restore) = cloud_task_board_restore {
-        task_board_restore
-    } else if preserved_existing_child {
-        ForkTaskBoardRestore::PreservedExistingChild
-    } else {
-        ForkTaskBoardRestore::Copied
-    };
-    Ok(task_board_restore)
-}
-
-/// Result of one transactional local-session fork. The caller owns
-/// presentation; this operation owns durable history, task-board, and runtime
-/// state restoration so TUI and line-mode commands cannot drift.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ForkSessionOutcome {
-    pub new_session_id: String,
-    pub events_copied: usize,
-    pub preserved_existing_child_task_board: bool,
-}
-
-/// Fork `parent_id` and atomically move the active runtime state to the child.
-/// Any error before `commit` drops the guard and restores the original state.
-pub(crate) async fn fork_session_into_state(
-    parent_id: &str,
-    label: Option<String>,
-    api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
-    state: &mut SessionState,
-) -> Result<ForkSessionOutcome, String> {
-    let fork = fork_local_session(ForkSessionOptions {
-        parent_session_id: parent_id.to_string(),
-        new_session_id: None,
-        label,
-        forked_after_turn: None,
-        data_branch: None,
-        snapshot_spec: None,
-    })?;
-    let new_session_id = fork.new_session_id;
-    let restored_child =
-        load_prepared_fork_restore(parent_id, &new_session_id, fork.forked_at_turn).await?;
-
-    let mut fork_guard = ForkStateGuard::new(state);
-    let cloud_task_board_copy =
-        fork_guard
-            .state()
-            .task_notify_tx
-            .as_ref()
-            .map(|_| CloudTaskBoardCopy {
-                cloud_base: api.api_origin(),
-                token: session_runtime::current_access_token(profile),
-            });
-    let task_board_restore = apply_prepared_fork_restore(
-        fork_guard.state(),
-        parent_id,
-        &new_session_id,
-        restored_child,
-        cloud_task_board_copy,
-    )
-    .await?;
-    if let Err(error) =
-        crate::cli::session::session_recovery::sync_recovery_snapshot_after_history_edit(
-            fork_guard.state(),
-        )
-        .await
-    {
-        if error.rollback_failed {
-            fork_guard.state().session_persistence_error = Some(error.message.clone());
-        }
-        return Err(error.message);
-    }
-    persist_profile_last_session_or_warn(
-        profile,
-        &new_session_id,
-        "slash_session:fork_new_session_id",
-    );
-
-    let outcome = ForkSessionOutcome {
-        new_session_id,
-        events_copied: fork.events_copied,
-        preserved_existing_child_task_board: task_board_restore
-            == ForkTaskBoardRestore::PreservedExistingChild,
-    };
-    fork_guard.commit();
-    Ok(outcome)
-}
-
 async fn restore_journal_history_if_available(
     state: &mut SessionState,
     session_id: &str,
 ) -> Result<(), String> {
-    let restored = prepared_fork_restore_from_journal(session_id).await?;
+    let restored = prepare_session_history(session_id).await?;
     if restored.history.len() > state.history.len() || state.history.is_empty() {
         state.history = restored.history;
     }
@@ -5541,44 +5235,14 @@ async fn apply_restored_session(
     state: &mut SessionState,
     mut restored: RestoredSession,
 ) -> Result<(), String> {
-    let had_versioned_resume_bundle = restored.resume_bundle.is_some();
-    let resume_bundle = restored.resume_bundle.take().or_else(|| {
-        let messages = session_continuation::sanitize_continuation_messages(std::mem::take(
-            &mut restored.conversation_messages,
-        ));
-        if messages.is_empty() {
-            return None;
-        }
-        let cursor = astra_turn_types::legacy_resume_cursor(
-            &crate::cli::cli_config::cli_utils::cli_user_id(),
-            &restored.session_id,
-            restored.turn_count,
-            &messages,
-        );
-        astra_turn_types::select_resume_bundle(
-            None,
-            [astra_turn_types::ResumeCandidateV1 {
-                source: astra_turn_types::ResumeSourceV1::Checkpoint,
-                cursor,
-                conversation_messages: messages,
-                materialized_conversation_root_hash: None,
-                degraded_reasons: vec![
-                    astra_turn_types::ResumeDegradedReasonV1::LegacyCursorUnknown,
-                    astra_turn_types::ResumeDegradedReasonV1::ProjectionCursorMissing,
-                    astra_turn_types::ResumeDegradedReasonV1::CheckpointFallback,
-                ],
-                repair_actions: vec![
-                    astra_turn_types::ResumeRepairActionV1::InspectCanonicalJournal,
-                    astra_turn_types::ResumeRepairActionV1::RebuildProjectionFromJournal,
-                ],
-                projections: Default::default(),
-            }],
-        )
-        .ok()
-    });
+    let resume_bundle = restored.resume_bundle.take();
+    if restored.restored_from_cloud && resume_bundle.is_none() {
+        return Err("cloud restore omitted required versioned ResumeBundle".to_string());
+    }
+    let had_resume_bundle = resume_bundle.is_some();
     let typed_continuation =
         resume_bundle.and_then(session_continuation::continuation_from_resume_bundle);
-    if had_versioned_resume_bundle && typed_continuation.is_none() {
+    if had_resume_bundle && typed_continuation.is_none() {
         return Err("restored ResumeBundle failed causal validation".to_string());
     }
     let local_journal = session_runtime::restored_journal_state(&restored.session_id)?;
@@ -5596,7 +5260,7 @@ async fn apply_restored_session(
         .total_cache_creation_tokens
         .max(local_state.total_cache_creation_tokens);
     let prepared_workspace = load_prepared_workspace_restore(&restored)?;
-    let prepared_history = prepared_fork_restore_from_journal(&restored.session_id).await?;
+    let prepared_history = prepare_session_history(&restored.session_id).await?;
     let use_typed_continuation = match (
         prepared_history.resume.as_ref(),
         typed_continuation.as_ref(),
@@ -5623,17 +5287,7 @@ async fn apply_restored_session(
             .as_ref()
             .map(|resume| resume.cursor.clone())
     };
-    // Local-only legacy metadata did not carry a cursor envelope. It remains
-    // admissible only when the local canonical journal proves that it was
-    // persisted at the exact same completed-turn boundary. A remote,
-    // checkpoint, or differently versioned projection must still lose all
-    // turn-sensitive controls when the local canonical generation wins.
-    let exact_local_legacy_projection = !restored.restored_from_cloud
-        && typed_continuation.is_none()
-        && prepared_history.journal_state.turn == restored.turn_count;
-    let use_restored_projection = use_typed_continuation
-        || prepared_history.resume.is_none()
-        || exact_local_legacy_projection;
+    let use_restored_projection = use_typed_continuation;
     if !use_restored_projection {
         // The local canonical generation won causal selection. Do not retain
         // independently persisted cloud/checkpoint controls from a different
@@ -5645,11 +5299,6 @@ async fn apply_restored_session(
         restored.interruption = None;
         restored.compaction_state = None;
         restored.pipeline_state = None;
-        restored.executing_plan_json = None;
-        restored.plan_goal = None;
-        restored.plan_config_json = None;
-        restored.plan_execution_rounds = 0;
-        restored.contract_json = None;
         restored.model = None;
         restored.permission_mode = None;
     }
@@ -5662,7 +5311,7 @@ async fn apply_restored_session(
     } else if let Some(active) = prepared_history.active_conversation.as_ref() {
         active.messages()
     } else {
-        restored.conversation_messages.as_slice()
+        &[]
     };
     let mut restored_activation = if use_restored_projection {
         restored.activated_deferred_tool_names.clone()
@@ -5677,7 +5326,6 @@ async fn apply_restored_session(
         .map(str::to_string)
         .unwrap_or_else(crate::cli::cli_config::cli_utils::cli_user_id);
 
-    let mut step_restore_error = None;
     let local_checkpoint_is_admissible = match selected_cursor.as_ref() {
         None => true,
         Some(selected) => {
@@ -5702,7 +5350,8 @@ async fn apply_restored_session(
             }
         }
     };
-    // Try new crash recovery state machine first; fall back to legacy restore
+    // Crash recovery has one current state-machine protocol. Missing crash
+    // state means there is nothing to replay; malformed state fails closed.
     let step_restored = if !local_checkpoint_is_admissible {
         tracing::warn!(
             session_id = %restored.session_id,
@@ -5802,42 +5451,12 @@ async fn apply_restored_session(
                     }
                 }
             }
-            Ok(None) => {
-                // No crash detected — use legacy restore
-                match astra_pipeline::step_restore::restore_session(&user_id, &restored.session_id)
-                {
-                    Ok(r) => r,
-                    Err(astra_pipeline::step_restore::RestoreError::IoError(error)) => {
-                        return Err(format!(
-                            "Failed to read local step checkpoint for user_id={} session_id={}: {}",
-                            user_id, restored.session_id, error
-                        ));
-                    }
-                    Err(error) => {
-                        step_restore_error = Some(error.to_string());
-                        None
-                    }
-                }
-            }
-            Err(cr_err) => {
-                tracing::warn!(
-                    error = %cr_err,
-                    "crash recovery state machine failed, falling back to legacy restore"
-                );
-                match astra_pipeline::step_restore::restore_session(&user_id, &restored.session_id)
-                {
-                    Ok(r) => r,
-                    Err(astra_pipeline::step_restore::RestoreError::IoError(error)) => {
-                        return Err(format!(
-                            "Failed to read local step checkpoint for user_id={} session_id={}: {}",
-                            user_id, restored.session_id, error
-                        ));
-                    }
-                    Err(error) => {
-                        step_restore_error = Some(error.to_string());
-                        None
-                    }
-                }
+            Ok(None) => None,
+            Err(error) => {
+                return Err(format!(
+                    "Crash recovery failed for user_id={} session_id={}: {}",
+                    user_id, restored.session_id, error
+                ));
             }
         }
     };
@@ -5885,22 +5504,6 @@ async fn apply_restored_session(
                 .cloned(),
         );
     }
-    if step_restore_error.is_some()
-        && !has_cloud_heavy_fallback
-        && selected_cursor.is_none()
-        && let Some(error) = step_restore_error.as_ref()
-    {
-        return Err(format!(
-            "Failed to restore local step checkpoint for user_id={} session_id={}: {}",
-            user_id, restored.session_id, error
-        ));
-    }
-    if let Some(error) = step_restore_error.as_ref() {
-        tracing::warn!(
-            error = %error,
-            "local step checkpoint restore failed; continuing with fallback state"
-        );
-    }
     let session_memory = super::slash_memory::load_current_session_memory_body_with_profile(
         api,
         profile,
@@ -5930,6 +5533,8 @@ async fn apply_restored_session(
 
     if let Some(step_restored) = step_restored {
         let summary = astra_pipeline::step_restore::restore_summary(&step_restored);
+        state.workspace_observation_quarantine =
+            step_restored.workspace_observation_quarantine.clone();
         for tool in &step_restored.blocked_tools {
             if !state.tool_health_entries.iter().any(|e| e.name == *tool) {
                 state
@@ -6027,7 +5632,7 @@ async fn apply_restored_session(
         restored_activation,
     );
     session_projection::seed_continuation_objective_from_messages(state, canonical_resume_messages);
-    session_projection::rebuild_continuation_anchor_from_live_state(state).await;
+    session_projection::rebuild_continuation_anchor_from_live_state(state);
     state.continuation_anchor = session_projection::merge_continuation_anchor_with_session_memory(
         state.continuation_anchor.take(),
         session_memory.as_deref(),
@@ -6056,63 +5661,6 @@ async fn apply_restored_session(
         state.resume_guidance.take(),
     );
 
-    if let Some(ref json) = restored.executing_plan_json {
-        state.executing_plan = serde_json::from_str(json).ok();
-    }
-    if let Some(ref goal) = restored.plan_goal {
-        state.executing_plan_goal = Some(goal.clone());
-        session_startup::steer_observability_goal(state, goal);
-    }
-    if let Some(ref json) = restored.plan_config_json {
-        state.plan_execution_config = serde_json::from_str(json).ok();
-    }
-    state.plan_execution_rounds = restored.plan_execution_rounds;
-    state.plan_execution_corrections = restored.plan_corrections.clone();
-
-    if let Some(ref json) = restored.contract_json
-        && let Ok(contract) = serde_json::from_str::<astra_services::TaskContract>(json)
-    {
-        let work_dir = std::env::current_dir().unwrap_or_default();
-        // Verification judge runs server-side via server_proxy_judge; the server resolves
-        // the reasoning Offering via reasoning_offering_id → governed default
-        // fallback. No local cloud judge.
-        let cloud_judge: Option<std::sync::Arc<dyn astra_services::LlmJudge>> = None;
-        let server_proxy_judge: Option<std::sync::Arc<dyn astra_services::LlmJudge>> =
-            match get_profile_and_token(profile) {
-                Ok((_, _, _, token)) => Some(std::sync::Arc::new(
-                    durable_bridge::ServerProxyLlmJudge::new(
-                        api.clone(),
-                        token,
-                        astra_turn_types::InferenceInvocationScope::Session {
-                            session_id: restored.session_id.clone(),
-                            turn: state.turn,
-                            round: 0,
-                            operation_id: "plan_verification".to_string(),
-                            logical_attempt: 0,
-                        },
-                    ),
-                )),
-                Err(_) => None,
-            };
-
-        let session_dir =
-            astra_services::session_workspace::workspace_dir_for(&restored.session_id);
-        let lifecycle = durable_bridge::create_local_lifecycle_full(
-            &session_dir,
-            &work_dir,
-            None,
-            Some(&restored.session_id),
-            state.ingestion_user_id.as_deref(),
-            cloud_judge,
-            server_proxy_judge,
-        );
-        state.durable_task_state = Some(durable_bridge::DurableTaskState {
-            contract,
-            lifecycle,
-            last_report: None,
-        });
-    }
-
     session_startup::initialize_journal_pub(state, &restored.session_id);
     persist_profile_last_session_or_warn(
         profile,
@@ -6137,27 +5685,6 @@ async fn apply_restored_session(
         if !preview.is_empty() {
             eprintln!("    {} {}", "Last trace:".dim(), preview.dim());
         }
-    }
-
-    if let Some(ref plan) = state.executing_plan {
-        let done = plan.items_done();
-        let total = plan.subtasks.len();
-        let pct = plan.progress_pct();
-        eprintln!(
-            "  {} Paused plan restored: {}/{} subtasks done ({}%)",
-            "📋".magenta(),
-            done,
-            total,
-            pct,
-        );
-        if let Some(ref goal) = state.executing_plan_goal {
-            eprintln!("    {} {}", "Goal:".dim(), goal.as_str().dim());
-        }
-        eprintln!(
-            "    {}",
-            "Paused plan restored. Inspect or edit it with slash commands; use correct … / rewind N to adjust; any other line abandons it."
-                .dim()
-        );
     }
 
     Ok(())
@@ -6241,7 +5768,6 @@ pub(crate) async fn handle_resume_command(
             source: String,
             workspace_error: bool,
             persistence_error: Option<String>,
-            has_plan: bool,
             age: String,
         }
 
@@ -6301,8 +5827,6 @@ pub(crate) async fn handle_resume_command(
                     .badge()
                     .to_string();
 
-            let has_plan = ws.as_ref().is_some_and(|w| w.executing_plan_json.is_some());
-
             // Age: from workspace or journal timestamp
             let age = ws
                 .as_ref()
@@ -6333,7 +5857,6 @@ pub(crate) async fn handle_resume_command(
                 source,
                 workspace_error,
                 persistence_error,
-                has_plan,
                 age,
             });
         }
@@ -6350,7 +5873,7 @@ pub(crate) async fn handle_resume_command(
                 .or(s.first_prompt.as_deref())
                 .unwrap_or("(no prompt)");
             let display_truncated: String = display_text.chars().take(60).collect();
-            let plan_badge = if s.has_plan { " 📋" } else { "" };
+            let plan_badge = "";
             eprintln!(
                 "  {}  {}{}  {}",
                 format!("[{}]", s.idx).magenta().bold(),
@@ -6556,15 +6079,6 @@ pub(crate) async fn handle_resume_command(
             );
         }
 
-        // Plan status
-        if let Some(ref w) = ws {
-            if w.plan_goal.is_some() {
-                let goal = w.plan_goal.as_deref().unwrap_or("");
-                let goal_short: String = goal.chars().take(50).collect();
-                eprintln!("  {:<14} 📋 {}", "plan:".dim(), goal_short.yellow());
-            }
-        }
-
         eprintln!();
 
         // Confirm
@@ -6592,56 +6106,24 @@ pub(crate) async fn handle_resume_command(
 #[cfg(test)]
 mod resume_tests {
     use super::{
-        ForkStateGuard, ForkStateSnapshot, ForkTaskBoardRestore, PreparedForkRestore,
         SessionListFilterOptions, SessionListFilterOutcome, apply_heavy_checkpoint_fallback,
-        apply_prepared_fork_restore, apply_restored_session, apply_resume_recovery_state,
-        build_session_list_entries, build_step_resume_guidance, filter_session_list_entries,
-        load_prepared_fork_restore, load_resumable_session_candidates,
+        apply_restored_session, apply_resume_recovery_state, build_session_list_entries,
+        build_step_resume_guidance, filter_session_list_entries, load_resumable_session_candidates,
         restore_journal_history_if_available, restore_session_into_state,
-        resume_persistence_warning, session_restore_client, session_runtime, session_startup,
-        switch_session_into_state, workspace_summary_line,
+        resume_persistence_warning, session_restore_client, switch_session_into_state,
+        workspace_summary_line,
     };
     use crate::cli::permission_manager::PermissionMode;
-    use crate::cli::session::session_state::{ContinuationAnchor, SessionState};
+    use crate::cli::session::session_state::SessionState;
     use astra_services::session_journal::{self, JournalDirGuard};
     use astra_services::session_restore::RestoredSession;
     use astra_services::session_workspace;
-    use astra_tools::task_mgmt::{SessionTask, TaskMutation, TaskStore};
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     struct EnvGuard {
         key: &'static str,
         old: Option<String>,
-    }
-
-    struct FailingLoadTaskStore;
-
-    #[async_trait::async_trait]
-    impl TaskStore for FailingLoadTaskStore {
-        async fn load(&self, session_id: &str) -> Result<Vec<SessionTask>, String> {
-            Err(format!("forced load failure for {session_id}"))
-        }
-
-        async fn save(&self, _session_id: &str, _tasks: Vec<SessionTask>) -> Result<(), String> {
-            Ok(())
-        }
-
-        async fn mutate(
-            &self,
-            session_id: &str,
-            _mutation: TaskMutation,
-        ) -> Result<astra_tools::task_mgmt::TaskMutationOutcome, String> {
-            Err(format!("forced mutate failure for {session_id}"))
-        }
-
-        async fn next_task_id(&self, session_id: &str) -> Result<u32, String> {
-            Err(format!("forced next id failure for {session_id}"))
-        }
-
-        async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
-            Ok(1)
-        }
     }
 
     impl EnvGuard {
@@ -6815,67 +6297,6 @@ mod resume_tests {
         .unwrap();
     }
 
-    fn write_workspace_lifecycle_state(session_id: &str) {
-        let mut ws = astra_services::session_workspace::read_workspace(session_id).unwrap();
-        let executing_plan = astra_services::task_orchestrator::TaskPlan {
-            subtasks: vec![
-                astra_services::task_orchestrator::SubtaskPlan {
-                    id: "plan-1".into(),
-                    title: "Capture restore summary".into(),
-                    status: astra_services::task_orchestrator::TaskStatus::Completed,
-                    ..Default::default()
-                },
-                astra_services::task_orchestrator::SubtaskPlan {
-                    id: "plan-2".into(),
-                    title: "Verify lifecycle state".into(),
-                    status: astra_services::task_orchestrator::TaskStatus::InProgress,
-                    ..Default::default()
-                },
-                astra_services::task_orchestrator::SubtaskPlan {
-                    id: "plan-3".into(),
-                    title: "Close recovery loop".into(),
-                    status: astra_services::task_orchestrator::TaskStatus::Pending,
-                    ..Default::default()
-                },
-            ],
-            notes: None,
-        };
-        let contract = astra_services::durable_task::TaskContract {
-            contract_id: "contract-restore".into(),
-            task_id: "task-restore".into(),
-            goal: "Ship lifecycle UX".into(),
-            scope: astra_services::durable_task::TaskScope::default(),
-            subtasks: vec![
-                astra_services::durable_task::DurableSubtask {
-                    id: "verify-1".into(),
-                    title: "Capture restore summary".into(),
-                    stage: astra_services::durable_task::SubtaskStage::Completed,
-                    ..Default::default()
-                },
-                astra_services::durable_task::DurableSubtask {
-                    id: "verify-2".into(),
-                    title: "Verify restore contract".into(),
-                    stage: astra_services::durable_task::SubtaskStage::AwaitingVerification,
-                    ..Default::default()
-                },
-            ],
-            global_verification: Vec::new(),
-            version: 1,
-            status: astra_services::durable_task::ContractStatus::Active,
-            created_at: "now".into(),
-            updated_at: "now".into(),
-            domain_hint: None,
-            task_type: None,
-            last_global_results: Vec::new(),
-        };
-        ws.executing_plan_json = Some(serde_json::to_string(&executing_plan).unwrap());
-        ws.plan_goal = Some("Ship lifecycle UX".into());
-        ws.plan_execution_rounds = 4;
-        ws.plan_corrections = vec!["tighten resume messaging".into()];
-        ws.contract_json = Some(serde_json::to_string(&contract).unwrap());
-        astra_services::session_workspace::write_workspace(&ws).unwrap();
-    }
-
     fn write_profile_with_token(session_id: &str) {
         let mut creds = crate::cli::cli_config::cli_utils::CredentialsFile::default();
         creds.profiles.insert(
@@ -6899,6 +6320,7 @@ mod resume_tests {
             &mut event_store,
             astra_pipeline::step_protocol::StepEvent {
                 event_id: format!("completed-read-{turn_count}"),
+                run_id: format!("local-{session_id}-{turn_count}"),
                 canonical_event_id: None,
                 step_id: format!("step-{turn_count}"),
                 event_type: astra_pipeline::step_protocol::StepEventType::ToolCallCompleted,
@@ -7552,58 +6974,6 @@ mod resume_tests {
         assert!(error.contains("failed to read session journal"), "{error}");
         assert!(!error.contains("not found or not owned"), "{error}");
     }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn load_prepared_fork_restore_requires_existing_child_journal() {
-        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
-
-        let error =
-            match load_prepared_fork_restore("parent-session", "missing-child-session", 1).await {
-                Ok(_) => panic!("missing child journal should abort fork restore"),
-                Err(error) => error,
-            };
-
-        assert!(error.contains("missing session journal"), "{error}");
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn load_prepared_fork_restore_verifies_the_service_owned_fork_basis() {
-        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
-        let parent_id = format!("fork-parent-{}", uuid::Uuid::new_v4());
-        let child_id = format!("fork-child-{}", uuid::Uuid::new_v4());
-        write_local_resumable_session(&parent_id, 1);
-        let fork = astra_services::fork_local_session(astra_services::ForkSessionOptions {
-            parent_session_id: parent_id.clone(),
-            new_session_id: Some(child_id.clone()),
-            label: None,
-            forked_after_turn: Some(1),
-            data_branch: None,
-            snapshot_spec: None,
-        })
-        .expect("service creates and verifies the child fork basis");
-
-        load_prepared_fork_restore(&parent_id, &child_id, fork.forked_at_turn)
-            .await
-            .expect("CLI accepts a child whose active state matches its immutable basis");
-
-        std::fs::write(
-            session_workspace::workspace_dir_for(&child_id)
-                .join("fork-basis-v1")
-                .join("workspace.yaml"),
-            b"tampered",
-        )
-        .unwrap();
-        let error =
-            match load_prepared_fork_restore(&parent_id, &child_id, fork.forked_at_turn).await {
-                Ok(_) => panic!("CLI must reject tampered fork basis before activation"),
-                Err(error) => error,
-            };
-        assert!(error.contains("content does not match"), "{error}");
-    }
-
-    #[serial_test::serial]
     #[tokio::test]
     async fn apply_restored_session_uses_cloud_fallback_when_local_step_checkpoint_is_invalid() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
@@ -8187,19 +7557,6 @@ mod resume_tests {
             ..Default::default()
         };
         state.set_session_id("current-session");
-        let old_created = state
-            .task_manager
-            .create(&serde_json::json!({"title": "old session task"}))
-            .await;
-        assert!(old_created.contains("created"), "{old_created}");
-        let restored_task_manager = astra_tools::task_mgmt::TaskManager::new(
-            session_id.clone(),
-            state.task_manager.store(),
-        );
-        let restored_created = restored_task_manager
-            .create(&serde_json::json!({"title": "restored session task"}))
-            .await;
-        assert!(restored_created.contains("created"), "{restored_created}");
 
         switch_session_into_state(&session_id, None, &api, &mut state)
             .await
@@ -8220,18 +7577,6 @@ mod resume_tests {
         assert!(
             state.journal.is_some(),
             "switch should initialize a journal"
-        );
-        let task_list = state
-            .task_manager
-            .list(&serde_json::json!({"status_filter": "all"}))
-            .await;
-        assert!(
-            task_list.contains("restored session task"),
-            "switch must rebind task manager to restored session: {task_list}"
-        );
-        assert!(
-            !task_list.contains("old session task"),
-            "switch must not leave task manager bound to old session: {task_list}"
         );
     }
 
@@ -8580,768 +7925,5 @@ mod resume_tests {
         assert_eq!(state.session_id.as_deref(), Some("current-session"));
         assert_eq!(state.model.as_deref(), Some("gpt-4o"));
         assert_eq!(state.perm_manager.mode(), PermissionMode::Auto);
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn restore_session_into_state_surfaces_interrupted_plan_and_durable_lifecycle_summary() {
-        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
-        let _creds_guard = crate::tests::isolate_credentials();
-        let session_id = format!("resume-lifecycle-{}", uuid::Uuid::new_v4());
-        write_local_resumable_session(&session_id, 2);
-        write_local_step_checkpoint_with_interruption(&session_id, 2);
-        write_workspace_lifecycle_state(&session_id);
-        write_profile_with_token(&session_id);
-
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path(format!("/sessions/{session_id}")))
-            .and(header_exists("authorization"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "session_id": session_id,
-                "status": "active"
-            })))
-            .mount(&server)
-            .await;
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
-
-        let mut state = SessionState::default();
-        restore_session_into_state(&session_id, None, &api, &mut state)
-            .await
-            .unwrap();
-
-        assert!(state.last_turn_interrupted);
-        assert!(state.resume_guidance.is_some());
-        assert_eq!(
-            state.executing_plan_goal.as_deref(),
-            Some("Ship lifecycle UX")
-        );
-        assert_eq!(state.plan_execution_rounds, 4);
-        assert_eq!(
-            state.plan_execution_corrections,
-            vec!["tighten resume messaging"]
-        );
-        assert!(state.durable_task_state.is_some());
-
-        let summary =
-            crate::cli::execution_state_summary::format_for_session_state(&state).unwrap();
-        assert!(summary.contains("turn state: last turn was interrupted"));
-        assert!(summary.contains("plan execution: goal=\"Ship lifecycle UX\""));
-        assert!(summary.contains("in_progress=\"Verify lifecycle state\""));
-        assert!(summary.contains("rounds=4"));
-        assert!(summary.contains("corrections=1"));
-        assert!(summary.contains("durable verification: status=active"));
-        assert!(summary.contains("verified=1/2"));
-        assert!(summary.contains("subtask=\"Verify restore contract\""));
-        assert!(summary.contains("stage=awaiting_verification"));
-    }
-
-    // ── Fork CSL integration tests ──────────────────────────────────────
-
-    #[tokio::test]
-    async fn session_fork_creates_child_csl_snapshot() {
-        use astra_turn_core::conversation_log::{
-            AppendMeta, CslEntry, CslStore, SessionStateCompact, file_store::FileCslStore,
-            manager::CslManager,
-        };
-        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
-        let parent_id = format!("fork-parent-{}", uuid::Uuid::new_v4());
-        let child_id = format!("fork-child-{}", uuid::Uuid::new_v4());
-
-        let base_dir = session_journal::local_owner_sessions_dir();
-        let store = std::sync::Arc::new(FileCslStore::new(base_dir));
-
-        // Write a 2-turn parent CSL.
-        let snapshot = CslEntry::Snapshot {
-            seq: 1,
-            turn: 1,
-            messages: vec![
-                serde_json::json!({"role": "user", "content": "hello"}),
-                serde_json::json!({"role": "assistant", "content": "hi"}),
-            ],
-            session_state: SessionStateCompact {
-                recent_tools: vec!["bash".into()],
-                ..Default::default()
-            },
-        };
-        store
-            .append(&parent_id, &snapshot, &AppendMeta::default())
-            .await
-            .unwrap();
-
-        let delta = CslEntry::TurnDelta {
-            seq: 2,
-            turn: 2,
-            appended: vec![
-                serde_json::json!({"role": "user", "content": "next"}),
-                serde_json::json!({"role": "assistant", "content": "ok"}),
-            ],
-            state_patch: None,
-        };
-        store
-            .append(&parent_id, &delta, &AppendMeta::default())
-            .await
-            .unwrap();
-
-        // Fork parent → child at turn 2.
-        let parent_mgr =
-            CslManager::new(store.clone(), parent_id.clone(), Default::default()).unwrap();
-        let (child_mgr, child_mat) = parent_mgr.fork(&child_id, 2).await.unwrap();
-
-        // Child should have last_seq=1, last_turn=2.
-        assert_eq!(child_mgr.last_seq(), 1);
-        assert_eq!(child_mgr.last_turn(), 2);
-
-        // fork() returns MaterializedState directly — no need for double load.
-        let mat = child_mat.expect("child should have CSL data");
-        assert_eq!(mat.messages.len(), 4);
-        assert_eq!(mat.messages[0]["content"], "hello");
-        assert_eq!(mat.messages[3]["content"], "ok");
-    }
-
-    #[tokio::test]
-    async fn session_fork_child_resume_uses_csl() {
-        use astra_turn_core::conversation_log::{
-            AppendMeta, CslEntry, CslStore, SessionStateCompact, file_store::FileCslStore,
-            manager::CslManager,
-        };
-        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
-        let parent_id = format!("fork-resume-parent-{}", uuid::Uuid::new_v4());
-        let child_id = format!("fork-resume-child-{}", uuid::Uuid::new_v4());
-
-        let base_dir = session_journal::local_owner_sessions_dir();
-        let store = std::sync::Arc::new(FileCslStore::new(base_dir));
-
-        let snapshot = CslEntry::Snapshot {
-            seq: 1,
-            turn: 1,
-            messages: vec![
-                serde_json::json!({"role": "user", "content": "q1"}),
-                serde_json::json!({"role": "assistant", "content": "a1"}),
-            ],
-            session_state: SessionStateCompact {
-                recent_tools: vec!["read_file".into()],
-                activated_deferred_tool_names: vec!["write_file".into()],
-                ..Default::default()
-            },
-        };
-        store
-            .append(&parent_id, &snapshot, &AppendMeta::default())
-            .await
-            .unwrap();
-
-        // Fork and get child manager.
-        let parent_mgr =
-            CslManager::new(store.clone(), parent_id.clone(), Default::default()).unwrap();
-        let (_child_mgr, _) = parent_mgr.fork(&child_id, 1).await.unwrap();
-
-        // Simulate resume: restore_journal_history_if_available should pick up
-        // the child's CSL data (not fall back to journal).
-        let mut state = SessionState::default();
-        restore_journal_history_if_available(&mut state, &child_id)
-            .await
-            .unwrap();
-
-        assert!(state.csl_manager.is_some(), "should use CSL path");
-        assert_eq!(state.history.len(), 1, "should have 1 user/assistant pair");
-        assert_eq!(state.history[0].0, "q1");
-        assert_eq!(state.history[0].1, "a1");
-        assert_eq!(
-            state.recent_tools,
-            vec!["read_file".to_string()],
-            "should restore recent_tools from CSL"
-        );
-        assert_eq!(
-            state.activated_deferred_tool_names,
-            vec!["write_file".to_string()],
-            "should restore pending deferred activations from CSL"
-        );
-    }
-
-    #[tokio::test]
-    async fn session_fork_no_parent_csl_gracefully_skips() {
-        use astra_turn_core::conversation_log::{file_store::FileCslStore, manager::CslManager};
-        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
-        let parent_id = format!("fork-no-csl-{}", uuid::Uuid::new_v4());
-        let child_id = format!("fork-no-csl-child-{}", uuid::Uuid::new_v4());
-
-        let base_dir = session_journal::local_owner_sessions_dir();
-        let store = std::sync::Arc::new(FileCslStore::new(base_dir));
-
-        // Parent has no CSL data. fork() succeeds but writes nothing to child.
-        let parent_mgr =
-            CslManager::new(store.clone(), parent_id.clone(), Default::default()).unwrap();
-        let (_child_mgr, _) = parent_mgr.fork(&child_id, 0).await.unwrap();
-
-        // Child has no CSL file, so resume falls back to journal (which is also
-        // empty). No error should occur.
-        let mut state = SessionState::default();
-        restore_journal_history_if_available(&mut state, &child_id)
-            .await
-            .unwrap();
-
-        assert!(
-            state.csl_manager.is_none(),
-            "no CSL data written, manager stays None"
-        );
-        assert!(
-            state.history.is_empty(),
-            "no history from either CSL or journal"
-        );
-    }
-
-    #[serial_test::serial]
-    #[tokio::test]
-    async fn fork_state_snapshot_capture_restore_roundtrip_preserves_fields() {
-        use astra_turn_core::conversation_log::{
-            SessionStateCompact, file_store::FileCslStore, manager::CslManager,
-        };
-
-        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
-        let sid = format!("fork-snapshot-{}", uuid::Uuid::new_v4());
-        let store = std::sync::Arc::new(FileCslStore::new(
-            session_journal::local_owner_sessions_dir(),
-        ));
-        let mut mgr = CslManager::new(store, sid.clone(), Default::default()).unwrap();
-        mgr.persist_turn(
-            1,
-            &[serde_json::json!({"role": "user", "content": "hi"})],
-            &SessionStateCompact {
-                recent_tools: vec!["bash".into()],
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        let mut source = SessionState::default();
-        source.set_session_id(sid.clone());
-        session_startup::initialize_journal_pub(&mut source, &sid);
-        source.turn = 4;
-        source.total_prompt_tokens = 11;
-        source.total_completion_tokens = 22;
-        source.total_cache_read_tokens = 33;
-        source.total_cache_creation_tokens = 44;
-        source.last_turn_event = Some(session_journal::JournalEvent::turn(
-            Some(&sid),
-            4,
-            Some("gpt-5"),
-            "question",
-            "answer",
-            0,
-            66,
-            40,
-            26,
-        ));
-        source.run_id = Some("run-1".into());
-        source.history = vec![("q1".into(), "a1".into())];
-        source.recent_tools = vec!["bash".into(), "read_file".into()];
-        source.last_response = Some("a1".into());
-        source.continuation_anchor = Some(ContinuationAnchor::rendered_for_test("anchor"));
-        source.csl_manager = Some(mgr);
-
-        let snapshot = ForkStateSnapshot::capture(&mut source);
-
-        let mut restored = SessionState::default();
-        snapshot.restore(&mut restored);
-
-        assert_eq!(restored.session_id.as_deref(), Some(sid.as_str()));
-        assert_eq!(restored.turn, 4);
-        assert_eq!(restored.total_prompt_tokens, 11);
-        assert_eq!(restored.total_completion_tokens, 22);
-        assert_eq!(restored.total_cache_read_tokens, 33);
-        assert_eq!(restored.total_cache_creation_tokens, 44);
-        assert_eq!(restored.run_id.as_deref(), Some("run-1"));
-        assert_eq!(restored.history, vec![("q1".to_string(), "a1".to_string())]);
-        assert_eq!(
-            restored.recent_tools,
-            vec!["bash".to_string(), "read_file".to_string()]
-        );
-        assert_eq!(restored.last_response.as_deref(), Some("a1"));
-        assert_eq!(restored.continuation_anchor.as_deref(), Some("anchor"));
-        assert!(
-            restored.journal.is_some(),
-            "restore should reinitialize journal"
-        );
-        assert_eq!(
-            restored
-                .csl_manager
-                .as_ref()
-                .expect("csl manager restored")
-                .last_seq(),
-            1
-        );
-    }
-
-    #[test]
-    fn fork_state_snapshot_restore_without_session_id_clears_identity() {
-        let mut source = SessionState {
-            turn: 2,
-            history: vec![("q".into(), "a".into())],
-            recent_tools: vec!["bash".into()],
-            last_response: Some("a".into()),
-            continuation_anchor: Some(ContinuationAnchor::rendered_for_test("anchor")),
-            ..Default::default()
-        };
-        let snapshot = ForkStateSnapshot::capture(&mut source);
-
-        let mut state = SessionState::default();
-        state.set_session_id("existing-session");
-        session_startup::initialize_journal_pub(&mut state, "existing-session");
-        state.turn = 9;
-        state.history = vec![("stale".into(), "state".into())];
-        state.recent_tools = vec!["stale-tool".into()];
-        state.last_response = Some("stale".into());
-        state.continuation_anchor = Some(ContinuationAnchor::rendered_for_test("stale-anchor"));
-
-        snapshot.restore(&mut state);
-
-        assert!(state.session_id.is_none());
-        assert!(state.journal.is_none());
-        assert_eq!(state.turn, 2);
-        assert_eq!(state.history, vec![("q".to_string(), "a".to_string())]);
-        assert_eq!(state.recent_tools, vec!["bash".to_string()]);
-        assert_eq!(state.last_response.as_deref(), Some("a"));
-        assert_eq!(state.continuation_anchor.as_deref(), Some("anchor"));
-    }
-
-    #[tokio::test]
-    async fn fork_state_guard_restores_original_state_on_drop_without_commit() {
-        let mut state = SessionState::default();
-        state.set_session_id("parent-session");
-        session_startup::initialize_journal_pub(&mut state, "parent-session");
-        state.turn = 3;
-        state.history = vec![("q1".into(), "a1".into())];
-        state.recent_tools = vec!["bash".into()];
-        state.last_response = Some("a1".into());
-        state.continuation_anchor = Some(ContinuationAnchor::rendered_for_test("anchor"));
-
-        {
-            let mut guard = ForkStateGuard::new(&mut state);
-            let child_state = session_runtime::RestoredSessionState {
-                history: vec![("child-q".into(), "child-a".into())],
-                turn: 1,
-                recent_tools: vec!["read_file".into()],
-                total_prompt_tokens: 10,
-                total_completion_tokens: 20,
-                total_cache_read_tokens: 30,
-                total_cache_creation_tokens: 40,
-            };
-            let restored_child = PreparedForkRestore {
-                history: child_state.history.clone(),
-                active_conversation: None,
-                resume: None,
-                recent_tools: child_state.recent_tools.clone(),
-                activated_deferred_tool_names: Vec::new(),
-                csl_manager: None,
-                journal_state: child_state,
-                last_turn_event: None,
-            };
-            let outcome = apply_prepared_fork_restore(
-                guard.state(),
-                "parent-session",
-                "child-session",
-                restored_child,
-                None,
-            )
-            .await
-            .unwrap();
-            assert_eq!(outcome, ForkTaskBoardRestore::Copied);
-        }
-
-        assert_eq!(state.session_id.as_deref(), Some("parent-session"));
-        assert_eq!(state.turn, 3);
-        assert_eq!(state.history, vec![("q1".to_string(), "a1".to_string())]);
-        assert_eq!(state.recent_tools, vec!["bash".to_string()]);
-        assert_eq!(state.last_response.as_deref(), Some("a1"));
-        assert_eq!(state.continuation_anchor.as_deref(), Some("anchor"));
-    }
-
-    #[tokio::test]
-    async fn fork_state_guard_restores_root_mailbox_on_drop_without_commit() {
-        let transport = std::sync::Arc::new(astra_messaging::InProcessTransport::new());
-        let tracker = std::sync::Arc::new(
-            astra_runtime::server::delegation::engine::DelegationTracker::new(),
-        );
-        let router = std::sync::Arc::new(astra_messaging::AgentMailboxRouter::new(
-            transport.clone(),
-            tracker,
-        ));
-        let root_addr = astra_messaging::AgentAddress::new("parent-session", "main");
-
-        let mut state = SessionState::default();
-        state.set_session_id("parent-session");
-        state.root_mailbox = Some(router.register(root_addr.clone(), None).await.unwrap());
-
-        {
-            let mut guard = ForkStateGuard::new(&mut state);
-            guard.state().set_session_id("child-session");
-        }
-
-        assert_eq!(state.session_id.as_deref(), Some("parent-session"));
-        assert_eq!(
-            state.root_mailbox.as_ref().map(|mailbox| &mailbox.address),
-            Some(&root_addr)
-        );
-        assert_eq!(transport.agent_count().await, 1);
-
-        state.unregister_root_mailbox().await;
-        assert_eq!(transport.agent_count().await, 0);
-        router
-            .register(root_addr, None)
-            .await
-            .expect("explicit unregister should release restored root mailbox route");
-    }
-
-    #[tokio::test]
-    async fn apply_prepared_fork_restore_copies_parent_task_board_to_child() {
-        let mut state = SessionState::default();
-        state.set_session_id("parent-session");
-        let created = state
-            .task_manager
-            .create(&serde_json::json!({"title": "continue forked work"}))
-            .await;
-        assert!(created.contains("created"), "{created}");
-        let started = state
-            .task_manager
-            .update(&serde_json::json!({"task_id": "task-1", "new_status": "in_progress"}))
-            .await;
-        assert!(!started.starts_with("Error:"), "{started}");
-
-        let child_state = session_runtime::RestoredSessionState {
-            history: vec![("child-q".into(), "child-a".into())],
-            turn: 1,
-            recent_tools: vec!["task_board".into()],
-            total_prompt_tokens: 10,
-            total_completion_tokens: 20,
-            total_cache_read_tokens: 30,
-            total_cache_creation_tokens: 40,
-        };
-        let restored_child = PreparedForkRestore {
-            history: child_state.history.clone(),
-            active_conversation: None,
-            resume: None,
-            recent_tools: child_state.recent_tools.clone(),
-            activated_deferred_tool_names: Vec::new(),
-            csl_manager: None,
-            journal_state: child_state,
-            last_turn_event: None,
-        };
-
-        let outcome = apply_prepared_fork_restore(
-            &mut state,
-            "parent-session",
-            "child-session",
-            restored_child,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(outcome, ForkTaskBoardRestore::Copied);
-
-        let child_list = state
-            .task_manager
-            .list(&serde_json::json!({"status_filter": "all"}))
-            .await;
-        assert!(
-            child_list.contains("continue forked work"),
-            "forked child should inherit the parent task board snapshot: {child_list}"
-        );
-        assert!(
-            child_list.contains("\"status\":\"paused\""),
-            "forked child should inherit active parent work as paused, not in_progress: {child_list}"
-        );
-        let child_snapshot = state.task_manager.snapshot().await.unwrap();
-        assert_eq!(
-            child_snapshot[0]
-                .metadata
-                .as_ref()
-                .and_then(|metadata| metadata.get("fork_copied_from_status"))
-                .and_then(serde_json::Value::as_str),
-            Some("in_progress"),
-            "forked child should explain active parent work was paused: {child_snapshot:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn apply_prepared_fork_restore_resets_task_reminder_counters() {
-        let mut state = SessionState {
-            turns_since_task_use: 9,
-            turns_since_task_reminder: 9,
-            ..SessionState::default()
-        };
-        state.set_session_id("parent-session");
-        let created = state
-            .task_manager
-            .create(&serde_json::json!({"title": "continue forked work"}))
-            .await;
-        assert!(created.contains("created"), "{created}");
-
-        let child_state = session_runtime::RestoredSessionState {
-            history: vec![("child-q".into(), "child-a".into())],
-            turn: 1,
-            recent_tools: vec![],
-            total_prompt_tokens: 10,
-            total_completion_tokens: 20,
-            total_cache_read_tokens: 30,
-            total_cache_creation_tokens: 40,
-        };
-        let restored_child = PreparedForkRestore {
-            history: child_state.history.clone(),
-            active_conversation: None,
-            resume: None,
-            recent_tools: child_state.recent_tools.clone(),
-            activated_deferred_tool_names: Vec::new(),
-            csl_manager: None,
-            journal_state: child_state,
-            last_turn_event: None,
-        };
-
-        apply_prepared_fork_restore(
-            &mut state,
-            "parent-session",
-            "child-session",
-            restored_child,
-            None,
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            state.turns_since_task_use, 0,
-            "forked child must not inherit stale parent task-use reminder age"
-        );
-        assert_eq!(
-            state.turns_since_task_reminder, 0,
-            "forked child must not immediately inject a task reminder from parent counters"
-        );
-    }
-
-    #[tokio::test]
-    async fn forked_child_first_turn_does_not_inject_stale_parent_task_reminder() {
-        let mut state = SessionState {
-            turns_since_task_use: 9,
-            turns_since_task_reminder: 9,
-            ..SessionState::default()
-        };
-        state.set_session_id("parent-session");
-        let created = state
-            .task_manager
-            .create(&serde_json::json!({"title": "continue forked work"}))
-            .await;
-        assert!(created.contains("created"), "{created}");
-
-        let child_state = session_runtime::RestoredSessionState {
-            history: vec![("child-q".into(), "child-a".into())],
-            turn: 1,
-            recent_tools: vec![],
-            total_prompt_tokens: 10,
-            total_completion_tokens: 20,
-            total_cache_read_tokens: 30,
-            total_cache_creation_tokens: 40,
-        };
-        let restored_child = PreparedForkRestore {
-            history: child_state.history.clone(),
-            active_conversation: None,
-            resume: None,
-            recent_tools: child_state.recent_tools.clone(),
-            activated_deferred_tool_names: Vec::new(),
-            csl_manager: None,
-            journal_state: child_state,
-            last_turn_event: None,
-        };
-
-        apply_prepared_fork_restore(
-            &mut state,
-            "parent-session",
-            "child-session",
-            restored_child,
-            None,
-        )
-        .await
-        .unwrap();
-
-        let finalized = crate::cli::session::session_input::finalize_effective_line(
-            crate::cli::session::session_input::PreparedInput::user_only("continue"),
-            "continue".into(),
-            None,
-            &mut state,
-        )
-        .await;
-
-        assert!(
-            finalized.runtime_volatile_texts.is_empty(),
-            "new forked child should not immediately inherit parent reminder pressure: {finalized:?}"
-        );
-        assert_eq!(finalized.user_message, "continue");
-        assert_eq!(state.turns_since_task_use, 1);
-        assert_eq!(state.turns_since_task_reminder, 1);
-    }
-
-    #[tokio::test]
-    async fn apply_prepared_fork_restore_preserves_existing_child_task_board() {
-        let mut state = SessionState::default();
-        state.set_session_id("parent-session");
-        let parent_created = state
-            .task_manager
-            .create(&serde_json::json!({"title": "parent open work"}))
-            .await;
-        assert!(parent_created.contains("created"), "{parent_created}");
-
-        let child_manager = astra_tools::task_mgmt::TaskManager::new(
-            "child-session".to_string(),
-            state.task_manager.store(),
-        );
-        let child_created = child_manager
-            .create(&serde_json::json!({"title": "child existing work"}))
-            .await;
-        assert!(child_created.contains("created"), "{child_created}");
-
-        let child_state = session_runtime::RestoredSessionState {
-            history: vec![("child-q".into(), "child-a".into())],
-            turn: 1,
-            recent_tools: vec!["task_board".into()],
-            total_prompt_tokens: 10,
-            total_completion_tokens: 20,
-            total_cache_read_tokens: 30,
-            total_cache_creation_tokens: 40,
-        };
-        let restored_child = PreparedForkRestore {
-            history: child_state.history.clone(),
-            active_conversation: None,
-            resume: None,
-            recent_tools: child_state.recent_tools.clone(),
-            activated_deferred_tool_names: Vec::new(),
-            csl_manager: None,
-            journal_state: child_state,
-            last_turn_event: None,
-        };
-
-        let outcome = apply_prepared_fork_restore(
-            &mut state,
-            "parent-session",
-            "child-session",
-            restored_child,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(outcome, ForkTaskBoardRestore::PreservedExistingChild);
-
-        let child_list = state
-            .task_manager
-            .list(&serde_json::json!({"status_filter": "all"}))
-            .await;
-        assert!(
-            child_list.contains("child existing work"),
-            "fork restore must not overwrite an existing child task board: {child_list}"
-        );
-        assert!(
-            !child_list.contains("parent open work"),
-            "parent task board should only be copied into an empty child session: {child_list}"
-        );
-    }
-
-    #[tokio::test]
-    async fn apply_prepared_fork_restore_fails_before_switching_when_task_load_fails() {
-        let mut state = SessionState::default();
-        state.task_manager = std::sync::Arc::new(astra_tools::task_mgmt::TaskManager::new(
-            "parent-session",
-            std::sync::Arc::new(FailingLoadTaskStore),
-        ));
-        state.set_session_id("parent-session");
-        state.turn = 7;
-        state.history = vec![("parent-q".into(), "parent-a".into())];
-
-        let child_state = session_runtime::RestoredSessionState {
-            history: vec![("child-q".into(), "child-a".into())],
-            turn: 1,
-            recent_tools: vec!["task_board".into()],
-            total_prompt_tokens: 10,
-            total_completion_tokens: 20,
-            total_cache_read_tokens: 30,
-            total_cache_creation_tokens: 40,
-        };
-        let restored_child = PreparedForkRestore {
-            history: child_state.history.clone(),
-            active_conversation: None,
-            resume: None,
-            recent_tools: child_state.recent_tools.clone(),
-            activated_deferred_tool_names: Vec::new(),
-            csl_manager: None,
-            journal_state: child_state,
-            last_turn_event: None,
-        };
-
-        let error = apply_prepared_fork_restore(
-            &mut state,
-            "parent-session",
-            "child-session",
-            restored_child,
-            None,
-        )
-        .await
-        .expect_err("task load failure should abort fork restore");
-
-        assert!(
-            error.contains("load existing task board for forked child child-session"),
-            "{error}"
-        );
-        assert_eq!(state.session_id.as_deref(), Some("parent-session"));
-        assert_eq!(state.turn, 7);
-        assert_eq!(
-            state.history,
-            vec![("parent-q".to_string(), "parent-a".to_string())]
-        );
-    }
-
-    #[tokio::test]
-    async fn apply_prepared_fork_restore_requires_cloud_copy_client_for_cloud_task_board() {
-        let mut state = SessionState::default();
-        state.set_session_id("parent-session");
-        state.turn = 7;
-        let (notify_tx, _) = tokio::sync::broadcast::channel(1);
-        state.task_notify_tx = Some(notify_tx);
-        let created = state
-            .task_manager
-            .create(&serde_json::json!({"title": "cloud-owned task"}))
-            .await;
-        assert!(created.contains("created"), "{created}");
-
-        let child_state = session_runtime::RestoredSessionState {
-            history: vec![("child-q".into(), "child-a".into())],
-            turn: 1,
-            recent_tools: vec!["task_board".into()],
-            total_prompt_tokens: 10,
-            total_completion_tokens: 20,
-            total_cache_read_tokens: 30,
-            total_cache_creation_tokens: 40,
-        };
-        let restored_child = PreparedForkRestore {
-            history: child_state.history.clone(),
-            active_conversation: None,
-            resume: None,
-            recent_tools: child_state.recent_tools.clone(),
-            activated_deferred_tool_names: Vec::new(),
-            csl_manager: None,
-            journal_state: child_state,
-            last_turn_event: None,
-        };
-
-        let error = apply_prepared_fork_restore(
-            &mut state,
-            "parent-session",
-            "child-session",
-            restored_child,
-            None,
-        )
-        .await
-        .expect_err("cloud fork must fail closed when copy client is missing");
-        assert!(
-            error.contains("cloud task board fork copy is unavailable"),
-            "{error}"
-        );
-        assert_eq!(state.session_id.as_deref(), Some("parent-session"));
-        assert_eq!(state.turn, 7);
     }
 }

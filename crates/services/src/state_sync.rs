@@ -207,24 +207,7 @@ impl SyncResult {
     }
 }
 
-/// One row from `plan_templates`, serialized for edge pull sync.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PlanTemplateSyncRow {
-    pub template_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_id: Option<String>,
-    pub goal_pattern: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_type: Option<String>,
-    pub template_json: String,
-    pub success_rate: f32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub avg_completion_time: Option<i32>,
-    pub use_count: i32,
-}
-
 const MAX_PREFERENCE_SYNC_ROWS: i64 = 128;
-const MAX_PLAN_TEMPLATE_SYNC_ROWS: i64 = 500;
 const MAX_PLAN_SYNC_ROWS: i64 = 200;
 const MAX_PLAN_STEP_RUN_SYNC_ROWS: i64 = 2000;
 
@@ -365,9 +348,6 @@ pub trait StateSyncService: Send + Sync {
     /// Pull all preferences for a user.
     async fn pull_all_preferences(&self, user_id: &str) -> Result<Vec<(String, String)>, String>;
 
-    /// JSON array of [`PlanTemplateSyncRow`] for the user plus global rows (`user_id IS NULL`).
-    async fn pull_plan_templates_pack(&self, user_id: &str) -> Result<String, String>;
-
     /// JSON array of [`PlanSyncRow`] for the user's owned plans (newest first).
     /// Returns `{"plans": [...], "step_runs": [...]}` — the `plans` table rows
     /// and matching `plan_step_runs` history so edge can replay attempt chains
@@ -378,17 +358,6 @@ pub trait StateSyncService: Send + Sync {
     /// by edge while offline. Upserts plans (optimistic version check) and
     /// appends previously-unseen step-runs (idempotent by `run_id`).
     async fn push_plans_pack(&self, user_id: &str, pack_json: &str) -> Result<String, String>;
-
-    /// JSON array of [`crate::task_orchestrator::TaskRecord`] for the user (`agent_tasks`).
-    async fn pull_tasks_pack(&self, user_id: &str) -> Result<String, String>;
-
-    /// Apply a task pack from an edge that holds valid leases (`holder_agent_id`).
-    async fn push_tasks_pack_held(
-        &self,
-        user_id: &str,
-        holder_agent_id: &str,
-        pack_json: &str,
-    ) -> Result<crate::multi_agent::TasksPackPushResult, String>;
 
     /// Get current sync status.
     async fn status(&self) -> SyncStatus;
@@ -414,29 +383,12 @@ impl StateSyncService for LocalOnlySyncService {
         Ok(Vec::new())
     }
 
-    async fn pull_plan_templates_pack(&self, _user_id: &str) -> Result<String, String> {
-        Ok("[]".to_string())
-    }
-
     async fn pull_plans_pack(&self, _user_id: &str) -> Result<String, String> {
         Ok(r#"{"plans":[],"step_runs":[]}"#.to_string())
     }
 
     async fn push_plans_pack(&self, _user_id: &str, _pack_json: &str) -> Result<String, String> {
         Ok(r#"{"applied":0,"skipped":0}"#.to_string())
-    }
-
-    async fn pull_tasks_pack(&self, _user_id: &str) -> Result<String, String> {
-        Ok("[]".to_string())
-    }
-
-    async fn push_tasks_pack_held(
-        &self,
-        _user_id: &str,
-        _holder_agent_id: &str,
-        _pack_json: &str,
-    ) -> Result<crate::multi_agent::TasksPackPushResult, String> {
-        Ok(crate::multi_agent::TasksPackPushResult::default())
     }
 
     async fn status(&self) -> SyncStatus {
@@ -599,64 +551,6 @@ impl StateSyncService for MatrixOneSyncService {
         .map_err(|e| format!("pull_all_prefs: {e}"))?;
 
         rows.iter().map(decode_preference_pair).collect()
-    }
-
-    async fn pull_plan_templates_pack(&self, user_id: &str) -> Result<String, String> {
-        let rows = sqlx::query(
-            "SELECT template_id, user_id, goal_pattern, project_type, template_json, \
-              success_rate, avg_completion_time, use_count \
-              FROM plan_templates \
-              WHERE user_id = ? \
-              ORDER BY updated_at DESC \
-              LIMIT ?",
-        )
-        .bind(user_id)
-        .bind(MAX_PLAN_TEMPLATE_SYNC_ROWS)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| format!("pull_plan_templates_pack: {e}"))?;
-
-        use sqlx::Row;
-        let mut items: Vec<PlanTemplateSyncRow> = Vec::with_capacity(rows.len());
-        for row in rows {
-            let template_id: String = row
-                .try_get("template_id")
-                .map_err(|e| format!("pull_plan_templates_pack template_id: {e}"))?;
-            let user_id_col: Option<String> = row
-                .try_get("user_id")
-                .map_err(|e| format!("pull_plan_templates_pack user_id: {e}"))?;
-            let goal_pattern: String = row
-                .try_get("goal_pattern")
-                .map_err(|e| format!("pull_plan_templates_pack goal_pattern: {e}"))?;
-            let project_type: Option<String> = row
-                .try_get("project_type")
-                .map_err(|e| format!("pull_plan_templates_pack project_type: {e}"))?;
-            let template_json: String = row
-                .try_get("template_json")
-                .map_err(|e| format!("pull_plan_templates_pack template_json: {e}"))?;
-            let success_rate: f32 = row
-                .try_get::<f64, _>("success_rate")
-                .map_err(|e| format!("pull_plan_templates_pack success_rate: {e}"))?
-                as f32;
-            let avg_completion_time: Option<i32> = row
-                .try_get("avg_completion_time")
-                .map_err(|e| format!("pull_plan_templates_pack avg_completion_time: {e}"))?;
-            let use_count: i32 = row
-                .try_get::<i64, _>("use_count")
-                .map_err(|e| format!("pull_plan_templates_pack use_count: {e}"))?
-                as i32;
-            items.push(PlanTemplateSyncRow {
-                template_id,
-                user_id: user_id_col,
-                goal_pattern,
-                project_type,
-                template_json,
-                success_rate,
-                avg_completion_time,
-                use_count,
-            });
-        }
-        serde_json::to_string(&items).map_err(|e| format!("pull_plan_templates_pack json: {e}"))
     }
 
     async fn pull_plans_pack(&self, user_id: &str) -> Result<String, String> {
@@ -1036,25 +930,6 @@ impl StateSyncService for MatrixOneSyncService {
         .map_err(|e| format!("push_plans_pack result json: {e}"))
     }
 
-    async fn pull_tasks_pack(&self, user_id: &str) -> Result<String, String> {
-        crate::multi_agent::pull_tasks_pack_mysql(&self.pool, user_id).await
-    }
-
-    async fn push_tasks_pack_held(
-        &self,
-        user_id: &str,
-        holder_agent_id: &str,
-        pack_json: &str,
-    ) -> Result<crate::multi_agent::TasksPackPushResult, String> {
-        crate::multi_agent::push_tasks_pack_held_mysql(
-            &self.pool,
-            user_id,
-            holder_agent_id,
-            pack_json,
-        )
-        .await
-    }
-
     async fn status(&self) -> SyncStatus {
         SyncStatus::default()
     }
@@ -1140,18 +1015,6 @@ mod tests {
         assert!(push.success);
         let pull = svc.pull_preference("user1", "key").await;
         assert!(pull.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn local_only_plan_templates_pack_is_empty_array() {
-        let svc = LocalOnlySyncService;
-        let j = svc.pull_plan_templates_pack("u1").await.unwrap();
-        assert_eq!(j, "[]");
-    }
-
-    #[test]
-    fn plan_template_sync_row_limit_is_bounded() {
-        assert_eq!(MAX_PLAN_TEMPLATE_SYNC_ROWS, 500);
     }
 
     // ── File-based preferences ──

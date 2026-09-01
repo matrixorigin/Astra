@@ -102,13 +102,21 @@ fn summarize_cache_turns(events: &[JournalEvent]) -> Vec<CacheTurnSummary> {
                 let Some(meta) = event.metadata.as_ref() else {
                     continue;
                 };
-                entry.cache_hit_ratio = meta.get("cache_hit_ratio").and_then(|v| match v {
-                    serde_json::Value::Number(n) => n.as_f64(),
-                    _ => None,
-                });
-                if let Some(reason) = meta.get("cache_break_reason").and_then(|v| v.as_str()) {
-                    entry.cache_break_reason = Some(reason.to_string());
-                }
+                let Ok(feedback_event) = serde_json::from_value::<
+                    astra_turn_core::pipeline_journal::PipelineJournalEvent,
+                >(meta.clone()) else {
+                    continue;
+                };
+                let Some(frame) = feedback_event.runtime_feedback.filter(|frame| {
+                    frame.is_valid()
+                        && frame.progress.session_turn == turn
+                        && feedback_event.turn == turn
+                }) else {
+                    continue;
+                };
+                entry.cache_hit_ratio = frame.cache_hit_ratio();
+                entry.cache_break_reason =
+                    frame.cache_break_detected.as_ref().map(ToString::to_string);
             }
             JournalEventType::PipelineAlert => {
                 let Some(meta) = event.metadata.as_ref() else {
@@ -339,8 +347,44 @@ mod tests {
             Some("s1"),
             3,
             serde_json::json!({
-                "cache_hit_ratio": 0.38,
-                "cache_break_reason": "UnknownColdStart"
+                "kind": "Feedback",
+                "turn": 3,
+                "runtime_feedback": {
+                    "schema_version": astra_turn_core::context_feedback::RuntimeFeedbackFrame::SCHEMA_VERSION,
+                    "identity": {
+                        "session_id": "s1",
+                        "run_id": "run-1",
+                        "agent_id": "agent-1",
+                        "model_id": "kimi-k2.6",
+                        "topology": "cli_server"
+                    },
+                    "progress": {
+                        "session_turn": 3,
+                        "agentic_round_index": 0,
+                        "llm_rounds_completed": 1,
+                        "slice_round_limit": 10,
+                        "slice_rounds_remaining": 9
+                    },
+                    "context": {
+                        "token_pressure": 0.1,
+                        "compaction_tier": "normal"
+                    },
+                    "request_usage": {
+                        "prompt": 620,
+                        "cache_read": 380,
+                        "cache_creation": 0,
+                        "completion": 200
+                    },
+                    "run_usage": {
+                        "prompt": 620,
+                        "cache_read": 380,
+                        "cache_creation": 0,
+                        "completion": 200
+                    },
+                    "was_truncated": false,
+                    "cache_break_detected": "UnknownColdStart",
+                    "policy_feedback": { "state": "not_evaluated" }
+                }
             }),
         );
         let alert = session_journal::JournalEvent::pipeline_alert(

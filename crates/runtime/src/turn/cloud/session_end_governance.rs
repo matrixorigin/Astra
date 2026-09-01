@@ -245,6 +245,7 @@ pub async fn run_session_end_governance(
                 );
             }
             Err(e) => {
+                report.working_purge_failed = true;
                 tracing::warn!(
                     session_id,
                     error = %e,
@@ -264,9 +265,9 @@ pub async fn run_session_end_governance(
     // Reflect in `candidates` mode returns a list of scene clusters the
     // backend has grouped but not synthesized into scene nodes (the v1
     // LLM path requires a backend-side LLM_API_KEY that often isn't
-    // configured). We forward-feed those clusters as `astra:scene`-
-    // tagged semantic memories ourselves so the next session's prewarm
-    // surfaces them alongside episodes. Without this step `reflect`
+    // configured). We forward-feed those clusters as typed semantic
+    // memories ourselves so query-relevant recall can surface them later.
+    // Without this step `reflect`
     // runs, produces output, and the output is silently discarded.
     match client.reflect_session(session_id, false).await {
         Ok(summary) => {
@@ -281,11 +282,14 @@ pub async fn run_session_end_governance(
                         report.scenes_stored += 1;
                     }
                     Ok(_) => report.scenes_stored += 1,
-                    Err(e) => tracing::warn!(
-                        session_id,
-                        error = %e,
-                        "session-end scene persistence failed"
-                    ),
+                    Err(e) => {
+                        report.scene_persist_failures += 1;
+                        tracing::warn!(
+                            session_id,
+                            error = %e,
+                            "session-end scene persistence failed"
+                        );
+                    }
                 }
             }
         }
@@ -307,6 +311,8 @@ pub async fn run_session_end_governance(
 #[derive(Debug, Clone, Default)]
 pub struct SessionEndReport {
     pub working_purged: u64,
+    /// The episode was safe (or unnecessary), but working-memory purge failed.
+    pub working_purge_failed: bool,
     /// True when an episode was worth writing but failed to persist, so the
     /// working snapshot was intentionally retained for a future retry.
     pub working_retained_due_to_episode_failure: bool,
@@ -318,10 +324,11 @@ pub struct SessionEndReport {
     pub reflect_candidates: u64,
     /// Whether reflect synthesized new scene nodes (v2 only).
     pub reflect_synthesized: bool,
-    /// Number of `astra:scene`-tagged semantic memories the client
-    /// forward-fed from reflect candidates into the store for
-    /// next-session prewarm.
+    /// Number of typed semantic memories the client forward-fed from
+    /// reflect candidates into the store for later query-relevant recall.
     pub scenes_stored: usize,
+    /// Scene candidates that could not be persisted after reflection.
+    pub scene_persist_failures: usize,
 }
 
 #[cfg(test)]
@@ -511,6 +518,7 @@ mod tests {
         scenes: Mutex<Vec<(String, String, String)>>, // session, signal, summary
         episodes: Mutex<Vec<String>>,
         reflect_response: Mutex<ReflectSummary>,
+        fail_scene: bool,
     }
 
     #[async_trait::async_trait]
@@ -556,6 +564,9 @@ mod tests {
             signal: &str,
             summary: &str,
         ) -> Result<String, String> {
+            if self.fail_scene {
+                return Err("scene store unavailable".into());
+            }
             self.scenes.lock().unwrap().push((
                 sid.to_string(),
                 signal.to_string(),
@@ -618,11 +629,43 @@ mod tests {
         assert!(client.scenes.lock().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn governance_reports_each_failed_scene_persistence() {
+        let client = Arc::new(SceneCaptureClient {
+            fail_scene: true,
+            ..Default::default()
+        });
+        *client.reflect_response.lock().unwrap() = ReflectSummary {
+            candidates: 2,
+            candidate_payloads: vec![
+                ReflectCandidate {
+                    signal: "one".into(),
+                    summary: "first".into(),
+                    importance: 1.0,
+                },
+                ReflectCandidate {
+                    signal: "two".into(),
+                    summary: "second".into(),
+                    importance: 1.0,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let report =
+            run_session_end_governance(&SessionFacts::default(), "scene-failures", client.as_ref())
+                .await
+                .expect("best-effort governance");
+        assert_eq!(report.scenes_stored, 0);
+        assert_eq!(report.scene_persist_failures, 2);
+    }
+
     #[derive(Default)]
     struct LifecycleOrderClient {
         operations: Mutex<Vec<String>>,
         episode: Mutex<Option<String>>,
         fail_episode: bool,
+        fail_purge: bool,
     }
 
     #[async_trait::async_trait]
@@ -669,7 +712,11 @@ mod tests {
 
         async fn purge_working(&self, _session_id: &str) -> Result<u64, String> {
             self.operations.lock().unwrap().push("purge".into());
-            Ok(1)
+            if self.fail_purge {
+                Err("working purge unavailable".into())
+            } else {
+                Ok(1)
+            }
         }
 
         async fn reflect_session(
@@ -728,5 +775,27 @@ mod tests {
         );
         assert_eq!(report.working_purged, 0);
         assert!(report.working_retained_due_to_episode_failure);
+    }
+
+    #[tokio::test]
+    async fn governance_reports_working_purge_failure_after_safe_episode_write() {
+        let client = LifecycleOrderClient {
+            fail_purge: true,
+            ..Default::default()
+        };
+        let report = run_session_end_governance(
+            &SessionFacts {
+                turn: 3,
+                ..Default::default()
+            },
+            "session-lifecycle",
+            &client,
+        )
+        .await
+        .expect("best-effort governance");
+
+        assert!(report.working_purge_failed);
+        assert_eq!(report.working_purged, 0);
+        assert_eq!(report.episode_memory_id.as_deref(), Some("episode-1"));
     }
 }

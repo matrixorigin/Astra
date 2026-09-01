@@ -18,6 +18,13 @@ const INFERENCE_ID_HEX_LEN: usize = 32;
 pub struct InferenceInvocationInput {
     pub user_id: String,
     pub scope: InferenceInvocationScope,
+    /// Exact durable execution capability for a run-scoped invocation.
+    ///
+    /// Session/harness work has its own owner boundary and must leave this
+    /// empty. A run-scoped provider admission is executable only while all of
+    /// these immutable facts still match in the same transaction that inserts
+    /// the invocation row.
+    pub run_authority: Option<InferenceRunAdmissionAuthority>,
     /// Non-secret identity of the server-managed credential owner. The route
     /// stores this Offering id for audit; provider credentials are never copied
     /// into invocation records.
@@ -31,10 +38,21 @@ pub struct InferenceInvocationInput {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InferenceRunAdmissionAuthority {
+    pub expected_owner_generation: u64,
+    pub expected_owner_pod_id: String,
+    /// Greatest durable run-event index through which this executor has
+    /// applied user control. `-1` means no event boundary was applied.
+    pub expected_control_epoch: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InferenceInvocationPlan {
     route_id: String,
     invocation_id: String,
     admission_token: String,
+    owner_token: String,
+    owner_generation: u64,
     input: InferenceInvocationInput,
 }
 
@@ -46,6 +64,8 @@ pub struct InferenceProviderAttemptPlan {
     attempt_index: u32,
     provider: String,
     admission_token: String,
+    owner_token: String,
+    owner_generation: u64,
     wire: InferenceProviderWireIdentity,
     invocation_input: InferenceInvocationInput,
     request_context: ModelRequestContextSeed,
@@ -73,6 +93,30 @@ impl InferenceInvocationPlan {
     #[must_use]
     pub fn invocation_id(&self) -> &str {
         &self.invocation_id
+    }
+
+    /// Opaque owner identity for the current durable lease generation.
+    #[must_use]
+    pub fn owner_token(&self) -> &str {
+        &self.owner_token
+    }
+
+    /// Monotonic fencing generation. Recovery increments this before it can
+    /// settle an abandoned invocation, so an old process can never publish a
+    /// late provider or logical terminal.
+    #[must_use]
+    pub fn owner_generation(&self) -> u64 {
+        self.owner_generation
+    }
+
+    /// Stable attempt identity within the caller-owned inference round.
+    ///
+    /// The runtime may advance this once after conclusively settling an
+    /// ambiguous pre-provider admission. Exposing the authoritative value
+    /// prevents an outer provider retry from reusing the recovered identity.
+    #[must_use]
+    pub fn logical_attempt(&self) -> u32 {
+        self.input.scope.logical_attempt()
     }
 }
 
@@ -197,16 +241,95 @@ impl InferenceTerminalStatus {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InferenceUsage {
-    pub input_tokens: u64,
+    /// Provider-normalized input buckets. Fresh input, cache reads, and cache
+    /// creation are disjoint and have one shared representation everywhere.
+    pub input: astra_turn_types::NormalizedPromptCacheUsage,
     pub output_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_creation_tokens: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceUsageStatus {
+    /// The provider supplied terminal usage for the complete response.
+    ProviderExact,
+    /// The provider supplied usage before an interrupted/uncertain terminal.
+    ProviderPartial,
+    /// No provider usage fact was available. Numeric zeroes are placeholders,
+    /// not measured zero-token billing.
+    #[default]
+    Unavailable,
+}
+
+impl InferenceUsageStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ProviderExact => "provider_exact",
+            Self::ProviderPartial => "provider_partial",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Provider-I/O authority at an exact-attempt settlement boundary.
+///
+/// `PreDelivery` proves the runtime never allowed the HTTP request to leave;
+/// an absent durable attempt row is therefore a valid cancelled outcome.
+/// `DeliveryAuthorized` means an absent row is a durable conflict and must be
+/// quarantined. Legacy rows use an internal `unknown` state and never get
+/// synthesized through this API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InferenceProviderDeliveryState {
+    PreDelivery,
+    DeliveryAuthorized,
+}
+
+/// Authoritative outcome of a logical-invocation admission whose caller lost
+/// the database acknowledgement.
+///
+/// Resolution is performed while holding the same durable scope locks as the
+/// original admission transaction, so `Absent` cannot race a late commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InferenceInvocationAdmissionResolution {
+    Settled,
+    ExactTerminal,
+    ConflictingIdentity,
+    ScopeUnavailable,
+    /// The exact ambiguous identity was conclusively closed, but the caller's
+    /// run generation/owner/lease/control capability is no longer live. The
+    /// caller must not create a replacement logical attempt.
+    AuthorityLost,
+}
+
+/// Authoritative result of projecting one exact durable settlement decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InferenceSettlementReconcileOutcome {
+    /// The canonical invocation carries the exact requested terminal.
+    Settled,
+    /// Durable debt remains retryable; the bounded runtime owner or sweeper
+    /// may attempt the same indexed identity again.
+    TransientPending,
+    /// The debt was retained as an operator-visible incident and removed from
+    /// the retry set. Runtime owners must release capacity instead of hammering
+    /// a state that requires repair.
+    PermanentlyQuarantined,
+}
+
+impl InferenceProviderDeliveryState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PreDelivery => "pre_delivery",
+            Self::DeliveryAuthorized => "delivery_authorized",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InferenceInvocationTerminal {
     pub status: InferenceTerminalStatus,
     pub usage: InferenceUsage,
+    pub usage_status: InferenceUsageStatus,
     pub provider_response_id: Option<String>,
     pub error_kind: Option<String>,
     pub error_message: Option<String>,
@@ -218,6 +341,7 @@ impl InferenceInvocationTerminal {
         Self {
             status: InferenceTerminalStatus::Succeeded,
             usage,
+            usage_status: InferenceUsageStatus::ProviderExact,
             provider_response_id,
             error_kind: None,
             error_message: None,
@@ -268,6 +392,34 @@ pub fn plan_inference_invocation(
         validate_identity(harness_run_id, "harness_run_id", 128)?;
     }
     validate_identity(input.scope.operation_id(), "operation_id", 64)?;
+    match (&input.scope, &input.run_authority) {
+        (InferenceInvocationScope::Run { .. }, Some(authority)) => {
+            validate_identity(
+                &authority.expected_owner_pod_id,
+                "expected_owner_pod_id",
+                128,
+            )?;
+            if authority.expected_control_epoch < -1 {
+                return Err(ServiceError::invalid(
+                    "expected_control_epoch must be at least -1",
+                ));
+            }
+            i64::try_from(authority.expected_owner_generation).map_err(|_| {
+                ServiceError::invalid("expected_owner_generation exceeds the durable BIGINT range")
+            })?;
+        }
+        (InferenceInvocationScope::Run { .. }, None) => {
+            return Err(ServiceError::invalid(
+                "run-scoped inference requires exact durable execution authority",
+            ));
+        }
+        (_, Some(_)) => {
+            return Err(ServiceError::invalid(
+                "run execution authority cannot cross a session or harness scope",
+            ));
+        }
+        (_, None) => {}
+    }
     validate_model_offering_id(&input.offering_id)
         .map_err(|error| ServiceError::invalid(error.to_string()))?;
     validate_identity(&input.resolved_model_name, "resolved_model_name", 255)?;
@@ -304,8 +456,79 @@ pub fn plan_inference_invocation(
         route_id,
         invocation_id,
         admission_token: new_admission_token(),
+        owner_token: new_admission_token(),
+        owner_generation: 1,
         input,
     })
+}
+
+/// Return the first unused two-attempt allocation after durable history for
+/// one exact logical operation. `N` is the requested identity and `N + 1` is
+/// reserved for the single foreground ambiguity recovery. This is a cursor
+/// read, not provider authority: concurrent callers are still serialized by
+/// the unique invocation identity at admission and losers must re-read.
+pub async fn next_inference_logical_attempt_pair_base(
+    pool: &SharedPool,
+    input: &InferenceInvocationInput,
+) -> ServiceResult<u32> {
+    // Reuse the complete public input validation contract before allowing a
+    // cursor lookup to influence durable identity selection.
+    let _ = plan_inference_invocation(input.clone())?;
+    let row = sqlx::query(
+        "SELECT MAX(logical_attempt) AS max_logical_attempt
+         FROM inference_invocations
+         WHERE user_id = ?
+           AND scope_kind = ?
+           AND session_id <=> ?
+           AND run_id <=> ?
+           AND harness_run_id <=> ?
+           AND turn_index <=> ?
+           AND round_index <=> ?
+           AND operation_id = ?
+           AND purpose = ?",
+    )
+    .bind(&input.user_id)
+    .bind(input.scope.kind())
+    .bind(input.scope.session_id())
+    .bind(input.scope.run_id())
+    .bind(input.scope.harness_run_id())
+    .bind(input.scope.turn().map(i64::from))
+    .bind(input.scope.round().map(i64::from))
+    .bind(input.scope.operation_id())
+    .bind(input.purpose.as_str())
+    .fetch_one(pool.get())
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "read durable inference logical-attempt cursor",
+            error,
+        )
+    })?;
+    let Some(max_logical_attempt) = row
+        .try_get::<Option<i64>, _>("max_logical_attempt")
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode durable inference logical-attempt cursor",
+                error,
+            )
+        })?
+    else {
+        return Ok(0);
+    };
+    let max_logical_attempt = u32::try_from(max_logical_attempt).map_err(|_| {
+        ServiceError::conflict(
+            "durable inference logical-attempt history is outside the supported u32 range",
+        )
+    })?;
+    max_logical_attempt
+        .checked_div(2)
+        .and_then(|pair| pair.checked_add(1))
+        .and_then(|pair| pair.checked_mul(2))
+        .ok_or_else(|| {
+            ServiceError::conflict("durable inference logical-attempt pair space is exhausted")
+        })
 }
 
 #[must_use]
@@ -343,6 +566,8 @@ pub fn plan_inference_provider_attempt_with_context(
         attempt_index,
         provider: invocation.input.provider.clone(),
         admission_token: new_admission_token(),
+        owner_token: invocation.owner_token.clone(),
+        owner_generation: invocation.owner_generation,
         wire,
         invocation_input: invocation.input.clone(),
         request_context,
@@ -358,6 +583,7 @@ fn terminal_fingerprint(terminal: &InferenceInvocationTerminal) -> ServiceResult
     let payload = serde_json::to_vec(&serde_json::json!({
         "status": terminal.status,
         "usage": terminal.usage,
+        "usage_status": terminal.usage_status,
         "provider_response_id": terminal.provider_response_id,
         "error_kind": terminal.error_kind,
         "error_message": terminal.error_message,
@@ -395,7 +621,7 @@ fn model_request_event(
     }
     let mut budget = attempt.request_context.budget.clone();
     let usage = terminal.map(|terminal| {
-        let measured = terminal.usage.input_tokens;
+        let measured = terminal.usage.input.total_input_tokens();
         budget.measured_input_tokens = Some(measured);
         budget.usage_source = Some("provider_terminal".to_string());
         if let Some(estimated) = budget.estimated_input_tokens {
@@ -410,19 +636,15 @@ fn model_request_event(
                 (estimated > 0).then_some(error as f64 / estimated as f64);
         }
         ModelRequestUsage {
-            fresh_input_tokens: measured
-                .saturating_sub(terminal.usage.cache_read_tokens)
-                .saturating_sub(terminal.usage.cache_creation_tokens),
-            cache_read_tokens: terminal.usage.cache_read_tokens,
-            cache_creation_tokens: terminal.usage.cache_creation_tokens,
-            request_input_tokens: measured,
+            input: terminal.usage.input,
             output_tokens: terminal.usage.output_tokens,
         }
     });
     let mut cache = attempt.request_context.cache.clone();
     if let Some(usage) = usage.as_ref() {
-        cache.cache_read_share = (usage.request_input_tokens > 0)
-            .then_some(usage.cache_read_tokens as f64 / usage.request_input_tokens as f64);
+        let total_input_tokens = usage.total_input_tokens();
+        cache.cache_read_share = (total_input_tokens > 0)
+            .then_some(usage.input.cache_read_tokens as f64 / total_input_tokens as f64);
     }
     let input = &attempt.invocation_input;
     let event = ModelRequestContextEvent {
@@ -467,6 +689,7 @@ fn model_request_event(
         cache,
         compaction: attempt.request_context.compaction.clone(),
         terminal_status: terminal.map(|terminal| terminal.status.as_str().to_string()),
+        usage_status: terminal.map(|terminal| terminal.usage_status.as_str().to_string()),
         error_kind: terminal.and_then(|terminal| terminal.error_kind.clone()),
     };
     let event_json = serde_json::to_string(&event).map_err(|error| {
@@ -580,7 +803,7 @@ async fn insert_model_request_context_event_with_expiry(
             .bind(model_family)
             .bind(&event.identity.inference_purpose)
             .bind(checked_optional_i64(
-                usage.map(|usage| usage.request_input_tokens),
+                usage.map(ModelRequestUsage::total_input_tokens),
                 "model request input_tokens",
             )?)
             .bind(checked_optional_i64(
@@ -588,11 +811,11 @@ async fn insert_model_request_context_event_with_expiry(
                 "model request output_tokens",
             )?)
             .bind(checked_optional_i64(
-                usage.map(|usage| usage.cache_read_tokens),
+                usage.map(|usage| usage.input.cache_read_tokens),
                 "model request cache_read_tokens",
             )?)
             .bind(checked_optional_i64(
-                usage.map(|usage| usage.cache_creation_tokens),
+                usage.map(|usage| usage.input.cache_creation_tokens),
                 "model request cache_creation_tokens",
             )?)
             .bind(event_json)
@@ -639,7 +862,7 @@ async fn insert_model_request_context_event_with_expiry(
         .bind(&event.identity.inference_purpose)
         .bind(status)
         .bind(checked_i64(
-            usage.request_input_tokens,
+            usage.total_input_tokens(),
             "model request metric input_tokens",
         )?)
         .bind(checked_i64(
@@ -647,11 +870,11 @@ async fn insert_model_request_context_event_with_expiry(
             "model request metric output_tokens",
         )?)
         .bind(checked_i64(
-            usage.cache_read_tokens,
+            usage.input.cache_read_tokens,
             "model request metric cache_read_tokens",
         )?)
         .bind(checked_i64(
-            usage.cache_creation_tokens,
+            usage.input.cache_creation_tokens,
             "model request metric cache_creation_tokens",
         )?)
         .execute(&mut *connection)
@@ -667,6 +890,161 @@ async fn insert_model_request_context_event_with_expiry(
     Ok(())
 }
 
+async fn insert_recovered_model_request_terminal(
+    db: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    invocation_id: &str,
+    attempt_id: &str,
+    terminal: &DurableInferenceTerminal,
+) -> Result<(), sqlx::Error> {
+    let mut tx = db.begin().await?;
+    insert_recovered_model_request_terminal_tx(
+        &mut tx,
+        user_id,
+        invocation_id,
+        attempt_id,
+        terminal,
+    )
+    .await?;
+    tx.commit().await
+}
+
+async fn insert_recovered_model_request_terminal_tx(
+    connection: &mut sqlx::MySqlConnection,
+    user_id: &str,
+    invocation_id: &str,
+    attempt_id: &str,
+    terminal: &DurableInferenceTerminal,
+) -> Result<(), sqlx::Error> {
+    let accepted = sqlx::query(
+        "SELECT event_json, model_family
+         FROM model_request_context_events
+         WHERE user_id = ? AND invocation_id = ? AND attempt_id = ?
+           AND event_stage = 'accepted'",
+    )
+    .bind(user_id)
+    .bind(invocation_id)
+    .bind(attempt_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+    let Some(accepted) = accepted else {
+        return Err(sqlx::Error::Protocol(format!(
+            "exact provider terminal recovery has no accepted request-context event for {user_id}/{invocation_id}/{attempt_id}"
+        )));
+    };
+    let accepted_json = accepted.try_get::<String, _>("event_json")?;
+    let model_family = accepted.try_get::<String, _>("model_family")?;
+    let mut event = serde_json::from_str::<ModelRequestContextEvent>(&accepted_json)
+        .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+    event.stage = ModelRequestEventStage::Terminal;
+    event.identity.provider_response_id = terminal.provider_response_id.clone();
+    let fresh_input_tokens = u64::try_from(terminal.input_tokens)
+        .map_err(|_| sqlx::Error::Protocol("negative recovered fresh input tokens".to_string()))?;
+    let cache_read_tokens = u64::try_from(terminal.cache_read_tokens)
+        .map_err(|_| sqlx::Error::Protocol("negative recovered cache-read tokens".to_string()))?;
+    let cache_creation_tokens = u64::try_from(terminal.cache_creation_tokens).map_err(|_| {
+        sqlx::Error::Protocol("negative recovered cache-creation tokens".to_string())
+    })?;
+    let output_tokens = u64::try_from(terminal.output_tokens)
+        .map_err(|_| sqlx::Error::Protocol("negative recovered output tokens".to_string()))?;
+    let usage = ModelRequestUsage {
+        input: astra_turn_types::NormalizedPromptCacheUsage::new(
+            fresh_input_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+        ),
+        output_tokens,
+    };
+    let measured = usage.total_input_tokens();
+    event.budget.measured_input_tokens = Some(measured);
+    event.budget.usage_source = Some("provider_terminal_recovery".to_string());
+    if let Some(estimated) = event.budget.estimated_input_tokens {
+        let error = i128::from(measured) - i128::from(estimated);
+        event.budget.estimate_error_tokens =
+            Some(i64::try_from(error).unwrap_or(if error.is_negative() {
+                i64::MIN
+            } else {
+                i64::MAX
+            }));
+        event.budget.estimate_error_ratio =
+            (estimated > 0).then_some(error as f64 / estimated as f64);
+    }
+    event.cache.cache_read_share =
+        (measured > 0).then_some(usage.input.cache_read_tokens as f64 / measured as f64);
+    event.usage = Some(usage.clone());
+    event.terminal_status = Some(terminal.status.clone());
+    event.usage_status = Some(terminal.usage_status.clone());
+    event.error_kind = terminal.error_kind.clone();
+    let event_json =
+        serde_json::to_string(&event).map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+    let event_id = hash_identity(
+        "mrctx",
+        &[attempt_id, ModelRequestEventStage::Terminal.as_str()],
+    );
+    let total_input_tokens = terminal
+        .input_tokens
+        .checked_add(terminal.cache_read_tokens)
+        .and_then(|total| total.checked_add(terminal.cache_creation_tokens))
+        .ok_or_else(|| sqlx::Error::Protocol("recovered input token total overflow".to_string()))?;
+    let inserted = sqlx::query(
+        "INSERT IGNORE INTO model_request_context_events
+         (event_id, user_id, attempt_id, invocation_id, session_id, run_id, harness_run_id,
+          event_stage, terminal_status, topology, provider, model_family, purpose,
+          input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+          event_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'terminal', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+    )
+    .bind(event_id)
+    .bind(user_id)
+    .bind(attempt_id)
+    .bind(invocation_id)
+    .bind(event.identity.session_id.as_deref())
+    .bind(event.identity.run_id.as_deref())
+    .bind(event.identity.harness_run_id.as_deref())
+    .bind(&terminal.status)
+    .bind(event.identity.topology.as_str())
+    .bind(&event.identity.provider)
+    .bind(&model_family)
+    .bind(&event.identity.inference_purpose)
+    .bind(total_input_tokens)
+    .bind(terminal.output_tokens)
+    .bind(terminal.cache_read_tokens)
+    .bind(terminal.cache_creation_tokens)
+    .bind(event_json)
+    .execute(&mut *connection)
+    .await?;
+    if inserted.rows_affected() == 0 {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO model_request_metric_shards
+         (metric_shard, topology, provider, model_family, purpose, terminal_status,
+          requests, input_tokens, output_tokens, cache_read_tokens,
+          cache_creation_tokens, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, NOW(6))
+         ON DUPLICATE KEY UPDATE
+          requests = requests + 1,
+          input_tokens = input_tokens + VALUES(input_tokens),
+          output_tokens = output_tokens + VALUES(output_tokens),
+          cache_read_tokens = cache_read_tokens + VALUES(cache_read_tokens),
+          cache_creation_tokens = cache_creation_tokens + VALUES(cache_creation_tokens),
+          updated_at = NOW(6)",
+    )
+    .bind(model_request_metric_shard(attempt_id))
+    .bind(event.identity.topology.as_str())
+    .bind(&event.identity.provider)
+    .bind(model_family)
+    .bind(&event.identity.inference_purpose)
+    .bind(&terminal.status)
+    .bind(total_input_tokens)
+    .bind(terminal.output_tokens)
+    .bind(terminal.cache_read_tokens)
+    .bind(terminal.cache_creation_tokens)
+    .execute(&mut *connection)
+    .await?;
+    Ok(())
+}
+
 async fn rollback_inference_tx(tx: sqlx::Transaction<'_, sqlx::MySql>, operation: &'static str) {
     if let Err(error) = tx.rollback().await {
         tracing::warn!(
@@ -678,105 +1056,231 @@ async fn rollback_inference_tx(tx: sqlx::Transaction<'_, sqlx::MySql>, operation
     }
 }
 
-async fn ensure_invocation_scope(
-    connection: &mut sqlx::MySqlConnection,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InvocationScopeAuthority {
+    Live,
+    Unavailable,
+}
+
+async fn lock_invocation_scope_authority(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     input: &InferenceInvocationInput,
-) -> ServiceResult<()> {
-    let exists = match &input.scope {
+) -> ServiceResult<InvocationScopeAuthority> {
+    // This is an ownership/lifecycle observation inside the admission
+    // transaction. MatrixOne's supported row-lock primitive here is
+    // `FOR UPDATE`; the shared storage primitive establishes the global
+    // session -> tombstone -> execution-slot -> exact-run order before this
+    // function observes run events. Keep those locks only through the durable
+    // invocation insert. Sibling fanout admissions may briefly queue on this
+    // scope lock, but provider I/O never occurs inside the transaction, so the
+    // execution topology remains parallel. The durable logical-invocation row
+    // remains the idempotency authority.
+    let authority = match &input.scope {
         InferenceInvocationScope::Run {
             session_id, run_id, ..
         } => {
-            let session_exists = sqlx::query(
-                "SELECT 1 FROM agent_sessions
-                 WHERE user_id = ? AND session_id = ? AND status <> 'deleting'
-                 LIMIT 1 FOR UPDATE",
-            )
-            .bind(&input.user_id)
-            .bind(session_id)
-            .fetch_optional(&mut *connection)
-            .await
-            .map_err(|error| {
-                ServiceError::with_source(
-                    ServiceErrorKind::Persistence,
-                    "verify inference session scope",
-                    error,
+            let expected = input.run_authority.as_ref().ok_or_else(|| {
+                ServiceError::invalid(
+                    "run-scoped inference requires exact durable execution authority",
                 )
-            })?
-            .is_some();
-            session_exists
-                && sqlx::query(
-                    "SELECT 1 FROM agent_runs
+            })?;
+            let run_exists = match crate::storage::admit_session_scoped_run_write(
+                tx,
+                session_id,
+                &input.user_id,
+                run_id,
+                false,
+            )
+            .await
+            {
+                Ok(run_exists) => run_exists,
+                Err(sqlx::Error::RowNotFound) => false,
+                Err(error) => {
+                    return Err(ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "lock canonical inference session/run scope",
+                        error,
+                    ));
+                }
+            };
+            if !run_exists {
+                InvocationScopeAuthority::Unavailable
+            } else {
+                let row = sqlx::query(
+                    "SELECT status, run_generation, owner_pod_id, last_event_idx,
+                            CAST(cancellation_requested_at IS NOT NULL AS SIGNED)
+                                AS cancellation_requested,
+                            CAST(CASE WHEN owner_lease_expires_at >= NOW(6) THEN 1 ELSE 0 END AS SIGNED)
+                                AS owner_lease_active
+                     FROM agent_runs
                      WHERE user_id = ? AND session_id = ? AND run_id = ?
                      LIMIT 1 FOR UPDATE",
                 )
                 .bind(&input.user_id)
                 .bind(session_id)
                 .bind(run_id)
-                .fetch_optional(&mut *connection)
+                .fetch_optional(&mut **tx)
                 .await
                 .map_err(|error| {
                     ServiceError::with_source(
                         ServiceErrorKind::Persistence,
-                        "verify inference run scope",
+                        "verify inference run execution authority",
                         error,
                     )
-                })?
-                .is_some()
+                })?;
+                let Some(row) = row else {
+                    return Ok(InvocationScopeAuthority::Unavailable);
+                };
+                let status: String = row.try_get("status").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode inference run status",
+                        error,
+                    )
+                })?;
+                let stored_generation: i64 = row.try_get("run_generation").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode inference run generation",
+                        error,
+                    )
+                })?;
+                let owner_pod_id: Option<String> =
+                    row.try_get("owner_pod_id").map_err(|error| {
+                        ServiceError::with_source(
+                            ServiceErrorKind::Persistence,
+                            "decode inference run owner",
+                            error,
+                        )
+                    })?;
+                let last_event_idx: i64 = row.try_get("last_event_idx").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode inference run control epoch",
+                        error,
+                    )
+                })?;
+                let lease_active: i64 = row.try_get("owner_lease_active").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode inference run owner lease",
+                        error,
+                    )
+                })?;
+                let cancellation_requested: i64 =
+                    row.try_get("cancellation_requested").map_err(|error| {
+                        ServiceError::with_source(
+                            ServiceErrorKind::Persistence,
+                            "decode inference run cancellation fence",
+                            error,
+                        )
+                    })?;
+                let expected_generation = i64::try_from(expected.expected_owner_generation)
+                    .map_err(|_| {
+                        ServiceError::invalid(
+                            "expected_owner_generation exceeds the durable BIGINT range",
+                        )
+                    })?;
+                if expected.expected_control_epoch > last_event_idx {
+                    return Err(ServiceError::invalid(format!(
+                        "inference control epoch {} is ahead of durable run event index {}",
+                        expected.expected_control_epoch, last_event_idx
+                    )));
+                }
+                if status != "running"
+                    || stored_generation != expected_generation
+                    || owner_pod_id.as_deref() != Some(expected.expected_owner_pod_id.as_str())
+                    || lease_active != 1
+                    || cancellation_requested != 0
+                {
+                    InvocationScopeAuthority::Unavailable
+                } else {
+                    // The run row is held before its event range, preserving
+                    // canonical session -> tombstone/slot -> run -> run-events
+                    // lock order. Any
+                    // later guidance is an execution fence. User cancellation
+                    // is represented by the run row marker locked above;
+                    // execution-owner cancellation atomically makes the row
+                    // terminal, so neither requires an event-history probe.
+                    let control_fence: Option<i64> = sqlx::query_scalar(
+                        "SELECT event_idx FROM agent_run_events
+                         WHERE user_id = ? AND run_id = ?
+                           AND event_type = 'user_intent' AND event_idx > ?
+                         ORDER BY event_idx ASC LIMIT 1",
+                    )
+                    .bind(&input.user_id)
+                    .bind(run_id)
+                    .bind(expected.expected_control_epoch)
+                    .fetch_optional(&mut **tx)
+                    .await
+                    .map_err(|error| {
+                        ServiceError::with_source(
+                            ServiceErrorKind::Persistence,
+                            "verify inference run control fence",
+                            error,
+                        )
+                    })?;
+                    if control_fence.is_some() {
+                        InvocationScopeAuthority::Unavailable
+                    } else {
+                        InvocationScopeAuthority::Live
+                    }
+                }
+            }
         }
-        InferenceInvocationScope::Session { session_id, .. } => sqlx::query(
-            "SELECT 1 FROM agent_sessions
-             WHERE user_id = ? AND session_id = ? AND status <> 'deleting'
-             LIMIT 1 FOR UPDATE",
-        )
-        .bind(&input.user_id)
-        .bind(session_id)
-        .fetch_optional(&mut *connection)
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "verify inference session scope",
-                error,
+        InferenceInvocationScope::Session { session_id, .. } => {
+            match crate::storage::admit_session_event_write(tx, session_id, &input.user_id, false)
+                .await
+            {
+                Ok(()) => InvocationScopeAuthority::Live,
+                Err(sqlx::Error::RowNotFound) => InvocationScopeAuthority::Unavailable,
+                Err(error) => {
+                    return Err(ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "lock canonical inference session scope",
+                        error,
+                    ));
+                }
+            }
+        }
+        InferenceInvocationScope::HarnessRun { harness_run_id, .. } => {
+            let status = sqlx::query_scalar::<_, String>(
+                "SELECT status FROM harness_runs
+                 WHERE user_id = ? AND harness_run_id = ? LIMIT 1 FOR UPDATE",
             )
-        })?
-        .is_some(),
-        InferenceInvocationScope::HarnessRun { harness_run_id, .. } => sqlx::query(
-            "SELECT 1 FROM harness_runs
-             WHERE user_id = ? AND harness_run_id = ? LIMIT 1 FOR UPDATE",
-        )
-        .bind(&input.user_id)
-        .bind(harness_run_id)
-        .fetch_optional(&mut *connection)
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "verify inference harness scope",
-                error,
-            )
-        })?
-        .is_some(),
+            .bind(&input.user_id)
+            .bind(harness_run_id)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "verify inference harness scope",
+                    error,
+                )
+            })?;
+            match status.as_deref() {
+                Some("running") => InvocationScopeAuthority::Live,
+                Some(_) | None => InvocationScopeAuthority::Unavailable,
+            }
+        }
     };
-    if !exists {
-        return Err(ServiceError::not_found(format!(
-            "inference {} scope does not exist for user_id={} owner_id={}",
-            input.scope.kind(),
-            input.user_id,
-            input
-                .scope
-                .run_id()
-                .or_else(|| input.scope.session_id())
-                .or_else(|| input.scope.harness_run_id())
-                .unwrap_or("none")
-        )));
-    }
-    Ok(())
+    Ok(authority)
+}
+
+fn unavailable_scope_error(input: &InferenceInvocationInput) -> ServiceError {
+    ServiceError::not_found(format!(
+        "inference {} scope is unavailable or no longer owned by this execution",
+        input.scope.kind()
+    ))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PersistedInvocationAdmissionFact {
     route_id: String,
     admission_token: String,
+    owner_token: String,
+    owner_generation: i64,
     status: String,
     terminal_fingerprint: Option<String>,
 }
@@ -786,7 +1290,8 @@ async fn load_invocation_admission_fact(
     plan: &InferenceInvocationPlan,
 ) -> ServiceResult<Option<PersistedInvocationAdmissionFact>> {
     sqlx::query(
-        "SELECT route_id, admission_token, status, terminal_fingerprint
+        "SELECT route_id, admission_token, owner_token, owner_generation,
+                status, terminal_fingerprint
          FROM inference_invocations
          WHERE user_id = ? AND invocation_id = ? LIMIT 1",
     )
@@ -805,6 +1310,8 @@ async fn load_invocation_admission_fact(
         Ok::<_, sqlx::Error>(PersistedInvocationAdmissionFact {
             route_id: row.try_get("route_id")?,
             admission_token: row.try_get("admission_token")?,
+            owner_token: row.try_get("owner_token")?,
+            owner_generation: row.try_get("owner_generation")?,
             status: row.try_get("status")?,
             terminal_fingerprint: row.try_get("terminal_fingerprint")?,
         })
@@ -841,6 +1348,12 @@ fn validate_ambiguous_invocation_admission(
     if persisted.admission_token != plan.admission_token {
         mismatches.push("admission_token");
     }
+    if persisted.owner_token != plan.owner_token {
+        mismatches.push("owner_token");
+    }
+    if persisted.owner_generation != i64::try_from(plan.owner_generation).unwrap_or(i64::MAX) {
+        mismatches.push("owner_generation");
+    }
     if !mismatches.is_empty() {
         return Err(ServiceError::conflict(format!(
             "inference invocation {} commit resolved to a different admission owner: {}",
@@ -861,88 +1374,6 @@ fn validate_ambiguous_invocation_admission(
             "missing"
         }
     )))
-}
-
-async fn insert_inference_invocation_admission(
-    connection: &mut sqlx::MySqlConnection,
-    plan: &InferenceInvocationPlan,
-) -> ServiceResult<()> {
-    ensure_invocation_scope(connection, &plan.input).await?;
-    let route_insert_sql = matrixone_statement_with_null_shape(
-        "INSERT INTO inference_routes
-         (route_id, user_id, session_id, scope_kind, run_id, harness_run_id,
-          offering_id, resolved_model_name,
-          upstream_model_name, provider, execution_placement, access_kind, purpose, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
-        [
-            plan.input.scope.session_id().is_some(),
-            plan.input.scope.run_id().is_some(),
-            plan.input.scope.harness_run_id().is_some(),
-        ],
-    );
-    sqlx::query(&route_insert_sql)
-        .bind(&plan.route_id)
-        .bind(&plan.input.user_id)
-        .bind(plan.input.scope.session_id())
-        .bind(plan.input.scope.kind())
-        .bind(plan.input.scope.run_id())
-        .bind(plan.input.scope.harness_run_id())
-        .bind(&plan.input.offering_id)
-        .bind(&plan.input.resolved_model_name)
-        .bind(&plan.input.upstream_model_name)
-        .bind(&plan.input.provider)
-        .bind(plan.input.execution_placement.as_str())
-        .bind(plan.input.access_kind.as_str())
-        .bind(plan.input.purpose.as_str())
-        .execute(&mut *connection)
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "insert inference route",
-                error,
-            )
-        })?;
-
-    let invocation_insert_sql = matrixone_statement_with_null_shape(
-        "INSERT INTO inference_invocations
-         (invocation_id, route_id, user_id, session_id, scope_kind, run_id, harness_run_id,
-          admission_token, turn_index,
-          round_index, operation_id, logical_attempt, purpose, status, created_at, terminal_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'admitted', NOW(6), NULL)",
-        [
-            plan.input.scope.session_id().is_some(),
-            plan.input.scope.run_id().is_some(),
-            plan.input.scope.harness_run_id().is_some(),
-            plan.input.scope.turn().is_some(),
-            plan.input.scope.round().is_some(),
-        ],
-    );
-    sqlx::query(&invocation_insert_sql)
-        .bind(&plan.invocation_id)
-        .bind(&plan.route_id)
-        .bind(&plan.input.user_id)
-        .bind(plan.input.scope.session_id())
-        .bind(plan.input.scope.kind())
-        .bind(plan.input.scope.run_id())
-        .bind(plan.input.scope.harness_run_id())
-        .bind(&plan.admission_token)
-        .bind(plan.input.scope.turn().map(i64::from))
-        .bind(plan.input.scope.round().map(i64::from))
-        .bind(plan.input.scope.operation_id())
-        .bind(i64::from(plan.input.scope.logical_attempt()))
-        .bind(plan.input.purpose.as_str())
-        .execute(&mut *connection)
-        .await
-        .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "insert inference invocation",
-                error,
-            )
-        })?;
-
-    Ok(())
 }
 
 /// Durably admit one logical inference.
@@ -967,7 +1398,15 @@ pub async fn admit_inference_invocation(
             error,
         )
     })?;
-    let write_result = insert_inference_invocation_admission(&mut tx, plan).await;
+    let write_result: ServiceResult<()> = async {
+        if lock_invocation_scope_authority(&mut tx, &plan.input).await?
+            != InvocationScopeAuthority::Live
+        {
+            return Err(unavailable_scope_error(&plan.input));
+        }
+        insert_inference_invocation_admission(&mut tx, plan).await
+    }
+    .await;
 
     if let Err(error) = write_result {
         rollback_inference_tx(tx, "admit_inference_invocation").await;
@@ -1000,6 +1439,340 @@ pub async fn admit_inference_invocation(
                 invocation_id = %plan.invocation_id,
                 %read_error,
                 "inference admission commit is unresolved after authoritative re-read failed"
+            );
+            Err(commit_error)
+        }
+    }
+}
+
+async fn insert_inference_invocation_admission(
+    connection: &mut sqlx::MySqlConnection,
+    plan: &InferenceInvocationPlan,
+) -> ServiceResult<()> {
+    // Keep the enum discriminant and its owner coordinates in one SQL shape.
+    // A generic row with three independently nullable owner binds asks the
+    // database/driver to reconstruct the Rust enum under concurrency and has
+    // produced impossible mixed rows at the CHECK boundary. Variant-specific
+    // statements make every submitted row valid by construction; the CHECKs
+    // remain defense in depth for non-Rust writers.
+    let route_query = match &plan.input.scope {
+        InferenceInvocationScope::Run {
+            session_id, run_id, ..
+        } => sqlx::query(
+            "INSERT INTO inference_routes
+                 (route_id, user_id, session_id, scope_kind, run_id,
+                  offering_id, resolved_model_name, upstream_model_name, provider,
+                  execution_placement, access_kind, purpose, created_at)
+                 VALUES (?, ?, ?, 'run', ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+        )
+        .bind(&plan.route_id)
+        .bind(&plan.input.user_id)
+        .bind(session_id)
+        .bind(run_id),
+        InferenceInvocationScope::Session { session_id, .. } => sqlx::query(
+            "INSERT INTO inference_routes
+                 (route_id, user_id, session_id, scope_kind,
+                  offering_id, resolved_model_name, upstream_model_name, provider,
+                  execution_placement, access_kind, purpose, created_at)
+                 VALUES (?, ?, ?, 'session', ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+        )
+        .bind(&plan.route_id)
+        .bind(&plan.input.user_id)
+        .bind(session_id),
+        InferenceInvocationScope::HarnessRun { harness_run_id, .. } => sqlx::query(
+            "INSERT INTO inference_routes
+                 (route_id, user_id, scope_kind, harness_run_id,
+                  offering_id, resolved_model_name, upstream_model_name, provider,
+                  execution_placement, access_kind, purpose, created_at)
+                 VALUES (?, ?, 'harness_run', ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+        )
+        .bind(&plan.route_id)
+        .bind(&plan.input.user_id)
+        .bind(harness_run_id),
+    };
+    route_query
+        .bind(&plan.input.offering_id)
+        .bind(&plan.input.resolved_model_name)
+        .bind(&plan.input.upstream_model_name)
+        .bind(&plan.input.provider)
+        .bind(plan.input.execution_placement.as_str())
+        .bind(plan.input.access_kind.as_str())
+        .bind(plan.input.purpose.as_str())
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "insert inference route",
+                error,
+            )
+        })?;
+
+    let invocation_query = match &plan.input.scope {
+        InferenceInvocationScope::Run {
+            session_id, run_id, ..
+        } => sqlx::query(
+            "INSERT INTO inference_invocations
+                 (invocation_id, route_id, user_id, session_id, scope_kind, run_id,
+                  admission_token, owner_token, owner_generation, owner_lease_expires_at,
+                  turn_index, round_index, operation_id, logical_attempt, purpose, status,
+                  terminal_fingerprint, usage_status, provider_delivery_state, created_at, terminal_at)
+                 VALUES (?, ?, ?, ?, 'run', ?, ?, ?, ?,
+                         DATE_ADD(NOW(6), INTERVAL 60 SECOND), ?, ?, ?, ?, ?,
+                         'admitted', NULL, 'unavailable', 'unknown', NOW(6), NULL)",
+        )
+        .bind(&plan.invocation_id)
+        .bind(&plan.route_id)
+        .bind(&plan.input.user_id)
+        .bind(session_id)
+        .bind(run_id),
+        InferenceInvocationScope::Session { session_id, .. } => sqlx::query(
+            "INSERT INTO inference_invocations
+                 (invocation_id, route_id, user_id, session_id, scope_kind,
+                  admission_token, owner_token, owner_generation, owner_lease_expires_at,
+                  turn_index, round_index, operation_id, logical_attempt, purpose, status,
+                  terminal_fingerprint, usage_status, provider_delivery_state, created_at, terminal_at)
+                 VALUES (?, ?, ?, ?, 'session', ?, ?, ?,
+                         DATE_ADD(NOW(6), INTERVAL 60 SECOND), ?, ?, ?, ?, ?,
+                         'admitted', NULL, 'unavailable', 'unknown', NOW(6), NULL)",
+        )
+        .bind(&plan.invocation_id)
+        .bind(&plan.route_id)
+        .bind(&plan.input.user_id)
+        .bind(session_id),
+        InferenceInvocationScope::HarnessRun { harness_run_id, .. } => sqlx::query(
+            "INSERT INTO inference_invocations
+                 (invocation_id, route_id, user_id, scope_kind, harness_run_id,
+                  admission_token, owner_token, owner_generation, owner_lease_expires_at,
+                  operation_id, logical_attempt, purpose, status, terminal_fingerprint,
+                  usage_status, provider_delivery_state, created_at, terminal_at)
+                 VALUES (?, ?, ?, 'harness_run', ?, ?, ?, ?,
+                         DATE_ADD(NOW(6), INTERVAL 60 SECOND), ?, ?, ?,
+                         'admitted', NULL, 'unavailable', 'unknown', NOW(6), NULL)",
+        )
+        .bind(&plan.invocation_id)
+        .bind(&plan.route_id)
+        .bind(&plan.input.user_id)
+        .bind(harness_run_id),
+    };
+    let invocation_query = invocation_query
+        .bind(&plan.admission_token)
+        .bind(&plan.owner_token)
+        .bind(i64::try_from(plan.owner_generation).map_err(|_| {
+            ServiceError::invalid("inference owner generation exceeds the durable BIGINT range")
+        })?);
+    let invocation_query = match &plan.input.scope {
+        InferenceInvocationScope::Run { turn, round, .. }
+        | InferenceInvocationScope::Session { turn, round, .. } => invocation_query
+            .bind(i64::from(*turn))
+            .bind(i64::from(*round)),
+        InferenceInvocationScope::HarnessRun { .. } => invocation_query,
+    };
+    invocation_query
+        .bind(plan.input.scope.operation_id())
+        .bind(i64::from(plan.input.scope.logical_attempt()))
+        .bind(plan.input.purpose.as_str())
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "insert inference invocation",
+                error,
+            )
+        })?;
+    Ok(())
+}
+
+/// Recover an admission whose caller stopped waiting before the database
+/// acknowledgement arrived, without inferring a rollback from a negative read.
+///
+/// If the original transaction rolled back, this transaction inserts the exact
+/// same logical identity. If it committed, the durable invocation row and its
+/// admission token decide the outcome. Scope validation uses the same short
+/// `FOR UPDATE` lock as the original transaction, so deletion cannot race the
+/// recovery insert.
+pub async fn settle_uncertain_inference_admission(
+    pool: &SharedPool,
+    plan: &InferenceInvocationPlan,
+    terminal: &InferenceInvocationTerminal,
+) -> ServiceResult<InferenceInvocationAdmissionResolution> {
+    if terminal.status != InferenceTerminalStatus::Cancelled
+        || terminal.usage != InferenceUsage::default()
+        || terminal.usage_status != InferenceUsageStatus::Unavailable
+        || terminal.provider_response_id.is_some()
+    {
+        return Err(ServiceError::invalid(
+            "an uncertain logical admission may settle only as a zero-usage pre-provider cancellation",
+        ));
+    }
+    let fingerprint = terminal_fingerprint(terminal)?;
+    let durable_terminal = DurableInferenceTerminal::from_terminal(terminal, fingerprint.clone())?;
+    let db = pool.get();
+    let mut tx = db.begin().await.map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "begin inference admission recovery",
+            error,
+        )
+    })?;
+    let scope_authority = match lock_invocation_scope_authority(&mut tx, &plan.input).await {
+        Ok(authority) => authority,
+        Err(error) => {
+            rollback_inference_tx(tx, "settle_uncertain_inference_admission").await;
+            return Err(error);
+        }
+    };
+    let row = sqlx::query(
+        "SELECT route_id, admission_token, owner_token, owner_generation,
+                status, terminal_fingerprint,
+                IF(owner_lease_expires_at > NOW(6), 1, 0) AS lease_live
+         FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ? LIMIT 1 FOR UPDATE",
+    )
+    .bind(&plan.input.user_id)
+    .bind(&plan.invocation_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "read inference admission resolution",
+            error,
+        )
+    })?;
+    let mut resolution = match row {
+        None => {
+            if scope_authority == InvocationScopeAuthority::Live {
+                insert_inference_invocation_admission(&mut tx, plan).await?;
+                InferenceInvocationAdmissionResolution::Settled
+            } else {
+                InferenceInvocationAdmissionResolution::ScopeUnavailable
+            }
+        }
+        Some(row) => {
+            let lease_live = row.try_get::<i64, _>("lease_live").map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "decode resolved inference owner lease",
+                    error,
+                )
+            })? == 1;
+            let persisted = PersistedInvocationAdmissionFact {
+                route_id: row.try_get("route_id").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode resolved inference route",
+                        error,
+                    )
+                })?,
+                admission_token: row.try_get("admission_token").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode resolved inference admission token",
+                        error,
+                    )
+                })?,
+                owner_token: row.try_get("owner_token").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode resolved inference owner token",
+                        error,
+                    )
+                })?,
+                owner_generation: row.try_get("owner_generation").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode resolved inference owner generation",
+                        error,
+                    )
+                })?,
+                status: row.try_get("status").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode resolved inference status",
+                        error,
+                    )
+                })?,
+                terminal_fingerprint: row.try_get("terminal_fingerprint").map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode resolved inference terminal fingerprint",
+                        error,
+                    )
+                })?,
+            };
+            if persisted.route_id != plan.route_id
+                || persisted.admission_token != plan.admission_token
+                || persisted.owner_token != plan.owner_token
+                || persisted.owner_generation
+                    != i64::try_from(plan.owner_generation).unwrap_or(i64::MAX)
+            {
+                InferenceInvocationAdmissionResolution::ConflictingIdentity
+            } else if persisted.status == "admitted" && persisted.terminal_fingerprint.is_none() {
+                if lease_live {
+                    InferenceInvocationAdmissionResolution::Settled
+                } else {
+                    InferenceInvocationAdmissionResolution::ConflictingIdentity
+                }
+            } else if persisted.status == terminal.status.as_str()
+                && persisted.terminal_fingerprint.as_deref() == Some(fingerprint.as_str())
+            {
+                InferenceInvocationAdmissionResolution::ExactTerminal
+            } else {
+                InferenceInvocationAdmissionResolution::ConflictingIdentity
+            }
+        }
+    };
+    let wrote_settlement_debt = resolution == InferenceInvocationAdmissionResolution::Settled;
+    if wrote_settlement_debt {
+        write_inference_settlement_debt(
+            &mut tx,
+            &plan.input.user_id,
+            &plan.invocation_id,
+            &durable_terminal,
+            None,
+            ProviderDeliveryState::PreDelivery,
+        )
+        .await?;
+    }
+    if scope_authority == InvocationScopeAuthority::Unavailable
+        && matches!(
+            resolution,
+            InferenceInvocationAdmissionResolution::Settled
+                | InferenceInvocationAdmissionResolution::ExactTerminal
+        )
+    {
+        resolution = InferenceInvocationAdmissionResolution::AuthorityLost;
+    }
+    let Err(error) = tx.commit().await else {
+        return Ok(resolution);
+    };
+    let commit_error = ServiceError::with_source(
+        ServiceErrorKind::Persistence,
+        "commit uncertain inference admission settlement",
+        error,
+    );
+    if !wrote_settlement_debt {
+        return Err(commit_error);
+    }
+    match inference_settlement_debt_matches(
+        db,
+        &plan.input.user_id,
+        &plan.invocation_id,
+        &durable_terminal,
+        None,
+        ProviderDeliveryState::PreDelivery,
+    )
+    .await
+    {
+        Ok(true) => Ok(resolution),
+        Ok(false) => Err(commit_error),
+        Err(read_error) => {
+            tracing::warn!(
+                invocation_id = %plan.invocation_id,
+                %read_error,
+                "uncertain inference admission settlement commit could not be confirmed"
             );
             Err(commit_error)
         }
@@ -1360,10 +2133,17 @@ async fn lock_admitted_inference_invocation(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     user_id: &str,
     invocation_id: &str,
+    owner_token: &str,
+    owner_generation: u64,
     action: &'static str,
 ) -> ServiceResult<()> {
-    let status = sqlx::query(
-        "SELECT status FROM inference_invocations
+    let owner_generation = i64::try_from(owner_generation).map_err(|_| {
+        ServiceError::invalid("inference owner generation exceeds the durable BIGINT range")
+    })?;
+    let row = sqlx::query(
+        "SELECT status, owner_token, owner_generation,
+                IF(owner_lease_expires_at > NOW(6), 1, 0) AS lease_live
+         FROM inference_invocations
          WHERE user_id = ? AND invocation_id = ?
          FOR UPDATE",
     )
@@ -1377,24 +2157,93 @@ async fn lock_admitted_inference_invocation(
             "lock inference invocation lifecycle",
             error,
         )
-    })?
-    .map(|row| row.try_get::<String, _>("status"))
-    .transpose()
-    .map_err(|error| {
+    })?;
+    let Some(row) = row else {
+        return Err(ServiceError::conflict(format!(
+            "inference invocation {invocation_id} is unavailable; cannot {action}"
+        )));
+    };
+    let status = row.try_get::<String, _>("status").map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
             "decode locked inference invocation status",
             error,
         )
     })?;
-    match status.as_deref() {
-        Some("admitted") => Ok(()),
-        Some(status) => Err(ServiceError::conflict(format!(
+    let durable_owner_token = row.try_get::<String, _>("owner_token").map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "decode locked inference owner token",
+            error,
+        )
+    })?;
+    let durable_owner_generation = row.try_get::<i64, _>("owner_generation").map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "decode locked inference owner generation",
+            error,
+        )
+    })?;
+    let lease_live = row.try_get::<i64, _>("lease_live").map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "decode locked inference owner lease",
+            error,
+        )
+    })? == 1;
+    if durable_owner_token != owner_token || durable_owner_generation != owner_generation {
+        return Err(ServiceError::conflict(format!(
+            "inference invocation {invocation_id} belongs to a different owner generation; cannot {action}"
+        )));
+    }
+    match status.as_str() {
+        "admitted" if lease_live => Ok(()),
+        "admitted" => Err(ServiceError::conflict(format!(
+            "inference invocation {invocation_id} owner lease expired; cannot {action}"
+        ))),
+        status => Err(ServiceError::conflict(format!(
             "inference invocation {invocation_id} is {status}; cannot {action}"
         ))),
-        None => Err(ServiceError::conflict(format!(
-            "inference invocation {invocation_id} is unavailable; cannot {action}"
-        ))),
+    }
+}
+
+/// Extend the current owner's lease using the database clock. An expired lease
+/// is never resurrected: recovery owns the next generation once the deadline
+/// passes, even if the old process later regains connectivity.
+pub async fn renew_inference_invocation_owner(
+    pool: &SharedPool,
+    plan: &InferenceInvocationPlan,
+) -> ServiceResult<()> {
+    let owner_generation = i64::try_from(plan.owner_generation).map_err(|_| {
+        ServiceError::invalid("inference owner generation exceeds the durable BIGINT range")
+    })?;
+    let updated = sqlx::query(
+        "UPDATE inference_invocations
+         SET owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL 60 SECOND)
+         WHERE user_id = ? AND invocation_id = ? AND status = 'admitted'
+           AND owner_token = ? AND owner_generation = ?
+           AND owner_lease_expires_at > NOW(6)",
+    )
+    .bind(&plan.input.user_id)
+    .bind(&plan.invocation_id)
+    .bind(&plan.owner_token)
+    .bind(owner_generation)
+    .execute(pool.get())
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "renew inference owner lease",
+            error,
+        )
+    })?;
+    if updated.rows_affected() == 1 {
+        Ok(())
+    } else {
+        Err(ServiceError::conflict(format!(
+            "inference invocation {} owner lease is no longer renewable",
+            plan.invocation_id
+        )))
     }
 }
 
@@ -1419,13 +2268,47 @@ pub async fn begin_inference_provider_attempt(
             error,
         )
     })?;
+    if lock_invocation_scope_authority(&mut tx, &attempt.invocation_input).await?
+        != InvocationScopeAuthority::Live
+    {
+        rollback_inference_tx(tx, "begin_inference_provider_attempt_scope_authority").await;
+        return Err(unavailable_scope_error(&attempt.invocation_input));
+    }
+    // Provider-attempt admission is the final durable fence before HTTP. Keep
+    // the canonical scope -> invocation lock order so a session deletion, run
+    // owner transfer, lease expiry, or newer control fact cannot slip between
+    // logical admission and physical delivery authorization.
     lock_admitted_inference_invocation(
         &mut tx,
         &attempt.user_id,
         &attempt.invocation_id,
+        &attempt.owner_token,
+        attempt.owner_generation,
         "begin a provider attempt",
     )
     .await?;
+    sqlx::query(
+        "UPDATE inference_invocations
+         SET owner_lease_expires_at = DATE_ADD(NOW(6), INTERVAL 60 SECOND)
+         WHERE user_id = ? AND invocation_id = ? AND status = 'admitted'
+           AND owner_token = ? AND owner_generation = ?
+           AND owner_lease_expires_at > NOW(6)",
+    )
+    .bind(&attempt.user_id)
+    .bind(&attempt.invocation_id)
+    .bind(&attempt.owner_token)
+    .bind(i64::try_from(attempt.owner_generation).map_err(|_| {
+        ServiceError::invalid("inference owner generation exceeds the durable BIGINT range")
+    })?)
+    .execute(&mut *tx)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "extend inference owner lease before provider delivery",
+            error,
+        )
+    })?;
     let settlement_pending = sqlx::query(
         "SELECT 1 FROM inference_invocation_settlement_debts
          WHERE user_id = ? AND invocation_id = ?
@@ -1444,44 +2327,137 @@ pub async fn begin_inference_provider_attempt(
     })?
     .is_some();
     if settlement_pending {
+        rollback_inference_tx(tx, "begin_provider_attempt_settlement_pending").await;
         return Err(ServiceError::conflict(format!(
             "inference invocation {} has a durable settlement decision; provider delivery must not be repeated",
             attempt.invocation_id
         )));
     }
-    if let Err(error) =
-        insert_inference_provider_attempt_admission(&mut tx, attempt, provider_wire_bytes).await
-    {
-        rollback_inference_tx(tx, "begin_inference_provider_attempt").await;
-        if let Some(persisted) = load_provider_attempt_fact(db, attempt).await? {
-            validate_persisted_provider_attempt_identity(&persisted, attempt, provider_wire_bytes)?;
-            return Err(ServiceError::conflict(format!(
-                "inference provider attempt {} already exists with status {}; provider delivery must not be repeated",
-                attempt.attempt_id, persisted.status
-            )));
-        }
-        return Err(error);
+    let provider_attempt_open = sqlx::query(
+        "SELECT 1 FROM inference_provider_attempts
+         WHERE user_id = ? AND invocation_id = ? AND status = 'started'
+         LIMIT 1",
+    )
+    .bind(&attempt.user_id)
+    .bind(&attempt.invocation_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "check open inference provider attempt",
+            error,
+        )
+    })?
+    .is_some();
+    if provider_attempt_open {
+        rollback_inference_tx(tx, "begin_provider_attempt_already_open").await;
+        return Err(ServiceError::conflict(format!(
+            "inference invocation {} already has an open provider attempt; concurrent provider delivery is forbidden",
+            attempt.invocation_id
+        )));
     }
-    let Err(error) = tx.commit().await else {
-        return Ok(());
-    };
-    let commit_error = ServiceError::with_source(
-        ServiceErrorKind::Persistence,
-        "commit inference provider attempt admission",
-        error,
-    );
-    match load_provider_attempt_fact(db, attempt).await {
-        Ok(Some(persisted)) => {
-            validate_ambiguous_provider_attempt_admission(&persisted, attempt, provider_wire_bytes)
-        }
-        Ok(None) => Err(commit_error),
-        Err(read_error) => {
-            tracing::warn!(
-                attempt_id = %attempt.attempt_id,
-                %read_error,
-                "provider attempt admission commit is unresolved after authoritative re-read failed"
+    let result = sqlx::query(
+        "INSERT INTO inference_provider_attempts
+         (attempt_id, invocation_id, user_id, session_id, run_id, harness_run_id, attempt_index,
+          provider, admission_token, provider_protocol, provider_wire_hash, provider_wire_bytes,
+          status, usage_status, started_at, terminal_at)
+         SELECT ?, invocation_id, user_id, session_id, run_id, harness_run_id,
+                ?, ?, ?, ?, ?, ?, 'started', 'unavailable', NOW(6), NULL
+         FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ? AND status = 'admitted'
+           AND owner_token = ? AND owner_generation = ?
+           AND owner_lease_expires_at > NOW(6)
+           AND NOT EXISTS (
+                SELECT 1
+                FROM inference_invocation_settlement_debts AS settlement_debt
+                WHERE settlement_debt.user_id = inference_invocations.user_id
+                  AND settlement_debt.invocation_id = inference_invocations.invocation_id
+           )
+           AND NOT EXISTS (
+                SELECT 1
+                FROM inference_provider_attempts AS open_attempt
+                WHERE open_attempt.user_id = inference_invocations.user_id
+                  AND open_attempt.invocation_id = inference_invocations.invocation_id
+                  AND open_attempt.status = 'started'
+           )",
+    )
+    .bind(&attempt.attempt_id)
+    .bind(i64::from(attempt.attempt_index))
+    .bind(&attempt.provider)
+    .bind(&attempt.admission_token)
+    .bind(&attempt.wire.protocol)
+    .bind(&attempt.wire.provider_wire_hash)
+    .bind(provider_wire_bytes)
+    .bind(&attempt.user_id)
+    .bind(&attempt.invocation_id)
+    .bind(&attempt.owner_token)
+    .bind(i64::try_from(attempt.owner_generation).map_err(|_| {
+        ServiceError::invalid("inference owner generation exceeds the durable BIGINT range")
+    })?)
+    .execute(&mut *tx)
+    .await;
+    match result {
+        Ok(result) if result.rows_affected() == 1 => {
+            if let Err(error) = insert_model_request_context_event(
+                &mut tx,
+                attempt,
+                ModelRequestEventStage::Accepted,
+                None,
+            )
+            .await
+            {
+                rollback_inference_tx(tx, "record accepted model request context").await;
+                return Err(error);
+            }
+            let Err(error) = tx.commit().await else {
+                return Ok(());
+            };
+            let commit_error = ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "commit inference provider attempt admission",
+                error,
             );
-            Err(commit_error)
+            match load_provider_attempt_fact(db, attempt).await {
+                Ok(Some(persisted)) => validate_ambiguous_provider_attempt_admission(
+                    &persisted,
+                    attempt,
+                    provider_wire_bytes,
+                ),
+                Ok(None) => Err(commit_error),
+                Err(read_error) => {
+                    tracing::warn!(
+                        attempt_id = %attempt.attempt_id,
+                        %read_error,
+                        "provider attempt admission commit is unresolved after authoritative re-read failed"
+                    );
+                    Err(commit_error)
+                }
+            }
+        }
+        Ok(_) => Err(ServiceError::conflict(format!(
+            "inference invocation {} is not admitted for provider attempt {}",
+            attempt.invocation_id, attempt.attempt_id
+        ))),
+        Err(error) => {
+            rollback_inference_tx(tx, "begin_inference_provider_attempt").await;
+            if let Some(persisted) = load_provider_attempt_fact(db, attempt).await? {
+                validate_persisted_provider_attempt_identity(
+                    &persisted,
+                    attempt,
+                    provider_wire_bytes,
+                )?;
+                Err(ServiceError::conflict(format!(
+                    "inference provider attempt {} already exists with status {}; provider delivery must not be repeated",
+                    attempt.attempt_id, persisted.status
+                )))
+            } else {
+                Err(ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "insert inference provider attempt",
+                    error,
+                ))
+            }
         }
     }
 }
@@ -1497,7 +2473,11 @@ async fn record_successful_attempt_debt_if_needed(
             db,
             &attempt.user_id,
             &attempt.invocation_id,
+            &attempt.owner_token,
+            attempt.owner_generation,
             terminal_state,
+            Some(&attempt.attempt_id),
+            ProviderDeliveryState::DeliveryAuthorized,
             SettlementDebtMode::RequireQuiescent,
         )
         .await?;
@@ -1549,25 +2529,10 @@ pub async fn finish_inference_provider_attempt(
     let terminal_state = DurableInferenceTerminal::from_terminal(terminal, fingerprint.clone())?;
     let provider_wire_bytes = checked_i64(attempt.wire.provider_wire_bytes, "provider_wire_bytes")?;
     let db = pool.get();
-    if let Some(persisted) = load_provider_attempt_fact(db, attempt).await? {
-        match classify_persisted_provider_terminal(
-            &persisted,
-            attempt,
-            provider_wire_bytes,
-            terminal,
-            &fingerprint,
-        )? {
-            PersistedProviderTerminalMatch::ExactTerminal => {
-                record_successful_attempt_debt_if_needed(db, attempt, terminal, &terminal_state)
-                    .await?;
-                return Ok(());
-            }
-            PersistedProviderTerminalMatch::Started => {}
-        }
-    }
     let update = sqlx::query(
         "UPDATE inference_provider_attempts
          SET status = ?, terminal_fingerprint = ?, provider_response_id = ?,
+             usage_status = ?,
              input_tokens = ?, output_tokens = ?, cache_read_tokens = ?,
              cache_creation_tokens = ?, error_kind = ?, error_message = ?, terminal_at = NOW(6)
          WHERE user_id = ? AND attempt_id = ?
@@ -1579,6 +2544,7 @@ pub async fn finish_inference_provider_attempt(
     .bind(&terminal_state.status)
     .bind(&fingerprint)
     .bind(&terminal_state.provider_response_id)
+    .bind(&terminal_state.usage_status)
     .bind(terminal_state.input_tokens)
     .bind(terminal_state.output_tokens)
     .bind(terminal_state.cache_read_tokens)
@@ -1610,6 +2576,8 @@ pub async fn finish_inference_provider_attempt(
             &mut tx,
             &attempt.user_id,
             &attempt.invocation_id,
+            &attempt.owner_token,
+            attempt.owner_generation,
             "record a successful provider terminal",
         )
         .await?;
@@ -1640,6 +2608,8 @@ pub async fn finish_inference_provider_attempt(
                 &attempt.user_id,
                 &attempt.invocation_id,
                 &terminal_state,
+                Some(&attempt.attempt_id),
+                ProviderDeliveryState::DeliveryAuthorized,
             )
             .await
         {
@@ -1684,6 +2654,15 @@ pub async fn finish_inference_provider_attempt(
                 error,
             )
         })?;
+        lock_admitted_inference_invocation(
+            &mut tx,
+            &attempt.user_id,
+            &attempt.invocation_id,
+            &attempt.owner_token,
+            attempt.owner_generation,
+            "record a provider terminal",
+        )
+        .await?;
         match update.execute(&mut *tx).await {
             Ok(result) => {
                 if result.rows_affected() == 1
@@ -1769,7 +2748,8 @@ async fn existing_terminal_fingerprint(
     plan: &InferenceInvocationPlan,
 ) -> ServiceResult<Option<String>> {
     sqlx::query(
-        "SELECT terminal_fingerprint FROM inference_invocations
+        "SELECT terminal_fingerprint, owner_token, owner_generation
+         FROM inference_invocations
          WHERE user_id = ? AND invocation_id = ? LIMIT 1",
     )
     .bind(&plan.input.user_id)
@@ -1784,6 +2764,28 @@ async fn existing_terminal_fingerprint(
         )
     })?
     .map(|row| {
+        let owner_token = row.try_get::<String, _>("owner_token").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode inference terminal owner token",
+                error,
+            )
+        })?;
+        let owner_generation = row.try_get::<i64, _>("owner_generation").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode inference terminal owner generation",
+                error,
+            )
+        })?;
+        if owner_token != plan.owner_token
+            || owner_generation != i64::try_from(plan.owner_generation).unwrap_or(i64::MAX)
+        {
+            return Err(ServiceError::conflict(format!(
+                "inference invocation {} terminal belongs to a different owner generation",
+                plan.invocation_id
+            )));
+        }
         row.try_get::<Option<String>, _>("terminal_fingerprint")
             .map_err(|error| {
                 ServiceError::with_source(
@@ -1801,6 +2803,7 @@ async fn existing_terminal_fingerprint(
 struct DurableInferenceTerminal {
     status: String,
     terminal_fingerprint: Option<String>,
+    usage_status: String,
     input_tokens: i64,
     output_tokens: i64,
     cache_read_tokens: i64,
@@ -1808,6 +2811,32 @@ struct DurableInferenceTerminal {
     provider_response_id: Option<String>,
     error_kind: Option<String>,
     error_message: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderDeliveryState {
+    Unknown,
+    PreDelivery,
+    DeliveryAuthorized,
+}
+
+impl From<InferenceProviderDeliveryState> for ProviderDeliveryState {
+    fn from(value: InferenceProviderDeliveryState) -> Self {
+        match value {
+            InferenceProviderDeliveryState::PreDelivery => Self::PreDelivery,
+            InferenceProviderDeliveryState::DeliveryAuthorized => Self::DeliveryAuthorized,
+        }
+    }
+}
+
+impl ProviderDeliveryState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::PreDelivery => "pre_delivery",
+            Self::DeliveryAuthorized => "delivery_authorized",
+        }
+    }
 }
 
 impl DurableInferenceTerminal {
@@ -1818,14 +2847,18 @@ impl DurableInferenceTerminal {
         Ok(Self {
             status: terminal.status.as_str().to_string(),
             terminal_fingerprint: Some(terminal_fingerprint),
-            input_tokens: checked_i64(terminal.usage.input_tokens, "terminal input_tokens")?,
+            usage_status: terminal.usage_status.as_str().to_string(),
+            input_tokens: checked_i64(
+                terminal.usage.input.fresh_input_tokens,
+                "terminal fresh_input_tokens",
+            )?,
             output_tokens: checked_i64(terminal.usage.output_tokens, "terminal output_tokens")?,
             cache_read_tokens: checked_i64(
-                terminal.usage.cache_read_tokens,
+                terminal.usage.input.cache_read_tokens,
                 "terminal cache_read_tokens",
             )?,
             cache_creation_tokens: checked_i64(
-                terminal.usage.cache_creation_tokens,
+                terminal.usage.input.cache_creation_tokens,
                 "terminal cache_creation_tokens",
             )?,
             provider_response_id: terminal.provider_response_id.clone(),
@@ -1838,6 +2871,7 @@ impl DurableInferenceTerminal {
         Ok(Self {
             status: row.try_get("status")?,
             terminal_fingerprint: row.try_get("terminal_fingerprint")?,
+            usage_status: row.try_get("usage_status")?,
             input_tokens: row.try_get("input_tokens")?,
             output_tokens: row.try_get("output_tokens")?,
             cache_read_tokens: row.try_get("cache_read_tokens")?,
@@ -1854,6 +2888,8 @@ async fn write_inference_settlement_debt(
     user_id: &str,
     invocation_id: &str,
     terminal: &DurableInferenceTerminal,
+    provider_attempt_id: Option<&str>,
+    provider_delivery_state: ProviderDeliveryState,
 ) -> ServiceResult<()> {
     let fingerprint = terminal.terminal_fingerprint.as_deref().ok_or_else(|| {
         ServiceError::invalid("inference settlement debt requires a terminal fingerprint")
@@ -1861,17 +2897,19 @@ async fn write_inference_settlement_debt(
     sqlx::query(
         "INSERT IGNORE INTO inference_invocation_settlement_debts
          (user_id, invocation_id, session_id, harness_run_id,
-          terminal_status, terminal_fingerprint,
+          terminal_status, terminal_fingerprint, usage_status,
           input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-          provider_response_id, error_kind, error_message)
+          provider_response_id, error_kind, error_message, provider_attempt_id,
+          provider_delivery_state)
          SELECT invocation.user_id, invocation.invocation_id,
                 invocation.session_id, invocation.harness_run_id,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
          FROM inference_invocations AS invocation
          WHERE invocation.user_id = ? AND invocation.invocation_id = ?",
     )
     .bind(&terminal.status)
     .bind(fingerprint)
+    .bind(&terminal.usage_status)
     .bind(terminal.input_tokens)
     .bind(terminal.output_tokens)
     .bind(terminal.cache_read_tokens)
@@ -1879,6 +2917,8 @@ async fn write_inference_settlement_debt(
     .bind(&terminal.provider_response_id)
     .bind(&terminal.error_kind)
     .bind(&terminal.error_message)
+    .bind(provider_attempt_id)
+    .bind(provider_delivery_state.as_str())
     .bind(user_id)
     .bind(invocation_id)
     .execute(&mut **tx)
@@ -1892,7 +2932,8 @@ async fn write_inference_settlement_debt(
     })?;
 
     let existing = sqlx::query(
-        "SELECT terminal_status, terminal_fingerprint
+        "SELECT terminal_status, terminal_fingerprint, provider_attempt_id,
+                provider_delivery_state
          FROM inference_invocation_settlement_debts
          WHERE user_id = ? AND invocation_id = ?",
     )
@@ -1925,13 +2966,205 @@ async fn write_inference_settlement_debt(
                 error,
             )
         })?;
-    if existing_status == terminal.status && existing_fingerprint == fingerprint {
-        Ok(())
-    } else {
-        Err(ServiceError::conflict(format!(
+    let existing_attempt_id = existing
+        .try_get::<Option<String>, _>("provider_attempt_id")
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode inference settlement debt provider attempt",
+                error,
+            )
+        })?;
+    let existing_delivery_state = existing
+        .try_get::<String, _>("provider_delivery_state")
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode inference settlement debt delivery state",
+                error,
+            )
+        })?;
+    if existing_status != terminal.status || existing_fingerprint != fingerprint {
+        return Err(ServiceError::conflict(format!(
             "inference invocation {invocation_id} already has a different durable settlement intent"
-        )))
+        )));
     }
+    match (existing_attempt_id.as_deref(), provider_attempt_id) {
+        (Some(existing), Some(requested)) if existing != requested => {
+            Err(ServiceError::conflict(format!(
+                "inference invocation {invocation_id} settlement names conflicting provider attempts"
+            )))
+        }
+        (Some(_), Some(_)) if existing_delivery_state != provider_delivery_state.as_str() => {
+            Err(ServiceError::conflict(format!(
+                "inference invocation {invocation_id} settlement has conflicting provider delivery authority"
+            )))
+        }
+        (Some(existing), Some(requested)) if existing == requested => Ok(()),
+        (None, Some(requested)) => {
+            sqlx::query(
+                "UPDATE inference_invocation_settlement_debts
+                 SET provider_attempt_id = ?, provider_delivery_state = ?
+                 WHERE user_id = ? AND invocation_id = ?
+                   AND terminal_fingerprint = ? AND provider_attempt_id IS NULL",
+            )
+            .bind(requested)
+            .bind(provider_delivery_state.as_str())
+            .bind(user_id)
+            .bind(invocation_id)
+            .bind(fingerprint)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "attach provider attempt to inference settlement debt",
+                    error,
+                )
+            })?;
+            Ok(())
+        }
+        (None, None)
+            if existing_delivery_state == ProviderDeliveryState::Unknown.as_str()
+                && provider_delivery_state == ProviderDeliveryState::PreDelivery
+                && terminal.status == InferenceTerminalStatus::Cancelled.as_str()
+                && terminal.usage_status == InferenceUsageStatus::Unavailable.as_str()
+                && terminal.input_tokens == 0
+                && terminal.output_tokens == 0
+                && terminal.cache_read_tokens == 0
+                && terminal.cache_creation_tokens == 0
+                && terminal.provider_response_id.is_none() =>
+        {
+            let updated = sqlx::query(
+                "UPDATE inference_invocation_settlement_debts
+                 SET provider_delivery_state = 'pre_delivery'
+                 WHERE user_id = ? AND invocation_id = ?
+                   AND terminal_fingerprint = ? AND provider_attempt_id IS NULL
+                   AND provider_delivery_state = 'unknown'",
+            )
+            .bind(user_id)
+            .bind(invocation_id)
+            .bind(fingerprint)
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "strengthen pre-provider inference settlement authority",
+                    error,
+                )
+            })?;
+            if updated.rows_affected() == 1 {
+                Ok(())
+            } else {
+                Err(ServiceError::conflict(format!(
+                    "inference invocation {invocation_id} settlement delivery authority changed concurrently"
+                )))
+            }
+        }
+        (None, None)
+            if existing_delivery_state == provider_delivery_state.as_str()
+                || (existing_delivery_state == ProviderDeliveryState::PreDelivery.as_str()
+                    && provider_delivery_state == ProviderDeliveryState::Unknown) =>
+        {
+            // A generic logical settlement carries no delivery fact. It may be
+            // replayed after the stronger pre-delivery fact is established, but
+            // must never downgrade that fact back to `unknown`.
+            Ok(())
+        }
+        (Some(_), None) if provider_delivery_state == ProviderDeliveryState::Unknown => {
+            // Exact attempt settlement is stronger than a replay of the same
+            // logical terminal, so retain the exact durable owner.
+            Ok(())
+        }
+        _ => Err(ServiceError::conflict(format!(
+            "inference invocation {invocation_id} settlement has incompatible provider delivery authority"
+        ))),
+    }
+}
+
+async fn inference_settlement_debt_matches(
+    db: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    invocation_id: &str,
+    terminal: &DurableInferenceTerminal,
+    provider_attempt_id: Option<&str>,
+    provider_delivery_state: ProviderDeliveryState,
+) -> ServiceResult<bool> {
+    let row = sqlx::query(
+        "SELECT terminal_status, terminal_fingerprint, provider_attempt_id,
+                provider_delivery_state
+         FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(user_id)
+    .bind(invocation_id)
+    .fetch_optional(db)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "re-read inference settlement debt",
+            error,
+        )
+    })?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let status = row
+        .try_get::<String, _>("terminal_status")
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode re-read inference settlement status",
+                error,
+            )
+        })?;
+    let fingerprint = row
+        .try_get::<String, _>("terminal_fingerprint")
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode re-read inference settlement fingerprint",
+                error,
+            )
+        })?;
+    let attempt_id = row
+        .try_get::<Option<String>, _>("provider_attempt_id")
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode re-read inference settlement provider attempt",
+                error,
+            )
+        })?;
+    let delivery_state = row
+        .try_get::<String, _>("provider_delivery_state")
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode re-read inference settlement delivery state",
+                error,
+            )
+        })?;
+    let delivery_authority_matches = match (attempt_id.as_deref(), provider_attempt_id) {
+        (Some(existing), Some(expected)) => {
+            existing == expected && delivery_state == provider_delivery_state.as_str()
+        }
+        (None, Some(_)) => false,
+        (None, None) if provider_delivery_state == ProviderDeliveryState::PreDelivery => {
+            delivery_state == ProviderDeliveryState::PreDelivery.as_str()
+        }
+        (None, None) if provider_delivery_state == ProviderDeliveryState::Unknown => {
+            delivery_state == ProviderDeliveryState::Unknown.as_str()
+                || delivery_state == ProviderDeliveryState::PreDelivery.as_str()
+        }
+        (Some(_), None) => provider_delivery_state == ProviderDeliveryState::Unknown,
+        (None, None) => false,
+    };
+    Ok(status == terminal.status
+        && terminal.terminal_fingerprint.as_deref() == Some(fingerprint.as_str())
+        && delivery_authority_matches)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1944,7 +3177,11 @@ async fn record_inference_settlement_debt(
     db: &sqlx::Pool<sqlx::MySql>,
     user_id: &str,
     invocation_id: &str,
+    owner_token: &str,
+    owner_generation: u64,
     terminal: &DurableInferenceTerminal,
+    provider_attempt_id: Option<&str>,
+    provider_delivery_state: ProviderDeliveryState,
     mode: SettlementDebtMode,
 ) -> ServiceResult<()> {
     let mut tx = db.begin().await.map_err(|error| {
@@ -1955,7 +3192,9 @@ async fn record_inference_settlement_debt(
         )
     })?;
     let invocation = sqlx::query(
-        "SELECT status, terminal_fingerprint FROM inference_invocations
+        "SELECT status, terminal_fingerprint, owner_token, owner_generation,
+                IF(owner_lease_expires_at > NOW(6), 1, 0) AS lease_live
+         FROM inference_invocations
          WHERE user_id = ? AND invocation_id = ?
          FOR UPDATE",
     )
@@ -1982,6 +3221,33 @@ async fn record_inference_settlement_debt(
             error,
         )
     })?;
+    let durable_owner_token = invocation
+        .try_get::<String, _>("owner_token")
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode inference settlement owner token",
+                error,
+            )
+        })?;
+    let durable_owner_generation =
+        invocation
+            .try_get::<i64, _>("owner_generation")
+            .map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "decode inference settlement owner generation",
+                    error,
+                )
+            })?;
+    let expected_owner_generation = i64::try_from(owner_generation).map_err(|_| {
+        ServiceError::invalid("inference owner generation exceeds the durable BIGINT range")
+    })?;
+    if durable_owner_token != owner_token || durable_owner_generation != expected_owner_generation {
+        return Err(ServiceError::conflict(format!(
+            "inference invocation {invocation_id} settlement belongs to a stale owner generation"
+        )));
+    }
     if status != "admitted" {
         let durable_fingerprint = invocation
             .try_get::<Option<String>, _>("terminal_fingerprint")
@@ -1999,6 +3265,21 @@ async fn record_inference_settlement_debt(
                 "inference invocation {invocation_id} is {status} with a different terminal result"
             )))
         };
+    }
+    let lease_live = invocation
+        .try_get::<i64, _>("lease_live")
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode inference settlement owner lease",
+                error,
+            )
+        })?
+        == 1;
+    if !lease_live {
+        return Err(ServiceError::conflict(format!(
+            "inference invocation {invocation_id} owner lease expired before settlement"
+        )));
     }
     let successful_terminal = terminal.status == InferenceTerminalStatus::Succeeded.as_str();
     let terminal_fingerprint = if successful_terminal {
@@ -2040,14 +3321,47 @@ async fn record_inference_settlement_debt(
             "inference invocation {invocation_id} cannot succeed without a matching succeeded provider attempt"
         )));
     }
-    write_inference_settlement_debt(&mut tx, user_id, invocation_id, terminal).await?;
-    tx.commit().await.map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "commit inference settlement debt",
-            error,
-        )
-    })
+    write_inference_settlement_debt(
+        &mut tx,
+        user_id,
+        invocation_id,
+        terminal,
+        provider_attempt_id,
+        provider_delivery_state,
+    )
+    .await?;
+    match tx.commit().await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let commit_error = ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "commit inference settlement debt",
+                error,
+            );
+            match inference_settlement_debt_matches(
+                db,
+                user_id,
+                invocation_id,
+                terminal,
+                provider_attempt_id,
+                provider_delivery_state,
+            )
+            .await
+            {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(commit_error),
+                Err(read_error) => {
+                    tracing::warn!(
+                        %user_id,
+                        %invocation_id,
+                        %read_error,
+                        "inference settlement debt commit is unresolved after authoritative re-read failed"
+                    );
+                    Err(commit_error)
+                }
+            }
+        }
+    }
 }
 
 /// Durably declare that the lifecycle owner has stopped retrying this logical
@@ -2065,7 +3379,53 @@ pub async fn declare_inference_settlement(
         pool.get(),
         &plan.input.user_id,
         &plan.invocation_id,
+        &plan.owner_token,
+        plan.owner_generation,
         &terminal,
+        None,
+        ProviderDeliveryState::Unknown,
+        SettlementDebtMode::FenceOpenAttempts,
+    )
+    .await
+}
+
+/// Durably bind a logical settlement to the exact physical attempt whose
+/// terminal acknowledgement may have been lost. Recovery applies that exact
+/// terminal before mirroring the logical result; it never guesses success from
+/// an open attempt or degrades known provider output to a generic timeout.
+pub async fn declare_inference_attempt_settlement(
+    pool: &SharedPool,
+    plan: &InferenceInvocationPlan,
+    attempt: &InferenceProviderAttemptPlan,
+    terminal: &InferenceInvocationTerminal,
+    provider_delivery_state: InferenceProviderDeliveryState,
+) -> ServiceResult<()> {
+    if attempt.user_id != plan.input.user_id || attempt.invocation_id != plan.invocation_id {
+        return Err(ServiceError::invalid(
+            "provider attempt does not belong to the declared logical invocation",
+        ));
+    }
+    if provider_delivery_state == InferenceProviderDeliveryState::PreDelivery
+        && (terminal.status != InferenceTerminalStatus::Cancelled
+            || terminal.usage != InferenceUsage::default()
+            || terminal.usage_status != InferenceUsageStatus::Unavailable
+            || terminal.provider_response_id.is_some())
+    {
+        return Err(ServiceError::invalid(
+            "an unauthorized provider attempt may settle only as a zero-usage pre-delivery cancellation",
+        ));
+    }
+    let fingerprint = terminal_fingerprint(terminal)?;
+    let terminal = DurableInferenceTerminal::from_terminal(terminal, fingerprint)?;
+    record_inference_settlement_debt(
+        pool.get(),
+        &plan.input.user_id,
+        &plan.invocation_id,
+        &plan.owner_token,
+        plan.owner_generation,
+        &terminal,
+        Some(&attempt.attempt_id),
+        provider_delivery_state.into(),
         SettlementDebtMode::FenceOpenAttempts,
     )
     .await
@@ -2094,11 +3454,14 @@ async fn apply_inference_terminal_if_quiescent(
     user_id: &str,
     invocation_id: &str,
     terminal: DurableInferenceTerminal,
+    provider_delivery_state: &str,
 ) -> Result<u64, sqlx::Error> {
     sqlx::query(
         "UPDATE inference_invocations
          SET status = ?,
              terminal_fingerprint = ?,
+             usage_status = ?,
+             provider_delivery_state = ?,
              input_tokens = ?,
              output_tokens = ?,
              cache_read_tokens = ?,
@@ -2120,6 +3483,8 @@ async fn apply_inference_terminal_if_quiescent(
     )
     .bind(terminal.status)
     .bind(terminal.terminal_fingerprint)
+    .bind(terminal.usage_status)
+    .bind(provider_delivery_state)
     .bind(terminal.input_tokens)
     .bind(terminal.output_tokens)
     .bind(terminal.cache_read_tokens)
@@ -2134,23 +3499,21 @@ async fn apply_inference_terminal_if_quiescent(
     .map(|result| result.rows_affected())
 }
 
-async fn matching_successful_provider_attempt<'e, E>(
-    executor: E,
+async fn matching_successful_provider_attempt(
+    db: &sqlx::Pool<sqlx::MySql>,
     user_id: &str,
     invocation_id: &str,
     fingerprint: &str,
-) -> Result<Option<DurableInferenceTerminal>, sqlx::Error>
-where
-    E: sqlx::Executor<'e, Database = sqlx::MySql>,
-{
+    provider_attempt_id: Option<&str>,
+) -> Result<bool, sqlx::Error> {
     sqlx::query(
-        "SELECT status, terminal_fingerprint, input_tokens, output_tokens, cache_read_tokens,
-                cache_creation_tokens, provider_response_id, error_kind, error_message
+        "SELECT 1
          FROM inference_provider_attempts
          WHERE user_id = ?
            AND invocation_id = ?
            AND status = 'succeeded'
            AND terminal_fingerprint = ?
+           AND (? IS NULL OR attempt_id = ?)
            AND NOT EXISTS (
                 SELECT 1
                 FROM inference_provider_attempts AS open_attempt
@@ -2170,10 +3533,11 @@ where
     .bind(user_id)
     .bind(invocation_id)
     .bind(fingerprint)
-    .fetch_optional(executor)
-    .await?
-    .map(|row| DurableInferenceTerminal::decode(&row))
-    .transpose()
+    .bind(provider_attempt_id)
+    .bind(provider_attempt_id)
+    .fetch_optional(db)
+    .await
+    .map(|row| row.is_some())
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2241,16 +3605,93 @@ async fn delete_inference_settlement_debt(
     .map(|result| result.rows_affected())
 }
 
+async fn quarantine_inference_settlement_debt(
+    db: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    invocation_id: &str,
+    fingerprint: &str,
+    reason: &str,
+) -> Result<(), sqlx::Error> {
+    let reason = reason.chars().take(255).collect::<String>();
+    sqlx::query(
+        "UPDATE inference_invocation_settlement_debts
+         SET reconciliation_status = 'quarantined', quarantine_reason = ?
+         WHERE user_id = ? AND invocation_id = ? AND terminal_fingerprint = ?",
+    )
+    .bind(reason)
+    .bind(user_id)
+    .bind(invocation_id)
+    .bind(fingerprint)
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
+async fn defer_inference_settlement_debt(
+    db: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    invocation_id: &str,
+) -> Result<(), sqlx::Error> {
+    // A transient or row-local persistence error must not leave one owner at
+    // the head of every bounded batch. The durable debt remains pending, but
+    // its next eligibility is delayed so other users receive a fair recovery
+    // turn. Permanent semantic conflicts are quarantined at their detection
+    // sites instead of using this retry lane.
+    sqlx::query(
+        "UPDATE inference_invocation_settlement_debts
+         SET next_retry_at = DATE_ADD(NOW(6), INTERVAL 30 SECOND)
+         WHERE user_id = ? AND invocation_id = ?
+           AND reconciliation_status = 'pending'",
+    )
+    .bind(user_id)
+    .bind(invocation_id)
+    .execute(db)
+    .await
+    .map(|_| ())
+}
+
 const INFERENCE_SETTLEMENT_RECOVERY_BATCH: i64 = 256;
 
 async fn close_open_attempts_owned_by_settlement_debt(
     db: &sqlx::Pool<sqlx::MySql>,
     user_id: &str,
     invocation_id: &str,
+    terminal: &DurableInferenceTerminal,
+    provider_attempt_id: Option<&str>,
 ) -> Result<u64, sqlx::Error> {
-    let terminal = InferenceInvocationTerminal {
+    if let Some(attempt_id) = provider_attempt_id {
+        return sqlx::query(
+            "UPDATE inference_provider_attempts
+             SET status = ?, terminal_fingerprint = ?,
+                 usage_status = ?,
+                 input_tokens = ?, output_tokens = ?, cache_read_tokens = ?,
+                 cache_creation_tokens = ?, provider_response_id = ?,
+                 error_kind = ?, error_message = ?, terminal_at = NOW(6)
+             WHERE user_id = ? AND invocation_id = ? AND attempt_id = ?
+               AND status = 'started'",
+        )
+        .bind(&terminal.status)
+        .bind(&terminal.terminal_fingerprint)
+        .bind(&terminal.usage_status)
+        .bind(terminal.input_tokens)
+        .bind(terminal.output_tokens)
+        .bind(terminal.cache_read_tokens)
+        .bind(terminal.cache_creation_tokens)
+        .bind(&terminal.provider_response_id)
+        .bind(&terminal.error_kind)
+        .bind(&terminal.error_message)
+        .bind(user_id)
+        .bind(invocation_id)
+        .bind(attempt_id)
+        .execute(db)
+        .await
+        .map(|result| result.rows_affected());
+    }
+
+    let fallback = InferenceInvocationTerminal {
         status: InferenceTerminalStatus::DeliveryUnknown,
         usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
         provider_response_id: None,
         error_kind: Some("settlement_recovery".to_string()),
         error_message: Some(
@@ -2258,24 +3699,76 @@ async fn close_open_attempts_owned_by_settlement_debt(
                 .to_string(),
         ),
     };
-    let fingerprint = terminal_fingerprint(&terminal)
+    let fingerprint = terminal_fingerprint(&fallback)
         .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
     sqlx::query(
         "UPDATE inference_provider_attempts
          SET status = 'delivery_unknown', terminal_fingerprint = ?,
+             usage_status = 'unavailable',
              input_tokens = 0, output_tokens = 0, cache_read_tokens = 0,
              cache_creation_tokens = 0, provider_response_id = NULL,
              error_kind = ?, error_message = ?, terminal_at = NOW(6)
          WHERE user_id = ? AND invocation_id = ? AND status = 'started'",
     )
     .bind(fingerprint)
-    .bind(terminal.error_kind)
-    .bind(terminal.error_message)
+    .bind(fallback.error_kind)
+    .bind(fallback.error_message)
     .bind(user_id)
     .bind(invocation_id)
     .execute(db)
     .await
     .map(|result| result.rows_affected())
+}
+
+/// Resolve the race where another reconciler terminalizes the invocation
+/// after this worker reads an admitted row but before its guarded UPDATE.
+/// A zero-row UPDATE is not evidence that debt remains pending; re-read the
+/// authoritative invocation before emitting an operational warning.
+async fn clear_debt_after_concurrent_invocation_terminal(
+    db: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    invocation_id: &str,
+    debt_fingerprint: &str,
+) -> Result<bool, sqlx::Error> {
+    let Some(row) = sqlx::query(
+        "SELECT status, terminal_fingerprint
+         FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ?",
+    )
+    .bind(user_id)
+    .bind(invocation_id)
+    .fetch_optional(db)
+    .await?
+    else {
+        return Ok(false);
+    };
+    let status = row.try_get::<String, _>("status")?;
+    if status == "admitted" {
+        return Ok(false);
+    }
+    let terminal_fingerprint = row.try_get::<Option<String>, _>("terminal_fingerprint")?;
+    if terminal_fingerprint.as_deref() == Some(debt_fingerprint) {
+        delete_inference_settlement_debt(db, user_id, invocation_id, debt_fingerprint).await?;
+    } else {
+        tracing::error!(
+            %user_id,
+            %invocation_id,
+            %status,
+            debt_fingerprint,
+            invocation_terminal_fingerprint = terminal_fingerprint.as_deref().unwrap_or("missing"),
+            "inference settlement debt conflicts with a concurrently terminalized invocation; retaining durable incident authority"
+        );
+        quarantine_inference_settlement_debt(
+            db,
+            user_id,
+            invocation_id,
+            debt_fingerprint,
+            "settlement debt conflicts with a concurrently terminalized invocation",
+        )
+        .await?;
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 async fn reconcile_inference_settlement_debt(
@@ -2288,13 +3781,17 @@ async fn reconcile_inference_settlement_debt(
                 debt.terminal_fingerprint, debt.input_tokens, debt.output_tokens,
                 debt.cache_read_tokens, debt.cache_creation_tokens,
                 debt.provider_response_id, debt.error_kind, debt.error_message,
+                debt.usage_status,
+                debt.provider_attempt_id,
+                debt.provider_delivery_state,
                 invocation.status AS invocation_status,
                 invocation.terminal_fingerprint AS invocation_terminal_fingerprint
          FROM inference_invocation_settlement_debts AS debt
-         JOIN inference_invocations AS invocation
+         LEFT JOIN inference_invocations AS invocation
            ON invocation.user_id = debt.user_id
           AND invocation.invocation_id = debt.invocation_id
-         WHERE debt.user_id = ? AND debt.invocation_id = ?",
+         WHERE debt.user_id = ? AND debt.invocation_id = ?
+           AND debt.reconciliation_status = 'pending'",
     )
     .bind(user_id)
     .bind(invocation_id)
@@ -2309,10 +3806,60 @@ async fn reconcile_inference_settlement_debt(
         .terminal_fingerprint
         .clone()
         .ok_or_else(|| sqlx::Error::Protocol("settlement debt has no fingerprint".to_string()))?;
-    let invocation_status = row.try_get::<String, _>("invocation_status")?;
+    let invocation_status = row.try_get::<Option<String>, _>("invocation_status")?;
+    let provider_attempt_id = row.try_get::<Option<String>, _>("provider_attempt_id")?;
+    let provider_delivery_state = row.try_get::<String, _>("provider_delivery_state")?;
+    let Some(invocation_status) = invocation_status else {
+        let reason = "settlement debt has no durable logical invocation owner";
+        quarantine_inference_settlement_debt(db, user_id, invocation_id, &fingerprint, reason)
+            .await?;
+        tracing::error!(%user_id, %invocation_id, %reason, "quarantined orphaned inference settlement debt");
+        return Ok(0);
+    };
     if invocation_status == "admitted" {
-        let recovered_attempts =
-            close_open_attempts_owned_by_settlement_debt(db, user_id, invocation_id).await?;
+        if provider_attempt_id.is_none()
+            && provider_delivery_state == ProviderDeliveryState::DeliveryAuthorized.as_str()
+        {
+            let reason = "provider delivery state requires an exact provider attempt identity";
+            quarantine_inference_settlement_debt(db, user_id, invocation_id, &fingerprint, reason)
+                .await?;
+            tracing::error!(%user_id, %invocation_id, %reason, "quarantined malformed inference settlement debt");
+            return Ok(0);
+        }
+        if provider_attempt_id.is_some()
+            && provider_delivery_state == ProviderDeliveryState::PreDelivery.as_str()
+            && terminal.status != InferenceTerminalStatus::Cancelled.as_str()
+        {
+            let reason = "pre-delivery exact debt must be a cancelled terminal";
+            quarantine_inference_settlement_debt(db, user_id, invocation_id, &fingerprint, reason)
+                .await?;
+            tracing::error!(%user_id, %invocation_id, %reason, "quarantined malformed inference settlement debt");
+            return Ok(0);
+        }
+        if provider_attempt_id.is_none()
+            && provider_delivery_state == ProviderDeliveryState::PreDelivery.as_str()
+            && (terminal.status != InferenceTerminalStatus::Cancelled.as_str()
+                || terminal.usage_status != InferenceUsageStatus::Unavailable.as_str()
+                || terminal.input_tokens != 0
+                || terminal.output_tokens != 0
+                || terminal.cache_read_tokens != 0
+                || terminal.cache_creation_tokens != 0
+                || terminal.provider_response_id.is_some())
+        {
+            let reason = "pre-provider logical admission debt must be a zero-usage cancellation";
+            quarantine_inference_settlement_debt(db, user_id, invocation_id, &fingerprint, reason)
+                .await?;
+            tracing::error!(%user_id, %invocation_id, %reason, "quarantined malformed inference settlement debt");
+            return Ok(0);
+        }
+        let recovered_attempts = close_open_attempts_owned_by_settlement_debt(
+            db,
+            user_id,
+            invocation_id,
+            &terminal,
+            provider_attempt_id.as_deref(),
+        )
+        .await?;
         if recovered_attempts > 0 {
             tracing::warn!(
                 %user_id,
@@ -2321,25 +3868,145 @@ async fn reconcile_inference_settlement_debt(
                 "closed provider attempts left open behind an authoritative settlement debt"
             );
         }
+        let exact_attempt = if let Some(attempt_id) = provider_attempt_id.as_deref() {
+            sqlx::query(
+                "SELECT terminal_fingerprint FROM inference_provider_attempts
+                 WHERE user_id = ? AND invocation_id = ? AND attempt_id = ?",
+            )
+            .bind(user_id)
+            .bind(invocation_id)
+            .bind(attempt_id)
+            .fetch_optional(db)
+            .await?
+        } else {
+            None
+        };
+        if let (Some(attempt_id), Some(attempt)) =
+            (provider_attempt_id.as_deref(), exact_attempt.as_ref())
+            && attempt
+                .try_get::<Option<String>, _>("terminal_fingerprint")?
+                .as_deref()
+                != Some(fingerprint.as_str())
+        {
+            tracing::error!(
+                %user_id,
+                %invocation_id,
+                %attempt_id,
+                debt_fingerprint = %fingerprint,
+                "exact-attempt settlement debt conflicts with physical terminal state; retaining durable incident authority"
+            );
+            quarantine_inference_settlement_debt(
+                db,
+                user_id,
+                invocation_id,
+                &fingerprint,
+                "exact provider terminal conflicts with the persisted physical terminal",
+            )
+            .await?;
+            return Ok(0);
+        }
+        if let Some(attempt_id) = provider_attempt_id.as_deref()
+            && exact_attempt.is_none()
+            && provider_delivery_state != ProviderDeliveryState::PreDelivery.as_str()
+        {
+            tracing::error!(
+                %user_id,
+                %invocation_id,
+                %attempt_id,
+                debt_fingerprint = %fingerprint,
+                "delivery-authorized exact-attempt debt has no physical admission row; retaining durable incident authority"
+            );
+            quarantine_inference_settlement_debt(
+                db,
+                user_id,
+                invocation_id,
+                &fingerprint,
+                "delivery-authorized or legacy exact debt has no physical attempt row",
+            )
+            .await?;
+            return Ok(0);
+        }
+        if let Some(attempt_id) = provider_attempt_id.as_deref()
+            && exact_attempt.is_some()
+            && let Err(error) = insert_recovered_model_request_terminal(
+                db,
+                user_id,
+                invocation_id,
+                attempt_id,
+                &terminal,
+            )
+            .await
+        {
+            quarantine_inference_settlement_debt(
+                db,
+                user_id,
+                invocation_id,
+                &fingerprint,
+                "exact provider attempt is missing accepted request-context evidence",
+            )
+            .await?;
+            tracing::error!(
+                %user_id,
+                %invocation_id,
+                %attempt_id,
+                %error,
+                "quarantined exact settlement debt with incomplete accounting evidence"
+            );
+            return Ok(0);
+        }
         if terminal.status == InferenceTerminalStatus::Succeeded.as_str()
-            && matching_successful_provider_attempt(db, user_id, invocation_id, &fingerprint)
-                .await?
-                .is_none()
+            && !matching_successful_provider_attempt(
+                db,
+                user_id,
+                invocation_id,
+                &fingerprint,
+                provider_attempt_id.as_deref(),
+            )
+            .await?
         {
             tracing::error!(
                 %user_id,
                 %invocation_id,
                 debt_fingerprint = %fingerprint,
-                "discarding inference success debt without a matching provider terminal"
+                exact_attempt = provider_attempt_id.is_some(),
+                "inference success debt has no matching provider terminal"
             );
-            delete_inference_settlement_debt(db, user_id, invocation_id, &fingerprint).await?;
+            if provider_attempt_id.is_none() {
+                // Legacy logical-only success debts could never establish
+                // physical authority; remove those invalid rows. A modern
+                // exact-attempt debt is an incident record and must survive
+                // until the referenced attempt can be reconciled or repaired.
+                delete_inference_settlement_debt(db, user_id, invocation_id, &fingerprint).await?;
+            } else {
+                quarantine_inference_settlement_debt(
+                    db,
+                    user_id,
+                    invocation_id,
+                    &fingerprint,
+                    "exact success debt has no matching successful physical attempt",
+                )
+                .await?;
+            }
             return Ok(0);
         }
-        let updated =
-            apply_inference_terminal_if_quiescent(db, user_id, invocation_id, terminal).await?;
+        let updated = apply_inference_terminal_if_quiescent(
+            db,
+            user_id,
+            invocation_id,
+            terminal,
+            &provider_delivery_state,
+        )
+        .await?;
         if updated == 1 {
             delete_inference_settlement_debt(db, user_id, invocation_id, &fingerprint).await?;
-        } else {
+        } else if !clear_debt_after_concurrent_invocation_terminal(
+            db,
+            user_id,
+            invocation_id,
+            &fingerprint,
+        )
+        .await?
+        {
             tracing::warn!(
                 %user_id,
                 %invocation_id,
@@ -2362,9 +4029,16 @@ async fn reconcile_inference_settlement_debt(
             %invocation_id,
             debt_fingerprint = %fingerprint,
             invocation_status,
-            "discarding inference settlement debt that conflicts with terminal invocation state"
+            "inference settlement debt conflicts with terminal invocation state; retaining durable incident authority"
         );
-        delete_inference_settlement_debt(db, user_id, invocation_id, &fingerprint).await?;
+        quarantine_inference_settlement_debt(
+            db,
+            user_id,
+            invocation_id,
+            &fingerprint,
+            "settlement debt conflicts with the terminal logical invocation",
+        )
+        .await?;
     }
     Ok(0)
 }
@@ -2406,7 +4080,9 @@ async fn reconcile_inference_settlement_debts_batch(
     let rows = sqlx::query(
         "SELECT user_id, invocation_id
          FROM inference_invocation_settlement_debts
-         ORDER BY user_id ASC, invocation_id ASC
+         WHERE reconciliation_status = 'pending'
+           AND next_retry_at <= NOW(6)
+         ORDER BY next_retry_at ASC, user_id ASC, invocation_id ASC
          LIMIT ?",
     )
     .bind(limit.clamp(1, INFERENCE_SETTLEMENT_RECOVERY_BATCH))
@@ -2431,7 +4107,274 @@ async fn reconcile_inference_settlement_debts_batch(
         identities.push((user_id, invocation_id));
     }
     reconcile_settlement_identities(identities, |user_id, invocation_id| async move {
-        reconcile_inference_settlement_debt(db, &user_id, &invocation_id).await
+        match reconcile_inference_settlement_debt(db, &user_id, &invocation_id).await {
+            Ok(count) => Ok(count),
+            Err(error) => {
+                if let Err(defer_error) =
+                    defer_inference_settlement_debt(db, &user_id, &invocation_id).await
+                {
+                    tracing::warn!(
+                        %user_id,
+                        %invocation_id,
+                        %defer_error,
+                        "failed to defer an inference settlement debt after reconciliation error"
+                    );
+                }
+                Err(error)
+            }
+        }
+    })
+    .await
+}
+
+async fn recover_expired_inference_invocation(
+    db: &sqlx::Pool<sqlx::MySql>,
+    user_id: &str,
+    invocation_id: &str,
+) -> Result<u64, sqlx::Error> {
+    let mut tx = db.begin().await?;
+    let Some(invocation) = sqlx::query(
+        "SELECT status, owner_token, owner_generation,
+                IF(owner_lease_expires_at <= NOW(6), 1, 0) AS lease_expired
+         FROM inference_invocations
+         WHERE user_id = ? AND invocation_id = ?
+         FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(invocation_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        tx.rollback().await?;
+        return Ok(0);
+    };
+    let status = invocation.try_get::<String, _>("status")?;
+    let lease_expired = invocation.try_get::<i64, _>("lease_expired")? == 1;
+    if status != "admitted" || !lease_expired {
+        tx.rollback().await?;
+        return Ok(0);
+    }
+    let old_owner_token = invocation.try_get::<String, _>("owner_token")?;
+    let old_owner_generation = invocation.try_get::<i64, _>("owner_generation")?;
+    let new_owner_generation = old_owner_generation.checked_add(1).ok_or_else(|| {
+        sqlx::Error::Protocol(format!(
+            "inference owner generation exhausted for {user_id}/{invocation_id}"
+        ))
+    })?;
+    let settlement_exists = sqlx::query(
+        "SELECT 1 FROM inference_invocation_settlement_debts
+         WHERE user_id = ? AND invocation_id = ? LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(invocation_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .is_some();
+    if settlement_exists {
+        tx.rollback().await?;
+        return Ok(0);
+    }
+
+    let attempts = sqlx::query(
+        "SELECT attempt_id, status, terminal_fingerprint, usage_status,
+                input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+                provider_response_id, error_kind, error_message
+         FROM inference_provider_attempts
+         WHERE user_id = ? AND invocation_id = ?
+         ORDER BY attempt_index ASC, attempt_id ASC
+         FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(invocation_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    let started_attempt_ids = attempts
+        .iter()
+        .filter_map(|attempt| {
+            attempt
+                .try_get::<String, _>("status")
+                .ok()
+                .filter(|status| status == "started")
+                .and_then(|_| attempt.try_get::<String, _>("attempt_id").ok())
+        })
+        .collect::<Vec<_>>();
+
+    let (terminal, delivery_state) = if attempts.is_empty() {
+        let terminal = InferenceInvocationTerminal {
+            status: InferenceTerminalStatus::Cancelled,
+            usage: InferenceUsage::default(),
+            usage_status: InferenceUsageStatus::Unavailable,
+            provider_response_id: None,
+            error_kind: Some("owner_lease_expired".to_string()),
+            error_message: Some(
+                "inference owner stopped before provider delivery was authorized".to_string(),
+            ),
+        };
+        let fingerprint = terminal_fingerprint(&terminal)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        (
+            DurableInferenceTerminal::from_terminal(&terminal, fingerprint)
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?,
+            ProviderDeliveryState::PreDelivery,
+        )
+    } else if !started_attempt_ids.is_empty() {
+        let terminal = InferenceInvocationTerminal {
+            status: InferenceTerminalStatus::DeliveryUnknown,
+            usage: InferenceUsage::default(),
+            usage_status: InferenceUsageStatus::Unavailable,
+            provider_response_id: None,
+            error_kind: Some("owner_lease_expired".to_string()),
+            error_message: Some(
+                "inference owner lease expired after provider delivery was authorized".to_string(),
+            ),
+        };
+        let fingerprint = terminal_fingerprint(&terminal)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        (
+            DurableInferenceTerminal::from_terminal(&terminal, fingerprint)
+                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?,
+            ProviderDeliveryState::DeliveryAuthorized,
+        )
+    } else {
+        let last = attempts.last().expect("non-empty terminal attempt set");
+        let terminal_fingerprint = last
+            .try_get::<Option<String>, _>("terminal_fingerprint")?
+            .ok_or_else(|| {
+                sqlx::Error::Protocol(format!(
+                    "terminal provider attempt has no fingerprint for {user_id}/{invocation_id}"
+                ))
+            })?;
+        (
+            DurableInferenceTerminal {
+                status: last.try_get("status")?,
+                terminal_fingerprint: Some(terminal_fingerprint),
+                usage_status: last.try_get("usage_status")?,
+                input_tokens: last.try_get("input_tokens")?,
+                output_tokens: last.try_get("output_tokens")?,
+                cache_read_tokens: last.try_get("cache_read_tokens")?,
+                cache_creation_tokens: last.try_get("cache_creation_tokens")?,
+                provider_response_id: last.try_get("provider_response_id")?,
+                error_kind: last.try_get("error_kind")?,
+                error_message: last.try_get("error_message")?,
+            },
+            ProviderDeliveryState::DeliveryAuthorized,
+        )
+    };
+
+    for attempt_id in &started_attempt_ids {
+        let updated = sqlx::query(
+            "UPDATE inference_provider_attempts
+             SET status = 'delivery_unknown', terminal_fingerprint = ?,
+                 usage_status = 'unavailable', input_tokens = 0, output_tokens = 0,
+                 cache_read_tokens = 0, cache_creation_tokens = 0,
+                 provider_response_id = NULL, error_kind = ?, error_message = ?,
+                 terminal_at = NOW(6)
+             WHERE user_id = ? AND invocation_id = ? AND attempt_id = ?
+               AND status = 'started'",
+        )
+        .bind(&terminal.terminal_fingerprint)
+        .bind(&terminal.error_kind)
+        .bind(&terminal.error_message)
+        .bind(user_id)
+        .bind(invocation_id)
+        .bind(attempt_id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(sqlx::Error::Protocol(format!(
+                "expired inference attempt {user_id}/{attempt_id} changed during recovery"
+            )));
+        }
+        insert_recovered_model_request_terminal_tx(
+            &mut tx,
+            user_id,
+            invocation_id,
+            attempt_id,
+            &terminal,
+        )
+        .await?;
+    }
+
+    let new_owner_token = new_admission_token();
+    let updated = sqlx::query(
+        "UPDATE inference_invocations
+         SET owner_token = ?, owner_generation = ?, owner_lease_expires_at = NOW(6),
+             status = ?, terminal_fingerprint = ?, usage_status = ?,
+             provider_delivery_state = ?, input_tokens = ?, output_tokens = ?,
+             cache_read_tokens = ?, cache_creation_tokens = ?, provider_response_id = ?,
+             error_kind = ?, error_message = ?, terminal_at = NOW(6)
+         WHERE user_id = ? AND invocation_id = ? AND status = 'admitted'
+           AND owner_token = ? AND owner_generation = ?
+           AND owner_lease_expires_at <= NOW(6)
+           AND NOT EXISTS (
+               SELECT 1 FROM inference_invocation_settlement_debts AS debt
+               WHERE debt.user_id = inference_invocations.user_id
+                 AND debt.invocation_id = inference_invocations.invocation_id
+           )",
+    )
+    .bind(new_owner_token)
+    .bind(new_owner_generation)
+    .bind(&terminal.status)
+    .bind(&terminal.terminal_fingerprint)
+    .bind(&terminal.usage_status)
+    .bind(delivery_state.as_str())
+    .bind(terminal.input_tokens)
+    .bind(terminal.output_tokens)
+    .bind(terminal.cache_read_tokens)
+    .bind(terminal.cache_creation_tokens)
+    .bind(&terminal.provider_response_id)
+    .bind(&terminal.error_kind)
+    .bind(&terminal.error_message)
+    .bind(user_id)
+    .bind(invocation_id)
+    .bind(old_owner_token)
+    .bind(old_owner_generation)
+    .execute(&mut *tx)
+    .await?;
+    if updated.rows_affected() != 1 {
+        tx.rollback().await?;
+        return Ok(0);
+    }
+    tx.commit().await?;
+    Ok(1)
+}
+
+async fn recover_expired_inference_invocations_batch(
+    db: &sqlx::Pool<sqlx::MySql>,
+    limit: i64,
+) -> Result<u64, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT user_id, invocation_id
+         FROM (
+             SELECT invocation.user_id, invocation.invocation_id,
+                    invocation.owner_lease_expires_at,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY invocation.user_id
+                        ORDER BY invocation.owner_lease_expires_at ASC,
+                                 invocation.invocation_id ASC
+                    ) AS owner_rank
+             FROM inference_invocations AS invocation
+             WHERE invocation.status = 'admitted'
+               AND invocation.owner_lease_expires_at <= NOW(6)
+               AND NOT EXISTS (
+                   SELECT 1 FROM inference_invocation_settlement_debts AS debt
+                   WHERE debt.user_id = invocation.user_id
+                     AND debt.invocation_id = invocation.invocation_id
+               )
+         ) AS expired
+         ORDER BY owner_rank ASC, owner_lease_expires_at ASC,
+                  user_id ASC, invocation_id ASC
+         LIMIT ?",
+    )
+    .bind(limit.clamp(1, INFERENCE_SETTLEMENT_RECOVERY_BATCH))
+    .fetch_all(db)
+    .await?;
+    let identities = rows
+        .into_iter()
+        .map(|row| Ok((row.try_get("user_id")?, row.try_get("invocation_id")?)))
+        .collect::<Result<Vec<(String, String)>, sqlx::Error>>()?;
+    reconcile_settlement_identities(identities, |user_id, invocation_id| async move {
+        recover_expired_inference_invocation(db, &user_id, &invocation_id).await
     })
     .await
 }
@@ -2440,7 +4383,10 @@ async fn reconcile_inference_settlement_debts_batch(
 /// Runtime workers call this repeatedly; schema readiness never waits for the
 /// operational backlog to drain.
 pub async fn reconcile_inference_settlements(pool: &SharedPool, limit: u32) -> ServiceResult<u64> {
-    reconcile_inference_settlement_debts_batch(pool.get(), i64::from(limit.max(1)))
+    let limit = i64::from(limit.max(2));
+    let debt_limit = (limit + 1) / 2;
+    let orphan_limit = limit / 2;
+    let reconciled_debts = reconcile_inference_settlement_debts_batch(pool.get(), debt_limit)
         .await
         .map_err(|error| {
             ServiceError::with_source(
@@ -2448,7 +4394,107 @@ pub async fn reconcile_inference_settlements(pool: &SharedPool, limit: u32) -> S
                 "reconcile inference settlement batch",
                 error,
             )
-        })
+        })?;
+    let recovered_orphans = recover_expired_inference_invocations_batch(pool.get(), orphan_limit)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "recover expired inference owner batch",
+                error,
+            )
+        })?;
+    Ok(reconciled_debts + recovered_orphans)
+}
+
+/// Project one already-declared settlement decision to its exact invocation.
+///
+/// Detached request owners use this point lookup after durably recording debt;
+/// the batch sweeper remains a crash-recovery fallback rather than the normal
+/// completion path. Repeating the exact terminal is idempotent, while a
+/// conflicting terminal remains an authoritative contract failure.
+pub async fn reconcile_inference_settlement(
+    pool: &SharedPool,
+    plan: &InferenceInvocationPlan,
+    terminal: &InferenceInvocationTerminal,
+) -> ServiceResult<InferenceSettlementReconcileOutcome> {
+    let fingerprint = terminal_fingerprint(terminal)?;
+    let db = pool.get();
+    reconcile_inference_settlement_debt(db, &plan.input.user_id, &plan.invocation_id)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "reconcile exact inference settlement",
+                error,
+            )
+        })?;
+    match existing_terminal_fingerprint(db, plan).await? {
+        Some(existing) if existing == fingerprint => {
+            Ok(InferenceSettlementReconcileOutcome::Settled)
+        }
+        Some(_) => Err(ServiceError::conflict(format!(
+            "inference invocation {} terminal payload conflicts with its durable result",
+            plan.invocation_id
+        ))),
+        None => {
+            let debt = sqlx::query(
+                "SELECT terminal_fingerprint, reconciliation_status
+                 FROM inference_invocation_settlement_debts
+                 WHERE user_id = ? AND invocation_id = ? LIMIT 1",
+            )
+            .bind(&plan.input.user_id)
+            .bind(&plan.invocation_id)
+            .fetch_optional(db)
+            .await
+            .map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "load exact inference settlement disposition",
+                    error,
+                )
+            })?;
+            let Some(debt) = debt else {
+                return Ok(InferenceSettlementReconcileOutcome::TransientPending);
+            };
+            let debt_fingerprint =
+                debt.try_get::<String, _>("terminal_fingerprint")
+                    .map_err(|error| {
+                        ServiceError::with_source(
+                            ServiceErrorKind::Persistence,
+                            "decode exact inference settlement fingerprint",
+                            error,
+                        )
+                    })?;
+            if debt_fingerprint != fingerprint {
+                return Err(ServiceError::conflict(format!(
+                    "inference invocation {} settlement debt conflicts with the requested terminal",
+                    plan.invocation_id
+                )));
+            }
+            match debt
+                .try_get::<String, _>("reconciliation_status")
+                .map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "decode exact inference settlement disposition",
+                        error,
+                    )
+                })?
+                .as_str()
+            {
+                "quarantined" => Ok(InferenceSettlementReconcileOutcome::PermanentlyQuarantined),
+                "pending" => Ok(InferenceSettlementReconcileOutcome::TransientPending),
+                status => Err(ServiceError::new(
+                    ServiceErrorKind::Verification,
+                    format!(
+                        "inference invocation {} has unknown settlement reconciliation status {status}",
+                        plan.invocation_id
+                    ),
+                )),
+            }
+        }
+    }
 }
 
 /// Resolve an ambiguous terminal transaction from its durable settlement debt.
@@ -2525,7 +4571,11 @@ pub async fn finish_inference_invocation(
         db,
         &plan.input.user_id,
         &plan.invocation_id,
+        &plan.owner_token,
+        plan.owner_generation,
         &terminal_state,
+        None,
+        ProviderDeliveryState::Unknown,
         SettlementDebtMode::RequireQuiescent,
     )
     .await?;
@@ -2540,10 +4590,20 @@ pub async fn finish_inference_invocation(
     let write_result: ServiceResult<()> = async {
         let invocation = sqlx::query(
             "UPDATE inference_invocations
-             SET status = ?, terminal_fingerprint = ?, input_tokens = ?, output_tokens = ?,
+             SET status = ?, terminal_fingerprint = ?, usage_status = ?,
+                 provider_delivery_state = IF(
+                     EXISTS (
+                         SELECT 1 FROM inference_provider_attempts AS delivered_attempt
+                         WHERE delivered_attempt.user_id = inference_invocations.user_id
+                           AND delivered_attempt.invocation_id = inference_invocations.invocation_id
+                     ),
+                     'delivery_authorized', 'pre_delivery'),
+                 input_tokens = ?, output_tokens = ?,
                  cache_read_tokens = ?, cache_creation_tokens = ?, provider_response_id = ?,
                  error_kind = ?, error_message = ?, terminal_at = NOW(6)
              WHERE user_id = ? AND invocation_id = ? AND status = 'admitted'
+               AND owner_token = ? AND owner_generation = ?
+               AND owner_lease_expires_at > NOW(6)
                AND NOT EXISTS (
                     SELECT 1
                     FROM inference_provider_attempts AS open_attempt
@@ -2554,6 +4614,7 @@ pub async fn finish_inference_invocation(
         )
         .bind(&terminal_state.status)
         .bind(&fingerprint)
+        .bind(&terminal_state.usage_status)
         .bind(terminal_state.input_tokens)
         .bind(terminal_state.output_tokens)
         .bind(terminal_state.cache_read_tokens)
@@ -2563,6 +4624,10 @@ pub async fn finish_inference_invocation(
         .bind(&terminal_state.error_message)
         .bind(&plan.input.user_id)
         .bind(&plan.invocation_id)
+        .bind(&plan.owner_token)
+        .bind(i64::try_from(plan.owner_generation).map_err(|_| {
+            ServiceError::invalid("inference owner generation exceeds the durable BIGINT range")
+        })?)
         .execute(&mut *tx)
         .await
         .map_err(|error| {
@@ -2669,12 +4734,18 @@ mod tests {
             purpose: InferencePurpose::PrimaryAgent,
             execution_placement: ModelExecutionPlacement::Server,
             access_kind: ModelAccessKind::SelfHosted,
+            run_authority: Some(InferenceRunAdmissionAuthority {
+                expected_owner_generation: 0,
+                expected_owner_pod_id: "test-inference-owner".to_string(),
+                expected_control_epoch: 0,
+            }),
         }
     }
 
     #[test]
     fn invocation_identity_changes_with_inference_purpose() {
         let primary = plan_inference_invocation(input()).expect("primary plan");
+        assert_eq!(primary.logical_attempt(), 0);
         let mut changed = input();
         changed.purpose = InferencePurpose::SubAgent;
         assert_ne!(
@@ -2714,6 +4785,46 @@ mod tests {
     }
 
     #[test]
+    fn run_scope_requires_exact_execution_authority_and_other_scopes_reject_it() {
+        let mut missing = input();
+        missing.run_authority = None;
+        assert_eq!(
+            plan_inference_invocation(missing)
+                .expect_err("run inference without execution authority must fail")
+                .kind,
+            ServiceErrorKind::Invalid
+        );
+
+        let mut session = input();
+        session.scope = InferenceInvocationScope::Session {
+            session_id: "session-1".to_string(),
+            turn: 3,
+            round: 2,
+            operation_id: "memory_extraction".to_string(),
+            logical_attempt: 0,
+        };
+        assert_eq!(
+            plan_inference_invocation(session)
+                .expect_err("run authority must not cross into a session scope")
+                .kind,
+            ServiceErrorKind::Invalid
+        );
+
+        let mut invalid_epoch = input();
+        invalid_epoch
+            .run_authority
+            .as_mut()
+            .expect("run authority")
+            .expected_control_epoch = -2;
+        assert_eq!(
+            plan_inference_invocation(invalid_epoch)
+                .expect_err("control authority below the initial epoch must fail")
+                .kind,
+            ServiceErrorKind::Invalid
+        );
+    }
+
+    #[test]
     fn invocation_identity_distinguishes_every_owner_kind() {
         let run = plan_inference_invocation(input()).expect("run plan");
         let mut session_input = input();
@@ -2724,6 +4835,7 @@ mod tests {
             operation_id: "agent_turn".to_string(),
             logical_attempt: 0,
         };
+        session_input.run_authority = None;
         let session = plan_inference_invocation(session_input).expect("session plan");
         let mut harness_input = input();
         harness_input.scope = InferenceInvocationScope::HarnessRun {
@@ -2731,6 +4843,7 @@ mod tests {
             operation_id: "skillify_extract".to_string(),
             logical_attempt: 0,
         };
+        harness_input.run_authority = None;
         harness_input.purpose = InferencePurpose::SkillSynthesis;
         let harness = plan_inference_invocation(harness_input).expect("harness plan");
 
@@ -2789,6 +4902,16 @@ mod tests {
             first_attempt.admission_token,
             second_attempt.admission_token
         );
+
+        let mut retry_input = input();
+        retry_input.scope = retry_input.scope.with_logical_attempt(1);
+        let retry_invocation = plan_inference_invocation(retry_input).expect("retry invocation");
+        assert_eq!(retry_invocation.logical_attempt(), 1);
+        assert_ne!(
+            first_invocation.invocation_id,
+            retry_invocation.invocation_id
+        );
+        assert_ne!(first_invocation.route_id, retry_invocation.route_id);
     }
 
     #[test]
@@ -2797,6 +4920,8 @@ mod tests {
         let exact = PersistedInvocationAdmissionFact {
             route_id: plan.route_id.clone(),
             admission_token: plan.admission_token.clone(),
+            owner_token: plan.owner_token.clone(),
+            owner_generation: i64::try_from(plan.owner_generation).expect("owner generation"),
             status: "admitted".to_string(),
             terminal_fingerprint: None,
         };
@@ -2908,11 +5033,10 @@ mod tests {
         let terminal = InferenceInvocationTerminal {
             status: InferenceTerminalStatus::DeliveryUnknown,
             usage: InferenceUsage {
-                input_tokens: 200,
+                input: astra_turn_types::NormalizedPromptCacheUsage::new(200, 800, 100),
                 output_tokens: 50,
-                cache_read_tokens: 800,
-                cache_creation_tokens: 100,
             },
+            usage_status: InferenceUsageStatus::ProviderPartial,
             provider_response_id: Some("provider-partial".to_string()),
             error_kind: Some("stream_transport".to_string()),
             error_message: Some("partial delivery".to_string()),
@@ -3000,10 +5124,8 @@ mod tests {
     fn terminal_fingerprint_is_idempotent_but_usage_sensitive() {
         let terminal = InferenceInvocationTerminal::succeeded(
             InferenceUsage {
-                input_tokens: 10,
+                input: astra_turn_types::NormalizedPromptCacheUsage::new(10, 4, 0),
                 output_tokens: 3,
-                cache_read_tokens: 4,
-                cache_creation_tokens: 0,
             },
             Some("provider-response".to_string()),
         );
@@ -3017,10 +5139,8 @@ mod tests {
             terminal_fingerprint(&changed).expect("changed fingerprint"),
             terminal_fingerprint(&InferenceInvocationTerminal::succeeded(
                 InferenceUsage {
-                    input_tokens: 10,
+                    input: astra_turn_types::NormalizedPromptCacheUsage::new(10, 4, 0),
                     output_tokens: 3,
-                    cache_read_tokens: 4,
-                    cache_creation_tokens: 0,
                 },
                 Some("provider-response".to_string()),
             ))
@@ -3054,10 +5174,8 @@ mod tests {
         let attempt = plan_inference_provider_attempt_with_context(&invocation, 2, wire, seed);
         let terminal = InferenceInvocationTerminal::succeeded(
             InferenceUsage {
-                input_tokens: 1_000,
+                input: astra_turn_types::NormalizedPromptCacheUsage::new(300, 600, 100),
                 output_tokens: 80,
-                cache_read_tokens: 600,
-                cache_creation_tokens: 100,
             },
             Some("provider-response".to_string()),
         );
@@ -3071,6 +5189,7 @@ mod tests {
 
         assert_ne!(accepted_id, terminal_id);
         assert!(accepted.usage.is_none());
+        assert!(accepted.usage_status.is_none());
         assert_eq!(terminal_event.identity.physical_attempt, 2);
         assert_eq!(
             terminal_event.identity.provider_wire_hash,
@@ -3079,15 +5198,16 @@ mod tests {
         assert_eq!(
             terminal_event.usage,
             Some(ModelRequestUsage {
-                fresh_input_tokens: 300,
-                cache_read_tokens: 600,
-                cache_creation_tokens: 100,
-                request_input_tokens: 1_000,
+                input: astra_turn_types::NormalizedPromptCacheUsage::new(300, 600, 100),
                 output_tokens: 80,
             })
         );
         assert_eq!(terminal_event.budget.estimate_error_tokens, Some(100));
         assert_eq!(terminal_event.cache.cache_read_share, Some(0.6));
+        assert_eq!(
+            terminal_event.usage_status.as_deref(),
+            Some("provider_exact")
+        );
         assert_eq!(terminal_event.wire_composition.system_bytes, 100);
         assert!(!accepted_json.contains("provider-response"));
         assert!(terminal_json.contains(MODEL_REQUEST_CONTEXT_SCHEMA));
@@ -3105,7 +5225,10 @@ mod tests {
                     .expect("every durable provider terminal has one context event");
             assert_eq!(event.terminal_status.as_deref(), Some(status.as_str()));
             assert_eq!(
-                event.usage.as_ref().map(|usage| usage.request_input_tokens),
+                event
+                    .usage
+                    .as_ref()
+                    .map(ModelRequestUsage::total_input_tokens),
                 Some(1_000)
             );
         }

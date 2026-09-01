@@ -23,20 +23,6 @@ fn parse_sse_events(raw: &str) -> Vec<Value> {
         .collect()
 }
 
-fn has_turn_complete(raw: &str) -> bool {
-    parse_sse_events(raw)
-        .iter()
-        .any(|event| event.get("type").and_then(Value::as_str) == Some("turn_complete"))
-}
-
-fn has_retryable_conflict(raw: &str) -> bool {
-    parse_sse_events(raw).iter().any(|event| {
-        event.get("type").and_then(Value::as_str) == Some("error")
-            && event.get("code").and_then(Value::as_str) == Some("CONFLICT")
-            && event.get("retryable").and_then(Value::as_bool) == Some(true)
-    })
-}
-
 pub async fn run_session_cancel_then_delete() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
@@ -83,7 +69,7 @@ pub async fn run_session_cancel_then_delete() {
     .await;
     assert_eq!(st_get, StatusCode::NOT_FOUND, "get after delete");
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Unauthenticated `/sessions`, duplicate register, and bad password login (real DB + services).
@@ -164,7 +150,7 @@ pub async fn run_memory_proxy_user_isolation() {
         "authorized durable session_id must be preserved: {body}"
     );
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 pub async fn run_auth_and_session_negative_paths() {
@@ -230,7 +216,7 @@ pub async fn run_auth_and_session_negative_paths() {
     .await;
     assert_eq!(st_ok, StatusCode::OK, "login still ok: {j_ok}");
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 pub async fn run_chat_stream_session_info_smoke() {
@@ -240,10 +226,8 @@ pub async fn run_chat_stream_session_info_smoke() {
     let auth = &b.auth_header;
     let session_id = ctx.session_id.clone();
 
-    // Test /chat/stream with lifecycle mock rounds. The bridge test secret is
-    // still sent by this harness, but /chat/stream must stay on the unified
-    // ServerAgenticLoopHost path.
-    let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
+    // The one admission is handled by the ServerAgenticLoopHost; mock rounds
+    // are request context for the legacy test-only inference hook.
     let body = json!({
         "message": "matrix e2e stream smoke",
         "session_id": session_id,
@@ -252,18 +236,18 @@ pub async fn run_chat_stream_session_info_smoke() {
             "initial_turns": 1,
             "hard_turn_limit": 1
         },
-        "test_llm_rounds": [{
-            "role": "assistant",
-            "content": "stream smoke reply",
-            "usage": { "prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8 }
-        }]
+        "context": {
+            "test_llm_rounds": [{
+                "full_text": "stream smoke reply",
+                "usage": { "prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8 }
+            }]
+        }
     });
     let req = Request::builder()
         .method("POST")
         .uri("/chat/stream")
         .header("authorization", auth.as_str())
         .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", &test_secret)
         .body(Body::from(body.to_string()))
         .expect("stream request");
     let (st, text) = collect_sse_body_text(app, req, 512 * 1024).await;
@@ -279,7 +263,7 @@ pub async fn run_chat_stream_session_info_smoke() {
         &text[..text.len().min(500)]
     );
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 pub async fn run_approval_respond_invalid_session_id_rejected() {
@@ -312,7 +296,7 @@ pub async fn run_approval_respond_invalid_session_id_rejected() {
         "invalid session detail should explain the rejected session id: {body}"
     );
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 pub async fn run_edge_callback_http_boundary_failures() {
@@ -331,7 +315,7 @@ pub async fn run_edge_callback_http_boundary_failures() {
             turn_chain_id: format!("chain-tool-unauth-{}", ctx.suffix),
             request_id: format!("tool-unauth-{}", ctx.suffix),
             edge_agent_id: ctx.edge_agent_id.clone(),
-            status: "ok".to_string(),
+            status: "completed".to_string(),
             output: "ignored".to_string(),
             duration_ms: 0,
             tool_result_fields: None,
@@ -367,7 +351,7 @@ pub async fn run_edge_callback_http_boundary_failures() {
         "/tools/result",
         Some(auth.as_str()),
         json!({
-            "status": "ok",
+            "status": "completed",
             "output": "missing request id"
         }),
     )
@@ -398,73 +382,90 @@ pub async fn run_edge_callback_http_boundary_failures() {
         "/approval/respond bad payload should be rejected: {st_appr_bad} {appr_bad}"
     );
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
-pub async fn run_duplicate_tool_result_is_idempotent() {
+pub async fn run_duplicate_tool_result_server_stream_is_idempotent() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
-    let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
     let tool_output = "duplicate tool result ok";
     let payload = json!({
         "agent_id": "system-matrix-dup-tool-agent",
-        "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
         "session_id": ctx.session_id,
-        "messages": [{ "role": "user", "content": "read the duplicate path" }],
+        "edge_executor_id": ctx.edge_agent_id,
+        "workspace_binding": {
+            "kind": "edge_workspace",
+            "display_name": "system-matrix-edge",
+            "root": "/tmp/astra-system-matrix-edge",
+            "authority": "read_write"
+        },
+        "executor_binding": {
+            "kind": "edge_agent",
+            "executor_id": ctx.edge_agent_id,
+            "display_name": "system-matrix-edge",
+            "transport": "edge_ledger",
+            "status": "online"
+        },
+        "message": "read the duplicate path",
         "model_selection": seeded_model_selection(ctx),
-        "edge_tools": [{
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "description": "read a file",
-                "parameters": {
-                    "type": "object",
-                    "properties": { "path": { "type": "string" } },
-                    "required": ["path"]
-                }
-            }
-        }],
-        "test_llm_rounds": [
-            {
-                "tool_calls": [{
-                    "id": "tc-dup-tool-1",
-                    "type": "function",
-                    "function": {
-                        "name": "read_file",
-                        "arguments": "{\"path\":\"dup.txt\"}"
-                    }
-                }]
+        "context": {
+            "edge_profile": {
+                "cwd": "/tmp/astra-system-matrix-edge",
+                "edge_agent_id": ctx.edge_agent_id,
+                "hostname": "system-matrix-edge"
             },
-            {
-                "full_text": "Done after duplicate tool result."
-            }
-        ]
+            "edge_tools": [{
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "read a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "path": { "type": "string" } },
+                        "required": ["path"]
+                    }
+                }
+            }],
+            "test_llm_rounds": [
+                {
+                    "tool_calls": [{
+                        "id": "tc-dup-tool-1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"dup.txt\"}"
+                        }
+                    }]
+                },
+                {
+                    "full_text": "Done after duplicate tool result."
+                }
+            ]
+        }
     });
 
     let req = Request::builder()
         .method("POST")
-        .uri("/chat/turn")
+        .uri("/chat/stream")
         .header("authorization", b.auth_header.as_str())
         .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", test_secret)
         .body(Body::from(payload.to_string()))
-        .expect("duplicate tool result request");
+        .expect("duplicate tool result stream request");
     let response = ctx
         .app
         .clone()
         .oneshot(req)
         .await
-        .expect("chat/turn oneshot");
+        .expect("chat/stream oneshot");
     assert_eq!(
         response.status(),
         StatusCode::OK,
-        "chat/turn should return 200"
+        "chat/stream should return 200"
     );
 
     let mut stream = response.into_body().into_data_stream();
     let mut acc = Vec::new();
     let mut posted_duplicates = false;
-    let mut saw_turn_complete = false;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.expect("duplicate tool result sse chunk");
         acc.extend_from_slice(&chunk);
@@ -474,7 +475,7 @@ pub async fn run_duplicate_tool_result_is_idempotent() {
                 s.as_ref(),
                 "tc-dup-tool-1",
                 &ctx.edge_agent_id,
-                "ok",
+                "completed",
                 tool_output,
                 0,
             )
@@ -491,13 +492,8 @@ pub async fn run_duplicate_tool_result_is_idempotent() {
             }
             posted_duplicates = true;
         }
-        if s.contains("\"type\":\"turn_complete\"") {
-            saw_turn_complete = true;
-            break;
-        }
     }
-    assert!(posted_duplicates, "chat/turn never emitted tool_request");
-    assert!(saw_turn_complete, "chat/turn never reached turn_complete");
+    assert!(posted_duplicates, "chat/stream never emitted tool_request");
 
     let full = String::from_utf8_lossy(&acc).into_owned();
     let events = parse_sse_events(&full);
@@ -510,19 +506,72 @@ pub async fn run_duplicate_tool_result_is_idempotent() {
         .count();
     assert_eq!(
         tool_requests, 1,
-        "duplicate /tools/result should still yield exactly one initial tool_request: {events:?}"
+        "duplicate /tools/result should still yield exactly one tool_request: {events:?}"
     );
-    let turn_complete = events
+    let terminals = events
         .iter()
-        .find(|event| event.get("type").and_then(Value::as_str) == Some("turn_complete"))
-        .expect("turn_complete after duplicate tool result");
+        .filter(|event| event.get("type").and_then(Value::as_str) == Some("turn_complete"))
+        .collect::<Vec<_>>();
+    assert_eq!(terminals.len(), 1, "one server stream terminal: {events:?}");
+    let turn_complete = terminals[0];
     assert_eq!(
-        turn_complete.get("has_tool_calls").and_then(Value::as_bool),
-        Some(true),
-        "duplicate tool-result handoff should close the initial stream with pending tool calls: {events:?}"
+        turn_complete
+            .get("continuation_owner")
+            .and_then(Value::as_str),
+        Some("server"),
+        "duplicate callback must not turn the tool boundary into a terminal: {events:?}"
+    );
+    assert_eq!(
+        turn_complete
+            .get("tool_calls_count")
+            .and_then(Value::as_u64),
+        Some(1),
+        "duplicate callback terminal must account for one tool call: {events:?}"
+    );
+    assert_eq!(
+        turn_complete
+            .get("tools_used")
+            .and_then(Value::as_array)
+            .map(|tools| tools.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
+        Some(vec!["read_file"]),
+        "duplicate callback terminal must report the normalized tool list: {events:?}"
+    );
+    assert_eq!(
+        turn_complete.get("llm_rounds").and_then(Value::as_u64),
+        Some(2),
+        "duplicate callback terminal must include the initial tool round and final model round: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("text_delta")
+                && event.get("content").and_then(Value::as_str)
+                    == Some("Done after duplicate tool result.")
+        }),
+        "same stream must consume the duplicate callback and emit its final model round: {events:?}"
+    );
+    let run_id = events
+        .iter()
+        .find(|event| event["type"].as_str() == Some("session_info"))
+        .and_then(|event| event["run_id"].as_str())
+        .expect("session_info run_id")
+        .to_string();
+    let durable_results: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_run_events \
+         WHERE user_id = ? AND run_id = ? AND event_type = 'tool_call_end' \
+           AND JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.call_id')) = ?",
+    )
+    .bind(&ctx.user_id)
+    .bind(&run_id)
+    .bind("tc-dup-tool-1")
+    .fetch_one(&ctx.pool)
+    .await
+    .expect("count durable duplicate tool results");
+    assert_eq!(
+        durable_results, 1,
+        "duplicate callback must have one durable effect"
     );
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 pub async fn run_duplicate_approval_response_is_idempotent() {
@@ -560,85 +609,102 @@ pub async fn run_duplicate_approval_response_is_idempotent() {
         "duplicate /approval/respond should commit one durable terminal decision"
     );
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
-pub async fn run_chat_turn_partial_batch_failure() {
+pub async fn run_server_stream_partial_batch_failure() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
-    let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
     let ok_output = "partial batch first ok";
     let err_output = "partial batch second failed";
     let payload = json!({
         "agent_id": "system-matrix-partial-batch-agent",
-        "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
         "session_id": ctx.session_id,
-        "messages": [{ "role": "user", "content": "read two files and continue even if one fails" }],
+        "edge_executor_id": ctx.edge_agent_id,
+        "workspace_binding": {
+            "kind": "edge_workspace",
+            "display_name": "system-matrix-edge",
+            "root": "/tmp/astra-system-matrix-edge",
+            "authority": "read_write"
+        },
+        "executor_binding": {
+            "kind": "edge_agent",
+            "executor_id": ctx.edge_agent_id,
+            "display_name": "system-matrix-edge",
+            "transport": "edge_ledger",
+            "status": "online"
+        },
+        "message": "read two files and continue even if one fails",
         "model_selection": seeded_model_selection(ctx),
-        "edge_tools": [{
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "description": "read a file",
-                "parameters": {
-                    "type": "object",
-                    "properties": { "path": { "type": "string" } },
-                    "required": ["path"]
-                }
-            }
-        }],
-        "test_llm_rounds": [
-            {
-                "tool_calls": [
-                    {
-                        "id": "tc-partial-1",
-                        "type": "function",
-                        "function": {
-                            "name": "read_file",
-                            "arguments": "{\"path\":\"a.txt\"}"
-                        }
-                    },
-                    {
-                        "id": "tc-partial-2",
-                        "type": "function",
-                        "function": {
-                            "name": "read_file",
-                            "arguments": "{\"path\":\"b.txt\"}"
-                        }
-                    }
-                ]
+        "context": {
+            "edge_profile": {
+                "cwd": "/tmp/astra-system-matrix-edge",
+                "edge_agent_id": ctx.edge_agent_id,
+                "hostname": "system-matrix-edge"
             },
-            {
-                "full_text": "Handled the partial batch failure."
-            }
-        ]
+            "edge_tools": [{
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "read a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "path": { "type": "string" } },
+                        "required": ["path"]
+                    }
+                }
+            }],
+            "test_llm_rounds": [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "tc-partial-1",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"path\":\"a.txt\"}"
+                            }
+                        },
+                        {
+                            "id": "tc-partial-2",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"path\":\"b.txt\"}"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "full_text": "Handled the partial batch failure."
+                }
+            ]
+        }
     });
 
     let req = Request::builder()
         .method("POST")
-        .uri("/chat/turn")
+        .uri("/chat/stream")
         .header("authorization", b.auth_header.as_str())
         .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", test_secret)
         .body(Body::from(payload.to_string()))
-        .expect("partial batch request");
+        .expect("partial batch stream request");
     let response = ctx
         .app
         .clone()
         .oneshot(req)
         .await
-        .expect("chat/turn oneshot");
+        .expect("chat/stream oneshot");
     assert_eq!(
         response.status(),
         StatusCode::OK,
-        "chat/turn should return 200"
+        "chat/stream should return 200"
     );
 
     let mut stream = response.into_body().into_data_stream();
     let mut acc = Vec::new();
     let mut posted_first = false;
     let mut posted_second = false;
-    let mut saw_turn_complete = false;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.expect("partial batch sse chunk");
         acc.extend_from_slice(&chunk);
@@ -648,7 +714,7 @@ pub async fn run_chat_turn_partial_batch_failure() {
                 s.as_ref(),
                 "tc-partial-1",
                 &ctx.edge_agent_id,
-                "ok",
+                "completed",
                 ok_output,
                 0,
             )
@@ -672,7 +738,10 @@ pub async fn run_chat_turn_partial_batch_failure() {
                 s.as_ref(),
                 "tc-partial-2",
                 &ctx.edge_agent_id,
-                "error",
+                // Edge callback statuses are a closed wire contract. Use the
+                // canonical terminal failure rather than the old display-only
+                // alias so this journey exercises a real failed receipt.
+                "failed",
                 err_output,
                 0,
             )
@@ -691,10 +760,6 @@ pub async fn run_chat_turn_partial_batch_failure() {
             );
             posted_second = true;
         }
-        if s.contains("\"type\":\"turn_complete\"") {
-            saw_turn_complete = true;
-            break;
-        }
     }
     assert!(
         posted_first,
@@ -704,11 +769,6 @@ pub async fn run_chat_turn_partial_batch_failure() {
         posted_second,
         "partial batch never emitted second tool_request"
     );
-    assert!(
-        saw_turn_complete,
-        "partial batch never reached turn_complete"
-    );
-
     let full = String::from_utf8_lossy(&acc).into_owned();
     let events = parse_sse_events(&full);
     let tool_requests = events
@@ -719,95 +779,187 @@ pub async fn run_chat_turn_partial_batch_failure() {
         tool_requests, 2,
         "expected two tool_request events: {events:?}"
     );
+    for request_id in ["tc-partial-1", "tc-partial-2"] {
+        let ends = events
+            .iter()
+            .filter(|event| {
+                event.get("type").and_then(Value::as_str) == Some("tool_call_end")
+                    && event.get("call_id").and_then(Value::as_str) == Some(request_id)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ends.len(),
+            1,
+            "callback {request_id} must have exactly one raw SSE terminal: {events:?}"
+        );
+        assert!(
+            ends[0]
+                .as_object()
+                .is_some_and(|event| event.keys().all(|key| !key.starts_with("_astra_"))),
+            "callback {request_id} leaked an internal settlement field: {:?}",
+            ends[0]
+        );
+    }
 
-    let turn_complete = events
+    let terminals = events
         .iter()
-        .find(|event| event.get("type").and_then(Value::as_str) == Some("turn_complete"))
-        .expect("turn_complete after partial batch handoff");
+        .filter(|event| event.get("type").and_then(Value::as_str) == Some("turn_complete"))
+        .collect::<Vec<_>>();
+    assert_eq!(terminals.len(), 1, "one server stream terminal: {events:?}");
+    let turn_complete = terminals[0];
     assert_eq!(
-        turn_complete.get("has_tool_calls").and_then(Value::as_bool),
-        Some(true),
-        "mixed callback handoff should end the initial stream with pending tool calls: {events:?}"
+        turn_complete
+            .get("continuation_owner")
+            .and_then(Value::as_str),
+        Some("server"),
+        "mixed callback boundary must not be terminal before final model round: {events:?}"
     );
+    assert_eq!(
+        turn_complete
+            .get("tool_calls_count")
+            .and_then(Value::as_u64),
+        Some(2),
+        "mixed callback terminal must account for both tool calls: {events:?}"
+    );
+    assert_eq!(
+        turn_complete
+            .get("tools_used")
+            .and_then(Value::as_array)
+            .map(|tools| tools.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
+        Some(vec!["read_file"]),
+        "mixed callback terminal must report a unique normalized tool list: {events:?}"
+    );
+    assert_eq!(
+        turn_complete.get("llm_rounds").and_then(Value::as_u64),
+        Some(2),
+        "mixed callback terminal must include the initial tool round and final model round: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["type"].as_str() == Some("text_delta")
+                && event["content"].as_str() == Some("Handled the partial batch failure.")
+        }),
+        "server stream must consume mixed callback results and emit final model text: {events:?}"
+    );
+    let run_id = events
+        .iter()
+        .find(|event| event["type"].as_str() == Some("session_info"))
+        .and_then(|event| event["run_id"].as_str())
+        .expect("session_info run_id")
+        .to_string();
+    for request_id in ["tc-partial-1", "tc-partial-2"] {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_run_events \
+             WHERE user_id = ? AND run_id = ? AND event_type = 'tool_call_end' \
+               AND JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.call_id')) = ?",
+        )
+        .bind(&ctx.user_id)
+        .bind(&run_id)
+        .bind(request_id)
+        .fetch_one(&ctx.pool)
+        .await
+        .expect("count durable mixed callback result");
+        assert_eq!(
+            count, 1,
+            "callback {request_id} should have one durable effect"
+        );
+    }
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
-pub async fn run_chat_turn_out_of_order_tool_results() {
+pub async fn run_server_stream_out_of_order_tool_results() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
-    let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
     let first_output = "race first ok";
     let second_output = "race second ok";
     let payload = json!({
         "agent_id": "system-matrix-race-agent",
-        "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
         "session_id": ctx.session_id,
-        "messages": [{ "role": "user", "content": "read two files even if callbacks arrive out of order" }],
+        "edge_executor_id": ctx.edge_agent_id,
+        "workspace_binding": {
+            "kind": "edge_workspace",
+            "display_name": "system-matrix-edge",
+            "root": "/tmp/astra-system-matrix-edge",
+            "authority": "read_write"
+        },
+        "executor_binding": {
+            "kind": "edge_agent",
+            "executor_id": ctx.edge_agent_id,
+            "display_name": "system-matrix-edge",
+            "transport": "edge_ledger",
+            "status": "online"
+        },
+        "message": "read two files even if callbacks arrive out of order",
         "model_selection": seeded_model_selection(ctx),
-        "edge_tools": [{
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "description": "read a file",
-                "parameters": {
-                    "type": "object",
-                    "properties": { "path": { "type": "string" } },
-                    "required": ["path"]
-                }
-            }
-        }],
-        "test_llm_rounds": [
-            {
-                "tool_calls": [
-                    {
-                        "id": "tc-race-1",
-                        "type": "function",
-                        "function": {
-                            "name": "read_file",
-                            "arguments": "{\"path\":\"race-a.txt\"}"
-                        }
-                    },
-                    {
-                        "id": "tc-race-2",
-                        "type": "function",
-                        "function": {
-                            "name": "read_file",
-                            "arguments": "{\"path\":\"race-b.txt\"}"
-                        }
-                    }
-                ]
+        "context": {
+            "edge_profile": {
+                "cwd": "/tmp/astra-system-matrix-edge",
+                "edge_agent_id": ctx.edge_agent_id,
+                "hostname": "system-matrix-edge"
             },
-            {
-                "full_text": "Handled out-of-order callback delivery."
-            }
-        ]
+            "edge_tools": [{
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "read a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "path": { "type": "string" } },
+                        "required": ["path"]
+                    }
+                }
+            }],
+            "test_llm_rounds": [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "tc-race-1",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"path\":\"race-a.txt\"}"
+                            }
+                        },
+                        {
+                            "id": "tc-race-2",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "{\"path\":\"race-b.txt\"}"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "full_text": "Handled out-of-order callback delivery."
+                }
+            ]
+        }
     });
 
     let req = Request::builder()
         .method("POST")
-        .uri("/chat/turn")
+        .uri("/chat/stream")
         .header("authorization", b.auth_header.as_str())
         .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", test_secret)
         .body(Body::from(payload.to_string()))
-        .expect("out-of-order request");
+        .expect("out-of-order stream request");
     let response = ctx
         .app
         .clone()
         .oneshot(req)
         .await
-        .expect("chat/turn oneshot");
+        .expect("chat/stream oneshot");
     assert_eq!(
         response.status(),
         StatusCode::OK,
-        "chat/turn should return 200"
+        "chat/stream should return 200"
     );
 
     let mut stream = response.into_body().into_data_stream();
     let mut acc = Vec::new();
     let mut posted_out_of_order = false;
-    let mut saw_turn_complete = false;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.expect("out-of-order sse chunk");
         acc.extend_from_slice(&chunk);
@@ -817,7 +969,7 @@ pub async fn run_chat_turn_out_of_order_tool_results() {
                 s.as_ref(),
                 "tc-race-2",
                 &ctx.edge_agent_id,
-                "ok",
+                "completed",
                 second_output,
                 0,
             );
@@ -825,7 +977,7 @@ pub async fn run_chat_turn_out_of_order_tool_results() {
                 s.as_ref(),
                 "tc-race-1",
                 &ctx.edge_agent_id,
-                "ok",
+                "completed",
                 first_output,
                 0,
             );
@@ -865,20 +1017,11 @@ pub async fn run_chat_turn_out_of_order_tool_results() {
             );
             posted_out_of_order = true;
         }
-        if s.contains("\"type\":\"turn_complete\"") {
-            saw_turn_complete = true;
-            break;
-        }
     }
     assert!(
         posted_out_of_order,
-        "chat/turn never emitted both tool_request callbacks"
+        "chat/stream never emitted both tool_request callbacks"
     );
-    assert!(
-        saw_turn_complete,
-        "chat/turn never completed after out-of-order callbacks"
-    );
-
     let full = String::from_utf8_lossy(&acc).into_owned();
     let events = parse_sse_events(&full);
     let tool_requests = events
@@ -889,390 +1032,95 @@ pub async fn run_chat_turn_out_of_order_tool_results() {
         tool_requests, 2,
         "expected two tool_request events: {events:?}"
     );
-
-    let turn_complete = events
-        .iter()
-        .find(|event| event.get("type").and_then(Value::as_str) == Some("turn_complete"))
-        .expect("turn_complete after out-of-order handoff");
-    assert_eq!(
-        turn_complete.get("has_tool_calls").and_then(Value::as_bool),
-        Some(true),
-        "out-of-order callback handoff should end the initial stream with pending tool calls: {events:?}"
-    );
-
-    ctx.pool.close().await;
-}
-
-pub async fn run_same_session_concurrent_turns_isolated() {
-    let b = bootstrap().await;
-    let ctx = &b.ctx;
-    let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
-    let session_id = ctx.session_id.clone();
-    let payload_a = json!({
-        "agent_id": "system-matrix-overlap-agent",
-        "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
-        "session_id": session_id,
-        "messages": [{ "role": "user", "content": "same-session overlap request A" }],
-        "model_selection": seeded_model_selection(ctx),
-        "test_llm_rounds": [{
-            "full_text": "Overlap response A",
-            "delay_ms": 250
-        }]
-    });
-    let payload_b = json!({
-        "agent_id": "system-matrix-overlap-agent",
-        "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
-        "session_id": ctx.session_id,
-        "messages": [{ "role": "user", "content": "same-session overlap request B" }],
-        "model_selection": seeded_model_selection(ctx),
-        "test_llm_rounds": [{
-            "full_text": "Overlap response B",
-            "delay_ms": 250
-        }]
-    });
-
-    let collect_turn = |app: axum::Router, auth: String, payload: Value, secret: String| async move {
-        let req = Request::builder()
-            .method("POST")
-            .uri("/chat/turn")
-            .header("authorization", auth)
-            .header("content-type", "application/json")
-            .header("x-mo-bridge-test-secret", secret)
-            .body(Body::from(payload.to_string()))
-            .expect("overlap request");
-        let response = app.clone().oneshot(req).await.expect("chat/turn oneshot");
+    for request_id in ["tc-race-1", "tc-race-2"] {
+        let ends = events
+            .iter()
+            .filter(|event| {
+                event.get("type").and_then(Value::as_str) == Some("tool_call_end")
+                    && event.get("call_id").and_then(Value::as_str) == Some(request_id)
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "chat/turn should return 200"
+            ends.len(),
+            1,
+            "callback {request_id} must have exactly one raw SSE terminal: {events:?}"
         );
+        assert!(
+            ends[0]
+                .as_object()
+                .is_some_and(|event| event.keys().all(|key| !key.starts_with("_astra_"))),
+            "callback {request_id} leaked an internal settlement field: {:?}",
+            ends[0]
+        );
+    }
 
-        let mut stream = response.into_body().into_data_stream();
-        let mut acc = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.expect("overlap sse chunk");
-            acc.extend_from_slice(&chunk);
-            if String::from_utf8_lossy(&acc).contains("\"type\":\"turn_complete\"") {
-                break;
-            }
-        }
-        String::from_utf8_lossy(&acc).into_owned()
-    };
-
-    let (raw_a, raw_b) = tokio::join!(
-        collect_turn(
-            ctx.app.clone(),
-            b.auth_header.clone(),
-            payload_a.clone(),
-            test_secret.clone(),
-        ),
-        collect_turn(
-            ctx.app.clone(),
-            b.auth_header.clone(),
-            payload_b.clone(),
-            test_secret.clone()
-        ),
-    );
-
-    let completed_a = has_turn_complete(&raw_a);
-    let completed_b = has_turn_complete(&raw_b);
+    let terminals = events
+        .iter()
+        .filter(|event| event.get("type").and_then(Value::as_str) == Some("turn_complete"))
+        .collect::<Vec<_>>();
+    assert_eq!(terminals.len(), 1, "one server stream terminal: {events:?}");
+    let turn_complete = terminals[0];
     assert_eq!(
-        usize::from(completed_a) + usize::from(completed_b),
-        1,
-        "one concurrent writer must commit and one must be fenced: A={raw_a}; B={raw_b}"
+        turn_complete
+            .get("continuation_owner")
+            .and_then(Value::as_str),
+        Some("server"),
+        "out-of-order callback boundary must not be terminal before final model round: {events:?}"
     );
     assert_eq!(
-        usize::from(has_retryable_conflict(&raw_a)) + usize::from(has_retryable_conflict(&raw_b)),
-        1,
-        "the losing writer must receive one typed retryable conflict: A={raw_a}; B={raw_b}"
+        turn_complete
+            .get("tool_calls_count")
+            .and_then(Value::as_u64),
+        Some(2),
+        "out-of-order callback terminal must account for both tool calls: {events:?}"
     );
-
-    let (raw_a, raw_b) = if completed_a {
-        let retried_b = collect_turn(
-            ctx.app.clone(),
-            b.auth_header.clone(),
-            payload_b,
-            test_secret.clone(),
-        )
-        .await;
-        assert!(
-            has_turn_complete(&retried_b),
-            "the fenced turn must succeed after the winner commits: {retried_b}"
-        );
-        (raw_a, retried_b)
-    } else {
-        let retried_a = collect_turn(
-            ctx.app.clone(),
-            b.auth_header.clone(),
-            payload_a,
-            test_secret.clone(),
-        )
-        .await;
-        assert!(
-            has_turn_complete(&retried_a),
-            "the fenced turn must succeed after the winner commits: {retried_a}"
-        );
-        (retried_a, raw_b)
-    };
-
-    assert!(
-        raw_a.contains("Overlap response A"),
-        "first concurrent turn should keep its own response: {raw_a}"
+    assert_eq!(
+        turn_complete
+            .get("tools_used")
+            .and_then(Value::as_array)
+            .map(|tools| tools.iter().filter_map(Value::as_str).collect::<Vec<_>>()),
+        Some(vec!["read_file"]),
+        "out-of-order callback terminal must report the normalized tool list: {events:?}"
+    );
+    assert_eq!(
+        turn_complete.get("llm_rounds").and_then(Value::as_u64),
+        Some(2),
+        "out-of-order callback terminal must include the initial tool round and final model round: {events:?}"
     );
     assert!(
-        raw_b.contains("Overlap response B"),
-        "second concurrent turn should keep its own response: {raw_b}"
+        events.iter().any(|event| {
+            event["type"].as_str() == Some("text_delta")
+                && event["content"].as_str() == Some("Handled out-of-order callback delivery.")
+        }),
+        "server stream must consume callbacks in identity order and emit final model text: {events:?}"
     );
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let llm_rows: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM agent_events \
-             WHERE session_id = ? AND user_id = ? AND event_type = 'llm_response' AND (content = ? OR content = ?)",
+    let run_id = events
+        .iter()
+        .find(|event| event["type"].as_str() == Some("session_info"))
+        .and_then(|event| event["run_id"].as_str())
+        .expect("session_info run_id")
+        .to_string();
+    for request_id in ["tc-race-1", "tc-race-2"] {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_run_events \
+             WHERE user_id = ? AND run_id = ? AND event_type = 'tool_call_end' \
+               AND JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.call_id')) = ?",
         )
-        .bind(&ctx.session_id)
         .bind(&ctx.user_id)
-        .bind("Overlap response A")
-        .bind("Overlap response B")
+        .bind(&run_id)
+        .bind(request_id)
         .fetch_one(&ctx.pool)
         .await
-        .expect("overlap llm_response count");
-        if llm_rows >= 2 {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "timed out waiting for concurrent same-session llm_response rows"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    let distinct_event_ids: i64 = sqlx::query_scalar(
-        "SELECT COUNT(DISTINCT event_id) FROM agent_events \
-         WHERE session_id = ? AND user_id = ? AND event_type = 'llm_response' AND (content = ? OR content = ?)",
-    )
-    .bind(&ctx.session_id)
-    .bind(&ctx.user_id)
-    .bind("Overlap response A")
-    .bind("Overlap response B")
-    .fetch_one(&ctx.pool)
-    .await
-    .expect("overlap distinct event_id count");
-    assert_eq!(
-        distinct_event_ids, 2,
-        "same-session overlap should persist distinct llm_response event IDs"
-    );
-
-    let distinct_chain_ids: i64 = sqlx::query_scalar(
-        "SELECT COUNT(DISTINCT causal_chain_id) FROM agent_events \
-         WHERE session_id = ? AND user_id = ? AND event_type = 'llm_response' AND (content = ? OR content = ?)",
-    )
-    .bind(&ctx.session_id)
-    .bind(&ctx.user_id)
-    .bind("Overlap response A")
-    .bind("Overlap response B")
-    .fetch_one(&ctx.pool)
-    .await
-    .expect("overlap distinct causal_chain_id count");
-    assert_eq!(
-        distinct_chain_ids, 2,
-        "same-session overlap should preserve distinct causal chains"
-    );
-
-    ctx.pool.close().await;
-}
-
-pub async fn run_same_session_waiting_turn_overlap_isolated() {
-    let b = bootstrap().await;
-    let ctx = &b.ctx;
-    let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
-    let tool_output = "waiting overlap tool ok";
-    let tool_turn_payload = json!({
-        "agent_id": "system-matrix-overlap-agent",
-        "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
-        "session_id": ctx.session_id,
-        "messages": [{ "role": "user", "content": "waiting overlap tool turn" }],
-        "model_selection": seeded_model_selection(ctx),
-        "edge_tools": [{
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "description": "read a file",
-                "parameters": {
-                    "type": "object",
-                    "properties": { "path": { "type": "string" } },
-                    "required": ["path"]
-                }
-            }
-        }],
-        "test_llm_rounds": [
-            {
-                "tool_calls": [{
-                    "id": "tc-overlap-wait-1",
-                    "type": "function",
-                    "function": {
-                        "name": "read_file",
-                        "arguments": "{\"path\":\"wait.txt\"}"
-                    }
-                }]
-            },
-            {
-                "full_text": "Waiting overlap tool turn finished."
-            }
-        ]
-    });
-
-    let collect_turn = |app: axum::Router, auth: String, payload: Value, secret: String| async move {
-        let req = Request::builder()
-            .method("POST")
-            .uri("/chat/turn")
-            .header("authorization", auth)
-            .header("content-type", "application/json")
-            .header("x-mo-bridge-test-secret", secret)
-            .body(Body::from(payload.to_string()))
-            .expect("waiting-overlap request");
-        let response = app.clone().oneshot(req).await.expect("chat/turn oneshot");
+        .expect("count durable out-of-order callback result");
         assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "chat/turn should return 200"
+            count, 1,
+            "callback {request_id} should have one durable effect"
         );
-
-        let mut stream = response.into_body().into_data_stream();
-        let mut acc = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.expect("waiting-overlap sse chunk");
-            acc.extend_from_slice(&chunk);
-            if String::from_utf8_lossy(&acc).contains("\"type\":\"turn_complete\"") {
-                break;
-            }
-        }
-        String::from_utf8_lossy(&acc).into_owned()
-    };
-
-    let req = Request::builder()
-        .method("POST")
-        .uri("/chat/turn")
-        .header("authorization", b.auth_header.as_str())
-        .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", &test_secret)
-        .body(Body::from(tool_turn_payload.to_string()))
-        .expect("waiting overlap tool request");
-    let response = ctx
-        .app
-        .clone()
-        .oneshot(req)
-        .await
-        .expect("chat/turn oneshot");
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "chat/turn should return 200"
-    );
-
-    let mut stream = response.into_body().into_data_stream();
-    let mut acc = Vec::new();
-    let mut ran_overlap_turn = false;
-    let mut overlap_raw = String::new();
-    let mut posted_tool_result = false;
-    let mut saw_turn_complete = false;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.expect("waiting overlap primary sse chunk");
-        acc.extend_from_slice(&chunk);
-        let s = String::from_utf8_lossy(&acc);
-        if !ran_overlap_turn
-            && let Some(payload) = maybe_tool_result_payload_from_sse(
-                s.as_ref(),
-                "tc-overlap-wait-1",
-                &ctx.edge_agent_id,
-                "ok",
-                tool_output,
-                0,
-            )
-        {
-            overlap_raw = collect_turn(
-                ctx.app.clone(),
-                b.auth_header.clone(),
-                json!({
-                    "agent_id": "system-matrix-overlap-agent",
-                    "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
-                    "session_id": ctx.session_id,
-                    "messages": [{ "role": "user", "content": "waiting overlap plain turn" }],
-                    "model_selection": seeded_model_selection(ctx),
-                    "test_llm_rounds": [{
-                        "full_text": "Waiting overlap plain turn finished."
-                    }]
-                }),
-                test_secret.clone(),
-            )
-            .await;
-            ran_overlap_turn = true;
-
-            let (status, body) = post_json(
-                &ctx.app,
-                "/tools/result",
-                Some(b.auth_header.as_str()),
-                payload,
-            )
-            .await;
-            assert_eq!(
-                status,
-                StatusCode::OK,
-                "waiting overlap tool result: {body}"
-            );
-            posted_tool_result = true;
-        }
-        if s.contains("\"type\":\"turn_complete\"") {
-            saw_turn_complete = true;
-            break;
-        }
     }
-    assert!(
-        ran_overlap_turn,
-        "primary tool-backed turn never emitted tool_request for overlap"
-    );
-    assert!(
-        posted_tool_result,
-        "waiting overlap never posted tool result"
-    );
-    assert!(
-        saw_turn_complete,
-        "tool-backed waiting overlap turn never reached turn_complete"
-    );
 
-    let primary_raw = String::from_utf8_lossy(&acc).into_owned();
-    assert!(
-        primary_raw.contains("\"type\":\"tool_request\"")
-            && primary_raw.contains("tc-overlap-wait-1"),
-        "tool-backed overlap turn should emit its own tool handoff: {primary_raw}"
-    );
-    assert!(
-        primary_raw.contains("\"type\":\"turn_complete\"")
-            && primary_raw.contains("\"has_tool_calls\":true"),
-        "tool-backed overlap turn should close the initial stream with pending tool calls: {primary_raw}"
-    );
-    assert!(
-        !primary_raw.contains("Waiting overlap plain turn finished."),
-        "tool-backed overlap turn should not leak the plain-turn response: {primary_raw}"
-    );
-    assert!(
-        has_retryable_conflict(&overlap_raw),
-        "a second writer must receive a typed retryable conflict while the tool turn owns the reservation: {overlap_raw}"
-    );
-    assert!(
-        !overlap_raw.contains("tc-overlap-wait-1"),
-        "plain overlap turn should not leak the tool-backed request id: {overlap_raw}"
-    );
-    assert!(
-        !overlap_raw.contains("Waiting overlap plain turn finished."),
-        "a fenced overlap must not execute its model fixture: {overlap_raw}"
-    );
-
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
-/// Admin model CRUD with `infra_llm_models` assertions. Uses `provider: mock` so connectivity check
-/// skips the network (`validate_connectivity` short-circuit).
 pub async fn run_models_admin_crud_with_db() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
@@ -1354,5 +1202,5 @@ pub async fn run_models_admin_crud_with_db() {
     let (st_g, _) = get_json(app, &format!("/models/{model_name}"), Some(auth), &[]).await;
     assert_eq!(st_g, StatusCode::NOT_FOUND, "get after delete");
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }

@@ -23,6 +23,16 @@ const TOOL_INVOCATION_COMPACTION_BATCH_RECORDS: i64 = 32;
 const TOOL_INVOCATION_ARCHIVE_CHUNK_MAX_BYTES: usize = 4 * 1024 * 1024;
 const TOOL_INVOCATION_ARCHIVE_RETENTION_DAYS: i64 = 30;
 
+/// Durable run-control position that a tool dispatcher has fully applied.
+/// This is consumed only by the atomic `Prepared -> Dispatched` claim; it is
+/// never forwarded to a provider or trusted from provider-authored arguments.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolInvocationDispatchAdmission {
+    pub expected_control_epoch: i64,
+    pub expected_owner_generation: u64,
+    pub expected_owner_pod_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolInvocationCompactionOutcome {
     pub archived_records: usize,
@@ -384,6 +394,7 @@ impl DatabaseToolInvocationLedger {
         run_id: &str,
     ) -> Result<ToolInvocationRunReconciliationOutcome, ToolInvocationLedgerStoreError> {
         let mut tx = self.pool.get().begin().await?;
+        crate::storage::admit_session_event_write(&mut tx, session_id, user_id, false).await?;
         let run_status = lock_terminal_run(&mut tx, user_id, session_id, run_id).await?;
         let completion_source = ToolInvocationCompletionSource::run_closure(&run_status)?;
         let result = ToolInvocationResultPayload::new(
@@ -926,11 +937,195 @@ impl DatabaseToolInvocationLedger {
         identity: &ToolInvocationIdentity,
         owner_id: &str,
         lease_duration_ms: u64,
+        admission: ToolInvocationDispatchAdmission,
     ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
         validate_lease_input(owner_id, lease_duration_ms)?;
         let lease_duration_us = lease_duration_us(lease_duration_ms)?;
         let mut tx = self.pool.get().begin().await?;
-        lock_executable_run(&mut tx, identity).await?;
+        let action_id = tool_invocation_action_id(identity);
+        let admission_outcome = crate::runs::admit_run_action_in_existing_transaction(
+            &mut tx,
+            crate::runs::AtomicRunActionAdmissionRequest {
+                user_id: &identity.user_id,
+                run_id: &identity.run_id,
+                expected_session_id: &identity.session_id,
+                action_id: &action_id,
+                expected_control_epoch: admission.expected_control_epoch,
+                expected_owner_generation: admission.expected_owner_generation,
+            },
+            &admission.expected_owner_pod_id,
+        )
+        .await;
+        let admission_outcome = match admission_outcome {
+            Ok(outcome) => outcome,
+            Err(reason) => {
+                rollback(tx, "tool dispatch action admission failed").await;
+                return Err(ToolInvocationLedgerStoreError::ActionAdmissionFailed {
+                    identity: identity.clone(),
+                    reason,
+                });
+            }
+        };
+        match admission_outcome {
+            crate::runs::TransactionalRunActionAdmission::Granted { .. } => {}
+            crate::runs::TransactionalRunActionAdmission::AlreadyStarted { event_index } => {
+                rollback(tx, "tool dispatch action was already started").await;
+                return Err(ToolInvocationLedgerStoreError::ActionAlreadyStarted {
+                    identity: identity.clone(),
+                    event_index,
+                });
+            }
+            crate::runs::TransactionalRunActionAdmission::Superseded {
+                user_intent_event_index,
+            } => {
+                let result = ToolInvocationResultPayload::new(
+                    serde_json::json!({
+                        "status": "rejected",
+                        "reason": "superseded_by_guidance",
+                        "user_intent_event_index": user_intent_event_index,
+                    })
+                    .to_string(),
+                    BTreeMap::from([
+                        (
+                            "error_kind".to_string(),
+                            serde_json::Value::String("superseded_by_guidance".to_string()),
+                        ),
+                        ("retryable".to_string(), serde_json::Value::Bool(false)),
+                        (
+                            "user_intent_event_index".to_string(),
+                            serde_json::Value::Number(user_intent_event_index.into()),
+                        ),
+                    ]),
+                    None,
+                )?;
+                let outcome = ToolInvocationTerminalOutcome::Rejected {
+                    result,
+                    rejection_code: Some("superseded_by_guidance".to_string()),
+                    retryable: false,
+                };
+                let completion_source = ToolInvocationCompletionSource::superseded_by_guidance(
+                    user_intent_event_index,
+                )?;
+                let outcome_json = serde_json::to_string(&outcome).map_err(|source| {
+                    ToolInvocationLedgerStoreError::Serialization {
+                        field: "outcome_json",
+                        source,
+                    }
+                })?;
+                let completion_source_json =
+                    serde_json::to_string(&completion_source).map_err(|source| {
+                        ToolInvocationLedgerStoreError::Serialization {
+                            field: "completion_source_json",
+                            source,
+                        }
+                    })?;
+                let closed = sqlx::query(
+                    "UPDATE tool_invocation_ledger
+                     SET state = 'rejected', dispatch_certainty = 'not_dispatched',
+                         outcome_json = ?, completion_source_json = ?,
+                         dispatch_owner = NULL, dispatch_lease_expires_at = NULL,
+                         updated_at = CURRENT_TIMESTAMP(6)
+                     WHERE user_id = ? AND session_id = ? AND run_id = ?
+                       AND turn_chain_id = ? AND invocation_id = ?
+                       AND state = 'prepared' AND attempt_count = 0",
+                )
+                .bind(outcome_json)
+                .bind(completion_source_json)
+                .bind(&identity.user_id)
+                .bind(&identity.session_id)
+                .bind(&identity.run_id)
+                .bind(&identity.turn_chain_id)
+                .bind(&identity.invocation_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(
+                    |source| ToolInvocationLedgerStoreError::ActionAdmissionFailed {
+                        identity: identity.clone(),
+                        reason: format!("persist superseded not-dispatched closure: {source}"),
+                    },
+                )?
+                .rows_affected();
+                if closed != 1 {
+                    let actual = load_record_in_tx(&mut tx, identity).await?.ok_or_else(|| {
+                        ToolInvocationLedgerStoreError::NotFound {
+                            identity: identity.clone(),
+                        }
+                    })?;
+                    rollback(tx, "superseded tool dispatch closure mismatch").await;
+                    if is_exact_guidance_rejection(&actual, &outcome, &completion_source) {
+                        return Err(ToolInvocationLedgerStoreError::ActionSuperseded {
+                            identity: identity.clone(),
+                            user_intent_event_index,
+                        });
+                    }
+                    return Err(ToolInvocationLedgerStoreError::ActionAdmissionFailed {
+                        identity: identity.clone(),
+                        reason: format!(
+                            "superseded closure conflicts with durable invocation state {:?}",
+                            actual.state
+                        ),
+                    });
+                }
+                if let Err(source) = tx.commit().await {
+                    if matches!(
+                        self.get(identity).await,
+                        Ok(Some(record))
+                            if is_exact_guidance_rejection(
+                                &record,
+                                &outcome,
+                                &completion_source,
+                            )
+                    ) {
+                        return Err(ToolInvocationLedgerStoreError::ActionSuperseded {
+                            identity: identity.clone(),
+                            user_intent_event_index,
+                        });
+                    }
+                    return Err(ToolInvocationLedgerStoreError::ActionAdmissionFailed {
+                        identity: identity.clone(),
+                        reason: format!("commit superseded not-dispatched closure: {source}"),
+                    });
+                }
+                return Err(ToolInvocationLedgerStoreError::ActionSuperseded {
+                    identity: identity.clone(),
+                    user_intent_event_index,
+                });
+            }
+            crate::runs::TransactionalRunActionAdmission::Inactive { status } => {
+                rollback(tx, "tool dispatch run inactive").await;
+                return Err(ToolInvocationLedgerStoreError::RunNotExecutable {
+                    run_id: identity.run_id.clone(),
+                    status,
+                });
+            }
+            crate::runs::TransactionalRunActionAdmission::OwnerGenerationMismatch {
+                actual_owner_generation,
+            } => {
+                rollback(tx, "tool dispatch owner generation changed").await;
+                return Err(ToolInvocationLedgerStoreError::RunOwnerGenerationMismatch {
+                    run_id: identity.run_id.clone(),
+                    expected_owner_generation: admission.expected_owner_generation,
+                    actual_owner_generation,
+                });
+            }
+            crate::runs::TransactionalRunActionAdmission::OwnerMismatch {
+                actual_owner_pod_id,
+            } => {
+                rollback(tx, "tool dispatch owner pod changed").await;
+                return Err(ToolInvocationLedgerStoreError::RunOwnerMismatch {
+                    run_id: identity.run_id.clone(),
+                    expected_owner_pod_id: admission.expected_owner_pod_id.clone(),
+                    actual_owner_pod_id,
+                });
+            }
+            crate::runs::TransactionalRunActionAdmission::Missing => {
+                rollback(tx, "tool dispatch run missing").await;
+                return Err(ToolInvocationLedgerStoreError::RunNotFound {
+                    user_id: identity.user_id.clone(),
+                    run_id: identity.run_id.clone(),
+                });
+            }
+        }
         let updated = sqlx::query(
             "UPDATE tool_invocation_ledger
              SET state = 'dispatched', dispatch_certainty = 'dispatched',
@@ -968,8 +1163,135 @@ impl DatabaseToolInvocationLedger {
         let record = record.ok_or_else(|| ToolInvocationLedgerStoreError::NotFound {
             identity: identity.clone(),
         })?;
-        tx.commit().await?;
+        if let Err(source) = tx.commit().await {
+            // COMMIT acknowledgement loss is not evidence that the claim
+            // rolled back. The provider boundary has not been crossed yet,
+            // so this same owner may proceed only when an authoritative
+            // reread proves that this exact Prepared -> Dispatched claim was
+            // committed. A different owner/state/attempt remains fail-closed.
+            return self
+                .recover_dispatch_claim_after_commit_error(
+                    identity,
+                    owner_id,
+                    lease_duration_us,
+                    &admission,
+                    source,
+                )
+                .await;
+        }
         Ok(record)
+    }
+
+    async fn recover_dispatch_claim_after_commit_error(
+        &self,
+        identity: &ToolInvocationIdentity,
+        owner_id: &str,
+        lease_duration_us: i64,
+        admission: &ToolInvocationDispatchAdmission,
+        original_commit_error: sqlx::Error,
+    ) -> Result<ToolInvocationRecord, ToolInvocationLedgerStoreError> {
+        let mut tx = self.pool.get().begin().await?;
+        let action_id = tool_invocation_action_id(identity);
+        let action = crate::runs::admit_run_action_in_existing_transaction(
+            &mut tx,
+            crate::runs::AtomicRunActionAdmissionRequest {
+                user_id: &identity.user_id,
+                run_id: &identity.run_id,
+                expected_session_id: &identity.session_id,
+                action_id: &action_id,
+                expected_control_epoch: admission.expected_control_epoch,
+                expected_owner_generation: admission.expected_owner_generation,
+            },
+            &admission.expected_owner_pod_id,
+        )
+        .await
+        .map_err(
+            |reason| ToolInvocationLedgerStoreError::ActionAdmissionFailed {
+                identity: identity.clone(),
+                reason: format!("recover dispatch commit acknowledgement: {reason}"),
+            },
+        )?;
+
+        let updated = match action {
+            crate::runs::TransactionalRunActionAdmission::Granted { .. } => sqlx::query(
+                "UPDATE tool_invocation_ledger
+                 SET state = 'dispatched', dispatch_certainty = 'dispatched',
+                     attempt_count = attempt_count + 1, dispatch_owner = ?,
+                     dispatch_lease_expires_at =
+                         TIMESTAMPADD(MICROSECOND, ?, CURRENT_TIMESTAMP(6)),
+                     updated_at = CURRENT_TIMESTAMP(6)
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?
+                   AND turn_chain_id = ? AND invocation_id = ? AND state = 'prepared'",
+            )
+            .bind(owner_id)
+            .bind(lease_duration_us)
+            .bind(&identity.user_id)
+            .bind(&identity.session_id)
+            .bind(&identity.run_id)
+            .bind(&identity.turn_chain_id)
+            .bind(&identity.invocation_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected(),
+            crate::runs::TransactionalRunActionAdmission::AlreadyStarted { .. } => sqlx::query(
+                "UPDATE tool_invocation_ledger
+                 SET dispatch_lease_expires_at =
+                         TIMESTAMPADD(MICROSECOND, ?, CURRENT_TIMESTAMP(6)),
+                     updated_at = CURRENT_TIMESTAMP(6)
+                 WHERE user_id = ? AND session_id = ? AND run_id = ?
+                   AND turn_chain_id = ? AND invocation_id = ?
+                   AND state = 'dispatched'
+                   AND dispatch_certainty = 'dispatched'
+                   AND attempt_count = 1
+                   AND dispatch_owner = ?
+                   AND dispatch_lease_expires_at >= CURRENT_TIMESTAMP(6)",
+            )
+            .bind(lease_duration_us)
+            .bind(&identity.user_id)
+            .bind(&identity.session_id)
+            .bind(&identity.run_id)
+            .bind(&identity.turn_chain_id)
+            .bind(&identity.invocation_id)
+            .bind(owner_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected(),
+            other => {
+                rollback(
+                    tx,
+                    "dispatch commit acknowledgement lost execution authority",
+                )
+                .await;
+                return Err(ToolInvocationLedgerStoreError::ActionAdmissionFailed {
+                    identity: identity.clone(),
+                    reason: format!(
+                        "dispatch commit acknowledgement was lost and current run authority is {other:?}: {original_commit_error}"
+                    ),
+                });
+            }
+        };
+        let recovered = load_record_in_tx(&mut tx, identity).await?;
+        let Some(recovered) = recovered.filter(|record| {
+            updated == 1
+                && dispatch_claim_shape_matches_after_db_lease_renewal(record, identity, owner_id)
+        }) else {
+            rollback(tx, "dispatch commit acknowledgement recovery mismatch").await;
+            return Err(ToolInvocationLedgerStoreError::ActionAdmissionFailed {
+                identity: identity.clone(),
+                reason: format!(
+                    "dispatch commit acknowledgement was lost and exact live claim could not be recovered: {original_commit_error}"
+                ),
+            });
+        };
+        tx.commit().await.map_err(|recovery_error| {
+            ToolInvocationLedgerStoreError::ActionAdmissionFailed {
+                identity: identity.clone(),
+                reason: format!(
+                    "dispatch commit acknowledgement recovery commit failed after {original_commit_error}: {recovery_error}"
+                ),
+            }
+        })?;
+        Ok(recovered)
     }
 
     pub async fn renew_dispatch(
@@ -1448,6 +1770,27 @@ async fn rollback(tx: Transaction<'_, MySql>, context: &'static str) {
     }
 }
 
+/// Validate immutable dispatch shape after the caller has renewed both the
+/// run and tool leases under DB-clock predicates in the current transaction.
+/// This helper alone is deliberately not a liveness check.
+fn dispatch_claim_shape_matches_after_db_lease_renewal(
+    record: &ToolInvocationRecord,
+    identity: &ToolInvocationIdentity,
+    owner_id: &str,
+) -> bool {
+    record.identity == *identity
+        && record.state == ToolInvocationState::Dispatched
+        && record.dispatch_certainty == DispatchCertainty::Dispatched
+        && record.attempt_count == 1
+        && record.outcome.is_none()
+        && record.completion_source.is_none()
+        && record
+            .dispatch_lease
+            .as_ref()
+            .is_some_and(|lease| lease.owner_id == owner_id)
+        && record.validate().is_ok()
+}
+
 fn validate_lease_input(
     owner_id: &str,
     lease_duration_ms: u64,
@@ -1457,6 +1800,26 @@ fn validate_lease_input(
         return Err(ToolInvocationLedgerStoreError::InvalidLeaseDuration);
     }
     Ok(())
+}
+
+fn tool_invocation_action_id(identity: &ToolInvocationIdentity) -> String {
+    // `agent_run_events.idempotency_key` is bounded. Hash the full structured
+    // identity rather than truncating provider call ids, which could alias two
+    // effects and turn idempotency into accidental suppression.
+    format!("tool_invocation:{}", identity.storage_key())
+}
+
+fn is_exact_guidance_rejection(
+    record: &ToolInvocationRecord,
+    outcome: &ToolInvocationTerminalOutcome,
+    completion_source: &ToolInvocationCompletionSource,
+) -> bool {
+    record.state == ToolInvocationState::Rejected
+        && record.dispatch_certainty == DispatchCertainty::NotDispatched
+        && record.attempt_count == 0
+        && record.dispatch_lease.is_none()
+        && record.outcome.as_ref() == Some(outcome)
+        && record.completion_source.as_ref() == Some(completion_source)
 }
 
 fn lease_duration_us(lease_duration_ms: u64) -> Result<i64, ToolInvocationLedgerStoreError> {
@@ -1579,6 +1942,41 @@ pub enum ToolInvocationLedgerStoreError {
     },
     #[error("tool invocation run {run_id} is not executable while status is {status}")]
     RunNotExecutable { run_id: String, status: String },
+    #[error(
+        "tool invocation run {run_id} owner generation changed: expected {expected_owner_generation}, actual {actual_owner_generation}"
+    )]
+    RunOwnerGenerationMismatch {
+        run_id: String,
+        expected_owner_generation: u64,
+        actual_owner_generation: u64,
+    },
+    #[error(
+        "tool invocation run {run_id} owner changed: expected {expected_owner_pod_id}, actual {actual_owner_pod_id:?}"
+    )]
+    RunOwnerMismatch {
+        run_id: String,
+        expected_owner_pod_id: String,
+        actual_owner_pod_id: Option<String>,
+    },
+    #[error(
+        "tool invocation action was superseded by user intent at event {user_intent_event_index}: {identity:?}"
+    )]
+    ActionSuperseded {
+        identity: ToolInvocationIdentity,
+        user_intent_event_index: i64,
+    },
+    #[error(
+        "tool invocation action already has a durable admission at event {event_index}: {identity:?}"
+    )]
+    ActionAlreadyStarted {
+        identity: ToolInvocationIdentity,
+        event_index: i64,
+    },
+    #[error("tool invocation action admission failed for {identity:?}: {reason}")]
+    ActionAdmissionFailed {
+        identity: ToolInvocationIdentity,
+        reason: String,
+    },
     #[error("tool invocation run {run_id} is not terminal while status is {status}")]
     RunNotTerminal { run_id: String, status: String },
     #[error(
@@ -1669,6 +2067,40 @@ pub enum ToolInvocationLedgerStoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astra_turn_types::DurableToolReference;
+    use serde_json::json;
+
+    fn dispatched_record(owner_id: &str) -> ToolInvocationRecord {
+        let identity = ToolInvocationIdentity::new(
+            "ack-user",
+            "ack-session",
+            "ack-run",
+            "ack-turn",
+            "ack-invocation",
+        )
+        .expect("identity");
+        let decision =
+            ToolInvocationDecision::new(&json!({"route": "server_local"})).expect("decision");
+        let fingerprint = ToolInvocationFingerprint::new(
+            DurableToolReference::built_in("bash", "registry-v1").expect("tool reference"),
+            &json!({"command": "pwd"}),
+            &decision.decision_id,
+        )
+        .expect("fingerprint");
+        ToolInvocationRecord {
+            identity,
+            fingerprint,
+            decision,
+            state: ToolInvocationState::Dispatched,
+            dispatch_certainty: DispatchCertainty::Dispatched,
+            attempt_count: 1,
+            dispatch_lease: Some(
+                ToolInvocationDispatchLease::new(owner_id, u64::MAX).expect("dispatch lease"),
+            ),
+            outcome: None,
+            completion_source: None,
+        }
+    }
 
     #[test]
     fn state_and_certainty_wire_labels_round_trip_exhaustively() {
@@ -1703,6 +2135,33 @@ mod tests {
         assert!(matches!(
             parse_certainty("maybe"),
             Err(ToolInvocationLedgerStoreError::InvalidDispatchCertainty(_))
+        ));
+    }
+
+    #[test]
+    fn commit_ack_recovery_authorizes_only_the_exact_first_dispatch_owner() {
+        let exact = dispatched_record("claim-owner");
+        assert!(dispatch_claim_shape_matches_after_db_lease_renewal(
+            &exact,
+            &exact.identity,
+            "claim-owner"
+        ));
+
+        let mut wrong_owner = exact.clone();
+        wrong_owner.dispatch_lease =
+            Some(ToolInvocationDispatchLease::new("another-owner", 1).expect("dispatch lease"));
+        assert!(!dispatch_claim_shape_matches_after_db_lease_renewal(
+            &wrong_owner,
+            &exact.identity,
+            "claim-owner"
+        ));
+
+        let mut retried = exact.clone();
+        retried.attempt_count = 2;
+        assert!(!dispatch_claim_shape_matches_after_db_lease_renewal(
+            &retried,
+            &exact.identity,
+            "claim-owner"
         ));
     }
 }

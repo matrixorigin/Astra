@@ -15,9 +15,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use astra_core::{STATUS_COMPLETED, STATUS_FAILED, STATUS_RUNNING};
-use astra_services::coordination::{
-    AgentProfile, AgentProfileRegistry, AgentTier, DelegationResult,
-};
+use astra_services::coordination::{AgentProfile, AgentProfileRegistry, DelegationResult};
 use astra_services::team_persistence::{TeamPersistenceService, WorktreeMode, resolve_team};
 
 use astra_server_types::team_orchestrator_traits::{
@@ -81,6 +79,29 @@ fn durable_status_for_team_outcome(status: &TeamExecutionStatus) -> &'static str
     }
 }
 
+fn build_execution_profile_snapshot(
+    shared_builtins: &AgentProfileRegistry,
+    source_agent_id: &str,
+    profiles: &[AgentProfile],
+) -> Result<AgentProfileRegistry, String> {
+    let source = shared_builtins
+        .get(source_agent_id)
+        .cloned()
+        .ok_or_else(|| format!("trusted source agent '{source_agent_id}' is not registered"))?;
+    let mut snapshot = AgentProfileRegistry::new();
+    snapshot.register(source)?;
+    for profile in profiles {
+        if shared_builtins.get(&profile.agent_id).is_some() {
+            return Err(format!(
+                "team member agent_id '{}' collides with a built-in profile",
+                profile.agent_id
+            ));
+        }
+        snapshot.register(profile.clone())?;
+    }
+    Ok(snapshot)
+}
+
 // ─── Orchestrator ───────────────────────────────────────────────────────────
 
 /// Orchestrates a full team execution lifecycle.
@@ -140,6 +161,7 @@ impl TeamExecutionOrchestrator {
             .run_engine
             .persist_status_if_current(
                 &self.config.user_id,
+                &self.config.session_id,
                 run_id,
                 &[STATUS_RUNNING],
                 status,
@@ -197,8 +219,43 @@ impl TeamExecutionOrchestrator {
             }
         };
 
-        // Start parent durable run with team metadata
         let parent_run_id = uuid::Uuid::new_v4().to_string();
+        let (request, profiles) =
+            match resolve_team(&team, task, &parent_run_id, &self.config.session_id) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    return self.fail_report(
+                        team_name,
+                        "",
+                        &parent_run_id,
+                        TeamExecutionErrorKind::InvalidTeam,
+                        format!("team validation failed: {error}"),
+                    );
+                }
+            };
+        let profile_snapshot = {
+            let builtins = self.profile_registry.read().await;
+            match build_execution_profile_snapshot(
+                &builtins,
+                &self.config.source_agent_id,
+                &profiles,
+            ) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return self.fail_report(
+                        team_name,
+                        "",
+                        &parent_run_id,
+                        TeamExecutionErrorKind::InvalidTeam,
+                        error,
+                    );
+                }
+            }
+        };
+        let delegation_id = request.delegation_id.clone();
+
+        // Start parent durable run only after the complete private execution
+        // profile snapshot has been validated.
         if let Err(e) = self
             .run_engine
             .start_run_ext(
@@ -226,6 +283,7 @@ impl TeamExecutionOrchestrator {
             self.run_engine
                 .append_event(
                     &self.config.user_id,
+                    &self.config.session_id,
                     &parent_run_id,
                     serde_json::json!({
                         "event_type": "team_prepare",
@@ -239,33 +297,6 @@ impl TeamExecutionOrchestrator {
             "Failed to run_engine.append_event"
         );
 
-        // Resolve members → profiles using the new resolve_team with registry lookup
-        let registry = self.profile_registry.read().await;
-        let (request, profiles) = match resolve_team(
-            &team,
-            task,
-            &parent_run_id,
-            &self.config.session_id,
-            Some(&registry),
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                drop(registry);
-                self.persist_active_run_outcome(&parent_run_id, STATUS_FAILED, Some(&e))
-                    .await;
-                return self.fail_report(
-                    team_name,
-                    "",
-                    &parent_run_id,
-                    TeamExecutionErrorKind::InvalidTeam,
-                    format!("team validation failed: {e}"),
-                );
-            }
-        };
-        drop(registry);
-
-        let delegation_id = request.delegation_id.clone();
-
         // Record execution start (Phase 1 complete, entering execution)
         warn_persist!(
             self.team_store
@@ -278,20 +309,6 @@ impl TeamExecutionOrchestrator {
             team_name: team_name.to_string(),
             member_count: profiles.len(),
         });
-
-        // Register profiles: virtual orchestrator + resolved team members
-        {
-            let mut reg = self.profile_registry.write().await;
-            let orch = AgentProfile::new(
-                &self.config.source_agent_id,
-                "orchestrator",
-                AgentTier::Orchestrator,
-            );
-            let _ = reg.register(orch);
-            for profile in &profiles {
-                let _ = reg.register(profile.clone());
-            }
-        }
 
         // Create worktrees if isolated mode
         let mut worktree_mgr = repo_root.map(|root| {
@@ -367,7 +384,12 @@ impl TeamExecutionOrchestrator {
         .to_string();
         warn_persist!(
             self.run_engine
-                .persist_checkpoint(&self.config.user_id, &parent_run_id, &checkpoint)
+                .persist_checkpoint(
+                    &self.config.user_id,
+                    &self.config.session_id,
+                    &parent_run_id,
+                    &checkpoint,
+                )
                 .await,
             "Failed to run_engine.persist_checkpoint"
         );
@@ -381,6 +403,7 @@ impl TeamExecutionOrchestrator {
             self.run_engine
                 .append_event(
                     &self.config.user_id,
+                    &self.config.session_id,
                     &parent_run_id,
                     serde_json::json!({
                         "event_type": "team_execute_start",
@@ -405,6 +428,7 @@ impl TeamExecutionOrchestrator {
         let delegation_future = self.delegation_engine.execute_delegation(
             effective_request,
             &self.config.source_agent_id,
+            profile_snapshot,
             Some(cancel_token.clone()),
         );
 
@@ -540,6 +564,7 @@ impl TeamExecutionOrchestrator {
             self.run_engine
                 .persist_usage(
                     &self.config.user_id,
+                    &self.config.session_id,
                     &parent_run_id,
                     total_prompt,
                     total_completion,
@@ -560,6 +585,7 @@ impl TeamExecutionOrchestrator {
                 self.run_engine
                     .append_event(
                         &self.config.user_id,
+                        &self.config.session_id,
                         &parent_run_id,
                         serde_json::json!({
                             "event_type": "team_budget_exceeded",
@@ -577,6 +603,7 @@ impl TeamExecutionOrchestrator {
             self.run_engine
                 .append_event(
                     &self.config.user_id,
+                    &self.config.session_id,
                     &parent_run_id,
                     serde_json::json!({
                         "event_type": "team_execute_complete",
@@ -676,6 +703,7 @@ impl TeamExecutionOrchestrator {
             self.run_engine
                 .append_event(
                     &self.config.user_id,
+                    &self.config.session_id,
                     &parent_run_id,
                     serde_json::json!({
                         "event_type": "team_complete",
@@ -1084,39 +1112,76 @@ mod tests {
         assert_eq!(run.status, "completed");
     }
 
-    #[tokio::test]
-    async fn execute_uses_resolve_team_with_registry() {
-        let store = Arc::new(InMemoryTeamStore::with_builtins("test-user"));
-        let (orch, _, _) = setup_with_engines(store).await;
+    #[test]
+    fn concurrent_execution_profile_snapshots_isolate_same_agent_id() {
+        let mut builtins = AgentProfileRegistry::new();
+        builtins
+            .register(AgentProfile::new(
+                "orchestrator",
+                "orchestrator",
+                AgentTier::Orchestrator,
+            ))
+            .unwrap();
+        let mut user_a = AgentProfile::new("shared-name", "worker", AgentTier::User);
+        user_a.system_prompt = Some("tenant A prompt".to_string());
+        let mut user_b = AgentProfile::new("shared-name", "worker", AgentTier::User);
+        user_b.system_prompt = Some("tenant B prompt".to_string());
 
-        // Pre-register a profile — but note the builtin team members have
-        // explicit system_prompt overrides, so the registry prompt won't
-        // be used (member override wins). We verify the profile is in the
-        // registry after execution, meaning resolve_team used registry lookup.
-        {
-            let mut reg = orch.profile_registry.write().await;
-            let mut custom =
-                AgentProfile::new("team-research-explorer", "explorer", AgentTier::System);
-            custom.system_prompt = Some("Custom registered prompt.".to_string());
-            let _ = reg.register(custom);
-        }
+        let builtins = Arc::new(builtins);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let build = |profile: AgentProfile| {
+            let builtins = builtins.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                build_execution_profile_snapshot(&builtins, "orchestrator", &[profile]).unwrap()
+            })
+        };
+        let handle_a = build(user_a);
+        let handle_b = build(user_b);
+        let snapshot_a = handle_a.join().unwrap();
+        let snapshot_b = handle_b.join().unwrap();
 
-        let report = orch.execute_team("research", "task", None).await;
-        assert_eq!(report.status, TeamExecutionStatus::Completed);
-
-        // After execution, the profile was re-registered with resolved values.
-        // The member's explicit system_prompt overrides the registry prompt.
-        let reg = orch.profile_registry.read().await;
-        let profile = reg.get("team-research-explorer").unwrap();
-        // Member system_prompt takes precedence over registry
-        assert!(
-            profile
-                .system_prompt
-                .as_ref()
-                .unwrap()
-                .contains("search the codebase")
+        assert_eq!(
+            snapshot_a
+                .get("shared-name")
+                .and_then(|profile| profile.system_prompt.as_deref()),
+            Some("tenant A prompt")
         );
-        // The registered profile was freshly resolved through the team member.
+        assert_eq!(
+            snapshot_b
+                .get("shared-name")
+                .and_then(|profile| profile.system_prompt.as_deref()),
+            Some("tenant B prompt")
+        );
+        assert!(builtins.get("shared-name").is_none());
+    }
+
+    #[test]
+    fn execution_profile_snapshot_rejects_builtin_collision_without_pollution() {
+        let mut builtins = AgentProfileRegistry::new();
+        builtins
+            .register(AgentProfile::new(
+                "orchestrator",
+                "orchestrator",
+                AgentTier::Orchestrator,
+            ))
+            .unwrap();
+        let builtin = AgentProfile::new("coder", "builtin coder", AgentTier::System);
+        builtins.register(builtin.clone()).unwrap();
+        let mut attacker = AgentProfile::new("coder", "tenant override", AgentTier::User);
+        attacker.system_prompt = Some("polluted".to_string());
+
+        let error = match build_execution_profile_snapshot(&builtins, "orchestrator", &[attacker]) {
+            Ok(_) => panic!("a team must not shadow a built-in profile"),
+            Err(error) => error,
+        };
+        assert!(error.contains("collides with a built-in"));
+        let retained = builtins
+            .get("coder")
+            .expect("builtin must remain registered");
+        assert_eq!(retained.name, builtin.name);
+        assert_eq!(retained.system_prompt, builtin.system_prompt);
     }
 
     #[tokio::test]

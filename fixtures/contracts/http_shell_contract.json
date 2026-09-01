@@ -15,7 +15,9 @@
         "database": "connected",
         "memoria": "disabled",
         "persist_ok": 0,
-        "persist_fail": 0
+        "persist_fail": 0,
+        "interaction_api_major": "1",
+        "build_git_sha": "<dynamic-build-git-sha>"
       }
     },
     "unhealthy": {
@@ -25,7 +27,9 @@
         "database": "unavailable",
         "memoria": "disabled",
         "persist_ok": 0,
-        "persist_fail": 0
+        "persist_fail": 0,
+        "interaction_api_major": "1",
+        "build_git_sha": "<dynamic-build-git-sha>"
       }
     }
   },

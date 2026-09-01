@@ -141,12 +141,12 @@ fn json_entry_to_config(name: &str, entry: &McpJsonServerEntry) -> Option<McpSer
             auth_token: entry.auth_token.clone(),
             headers: entry.headers.clone(),
         },
-        "http" | "streamable_http" | "streamable-http" => Transport::StreamableHttp {
+        "streamable_http" => Transport::StreamableHttp {
             url: entry.url.clone()?,
             auth_token: entry.auth_token.clone(),
             headers: entry.headers.clone(),
         },
-        "ws" | "websocket" => Transport::Ws {
+        "ws" => Transport::Ws {
             url: entry.url.clone()?,
             auth_token: entry.auth_token.clone(),
             headers: entry.headers.clone(),
@@ -284,7 +284,7 @@ mcp_servers:
     }
 
     #[test]
-    fn parses_stdio_sse_http_and_websocket_transports() {
+    fn parses_only_canonical_stdio_sse_streamable_http_and_ws_transports() {
         let stdio = parse_json_server(
             "stdio",
             r#"{"mcpServers":{"stdio":{"command":"tool","args":["--flag"]}}}"#,
@@ -304,17 +304,24 @@ mcp_servers:
 
         let http = parse_json_server(
             "http",
-            r#"{"mcpServers":{"http":{"type":"streamable-http","url":"http://localhost/mcp"}}}"#,
+            r#"{"mcpServers":{"http":{"type":"streamable_http","url":"http://localhost/mcp"}}}"#,
         )
         .unwrap();
         assert!(matches!(http.transport, Transport::StreamableHttp { .. }));
 
         let websocket = parse_json_server(
             "ws",
-            r#"{"mcpServers":{"ws":{"type":"websocket","url":"ws://localhost/mcp"}}}"#,
+            r#"{"mcpServers":{"ws":{"type":"ws","url":"ws://localhost/mcp"}}}"#,
         )
         .unwrap();
         assert!(matches!(websocket.transport, Transport::Ws { .. }));
+
+        for retired in ["http", "streamable-http", "websocket"] {
+            let json = format!(
+                r#"{{"mcpServers":{{"retired":{{"type":"{retired}","url":"http://localhost/mcp"}}}}}}"#
+            );
+            assert!(parse_json_server("retired", &json).is_none(), "{retired}");
+        }
     }
 
     #[test]

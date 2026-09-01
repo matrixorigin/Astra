@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use tokio::sync::{Semaphore, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use super::app_event::TuiAppEvent;
 use crate::cli::chat_stream::StreamEvent;
@@ -29,20 +30,54 @@ pub(crate) fn create_channels() -> (TuiAppEventTx, TuiAppEventRx) {
 pub(crate) fn create_per_turn_bridge(
     tui_tx: TuiAppEventTx,
 ) -> crate::cli::chat_stream::StreamEventTx {
+    create_controlled_per_turn_bridge(tui_tx).0
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PerTurnStreamBridgeControl {
+    close: CancellationToken,
+}
+
+impl PerTurnStreamBridgeControl {
+    pub(crate) fn close_and_drain(&self) {
+        self.close.cancel();
+    }
+}
+
+pub(crate) fn create_controlled_per_turn_bridge(
+    tui_tx: TuiAppEventTx,
+) -> (
+    crate::cli::chat_stream::StreamEventTx,
+    PerTurnStreamBridgeControl,
+) {
     let (stream_tx, mut stream_rx) = crate::cli::chat_stream::stream_event_channel();
+    let close = CancellationToken::new();
+    let bridge_close = close.clone();
 
     tokio::spawn(async move {
-        while let Some(event) = stream_rx.recv().await {
+        loop {
+            let event = tokio::select! {
+                biased;
+                _ = bridge_close.cancelled() => {
+                    stream_rx.close();
+                    stream_rx.recv().await
+                }
+                event = stream_rx.recv() => event,
+            };
+            let Some(event) = event else {
+                break;
+            };
             if let Some(tui_event) = map_stream_event(event)
                 && tui_tx.send(tui_event).await.is_err()
             {
-                break;
+                return;
             }
         }
         let _ = tui_tx.send(TuiAppEvent::TurnStreamClosed).await;
+        let _ = tui_tx.send(TuiAppEvent::TurnProjectionDrained).await;
     });
 
-    stream_tx
+    (stream_tx, PerTurnStreamBridgeControl { close })
 }
 
 const LIVE_AGENT_QUEUE_CAPACITY: usize = 1024;
@@ -300,6 +335,8 @@ async fn recv_next_live_event(
 /// stay identical across execution modes.
 pub(crate) fn map_stream_event(event: StreamEvent) -> Option<TuiAppEvent> {
     Some(match event {
+        StreamEvent::SessionBound(session_id) => TuiAppEvent::SessionBound(session_id),
+        StreamEvent::RunBound(run_id) => TuiAppEvent::RunBound(run_id),
         StreamEvent::ContextWindowPolicy {
             raw_window_tokens,
             usable_input_tokens,
@@ -313,6 +350,7 @@ pub(crate) fn map_stream_event(event: StreamEvent) -> Option<TuiAppEvent> {
         }
         StreamEvent::ContextWindowMeasured(tokens) => TuiAppEvent::ContextWindowMeasured(tokens),
         StreamEvent::RequestTokenUsage(usage) => TuiAppEvent::RequestTokenUsage(usage),
+        StreamEvent::RuntimeFeedback(_) => return None,
         StreamEvent::Token(text) => TuiAppEvent::Token(text),
         StreamEvent::Thinking(true) => TuiAppEvent::ThinkingStarted,
         StreamEvent::Thinking(false) => TuiAppEvent::ThinkingStopped,
@@ -362,6 +400,7 @@ pub(crate) fn map_stream_event(event: StreamEvent) -> Option<TuiAppEvent> {
             tool_use_id,
             parent_tool_use_id,
         },
+        StreamEvent::WorkTaskBoardUpdate(update) => TuiAppEvent::WorkTaskBoardUpdate(update),
         StreamEvent::AskUserPrompted { prompt, .. } => TuiAppEvent::StatusLine(format!(
             "ask_user: waiting for user ({} questions)",
             prompt
@@ -410,6 +449,19 @@ pub(crate) fn map_stream_event(event: StreamEvent) -> Option<TuiAppEvent> {
             event_index,
             content,
         } => TuiAppEvent::UserIntentApplied {
+            intent_id,
+            delivery,
+            status,
+            event_index,
+            content,
+        },
+        StreamEvent::UserIntentReturned {
+            intent_id,
+            delivery,
+            status,
+            event_index,
+            content,
+        } => TuiAppEvent::UserIntentReturned {
             intent_id,
             delivery,
             status,
@@ -481,11 +533,110 @@ mod tests {
     }
 
     #[test]
+    fn user_intent_returned_maps_without_losing_identity() {
+        let mapped = map_stream_event(StreamEvent::UserIntentReturned {
+            intent_id: "input-10".into(),
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            status: astra_turn_types::UserIntentStatus::Returned,
+            event_index: 10,
+            content: "do this later".into(),
+        });
+        assert!(matches!(
+            mapped,
+            Some(TuiAppEvent::UserIntentReturned {
+                intent_id,
+                event_index: 10,
+                content,
+                ..
+            }) if intent_id == "input-10" && content == "do this later"
+        ));
+    }
+
+    #[test]
+    fn accepted_session_binding_reaches_the_foreground_reducer() {
+        assert!(matches!(
+            map_stream_event(StreamEvent::SessionBound("session-live".into())),
+            Some(TuiAppEvent::SessionBound(session_id)) if session_id == "session-live"
+        ));
+    }
+
+    #[test]
+    fn accepted_run_binding_reaches_the_guidance_reducer() {
+        assert!(matches!(
+            map_stream_event(StreamEvent::RunBound("run-live".into())),
+            Some(TuiAppEvent::RunBound(run_id)) if run_id == "run-live"
+        ));
+    }
+
+    #[test]
+    fn durable_work_board_update_reaches_the_foreground_reducer() {
+        assert!(matches!(
+            map_stream_event(StreamEvent::WorkTaskBoardUpdate(serde_json::json!({
+                "schema_version": 1,
+                "work_id": "work-1"
+            }))),
+            Some(TuiAppEvent::WorkTaskBoardUpdate(update)) if update["work_id"] == "work-1"
+        ));
+    }
+
+    #[test]
     fn assistant_output_settled_maps_to_typed_tui_finalization_boundary() {
         assert!(matches!(
             map_stream_event(StreamEvent::AssistantOutputSettled),
             Some(TuiAppEvent::AssistantOutputSettled)
         ));
+    }
+
+    #[tokio::test]
+    async fn controlled_close_drains_accepted_events_before_terminal_projection_barrier() {
+        let (tui_tx, mut tui_rx) = create_channels();
+        let (stream_tx, control) = create_controlled_per_turn_bridge(tui_tx);
+        stream_tx
+            .send(StreamEvent::Token("partial-before-error".into()))
+            .await
+            .expect("turn stream is open");
+        stream_tx
+            .send(StreamEvent::AssistantOutputSettled)
+            .await
+            .expect("visible settlement is not the terminal turn drain");
+        stream_tx
+            .send(StreamEvent::ExplainReport(vec![serde_json::json!({
+                "after_visible_settlement": true
+            })]))
+            .await
+            .expect("post-loop report is still part of the same turn");
+
+        control.close_and_drain();
+
+        assert!(matches!(
+            tui_rx.recv().await,
+            Some(TuiAppEvent::Token(text)) if text == "partial-before-error"
+        ));
+        assert!(matches!(
+            tui_rx.recv().await,
+            Some(TuiAppEvent::AssistantOutputSettled)
+        ));
+        assert!(matches!(
+            tui_rx.recv().await,
+            Some(TuiAppEvent::ExplainReport(items))
+                if items.first().and_then(|item| item["after_visible_settlement"].as_bool())
+                    == Some(true)
+        ));
+        assert!(matches!(
+            tui_rx.recv().await,
+            Some(TuiAppEvent::TurnStreamClosed)
+        ));
+        assert!(matches!(
+            tui_rx.recv().await,
+            Some(TuiAppEvent::TurnProjectionDrained)
+        ));
+        assert!(
+            stream_tx
+                .send(StreamEvent::Token("late-old-turn-output".into()))
+                .await
+                .is_err(),
+            "the terminal projection barrier must reject late events from the old turn"
+        );
     }
 
     #[tokio::test]

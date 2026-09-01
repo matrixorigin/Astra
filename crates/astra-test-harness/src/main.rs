@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use astra_test_harness::case::{Case, matches_filter};
-use astra_test_harness::criteria::requires_session_capture;
+use astra_test_harness::case::{Case, expand_prompt_variants, matches_filter};
+use astra_test_harness::criteria::{Criterion, requires_session_capture};
 use astra_test_harness::digest::AstraCliDigestCollector;
 use astra_test_harness::exec::AstraCliExecutor;
 use astra_test_harness::judger::{
@@ -16,7 +16,7 @@ use astra_test_harness::judger::{
 };
 use astra_test_harness::preflight::run_preflight;
 use astra_test_harness::report::{Format, render};
-use astra_test_harness::runner::{RunnerConfig, resolve_models};
+use astra_test_harness::runner::{RunnerConfig, resolve_models, resolve_runner_profile_owner};
 use astra_test_harness::suite::{
     ScopedDiskSessionLoader, SessionCaptureMode, SuiteConfig, SuiteRunner,
 };
@@ -31,6 +31,19 @@ struct Args {
     /// Optional when --live-dashboard is used (auto-detected).
     #[arg(long, value_name = "DIR")]
     suite: Option<PathBuf>,
+
+    /// Validate product capability coverage against shipped model probes and exit.
+    #[arg(long)]
+    audit_capabilities: bool,
+
+    /// Run only model probes declared by the product capability matrix.
+    #[arg(long)]
+    capability_probes: bool,
+
+    /// Expand meaning-preserving user-turn rewrites and run every rewrite
+    /// against the canonical journey's exact same typed criteria.
+    #[arg(long)]
+    prompt_variants: bool,
 
     /// Comma-separated fallback model list.
     #[arg(long, value_name = "CSV", default_value = "")]
@@ -166,6 +179,28 @@ struct Args {
     live_dashboard: Option<u16>,
 }
 
+fn collect_judger_models(
+    criteria: &[Criterion],
+    default_model: &str,
+    include_advisory: bool,
+    models: &mut Vec<String>,
+) {
+    for criterion in criteria {
+        match criterion {
+            Criterion::Judger { model, .. } if include_advisory => {
+                models.push(model.as_deref().unwrap_or(default_model).to_string());
+            }
+            Criterion::HardJudger { model, .. } => {
+                models.push(model.as_deref().unwrap_or(default_model).to_string());
+            }
+            Criterion::AnyOf { criteria } | Criterion::AllOf { criteria } => {
+                collect_judger_models(criteria, default_model, include_advisory, models);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn resolve_suite_dir(explicit: &std::path::Path, astra_bin: &std::path::Path) -> PathBuf {
     if !explicit.as_os_str().is_empty() && explicit.is_dir() {
         return std::fs::canonicalize(explicit).unwrap_or_else(|_| explicit.to_path_buf());
@@ -235,49 +270,6 @@ fn resolve_workspace_astra_bin(ancestor: &std::path::Path) -> Option<PathBuf> {
     }
 }
 
-struct RunnerProfileIdentity {
-    profile_name: String,
-    local_owner_scope: astra_services::OwnerScope,
-    artifact_owner_scopes: Vec<astra_services::OwnerScope>,
-}
-
-fn resolve_runner_profile_owner(requested_profile: Option<&str>) -> Result<RunnerProfileIdentity> {
-    let credentials = astra_credentials::CredentialStore::new()
-        .load()
-        .context("load CLI credentials for harness session capture")?;
-    let profile_name = astra_credentials::CredentialStore::resolve_profile_name(
-        requested_profile,
-        credentials.current_profile.as_deref(),
-    );
-    let profile = credentials.profiles.get(&profile_name).ok_or_else(|| {
-        anyhow::anyhow!(
-            "credential profile `{profile_name}` is unavailable after preflight; \
-             authenticate that profile before running the harness"
-        )
-    })?;
-    let account_id = profile.account_id.as_deref().ok_or_else(|| {
-        anyhow::anyhow!(
-            "credential profile `{profile_name}` has no server-issued account_id; \
-             log in again before running owner-scoped harness verification"
-        )
-    })?;
-    let local_owner_id = astra_credentials::local_profile_owner_id(&profile_name, Some(account_id))
-        .map_err(anyhow::Error::msg)?;
-    let local_owner_scope =
-        astra_services::OwnerScope::user(local_owner_id).map_err(anyhow::Error::msg)?;
-    let server_owner_scope =
-        astra_services::OwnerScope::user(account_id).map_err(anyhow::Error::msg)?;
-    let mut artifact_owner_scopes = vec![local_owner_scope.clone()];
-    if server_owner_scope != local_owner_scope {
-        artifact_owner_scopes.push(server_owner_scope);
-    }
-    Ok(RunnerProfileIdentity {
-        profile_name,
-        local_owner_scope,
-        artifact_owner_scopes,
-    })
-}
-
 fn resolve_astra_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(p) = explicit {
         if !p.is_file() {
@@ -328,6 +320,29 @@ fn resolve_astra_bin(explicit: Option<PathBuf>) -> Result<PathBuf> {
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    if args.audit_capabilities {
+        let suite_path = args
+            .suite
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("--suite is required with --audit-capabilities"))?;
+        let cases = Case::load_dir(suite_path)
+            .with_context(|| format!("load cases from {}", suite_path.display()))?;
+        let coverage =
+            astra_test_harness::capability_coverage::validate_capability_coverage(&cases)
+                .map_err(|issues| anyhow::anyhow!(issues.join("\n")))?;
+        println!(
+            "capability coverage: {} product capabilities, {} model probes, {} deterministic-only boundaries",
+            coverage.product_capabilities,
+            coverage.model_probes.len(),
+            coverage.deterministic_only,
+        );
+        for probe in coverage.model_probes {
+            println!("model-probe: {probe}");
+        }
+        return Ok(());
+    }
+
     let astra_bin = resolve_astra_bin(args.astra_bin.clone())?;
 
     // ── Dashboard-only mode ─────────────────────────────────────────
@@ -368,6 +383,26 @@ async fn main() -> Result<()> {
         anyhow::bail!("no cases found in {}", suite_path.display());
     }
 
+    if args.capability_probes {
+        let coverage =
+            astra_test_harness::capability_coverage::retain_model_probe_cases(&mut cases)
+                .map_err(|issues| anyhow::anyhow!(issues.join("\n")))?;
+        eprintln!(
+            "[astra-test] selected {} model probes for {} product capabilities; {} boundaries remain deterministic-only",
+            coverage.model_probes.len(),
+            coverage.product_capabilities,
+            coverage.deterministic_only,
+        );
+    }
+
+    if args.prompt_variants {
+        let added = expand_prompt_variants(&mut cases).map_err(anyhow::Error::msg)?;
+        eprintln!(
+            "[astra-test] expanded {added} prompt variants into {} total cases; equivalence-class weights preserved",
+            cases.len()
+        );
+    }
+
     // Apply --filter
     if let Some(ref pattern) = args.filter {
         cases.retain(|c| matches_filter(&c.name, pattern));
@@ -394,7 +429,7 @@ async fn main() -> Result<()> {
 
     // Pre-flight checks — verify all unique models in the matrix, not just the first.
     if !args.skip_preflight {
-        let preflight_models: Vec<String> = if let Some(ref forced) = args.force_model {
+        let mut preflight_models: Vec<String> = if let Some(ref forced) = args.force_model {
             vec![forced.clone()]
         } else {
             let mut all_models: Vec<String> = Vec::new();
@@ -406,10 +441,26 @@ async fn main() -> Result<()> {
             if all_models.is_empty() {
                 all_models = fallback_models.clone();
             }
-            all_models.sort();
-            all_models.dedup();
             all_models
         };
+        for case in &cases {
+            collect_judger_models(
+                &case.criteria,
+                &args.judger_model,
+                !args.no_judger,
+                &mut preflight_models,
+            );
+            for step in &case.steps {
+                collect_judger_models(
+                    &step.criteria,
+                    &args.judger_model,
+                    !args.no_judger,
+                    &mut preflight_models,
+                );
+            }
+        }
+        preflight_models.sort();
+        preflight_models.dedup();
         match run_preflight(&astra_bin, &preflight_models, args.profile.as_deref()).await {
             Ok(effective_profile) => {
                 if effective_profile.is_some() {
@@ -422,12 +473,14 @@ async fn main() -> Result<()> {
         }
     }
 
-    let runner_identity = resolve_runner_profile_owner(runner_profile.as_deref())?;
+    let runner_identity =
+        resolve_runner_profile_owner(runner_profile.as_deref()).map_err(anyhow::Error::msg)?;
     astra_services::configure_local_owner_scope(runner_identity.local_owner_scope.clone());
     runner_profile = Some(runner_identity.profile_name);
 
-    let mut runner_cfg =
-        RunnerConfig::new(astra_bin.clone()).with_fallback_models(fallback_models.clone());
+    let mut runner_cfg = RunnerConfig::new(astra_bin.clone())
+        .with_fallback_models(fallback_models.clone())
+        .with_required_session_subsystem_health();
     runner_cfg.working_dir = args.working_dir.clone();
     runner_cfg.profile = runner_profile.clone();
     runner_cfg.artifact_owner_scopes = runner_identity.artifact_owner_scopes.clone();
@@ -461,7 +514,26 @@ async fn main() -> Result<()> {
         Box::new(cli_judger)
     };
 
-    if !args.no_judger {
+    let mut configured_judger_models = Vec::new();
+    for case in &cases {
+        collect_judger_models(
+            &case.criteria,
+            &args.judger_model,
+            !args.no_judger,
+            &mut configured_judger_models,
+        );
+        for step in &case.steps {
+            collect_judger_models(
+                &step.criteria,
+                &args.judger_model,
+                !args.no_judger,
+                &mut configured_judger_models,
+            );
+        }
+    }
+    configured_judger_models.sort();
+    configured_judger_models.dedup();
+    if !configured_judger_models.is_empty() {
         let mut tested: Vec<String> = Vec::new();
         for c in &cases {
             if let Ok(ms) = resolve_models(c, &runner_cfg) {
@@ -470,7 +542,9 @@ async fn main() -> Result<()> {
         }
         tested.sort();
         tested.dedup();
-        warn_if_same_family(&args.judger_model, &tested);
+        for judger_model in configured_judger_models {
+            warn_if_same_family(&judger_model, &tested);
+        }
     }
 
     let session_loader =
@@ -600,7 +674,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    if suite.failed() > 0 {
+    if suite.non_passed() > 0 {
         std::process::exit(1);
     }
     Ok(())
@@ -608,7 +682,8 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_runner_profile_owner, resolve_workspace_astra_bin};
+    use super::resolve_workspace_astra_bin;
+    use astra_test_harness::runner::resolve_runner_profile_owner;
     use std::fs;
     use std::time::Duration;
 

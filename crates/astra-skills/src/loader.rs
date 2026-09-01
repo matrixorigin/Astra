@@ -49,6 +49,8 @@ struct RawFrontmatter {
     #[serde(default)]
     isolated: Option<bool>,
     #[serde(default)]
+    execution_topology: Option<super::manifest::SkillExecutionTopology>,
+    #[serde(default)]
     hooks: Option<SkillHooks>,
     #[serde(default)]
     paths: Vec<String>,
@@ -152,6 +154,20 @@ pub fn parse_skill_md(content: &str) -> Result<(SkillManifest, String), SkillErr
 
     let dependencies = parse_dependencies(&raw.depends_on)?;
 
+    let mut metadata = HashMap::new();
+    if let Some(topology) = raw.execution_topology {
+        metadata.insert(
+            "execution_topology".to_string(),
+            serde_json::Value::String(
+                match topology {
+                    super::manifest::SkillExecutionTopology::Primary => "primary",
+                    super::manifest::SkillExecutionTopology::ParallelSubruns => "parallel_subruns",
+                }
+                .to_string(),
+            ),
+        );
+    }
+
     let manifest = SkillManifest {
         name: raw.name,
         version,
@@ -169,7 +185,7 @@ pub fn parse_skill_md(content: &str) -> Result<(SkillManifest, String), SkillErr
         dependencies,
         category: raw.category,
         tags: raw.tags,
-        metadata: HashMap::new(),
+        metadata,
         input_schema: raw.input_schema,
         output_schema: raw.output_schema,
         remote_url: None,
@@ -480,39 +496,54 @@ pub fn discover_skills_in_dir(dir: &Path) -> Vec<(String, PathBuf)> {
 
 /// Standard skill directory search order (high -> low priority):
 ///
-/// 1. Walk-up from cwd: `{ancestor}/.astra/skills/` for each ancestor
-/// 2. Walk-up from cwd: `{ancestor}/.agent/skills/` for each ancestor
-/// 3. Walk-up from cwd: `{ancestor}/.claude/skills/` for each ancestor
+/// 1. Walk-up from `project_root`: `{ancestor}/.astra/skills/` for each ancestor
+/// 2. Walk-up from `project_root`: `{ancestor}/.agent/skills/` for each ancestor
+/// 3. Walk-up from `project_root`: `{ancestor}/.claude/skills/` for each ancestor
 /// 4. `~/.astra/skills/`      — user-level global skills
 /// 5. `~/.agent/skills/`      — user-level Agent-compatible path
 /// 6. `~/.claude/skills/`     — user-level Claude-compatible path
 ///
-/// Walk-up discovery traverses from `cwd` upward to the filesystem root,
+/// Walk-up discovery traverses from `project_root` upward to the filesystem root,
 /// collecting skill directories. Astra's SKILL.md format is compatible with
 /// the Agent Skills open standard, so skills authored for either tool work in
 /// both. Compatibility paths are discovered at lower
 /// priority so astra-native skills take precedence when names collide.
 pub fn skill_search_paths() -> Vec<PathBuf> {
-    let home = dirs::home_dir();
-    if let Ok(cwd) = std::env::current_dir() {
-        let mut paths = if astra_runtime_env::local_state_root_override().is_some() {
-            isolated_project_skill_search_paths(&cwd)
-        } else {
-            project_skill_search_paths_from(&cwd, home.as_deref())
-        };
-        for global in process_global_skill_search_paths(home.as_deref()) {
-            if !paths.contains(&global) {
-                paths.push(global);
+    match std::env::current_dir() {
+        Ok(cwd) => skill_search_paths_from_root(&cwd),
+        Err(_) => {
+            let mut paths = vec![
+                PathBuf::from(".astra/skills"),
+                PathBuf::from(".agent/skills"),
+                PathBuf::from(".claude/skills"),
+            ];
+            let home = dirs::home_dir();
+            for global in process_global_skill_search_paths(home.as_deref()) {
+                if !paths.contains(&global) {
+                    paths.push(global);
+                }
             }
+            paths
         }
-        return paths;
     }
+}
 
-    let mut paths = vec![
-        PathBuf::from(".astra/skills"),
-        PathBuf::from(".agent/skills"),
-        PathBuf::from(".claude/skills"),
-    ];
+/// Explicit project-root variant of [`skill_search_paths`].
+///
+/// The walk-up discovery root is `project_root` instead of the process
+/// current directory. Tool execution may run in a workspace that differs
+/// from the process cwd (e.g. a CLI process launched from a monorepo root
+/// while the session workspace is a nested repository). Binding skill
+/// discovery to the explicit project root keeps project skills visible in
+/// that case; callers that have no better root should use
+/// [`skill_search_paths`] (which falls back to the process cwd).
+pub fn skill_search_paths_from_root(project_root: &Path) -> Vec<PathBuf> {
+    let home = dirs::home_dir();
+    let mut paths = if astra_runtime_env::local_state_root_override().is_some() {
+        isolated_project_skill_search_paths(project_root)
+    } else {
+        project_skill_search_paths_from(project_root, home.as_deref())
+    };
     for global in process_global_skill_search_paths(home.as_deref()) {
         if !paths.contains(&global) {
             paths.push(global);
@@ -920,6 +951,26 @@ Instructions.
     }
 
     #[test]
+    fn parse_execution_topology_as_closed_manifest_protocol() {
+        let content = "---\nname: parallel-review\nexecution_topology: parallel_subruns\n---\nUse independent reviewers.";
+        let (manifest, _) = parse_skill_md(content).unwrap();
+        assert_eq!(
+            manifest.execution_topology(),
+            Some(super::super::manifest::SkillExecutionTopology::ParallelSubruns)
+        );
+    }
+
+    #[test]
+    fn parse_rejects_unknown_execution_topology() {
+        let content =
+            "---\nname: unsafe-topology\nexecution_topology: unlimited_fanout\n---\nBody.";
+        assert!(matches!(
+            parse_skill_md(content),
+            Err(SkillError::ParseFailed(_))
+        ));
+    }
+
+    #[test]
     fn parse_inline_is_default_execution_context() {
         let content = "---\nname: inline-skill\n---\nInline.";
         let (manifest, _) = parse_skill_md(content).unwrap();
@@ -1082,6 +1133,49 @@ Hooked body."#;
         assert!(
             has_agent,
             "should include .agent/skills/ paths, got: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn skill_search_paths_from_root_walks_up_from_explicit_project_root() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let project = dir.path().join("nested").join("repo");
+        std::fs::create_dir_all(project.join(".astra").join("skills")).unwrap();
+        std::fs::create_dir_all(project.join(".claude").join("skills")).unwrap();
+        // A nested .git boundary is NOT required — the explicit root anchors
+        // the walk. The important contract: paths must be anchored at
+        // `project`, never at the process cwd (which may point elsewhere).
+        let paths = skill_search_paths_from_root(&project);
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.starts_with(project.join(".astra").join("skills"))),
+            "project .astra/skills must be discovered from the explicit root, got: {paths:?}"
+        );
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.starts_with(project.join(".claude").join("skills"))),
+            "project .claude/skills must be discovered from the explicit root, got: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn skill_search_paths_from_root_never_inherits_process_cwd() {
+        // The explicit-root variant must not silently pick up a `.astra/skills`
+        // directory from the process cwd when the project root differs. We
+        // assert that the first (highest-priority) project path is rooted at
+        // the explicit root even when cwd is unrelated.
+        let dir = tempfile::TempDir::new().unwrap();
+        let project = dir.path().join("project-a");
+        std::fs::create_dir_all(project.join(".astra").join("skills")).unwrap();
+        let paths = skill_search_paths_from_root(&project);
+        assert!(
+            paths
+                .iter()
+                .find(|p| p.ends_with(".astra/skills"))
+                .is_some_and(|p| p.starts_with(project.join(".astra").join("skills"))),
+            "first .astra/skills entry must be the explicit project root's, got: {paths:?}"
         );
     }
 

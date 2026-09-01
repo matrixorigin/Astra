@@ -287,6 +287,7 @@ pub(crate) struct AgentTranscriptView {
     transcript: TranscriptView,
     completed: bool,
     reopen: Option<String>,
+    return_action: BottomPaneViewAction,
     pending_action: Option<ViewActionRequest>,
     export_pending: bool,
     export_seen_cursors: std::collections::HashSet<i64>,
@@ -335,6 +336,7 @@ impl AgentTranscriptView {
             viewport_width,
             completed: false,
             reopen: Some(reopen.into()),
+            return_action: BottomPaneViewAction::ReturnToConversationNavigator,
             pending_action: None,
             export_pending: false,
             export_seen_cursors: std::collections::HashSet::new(),
@@ -380,6 +382,7 @@ impl AgentTranscriptView {
             viewport_width,
             completed: false,
             reopen: Some(reopen.into()),
+            return_action: BottomPaneViewAction::ReturnToConversationNavigator,
             pending_action: None,
             export_pending: false,
             export_seen_cursors: std::collections::HashSet::new(),
@@ -1174,13 +1177,13 @@ impl BottomPaneView for AgentTranscriptView {
             KeyCode::Left if self.transcript.is_search_active() => self.transcript.handle_key(key),
             KeyCode::Left if !self.transcript.collapse_current_item() => {
                 self.pending_action = Some(ViewActionRequest {
-                    action: BottomPaneViewAction::ReturnToConversationNavigator,
+                    action: self.return_action.clone(),
                     disposition: ViewActionDisposition::KeepOpen,
                 });
             }
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.pending_action = Some(ViewActionRequest {
-                    action: BottomPaneViewAction::ReturnToConversationNavigator,
+                    action: self.return_action.clone(),
                     disposition: ViewActionDisposition::KeepOpen,
                 });
             }
@@ -2116,7 +2119,7 @@ mod tests {
                     agent_id: "reviewer".into(),
                 },
             },
-            payload_kind: "review".into(),
+            payload_kind: astra_turn_types::AgentCommunicationPayloadKind::Text,
             summary: Some("lock ownership is unsafe".into()),
             response_accepted: None,
             related_message_id: None,

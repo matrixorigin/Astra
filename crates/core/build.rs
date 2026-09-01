@@ -37,6 +37,8 @@ fn watch_git_path(workspace: &Path, name: &str) {
 
 fn main() {
     println!("cargo:rerun-if-env-changed={BUILD_ATTESTATION_NONCE_ENV}");
+    let build_target = env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
+    let build_profile = env::var("PROFILE").unwrap_or_else(|_| "unknown".to_string());
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
     let workspace = manifest
         .join("../..")
@@ -59,9 +61,12 @@ fn main() {
             matches!(sha.len(), 40 | 64) && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
         })
         .unwrap_or_else(|| "unknown".to_string());
+    // Executable identity gates only on tracked source changes.  Benchmark
+    // artifacts, logs, and user worktrees are intentionally untracked and
+    // must not make an otherwise reproducible build unverifiable.
     let git_dirty = git_text(
         &workspace,
-        &["status", "--porcelain=v1", "--untracked-files=all"],
+        &["status", "--porcelain=v1", "--untracked-files=no"],
     )
     .map(|status| !status.is_empty())
     .unwrap_or(true);
@@ -72,4 +77,6 @@ fn main() {
     println!("cargo:rustc-env=ASTRA_BUILD_GIT_SHA={git_sha}");
     println!("cargo:rustc-env=ASTRA_BUILD_GIT_DIRTY={git_dirty}");
     println!("cargo:rustc-env=ASTRA_BUILD_ATTESTATION_NONCE={attestation_nonce}");
+    println!("cargo:rustc-env=ASTRA_BUILD_TARGET={build_target}");
+    println!("cargo:rustc-env=ASTRA_BUILD_PROFILE={build_profile}");
 }

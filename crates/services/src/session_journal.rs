@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{
     LazyLock, Mutex,
@@ -25,7 +26,7 @@ use std::sync::{
 
 use astra_core::canonical_names::{normalize_name_list, normalize_optional_name};
 use astra_turn_types::{
-    ConversationCommitV1, InferencePurpose, UserIntentDelivery, UserIntentStatus,
+    ConversationCommitV1, InferencePurpose, SessionCursorV1, UserIntentDelivery, UserIntentStatus,
 };
 
 use crate::interaction_contract::{
@@ -36,6 +37,8 @@ use crate::{OwnerScope, SessionArtifactStore};
 
 thread_local! {
     static LOCAL_SESSIONS_DIR_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    #[cfg(test)]
+    static JOURNAL_DIRECTORY_SYNC_FAILURE_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +51,59 @@ static NEXT_PROCESS_SESSIONS_DIR_OVERRIDE_ID: AtomicU64 = AtomicU64::new(1);
 static PROCESS_SESSIONS_DIR_OVERRIDE_POISONED_COUNT: AtomicU64 = AtomicU64::new(0);
 static PROCESS_SESSIONS_DIR_OVERRIDES: LazyLock<Mutex<Vec<ProcessSessionsDirOverride>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
+
+#[cfg(test)]
+struct ApprovalAppendOpenHook {
+    path: PathBuf,
+    opened: std::sync::mpsc::SyncSender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static APPROVAL_APPEND_OPEN_HOOK: LazyLock<Mutex<Option<ApprovalAppendOpenHook>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+#[cfg(test)]
+struct CanonicalCommitCasOpenHook {
+    path: PathBuf,
+    opened: std::sync::mpsc::SyncSender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static CANONICAL_COMMIT_CAS_OPEN_HOOK: LazyLock<Mutex<Option<CanonicalCommitCasOpenHook>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+#[cfg(test)]
+fn run_approval_append_open_hook(path: &Path) {
+    let hook = APPROVAL_APPEND_OPEN_HOOK.lock().ok().and_then(|mut slot| {
+        slot.as_ref()
+            .is_some_and(|hook| hook.path == path)
+            .then(|| slot.take())
+            .flatten()
+    });
+    if let Some(hook) = hook {
+        let _ = hook.opened.send(());
+        let _ = hook.resume.recv();
+    }
+}
+
+#[cfg(test)]
+fn run_canonical_commit_cas_open_hook(path: &Path) {
+    let hook = CANONICAL_COMMIT_CAS_OPEN_HOOK
+        .lock()
+        .ok()
+        .and_then(|mut slot| {
+            slot.as_ref()
+                .is_some_and(|hook| hook.path == path)
+                .then(|| slot.take())
+                .flatten()
+        });
+    if let Some(hook) = hook {
+        let _ = hook.opened.send(());
+        let _ = hook.resume.recv();
+    }
+}
 
 /// Cargo places unit-, integration-, and benchmark-test executables under a
 /// `target/{profile}/deps/<name>-<16 hex>` path.  A library dependency is not
@@ -447,19 +503,30 @@ fn prepend_session_start_if_needed<'a>(
     path: &Path,
     events: &'a [JournalEvent],
 ) -> std::io::Result<Cow<'a, [JournalEvent]>> {
+    let needs_session_start = journal_needs_session_start_for_path(path)?;
+    Ok(prepend_session_start_for_known_state(
+        events,
+        needs_session_start,
+    ))
+}
+
+fn prepend_session_start_for_known_state(
+    events: &[JournalEvent],
+    needs_session_start: bool,
+) -> Cow<'_, [JournalEvent]> {
     if events.is_empty()
         || events
             .iter()
             .any(|event| event.event_type == JournalEventType::SessionStart)
-        || !journal_needs_session_start_for_path(path)?
+        || !needs_session_start
     {
-        return Ok(Cow::Borrowed(events));
+        return Cow::Borrowed(events);
     }
     let Some(seed) = events
         .iter()
         .find(|event| event.event_type != JournalEventType::SessionStart)
     else {
-        return Ok(Cow::Borrowed(events));
+        return Cow::Borrowed(events);
     };
     let mut session_start =
         JournalEvent::session_start(seed.session_id.as_deref(), seed.model.as_deref());
@@ -475,7 +542,7 @@ fn prepend_session_start_if_needed<'a>(
     let mut prefixed = Vec::with_capacity(events.len() + 1);
     prefixed.push(session_start);
     prefixed.extend(events.iter().cloned());
-    Ok(Cow::Owned(prefixed))
+    Cow::Owned(prefixed)
 }
 
 /// Opens a journal file with an exclusive file lock.
@@ -496,6 +563,34 @@ fn prepend_session_start_if_needed<'a>(
 /// file already exists, fall through to a plain append-open without chmod.
 fn open_locked_journal_file(path: &Path) -> std::io::Result<std::fs::File> {
     use fs2::FileExt;
+    let file = open_unlocked_journal_file(path)?;
+    file.lock_exclusive()?;
+    Ok(file)
+}
+
+fn missing_directories_before_create(path: &Path) -> Vec<PathBuf> {
+    let mut missing = Vec::new();
+    let mut candidate = Some(path);
+    while let Some(current) = candidate {
+        if current.exists() {
+            break;
+        }
+        missing.push(current.to_path_buf());
+        candidate = current.parent();
+    }
+    missing
+}
+
+fn open_unlocked_journal_file(path: &Path) -> std::io::Result<std::fs::File> {
+    Ok(open_unlocked_journal_file_with_creation(path)?.file)
+}
+
+struct OpenedJournalFile {
+    file: std::fs::File,
+    created: bool,
+}
+
+fn open_unlocked_journal_file_with_creation(path: &Path) -> std::io::Result<OpenedJournalFile> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -530,8 +625,10 @@ fn open_locked_journal_file(path: &Path) -> std::io::Result<std::fs::File> {
     {
         let _ = we_created_it;
     }
-    file.lock_exclusive()?;
-    Ok(file)
+    Ok(OpenedJournalFile {
+        file,
+        created: we_created_it,
+    })
 }
 
 fn serialize_journal_events(events: &[JournalEvent]) -> std::io::Result<Vec<u8>> {
@@ -555,6 +652,21 @@ fn serialize_journal_events(events: &[JournalEvent]) -> std::io::Result<Vec<u8>>
         buf.extend(line);
     }
     Ok(buf)
+}
+
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if JOURNAL_DIRECTORY_SYNC_FAILURE_ONCE.with(|fail| fail.replace(false)) {
+        return Err(std::io::Error::other(
+            "injected journal directory sync failure",
+        ));
+    }
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(test)]
+fn fail_next_journal_directory_sync() {
+    JOURNAL_DIRECTORY_SYNC_FAILURE_ONCE.with(|fail| fail.set(true));
 }
 
 fn record_journal_read(site: astra_core::history_work::HistoryWorkSite, bytes: usize, rows: usize) {
@@ -1017,7 +1129,7 @@ pub struct EdgePolicySnapshot {
 }
 
 /// Per-tool-call audit record, embedded in turn events for granular tracking.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ToolCallRecord {
     /// Provider/model tool call id. Stable linkage between assistant tool call,
     /// tool result, DB trace row, and any child-agent lifecycle event.
@@ -1074,9 +1186,17 @@ pub struct ToolCallRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub round: Option<u32>,
     /// Full tool arguments as JSON string (untruncated).
-    /// Enables exact tool call reproduction from journal data alone.
+    /// This is the display-safe durable projection. Runtime authority that
+    /// still needs the exact invocation uses [`Self::authoritative_args_full`]
+    /// while the call is live; raw arguments must never cross a serde boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub args_full: Option<String>,
+    /// Lossless arguments retained only in the live process for typed
+    /// lifecycle/evidence decisions. This field is deliberately skipped by
+    /// serde so checkpoints, events, journals, and cross-process payloads
+    /// cannot persist model-supplied credentials.
+    #[serde(skip)]
+    pub runtime_args_full: Option<String>,
     /// Full tool result text (untruncated, after per-tool output limit).
     /// Enables debugging tool failures without re-execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1107,6 +1227,45 @@ pub struct ToolCallRecord {
     /// build/test pipeline whose final `tail` command exits successfully.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_class: Option<String>,
+    /// Executor-owned post-execution fact that the bound workspace changed.
+    /// This is intentionally separate from lexical mutation classification:
+    /// an opaque shell command may change files without containing a known
+    /// redirect/verb, while a command that merely may mutate is not proof that
+    /// it did. Only a trusted workspace executor may set this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_mutation_observed: Option<bool>,
+    /// Binding scope for `workspace_mutation_observed`; only
+    /// `bound_workspace` may satisfy a workspace completion obligation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_mutation_scope: Option<String>,
+    /// Compact executor receipt retained for audit/debugging.  The boolean
+    /// projection above is used by hot-path scheduling; this value preserves
+    /// the receipt schema/source without carrying file contents across the
+    /// journal boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_mutation_receipt: Option<serde_json::Value>,
+    /// Executor-owned observation that explicitly declared state outside the
+    /// bound workspace changed during this invocation. This is separate from
+    /// workspace evidence so neither scope can satisfy the other's contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_effect_observed: Option<bool>,
+    /// Scope bound into `external_effect_receipt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_effect_scope: Option<String>,
+    /// Compact, validated executor receipt for the declared external targets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_effect_receipt: Option<serde_json::Value>,
+    /// A multi-target writer committed a strict prefix before failing. This
+    /// is a quarantine/barrier fact, never successful mutation evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_mutation_partial: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_mutation_partial_paths: Option<Vec<String>>,
+    /// Validated executor-authored fact that a best-effort inferred source was
+    /// modified or deleted.  This is advisory recovery state, not proof that
+    /// the tool failed and not authority to roll the change back implicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_preimage_recovery: Option<serde_json::Value>,
     /// Source-authored error classification. This remains typed across
     /// runtime, journal, ingestion, and reflection boundaries so downstream
     /// systems never need to infer control semantics from error prose.
@@ -1115,6 +1274,20 @@ pub struct ToolCallRecord {
     /// What happened to the requested call at the execution boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposition: Option<ToolCallDisposition>,
+}
+
+impl fmt::Debug for ToolCallRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Serialize the durable projection instead of deriving Debug over the
+        // live-only runtime_args_full field. This keeps accidental tracing or
+        // panic formatting from turning a model-supplied secret into a log
+        // record while preserving a useful, complete audit shape.
+        let durable = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
+        formatter
+            .debug_struct("ToolCallRecord")
+            .field("durable", &durable)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1197,6 +1370,19 @@ pub const NOOP_OR_CACHED_RESULT_CLASS: &str = "noop_or_cached";
 pub const BLOCKED_TOOL_RESULT_CLASS: &str = "blocked_tool";
 
 impl ToolCallRecord {
+    /// Return the lossless arguments for live authority decisions. Restored
+    /// records from before the runtime-only lane remain usable when their
+    /// durable projection is exact; a redacted projection is intentionally
+    /// not parsed as an authority input because its marker is not the command
+    /// the executor ran.
+    pub fn authoritative_args_full(&self) -> Option<&str> {
+        if let Some(runtime_args) = self.runtime_args_full.as_deref() {
+            return Some(runtime_args);
+        }
+        let durable_args = self.args_full.as_deref()?;
+        (!durable_args.contains("[REDACTED:")).then_some(durable_args)
+    }
+
     pub fn was_executed(&self) -> bool {
         self.effective_disposition() == ToolCallDisposition::Executed
     }
@@ -1627,6 +1813,14 @@ pub enum JournalEventType {
     /// Describes a single atomic rewrite of the session-memory L1
     /// artifact.
     SessionMemoryExtraction,
+    /// A durable, structured diagnostic from asynchronous subsystem work.
+    ///
+    /// This is intentionally separate from free-form logs: product verification
+    /// and operators can act on severity/subsystem/operation/code without
+    /// matching human-facing error text.
+    SubsystemDiagnostic,
+    /// An asynchronous subsystem reached its durable observation boundary.
+    SubsystemSettled,
     /// Context pipeline per-turn feedback (cache ratio, tokens, tier).
     PipelineFeedback,
     /// Context pipeline trace alert fired (cache break, recovery loop, etc.).
@@ -1649,10 +1843,18 @@ pub enum JournalEventType {
 pub enum SessionMemoryExtractionSkipReason {
     NoSessionId,
     NoGrowth,
+    /// The selector returned a structurally valid empty sparse patch. This is
+    /// a successful semantic decision: retrying other models cannot create
+    /// evidence that the conversation did not contain.
+    NoSemanticChange,
     /// A durable snapshot already covers this turn. This closes the
     /// cross-process/restart gap that an in-memory debounce cannot observe.
     AlreadyCurrent,
     InFlight,
+    /// A newer canonical turn already owns extraction for this session. The
+    /// older snapshot is intentionally discarded instead of being allowed to
+    /// overwrite or delay newer memory.
+    Superseded,
     SelectorCooldown,
     /// Memoria endpoint tripped the circuit breaker after consecutive
     /// failures. Emitted synchronously — no spawn, no retry attempted
@@ -1667,6 +1869,11 @@ pub enum SessionMemoryExtractionErrorReason {
     /// The caller supplied a non-session inference owner to session-memory
     /// extraction. No provider or Memoria request was attempted.
     InvalidScope,
+    /// The complete background extraction operation exceeded its bounded
+    /// deadline before it reached a durable terminal outcome. This is
+    /// deliberately distinct from [`Self::LlmTimeout`]: the deadline covers
+    /// provider selection, snapshot I/O, persistence, and cleanup together.
+    DeadlineExceeded,
     LlmTimeout,
     LlmError,
     EmptyResponse,
@@ -1683,6 +1890,14 @@ pub enum SessionMemoryExtractionErrorReason {
 pub enum SessionMemoryExtractionSource {
     Llm,
     RuleFallback,
+}
+
+/// Operational impact of a structured subsystem diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubsystemDiagnosticSeverity {
+    Warning,
+    Error,
 }
 
 /// Full outcome of a single extraction attempt. Serialized flat into the
@@ -1790,10 +2005,268 @@ impl SessionMemoryExtractionOutcome {
 }
 
 /// Writer that appends events to a session journal file.
+#[derive(Debug, thiserror::Error)]
+pub enum SessionExecutionLeaseError {
+    #[error("session `{session_id}` already has an active execution")]
+    Conflict { session_id: String },
+    #[error("failed to acquire execution lease for session `{session_id}`: {source}")]
+    Io {
+        session_id: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+/// Process-independent admission token for one session execution.
+///
+/// On Linux, a kernel-named abstract Unix socket is the primary admission
+/// authority. It cannot be renamed or unlinked, so replacing the advisory
+/// lock-file inode cannot create two simultaneous owners. The lock file is a
+/// second fence for cooperating processes in other network namespaces and on
+/// shared filesystems. It is deliberately independent from the rotatable
+/// journal inode and is never removed. Dropping the token releases both locks.
+#[derive(Debug)]
+pub struct SessionExecutionLease {
+    #[cfg(target_os = "linux")]
+    _kernel_authority: std::os::unix::net::UnixDatagram,
+    _file: std::fs::File,
+    session_id: String,
+    lock_path: PathBuf,
+    created_parent_dirs: Vec<PathBuf>,
+}
+
+impl SessionExecutionLease {
+    pub fn try_acquire(session_id: &str) -> Result<Self, SessionExecutionLeaseError> {
+        let owner_scope = OwnerScope::local_user();
+        let journal_path =
+            journal_file_path_for_owner(&owner_scope, session_id).map_err(|source| {
+                SessionExecutionLeaseError::Io {
+                    session_id: session_id.to_string(),
+                    source,
+                }
+            })?;
+        let lock_path = execution_lease_path(&journal_path, session_id);
+        let _kernel_authority =
+            acquire_execution_kernel_authority(&owner_scope, &journal_path, session_id)?;
+        let created_parent_dirs = journal_path
+            .parent()
+            .map(missing_directories_before_create)
+            .unwrap_or_default();
+        if let Some(parent) = lock_path.parent()
+            && let Err(source) = std::fs::create_dir_all(parent)
+        {
+            return Err(SessionExecutionLeaseError::Io {
+                session_id: session_id.to_string(),
+                source,
+            });
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|source| SessionExecutionLeaseError::Io {
+                session_id: session_id.to_string(),
+                source,
+            })?;
+        use fs2::FileExt;
+        match file.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+                return Err(SessionExecutionLeaseError::Conflict {
+                    session_id: session_id.to_string(),
+                });
+            }
+            Err(source) => {
+                return Err(SessionExecutionLeaseError::Io {
+                    session_id: session_id.to_string(),
+                    source,
+                });
+            }
+        }
+        match open_journal_file_is_current(&file, &lock_path) {
+            Ok(true) => Ok(Self {
+                #[cfg(target_os = "linux")]
+                _kernel_authority,
+                _file: file,
+                session_id: session_id.to_string(),
+                lock_path,
+                created_parent_dirs,
+            }),
+            Ok(false) => Err(SessionExecutionLeaseError::Io {
+                session_id: session_id.to_string(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "execution lease inode was replaced during acquisition",
+                ),
+            }),
+            Err(source) => Err(SessionExecutionLeaseError::Io {
+                session_id: session_id.to_string(),
+                source,
+            }),
+        }
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn acquire_execution_kernel_authority(
+    owner_scope: &OwnerScope,
+    journal_path: &Path,
+    session_id: &str,
+) -> Result<std::os::unix::net::UnixDatagram, SessionExecutionLeaseError> {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixDatagram};
+
+    let absolute_journal_path = if journal_path.is_absolute() {
+        journal_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(journal_path))
+            .map_err(|source| SessionExecutionLeaseError::Io {
+                session_id: session_id.to_string(),
+                source,
+            })?
+    };
+    let mut identity = Sha256::new();
+    identity.update(b"astra-session-execution-authority-v1\0");
+    identity.update(owner_scope.id().as_bytes());
+    identity.update(b"\0");
+    identity.update(absolute_journal_path.as_os_str().as_encoded_bytes());
+    identity.update(b"\0");
+    identity.update(session_id.as_bytes());
+    let name = format!("astra-exec-v1-{:x}", identity.finalize());
+    let address = SocketAddr::from_abstract_name(name.as_bytes()).map_err(|source| {
+        SessionExecutionLeaseError::Io {
+            session_id: session_id.to_string(),
+            source,
+        }
+    })?;
+    UnixDatagram::bind_addr(&address).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::AddrInUse {
+            SessionExecutionLeaseError::Conflict {
+                session_id: session_id.to_string(),
+            }
+        } else {
+            SessionExecutionLeaseError::Io {
+                session_id: session_id.to_string(),
+                source,
+            }
+        }
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn acquire_execution_kernel_authority(
+    _owner_scope: &OwnerScope,
+    _journal_path: &Path,
+    session_id: &str,
+) -> Result<(), SessionExecutionLeaseError> {
+    Err(SessionExecutionLeaseError::Io {
+        session_id: session_id.to_string(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this platform has no rename-resistant session execution authority",
+        ),
+    })
+}
+
+fn execution_lease_path(journal_path: &Path, session_id: &str) -> PathBuf {
+    journal_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".execution-locks")
+        .join(format!("{session_id}.lock"))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CanonicalCommitCasOutcome {
+    Committed { persistence_warning: Option<String> },
+    NotCommitted(String),
+    Conflict(String),
+    Unknown(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CanonicalCommitPresence {
+    Exact,
+    Absent,
+    Conflict(String),
+    Unknown(String),
+}
+
+fn classify_canonical_commit_presence(
+    events: &[JournalEvent],
+    malformed_lines: usize,
+    turn: u32,
+    intended: &ConversationCommitV1,
+) -> CanonicalCommitPresence {
+    if malformed_lines > 0 {
+        return CanonicalCommitPresence::Unknown(format!(
+            "journal contains {malformed_lines} malformed record(s)"
+        ));
+    }
+
+    let intended_cursor = &intended.cursor;
+    let mut exact_matches = 0usize;
+    let mut same_turn_conflict = false;
+    let mut same_cursor_conflict = false;
+    for event in events {
+        if let Some(commit) = event.conversation_commit.as_ref() {
+            if commit == intended {
+                exact_matches += 1;
+                continue;
+            }
+            let cursor = &commit.cursor;
+            if cursor.owner_id == intended_cursor.owner_id
+                && cursor.session_id == intended_cursor.session_id
+                && cursor.branch_id == intended_cursor.branch_id
+                && cursor.completed_turn == intended_cursor.completed_turn
+                && cursor.journal_event_seq == intended_cursor.journal_event_seq
+                && cursor.conversation_seq == intended_cursor.conversation_seq
+            {
+                same_cursor_conflict = true;
+            }
+        }
+        if matches!(
+            event.event_type,
+            JournalEventType::Turn | JournalEventType::TurnError
+        ) && event.turn == Some(turn)
+        {
+            same_turn_conflict = true;
+        }
+    }
+
+    if exact_matches == 1 && !same_turn_conflict && !same_cursor_conflict {
+        CanonicalCommitPresence::Exact
+    } else if exact_matches > 1
+        || (exact_matches == 1 && (same_turn_conflict || same_cursor_conflict))
+    {
+        CanonicalCommitPresence::Unknown(
+            "journal contains duplicate or conflicting copies of the intended canonical commit"
+                .to_string(),
+        )
+    } else if same_cursor_conflict {
+        CanonicalCommitPresence::Conflict(
+            "journal contains a different commit at the intended canonical cursor".to_string(),
+        )
+    } else if same_turn_conflict {
+        CanonicalCommitPresence::Conflict(format!(
+            "journal turn identity {turn} is already committed"
+        ))
+    } else {
+        CanonicalCommitPresence::Absent
+    }
+}
+
 pub struct JournalWriter {
     path: PathBuf,
     owner_scope: OwnerScope,
     session_id: String,
+    created_parent_dirs: Vec<PathBuf>,
 }
 
 impl JournalWriter {
@@ -1834,13 +2307,16 @@ impl JournalWriter {
                 format!("journal path is a directory: {}", path.display()),
             ));
         }
+        let mut created_parent_dirs = Vec::new();
         if let Some(dir) = path.parent() {
+            created_parent_dirs = missing_directories_before_create(dir);
             std::fs::create_dir_all(dir)?;
         }
         Ok(Self {
             path,
             owner_scope,
             session_id: session_id.to_string(),
+            created_parent_dirs,
         })
     }
 
@@ -1901,6 +2377,345 @@ impl JournalWriter {
         self.append_bulk_inner(events, false)
     }
 
+    fn sync_creation_metadata_if_needed(
+        &self,
+        journal_created: bool,
+        first_canonical_commit: bool,
+        lease_created_dirs: &[PathBuf],
+    ) -> std::io::Result<()> {
+        if !journal_created
+            && !first_canonical_commit
+            && self.created_parent_dirs.is_empty()
+            && lease_created_dirs.is_empty()
+        {
+            return Ok(());
+        }
+        let mut directories = Vec::new();
+        if let Some(parent) = self.path.parent() {
+            directories.push(parent.to_path_buf());
+        }
+        for created in self.created_parent_dirs.iter().chain(lease_created_dirs) {
+            if !directories.iter().any(|existing| existing == created) {
+                directories.push(created.clone());
+            }
+            if let Some(parent) = created.parent()
+                && !directories.iter().any(|existing| existing == parent)
+            {
+                directories.push(parent.to_path_buf());
+            }
+        }
+        directories.sort_by_key(|directory| std::cmp::Reverse(directory.components().count()));
+        for directory in directories {
+            sync_directory(&directory)?;
+        }
+        Ok(())
+    }
+
+    /// Atomically compare and append one canonical conversation commit.
+    ///
+    /// The compare, append, durability fence, generation confirmation, and
+    /// exact-commit verification all happen while holding one exclusive file
+    /// lock. A stale caller can therefore never append a second version of the
+    /// same turn or report success for a detached journal inode.
+    pub fn append_canonical_commit_cas(
+        &self,
+        lease: &SessionExecutionLease,
+        expected_base_cursor: Option<&SessionCursorV1>,
+        turn: u32,
+        intended: &ConversationCommitV1,
+        events: &[JournalEvent],
+    ) -> CanonicalCommitCasOutcome {
+        if lease.session_id != self.session_id
+            || lease.lock_path != execution_lease_path(&self.path, &self.session_id)
+        {
+            return CanonicalCommitCasOutcome::NotCommitted(
+                "canonical CAS requires the matching active session execution lease".to_string(),
+            );
+        }
+        self.append_canonical_commit_cas_locked(
+            expected_base_cursor,
+            turn,
+            intended,
+            events,
+            &lease.created_parent_dirs,
+        )
+    }
+
+    fn append_canonical_commit_cas_locked(
+        &self,
+        expected_base_cursor: Option<&SessionCursorV1>,
+        turn: u32,
+        intended: &ConversationCommitV1,
+        events: &[JournalEvent],
+        lease_created_dirs: &[PathBuf],
+    ) -> CanonicalCommitCasOutcome {
+        use fs2::FileExt;
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        if intended.cursor.session_id != self.session_id || intended.cursor.completed_turn != turn {
+            return CanonicalCommitCasOutcome::NotCommitted(
+                "intended canonical commit does not match the writer session/turn".to_string(),
+            );
+        }
+        let intended_turns = events
+            .iter()
+            .filter(|event| {
+                event.event_type == JournalEventType::Turn
+                    && event.turn == Some(turn)
+                    && event.conversation_commit.as_ref() == Some(intended)
+            })
+            .count();
+        let terminal_turn_events = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type,
+                    JournalEventType::Turn | JournalEventType::TurnError
+                )
+            })
+            .count();
+        let other_commits = events.iter().any(|event| {
+            event
+                .conversation_commit
+                .as_ref()
+                .is_some_and(|commit| commit != intended)
+        });
+        if intended_turns != 1 || terminal_turn_events != 1 || other_commits {
+            return CanonicalCommitCasOutcome::NotCommitted(
+                "canonical CAS batch must contain exactly one intended turn commit".to_string(),
+            );
+        }
+
+        const MAX_GENERATION_RETRIES: usize = 8;
+        for _ in 0..MAX_GENERATION_RETRIES {
+            let opened = match open_unlocked_journal_file_with_creation(&self.path) {
+                Ok(opened) => opened,
+                Err(error) => {
+                    return CanonicalCommitCasOutcome::Unknown(format!(
+                        "failed to open canonical journal CAS: {error}"
+                    ));
+                }
+            };
+            let journal_created = opened.created;
+            let mut file = opened.file;
+            #[cfg(test)]
+            run_canonical_commit_cas_open_hook(&self.path);
+            if let Err(error) = file.lock_exclusive() {
+                return CanonicalCommitCasOutcome::Unknown(format!(
+                    "failed to lock canonical journal CAS: {error}"
+                ));
+            }
+            match open_journal_file_is_current(&file, &self.path) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return CanonicalCommitCasOutcome::Unknown(
+                        "canonical journal generation rotated before CAS validation".to_string(),
+                    );
+                }
+                Err(error) => {
+                    return CanonicalCommitCasOutcome::Unknown(format!(
+                        "failed to verify canonical journal generation: {error}"
+                    ));
+                }
+            }
+
+            if let Err(error) = file.seek(SeekFrom::Start(0)) {
+                return CanonicalCommitCasOutcome::Unknown(format!(
+                    "failed to seek canonical journal CAS: {error}"
+                ));
+            }
+            let mut content = String::new();
+            if let Err(error) = file.read_to_string(&mut content) {
+                return CanonicalCommitCasOutcome::Unknown(format!(
+                    "failed to read canonical journal CAS: {error}"
+                ));
+            }
+            let (current_events, _, malformed_lines) =
+                match parse_complete_journal_text_in_append_order(&content) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        return CanonicalCommitCasOutcome::Unknown(format!(
+                            "canonical journal CAS readback is incomplete: {error}"
+                        ));
+                    }
+                };
+            match classify_canonical_commit_presence(
+                &current_events,
+                malformed_lines,
+                turn,
+                intended,
+            ) {
+                CanonicalCommitPresence::Exact => {
+                    if let Err(error) = file.sync_data() {
+                        return CanonicalCommitCasOutcome::Unknown(format!(
+                            "failed canonical journal CAS durability fence: {error}"
+                        ));
+                    }
+                    return match open_journal_file_is_current(&file, &self.path) {
+                        Ok(true) => {
+                            if let Err(error) = self.sync_creation_metadata_if_needed(
+                                journal_created,
+                                false,
+                                lease_created_dirs,
+                            ) {
+                                CanonicalCommitCasOutcome::Unknown(format!(
+                                    "failed to sync canonical journal creation metadata: {error}"
+                                ))
+                            } else {
+                                CanonicalCommitCasOutcome::Committed {
+                                    persistence_warning: None,
+                                }
+                            }
+                        }
+                        Ok(false) => CanonicalCommitCasOutcome::Unknown(
+                            "canonical commit exists only on a rotated journal generation"
+                                .to_string(),
+                        ),
+                        Err(error) => CanonicalCommitCasOutcome::Unknown(format!(
+                            "failed to confirm canonical journal generation: {error}"
+                        )),
+                    };
+                }
+                CanonicalCommitPresence::Conflict(reason) => {
+                    return CanonicalCommitCasOutcome::Conflict(reason);
+                }
+                CanonicalCommitPresence::Unknown(reason) => {
+                    return CanonicalCommitCasOutcome::Unknown(reason);
+                }
+                CanonicalCommitPresence::Absent => {}
+            }
+
+            let current_base_cursor = current_events
+                .iter()
+                .filter_map(|event| event.conversation_commit.as_ref())
+                .last()
+                .map(|commit| &commit.cursor);
+            let first_canonical_commit = current_base_cursor.is_none();
+            if current_base_cursor != expected_base_cursor {
+                return CanonicalCommitCasOutcome::Conflict(
+                    "canonical journal base changed before turn settlement".to_string(),
+                );
+            }
+
+            let needs_session_start = current_events
+                .last()
+                .is_none_or(|event| event.event_type == JournalEventType::SessionEnd);
+            let append_events = prepend_session_start_for_known_state(events, needs_session_start);
+            let serialized = match serialize_journal_events(append_events.as_ref()) {
+                Ok(serialized) => serialized,
+                Err(error) => {
+                    return CanonicalCommitCasOutcome::NotCommitted(format!(
+                        "failed to serialize canonical journal CAS: {error}"
+                    ));
+                }
+            };
+            let write_error = file.write_all(&serialized).err();
+            if let Err(error) = file.sync_data() {
+                return CanonicalCommitCasOutcome::Unknown(format!(
+                    "failed canonical journal CAS durability fence: {error}"
+                ));
+            }
+            match open_journal_file_is_current(&file, &self.path) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return CanonicalCommitCasOutcome::Unknown(
+                        "canonical journal generation rotated after CAS write".to_string(),
+                    );
+                }
+                Err(error) => {
+                    return CanonicalCommitCasOutcome::Unknown(format!(
+                        "failed to confirm canonical journal generation: {error}"
+                    ));
+                }
+            }
+
+            if let Err(error) = file.seek(SeekFrom::Start(0)) {
+                return CanonicalCommitCasOutcome::Unknown(format!(
+                    "failed to seek canonical journal CAS verification: {error}"
+                ));
+            }
+            let mut verified_content = String::new();
+            if let Err(error) = file.read_to_string(&mut verified_content) {
+                return CanonicalCommitCasOutcome::Unknown(format!(
+                    "failed to read canonical journal CAS verification: {error}"
+                ));
+            }
+            let (verified_events, _, verified_malformed_lines) =
+                match parse_complete_journal_text_in_append_order(&verified_content) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        return CanonicalCommitCasOutcome::Unknown(format!(
+                            "canonical journal CAS verification is incomplete: {error}"
+                        ));
+                    }
+                };
+            return match classify_canonical_commit_presence(
+                &verified_events,
+                verified_malformed_lines,
+                turn,
+                intended,
+            ) {
+                CanonicalCommitPresence::Exact => {
+                    match open_journal_file_is_current(&file, &self.path) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            return CanonicalCommitCasOutcome::Unknown(
+                                "canonical journal generation rotated during CAS verification"
+                                    .to_string(),
+                            );
+                        }
+                        Err(error) => {
+                            return CanonicalCommitCasOutcome::Unknown(format!(
+                                "failed final canonical journal generation check: {error}"
+                            ));
+                        }
+                    }
+                    if let Err(error) = self.sync_creation_metadata_if_needed(
+                        journal_created,
+                        first_canonical_commit,
+                        lease_created_dirs,
+                    ) {
+                        return CanonicalCommitCasOutcome::Unknown(format!(
+                            "failed to sync canonical journal creation metadata: {error}"
+                        ));
+                    }
+                    update_cached_session_start_state_from_events(
+                        &self.path,
+                        append_events.as_ref(),
+                    );
+                    CanonicalCommitCasOutcome::Committed {
+                        persistence_warning: write_error.map(|error| {
+                            format!(
+                                "canonical journal CAS write reported an error but exact durable verification succeeded: {error}"
+                            )
+                        }),
+                    }
+                }
+                CanonicalCommitPresence::Absent => {
+                    if let Some(error) = write_error {
+                        CanonicalCommitCasOutcome::NotCommitted(format!(
+                            "canonical journal CAS write failed and exact commit is absent: {error}"
+                        ))
+                    } else {
+                        CanonicalCommitCasOutcome::Unknown(
+                            "canonical journal CAS write succeeded but exact commit is absent"
+                                .to_string(),
+                        )
+                    }
+                }
+                CanonicalCommitPresence::Conflict(reason)
+                | CanonicalCommitPresence::Unknown(reason) => CanonicalCommitCasOutcome::Unknown(
+                    format!("canonical journal CAS verification failed: {reason}"),
+                ),
+            };
+        }
+
+        CanonicalCommitCasOutcome::Unknown(format!(
+            "journal {} kept rotating before canonical CAS write",
+            self.session_id
+        ))
+    }
+
     /// Commit prior no-sync appends to the local durable boundary without
     /// manufacturing another journal event. Long-running child agents can
     /// expose live pages after each round, then pay one fsync at terminal
@@ -1908,6 +2723,114 @@ impl JournalWriter {
     pub fn sync_data(&self) -> std::io::Result<()> {
         let file = open_locked_journal_file(&self.path)?;
         file.sync_data()
+    }
+
+    /// Read one complete current-generation snapshot in physical append
+    /// order. Canonical replay must use this order rather than timestamps,
+    /// which are diagnostic and may move backwards across processes.
+    pub fn complete_append_order_snapshot(&self) -> std::io::Result<Vec<JournalEvent>> {
+        use fs2::FileExt;
+        use std::io::{Read, Seek, SeekFrom};
+
+        const MAX_GENERATION_RETRIES: usize = 8;
+        for _ in 0..MAX_GENERATION_RETRIES {
+            let mut file = match std::fs::OpenOptions::new().read(true).open(&self.path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(Vec::new());
+                }
+                Err(error) => return Err(error),
+            };
+            FileExt::lock_shared(&file)?;
+            if !open_journal_file_is_current(&file, &self.path)? {
+                continue;
+            }
+            file.seek(SeekFrom::Start(0))?;
+            let mut content = String::new();
+            file.read_to_string(&mut content)?;
+            if !open_journal_file_is_current(&file, &self.path)? {
+                continue;
+            }
+            let (events, _, malformed_lines) =
+                parse_complete_journal_text_in_append_order(&content)?;
+            if malformed_lines > 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("journal contains {malformed_lines} malformed record(s)"),
+                ));
+            }
+            record_journal_read(
+                astra_core::history_work::HistoryWorkSite::SessionJournalDigestRead,
+                content.len(),
+                events.len(),
+            );
+            return Ok(events);
+        }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!(
+                "journal {} kept rotating during append-order snapshot",
+                self.session_id
+            ),
+        ))
+    }
+
+    /// Establish a durability fence and read the exact journal generation
+    /// protected by that fence.
+    ///
+    /// This is intended for reconciling an ambiguous append result: callers
+    /// must not treat an ordinary pathname read as proof that page-cache
+    /// bytes survived the failed durability boundary.
+    pub fn durable_readback(&self) -> std::io::Result<(Vec<JournalEvent>, usize, usize)> {
+        self.durable_readback_with(|file| file.sync_data())
+    }
+
+    fn durable_readback_with<F>(
+        &self,
+        sync_data: F,
+    ) -> std::io::Result<(Vec<JournalEvent>, usize, usize)>
+    where
+        F: Fn(&std::fs::File) -> std::io::Result<()>,
+    {
+        use fs2::FileExt;
+        use std::io::{Read, Seek, SeekFrom};
+
+        const MAX_GENERATION_RETRIES: usize = 8;
+        for _ in 0..MAX_GENERATION_RETRIES {
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&self.path)?;
+            file.lock_exclusive()?;
+            if !open_journal_file_is_current(&file, &self.path)? {
+                continue;
+            }
+
+            sync_data(&file)?;
+            file.seek(SeekFrom::Start(0))?;
+            let mut content = String::new();
+            file.read_to_string(&mut content)?;
+            if !open_journal_file_is_current(&file, &self.path)? {
+                continue;
+            }
+
+            let parsed = parse_complete_journal_text(&content)?;
+            record_journal_read(
+                astra_core::history_work::HistoryWorkSite::SessionJournalDigestRead,
+                content.len(),
+                parsed.0.len(),
+            );
+            return Ok(parsed);
+        }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!(
+                "journal {} kept rotating during durable readback",
+                self.session_id
+            ),
+        ))
     }
 
     fn append_bulk_inner(&self, events: &[JournalEvent], sync: bool) -> std::io::Result<()> {
@@ -1993,6 +2916,7 @@ pub struct TurnEventBuffer {
     events: std::collections::VecDeque<JournalEvent>,
     dropped_events: u64,
     turn_start: std::time::Instant,
+    turn_started_at: chrono::DateTime<chrono::Utc>,
     session_id: Option<String>,
     /// Canonical user-visible session turn. Child producers deliberately have
     /// no session turn; their local turn belongs in `producer_turn` instead.
@@ -2002,6 +2926,15 @@ pub struct TurnEventBuffer {
     producer_turn: Option<u32>,
     round: u32,
     batch_counter: u32,
+    /// Action union from the exact tool schemas sent on the current provider
+    /// boundary. Tool names alone cannot prove whether a sensitive action
+    /// (for example `agent_fanout.start`) was actually visible.
+    visible_tool_actions: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    /// Exact provider-visible tool names for the current round. This is a
+    /// bounded schema projection, not the schemas themselves, and lets
+    /// lifecycle diagnostics prove that an assigned run was actually given
+    /// its required continuation operation.
+    visible_tool_names: Option<Vec<String>>,
 }
 
 impl TurnEventBuffer {
@@ -2016,11 +2949,14 @@ impl TurnEventBuffer {
             events: std::collections::VecDeque::new(),
             dropped_events: 0,
             turn_start: std::time::Instant::now(),
+            turn_started_at: chrono::Utc::now(),
             session_id: session_id.map(ToString::to_string),
             session_turn: Some(turn),
             producer_turn: None,
             round,
             batch_counter: 0,
+            visible_tool_actions: None,
+            visible_tool_names: None,
         }
     }
 
@@ -2034,11 +2970,14 @@ impl TurnEventBuffer {
             events: std::collections::VecDeque::new(),
             dropped_events: 0,
             turn_start: std::time::Instant::now(),
+            turn_started_at: chrono::Utc::now(),
             session_id: session_id.map(ToString::to_string),
             session_turn: None,
             producer_turn: Some(producer_turn),
             round: 0,
             batch_counter: 0,
+            visible_tool_actions: None,
+            visible_tool_names: None,
         }
     }
 
@@ -2095,6 +3034,13 @@ impl TurnEventBuffer {
         self.turn_start
     }
 
+    /// Wall-clock anchor paired with [`Self::turn_start_instant`]. Trace
+    /// projections use this to preserve the observed event timeline instead
+    /// of assigning post-loop import time to every round/tool.
+    pub fn turn_started_at(&self) -> chrono::DateTime<chrono::Utc> {
+        self.turn_started_at
+    }
+
     /// Current LLM round index (0-based).
     pub fn current_round(&self) -> u32 {
         self.round
@@ -2105,6 +3051,26 @@ impl TurnEventBuffer {
         let id = format!("b-{}-{}", self.round, self.batch_counter);
         self.batch_counter += 1;
         id
+    }
+
+    /// Persist a bounded projection of the exact action surface for the next
+    /// LLM round. The full schemas remain out of the journal; this map is the
+    /// minimum evidence needed to distinguish "tool name visible" from
+    /// "requested action branch visible" during incident review.
+    pub fn set_visible_tool_actions(
+        &mut self,
+        actions: std::collections::BTreeMap<String, Vec<String>>,
+    ) {
+        self.visible_tool_actions = (!actions.is_empty()).then_some(actions);
+    }
+
+    /// Persist the bounded name projection of the exact provider wire
+    /// surface for the next LLM round.
+    pub fn set_visible_tool_names(&mut self, names: Vec<String>) {
+        let mut seen = std::collections::HashSet::new();
+        let mut names = names;
+        names.retain(|name| !name.trim().is_empty() && seen.insert(name.clone()));
+        self.visible_tool_names = Some(names);
     }
 
     /// Record an LLM round completion (one LLM→tools cycle).
@@ -2138,11 +3104,49 @@ impl TurnEventBuffer {
         }
         let mut meta = serde_json::Map::new();
         meta.insert("purpose".into(), serde_json::json!(r.purpose));
+        // Keep the observability facts alongside the canonical event fields
+        // when this journal is uploaded to `agent_events`. The cloud event
+        // schema stores generic metadata plus token counters, so without
+        // these bounded scalar fields a normal `llm_round` loses its duration
+        // and TTFT and reflection cannot explain where a session spent time.
+        if r.duration_ms > 0 {
+            meta.insert("duration_ms".into(), serde_json::json!(r.duration_ms));
+        }
+        if let Some(ttft_ms) = r.ttft_ms {
+            meta.insert("ttft_ms".into(), serde_json::json!(ttft_ms));
+        }
+        if r.prompt_tokens > 0 {
+            meta.insert("prompt_tokens".into(), serde_json::json!(r.prompt_tokens));
+        }
+        if r.completion_tokens > 0 {
+            meta.insert(
+                "completion_tokens".into(),
+                serde_json::json!(r.completion_tokens),
+            );
+        }
+        if r.cache_read_tokens > 0 {
+            meta.insert(
+                "cache_read_tokens".into(),
+                serde_json::json!(r.cache_read_tokens),
+            );
+        }
+        if r.cache_creation_tokens > 0 {
+            meta.insert(
+                "cache_creation_tokens".into(),
+                serde_json::json!(r.cache_creation_tokens),
+            );
+        }
         if !r.tool_call_names.is_empty() {
             meta.insert(
                 "tool_call_names".into(),
                 serde_json::json!(r.tool_call_names),
             );
+        }
+        if let Some(actions) = self.visible_tool_actions.as_ref() {
+            meta.insert("visible_tool_actions".into(), serde_json::json!(actions));
+        }
+        if let Some(names) = self.visible_tool_names.as_ref() {
+            meta.insert("visible_tools".into(), serde_json::json!(names));
         }
         if let Some(finish_reason) = r.finish_reason {
             meta.insert("finish_reason".into(), serde_json::json!(finish_reason));
@@ -2251,6 +3255,30 @@ fn parse_journal_text(content: &str) -> (Vec<JournalEvent>, usize, usize) {
         parse_journal_text_in_append_order(content);
     stabilize_event_order(&mut events);
     (events, non_empty_lines, malformed_lines)
+}
+
+fn parse_complete_journal_text(
+    content: &str,
+) -> std::io::Result<(Vec<JournalEvent>, usize, usize)> {
+    if !content.is_empty() && !content.ends_with('\n') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "journal has a non-empty unterminated tail",
+        ));
+    }
+    Ok(parse_journal_text(content))
+}
+
+fn parse_complete_journal_text_in_append_order(
+    content: &str,
+) -> std::io::Result<(Vec<JournalEvent>, usize, usize)> {
+    if !content.is_empty() && !content.ends_with('\n') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "journal has a non-empty unterminated tail",
+        ));
+    }
+    Ok(parse_journal_text_in_append_order(content))
 }
 
 /// Parse physical append order without timestamp repair. This is the cursor
@@ -2440,6 +3468,239 @@ pub fn read_durable_journal_append_delta_for_owner(
     })
 }
 
+/// Rotation-aware cursor used by approval waiters.
+///
+/// A byte offset alone is not an identity: after atomic replacement the same
+/// offset may point into unrelated JSONL. Keep file generation with the byte
+/// position so replacement is detected even when the new file has the exact
+/// same length. The generic sync-outbox cursor remains monotonic and separate.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApprovalJournalCursor {
+    offset: u64,
+    identity: Option<JournalFileIdentity>,
+    version: Option<JournalFileVersion>,
+    prefix_fingerprint: Option<[u8; 32]>,
+}
+
+impl ApprovalJournalCursor {
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JournalFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn journal_file_identity(metadata: &std::fs::Metadata) -> Option<JournalFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    Some(JournalFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JournalFileIdentity;
+
+#[cfg(not(unix))]
+fn journal_file_identity(_metadata: &std::fs::Metadata) -> Option<JournalFileIdentity> {
+    // Correctness wins over a speculative timestamp fingerprint: without a
+    // stable platform file id, callers rescan rather than risk missing a
+    // same-size replacement.
+    None
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JournalFileVersion {
+    len: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+#[cfg(unix)]
+fn journal_file_version(metadata: &std::fs::Metadata) -> Option<JournalFileVersion> {
+    use std::os::unix::fs::MetadataExt;
+    Some(JournalFileVersion {
+        len: metadata.len(),
+        modified_seconds: metadata.mtime(),
+        modified_nanoseconds: metadata.mtime_nsec(),
+        changed_seconds: metadata.ctime(),
+        changed_nanoseconds: metadata.ctime_nsec(),
+    })
+}
+
+#[cfg(not(unix))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JournalFileVersion {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+#[cfg(not(unix))]
+fn journal_file_version(metadata: &std::fs::Metadata) -> Option<JournalFileVersion> {
+    Some(JournalFileVersion {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+/// Hash the complete consumed prefix whenever the file version changes.
+///
+/// File identity catches atomic replacement. Metadata makes the unchanged
+/// polling path O(1). A complete prefix digest, rather than sampled boundary
+/// windows, proves that an apparent append did not actually truncate/regrow or
+/// rewrite the middle of a large same-inode journal between polls.
+fn approval_cursor_prefix_fingerprint(
+    file: &mut std::fs::File,
+    offset: u64,
+) -> std::io::Result<Option<[u8; 32]>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    if offset > file.metadata()?.len() {
+        return Ok(None);
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"astra-approval-cursor-v2");
+    hasher.update(offset.to_le_bytes());
+    file.seek(SeekFrom::Start(0))?;
+    let mut remaining = offset;
+    let mut buffer = [0_u8; 16 * 1024];
+    while remaining > 0 {
+        let take = remaining.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..take])?;
+        hasher.update(&buffer[..take]);
+        remaining -= take as u64;
+    }
+    Ok(Some(hasher.finalize().into()))
+}
+
+fn read_approval_journal_append_delta_for_user(
+    user_id: &str,
+    session_id: &str,
+    cursor: Option<&ApprovalJournalCursor>,
+) -> std::io::Result<(Vec<JournalEvent>, ApprovalJournalCursor)> {
+    use fs2::FileExt;
+    use std::io::{Read, Seek, SeekFrom};
+
+    validate_session_id(session_id)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let path = journal_file_path_for_user(user_id, session_id)?;
+    let mut file = match std::fs::OpenOptions::new().read(true).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), ApprovalJournalCursor::default()));
+        }
+        Err(error) => return Err(error),
+    };
+    let unlocked_metadata = file.metadata()?;
+    let unlocked_identity = journal_file_identity(&unlocked_metadata);
+    let unlocked_version = journal_file_version(&unlocked_metadata);
+    if let Some(cursor) = cursor
+        && cursor.identity.is_some()
+        && cursor.identity == unlocked_identity
+        && cursor.version == unlocked_version
+        && cursor.offset == unlocked_metadata.len()
+    {
+        // Same inode, length and nanosecond change metadata: the generation is
+        // unchanged. This high-frequency path is O(1), takes no lock and does
+        // no I/O proportional to session size. When metadata changes, the slow
+        // path verifies the complete old prefix before trusting the offset.
+        // A racing append is harmless: it is observed on the next polling tick.
+        return Ok((Vec::new(), cursor.clone()));
+    }
+
+    if let Err(error) = FileExt::try_lock_shared(&file) {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            // An appender owns the file. Never block an async approval waiter
+            // or consume a blocking-pool thread behind another session; the
+            // next polling tick retries after the writer has committed.
+            return Ok((
+                Vec::new(),
+                cursor
+                    .cloned()
+                    .unwrap_or_else(ApprovalJournalCursor::default),
+            ));
+        }
+        return Err(error);
+    }
+    let metadata = file.metadata()?;
+    let identity = journal_file_identity(&metadata);
+    let version = journal_file_version(&metadata);
+    let prefix_matches = if let Some(cursor) = cursor
+        && cursor.identity.is_some()
+        && cursor.identity == identity
+        && cursor.offset <= metadata.len()
+    {
+        approval_cursor_prefix_fingerprint(&mut file, cursor.offset)? == cursor.prefix_fingerprint
+    } else {
+        false
+    };
+    let offset = cursor
+        .filter(|_| prefix_matches)
+        .map(|cursor| cursor.offset)
+        .unwrap_or(0);
+    file.seek(SeekFrom::Start(offset))?;
+    let mut suffix = Vec::new();
+    file.read_to_end(&mut suffix)?;
+    let complete_len = suffix
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let next_offset = offset.saturating_add(complete_len as u64);
+    let next_cursor = ApprovalJournalCursor {
+        offset: next_offset,
+        identity,
+        version,
+        prefix_fingerprint: approval_cursor_prefix_fingerprint(&mut file, next_offset)?,
+    };
+    if complete_len == 0 {
+        record_journal_read(
+            astra_core::history_work::HistoryWorkSite::SessionJournalAppendDeltaRead,
+            suffix.len(),
+            0,
+        );
+        return Ok((Vec::new(), next_cursor));
+    }
+    let complete = std::str::from_utf8(&suffix[..complete_len]).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("journal {session_id} contains non-UTF-8 JSONL: {error}"),
+        )
+    })?;
+    let mut events = Vec::new();
+    for (line_index, line) in complete.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        events.push(serde_json::from_str::<JournalEvent>(line).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "journal {session_id} has invalid JSONL at append line {}: {error}",
+                    line_index + 1
+                ),
+            )
+        })?);
+    }
+    record_journal_read(
+        astra_core::history_work::HistoryWorkSite::SessionJournalAppendDeltaRead,
+        suffix.len(),
+        events.len(),
+    );
+    Ok((events, next_cursor))
+}
+
 /// Read the last `limit` events from a session journal file.
 ///
 /// This avoids loading the entire journal into memory for long-running sessions
@@ -2536,6 +3797,40 @@ pub fn find_latest_approval_decision_for_run(
     find_latest_approval_decision_impl(session_id, request_id, Some(run_id))
 }
 
+/// Find a durable approval decision inside one authenticated user's journal.
+///
+/// Cloud/server callers must use this instead of the process-local lookup so
+/// replay receipts cannot escape the session owner's audit partition.
+pub fn find_latest_approval_decision_for_user_run(
+    user_id: &str,
+    session_id: &str,
+    request_id: &str,
+    run_id: &str,
+) -> std::io::Result<Option<ApprovalJournalDecision>> {
+    let events = read_journal_for_user(user_id, session_id)?;
+    Ok(find_latest_approval_decision_in_events(
+        events.iter(),
+        request_id,
+        Some(run_id),
+    ))
+}
+
+/// Read only approval events appended after `cursor`, returning the next
+/// durable generation-aware cursor. A new file generation is scanned from
+/// zero, while an unchanged generation is a metadata-only fast path.
+pub fn find_latest_approval_decision_for_user_run_after(
+    user_id: &str,
+    session_id: &str,
+    request_id: &str,
+    run_id: &str,
+    cursor: Option<&ApprovalJournalCursor>,
+) -> std::io::Result<(Option<ApprovalJournalDecision>, ApprovalJournalCursor)> {
+    let (events, next_cursor) =
+        read_approval_journal_append_delta_for_user(user_id, session_id, cursor)?;
+    let decision = find_latest_approval_decision_in_events(events.iter(), request_id, Some(run_id));
+    Ok((decision, next_cursor))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalDecisionAppendOutcome {
     Appended,
@@ -2597,6 +3892,60 @@ pub fn append_approval_decision_for_run_if_absent(
     decision: &str,
     reason: Option<&str>,
 ) -> std::io::Result<ApprovalDecisionAppendOutcome> {
+    let path = journal_file_path(session_id);
+    append_approval_decision_for_run_if_absent_at_path(
+        &path,
+        session_id,
+        turn,
+        request_id,
+        run_id,
+        tool_name,
+        approval_kind,
+        decision,
+        reason,
+    )
+}
+
+/// Atomically append an approval decision to one authenticated user's journal.
+#[allow(clippy::too_many_arguments)]
+pub fn append_approval_decision_for_user_run_if_absent(
+    user_id: &str,
+    session_id: &str,
+    turn: Option<u32>,
+    request_id: &str,
+    run_id: &str,
+    tool_name: Option<&str>,
+    approval_kind: Option<&str>,
+    decision: &str,
+    reason: Option<&str>,
+) -> std::io::Result<ApprovalDecisionAppendOutcome> {
+    let path = journal_file_path_for_user(user_id, session_id)?;
+    append_approval_decision_for_run_if_absent_at_path(
+        &path,
+        session_id,
+        turn,
+        request_id,
+        run_id,
+        tool_name,
+        approval_kind,
+        decision,
+        reason,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_approval_decision_for_run_if_absent_at_path(
+    path: &Path,
+    session_id: &str,
+    turn: Option<u32>,
+    request_id: &str,
+    run_id: &str,
+    tool_name: Option<&str>,
+    approval_kind: Option<&str>,
+    decision: &str,
+    reason: Option<&str>,
+) -> std::io::Result<ApprovalDecisionAppendOutcome> {
+    use fs2::FileExt;
     use std::io::{Read, Seek, SeekFrom, Write};
 
     validate_session_id(session_id)
@@ -2608,39 +3957,91 @@ pub fn append_approval_decision_for_run_if_absent(
         ));
     }
 
-    let path = journal_file_path(session_id);
-    let mut file = open_locked_journal_file(&path)?;
-    let mut content = String::new();
-    file.seek(SeekFrom::Start(0))?;
-    file.read_to_string(&mut content)?;
-    let events = parse_journal_text(&content).0;
-    for event in events.iter().rev() {
-        let Some(existing) = approval_decision_from_event(event, request_id, Some(run_id)) else {
+    const MAX_GENERATION_RETRIES: usize = 8;
+    for _ in 0..MAX_GENERATION_RETRIES {
+        let mut file = open_unlocked_journal_file(path)?;
+        #[cfg(test)]
+        run_approval_append_open_hook(path);
+        file.lock_exclusive()?;
+        // `flock` belongs to the inode, not the directory entry. An operator
+        // may rotate the pathname while this writer waits for the old inode's
+        // lock. Never inspect or acknowledge a detached generation.
+        if !open_journal_file_is_current(&file, path)? {
             continue;
-        };
-        return if approval_decision_matches(&existing, decision, reason, tool_name, approval_kind) {
-            Ok(ApprovalDecisionAppendOutcome::Idempotent)
-        } else {
-            Ok(ApprovalDecisionAppendOutcome::Conflict(existing))
-        };
-    }
+        }
 
-    let event = JournalEvent::approval_decision_for_run(
-        Some(session_id),
-        turn,
-        request_id,
-        Some(run_id),
-        tool_name,
-        approval_kind,
-        decision,
-        reason,
-    );
-    let events = prepend_session_start_if_needed(&path, std::slice::from_ref(&event))?;
-    let buf = serialize_journal_events(events.as_ref())?;
-    file.write_all(&buf)?;
-    file.sync_data()?;
-    update_cached_session_start_state_from_events(&path, events.as_ref());
-    Ok(ApprovalDecisionAppendOutcome::Appended)
+        let mut content = String::new();
+        file.seek(SeekFrom::Start(0))?;
+        file.read_to_string(&mut content)?;
+        let events = parse_journal_text(&content).0;
+        if let Some(existing) = events
+            .iter()
+            .rev()
+            .find_map(|event| approval_decision_from_event(event, request_id, Some(run_id)))
+        {
+            if !open_journal_file_is_current(&file, path)? {
+                continue;
+            }
+            return if approval_decision_matches(
+                &existing,
+                decision,
+                reason,
+                tool_name,
+                approval_kind,
+            ) {
+                Ok(ApprovalDecisionAppendOutcome::Idempotent)
+            } else {
+                Ok(ApprovalDecisionAppendOutcome::Conflict(existing))
+            };
+        }
+
+        let event = JournalEvent::approval_decision_for_run(
+            Some(session_id),
+            turn,
+            request_id,
+            Some(run_id),
+            tool_name,
+            approval_kind,
+            decision,
+            reason,
+        );
+        let events = prepend_session_start_if_needed(path, std::slice::from_ref(&event))?;
+        let buf = serialize_journal_events(events.as_ref())?;
+        file.write_all(&buf)?;
+        file.sync_data()?;
+        if !open_journal_file_is_current(&file, path)? {
+            // The durable bytes landed in a rotated generation. Retry the
+            // idempotent operation against the pathname that readers use.
+            continue;
+        }
+        update_cached_session_start_state_from_events(path, events.as_ref());
+        return Ok(ApprovalDecisionAppendOutcome::Appended);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        format!("journal {session_id} kept rotating while persisting approval receipt"),
+    ))
+}
+
+#[cfg(unix)]
+fn open_journal_file_is_current(file: &std::fs::File, path: &Path) -> std::io::Result<bool> {
+    let open_identity = journal_file_identity(&file.metadata()?);
+    let path_metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let path_identity = journal_file_identity(&path_metadata);
+    Ok(open_identity.is_some() && open_identity == path_identity)
+}
+
+#[cfg(not(unix))]
+fn open_journal_file_is_current(_file: &std::fs::File, path: &Path) -> std::io::Result<bool> {
+    // Platforms without a stable file id cannot prove pathname continuity
+    // from std metadata alone. Preserve existing behavior rather than making
+    // every approval append fail; the directory-level generation protocol is
+    // enforced on Unix deployments where server-side rotation is supported.
+    Ok(path.exists())
 }
 
 fn find_latest_approval_decision_impl(
@@ -2651,12 +4052,21 @@ fn find_latest_approval_decision_impl(
     validate_session_id(session_id)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let events = read_journal(session_id)?;
-    for event in events.iter().rev() {
-        if let Some(decision) = approval_decision_from_event(event, request_id, run_id) {
-            return Ok(Some(decision));
-        };
-    }
-    Ok(None)
+    Ok(find_latest_approval_decision_in_events(
+        events.iter(),
+        request_id,
+        run_id,
+    ))
+}
+
+fn find_latest_approval_decision_in_events<'a>(
+    events: impl DoubleEndedIterator<Item = &'a JournalEvent>,
+    request_id: &str,
+    run_id: Option<&str>,
+) -> Option<ApprovalJournalDecision> {
+    events
+        .rev()
+        .find_map(|event| approval_decision_from_event(event, request_id, run_id))
 }
 
 pub fn find_latest_approval_required(
@@ -3799,6 +5209,23 @@ fn resolve_session_id_from_list(query: &str, sessions: &[String]) -> std::io::Re
 // ── Builder helpers for common events ───────────────────────────────
 
 impl JournalEvent {
+    /// Attach the server-owned producer identity to an event emitted while a
+    /// run is executing.  Pipeline telemetry is created by a few specialised
+    /// builders, but it must obey the same run-scoped evidence contract as
+    /// `llm_round` and tool events.
+    pub fn with_producer_scope(mut self, run_id: Option<&str>) -> Self {
+        let Some(run_id) = run_id.map(str::trim).filter(|run_id| !run_id.is_empty()) else {
+            return self;
+        };
+        self.producer_scope = Some(JournalProducerScope {
+            run_id: run_id.to_string(),
+            parent_run_id: None,
+            agent_id: None,
+            local_turn: None,
+        });
+        self
+    }
+
     fn base(event_type: JournalEventType, session_id: Option<&str>) -> Self {
         Self {
             event_type,
@@ -4030,6 +5457,11 @@ impl TraceSpanBuilder {
             "start_us": start_us,
             "end_us": end_us,
             "duration_us": end_us.saturating_sub(start_us),
+            // Keep the coarse duration at the stable top-level metadata key
+            // used by the event-ingestion index. `duration_us` remains the
+            // source of precision; this enables per-phase latency queries
+            // without JSON-path scans or phase-specific extraction rules.
+            "duration_ms": end_us.saturating_sub(start_us) / 1_000,
         });
         if let Some(ref pid) = self.parent_span_id {
             meta["parent_span_id"] = serde_json::Value::String(pid.clone());
@@ -4737,7 +6169,8 @@ impl JournalEvent {
     ) -> Self {
         let visible_tools = normalize_name_list(&visible_tools);
         let selected_skills = normalize_name_list(&selected_skills);
-        let tools_used = normalize_name_list(&tools_used);
+        let mut tools_used = normalize_name_list(&tools_used);
+        tools_used.sort_unstable();
         self.visible_tools = Some(visible_tools);
         if !selected_skills.is_empty() {
             self.selected_skills = Some(selected_skills);
@@ -4763,7 +6196,9 @@ impl JournalEvent {
             self.tool_outcomes = Some(outcomes);
             self.tool_calls = Some(records);
         } else {
-            self.tool_count = Some(0);
+            // An empty detail vector means this projection has no per-call
+            // records. It does not invalidate an authoritative aggregate
+            // count already supplied by a remote execution owner.
             self.tool_calls = None;
             self.tool_outcomes = None;
         }
@@ -5574,6 +7009,38 @@ impl JournalEvent {
         evt
     }
 
+    /// Durable machine-readable evidence for degraded asynchronous work.
+    ///
+    /// The four classification fields must be stable identifiers. Free-form
+    /// provider/backend errors belong in logs, not in this bounded contract.
+    pub fn subsystem_diagnostic(
+        session_id: Option<&str>,
+        turn: u32,
+        severity: SubsystemDiagnosticSeverity,
+        subsystem: &'static str,
+        operation: &'static str,
+        code: &'static str,
+    ) -> Self {
+        let mut evt = Self::base(JournalEventType::SubsystemDiagnostic, session_id);
+        evt.turn = Some(turn);
+        evt.metadata = Some(serde_json::json!({
+            "severity": severity,
+            "subsystem": subsystem,
+            "operation": operation,
+            "code": code,
+        }));
+        evt
+    }
+
+    /// Marks the point after which a verifier has complete evidence for one
+    /// asynchronous subsystem's work on this turn.
+    pub fn subsystem_settled(session_id: Option<&str>, turn: u32, subsystem: &'static str) -> Self {
+        let mut evt = Self::base(JournalEventType::SubsystemSettled, session_id);
+        evt.turn = Some(turn);
+        evt.metadata = Some(serde_json::json!({"subsystem": subsystem}));
+        evt
+    }
+
     /// Context pipeline per-turn feedback event.
     pub fn pipeline_feedback(
         session_id: Option<&str>,
@@ -5980,6 +7447,437 @@ mod approval_tests {
             .filter(|event| event.event_type == JournalEventType::ApprovalDecision)
             .count();
         assert_eq!(decisions, 1, "idempotent/conflict paths must not append");
+    }
+
+    #[test]
+    fn authenticated_approval_decisions_are_owner_isolated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+
+        let outcome = append_approval_decision_for_user_run_if_absent(
+            "user-a",
+            "sess-owner-approval",
+            Some(1),
+            "req-owner",
+            "run-owner",
+            Some("bash"),
+            Some("explicit"),
+            "allow",
+            None,
+        )
+        .unwrap();
+        assert_eq!(outcome, ApprovalDecisionAppendOutcome::Appended);
+
+        assert!(
+            find_latest_approval_decision_for_user_run(
+                "user-a",
+                "sess-owner-approval",
+                "req-owner",
+                "run-owner",
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            find_latest_approval_decision_for_user_run(
+                "user-b",
+                "sess-owner-approval",
+                "req-owner",
+                "run-owner",
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            find_latest_approval_decision_for_run("sess-owner-approval", "req-owner", "run-owner",)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn authenticated_approval_lookup_advances_by_durable_append_cursor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::for_user("user-a", "sess-approval-cursor").unwrap();
+        writer
+            .append(&JournalEvent::session_start(
+                Some("sess-approval-cursor"),
+                Some("model-a"),
+            ))
+            .unwrap();
+
+        let (missing, cursor) = find_latest_approval_decision_for_user_run_after(
+            "user-a",
+            "sess-approval-cursor",
+            "req-cursor",
+            "run-cursor",
+            None,
+        )
+        .unwrap();
+        assert!(missing.is_none());
+        assert!(cursor.offset() > 0);
+
+        writer
+            .append(&JournalEvent::approval_decision_for_run(
+                Some("sess-approval-cursor"),
+                Some(1),
+                "req-cursor",
+                Some("run-cursor"),
+                Some("write_file"),
+                Some("standard"),
+                "allow",
+                None,
+            ))
+            .unwrap();
+
+        let (found, next_cursor) = find_latest_approval_decision_for_user_run_after(
+            "user-a",
+            "sess-approval-cursor",
+            "req-cursor",
+            "run-cursor",
+            Some(&cursor),
+        )
+        .unwrap();
+        assert_eq!(found.unwrap().decision, "allow");
+        assert!(next_cursor.offset() > cursor.offset());
+
+        let (no_replay, stable_cursor) = find_latest_approval_decision_for_user_run_after(
+            "user-a",
+            "sess-approval-cursor",
+            "req-cursor",
+            "run-cursor",
+            Some(&next_cursor),
+        )
+        .unwrap();
+        assert!(no_replay.is_none());
+        assert_eq!(stable_cursor, next_cursor);
+
+        // Grow the old file enough that a replacement is unambiguously
+        // shorter, then truncate it as an operator rotation/recovery would.
+        for _ in 0..8 {
+            writer
+                .append(&JournalEvent::session_start(
+                    Some("sess-approval-cursor"),
+                    Some("padding-model"),
+                ))
+                .unwrap();
+        }
+        let (_, old_file_cursor) = find_latest_approval_decision_for_user_run_after(
+            "user-a",
+            "sess-approval-cursor",
+            "missing-before-rotation",
+            "run-cursor",
+            Some(&stable_cursor),
+        )
+        .unwrap();
+        assert!(old_file_cursor.offset() > stable_cursor.offset());
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(writer.path())
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        writer
+            .append(&JournalEvent::approval_decision_for_run(
+                Some("sess-approval-cursor"),
+                Some(2),
+                "req-after-rotation",
+                Some("run-cursor"),
+                Some("bash"),
+                Some("standard"),
+                "deny",
+                None,
+            ))
+            .unwrap();
+
+        let (after_rotation, replacement_cursor) =
+            find_latest_approval_decision_for_user_run_after(
+                "user-a",
+                "sess-approval-cursor",
+                "req-after-rotation",
+                "run-cursor",
+                Some(&old_file_cursor),
+            )
+            .unwrap();
+        assert_eq!(after_rotation.unwrap().decision, "deny");
+        assert!(replacement_cursor.offset() < old_file_cursor.offset());
+    }
+
+    #[test]
+    fn authenticated_approval_cursor_detects_equal_size_atomic_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::for_user("user-a", "sess-equal-rotation").unwrap();
+        writer
+            .append(&JournalEvent::approval_decision_for_run(
+                Some("sess-equal-rotation"),
+                Some(1),
+                "req-before",
+                Some("run-rotation"),
+                Some("bash"),
+                Some("standard"),
+                "allow",
+                None,
+            ))
+            .unwrap();
+        let (_, cursor) = find_latest_approval_decision_for_user_run_after(
+            "user-a",
+            "sess-equal-rotation",
+            "missing",
+            "run-rotation",
+            None,
+        )
+        .unwrap();
+
+        let original = std::fs::read(writer.path()).unwrap();
+        let original_text = String::from_utf8(original).unwrap();
+        let replacement = original_text.replace("req-before", "req-afterx");
+        assert_eq!(replacement.len() as u64, cursor.offset());
+        let replacement_path = writer.path().with_extension("replacement");
+        std::fs::write(&replacement_path, replacement).unwrap();
+        std::fs::rename(&replacement_path, writer.path()).unwrap();
+
+        let (found, next_cursor) = find_latest_approval_decision_for_user_run_after(
+            "user-a",
+            "sess-equal-rotation",
+            "req-afterx",
+            "run-rotation",
+            Some(&cursor),
+        )
+        .unwrap();
+        assert_eq!(found.unwrap().decision, "allow");
+        assert_eq!(next_cursor.offset(), cursor.offset());
+        assert_ne!(next_cursor, cursor, "file generation must change");
+    }
+
+    #[test]
+    fn authenticated_approval_cursor_detects_same_inode_truncate_and_regrow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::for_user("user-a", "sess-inode-regrow").unwrap();
+        writer
+            .append(&JournalEvent::approval_decision_for_run(
+                Some("sess-inode-regrow"),
+                Some(1),
+                "req-before",
+                Some("run-regrow"),
+                Some("bash"),
+                Some("standard"),
+                "allow",
+                None,
+            ))
+            .unwrap();
+        let (_, cursor) = find_latest_approval_decision_for_user_run_after(
+            "user-a",
+            "sess-inode-regrow",
+            "missing",
+            "run-regrow",
+            None,
+        )
+        .unwrap();
+
+        let original = std::fs::read_to_string(writer.path()).unwrap();
+        let replacement = original.replace("req-before", "req-afterx");
+        assert_eq!(replacement.len() as u64, cursor.offset());
+        // `write` truncates and regrows the existing inode. The entire change
+        // occurs between polls, so length and inode alone are unchanged.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(writer.path(), replacement).unwrap();
+
+        let (found, next_cursor) = find_latest_approval_decision_for_user_run_after(
+            "user-a",
+            "sess-inode-regrow",
+            "req-afterx",
+            "run-regrow",
+            Some(&cursor),
+        )
+        .unwrap();
+        assert_eq!(found.unwrap().decision, "allow");
+        assert_eq!(next_cursor.offset(), cursor.offset());
+        assert_ne!(
+            next_cursor, cursor,
+            "same-inode rewrite must replace cursor boundary evidence"
+        );
+    }
+
+    #[test]
+    fn authenticated_approval_cursor_detects_large_middle_rewrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::for_user("user-a", "sess-large-regrow").unwrap();
+        let padding = format!(
+            "{}\n",
+            serde_json::to_string(&JournalEvent::session_start(
+                Some("sess-large-regrow"),
+                Some("padding-model"),
+            ))
+            .unwrap()
+        );
+        let decision = format!(
+            "{}\n",
+            serde_json::to_string(&JournalEvent::approval_decision_for_run(
+                Some("sess-large-regrow"),
+                Some(1),
+                "req-before",
+                Some("run-regrow"),
+                Some("bash"),
+                Some("standard"),
+                "allow",
+                None,
+            ))
+            .unwrap()
+        );
+        let original = format!("{}{}{}", padding.repeat(180), decision, padding.repeat(180));
+        assert!(original.len() > 32 * 1024);
+        std::fs::write(writer.path(), &original).unwrap();
+        let (_, cursor) = find_latest_approval_decision_for_user_run_after(
+            "user-a",
+            "sess-large-regrow",
+            "missing",
+            "run-regrow",
+            None,
+        )
+        .unwrap();
+
+        // Preserve inode, length, and both distant ends while changing only a
+        // decision in the middle. Sampled prefix/suffix fingerprints miss this
+        // operator truncate+regrow pattern permanently.
+        let replacement = original.replace("req-before", "req-afterx");
+        assert_eq!(replacement.len(), original.len());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(writer.path(), replacement).unwrap();
+
+        let (found, next_cursor) = find_latest_approval_decision_for_user_run_after(
+            "user-a",
+            "sess-large-regrow",
+            "req-afterx",
+            "run-regrow",
+            Some(&cursor),
+        )
+        .unwrap();
+        assert_eq!(found.unwrap().decision, "allow");
+        assert_eq!(next_cursor.offset(), cursor.offset());
+        assert_ne!(next_cursor, cursor, "middle rewrite must change generation");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approval_append_retries_when_locked_inode_is_rotated() {
+        use fs2::FileExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::for_user("user-a", "sess-append-rotation").unwrap();
+        writer
+            .append(&JournalEvent::session_start(
+                Some("sess-append-rotation"),
+                Some("model-a"),
+            ))
+            .unwrap();
+        let path = writer.path().to_path_buf();
+        let locked_old = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        FileExt::lock_exclusive(&locked_old).unwrap();
+
+        let (opened_tx, opened_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        *APPROVAL_APPEND_OPEN_HOOK.lock().unwrap() = Some(ApprovalAppendOpenHook {
+            path: path.clone(),
+            opened: opened_tx,
+            resume: resume_rx,
+        });
+        let journal_dir = current_journal_dir_override().unwrap();
+        let append = std::thread::spawn(move || {
+            let _guard = JournalDirGuard::new(journal_dir);
+            append_approval_decision_for_user_run_if_absent(
+                "user-a",
+                "sess-append-rotation",
+                Some(1),
+                "req-rotation",
+                "run-rotation",
+                Some("bash"),
+                Some("standard"),
+                "allow",
+                None,
+            )
+        });
+        opened_rx.recv().unwrap();
+        let rotated = path.with_extension("rotated");
+        std::fs::rename(&path, &rotated).unwrap();
+        std::fs::write(&path, []).unwrap();
+        FileExt::unlock(&locked_old).unwrap();
+        resume_tx.send(()).unwrap();
+
+        assert_eq!(
+            append.join().unwrap().unwrap(),
+            ApprovalDecisionAppendOutcome::Appended
+        );
+        let current = find_latest_approval_decision_for_user_run(
+            "user-a",
+            "sess-append-rotation",
+            "req-rotation",
+            "run-rotation",
+        )
+        .unwrap();
+        assert_eq!(current.unwrap().decision, "allow");
+        let rotated_text = std::fs::read_to_string(rotated).unwrap();
+        assert!(!rotated_text.contains("req-rotation"));
+    }
+
+    #[test]
+    fn unchanged_approval_cursor_does_not_wait_for_the_writer_lock() {
+        use fs2::FileExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::for_user("user-a", "sess-fast-cursor").unwrap();
+        writer
+            .append(&JournalEvent::session_start(
+                Some("sess-fast-cursor"),
+                Some("model-a"),
+            ))
+            .unwrap();
+        let (_, cursor) = find_latest_approval_decision_for_user_run_after(
+            "user-a",
+            "sess-fast-cursor",
+            "missing",
+            "run-fast",
+            None,
+        )
+        .unwrap();
+
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(writer.path())
+            .unwrap();
+        FileExt::lock_exclusive(&locked).unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        let cursor_for_thread = cursor.clone();
+        let journal_dir = current_journal_dir_override().unwrap();
+        let handle = std::thread::spawn(move || {
+            let _guard = JournalDirGuard::new(journal_dir);
+            let result = find_latest_approval_decision_for_user_run_after(
+                "user-a",
+                "sess-fast-cursor",
+                "missing",
+                "run-fast",
+                Some(&cursor_for_thread),
+            );
+            let _ = sent.send(result);
+        });
+        let result = received.recv_timeout(std::time::Duration::from_secs(1));
+        FileExt::unlock(&locked).unwrap();
+        let result = result.expect("unchanged cursor must not wait for an exclusive writer lock");
+        let (decision, next_cursor) = result.unwrap();
+        assert!(decision.is_none());
+        assert_eq!(next_cursor, cursor);
+        handle.join().unwrap();
     }
 
     #[test]
@@ -6498,6 +8396,20 @@ mod tests {
     const REAL_SESSION_0AC769_FIXTURE: &str =
         include_str!("../fixtures/real_session_0ac769_min.jsonl");
 
+    #[test]
+    fn trace_span_exposes_indexable_milliseconds_without_losing_microseconds() {
+        let event = TraceSpanBuilder::default()
+            .span_id("phase-1".to_string())
+            .name("model_inference".to_string())
+            .start_us(1_500)
+            .end_us(12_734)
+            .build();
+        let metadata = event.metadata.expect("trace span metadata");
+
+        assert_eq!(metadata["duration_us"], serde_json::json!(11_234));
+        assert_eq!(metadata["duration_ms"], serde_json::json!(11));
+    }
+
     fn base_tool_record(name: &str, ok: bool, preview: Option<&str>) -> ToolCallRecord {
         ToolCallRecord {
             name: name.to_string(),
@@ -6960,6 +8872,8 @@ mod tests {
 
     #[test]
     fn cloud_pull_sync_marker_append_to_journal_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
         let sid = format!("test-cloud-pull-{}", uuid::Uuid::new_v4());
         let writer = JournalWriter::new(&sid).unwrap();
         let evt =
@@ -7020,6 +8934,7 @@ mod tests {
             path: write_path.clone(),
             owner_scope: OwnerScope::local_user(),
             session_id: "test-sess".to_string(),
+            created_parent_dirs: Vec::new(),
         };
         writer
             .append(&JournalEvent::session_start(Some("test-sess"), None))
@@ -7034,6 +8949,7 @@ mod tests {
             path: multi_path.clone(),
             owner_scope: OwnerScope::local_user(),
             session_id: "multi".to_string(),
+            created_parent_dirs: Vec::new(),
         };
         writer
             .append(&JournalEvent::session_start(Some("m"), None))
@@ -7195,6 +9111,7 @@ mod tests {
             path: path.clone(),
             owner_scope: OwnerScope::local_user(),
             session_id: "sel-test".to_string(),
+            created_parent_dirs: Vec::new(),
         };
 
         writer
@@ -7320,6 +9237,16 @@ mod tests {
             "empty tool_calls should be omitted: {json}"
         );
         assert!(!json.contains("tool_outcomes"), "{json}");
+    }
+
+    #[test]
+    fn with_tool_calls_empty_preserves_authoritative_aggregate_count() {
+        let evt = JournalEvent::turn(Some("s1"), 1, None, "hi", "hello", 7, 10, 5, 50)
+            .with_tool_calls(vec![]);
+
+        assert_eq!(evt.tool_count, Some(7));
+        assert!(evt.tool_calls.is_none());
+        assert!(evt.tool_outcomes.is_none());
     }
 
     #[test]
@@ -9539,6 +11466,32 @@ mod turn_event_buffer_tests {
     }
 
     #[test]
+    fn llm_round_persists_exact_visible_action_union() {
+        let mut buf = TurnEventBuffer::begin_turn(Some("sess-actions"), 1);
+        buf.set_visible_tool_names(vec![
+            "start_work".to_string(),
+            "settle_work_item".to_string(),
+            "settle_work_item".to_string(),
+        ]);
+        buf.set_visible_tool_actions(std::collections::BTreeMap::from([(
+            "agent_fanout".to_string(),
+            vec!["get_results".to_string(), "stop_group".to_string()],
+        )]));
+        buf.record_llm_round(LlmRoundRecord::new(InferencePurpose::PrimaryAgent));
+
+        let event = buf.drain().into_iter().next().expect("llm round event");
+        assert_eq!(
+            event.metadata.as_ref().expect("metadata")["visible_tool_actions"]["agent_fanout"],
+            serde_json::json!(["get_results", "stop_group"])
+        );
+        assert_eq!(
+            event.metadata.as_ref().expect("metadata")["visible_tools"],
+            serde_json::json!(["start_work", "settle_work_item"]),
+            "round evidence keeps exact tool names even when a lifecycle tool has no action enum"
+        );
+    }
+
+    #[test]
     fn recorded_llm_round_event_has_correct_fields() {
         let mut buf = TurnEventBuffer::begin_turn(Some("sess-1"), 5);
         buf.record_llm_round(LlmRoundRecord {
@@ -9571,6 +11524,11 @@ mod turn_event_buffer_tests {
         assert_eq!(ev.tool_calls_returned, Some(3));
         let meta = ev.metadata.as_ref().unwrap();
         assert_eq!(meta["tool_call_names"].as_array().unwrap().len(), 3);
+        assert_eq!(meta["duration_ms"], 800);
+        assert_eq!(meta["ttft_ms"], 42);
+        assert_eq!(meta["prompt_tokens"], 3000);
+        assert_eq!(meta["completion_tokens"], 400);
+        assert_eq!(meta["cache_read_tokens"], 1000);
         assert_eq!(meta["source"], "agentic_loop");
         assert_eq!(
             ev.producer_scope
@@ -9634,6 +11592,29 @@ mod turn_event_buffer_tests {
             tool_calls[0].args_full.as_deref(),
             Some("{\"action\":\"diff\",\"stat_only\":true}")
         );
+    }
+
+    #[test]
+    fn tool_call_record_keeps_live_authority_out_of_durable_json() {
+        let raw = r#"{"command":"tool --token secret-token-value"}"#;
+        let safe = r#"{"command":"tool --token [REDACTED:TOKEN_ARGUMENT]"}"#;
+        let record = ToolCallRecord {
+            name: "bash".into(),
+            args_full: Some(safe.into()),
+            runtime_args_full: Some(raw.into()),
+            ..Default::default()
+        };
+
+        assert_eq!(record.authoritative_args_full(), Some(raw));
+        let encoded = serde_json::to_string(&record).expect("record serializes");
+        assert!(encoded.contains("[REDACTED:TOKEN_ARGUMENT]"));
+        assert!(!encoded.contains("secret-token-value"));
+        let debug = format!("{record:?}");
+        assert!(!debug.contains("secret-token-value"));
+
+        let restored: ToolCallRecord = serde_json::from_str(&encoded).expect("record restores");
+        assert_eq!(restored.runtime_args_full, None);
+        assert_eq!(restored.authoritative_args_full(), None);
     }
 
     #[test]
@@ -10011,6 +11992,450 @@ mod turn_event_buffer_tests {
         let content = std::fs::read_to_string(writer.path()).unwrap();
         let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
         assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn durable_readback_surfaces_sync_fence_failure() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-durable-readback-sync-fail").unwrap();
+        writer
+            .append(&JournalEvent::session_start(
+                Some("sess-durable-readback-sync-fail"),
+                Some("test-model"),
+            ))
+            .unwrap();
+
+        let error = writer
+            .durable_readback_with(|_| {
+                Err(std::io::Error::other("injected durability fence failure"))
+            })
+            .expect_err("a failed sync fence must make readback uncertain");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert!(
+            error
+                .to_string()
+                .contains("injected durability fence failure")
+        );
+    }
+
+    #[test]
+    fn durable_readback_rejects_exact_json_without_terminal_newline() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let writer = JournalWriter::new("sess-durable-readback-no-newline").unwrap();
+        let event = JournalEvent::session_start(
+            Some("sess-durable-readback-no-newline"),
+            Some("test-model"),
+        );
+        std::fs::write(writer.path(), serde_json::to_vec(&event).unwrap()).unwrap();
+
+        let error = writer
+            .durable_readback()
+            .expect_err("an unterminated tail cannot prove a durable complete record");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("unterminated tail"));
+
+        let commit = canonical_cas_test_commit("sess-durable-readback-no-newline", "next");
+        let event =
+            canonical_cas_test_event("sess-durable-readback-no-newline", "next", commit.clone());
+        let lease = SessionExecutionLease::try_acquire("sess-durable-readback-no-newline").unwrap();
+        assert!(matches!(
+            writer.append_canonical_commit_cas(&lease, None, 1, &commit, &[event]),
+            CanonicalCommitCasOutcome::Unknown(reason) if reason.contains("incomplete")
+        ));
+    }
+
+    fn canonical_cas_test_commit(session_id: &str, marker: &str) -> ConversationCommitV1 {
+        let messages = vec![serde_json::json!({
+            "role": "assistant",
+            "content": marker,
+        })];
+        ConversationCommitV1 {
+            schema_version: astra_turn_types::CONVERSATION_COMMIT_SCHEMA_VERSION,
+            base_root_hash: astra_turn_types::canonical_conversation_root(&[]),
+            cursor: SessionCursorV1 {
+                schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
+                owner_id: "owner-cas-test".to_string(),
+                session_id: session_id.to_string(),
+                branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.to_string(),
+                completed_turn: 1,
+                journal_event_seq: 1,
+                conversation_seq: 1,
+                canonical_root_hash: astra_turn_types::canonical_conversation_root(&messages),
+                projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
+                compaction_generation: 0,
+                config_version_id: None,
+            },
+            delta: astra_turn_types::ConversationDeltaV1::Append { messages },
+        }
+    }
+
+    fn canonical_cas_test_event(
+        session_id: &str,
+        marker: &str,
+        commit: ConversationCommitV1,
+    ) -> JournalEvent {
+        let mut event = JournalEvent::turn(
+            Some(session_id),
+            1,
+            Some("test-model"),
+            marker,
+            marker,
+            0,
+            0,
+            0,
+            1,
+        );
+        event.conversation_commit = Some(commit);
+        event
+    }
+
+    #[test]
+    fn canonical_presence_accepts_one_exact_turn_without_self_conflict() {
+        let sid = "sess-canonical-presence-exact";
+        let commit = canonical_cas_test_commit(sid, "exact");
+        let event = canonical_cas_test_event(sid, "exact", commit.clone());
+        assert_eq!(
+            classify_canonical_commit_presence(&[event], 0, 1, &commit),
+            CanonicalCommitPresence::Exact
+        );
+    }
+
+    #[test]
+    fn session_execution_lease_rejects_second_instance_before_mock_invocation() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let _guard = JournalDirGuard::new(&dir);
+        let session_id = "sess-execution-lease-admission";
+        let invocation_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let winner_lease = SessionExecutionLease::try_acquire(session_id).unwrap();
+        invocation_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let loser_dir = dir.clone();
+        let loser_invocations = invocation_count.clone();
+        let loser = std::thread::spawn(move || {
+            let _guard = JournalDirGuard::new(&loser_dir);
+            match SessionExecutionLease::try_acquire(session_id) {
+                Ok(_lease) => {
+                    loser_invocations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    false
+                }
+                Err(SessionExecutionLeaseError::Conflict { .. }) => true,
+                Err(error) => panic!("unexpected lease error: {error}"),
+            }
+        });
+
+        assert!(loser.join().unwrap());
+        assert_eq!(
+            invocation_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the losing process must be rejected before mock LLM/tool invocation"
+        );
+        drop(winner_lease);
+        assert!(SessionExecutionLease::try_acquire(session_id).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn execution_lease_lock_inode_replacement_cannot_create_a_second_executor() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let session_id = "sess-execution-lease-inode-replacement";
+        let invocation_count = std::sync::atomic::AtomicUsize::new(0);
+        let first = SessionExecutionLease::try_acquire(session_id).unwrap();
+        invocation_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        let detached_lock_path = first.lock_path.with_extension("detached-lock");
+        std::fs::rename(&first.lock_path, &detached_lock_path).unwrap();
+        std::fs::write(&first.lock_path, b"replacement inode").unwrap();
+
+        match SessionExecutionLease::try_acquire(session_id) {
+            Ok(_second) => {
+                invocation_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                panic!("a replacement lock inode must not admit a second executor");
+            }
+            Err(SessionExecutionLeaseError::Conflict {
+                session_id: conflict,
+            }) => {
+                assert_eq!(conflict, session_id);
+            }
+            Err(error) => panic!("replacement must fail as a typed conflict: {error}"),
+        }
+        assert_eq!(
+            invocation_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the competing executor must be rejected before its mock LLM/tool boundary"
+        );
+
+        drop(first);
+        assert!(
+            SessionExecutionLease::try_acquire(session_id).is_ok(),
+            "dropping the kernel authority must allow the next per-turn owner"
+        );
+    }
+
+    #[test]
+    fn first_canonical_commit_requires_parent_directory_durability() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let session_id = "sess-canonical-parent-sync-failure";
+        let writer = JournalWriter::new(session_id).unwrap();
+        let lease = SessionExecutionLease::try_acquire(session_id).unwrap();
+        let commit = canonical_cas_test_commit(session_id, "first");
+        let event = canonical_cas_test_event(session_id, "first", commit.clone());
+        fail_next_journal_directory_sync();
+
+        assert!(matches!(
+            writer.append_canonical_commit_cas(&lease, None, 1, &commit, &[event]),
+            CanonicalCommitCasOutcome::Unknown(reason)
+                if reason.contains("creation metadata")
+                    && reason.contains("injected journal directory sync failure")
+        ));
+        assert_eq!(
+            writer
+                .complete_append_order_snapshot()
+                .unwrap()
+                .iter()
+                .filter(|event| event.conversation_commit.is_some())
+                .count(),
+            1,
+            "the bytes may exist, but authority must remain unknown when the directory fence fails"
+        );
+    }
+
+    #[test]
+    fn canonical_presence_marks_exact_plus_same_turn_conflict_unknown() {
+        let sid = "sess-canonical-presence-conflict";
+        let commit = canonical_cas_test_commit(sid, "exact");
+        let exact = canonical_cas_test_event(sid, "exact", commit.clone());
+        let conflicting = JournalEvent::turn(
+            Some(sid),
+            1,
+            Some("test-model"),
+            "different",
+            "different",
+            0,
+            0,
+            0,
+            1,
+        );
+        assert!(matches!(
+            classify_canonical_commit_presence(&[exact, conflicting], 0, 1, &commit),
+            CanonicalCommitPresence::Unknown(_)
+        ));
+    }
+
+    #[test]
+    fn canonical_cas_rejects_turn_after_terminal_turn_error_identity() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let session_id = "sess-canonical-cas-turn-error";
+        let writer = JournalWriter::new(session_id).unwrap();
+        writer
+            .append(&JournalEvent::turn_error(
+                Some(session_id),
+                1,
+                Some("test-model"),
+                "failed turn",
+                "boom",
+                1,
+            ))
+            .unwrap();
+        let commit = canonical_cas_test_commit(session_id, "must-not-append");
+        let event = canonical_cas_test_event(session_id, "must-not-append", commit.clone());
+        let lease = SessionExecutionLease::try_acquire(session_id).unwrap();
+
+        assert!(matches!(
+            writer.append_canonical_commit_cas(&lease, None, 1, &commit, &[event]),
+            CanonicalCommitCasOutcome::Conflict(reason) if reason.contains("already committed")
+        ));
+        let events = read_journal(session_id).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.event_type,
+                    JournalEventType::Turn | JournalEventType::TurnError
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(events[0].event_type, JournalEventType::SessionStart);
+        assert_eq!(events[1].event_type, JournalEventType::TurnError);
+    }
+
+    #[test]
+    fn canonical_cas_rejects_batch_with_turn_and_turn_error_terminal_identities() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let session_id = "sess-canonical-cas-invalid-terminal-batch";
+        let writer = JournalWriter::new(session_id).unwrap();
+        let lease = SessionExecutionLease::try_acquire(session_id).unwrap();
+        let commit = canonical_cas_test_commit(session_id, "candidate");
+        let candidate = canonical_cas_test_event(session_id, "candidate", commit.clone());
+        let turn_error = JournalEvent::turn_error(
+            Some(session_id),
+            1,
+            Some("test-model"),
+            "candidate",
+            "boom",
+            1,
+        );
+
+        assert!(matches!(
+            writer.append_canonical_commit_cas(
+                &lease,
+                None,
+                1,
+                &commit,
+                &[turn_error, candidate],
+            ),
+            CanonicalCommitCasOutcome::NotCommitted(reason)
+                if reason.contains("exactly one intended turn commit")
+        ));
+        assert!(writer.complete_append_order_snapshot().unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_canonical_cas_writers_commit_exactly_one_same_turn() {
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let session_id = "sess-canonical-cas-race";
+        let first_commit = canonical_cas_test_commit(session_id, "first");
+        let second_commit = canonical_cas_test_commit(session_id, "second");
+        let first_event = canonical_cas_test_event(session_id, "first", first_commit.clone());
+        let second_event = canonical_cas_test_event(session_id, "second", second_commit.clone());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let outcomes = std::thread::scope(|scope| {
+            let first_barrier = barrier.clone();
+            let first_dir = dir.clone();
+            let first = scope.spawn(move || {
+                let _guard = JournalDirGuard::new(&first_dir);
+                let writer = JournalWriter::new(session_id).unwrap();
+                first_barrier.wait();
+                writer.append_canonical_commit_cas_locked(
+                    None,
+                    1,
+                    &first_commit,
+                    &[first_event],
+                    &[],
+                )
+            });
+            let second_barrier = barrier.clone();
+            let second_dir = dir.clone();
+            let second = scope.spawn(move || {
+                let _guard = JournalDirGuard::new(&second_dir);
+                let writer = JournalWriter::new(session_id).unwrap();
+                second_barrier.wait();
+                writer.append_canonical_commit_cas_locked(
+                    None,
+                    1,
+                    &second_commit,
+                    &[second_event],
+                    &[],
+                )
+            });
+            vec![first.join().unwrap(), second.join().unwrap()]
+        });
+
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, CanonicalCommitCasOutcome::Committed { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, CanonicalCommitCasOutcome::Conflict(_)))
+                .count(),
+            1
+        );
+        let _guard = JournalDirGuard::new(&dir);
+        let turns = read_journal(session_id)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == JournalEventType::Turn)
+            .collect::<Vec<_>>();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].turn, Some(1));
+    }
+
+    #[test]
+    fn canonical_cas_reports_unknown_without_writing_after_locked_inode_rotation() {
+        use fs2::FileExt;
+
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let _guard = JournalDirGuard::new(&dir);
+        let session_id = "sess-canonical-cas-rotation";
+        let writer = JournalWriter::new(session_id).unwrap();
+        writer
+            .append(&JournalEvent::session_start(
+                Some(session_id),
+                Some("old-generation"),
+            ))
+            .unwrap();
+        let path = writer.path().clone();
+        let detached_path = path.with_extension("detached.jsonl");
+        let locked_old = std::fs::OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        locked_old.lock_exclusive().unwrap();
+
+        let (opened_tx, opened_rx) = std::sync::mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+        *CANONICAL_COMMIT_CAS_OPEN_HOOK.lock().unwrap() = Some(CanonicalCommitCasOpenHook {
+            path: path.clone(),
+            opened: opened_tx,
+            resume: resume_rx,
+        });
+        let commit = canonical_cas_test_commit(session_id, "current-generation");
+        let event = canonical_cas_test_event(session_id, "current-generation", commit.clone());
+        let thread_dir = dir.clone();
+        let handle = std::thread::spawn(move || {
+            let _guard = JournalDirGuard::new(&thread_dir);
+            JournalWriter::new(session_id)
+                .unwrap()
+                .append_canonical_commit_cas_locked(None, 1, &commit, &[event], &[])
+        });
+
+        opened_rx.recv().unwrap();
+        std::fs::rename(&path, &detached_path).unwrap();
+        JournalWriter::new(session_id)
+            .unwrap()
+            .append(&JournalEvent::session_start(
+                Some(session_id),
+                Some("current-generation"),
+            ))
+            .unwrap();
+        FileExt::unlock(&locked_old).unwrap();
+        resume_tx.send(()).unwrap();
+
+        assert!(matches!(
+            handle.join().unwrap(),
+            CanonicalCommitCasOutcome::Unknown(reason) if reason.contains("rotated")
+        ));
+        let current_events = read_journal(session_id).unwrap();
+        assert_eq!(
+            current_events
+                .iter()
+                .filter(|event| event.conversation_commit.is_some())
+                .count(),
+            0
+        );
+        let detached_content = std::fs::read_to_string(detached_path).unwrap();
+        assert!(
+            parse_journal_text(&detached_content)
+                .0
+                .iter()
+                .all(|event| event.conversation_commit.is_none())
+        );
     }
 
     /// Concurrent appends from multiple threads must remain record-separated.

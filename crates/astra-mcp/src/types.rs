@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 /// MCP server transport configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Transport {
     /// Stdio transport: communicates via stdin/stdout with a child process.
     Stdio {
@@ -14,7 +14,6 @@ pub enum Transport {
         env: HashMap<String, String>,
     },
     /// Classic HTTP SSE transport: GET opens an SSE stream, POST sends JSON-RPC to the endpoint event.
-    #[serde(alias = "sse")]
     Sse {
         url: String,
         #[serde(default)]
@@ -23,7 +22,7 @@ pub enum Transport {
         headers: HashMap<String, String>,
     },
     /// Streamable HTTP transport (MCP 2025-03-26 spec).
-    #[serde(rename = "streamable_http", alias = "http", alias = "streamable-http")]
+    #[serde(rename = "streamable_http")]
     StreamableHttp {
         url: String,
         #[serde(default)]
@@ -32,7 +31,6 @@ pub enum Transport {
         headers: HashMap<String, String>,
     },
     /// WebSocket transport.
-    #[serde(alias = "websocket")]
     Ws {
         url: String,
         #[serde(default)]

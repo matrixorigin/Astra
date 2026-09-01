@@ -17,8 +17,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::edge_ws_protocol::{
-    EDGE_TOOL_TIMEOUT_SECS, EdgeServerMessage, RuntimeProcessAuthorizationContext,
-    ToolInvocationIdentity,
+    EDGE_TOOL_RESULT_GRACE_SECS, EDGE_TOOL_TIMEOUT_SECS, EdgeServerMessage,
+    MAX_EDGE_TOOL_TIMEOUT_SECS, RuntimeProcessAuthorizationContext, ToolInvocationIdentity,
 };
 
 /// Maximum number of inflight dispatched tool requests tracked for dedup.
@@ -32,7 +32,12 @@ const MAX_PENDING_REQUESTS_PER_USER: usize = 100;
 /// being purged by `cleanup_stale`. Set to 3× the edge tool timeout as a
 /// generous safety margin (normal cleanup happens in execute_tool's
 /// success/timeout paths).
-const PENDING_REQUEST_TTL_SECS: u64 = EDGE_TOOL_TIMEOUT_SECS * 3;
+const PENDING_REQUEST_TTL_SECS: u64 =
+    (MAX_EDGE_TOOL_TIMEOUT_SECS + EDGE_TOOL_RESULT_GRACE_SECS) * 3;
+
+fn edge_result_wait_timeout(execution_timeout_secs: u64) -> Duration {
+    Duration::from_secs(execution_timeout_secs.saturating_add(EDGE_TOOL_RESULT_GRACE_SECS))
+}
 
 /// Maximum capacity for the channel between the tool router and an edge agent's
 /// WebSocket write loop. When full, senders apply backpressure to prevent OOM.
@@ -52,6 +57,7 @@ pub struct DurablyAdmittedEdgeInvocation<'a> {
     pub args: &'a serde_json::Value,
     pub runtime_process_authorization:
         Option<&'a astra_services::runs::RuntimeProcessAuthorizationContext>,
+    pub timeout_secs: u64,
     pub cancel_token: Option<&'a CancellationToken>,
 }
 
@@ -598,6 +604,7 @@ impl EdgeConnectionPool {
                 tool,
                 args,
                 runtime_process_authorization: None,
+                timeout_secs: EDGE_TOOL_TIMEOUT_SECS,
                 cancel_token,
             },
         )
@@ -622,11 +629,69 @@ impl EdgeConnectionPool {
             tool,
             args,
             runtime_process_authorization,
+            timeout_secs,
             cancel_token,
         } = invocation;
+        self.execute_durably_admitted_invocation_on_connection_with_authorization_timeout_and_cancel(
+            connection_user_id,
+            identity,
+            edge_agent_id,
+            tool,
+            args,
+            runtime_process_authorization,
+            timeout_secs,
+            cancel_token,
+        )
+        .await
+    }
+
+    /// As above, but preserves the execution deadline selected by the runtime
+    /// policy.  Database admission is complete before this method starts its
+    /// socket wait; the deadline therefore governs only the edge invocation,
+    /// never a checked-out database connection or transaction.
+    pub async fn execute_durably_admitted_invocation_on_connection_with_timeout_and_cancel(
+        &self,
+        connection_user_id: &str,
+        identity: &ToolInvocationIdentity,
+        edge_agent_id: &str,
+        tool: &str,
+        args: &serde_json::Value,
+        timeout_secs: u64,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Option<EdgeToolResult> {
+        self.execute_durably_admitted_invocation_on_connection_with_authorization_timeout_and_cancel(
+            connection_user_id,
+            identity,
+            edge_agent_id,
+            tool,
+            args,
+            None,
+            timeout_secs,
+            cancel_token,
+        )
+        .await
+    }
+
+    async fn execute_durably_admitted_invocation_on_connection_with_authorization_timeout_and_cancel(
+        &self,
+        connection_user_id: &str,
+        identity: &ToolInvocationIdentity,
+        edge_agent_id: &str,
+        tool: &str,
+        args: &serde_json::Value,
+        runtime_process_authorization: Option<
+            &astra_services::runs::RuntimeProcessAuthorizationContext,
+        >,
+        timeout_secs: u64,
+        cancel_token: Option<&CancellationToken>,
+    ) -> Option<EdgeToolResult> {
         if cancel_token.is_some_and(CancellationToken::is_cancelled) {
             return None;
         }
+        // Public callers include server integrations outside the runtime plan.
+        // Clamp defensively here too so a malformed policy can neither create
+        // a zero-duration invocation nor outlive the callback custody window.
+        let timeout_secs = timeout_secs.clamp(1, MAX_EDGE_TOOL_TIMEOUT_SECS);
         let key = pool_key(connection_user_id, edge_agent_id);
         let (pending_results, sender) = {
             let Some(entry) = self.connections.get(&key) else {
@@ -677,7 +742,7 @@ impl EdgeConnectionPool {
                 })
             }),
             runtime_process_authorization_required: runtime_process_authorization.is_some(),
-            timeout_secs: EDGE_TOOL_TIMEOUT_SECS,
+            timeout_secs,
         };
 
         // Store in dispatched set for reconnection dedup
@@ -719,7 +784,11 @@ impl EdgeConnectionPool {
             });
         };
 
-        let timeout_dur = Duration::from_secs(EDGE_TOOL_TIMEOUT_SECS);
+        // The edge enforces `timeout_secs` while executing.  Keep the server
+        // waiter alive briefly longer for the durable result callback, so a
+        // tool that ends at its deadline cannot lose its receiver in the same
+        // instant it reports the timeout/completion result.
+        let timeout_dur = edge_result_wait_timeout(timeout_secs);
         let result = if let Some(token) = cancel_token {
             tokio::select! {
                 _ = token.cancelled() => {
@@ -746,7 +815,7 @@ impl EdgeConnectionPool {
                     target: "astra_runtime::edge_dispatch_diag",
                     key = %key,
                     request_id = %request_id,
-                    timeout_secs = EDGE_TOOL_TIMEOUT_SECS,
+                    timeout_secs,
                     "edge_dispatch: execute_tool_with_cancel timed out waiting for edge tool result"
                 );
                 cancel_edge();
@@ -1142,6 +1211,58 @@ mod tests {
             } => (caller, request_id, delivery_generation),
             other => panic!("expected tool request, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_execution_timeout_reaches_edge_and_is_bounded() {
+        let pool = EdgeConnectionPool::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        pool.register("user-1", "edge-a", None, None, tx);
+        let identity = admitted_identity("policy-deadline");
+        let caller_pool = pool.clone();
+        let caller = tokio::spawn(async move {
+            caller_pool
+                .execute_durably_admitted_invocation_on_connection_with_timeout_and_cancel(
+                    "user-1",
+                    &identity,
+                    "edge-a",
+                    "bash",
+                    &json!({ "command": "effect" }),
+                    MAX_EDGE_TOOL_TIMEOUT_SECS + 1,
+                    None,
+                )
+                .await
+        });
+
+        let request = rx.recv().await.expect("socket request");
+        let (request_id, delivery_generation, timeout_secs) = match request {
+            EdgeServerMessage::ToolRequest {
+                request_id,
+                delivery_generation,
+                timeout_secs,
+                ..
+            } => (request_id, delivery_generation, timeout_secs),
+            other => panic!("expected tool request, got {other:?}"),
+        };
+        assert_eq!(timeout_secs, MAX_EDGE_TOOL_TIMEOUT_SECS);
+        assert_eq!(
+            edge_result_wait_timeout(timeout_secs),
+            Duration::from_secs(MAX_EDGE_TOOL_TIMEOUT_SECS + EDGE_TOOL_RESULT_GRACE_SECS),
+            "server callback custody must outlive the edge execution deadline"
+        );
+        assert!(pool.deliver_tool_result(
+            "user-1",
+            "edge-a",
+            &request_id,
+            delivery_generation,
+            EdgeToolResult {
+                output: "completed".to_string(),
+                is_error: false,
+                duration_ms: Some(1),
+                tool_result_fields: None,
+            }
+        ));
+        assert_eq!(caller.await.unwrap().unwrap().output, "completed");
     }
 
     #[tokio::test]

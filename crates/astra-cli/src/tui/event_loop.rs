@@ -39,6 +39,8 @@ use super::frame_requester::FrameRequester;
 use super::history_cell::HistoryCell;
 use super::keymap::{AppAction, AppKeymap};
 use super::render::line_utils::sanitize_lines_for_terminal;
+#[cfg(test)]
+use super::status_line;
 use super::task_status::TaskStatus;
 use super::terminal::TerminalGuard;
 
@@ -47,16 +49,18 @@ use super::bg_task_proxy::*;
 use super::bg_task_rendering::*;
 use super::plan_mode::*;
 use super::{
-    bottom_pane, chat_widget, history_cell, mention_menu, resume_summary, slash_dispatch,
-    slash_menu, status_indicator, status_line, stream_bridge, task_board_observer, ui_adapter,
+    bottom_pane, chat_widget, history_cell, mention_menu, slash_dispatch, slash_menu,
+    status_indicator, stream_bridge, task_board_observer, ui_adapter,
 };
 
 const BASH_DETACH_HANDOFF_WAIT: Duration = Duration::from_millis(500);
 const BACKGROUND_REGISTRY_SHUTDOWN_WAIT: Duration = Duration::from_secs(2);
+const BACKGROUND_SURFACE_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const LOCAL_AGENT_RECONCILE_INTERVAL: Duration = Duration::from_millis(500);
 const LOCAL_AGENT_SESSION_REBIND_DRAIN: Duration = Duration::from_millis(250);
 const LOCAL_AGENT_SESSION_SHUTDOWN_DRAIN: Duration = Duration::from_secs(2);
 const RUNTIME_NOTIFICATION_SETTLE_DELAY: Duration = Duration::from_millis(200);
+const GUIDANCE_OBSERVER_OWNER_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const LOCAL_AGENT_SESSION_REBIND_REASON: &str =
     "session changed; local agent belonged to the previous session";
 const LOCAL_AGENT_SESSION_SHUTDOWN_REASON: &str = "interactive session is shutting down";
@@ -104,7 +108,6 @@ fn release_runtime_notification_turn(
 enum StartupUiEffect {
     GitBranch(Option<String>),
     McpCompletions(Vec<(String, String)>),
-    ResumeSummary(String),
 }
 
 /// Completion of the one-shot `/model` catalog action. The catalog stays
@@ -128,7 +131,6 @@ enum SlashBackgroundReadEffect {
         timeline: crate::tui::timeline::Timeline,
     },
     ResumePicker(crate::tui::session_picker::SessionDiscovery),
-    ForkPicker(crate::tui::session_picker::SessionDiscovery),
     SessionHub {
         snapshot: Box<slash_dispatch::SessionHubSnapshot>,
         workspace:
@@ -175,6 +177,59 @@ struct SlashBackgroundReadCompletion {
     effect: SlashBackgroundReadEffect,
 }
 
+struct WorkStartCompletion {
+    session_id: String,
+    result: Result<serde_json::Value, String>,
+}
+
+fn work_start_request_id(session_id: &str, goal: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut digest = Sha256::new();
+    digest.update(b"astra.tui-work-start.v1\0");
+    for field in [session_id, goal] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field.as_bytes());
+    }
+    format!("tui-work-start-{:x}", digest.finalize())
+}
+
+fn dispatch_work_start(
+    request: slash_dispatch::WorkStartRequest,
+    effect_tx: tokio::sync::mpsc::Sender<WorkStartCompletion>,
+    tasks: &mut tokio::task::JoinSet<()>,
+) {
+    tasks.spawn(async move {
+        let token = crate::cli::session::session_runtime::fresh_access_token(
+            &request.api,
+            request.profile.as_deref(),
+        )
+        .await;
+        let result = match token {
+            Some(token) => request
+                .api
+                .post_work_session_binding(
+                    &token,
+                    &request.session_id,
+                    &astra_thin_client::WorkCreateRequestV1 {
+                        request_id: work_start_request_id(&request.session_id, &request.goal),
+                        goal: request.goal,
+                        criteria: Vec::new(),
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string()),
+            None => Err("Not logged in. Use /login.".to_string()),
+        };
+        let _ = effect_tx
+            .send(WorkStartCompletion {
+                session_id: request.session_id,
+                result,
+            })
+            .await;
+    });
+}
+
 /// Runs derived turn persistence in order. A turn's canonical journal event is
 /// already durable before it reaches this worker; a restart therefore loses no
 /// conversation truth and future turns can continue using a fresh queue.
@@ -196,25 +251,15 @@ fn spawn_turn_post_commit_worker(
 }
 
 /// Applies a presentation-only startup observation after the first frame is
-/// already possible. Returns whether the transcript needs flushing.
-fn apply_startup_ui_effect(
-    effect: StartupUiEffect,
-    bottom_pane: &mut BottomPane,
-    chat_widget: &mut chat_widget::ChatWidget,
-) -> bool {
+/// already possible.
+fn apply_startup_ui_effect(effect: StartupUiEffect, bottom_pane: &mut BottomPane) {
     match effect {
         StartupUiEffect::GitBranch(Some(branch)) => {
             bottom_pane.footer.git_branch = Some(branch);
-            false
         }
-        StartupUiEffect::GitBranch(None) => false,
+        StartupUiEffect::GitBranch(None) => {}
         StartupUiEffect::McpCompletions(completions) => {
             bottom_pane.update_mcp_completions(completions);
-            false
-        }
-        StartupUiEffect::ResumeSummary(summary) => {
-            chat_widget.commit_resume_summary(summary);
-            true
         }
     }
 }
@@ -402,15 +447,6 @@ fn dispatch_slash_background_read(
             slash_dispatch::SlashBackgroundRead::ResumePicker => {
                 match tokio::task::spawn_blocking(load_session_picker).await {
                     Ok(discovery) => SlashBackgroundReadEffect::ResumePicker(discovery),
-                    Err(error) => SlashBackgroundReadEffect::Failed {
-                        action: "session discovery",
-                        error: error.to_string(),
-                    },
-                }
-            }
-            slash_dispatch::SlashBackgroundRead::ForkPicker => {
-                match tokio::task::spawn_blocking(load_session_picker).await {
-                    Ok(discovery) => SlashBackgroundReadEffect::ForkPicker(discovery),
                     Err(error) => SlashBackgroundReadEffect::Failed {
                         action: "session discovery",
                         error: error.to_string(),
@@ -763,22 +799,6 @@ fn apply_slash_background_read_effect(
                 bottom_pane.push_view(Box::new(SessionPickerView::new(discovery)));
             }
         }
-        SlashBackgroundReadEffect::ForkPicker(discovery) => {
-            if discovery.total() == 0 {
-                chat_widget.commit_system(history_cell::system::SystemCell::info(
-                    "No previous sessions to fork from.",
-                ));
-            } else {
-                use crate::tui::bottom_pane::session_picker_view::SessionPickerView;
-                use crate::tui::bottom_pane::view::SessionSelectionIntent;
-                chat_widget.commit_system(history_cell::system::SystemCell::response(
-                    "Opened session fork picker",
-                ));
-                bottom_pane.push_view(Box::new(
-                    SessionPickerView::new(discovery).with_intent(SessionSelectionIntent::Fork),
-                ));
-            }
-        }
         SlashBackgroundReadEffect::SessionHub {
             snapshot,
             workspace,
@@ -1105,14 +1125,13 @@ async fn render_pending_sixel_images(guard: &mut TerminalGuard) {
         let display_result = guard
             .with_restored(|| async move {
                 tokio::task::spawn_blocking(move || {
-                    use std::io::Write as _;
-                    let mut out = std::io::stdout();
                     // Home + clear-to-end, blit the image at the top (full height),
                     // then a prompt line.
-                    let _ = out.write_all(b"\x1b[H\x1b[J");
-                    let _ = out.write_all(&bytes);
-                    let _ = out.write_all(b"\r\n\x1b[7m Press Enter to continue \x1b[0m");
-                    let _ = out.flush();
+                    let _ = crate::cli::stream::output_sink::write_stdout_fragments(&[
+                        b"\x1b[H\x1b[J",
+                        &bytes,
+                        b"\r\n\x1b[7m Press Enter to continue \x1b[0m",
+                    ]);
                     // Raw mode is off inside `with_restored`, so this is a cooked,
                     // line-buffered read that returns when the user hits Enter.
                     let mut line = String::new();
@@ -1218,64 +1237,32 @@ fn user_intent_preview(text: &str) -> String {
 }
 
 /// One cancellation choke point for keyboard and composer-driven stop
-/// requests. Local cancellation is visible to the run before any durable
-/// child-task RPCs are attempted, so a service round trip cannot allow another
-/// model round to start before cancellation is visible locally.
+/// requests. The run cancellation token owns execution cancellation; agent
+/// tool-use ids are presentation identities and must never be sent to the
+/// durable task service as task ids.
 fn request_active_run_cancel(
     chat_widget: &mut chat_widget::ChatWidget,
     bottom_pane: &mut BottomPane,
     status_indicator: &mut status_indicator::StatusIndicator,
-    cancel_control_tasks: &mut tokio::task::JoinSet<()>,
-    task_service: Option<&Arc<dyn astra_services::TaskService>>,
     run_control: &crate::cli::turn::local_run_control::LocalRunControl,
     tui_cancel_token: &tokio_util::sync::CancellationToken,
 ) {
-    run_control.request_cancel();
+    run_control.request_cancel_for_user();
     tui_cancel_token.cancel();
     let now = std::time::Instant::now();
     bottom_pane.set_task_status(TaskStatus::Cancelling);
     status_indicator.set_state(status_indicator::IndicatorState::Cancelling { started_at: now });
 
-    let ids = chat_widget.in_flight_task_ids().to_vec();
-    chat_widget.mark_control_tasks_cancelling(&ids);
+    let ids = chat_widget.in_flight_agent_tool_use_ids().to_vec();
+    chat_widget.mark_agents_cancelling(&ids);
     let cancelled_count = ids.len();
-    chat_widget.commit_cancel_banner(cancelled_count);
-
-    if !ids.is_empty()
-        && let Some(service) = task_service.cloned()
-    {
-        // The local run boundary is already cancelled. Remote child cleanup
-        // must not hold the key handler (and therefore the renderer) hostage
-        // to service latency. Keep the cleanup observable in logs while the
-        // foreground immediately renders `Stopping`.
-        cancel_control_tasks.spawn(async move {
-            let user_id = Arc::new(crate::cli::cli_config::cli_utils::cli_user_id());
-            let errors = super::cancel_fanout::fanout(&ids, move |id| {
-                let service = service.clone();
-                let user_id = user_id.clone();
-                async move {
-                    service
-                        .update_status(user_id.as_str(), &id, astra_services::TaskStatus::Cancelled)
-                        .await
-                }
-            })
-            .await;
-            for (id, error) in errors {
-                tracing::warn!(
-                    target: "astra_cli::tui",
-                    task_id = %id,
-                    error = %error,
-                    "active-run cancel fan-out: cancel rpc failed"
-                );
-            }
-        });
-    }
+    chat_widget.commit_cancel_requested_banner(cancelled_count);
 }
 
-/// Resolve submissions that were accepted while a turn still owned the
-/// composer. A normal turn gives them a deterministic next-turn route; an
-/// interrupted or failed turn returns every queued byte to the caller for
-/// restoration instead of starting work from an uncertain state.
+/// Resolve submissions still owned by the client while a turn owns the
+/// composer. Server-accepted active-run guidance is deliberately excluded by
+/// the caller; only local follow-ups receive a deterministic next-turn route.
+/// An interrupted or failed turn returns every locally owned byte for recovery.
 fn settle_followup_submissions(
     queued_followups: &mut VecDeque<String>,
     unapplied_current_turn: impl IntoIterator<Item = String>,
@@ -1294,24 +1281,547 @@ fn settle_followup_submissions(
     (!restored.is_empty()).then(|| restored.into_iter().collect::<Vec<_>>().join("\n\n"))
 }
 
+fn submission_belongs_to_next_turn(
+    output_has_settled: bool,
+    foreground_lifecycle_transferred: bool,
+) -> bool {
+    output_has_settled || foreground_lifecycle_transferred
+}
+
+/// Slash commands belong to the local command dispatcher, never to the
+/// model-facing active-run guidance channel.  Queue them until the current
+/// turn settles so the ordinary idle submission path can dispatch them with
+/// exactly the same semantics as a command entered between turns.
+fn active_submission_belongs_to_next_turn(
+    text: &str,
+    output_has_settled: bool,
+    foreground_lifecycle_transferred: bool,
+) -> bool {
+    text.trim_start().starts_with('/')
+        || submission_belongs_to_next_turn(output_has_settled, foreground_lifecycle_transferred)
+}
+
+fn should_start_queued_followups(
+    turn_ok: bool,
+    turn_interrupted: bool,
+    foreground_lifecycle_transferred: bool,
+    exit_after_turn_settlement: bool,
+) -> bool {
+    (turn_ok && !turn_interrupted || foreground_lifecycle_transferred)
+        && !exit_after_turn_settlement
+}
+
+fn primary_guidance_disposition_event(
+    event: astra_thin_client::StreamEvent,
+    expected_run_id: &str,
+    expected_intent_id: &str,
+) -> Option<TuiAppEvent> {
+    match event {
+        astra_thin_client::StreamEvent::RunUserIntentApplied {
+            run_id,
+            intent_id,
+            delivery,
+            event_index,
+            content,
+            ..
+        } if run_id == expected_run_id && intent_id == expected_intent_id => {
+            Some(TuiAppEvent::UserIntentApplied {
+                intent_id,
+                delivery,
+                status: astra_turn_types::UserIntentStatus::Applied,
+                event_index: usize::try_from(event_index).unwrap_or(usize::MAX),
+                content,
+            })
+        }
+        astra_thin_client::StreamEvent::RunUserIntentReturned {
+            run_id,
+            intent_id,
+            delivery,
+            event_index,
+            content,
+            ..
+        } if run_id == expected_run_id && intent_id == expected_intent_id => {
+            Some(TuiAppEvent::UserIntentReturned {
+                intent_id,
+                delivery,
+                status: astra_turn_types::UserIntentStatus::Returned,
+                event_index: usize::try_from(event_index).unwrap_or(usize::MAX),
+                content,
+            })
+        }
+        _ => None,
+    }
+}
+
+struct PrimaryGuidanceObserverClaim(
+    std::sync::Weak<crate::cli::turn::local_run_control::LocalRunControl>,
+);
+
+impl Drop for PrimaryGuidanceObserverClaim {
+    fn drop(&mut self) {
+        if let Some(run_control) = self.0.upgrade() {
+            run_control.release_remote_disposition_observer();
+        }
+    }
+}
+
+async fn next_guidance_stream_item_while_owner_alive<S>(
+    stream: &mut S,
+    run_control: &std::sync::Weak<crate::cli::turn::local_run_control::LocalRunControl>,
+) -> Option<S::Item>
+where
+    S: tokio_stream::Stream + Unpin,
+{
+    await_guidance_future_while_owner_alive(stream.next(), run_control)
+        .await
+        .flatten()
+}
+
+async fn await_guidance_future_while_owner_alive<F>(
+    future: F,
+    run_control: &std::sync::Weak<crate::cli::turn::local_run_control::LocalRunControl>,
+) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::pin!(future);
+    loop {
+        run_control.upgrade()?;
+        tokio::select! {
+            output = &mut future => return Some(output),
+            _ = tokio::time::sleep(GUIDANCE_OBSERVER_OWNER_CHECK_INTERVAL) => {}
+        }
+    }
+}
+
+/// Publish the durable disposition to the foreground reducer before releasing
+/// the turn-settlement barrier. Otherwise a saturated TUI channel can let the
+/// turn finish, drop this observer, and leave the visible intent permanently
+/// stuck at `AcceptedRemote` even though the server already applied it.
+async fn project_primary_guidance_disposition(
+    tui_tx: &stream_bridge::TuiAppEventTx,
+    run_control: &std::sync::Weak<crate::cli::turn::local_run_control::LocalRunControl>,
+    disposition: TuiAppEvent,
+) -> Option<bool> {
+    let intent_id = match &disposition {
+        TuiAppEvent::UserIntentApplied { intent_id, .. }
+        | TuiAppEvent::UserIntentReturned { intent_id, .. } => intent_id,
+        _ => return None,
+    };
+    let active_run_control = run_control.upgrade()?;
+    let projection_ack = active_run_control.remote_disposition_projection_ack(intent_id);
+    drop(active_run_control);
+    let _delivery =
+        await_guidance_future_while_owner_alive(tui_tx.send(disposition.clone()), run_control)
+            .await?;
+    if !projection_ack.wait().await {
+        return None;
+    }
+    let active_run_control = run_control.upgrade()?;
+    Some(active_run_control.release_remote_disposition_observer_if_idle())
+}
+
+fn spawn_primary_guidance_reconciliation(
+    api: astra_thin_client::ThinClient,
+    profile: Option<String>,
+    tui_tx: stream_bridge::TuiAppEventTx,
+    run_control: std::sync::Arc<crate::cli::turn::local_run_control::LocalRunControl>,
+    receipt: crate::cli::turn::local_run_control::UserIntentReceipt,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let Some(run_id) = receipt.run_id else {
+        return None;
+    };
+    run_control.expect_remote_user_intent_disposition(&receipt.intent_id, receipt.event_index);
+    let Some(oldest_pending_cursor) = run_control.claim_remote_disposition_observer() else {
+        return None;
+    };
+    let Ok(after_event_index) = u32::try_from(oldest_pending_cursor) else {
+        tracing::warn!(
+            intent_id = %receipt.intent_id,
+            event_index = oldest_pending_cursor,
+            "cannot reconcile guidance with an invalid durable event cursor"
+        );
+        run_control.release_remote_disposition_observer();
+        return None;
+    };
+    let run_control = std::sync::Arc::downgrade(&run_control);
+    Some(tokio::spawn(async move {
+        let _observer_claim = PrimaryGuidanceObserverClaim(run_control.clone());
+        // The acceptance response supplies the exact durable cursor, so this
+        // observer reads only the control tail rather than replaying a long
+        // run's complete model/tool history. Keep this single per-run owner
+        // alive across auth/network failures: releasing it without arranging
+        // a successor strands accepted guidance when no later intent arrives.
+        // Reconnecting from the same cursor is idempotent because BottomPane
+        // resolves by stable intent_id.
+        let mut retry_delay = Duration::from_millis(100);
+        loop {
+            {
+                let Some(run_control) = run_control.upgrade() else {
+                    return;
+                };
+                if run_control.release_remote_disposition_observer_if_idle() {
+                    return;
+                }
+            }
+            let Some(token) = await_guidance_future_while_owner_alive(
+                crate::cli::session::session_runtime::fresh_access_token(&api, profile.as_deref()),
+                &run_control,
+            )
+            .await
+            .flatten() else {
+                if run_control.upgrade().is_none() {
+                    return;
+                }
+                tracing::debug!(
+                    run_id,
+                    intent_id = %receipt.intent_id,
+                    "guidance disposition authentication is temporarily unavailable; retrying"
+                );
+                if await_guidance_future_while_owner_alive(
+                    tokio::time::sleep(retry_delay),
+                    &run_control,
+                )
+                .await
+                .is_none()
+                {
+                    return;
+                }
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(2));
+                continue;
+            };
+            let mut stream = api.stream_run(&run_id, after_event_index, Some(&token));
+            while let Some(item) =
+                next_guidance_stream_item_while_owner_alive(&mut stream, &run_control).await
+            {
+                match item {
+                    Ok(event) => {
+                        let Some(active_run_control) = run_control.upgrade() else {
+                            return;
+                        };
+                        let disposition = active_run_control
+                            .pending_remote_disposition_ids()
+                            .into_iter()
+                            .find_map(|intent_id| {
+                                primary_guidance_disposition_event(
+                                    event.clone(),
+                                    &run_id,
+                                    &intent_id,
+                                )
+                            });
+                        if let Some(disposition) = disposition {
+                            drop(active_run_control);
+                            let Some(observer_is_idle) = project_primary_guidance_disposition(
+                                &tui_tx,
+                                &run_control,
+                                disposition,
+                            )
+                            .await
+                            else {
+                                return;
+                            };
+                            if observer_is_idle {
+                                return;
+                            }
+                            retry_delay = Duration::from_millis(100);
+                            continue;
+                        }
+                        if matches!(
+                            event,
+                            astra_thin_client::StreamEvent::RunFinished { .. }
+                                | astra_thin_client::StreamEvent::RunCancelled { .. }
+                                | astra_thin_client::StreamEvent::RunError { .. }
+                        ) {
+                            tracing::warn!(
+                                run_id,
+                                intent_id = %receipt.intent_id,
+                                "run terminated without projecting the accepted guidance disposition"
+                            );
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            run_id,
+                            intent_id = %receipt.intent_id,
+                            error = %error,
+                            "guidance disposition stream interrupted; reconnecting"
+                        );
+                        break;
+                    }
+                }
+            }
+            if run_control.upgrade().is_none() {
+                return;
+            }
+            if await_guidance_future_while_owner_alive(
+                tokio::time::sleep(retry_delay),
+                &run_control,
+            )
+            .await
+            .is_none()
+            {
+                return;
+            }
+            retry_delay = (retry_delay * 2).min(Duration::from_secs(2));
+        }
+    }))
+}
+
 async fn submit_active_run_guidance(
-    run_control: &std::sync::Arc<
-        std::sync::Mutex<
-            Option<std::sync::Arc<crate::cli::turn::local_run_control::LocalRunControl>>,
-        >,
-    >,
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    remote_run_id: &std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    run_control: &std::sync::Weak<crate::cli::turn::local_run_control::LocalRunControl>,
+    intent_id: &str,
     text: &str,
     background_work_snapshot: Option<&str>,
     work_unit_observations: &[astra_core::work_unit::WorkUnitObservation],
-) -> Result<crate::cli::turn::local_run_control::LocalUserIntentReceipt, String> {
-    let provider = astra_core::sync_poison::recover_mutex_lock(run_control)
+) -> Result<crate::cli::turn::local_run_control::UserIntentReceipt, GuidanceSubmissionError> {
+    let run_id = astra_core::sync_poison::recover_mutex_lock(remote_run_id)
         .clone()
-        .ok_or_else(|| "Run is changing state. Try again, or press Ctrl+C to stop.".to_string())?;
-    provider.accept_guidance_with_runtime_context(
+        .ok_or_else(|| {
+            GuidanceSubmissionError::Rejected(
+                "The server run is still starting. Try again in a moment.".to_string(),
+            )
+        })?;
+    let input = crate::cli::turn::local_run_control::LocalRunControl::guidance_input(
         text,
         background_work_snapshot,
         work_unit_observations,
     )
+    .map_err(GuidanceSubmissionError::Rejected)?;
+    let submission = async {
+        let token = crate::cli::session::session_runtime::fresh_access_token(api, profile)
+            .await
+            .ok_or_else(|| {
+                GuidanceSubmissionError::Rejected(
+                    "Authentication is unavailable for active-run guidance.".to_string(),
+                )
+            })?;
+        let request = astra_thin_client::RunUserIntentRequest {
+            intent_id: intent_id.to_string(),
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            input,
+        };
+        let mut last_unconfirmed = None;
+        for attempt in 0..2 {
+            match api
+                .submit_run_user_intent(Some(&token), &run_id, &request)
+                .await
+            {
+                Ok(response)
+                    if response.run_id == run_id
+                        && response.intent_id == intent_id
+                        && response.status
+                            == astra_turn_types::UserIntentStatus::AcceptedRemote
+                        && response.event_index >= 0 =>
+                {
+                    return Ok(crate::cli::turn::local_run_control::UserIntentReceipt {
+                        run_id: Some(run_id.clone()),
+                        intent_id: intent_id.to_string(),
+                        delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                        status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+                        event_index: response.event_index,
+                    });
+                }
+                Ok(_) => {
+                    last_unconfirmed = Some(
+                        "The server returned an inconsistent guidance acknowledgement.".to_string(),
+                    );
+                }
+                Err(error) => match GuidanceSubmissionError::from_thin_client(error) {
+                    GuidanceSubmissionError::Rejected(error) => {
+                        return Err(GuidanceSubmissionError::Rejected(error));
+                    }
+                    GuidanceSubmissionError::Unconfirmed(error) => {
+                        last_unconfirmed = Some(error);
+                    }
+                },
+            }
+            if attempt == 0 {
+                // The Server binds immutable facts to intent_id, so retrying the
+                // exact request reconciles a lost acknowledgement without
+                // duplicating execution or inventing another identity.
+                continue;
+            }
+        }
+        Err(GuidanceSubmissionError::Unconfirmed(
+            last_unconfirmed.unwrap_or_else(|| "Guidance delivery could not be confirmed.".into()),
+        ))
+    };
+    await_active_guidance_submission(
+        submission,
+        run_control,
+        ACTIVE_RUN_GUIDANCE_SUBMISSION_TIMEOUT,
+    )
+    .await?
+}
+
+// Turn settlement reserves five seconds for remote guidance reconciliation.
+// Keep submission below that owner deadline so the ACK result can be
+// projected (or released) before the enclosing turn hands ownership back.
+const ACTIVE_RUN_GUIDANCE_SUBMISSION_TIMEOUT: Duration = Duration::from_secs(4);
+const ACTIVE_RUN_GUIDANCE_CLOSURE_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn await_active_guidance_submission<F, T>(
+    submission: F,
+    run_control: &std::sync::Weak<crate::cli::turn::local_run_control::LocalRunControl>,
+    timeout: Duration,
+) -> Result<T, GuidanceSubmissionError>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(submission);
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    loop {
+        if run_control.upgrade().is_none() {
+            return Err(GuidanceSubmissionError::Unconfirmed(
+                "The active turn ended before guidance submission was confirmed.".into(),
+            ));
+        }
+        tokio::select! {
+            output = &mut submission => return Ok(output),
+            _ = &mut deadline => {
+                return Err(GuidanceSubmissionError::Unconfirmed(
+                    "Guidance submission exceeded its bounded acknowledgement deadline.".into(),
+                ));
+            }
+            _ = tokio::time::sleep(GUIDANCE_OBSERVER_OWNER_CHECK_INTERVAL) => {}
+        }
+    }
+}
+
+struct ActiveRunGuidanceSubmission {
+    intent_id: String,
+    text: String,
+    result: Result<crate::cli::turn::local_run_control::UserIntentReceipt, GuidanceSubmissionError>,
+}
+
+fn active_guidance_closure_pending(
+    run_control: &crate::cli::turn::local_run_control::LocalRunControl,
+    submission_in_flight: bool,
+) -> bool {
+    let barriers = TurnClosureBarriers::capture(run_control, submission_in_flight, false, false);
+    barriers.guidance_submission_pending || barriers.guidance_disposition_pending
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TurnClosureBarriers {
+    bash_detach_request_pending: bool,
+    guidance_submission_pending: bool,
+    guidance_disposition_pending: bool,
+    turn_projection_drain_pending: bool,
+}
+
+impl TurnClosureBarriers {
+    fn capture(
+        run_control: &crate::cli::turn::local_run_control::LocalRunControl,
+        guidance_submission_in_flight: bool,
+        bash_detach_request_pending: bool,
+        turn_projection_drain_pending: bool,
+    ) -> Self {
+        Self {
+            bash_detach_request_pending,
+            guidance_submission_pending: guidance_submission_in_flight
+                || !run_control.pending_remote_submission_ids().is_empty(),
+            guidance_disposition_pending: !run_control.pending_remote_disposition_ids().is_empty(),
+            turn_projection_drain_pending,
+        }
+    }
+
+    fn guidance_pending(self) -> bool {
+        self.guidance_submission_pending || self.guidance_disposition_pending
+    }
+
+    fn all_clear(self) -> bool {
+        !self.bash_detach_request_pending
+            && !self.guidance_pending()
+            && !self.turn_projection_drain_pending
+    }
+}
+
+fn take_ready_result_if_all_closure_barriers_clear<T>(
+    turn_result_ready: &mut Option<T>,
+    barriers: TurnClosureBarriers,
+) -> Option<T> {
+    barriers
+        .all_clear()
+        .then(|| turn_result_ready.take())
+        .flatten()
+}
+
+fn begin_turn_result_closure(
+    bridge: &stream_bridge::PerTurnStreamBridgeControl,
+    turn_result_ready: &mut Option<Result<(), String>>,
+    result: Result<(), String>,
+) {
+    // This is the sole non-shutdown transition from a running turn future to
+    // a publishable result. Closing receiver admission first makes the later
+    // TurnProjectionDrained marker an exact reducer boundary for both success
+    // and every failure source, including local terminal I/O errors.
+    bridge.close_and_drain();
+    *turn_result_ready = Some(result);
+}
+
+fn expire_guidance_closure_as_unconfirmed(
+    run_control: &crate::cli::turn::local_run_control::LocalRunControl,
+    deadline: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> Option<Vec<String>> {
+    if !deadline.is_some_and(|deadline| now >= deadline) {
+        return None;
+    }
+    let mut unconfirmed_ids = std::collections::BTreeSet::new();
+    for intent_id in run_control.pending_remote_submission_ids() {
+        run_control.release_remote_user_intent_submission(&intent_id);
+        unconfirmed_ids.insert(intent_id);
+    }
+    for intent_id in run_control.pending_remote_disposition_ids() {
+        run_control.abandon_remote_user_intent_disposition(&intent_id);
+        unconfirmed_ids.insert(intent_id);
+    }
+    Some(unconfirmed_ids.into_iter().collect())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GuidanceSubmissionError {
+    /// The request is known not to have transferred ownership to the run.
+    Rejected(String),
+    /// The request may have committed, but its acknowledgement was lost or
+    /// malformed. Keep the stable local identity pending until durable run
+    /// events settle it; never manufacture a second intent id.
+    Unconfirmed(String),
+}
+
+impl GuidanceSubmissionError {
+    fn from_thin_client(error: astra_thin_client::ThinClientError) -> Self {
+        match error {
+            astra_thin_client::ThinClientError::Api { status, body }
+                if status.is_client_error() && status != reqwest::StatusCode::REQUEST_TIMEOUT =>
+            {
+                Self::Rejected(astra_thin_client::ThinClientError::Api { status, body }.to_string())
+            }
+            astra_thin_client::ThinClientError::InvalidBaseUrl(_)
+            | astra_thin_client::ThinClientError::InvalidAuthHeader
+            | astra_thin_client::ThinClientError::InvalidInput(_) => {
+                Self::Rejected(error.to_string())
+            }
+            // A transport failure, a successful response with an invalid
+            // body, or a protocol mismatch can all happen after the server's
+            // idempotent durable insert. Conservatively retain ownership
+            // ambiguity and reconcile by intent_id.
+            astra_thin_client::ThinClientError::Http(_)
+            | astra_thin_client::ThinClientError::Api { .. }
+            | astra_thin_client::ThinClientError::Json(_)
+            | astra_thin_client::ThinClientError::SseParse(_)
+            | astra_thin_client::ThinClientError::IncompatibleRuntime { .. }
+            | astra_thin_client::ThinClientError::InvalidSseJson(_) => {
+                Self::Unconfirmed(error.to_string())
+            }
+        }
+    }
 }
 
 async fn submit_active_runtime_notification(
@@ -1350,21 +1860,22 @@ async fn drain_background_task_commands(
     agent_spawner: Option<&Arc<astra_runtime::orchestration::DynamicAgentSpawner>>,
     restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
     list_cache: &Arc<tokio::sync::RwLock<String>>,
-) {
+) -> bool {
     let commands: Vec<_> = commands.lock_recover().drain(..).collect();
+    let mut mutated = false;
     for command in commands {
         match command {
             crate::edge_tools::BgTaskCommand::Kill { task_id, reply } => {
-                let _ = reply.send(
-                    stop_background_task_with_agents(
-                        background_registry,
-                        agent_spawner,
-                        restored_local_agents,
-                        &task_id,
-                    )
-                    .await
-                    .map(|_| ()),
-                );
+                let result = stop_background_task_with_agents(
+                    background_registry,
+                    agent_spawner,
+                    restored_local_agents,
+                    &task_id,
+                )
+                .await
+                .map(|_| ());
+                mutated |= result.is_ok();
+                let _ = reply.send(result);
             }
             crate::edge_tools::BgTaskCommand::GetOutputSince {
                 task_id,
@@ -1414,6 +1925,54 @@ async fn drain_background_task_commands(
             }
         }
     }
+    mutated
+}
+
+/// Rebuild background-work presentation at the cadence its underlying output
+/// sampler can actually change. The 50 ms input loop must not serialize XML or
+/// contend on the model-facing cache when no background fact changed. An open
+/// task view still receives per-frame elapsed-time projection without forcing
+/// the shared cache and footer down that hot path.
+async fn refresh_background_task_surfaces(
+    background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
+    local_agent_snapshot: &super::local_agent_snapshot::LocalAgentSnapshot,
+    restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
+    list_cache: &tokio::sync::RwLock<String>,
+    bottom_pane: &mut BottomPane,
+    next_shared_refresh: &mut std::time::Instant,
+    force_shared_refresh: bool,
+) -> bool {
+    let now = std::time::Instant::now();
+    let view_open = bottom_pane.accepts_background_task_rows();
+    let shared_due = force_shared_refresh || now >= *next_shared_refresh;
+    if !view_open && !shared_due {
+        return false;
+    }
+
+    let rows = background_task_rows_with_agent_snapshot(
+        background_registry,
+        local_agent_snapshot,
+        restored_local_agents,
+    );
+    let mut changed = false;
+    if shared_due {
+        let xml = render_background_task_rows_xml(&rows);
+        let mut cache = list_cache.write().await;
+        if *cache != xml {
+            *cache = xml;
+            changed = true;
+        }
+        drop(cache);
+
+        let previous_counts = bottom_pane.footer.bg_task_counts;
+        sync_background_task_footer_from_rows(bottom_pane, &rows);
+        changed |= bottom_pane.footer.bg_task_counts != previous_counts;
+        *next_shared_refresh = now + BACKGROUND_SURFACE_REFRESH_INTERVAL;
+    }
+    if view_open {
+        changed |= bottom_pane.refresh_background_task_rows(rows);
+    }
+    changed
 }
 
 fn transcript_snapshot(
@@ -1687,327 +2246,49 @@ fn handle_global_key_action(
     }
 }
 
-/// Drain a plan executor through the same typed event model used by a
-/// foreground turn. The executor remains background work; this function only
-/// owns its local UI projection and state reconciliation.
-///
-/// Keeping this in the event loop is intentional: only the workbench owns
-/// focus, approvals, scrollback, and frame scheduling. The plan runtime owns
-/// execution and emits `PlanUpdate` facts without knowing about terminal UI.
-fn drain_plan_updates_into_workbench(
-    state: &mut crate::cli::session::session_state::SessionState,
-    chat_widget: &mut chat_widget::ChatWidget,
-    bottom_pane: &mut BottomPane,
-    status_indicator: &mut status_indicator::StatusIndicator,
-    frame_requester: &FrameRequester,
-) -> bool {
-    use crate::cli::plan::plan_executor::PlanUpdate;
-
-    let mut changed = false;
-    let mut terminal_update = false;
-
-    loop {
-        let update = state
-            .plan_handle
-            .as_mut()
-            .and_then(|handle| handle.try_recv());
-        let Some(update) = update else {
-            break;
-        };
-        changed = true;
-
-        match update {
-            PlanUpdate::SubtaskStarted {
-                id,
-                title,
-                index,
-                total,
-            } => {
-                state.current_plan_subtask_id = Some(id.clone());
-                chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
-                    "Plan · {index}/{total} · {title} ({id})"
-                )));
-                bottom_pane.set_task_status(TaskStatus::WaitingModel);
-                status_indicator.set_state(status_indicator::IndicatorState::WaitingModel {
-                    started_at: std::time::Instant::now(),
-                });
-            }
-            PlanUpdate::SubtaskCompleted {
-                id,
-                title,
-                pct,
-                elapsed,
-                verification_passed,
-            } => {
-                let elapsed = elapsed
-                    .map(crate::cli::plan::plan_monitor::format_duration_short)
-                    .map(|value| format!(" · {value}"))
-                    .unwrap_or_default();
-                let verdict = if verification_passed {
-                    "verified"
-                } else {
-                    "needs review"
-                };
-                chat_widget.commit_system(history_cell::system::SystemCell::response(format!(
-                    "Plan · {pct}% · {title} ({id}) · {verdict}{elapsed}"
-                )));
-            }
-            PlanUpdate::SubtaskRetry {
-                id,
-                attempt,
-                max_retries,
-                retries_exhausted,
-                failure_hint,
-                ..
-            } => {
-                let retry = if max_retries == 0 {
-                    "retrying".to_string()
-                } else {
-                    format!("attempt {attempt}/{max_retries}")
-                };
-                let result = if retries_exhausted {
-                    "verification exhausted"
-                } else {
-                    "verification failed; retrying"
-                };
-                let hint = failure_hint
-                    .map(|value| format!(" · {value}"))
-                    .unwrap_or_default();
-                chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
-                    "Plan · {id} · {result} · {retry}{hint}"
-                )));
-            }
-            PlanUpdate::PlanProgress { .. } | PlanUpdate::ParallelGroupInfo { .. } => {}
-            PlanUpdate::SubtaskTurnResult {
-                subtask_id,
-                prompt_tokens,
-                completion_tokens,
-                session_id,
-                ..
-            } => {
-                state.total_prompt_tokens = state.total_prompt_tokens.saturating_add(prompt_tokens);
-                state.total_completion_tokens = state
-                    .total_completion_tokens
-                    .saturating_add(completion_tokens);
-                state.turn = state.turn.saturating_add(1);
-                state.current_plan_subtask_id = Some(subtask_id);
-                if state.session_id.is_none() {
-                    if let Some(session_id) = session_id {
-                        state.set_session_id(session_id);
-                    }
-                }
-                if let Some(event) = chat_widget::translate(
-                    TuiAppEvent::TurnComplete,
-                    chat_widget::TurnContext::default(),
-                ) {
-                    chat_widget.handle_event(event);
-                }
-            }
-            PlanUpdate::SubtaskStatusSync { id, status } => {
-                crate::cli::plan::plan_monitor::sync_subtask_status(state, &id, status);
-            }
-            PlanUpdate::DurableStateReturn(durable) => {
-                state.durable_task_state = Some(*durable);
-            }
-            PlanUpdate::Advisory { title, detail } => {
-                chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
-                    "{title} · {detail}"
-                )));
-            }
-            PlanUpdate::JournalEvent(event) => {
-                if let Some(journal) = state.journal.as_ref() {
-                    crate::cli::cli_config::cli_utils::append_journal_event_or_warn(
-                        journal,
-                        state.session_id.as_deref(),
-                        &event,
-                        "tui_plan_projection:journal_event",
-                    );
-                }
-            }
-            PlanUpdate::HistoryEntry {
-                user_msg,
-                assistant_msg,
-            } => state.history.push((user_msg, assistant_msg)),
-            PlanUpdate::DeliveryReport(report) => state.last_delivery_report = Some(report),
-            PlanUpdate::VerificationReport(report) => {
-                chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
-                    "Plan verification recorded for {}",
-                    report.subtask_id
-                )));
-            }
-            PlanUpdate::StreamingEvent { event, .. } => {
-                if let Some(event) = stream_bridge::map_stream_event(event) {
-                    if let Some(chat_event) =
-                        chat_widget::translate(event.clone(), chat_widget::TurnContext::default())
-                    {
-                        chat_widget.handle_event(chat_event);
-                        refresh_open_agent_views_for_event(&event, chat_widget, bottom_pane);
-                    }
-                    apply_tui_control_event(&event, bottom_pane, chat_widget);
-                    handle_app_event(&event, bottom_pane, status_indicator, frame_requester);
-                }
-            }
-            PlanUpdate::ApprovalNeeded {
-                tool,
-                header,
-                detail,
-                reason,
-                response_tx,
-            } => {
-                bottom_pane.enqueue_approval(
-                    tool.clone(),
-                    header,
-                    detail,
-                    reason,
-                    serde_json::Value::Null,
-                    response_tx,
-                );
-                bottom_pane.set_task_status(TaskStatus::WaitingApproval { tool });
-                status_indicator.set_state(status_indicator::IndicatorState::AwaitingApproval {
-                    started_at: std::time::Instant::now(),
-                });
-            }
-            PlanUpdate::PlanPaused {
-                pct,
-                remaining,
-                elapsed,
-                blocked_ids,
-            } => {
-                state.plan_execution_paused = true;
-                let blocked = if blocked_ids.is_empty() {
-                    String::new()
-                } else {
-                    format!(" · blocked by {}", blocked_ids.join(", "))
-                };
-                chat_widget.commit_system(history_cell::system::SystemCell::response(format!(
-                    "Plan paused · {pct}% · {remaining} remaining · {}{blocked}",
-                    crate::cli::plan::plan_monitor::format_duration_short(elapsed),
-                )));
-                let mut extra = serde_json::Map::new();
-                extra.insert("pct".to_string(), serde_json::json!(pct));
-                extra.insert("remaining".to_string(), serde_json::json!(remaining));
-                extra.insert("blocked_ids".to_string(), serde_json::json!(blocked_ids));
-                crate::cli::plan::plan_monitor::emit_plan_lifecycle_event(
-                    state.journal.as_ref(),
-                    state.session_id.as_deref(),
-                    state.executing_plan.as_ref(),
-                    "Plan execution paused",
-                    "paused",
-                    extra,
-                );
-                bottom_pane.set_task_status(TaskStatus::Idle);
-                status_indicator.set_state(status_indicator::IndicatorState::Idle);
-            }
-            PlanUpdate::PlanFinished {
-                pct,
-                elapsed,
-                outcome,
-            } => {
-                terminal_update = true;
-                state.plan_execution_paused = false;
-                let stage = outcome.as_str();
-                let description = format!("Plan execution {stage}");
-                let mut extra = serde_json::Map::new();
-                extra.insert("pct".to_string(), serde_json::json!(pct));
-                extra.insert(
-                    "elapsed_ms".to_string(),
-                    serde_json::json!(elapsed.as_millis() as u64),
-                );
-                extra.insert("outcome".to_string(), serde_json::json!(stage));
-                crate::cli::plan::plan_monitor::emit_plan_lifecycle_event(
-                    state.journal.as_ref(),
-                    state.session_id.as_deref(),
-                    state.executing_plan.as_ref(),
-                    &description,
-                    stage,
-                    extra,
-                );
-                state.plan_execution_last_error = None;
-                state.executing_plan = None;
-                state.current_plan_subtask_id = None;
-                chat_widget.commit_system(history_cell::system::SystemCell::response(format!(
-                    "Plan {stage} · {pct}% · {}",
-                    crate::cli::plan::plan_monitor::format_duration_short(elapsed),
-                )));
-                bottom_pane.set_task_status(TaskStatus::Idle);
-                status_indicator.set_state(status_indicator::IndicatorState::Idle);
-            }
-            PlanUpdate::PlanError { error } => {
-                terminal_update = true;
-                state.plan_execution_paused = false;
-                state.plan_execution_last_error = Some(error.clone());
-                let mut extra = serde_json::Map::new();
-                extra.insert("error".to_string(), serde_json::json!(error));
-                crate::cli::plan::plan_monitor::emit_plan_lifecycle_event(
-                    state.journal.as_ref(),
-                    state.session_id.as_deref(),
-                    state.executing_plan.as_ref(),
-                    "Plan execution failed",
-                    "error",
-                    extra,
-                );
-                state.executing_plan = None;
-                state.current_plan_subtask_id = None;
-                chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
-                    "Plan failed: {error}"
-                )));
-                bottom_pane.set_task_status(TaskStatus::Idle);
-                status_indicator.set_state(status_indicator::IndicatorState::Idle);
-            }
-        }
+fn reconcile_task_board_on_open(
+    task_board: &task_board_observer::TaskBoardObserver,
+    work_observer: Option<&crate::tui::plan_task_observer::PlanTaskObserver>,
+) {
+    let Some(work_observer) = work_observer else {
+        return;
+    };
+    if work_observer.request_refresh() {
+        work_observer.maybe_refresh();
     }
-
-    let executor_closed = state
-        .plan_handle
-        .as_ref()
-        .is_some_and(|handle| handle.is_finished());
-    if terminal_update || executor_closed {
-        if let Some(mut handle) = state.plan_handle.take() {
-            while let Some(update) = handle.try_recv() {
-                crate::cli::plan::plan_monitor::apply_trailing_update(update, state);
-            }
-        }
-    }
-
-    if executor_closed && !terminal_update && !state.plan_execution_paused {
-        changed = true;
-        let error = "Plan executor stopped without a terminal update.".to_string();
-        state.plan_execution_last_error = Some(error.clone());
-        state.plan_execution_paused = false;
-        let mut extra = serde_json::Map::new();
-        extra.insert("error".to_string(), serde_json::json!(error));
-        crate::cli::plan::plan_monitor::emit_plan_lifecycle_event(
-            state.journal.as_ref(),
-            state.session_id.as_deref(),
-            state.executing_plan.as_ref(),
-            "Plan executor stopped unexpectedly",
-            "error",
-            extra,
-        );
-        state.executing_plan = None;
-        state.current_plan_subtask_id = None;
-        chat_widget.commit_system(history_cell::system::SystemCell::error(
-            "Plan stopped unexpectedly. No further plan work will run; inspect the transcript before retrying.",
-        ));
-        bottom_pane.set_task_status(TaskStatus::Idle);
-        status_indicator.set_state(status_indicator::IndicatorState::Idle);
-    }
-
-    if changed {
-        frame_requester.schedule_frame();
-    }
-    changed
+    let projection = work_observer.projection();
+    let _ = task_board.set_projected_work_projection(
+        projection.work,
+        projection.tasks,
+        projected_truth_for_plan_task(projection.truth_state),
+    );
 }
 
-fn reconcile_task_board_on_open(task_board: &task_board_observer::TaskBoardObserver) {
-    if task_board.request_refresh() && tokio::runtime::Handle::try_current().is_ok() {
-        task_board.maybe_refresh();
-    }
+/// Reveal the canonical Work task board in the current conversation canvas.
+///
+/// Work is execution context, not a separate destination. Ctrl+T and `/work
+/// status` therefore expand the live board above the composer while keeping
+/// the active transcript, composer, and any in-flight work visible. This is
+/// also the only route that changes its visibility: the board's data remains
+/// owned by the observer and refreshes in place.
+fn open_work_task_surface(
+    task_board: &task_board_observer::TaskBoardObserver,
+    work_observer: Option<&crate::tui::plan_task_observer::PlanTaskObserver>,
+    board_expanded: &mut bool,
+    board_user_pin: &mut Option<bool>,
+    frame_requester: &FrameRequester,
+) {
+    task_board.reveal_completed_for_review();
+    reconcile_task_board_on_open(task_board, work_observer);
+    *board_user_pin = Some(true);
+    *board_expanded = true;
+    frame_requester.schedule_frame();
 }
 
 fn handle_task_surface_shortcut(
     key: &crossterm::event::KeyEvent,
     task_board: &task_board_observer::TaskBoardObserver,
+    work_observer: Option<&crate::tui::plan_task_observer::PlanTaskObserver>,
     board_expanded: &mut bool,
     board_user_pin: &mut Option<bool>,
     bottom_pane: &mut BottomPane,
@@ -2017,79 +2298,112 @@ fn handle_task_surface_shortcut(
         || !key
             .modifiers
             .contains(crossterm::event::KeyModifiers::CONTROL)
-        || (bottom_pane.has_active_view()
-            && !bottom_pane.primary_workspace_is_open()
-            && !bottom_pane.agent_monitor_is_open())
+    {
+        return false;
+    }
+    toggle_task_surface(
+        task_board,
+        work_observer,
+        board_expanded,
+        board_user_pin,
+        bottom_pane,
+        frame_requester,
+    )
+}
+
+fn toggle_task_surface(
+    task_board: &task_board_observer::TaskBoardObserver,
+    work_observer: Option<&crate::tui::plan_task_observer::PlanTaskObserver>,
+    board_expanded: &mut bool,
+    board_user_pin: &mut Option<bool>,
+    bottom_pane: &mut BottomPane,
+    frame_requester: &FrameRequester,
+) -> bool {
+    if bottom_pane.has_active_view()
+        && !bottom_pane.primary_workspace_is_open()
+        && !bottom_pane.agent_monitor_is_open()
     {
         return false;
     }
 
-    // A primary workspace owns the canvas, so the compact board beneath the
-    // composer is not painted. Ctrl+T therefore switches to the canonical
-    // Task Board workspace instead of toggling invisible state behind a
-    // transcript, agent monitor, or other workbench view. The retained view
-    // is reactivated so its typed focus and scroll state survive navigation.
-    // Ctrl+B remains the explicit background-task surface.
-    if bottom_pane.task_board_is_open() {
-        if key
-            .modifiers
-            .contains(crossterm::event::KeyModifiers::SHIFT)
-        {
-            task_board.toggle_view_mode();
-            task_board.reveal_completed_for_review();
-            reconcile_task_board_on_open(task_board);
-            bottom_pane.refresh_task_board(&task_board.active_projection());
-            frame_requester.schedule_frame();
-            return true;
-        }
-        bottom_pane.close_active_view();
+    if *board_expanded {
+        *board_user_pin = Some(false);
+        *board_expanded = false;
         frame_requester.schedule_frame();
-        return true;
-    }
-    if bottom_pane.primary_workspace_is_open() || bottom_pane.agent_monitor_is_open() {
-        if key
-            .modifiers
-            .contains(crossterm::event::KeyModifiers::SHIFT)
-        {
-            task_board.toggle_view_mode();
-        }
-        task_board.reveal_completed_for_review();
-        reconcile_task_board_on_open(task_board);
-        if !bottom_pane.activate_task_board() {
-            bottom_pane.push_view(Box::new(bottom_pane::task_board_view::TaskBoardView::new(
-                task_board.active_projection(),
-            )));
-        }
-        frame_requester.schedule_frame();
-        return true;
-    }
-
-    if key
-        .modifiers
-        .contains(crossterm::event::KeyModifiers::SHIFT)
-    {
-        task_board.toggle_view_mode();
-        // Ctrl+Shift+T is an explicit request to inspect the cross-session
-        // board. Keep it open even if its first read fails; otherwise the
-        // user sees no acknowledgement and cannot distinguish an empty board
-        // from an unavailable checklist service.
-        *board_expanded = true;
-        *board_user_pin = Some(true);
-        reconcile_task_board_on_open(task_board);
-        frame_requester.schedule_frame();
-        return true;
-    }
-
-    let new_pin = !*board_expanded;
-    *board_user_pin = Some(new_pin);
-    *board_expanded = new_pin;
-    if new_pin {
-        task_board.reveal_completed_for_review();
-        // Ctrl+T is an explicit inspection request. Reconcile immediately so
-        // an idle/terminal board does not first show a quiet-poll-old snapshot.
-        reconcile_task_board_on_open(task_board);
     } else {
-        task_board.hide_completed_after_review();
+        open_work_task_surface(
+            task_board,
+            work_observer,
+            board_expanded,
+            board_user_pin,
+            frame_requester,
+        );
+    }
+    true
+}
+
+/// Product-level Ctrl+T route for the canonical session task board.
+fn is_primary_task_shortcut(key: &crossterm::event::KeyEvent) -> bool {
+    key.code == crossterm::event::KeyCode::Char('t')
+        && key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL)
+}
+
+/// Handle a Ctrl+T event after the caller has classified the key. Keeping key
+/// classification outside this product route makes the actual dependencies of
+/// task-surface selection explicit and lets every event-loop state share it.
+fn handle_primary_task_shortcut(
+    task_board: &task_board_observer::TaskBoardObserver,
+    work_observer: Option<&crate::tui::plan_task_observer::PlanTaskObserver>,
+    board_expanded: &mut bool,
+    board_user_pin: &mut Option<bool>,
+    bottom_pane: &mut BottomPane,
+    frame_requester: &FrameRequester,
+) -> bool {
+    let modal_owns_focus = bottom_pane.has_active_view()
+        && !bottom_pane.conversation_tab_is_open()
+        && !bottom_pane.primary_workspace_is_open()
+        && !bottom_pane.agent_monitor_is_open();
+
+    if modal_owns_focus {
+        return false;
+    }
+
+    toggle_task_surface(
+        task_board,
+        work_observer,
+        board_expanded,
+        board_user_pin,
+        bottom_pane,
+        frame_requester,
+    )
+}
+
+/// `R` refreshes the already-open Work board. The rendered shortcut must be
+/// executable, but ordinary typing remains untouched: it is active only when
+/// the board owns the empty conversation canvas.
+fn handle_task_surface_refresh_shortcut(
+    key: &crossterm::event::KeyEvent,
+    work_observer: &crate::tui::plan_task_observer::PlanTaskObserver,
+    board_expanded: bool,
+    bottom_pane: &BottomPane,
+    frame_requester: &FrameRequester,
+) -> bool {
+    let plain_r = matches!(key.code, crossterm::event::KeyCode::Char('r' | 'R'))
+        && matches!(
+            key.modifiers,
+            crossterm::event::KeyModifiers::NONE | crossterm::event::KeyModifiers::SHIFT
+        );
+    if !plain_r
+        || !board_expanded
+        || !bottom_pane.composer.is_empty()
+        || bottom_pane.has_active_view()
+    {
+        return false;
+    }
+    if work_observer.request_refresh() {
+        work_observer.maybe_refresh();
     }
     frame_requester.schedule_frame();
     true
@@ -2250,13 +2564,21 @@ fn apply_external_capability_discovery(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UserIntentProjection {
+    None,
+    Applied,
+    Returned,
+}
+
 /// Apply structured app events that update both the bottom-pane control
-/// surface and transcript projection.
+/// surface and transcript projection. The result is an exact reducer ACK, not
+/// merely evidence that an event entered the TUI channel.
 fn apply_tui_control_event(
     event: &TuiAppEvent,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut chat_widget::ChatWidget,
-) {
+) -> UserIntentProjection {
     match event {
         TuiAppEvent::PermissionAutoApproved { tool, reason } => {
             chat_widget.commit_system(history_cell::system::SystemCell::info(
@@ -2264,6 +2586,7 @@ fn apply_tui_control_event(
                     .trim()
                     .to_string(),
             ));
+            UserIntentProjection::None
         }
         TuiAppEvent::UserIntentApplied {
             intent_id,
@@ -2281,6 +2604,7 @@ fn apply_tui_control_event(
                     intent.status,
                     intent.text,
                 );
+                UserIntentProjection::Applied
             } else {
                 tracing::debug!(
                     target: "astra_cli::tui",
@@ -2288,6 +2612,30 @@ fn apply_tui_control_event(
                     event_index,
                     "ignored duplicate or incomplete user-intent applied event"
                 );
+                UserIntentProjection::None
+            }
+        }
+        TuiAppEvent::UserIntentReturned {
+            intent_id,
+            status,
+            event_index,
+            content,
+            ..
+        } => {
+            if bottom_pane.return_user_intent(intent_id, *status, content) {
+                chat_widget.commit_system(history_cell::system::SystemCell::info(
+                    "The run ended before applying your guidance; it was restored as an unsent draft."
+                        .to_string(),
+                ));
+                UserIntentProjection::Returned
+            } else {
+                tracing::debug!(
+                    target: "astra_cli::tui",
+                    intent_id,
+                    event_index,
+                    "ignored duplicate or non-owned returned user intent"
+                );
+                UserIntentProjection::None
             }
         }
         TuiAppEvent::AgentCommunication(event)
@@ -2296,15 +2644,56 @@ fn apply_tui_control_event(
             if let Some(intent) = bottom_pane.remove_agent_guide(&event.message_id) {
                 let agent_name = match intent.target {
                     bottom_pane::PendingUserIntentTarget::AgentRun { agent_name, .. } => agent_name,
-                    bottom_pane::PendingUserIntentTarget::ActiveRun => return,
+                    bottom_pane::PendingUserIntentTarget::ActiveRun => {
+                        return UserIntentProjection::None;
+                    }
                 };
                 chat_widget.commit_system(history_cell::system::SystemCell::info(format!(
                     "Guidance received by {agent_name}: {}",
                     intent.text
                 )));
             }
+            UserIntentProjection::None
         }
-        _ => {}
+        _ => UserIntentProjection::None,
+    }
+}
+
+fn apply_active_turn_tui_control_event(
+    event: &TuiAppEvent,
+    bottom_pane: &mut BottomPane,
+    chat_widget: &mut chat_widget::ChatWidget,
+    run_control: &crate::cli::turn::local_run_control::LocalRunControl,
+) {
+    match apply_tui_control_event(event, bottom_pane, chat_widget) {
+        UserIntentProjection::Applied => {
+            let TuiAppEvent::UserIntentApplied {
+                intent_id,
+                delivery,
+                status,
+                event_index,
+                content,
+            } = event
+            else {
+                unreachable!("typed applied projection must originate from its applied event");
+            };
+            run_control.record_remotely_applied_user_intent(
+                crate::cli::stream::streaming_types::AppliedStreamUserIntent {
+                    intent_id: intent_id.clone(),
+                    delivery: *delivery,
+                    status: *status,
+                    event_index: *event_index,
+                    content: content.clone(),
+                },
+            );
+        }
+        UserIntentProjection::Returned => {
+            let TuiAppEvent::UserIntentReturned { intent_id, .. } = event else {
+                unreachable!("typed returned projection must originate from its returned event");
+            };
+            run_control.record_remotely_returned_user_intent(intent_id);
+        }
+        UserIntentProjection::None => {}
     }
 }
 
@@ -2604,8 +2993,9 @@ async fn execute_agent_control(
                 return Err("the local runtime that owns this agent is unavailable".into());
             };
             if spawner
-                .cancel_agent(&agent_id, "user-requested via Agent monitor")
+                .cancel_agent_for_user(&agent_id, "user-requested via Agent monitor")
                 .await
+                .owns_local_stop()
             {
                 Ok(AgentControlExecution::Applied)
             } else {
@@ -2846,8 +3236,6 @@ async fn dispatch_projection_actions(
     background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
     server_agent_observer: &crate::tui::server_agent_observer::ServerAgentObserver,
     server_agent_projection_sequence: &mut Option<u64>,
-    task_board: &task_board_observer::TaskBoardObserver,
-    plan_task_observer: &crate::tui::plan_task_observer::PlanTaskObserver,
     backends: ViewActionBackends,
     restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
     chat_widget: &mut chat_widget::ChatWidget,
@@ -2862,8 +3250,6 @@ async fn dispatch_projection_actions(
             background_registry,
             server_agent_observer,
             server_agent_projection_sequence,
-            task_board,
-            plan_task_observer,
             backends.clone(),
             restored_local_agents,
             chat_widget,
@@ -3795,6 +4181,13 @@ fn dispatch_agent_guide(
                     }) if event_run_id == run_id && event_intent_id == intent_id => {
                         return Ok(applied_content);
                     }
+                    Ok(astra_thin_client::StreamEvent::RunUserIntentReturned {
+                        run_id: event_run_id,
+                        intent_id: event_intent_id,
+                        ..
+                    }) if event_run_id == run_id && event_intent_id == intent_id => {
+                        return Err("the agent run ended before applying the guidance; delivery ownership was returned".into());
+                    }
                     Ok(astra_thin_client::StreamEvent::RunFinished { .. })
                     | Ok(astra_thin_client::StreamEvent::RunCancelled { .. }) => {
                         return Err("the agent run ended before a matching applied event".into());
@@ -3871,6 +4264,40 @@ fn rebind_workbench_observers(
     *board_user_pin = None;
 }
 
+/// Apply the server-issued session binding before consuming later stream
+/// events. In particular, a Work lifecycle receipt may arrive in the first
+/// tool round of a newly created conversation; delaying this until turn
+/// settlement leaves its projection detached from the session that owns it.
+fn apply_live_session_binding(
+    event: &TuiAppEvent,
+    chat_widget: &mut chat_widget::ChatWidget,
+    task_board: &task_board_observer::TaskBoardObserver,
+    server_agent_observer: &crate::tui::server_agent_observer::ServerAgentObserver,
+    plan_task_observer: &crate::tui::plan_task_observer::PlanTaskObserver,
+    board_user_pin: &mut Option<bool>,
+) -> bool {
+    let TuiAppEvent::SessionBound(session_id) = event else {
+        return false;
+    };
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return false;
+    }
+    if chat_widget.session_id() == session_id {
+        return false;
+    }
+
+    chat_widget.set_session_id(session_id.to_string());
+    rebind_workbench_observers(
+        Some(session_id),
+        task_board,
+        server_agent_observer,
+        plan_task_observer,
+        board_user_pin,
+    );
+    true
+}
+
 // Central event-loop dispatch deliberately exposes every mutable subsystem it
 // may advance, avoiding an ambient bag that could be retained across awaits.
 #[allow(clippy::too_many_arguments)]
@@ -3879,8 +4306,6 @@ async fn dispatch_bottom_pane_view_action(
     background_registry: &mut super::background_tasks::BackgroundTaskRegistry,
     server_agent_observer: &crate::tui::server_agent_observer::ServerAgentObserver,
     server_agent_projection_sequence: &mut Option<u64>,
-    task_board: &task_board_observer::TaskBoardObserver,
-    plan_task_observer: &crate::tui::plan_task_observer::PlanTaskObserver,
     backends: ViewActionBackends,
     restored_local_agents: &[astra_services::session_workspace::BackgroundLocalAgentTaskProjection],
     chat_widget: &mut chat_widget::ChatWidget,
@@ -4017,25 +4442,6 @@ async fn dispatch_bottom_pane_view_action(
                     bottom_pane,
                     frame_requester,
                 );
-            }
-            frame_requester.schedule_frame();
-        }
-        BottomPaneViewAction::RefreshTaskBoard => {
-            // A task board is a projection over two canonical sources. A
-            // manual refresh asks both to reconcile; neither source is
-            // mutated and an existing request always wins over a duplicate.
-            let refresh_started = task_board.request_refresh();
-            let plan_refresh_started = plan_task_observer.request_refresh();
-            if refresh_started || plan_refresh_started {
-                plan_task_observer.maybe_refresh();
-                let plan_projection = plan_task_observer.projection();
-                task_board.set_projected_task_projection(
-                    plan_projection.tasks,
-                    projected_truth_for_plan_task(plan_projection.truth_state),
-                );
-                task_board.set_projected_multi_summaries(plan_projection.multi_session);
-                task_board.maybe_refresh();
-                bottom_pane.refresh_task_board(&task_board.active_projection());
             }
             frame_requester.schedule_frame();
         }
@@ -4489,13 +4895,9 @@ pub(crate) async fn run_tui_session(
     initial_model: Option<&str>,
     resume_session_id: Option<&str>,
     no_instructions: bool,
-    max_budget: f64,
     cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<(), String> {
-    use crate::cli::session::session_runtime::{
-        initialize_session_state, install_task_service, install_task_store, resolve_task_service,
-        resolve_task_store,
-    };
+    use crate::cli::session::session_runtime::initialize_session_state;
     use crate::cli::session::session_startup::{SessionStartupArtifacts, complete_session_startup};
     use crate::cli::startup_trace::StartupTracer;
 
@@ -4518,14 +4920,6 @@ pub(crate) async fn run_tui_session(
     // frozen startup screen.
     tracer.phase("cached_auth");
     let mut state = initialize_session_state(profile, initial_model, cli_context);
-    let task_service = resolve_task_service(profile).await;
-    install_task_service(&mut state, task_service);
-    let (task_store, task_notify_tx) = resolve_task_store(profile, Some(&api.api_origin())).await;
-    install_task_store(&mut state, task_store);
-    state.task_notify_tx = task_notify_tx.clone();
-    if max_budget > 0.0 {
-        state.max_budget_limit = max_budget;
-    }
     tracer.phase("state_init");
     let startup = complete_session_startup(
         &mut state,
@@ -4666,9 +5060,11 @@ pub(crate) async fn run_tui_session(
     let (slash_background_read_tx, mut slash_background_read_rx) =
         tokio::sync::mpsc::channel::<SlashBackgroundReadCompletion>(8);
     let mut slash_background_read_tasks = tokio::task::JoinSet::new();
-    let mut cancel_control_tasks = tokio::task::JoinSet::new();
     let mut slash_background_read_count = 0usize;
     let mut slash_background_read_generation = 0u64;
+    let (work_start_tx, mut work_start_rx) = tokio::sync::mpsc::channel::<WorkStartCompletion>(2);
+    let mut work_start_tasks = tokio::task::JoinSet::new();
+    let mut work_start_in_flight = false;
     // A single ordered worker owns all derived persistence for completed
     // turns. The canonical journal fsync remains in the foreground turn;
     // workspace/checkpoint/CSL/telemetry projections never do.
@@ -4781,42 +5177,6 @@ pub(crate) async fn run_tui_session(
         chat_widget.commit_system(history_cell::system::SystemCell::info(notice));
     }
 
-    // Resume-time summary is useful but not required to start composing.
-    // Fetch it after terminal ownership is established; a remote task service
-    // can otherwise hold the first interactive frame for its whole transport
-    // timeout.
-    if let (Some(svc), Some(sid)) = (state.task_service.clone(), state.session_id.clone())
-        && !sid.is_empty()
-    {
-        let user_id = state
-            .ingestion_user_id
-            .clone()
-            .unwrap_or_else(|| "local".into());
-        let cutoff = resume_summary::last_seen_cutoff(state.last_turn_event.as_ref())
-            .unwrap_or("")
-            .to_string();
-        let startup_effect_tx = startup_effect_tx.clone();
-        startup_observation_tasks.push(tokio::spawn(async move {
-            match svc
-                .list_recent_tasks_for_session(&user_id, &sid, None)
-                .await
-            {
-                Ok(items) => {
-                    let summary = resume_summary::summarize(&items, &sid, &cutoff);
-                    if !summary.is_empty() {
-                        let _ = startup_effect_tx
-                            .send(StartupUiEffect::ResumeSummary(summary.render()))
-                            .await;
-                    }
-                }
-                Err(error) => tracing::debug!(
-                    target: "astra_cli::tui",
-                    error = %error,
-                    "resume summary: list_recent_tasks failed; skipping banner"
-                ),
-            }
-        }));
-    }
     drop(startup_effect_tx);
     let mut status_indicator = status_indicator::StatusIndicator::new();
     let mut pending_deferred_slash_flush = false;
@@ -4834,25 +5194,21 @@ pub(crate) async fn run_tui_session(
     let mut queued_followup_submissions = VecDeque::<String>::new();
     let mut runtime_notification_turn_pending = false;
     let mut runtime_notification_wake_at: Option<std::time::Instant> = None;
-    let mut last_plan_interrupt: Option<std::time::Instant> = None;
 
-    // Task board observer + toggle state. Observer is tick-driven
-    // (see task_board_observer.rs rationale); no background loop
-    // holding locks across `.await`. Ctrl+T flips the toggle; when
-    // the board transitions from empty to non-empty we auto-open it.
-    let task_board = task_board_observer::TaskBoardObserver::new(
-        state.task_manager.store(),
-        state.session_id.clone().unwrap_or_default(),
-    );
-    // Durable plans are a separate canonical owner from `session_todos`.
-    // The observer only contributes read-only display rows to the shared
-    // Taskboard projection; it never mirrors or writes plan steps as todos.
+    // The task board is a lock-consistent renderer cache. Work observation is
+    // bounded and asynchronous below; drawing never holds a lock across I/O.
+    let task_board =
+        task_board_observer::TaskBoardObserver::new(state.session_id.clone().unwrap_or_default());
+    // Canonical Work remains the board's only authority. The observer performs
+    // bounded reconciliation, while a just-acknowledged server receipt can
+    // make that same authority visible before the next read returns.
     let plan_task_observer = crate::tui::plan_task_observer::PlanTaskObserver::new(
         api.clone(),
         profile,
         state.session_id.as_deref(),
     );
     let mut board_expanded = false;
+    let mut plan_task_projection_sequence = None;
     let server_agent_observer = crate::tui::server_agent_observer::ServerAgentObserver::new(
         api.clone(),
         profile,
@@ -4893,6 +5249,7 @@ pub(crate) async fn run_tui_session(
         dispatch_local_agent_journal_load(session_id.to_string(), agent_workbench_tx.clone());
     }
     let mut next_local_agent_reconcile = std::time::Instant::now() + LOCAL_AGENT_RECONCILE_INTERVAL;
+    let mut next_background_surface_refresh = std::time::Instant::now();
     // User's explicit Ctrl+T choice. `None` = compact baseline;
     // `Some(true|false)` = honour the user's pin until the task list empties.
     let mut board_user_pin: Option<bool> = None;
@@ -4964,6 +5321,47 @@ pub(crate) async fn run_tui_session(
                 bottom_pane.sync_popups();
                 frame_requester.schedule_frame();
             }
+            Some(completion) = work_start_rx.recv() => {
+                work_start_in_flight = false;
+                match completion.result {
+                    Ok(observation) => {
+                        let work_id = observation
+                            .pointer("/overview/work_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("Work");
+                        chat_widget.commit_system(history_cell::system::SystemCell::response(
+                            format!("Work started · {work_id} · Ctrl+T opens tasks"),
+                        ));
+                        if state.session_id.as_deref() == Some(completion.session_id.as_str()) {
+                            board_user_pin = Some(true);
+                            board_expanded = true;
+                            if plan_task_observer.request_refresh() {
+                                plan_task_observer.maybe_refresh();
+                            }
+                            state.pending_bg_notifications.push(
+                                serde_json::json!({
+                                    "type": "canonical_work_started",
+                                    "work_id": work_id,
+                                    "action": "inspect the canonical Work plan, establish a useful task graph when the goal has multiple verifiable steps, and continue the Work"
+                                })
+                                .to_string(),
+                            );
+                            schedule_runtime_notification_wake(
+                                &mut runtime_notification_wake_at,
+                                std::time::Instant::now(),
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        chat_widget.commit_system(history_cell::system::SystemCell::error(
+                            format!("Work could not start: {error}"),
+                        ));
+                    }
+                }
+                let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+                flush_chat_widget(&mut guard, &mut chat_widget, width);
+                frame_requester.schedule_frame();
+            }
             Some(effect) = model_catalog_rx.recv() => {
                 model_catalog_loading = false;
                 pending_deferred_slash_flush = apply_model_catalog_effect(
@@ -4990,10 +5388,7 @@ pub(crate) async fn run_tui_session(
                 frame_requester.schedule_frame();
             }
             Some(effect) = startup_effect_rx.recv() => {
-                if apply_startup_ui_effect(effect, &mut bottom_pane, &mut chat_widget) {
-                    let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
-                    flush_chat_widget(&mut guard, &mut chat_widget, width);
-                }
+                apply_startup_ui_effect(effect, &mut bottom_pane);
                 frame_requester.schedule_frame();
             }
             Some(ev) = event_stream.next() => {
@@ -5051,45 +5446,6 @@ pub(crate) async fn run_tui_session(
                                 .contains(crossterm::event::KeyModifiers::CONTROL)
                             && bottom_pane.composer.is_empty()
                             && !bottom_pane.has_active_view()
-                            && let Some(handle) = state.plan_handle.as_ref()
-                        {
-                            let now = std::time::Instant::now();
-                            let cancel = last_plan_interrupt.is_some_and(|at| {
-                                now.duration_since(at) < Duration::from_secs(2)
-                            });
-                            last_plan_interrupt = Some(now);
-                            let command = if cancel {
-                                crate::cli::plan::plan_executor::PlanCommand::Cancel
-                            } else {
-                                crate::cli::plan::plan_executor::PlanCommand::Pause
-                            };
-                            match handle.send_command(command) {
-                                Ok(()) if cancel => chat_widget.commit_system(
-                                    history_cell::system::SystemCell::response(
-                                        "Cancelling plan…".to_string(),
-                                    ),
-                                ),
-                                Ok(()) => chat_widget.commit_system(
-                                    history_cell::system::SystemCell::response(
-                                        "Pausing plan… press Ctrl+C again within 2s to cancel."
-                                            .to_string(),
-                                    ),
-                                ),
-                                Err(error) => chat_widget.commit_system(
-                                    history_cell::system::SystemCell::error(format!(
-                                        "Could not control plan: {error}"
-                                    )),
-                                ),
-                            }
-                            frame_requester.schedule_frame();
-                            continue;
-                        }
-                        if key.code == crossterm::event::KeyCode::Char('c')
-                            && key
-                                .modifiers
-                                .contains(crossterm::event::KeyModifiers::CONTROL)
-                            && bottom_pane.composer.is_empty()
-                            && !bottom_pane.has_active_view()
                             && slash_background_read_count > 0
                         {
                             let dismissed = slash_background_read_count;
@@ -5126,15 +5482,25 @@ pub(crate) async fn run_tui_session(
                         ) {
                             continue;
                         }
-                        if handle_task_surface_shortcut(
-                            &key,
+                        if is_primary_task_shortcut(&key)
+                            && handle_primary_task_shortcut(
                             &task_board,
+                            Some(&plan_task_observer),
                             &mut board_expanded,
                             &mut board_user_pin,
                             &mut bottom_pane,
                             &frame_requester,
                         )
                         {
+                            continue;
+                        }
+                        if handle_task_surface_refresh_shortcut(
+                            &key,
+                            &plan_task_observer,
+                            board_expanded,
+                            &bottom_pane,
+                            &frame_requester,
+                        ) {
                             continue;
                         }
                         // Ctrl+R: edit last — pull the most recent user
@@ -5241,7 +5607,7 @@ pub(crate) async fn run_tui_session(
                                         let shell_shutdown = session_shutdown_token.clone();
                                         let status = guard
                                             .with_restored(|| async move {
-                                                println!("! {command_for_child}");
+                                                stdout_println!("! {command_for_child}");
                                                 run_interactive_shell_command(
                                                     &command_for_child,
                                                     &shell_shutdown,
@@ -5363,68 +5729,31 @@ pub(crate) async fn run_tui_session(
                                 let mut inline_chat_submit = None;
                                 if let Some(plan_goal) = slash_plan_goal(&text) {
                                     let before = capture_plan_mode_ui_snapshot(&state);
-                                    let Some(token) =
-                                        crate::cli::plan::plan_lifecycle::fresh_token_for_plan(api, profile).await
-                                    else {
-                                        chat_widget.commit_system(
-                                            history_cell::system::SystemCell::error(
-                                                "Not logged in. Use /login.",
-                                            ),
-                                        );
-                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
-                                        finish_submission_feedback(
-                                            &mut bottom_pane,
-                                            &mut status_indicator,
-                                        );
-                                        frame_requester.schedule_frame();
-                                        continue;
-                                    };
-                                    match crate::cli::plan::plan_lifecycle::enter_remote_plan_mode(
-                                        api,
-                                        profile,
-                                        &token,
+                                    crate::cli::slash::slash_plan::enter_local_plan_mode_with_goal(
                                         &mut state,
                                         plan_goal,
-                                    )
-                                    .await
+                                    );
+                                    inline_chat_submit = Some(plan_goal.to_string());
+                                    commit_plan_transition_notice(
+                                        &mut chat_widget,
+                                        &before,
+                                        &state,
+                                        true,
+                                    );
+                                    if let Some(ref sid) = state.session_id
+                                        && chat_widget.session_id() != sid
                                     {
-                                        Ok(_) => {
-                                            inline_chat_submit = Some(plan_goal.to_string());
-                                            commit_plan_transition_notice(
-                                                &mut chat_widget,
-                                                &before,
-                                                &state,
-                                                true,
-                                            );
-                                            if let Some(ref sid) = state.session_id
-                                                && chat_widget.session_id() != sid
-                                            {
-                                                chat_widget.set_session_id(sid.clone());
-                                                rebind_workbench_observers(
-                                                    Some(sid),
-                                                    &task_board,
-                                                    &server_agent_observer,
-                                                    &plan_task_observer,
-                                                    &mut board_user_pin,
-                                                );
-                                            }
-                                            refresh_footer_from_state(&mut bottom_pane, &state);
-                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
-                                        }
-                                        Err(error) => {
-                                            chat_widget.commit_system(
-                                                history_cell::system::SystemCell::error(error),
-                                            );
-                                            refresh_footer_from_state(&mut bottom_pane, &state);
-                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
-                                            finish_submission_feedback(
-                                                &mut bottom_pane,
-                                                &mut status_indicator,
-                                            );
-                                            frame_requester.schedule_frame();
-                                            continue;
-                                        }
+                                        chat_widget.set_session_id(sid.clone());
+                                        rebind_workbench_observers(
+                                            Some(sid),
+                                            &task_board,
+                                            &server_agent_observer,
+                                            &plan_task_observer,
+                                            &mut board_user_pin,
+                                        );
                                     }
+                                    refresh_footer_from_state(&mut bottom_pane, &state);
+                                    flush_chat_widget(&mut guard, &mut chat_widget, w);
                                 }
 
                                 if text.trim_start().starts_with('/')
@@ -5479,15 +5808,30 @@ pub(crate) async fn run_tui_session(
                                                 &frame_requester,
                                             );
                                         }
-                                        slash_dispatch::SlashResult::OpenBackgroundTasks => {
-                                            let _ = force_open_background_task_view(
-                                                &mut background_registry,
-                                                state.agent_spawner.as_ref(),
-                                                &restored_local_agent_task_projections,
-                                                &mut bottom_pane,
+                                        slash_dispatch::SlashResult::OpenWorkTasks => {
+                                            open_work_task_surface(
+                                                &task_board,
+                                                Some(&plan_task_observer),
+                                                &mut board_expanded,
+                                                &mut board_user_pin,
                                                 &frame_requester,
-                                            )
-                                            .await;
+                                            );
+                                        }
+                                        slash_dispatch::SlashResult::StartWork(request) => {
+                                            if work_start_in_flight {
+                                                chat_widget.commit_system(
+                                                    history_cell::system::SystemCell::warning(
+                                                        "Work is already starting for this conversation.",
+                                                    ),
+                                                );
+                                            } else {
+                                                work_start_in_flight = true;
+                                                dispatch_work_start(
+                                                    *request,
+                                                    work_start_tx.clone(),
+                                                    &mut work_start_tasks,
+                                                );
+                                            }
                                         }
                                         slash_dispatch::SlashResult::BackgroundRead(action) => {
                                             slash_background_read_count += 1;
@@ -5557,285 +5901,33 @@ pub(crate) async fn run_tui_session(
                                     );
                                     frame_requester.schedule_frame();
                                 } else {
-                                    let submit_was_inline_plan_goal = inline_chat_submit.is_some();
                                     let submit_text = inline_chat_submit.unwrap_or(text);
                                     if !runtime_notification_submission
                                         && crate::cli::plan::plan_lifecycle::looks_like_pending_local_plan_entry(
                                             &state,
                                         )
                                     {
-                                        let Some(token) =
-                                            crate::cli::plan::plan_lifecycle::fresh_token_for_plan(api, profile)
-                                                .await
-                                        else {
-                                            chat_widget.commit_system(
-                                                history_cell::system::SystemCell::error(
-                                                    "Not logged in. Use /login.",
-                                                ),
-                                            );
-                                            refresh_footer_from_state(&mut bottom_pane, &state);
-                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
-                                            finish_submission_feedback(
-                                                &mut bottom_pane,
-                                                &mut status_indicator,
-                                            );
-                                            frame_requester.schedule_frame();
-                                            continue;
-                                        };
-                                        match crate::cli::plan::plan_lifecycle::enter_remote_plan_mode(
-                                            api,
-                                            profile,
-                                            &token,
+                                        crate::cli::slash::slash_plan::enter_local_plan_mode_with_goal(
                                             &mut state,
                                             &submit_text,
-                                        )
-                                        .await
+                                        );
+                                        // After bare `/plan`, the first plain message is the
+                                        // user's real planning goal. Don't insert a synthetic
+                                        // system line above the actual planning/model output.
+                                        if let Some(ref sid) = state.session_id
+                                            && chat_widget.session_id() != sid
                                         {
-                                            Ok(_) => {
-                                                // After bare `/plan`, the first plain message is
-                                                // the user's real planning goal. Don't insert a
-                                                // synthetic `Plan goal set ...` system line above
-                                                // the actual planning/model output.
-                                                if let Some(ref sid) = state.session_id
-                                                    && chat_widget.session_id() != sid
-                                                {
-                                                    chat_widget.set_session_id(sid.clone());
-                                                    rebind_workbench_observers(
-                                                        Some(sid),
-                                                        &task_board,
-                                                        &server_agent_observer,
-                                                        &plan_task_observer,
-                                                        &mut board_user_pin,
-                                                    );
-                                                }
-                                                refresh_footer_from_state(&mut bottom_pane, &state);
-                                                flush_chat_widget(&mut guard, &mut chat_widget, w);
-                                            }
-                                            Err(error) => {
-                                                chat_widget.commit_system(
-                                                    history_cell::system::SystemCell::error(error),
-                                                );
-                                                refresh_footer_from_state(&mut bottom_pane, &state);
-                                                flush_chat_widget(&mut guard, &mut chat_widget, w);
-                                                finish_submission_feedback(
-                                                    &mut bottom_pane,
-                                                    &mut status_indicator,
-                                                );
-                                                frame_requester.schedule_frame();
-                                                continue;
-                                            }
+                                            chat_widget.set_session_id(sid.clone());
+                                            rebind_workbench_observers(
+                                                Some(sid),
+                                                &task_board,
+                                                &server_agent_observer,
+                                                &plan_task_observer,
+                                                &mut board_user_pin,
+                                            );
                                         }
-                                    } else {
-                                        if !submit_was_inline_plan_goal {
-                                            if let Some(plan_command) =
-                                                crate::cli::plan::plan_commands::parse_plan_command(&submit_text)
-                                                    .filter(|command| {
-                                                        crate::cli::plan::plan_commands::is_plan_command_available(
-                                                            &state, command,
-                                                        )
-                                                    })
-                                            {
-                                                match plan_command {
-                                                    crate::cli::plan::plan_commands::ParsedPlanCommand::Go => {
-                                                        let go_result = async {
-                                                            let Some(token) =
-                                                                crate::cli::plan::plan_lifecycle::fresh_token_for_plan(
-                                                                    api, profile,
-                                                                )
-                                                                .await
-                                                            else {
-                                                                return Err(
-                                                                    "Not logged in. Use /login."
-                                                                        .to_string(),
-                                                                );
-                                                            };
-                                                            crate::cli::plan::plan_commands::prepare_plan_execution(
-                                                                &mut state, api, &token,
-                                                            )
-                                                            .await?;
-                                                            crate::cli::plan::plan_runtime::start_plan_executor(
-                                                                &mut state,
-                                                                Some(&token),
-                                                                api,
-                                                                profile,
-                                                            )
-                                                            .await
-                                                        }
-                                                        .await;
-                                                        let plan_started = go_result.is_ok();
-                                                        match go_result {
-                                                            Ok(()) => {
-                                                                chat_widget.commit_system(
-                                                                    history_cell::system::SystemCell::response(
-                                                                        "Plan started in the workbench · Ctrl+C pauses · Ctrl+O opens its live transcript.".to_string(),
-                                                                    ),
-                                                                );
-                                                                let now = std::time::Instant::now();
-                                                                bottom_pane.set_task_status(TaskStatus::WaitingModel);
-                                                                status_indicator.begin_turn(now);
-                                                                status_indicator.set_state(
-                                                                    status_indicator::IndicatorState::WaitingModel {
-                                                                        started_at: now,
-                                                                    },
-                                                                );
-                                                            }
-                                                            Err(error) => {
-                                                                chat_widget.commit_system(
-                                                                    history_cell::system::SystemCell::error(
-                                                                        error,
-                                                                    ),
-                                                                );
-                                                            }
-                                                        }
-                                                        refresh_footer_from_state(
-                                                            &mut bottom_pane,
-                                                            &state,
-                                                        );
-                                                        flush_chat_widget(
-                                                            &mut guard,
-                                                            &mut chat_widget,
-                                                            w,
-                                                        );
-                                                        if !plan_started {
-                                                            finish_submission_feedback(
-                                                                &mut bottom_pane,
-                                                                &mut status_indicator,
-                                                            );
-                                                        }
-                                                        frame_requester.schedule_frame();
-                                                        continue;
-                                                    }
-                                                    crate::cli::plan::plan_commands::ParsedPlanCommand::Show => {
-                                                        match crate::cli::plan::plan_commands::render_plan_snapshot(
-                                                            &state,
-                                                        ) {
-                                                            Ok(message) => chat_widget.commit_system(
-                                                                history_cell::system::SystemCell::response(
-                                                                    message,
-                                                                ),
-                                                            ),
-                                                            Err(error) => chat_widget.commit_system(
-                                                                history_cell::system::SystemCell::error(
-                                                                    error,
-                                                                ),
-                                                            ),
-                                                        }
-                                                        refresh_footer_from_state(
-                                                            &mut bottom_pane,
-                                                            &state,
-                                                        );
-                                                        flush_chat_widget(
-                                                            &mut guard,
-                                                            &mut chat_widget,
-                                                            w,
-                                                        );
-                                                        finish_submission_feedback(
-                                                            &mut bottom_pane,
-                                                            &mut status_indicator,
-                                                        );
-                                                        frame_requester.schedule_frame();
-                                                        continue;
-                                                    }
-                                                    crate::cli::plan::plan_commands::ParsedPlanCommand::Rewind {
-                                                        anchor,
-                                                    } => {
-                                                        let token =
-                                                            crate::cli::plan::plan_lifecycle::fresh_token_for_plan(
-                                                                api, profile,
-                                                            )
-                                                            .await;
-                                                        match crate::cli::plan::plan_commands::rewind_plan(
-                                                            &mut state,
-                                                            api,
-                                                            token.as_deref(),
-                                                            &anchor,
-                                                        )
-                                                        .await
-                                                        {
-                                                            Ok(message) => chat_widget.commit_system(
-                                                                history_cell::system::SystemCell::response(
-                                                                    message,
-                                                                ),
-                                                            ),
-                                                            Err(error) => chat_widget.commit_system(
-                                                                history_cell::system::SystemCell::error(
-                                                                    error,
-                                                                ),
-                                                            ),
-                                                        }
-                                                        refresh_footer_from_state(
-                                                            &mut bottom_pane,
-                                                            &state,
-                                                        );
-                                                        flush_chat_widget(
-                                                            &mut guard,
-                                                            &mut chat_widget,
-                                                            w,
-                                                        );
-                                                        finish_submission_feedback(
-                                                            &mut bottom_pane,
-                                                            &mut status_indicator,
-                                                        );
-                                                        frame_requester.schedule_frame();
-                                                        continue;
-                                                    }
-                                                    crate::cli::plan::plan_commands::ParsedPlanCommand::AddCorrection { .. }
-                                                    | crate::cli::plan::plan_commands::ParsedPlanCommand::ClearCorrections => {
-                                                        match crate::cli::plan::plan_commands::apply_plan_correction(
-                                                            &mut state,
-                                                            &plan_command,
-                                                        ) {
-                                                            Ok(message) => chat_widget.commit_system(
-                                                                history_cell::system::SystemCell::response(
-                                                                    message,
-                                                                ),
-                                                            ),
-                                                            Err(error) => chat_widget.commit_system(
-                                                                history_cell::system::SystemCell::error(
-                                                                    error,
-                                                                ),
-                                                            ),
-                                                        }
-                                                        refresh_footer_from_state(
-                                                            &mut bottom_pane,
-                                                            &state,
-                                                        );
-                                                        flush_chat_widget(
-                                                            &mut guard,
-                                                            &mut chat_widget,
-                                                            w,
-                                                        );
-                                                        finish_submission_feedback(
-                                                            &mut bottom_pane,
-                                                            &mut status_indicator,
-                                                        );
-                                                        frame_requester.schedule_frame();
-                                                        continue;
-                                                    }
-                                                }
-                                            }
-                                            if state.executing_plan.is_some()
-                                                && !state.plan_mode_active()
-                                                && crate::cli::plan::plan_commands::abandon_plan_execution(
-                                                    &mut state,
-                                                )
-                                            {
-                                                chat_widget.commit_system(
-                                                    history_cell::system::SystemCell::info(
-                                                        "Paused plan abandoned — continuing with normal chat.".to_string(),
-                                                    ),
-                                                );
-                                                refresh_footer_from_state(
-                                                    &mut bottom_pane,
-                                                    &state,
-                                                );
-                                                flush_chat_widget(
-                                                    &mut guard,
-                                                    &mut chat_widget,
-                                                    w,
-                                                );
-                                            }
-                                        }
+                                        refresh_footer_from_state(&mut bottom_pane, &state);
+                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
                                     }
 
                                     let turn_start = std::time::Instant::now();
@@ -5853,6 +5945,7 @@ pub(crate) async fn run_tui_session(
                                     let mut turn_tool_count: u32 = 0;
                                     let mut turn_ttft: Option<std::time::Instant> = None;
                                     let mut output_settled_at: Option<std::time::Instant> = None;
+                                    let mut turn_projection_drained = false;
                                     let mut exit_after_turn_settlement = false;
                                     let mut explain_items: Vec<serde_json::Value> = Vec::new();
                                     // Phase 3b.3c: prime the bash detach slot for this
@@ -5876,6 +5969,7 @@ pub(crate) async fn run_tui_session(
                                     ) = tokio::sync::mpsc::unbounded_channel::<
                                         BashDetachHandoffResult,
                                     >();
+                                    let mut bash_detach_handoff_channel_open = true;
                                     let mut bash_detach_request_pending = false;
                                     let mut active_bash_tool_use_id: Option<String> = None;
                                     let mut active_bash_description: Option<String> = None;
@@ -5883,21 +5977,42 @@ pub(crate) async fn run_tui_session(
                                         std::collections::BTreeMap::<String, (String, String)>::new();
                                     let mut background_handoff_tool_ids =
                                         std::collections::HashSet::<String>::new();
+                                    // Once Ctrl+B transfers lifecycle ownership away from
+                                    // the foreground parent, that parent is no longer a valid
+                                    // guidance target. Composer input after the handoff belongs
+                                    // to the next turn even while the cancelled parent future is
+                                    // still draining its final transport events.
+                                    let mut foreground_lifecycle_transferred = false;
                                     let mut deferred_active_bg_notifications = Vec::new();
 
-                                    let turn_tx = stream_bridge::create_per_turn_bridge(tui_tx.clone());
+                                    let (turn_tx, turn_stream_bridge_control) =
+                                        stream_bridge::create_controlled_per_turn_bridge(
+                                            tui_tx.clone(),
+                                        );
                                     let live_sink = stream_bridge::create_agent_live_sink(tui_tx.clone());
                                     state.tui_stream_event_tx = Some(turn_tx);
                                     state.tui_agent_live_event_sink = Some(live_sink);
+                                    // The durable server run identity arrives on the accepted
+                                    // stream. Keep it turn-scoped and share only that typed
+                                    // identity with composer submissions; local execution state
+                                    // is not evidence that the server accepted guidance.
+                                    let active_remote_run_id = std::sync::Arc::new(
+                                        std::sync::Mutex::new(None::<String>),
+                                    );
+                                    let (
+                                        guidance_submission_tx,
+                                        mut guidance_submission_rx,
+                                    ) = tokio::sync::mpsc::channel::<
+                                        ActiveRunGuidanceSubmission,
+                                    >(1);
+                                    let mut guidance_submission_in_flight = false;
+                                    let mut guidance_submission_task: Option<
+                                        tokio::task::JoinHandle<()>,
+                                    > = None;
+                                    let mut guidance_closure_deadline: Option<tokio::time::Instant> =
+                                        None;
 
                                     let turn_result = {
-                                        // Snapshot the Arc<dyn TaskService> before the
-                                        // turn borrows `state` mutably — Ctrl+C still
-                                        // needs to issue cancel RPCs for in-flight
-                                        // sub-agents, and the mutable borrow prevents
-                                        // us from reaching through `state` inside the
-                                        // inner select.
-                                        let task_service_for_cancel = state.task_service.clone();
                                         let agent_spawner_for_cancel = state.agent_spawner.clone();
                                         let delegation_engine_for_control =
                                             state.delegation_engine.clone();
@@ -5919,6 +6034,8 @@ pub(crate) async fn run_tui_session(
                                             state.bg_task_list_cache.clone();
                                         let active_work_registry_for_turn =
                                             state.active_work_registry.clone();
+                                        let active_session_hub_snapshot =
+                                            slash_dispatch::session_hub_snapshot(&state);
                                         let ctx = crate::cli::turn::turn_entry::TurnContext {
                                             api,
                                             profile,
@@ -5953,11 +6070,79 @@ pub(crate) async fn run_tui_session(
                                         tokio::pin!(fut);
 
                                         let mut turn_result_ready: Option<Result<(), String>> = None;
+                                        let mut terminal_mode_closure_started = false;
                                         let r: Result<(), String> = loop {
-                                            if let Err(e) = guard.ensure_tui_modes() {
-                                                break Err(format!(
-                                                    "failed to restore terminal input mode: {e}"
-                                                ));
+                                            if !terminal_mode_closure_started
+                                                && let Err(e) = guard.ensure_tui_modes()
+                                            {
+                                                terminal_mode_closure_started = true;
+                                                begin_turn_result_closure(
+                                                    &turn_stream_bridge_control,
+                                                    &mut turn_result_ready,
+                                                    Err(format!(
+                                                        "failed to restore terminal input mode: {e}"
+                                                    )),
+                                                );
+                                                continue;
+                                            }
+                                            let closure_barriers = TurnClosureBarriers::capture(
+                                                &preinstalled_run_control,
+                                                guidance_submission_in_flight,
+                                                bash_detach_request_pending,
+                                                turn_result_ready.is_some()
+                                                    && !turn_projection_drained,
+                                            );
+                                            if turn_result_ready.is_some()
+                                                && closure_barriers.guidance_pending()
+                                                && guidance_closure_deadline.is_none()
+                                            {
+                                                guidance_closure_deadline = Some(
+                                                    tokio::time::Instant::now()
+                                                        + ACTIVE_RUN_GUIDANCE_CLOSURE_TIMEOUT,
+                                                );
+                                            }
+                                            if let Some(result) =
+                                                take_ready_result_if_all_closure_barriers_clear(
+                                                    &mut turn_result_ready,
+                                                    closure_barriers,
+                                                )
+                                            {
+                                                break result;
+                                            }
+                                            if turn_result_ready.is_some()
+                                                && guidance_closure_deadline.is_some()
+                                            {
+                                                if !active_guidance_closure_pending(
+                                                    &preinstalled_run_control,
+                                                    guidance_submission_in_flight,
+                                                ) {
+                                                    guidance_closure_deadline = None;
+                                                }
+                                                if let Some(unconfirmed_ids) =
+                                                    expire_guidance_closure_as_unconfirmed(
+                                                        &preinstalled_run_control,
+                                                        guidance_closure_deadline,
+                                                        tokio::time::Instant::now(),
+                                                    )
+                                                {
+                                                    if let Some(task) = guidance_submission_task.take()
+                                                    {
+                                                        task.abort();
+                                                    }
+                                                    guidance_submission_in_flight = false;
+                                                    for intent_id in unconfirmed_ids {
+                                                        bottom_pane
+                                                            .mark_user_intent_unconfirmed(&intent_id);
+                                                    }
+                                                    chat_widget.commit_system(
+                                                        history_cell::system::SystemCell::info(
+                                                            "Guidance reconciliation did not finish before the bounded turn handoff. Its stable identity remains unconfirmed and will not be replayed as a new turn."
+                                                                .to_string(),
+                                                        ),
+                                                    );
+                                                    guidance_closure_deadline = None;
+                                                    continue;
+                                                }
                                             }
                                             let itick = tokio::time::sleep(Duration::from_millis(80));
                                             tokio::pin!(itick);
@@ -5968,11 +6153,62 @@ pub(crate) async fn run_tui_session(
                                                 // Fair selection keeps key storms from starving a
                                                 // ready Bash handoff or runtime event.
                                                 result = &mut fut, if turn_result_ready.is_none() => {
-                                                    if bash_detach_request_pending {
-                                                        turn_result_ready = Some(result);
-                                                        continue;
+                                                    begin_turn_result_closure(
+                                                        &turn_stream_bridge_control,
+                                                        &mut turn_result_ready,
+                                                        result,
+                                                    );
+                                                    continue;
+                                                }
+                                                Some(submission) = guidance_submission_rx.recv() => {
+                                                    guidance_submission_in_flight = false;
+                                                    guidance_submission_task = None;
+                                                    match submission.result {
+                                                        Ok(receipt) => {
+                                                            debug_assert_eq!(receipt.intent_id, submission.intent_id);
+                                                            bottom_pane.promote_user_intent_accepted(
+                                                                &submission.intent_id,
+                                                            );
+                                                            let _ = spawn_primary_guidance_reconciliation(
+                                                                api.clone(),
+                                                                profile.map(str::to_string),
+                                                                tui_tx.clone(),
+                                                                preinstalled_run_control.clone(),
+                                                                receipt,
+                                                            );
+                                                            chat_widget.commit_concurrent_system(
+                                                                history_cell::system::SystemCell::runtime_control(
+                                                                    "Guidance accepted; not yet applied. It replaces stale work before next unstarted action."
+                                                                        .to_string(),
+                                                                ),
+                                                            );
+                                                        }
+                                                        Err(GuidanceSubmissionError::Rejected(error)) => {
+                                                            preinstalled_run_control.release_remote_user_intent_submission(
+                                                                &submission.intent_id,
+                                                            );
+                                                            bottom_pane.remove_local_user_intent(&submission.intent_id);
+                                                            bottom_pane.restore_into_composer(&submission.text);
+                                                            chat_widget.commit_system(
+                                                                history_cell::system::SystemCell::error(error),
+                                                            );
+                                                        }
+                                                        Err(GuidanceSubmissionError::Unconfirmed(error)) => {
+                                                            preinstalled_run_control.release_remote_user_intent_submission(
+                                                                &submission.intent_id,
+                                                            );
+                                                            bottom_pane.mark_user_intent_unconfirmed(&submission.intent_id);
+                                                            chat_widget.commit_system(
+                                                                history_cell::system::SystemCell::info(format!(
+                                                                    "Guidance delivery could not be confirmed. Its stable identity is retained and will not be resent as another turn. ({error})"
+                                                                )),
+                                                            );
+                                                        }
                                                     }
-                                                    break result;
+                                                    let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                                    flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                                    frame_requester.schedule_frame();
+                                                    continue;
                                                 }
                                                 // Keep the UI live while a completed turn is still
                                                 // waiting for Bash background-handoff adoption. The
@@ -6127,6 +6363,7 @@ pub(crate) async fn run_tui_session(
                                                                             &handoff_message,
                                                                         ),
                                                                     );
+                                                                    foreground_lifecycle_transferred = true;
                                                                     tui_cancel_token.cancel();
                                                                 }
 
@@ -6165,15 +6402,25 @@ pub(crate) async fn run_tui_session(
                                                             ) {
                                                                 continue;
                                                             }
-                                                            if handle_task_surface_shortcut(
-                                                                &k,
+                                                            if is_primary_task_shortcut(&k)
+                                                                && handle_primary_task_shortcut(
                                                                 &task_board,
+                                                                Some(&plan_task_observer),
                                                                 &mut board_expanded,
                                                                 &mut board_user_pin,
                                                                 &mut bottom_pane,
                                                                 &frame_requester,
                                                             )
                                                             {
+                                                                continue;
+                                                            }
+                                                            if handle_task_surface_refresh_shortcut(
+                                                                &k,
+                                                                &plan_task_observer,
+                                                                board_expanded,
+                                                                &bottom_pane,
+                                                                &frame_requester,
+                                                            ) {
                                                                 continue;
                                                             }
                                                             // During turn: composer stays usable.
@@ -6196,8 +6443,6 @@ pub(crate) async fn run_tui_session(
                                                                                             &mut chat_widget,
                                                                                             &mut bottom_pane,
                                                                                             &mut status_indicator,
-                                                                                            &mut cancel_control_tasks,
-                                                                                            task_service_for_cancel.as_ref(),
                                                                                             &preinstalled_run_control,
                                                                                             &tui_cancel_token,
                                                                                         );
@@ -6228,8 +6473,6 @@ pub(crate) async fn run_tui_session(
                                                                                         &mut chat_widget,
                                                                                         &mut bottom_pane,
                                                                                         &mut status_indicator,
-                                                                                        &mut cancel_control_tasks,
-                                                                                        task_service_for_cancel.as_ref(),
                                                                                         &preinstalled_run_control,
                                                                                         &tui_cancel_token,
                                                                                     );
@@ -6304,7 +6547,41 @@ pub(crate) async fn run_tui_session(
                                                                                 continue;
                                                                             }
                                                                         }
-                                                                        if output_settled_at.is_some() {
+                                                                        if let Some(action) =
+                                                                            slash_dispatch::active_run_concurrent_read(
+                                                                                &queued_text,
+                                                                                &active_session_hub_snapshot,
+                                                                            )
+                                                                        {
+                                                                            commit_submission_projection(
+                                                                                &mut chat_widget,
+                                                                                &queued_text,
+                                                                            );
+                                                                            chat_widget.commit_system(
+                                                                                history_cell::system::SystemCell::response(
+                                                                                    "Loading session overview…",
+                                                                                ),
+                                                                            );
+                                                                            slash_background_read_count += 1;
+                                                                            dispatch_slash_background_read(
+                                                                                action,
+                                                                                slash_background_read_generation,
+                                                                                slash_background_read_tx.clone(),
+                                                                                &mut slash_background_read_tasks,
+                                                                            );
+                                                                            flush_chat_widget(
+                                                                                &mut guard,
+                                                                                &mut chat_widget,
+                                                                                w,
+                                                                            );
+                                                                            frame_requester.schedule_frame();
+                                                                            continue;
+                                                                        }
+                                                                        if active_submission_belongs_to_next_turn(
+                                                                            &queued_text,
+                                                                            output_settled_at.is_some(),
+                                                                            foreground_lifecycle_transferred,
+                                                                        ) {
                                                                             // The response stream has ended, so this
                                                                             // is a real next-turn message rather than
                                                                             // guidance for a run that can no longer
@@ -6315,16 +6592,17 @@ pub(crate) async fn run_tui_session(
                                                                             frame_requester.schedule_frame();
                                                                             continue;
                                                                         }
-                                                                        // The live agent strip is updated by streamed child events,
-                                                                        // while `local_agent_snapshot` advances on a bounded polling
-                                                                        // cadence. Capture the producer directly at this acceptance
-                                                                        // boundary so the immediate receipt cannot report older slot
-                                                                        // counts than the UI the user just acted on.
-                                                                        let guidance_agent_snapshot =
-                                                                            super::local_agent_snapshot::LocalAgentSnapshot::capture(
-                                                                                agent_spawner_for_cancel.as_ref(),
-                                                                            )
-                                                                            .await;
+                                                                        if guidance_submission_in_flight {
+                                                                            bottom_pane.restore_into_composer(&queued_text);
+                                                                            chat_widget.commit_system(
+                                                                                history_cell::system::SystemCell::info(
+                                                                                    "Another guidance message is still being submitted. Wait for its acknowledgement before sending another."
+                                                                                        .to_string(),
+                                                                                ),
+                                                                            );
+                                                                            frame_requester.schedule_frame();
+                                                                            continue;
+                                                                        }
                                                                         let active_work_snapshot =
                                                                             bg_task_list_cache_for_turn
                                                                                 .read()
@@ -6333,50 +6611,66 @@ pub(crate) async fn run_tui_session(
                                                                         let active_work_observations =
                                                                             active_work_registry_for_turn
                                                                                 .active_work_observations();
-                                                                        match submit_active_run_guidance(
-                                                                            &active_turn_local_run_control,
-                                                                            &queued_text,
-                                                                            Some(&active_work_snapshot),
-                                                                            &active_work_observations,
-                                                                        )
-                                                                        .await
-                                                                        {
-                                                                                Ok(receipt) => {
-                                                                                    bottom_pane.accept_user_intent(
-                                                                                        receipt.intent_id,
-                                                                                        receipt.delivery,
-                                                                                        receipt.status,
-                                                                                        queued_text,
-                                                                                    );
-                                                                                    chat_widget.commit_concurrent_system(
-                                                                                        history_cell::system::SystemCell::runtime_work(
-                                                                                            guidance_agent_snapshot.active_guidance_receipt(),
-                                                                                        ),
-                                                                                    );
-                                                                                    // Guidance is accepted while the foreground
-                                                                                    // tool still owns the turn, so no normal
-                                                                                    // stream event may arrive for several seconds.
-                                                                                    // Explicitly wake the renderer instead of
-                                                                                    // leaving the receipt buffered behind fan-in.
-                                                                                    // Committed history is rendered through the
-                                                                                    // terminal scrollback queue, independently of
-                                                                                    // the live frame. Drain it now as well as
-                                                                                    // requesting a frame; otherwise the receipt is
-                                                                                    // invisible until the foreground tool commits.
-                                                                                    flush_chat_widget(
-                                                                                        &mut guard,
-                                                                                        &mut chat_widget,
-                                                                                        w,
-                                                                                    );
-                                                                                    frame_requester.schedule_frame();
-                                                                                }
-                                                                            Err(error) => {
-                                                                                bottom_pane.composer.set_text(&queued_text);
-                                                                                chat_widget.commit_system(
-                                                                                    history_cell::system::SystemCell::error(error),
-                                                                                );
-                                                                            }
+                                                                        let intent_id = format!(
+                                                                            "intent_{}",
+                                                                            uuid::Uuid::now_v7().simple()
+                                                                        );
+                                                                        if !bottom_pane.accept_user_intent(
+                                                                            intent_id.clone(),
+                                                                            astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                                                                            astra_turn_types::UserIntentStatus::AcceptedLocal,
+                                                                            queued_text.clone(),
+                                                                        ) {
+                                                                            bottom_pane.restore_into_composer(&queued_text);
+                                                                            chat_widget.commit_system(
+                                                                                history_cell::system::SystemCell::error(
+                                                                                    "Could not establish local ownership for this guidance.",
+                                                                                ),
+                                                                            );
+                                                                            continue;
                                                                         }
+                                                                        // Project local custody before awaiting the network.
+                                                                        // The user can now distinguish "sending" from a
+                                                                        // server-owned intent, and an ambiguous response cannot
+                                                                        // silently turn the same bytes into a second submission.
+                                                                        flush_chat_widget(
+                                                                            &mut guard,
+                                                                            &mut chat_widget,
+                                                                            w,
+                                                                        );
+                                                                        frame_requester.schedule_frame();
+                                                                        let submission_api = api.clone();
+                                                                        let submission_profile = profile.map(str::to_string);
+                                                                        let submission_run_id = active_remote_run_id.clone();
+                                                                        let submission_run_control = std::sync::Arc::downgrade(
+                                                                            &preinstalled_run_control,
+                                                                        );
+                                                                        let submission_intent_id = intent_id.clone();
+                                                                        let submission_text = queued_text.clone();
+                                                                        let submission_tx = guidance_submission_tx.clone();
+                                                                        preinstalled_run_control
+                                                                            .expect_remote_user_intent_submission(&intent_id);
+                                                                        guidance_submission_in_flight = true;
+                                                                        guidance_submission_task = Some(tokio::spawn(async move {
+                                                                            let result = submit_active_run_guidance(
+                                                                                &submission_api,
+                                                                                submission_profile.as_deref(),
+                                                                                &submission_run_id,
+                                                                                &submission_run_control,
+                                                                                &submission_intent_id,
+                                                                                &submission_text,
+                                                                                Some(&active_work_snapshot),
+                                                                                &active_work_observations,
+                                                                            )
+                                                                            .await;
+                                                                            let _ = submission_tx
+                                                                                .send(ActiveRunGuidanceSubmission {
+                                                                                    intent_id: submission_intent_id,
+                                                                                    text: submission_text,
+                                                                                    result,
+                                                                                })
+                                                                                .await;
+                                                                        }));
                                                                     }
                                                                     BottomPaneAction::ExternalEditorUnavailable => {
                                                                         surface_external_editor_unavailable(
@@ -6399,8 +6693,6 @@ pub(crate) async fn run_tui_session(
                                                                             &mut background_registry,
                                                                             &server_agent_observer,
                                                                             &mut server_agent_projection_sequence,
-                                                                            &task_board,
-                                                                            &plan_task_observer,
                                                                             ViewActionBackends {
                                                                                 agent_spawner: agent_spawner_for_cancel.clone(),
                                                                                 delegation_engine: delegation_engine_for_control.clone(),
@@ -6488,8 +6780,6 @@ pub(crate) async fn run_tui_session(
                                                                             &mut chat_widget,
                                                                             &mut bottom_pane,
                                                                             &mut status_indicator,
-                                                                            &mut cancel_control_tasks,
-                                                                            task_service_for_cancel.as_ref(),
                                                                             &preinstalled_run_control,
                                                                             &tui_cancel_token,
                                                                         );
@@ -6585,11 +6875,12 @@ pub(crate) async fn run_tui_session(
                                                         }
                                                     }
                                                 }
-                                                handoff = bash_detach_handoff_rx.recv() => {
+                                                handoff = bash_detach_handoff_rx.recv(), if bash_detach_handoff_channel_open => {
                                                     bash_detach_request_pending = false;
                                                     let handoff = match handoff {
                                                         Some(handoff) => handoff,
                                                         None => {
+                                                            bash_detach_handoff_channel_open = false;
                                                             tracing::warn!(
                                                                 "bash detach handoff channel closed without payload"
                                                             );
@@ -6604,9 +6895,6 @@ pub(crate) async fn run_tui_session(
                                                                 false,
                                                             );
                                                             frame_requester.schedule_frame();
-                                                            if let Some(result) = turn_result_ready.take() {
-                                                                break result;
-                                                            }
                                                             continue;
                                                         }
                                                     };
@@ -6637,9 +6925,6 @@ pub(crate) async fn run_tui_session(
                                                                     false,
                                                                 );
                                                                 frame_requester.schedule_frame();
-                                                                if let Some(result) = turn_result_ready.take() {
-                                                                    break result;
-                                                                }
                                                                 continue;
                                                             }
 
@@ -6662,6 +6947,7 @@ pub(crate) async fn run_tui_session(
                                                             ) {
                                                                 Ok(id) => {
                                                                     let _ = adoption_tx.send(Ok(id.clone()));
+                                                                    foreground_lifecycle_transferred = true;
                                                                     id
                                                                 }
                                                                 Err(error) => {
@@ -6689,9 +6975,6 @@ pub(crate) async fn run_tui_session(
                                                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                                                     flush_chat_widget(&mut guard, &mut chat_widget, w);
                                                                     frame_requester.schedule_frame();
-                                                                    if let Some(result) = turn_result_ready.take() {
-                                                                        break result;
-                                                                    }
                                                                     continue;
                                                                 }
                                                             };
@@ -6741,17 +7024,52 @@ pub(crate) async fn run_tui_session(
                                                     let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                                     flush_chat_widget(&mut guard, &mut chat_widget, w);
                                                     frame_requester.schedule_frame();
-                                                    if let Some(result) = turn_result_ready.take() {
-                                                        break result;
-                                                    }
                                                     continue;
                                                 }
                                                 Some(ae) = tui_rx.recv() => {
+                                                    if let TuiAppEvent::RunBound(run_id) = &ae {
+                                                        let mut bound = astra_core::sync_poison::recover_mutex_lock(
+                                                            &active_remote_run_id,
+                                                        );
+                                                        match bound.as_deref() {
+                                                            None => *bound = Some(run_id.clone()),
+                                                            Some(existing) if existing != run_id => {
+                                                                tracing::warn!(
+                                                                    bound_run_id = existing,
+                                                                    conflicting_run_id = run_id,
+                                                                    "ignored conflicting active-run binding"
+                                                                );
+                                                            }
+                                                            Some(_) => {}
+                                                        }
+                                                    }
+                                                    if apply_live_session_binding(
+                                                        &ae,
+                                                        &mut chat_widget,
+                                                        &task_board,
+                                                        &server_agent_observer,
+                                                        &plan_task_observer,
+                                                        &mut board_user_pin,
+                                                    ) {
+                                                        frame_requester.schedule_frame();
+                                                    }
                                                     if matches!(
                                                         &ae,
                                                         TuiAppEvent::ToolCompleted { tool_use_id, .. }
                                                             if background_handoff_tool_ids.contains(tool_use_id)
                                                     ) {
+                                                        continue;
+                                                    }
+                                                    if matches!(
+                                                        &ae,
+                                                        TuiAppEvent::TurnProjectionDrained
+                                                    ) {
+                                                        // The bridge closed producer admission and
+                                                        // forwarded every accepted event before
+                                                        // this marker. Dangling tool projections are
+                                                        // finalized by the immediately following
+                                                        // TurnComplete/TurnError reducer.
+                                                        turn_projection_drained = true;
                                                         continue;
                                                     }
                                                     if matches!(
@@ -6787,12 +7105,15 @@ pub(crate) async fn run_tui_session(
                                                         frame_requester.schedule_frame();
                                                         continue;
                                                     }
-                                                    // Track per-turn metrics
+                                                    // Track per-turn metrics. TTFT is the first
+                                                    // model-originated content, which can be
+                                                    // reasoning or a tool call before answer text.
+                                                    if turn_ttft.is_none()
+                                                        && starts_model_output(&ae)
+                                                    {
+                                                        turn_ttft = Some(std::time::Instant::now());
+                                                    }
                                                     match &ae {
-                                                        TuiAppEvent::Token(_)
-                                                            if turn_ttft.is_none() => {
-                                                                turn_ttft = Some(std::time::Instant::now());
-                                                            }
                                                         TuiAppEvent::ToolStarted { .. } => {
                                                             turn_tool_count += 1;
                                                         }
@@ -6845,10 +7166,11 @@ pub(crate) async fn run_tui_session(
                                                             &frame_requester,
                                                         );
                                                     }
-                                                    apply_tui_control_event(
+                                                    apply_active_turn_tui_control_event(
                                                         &ae,
                                                         &mut bottom_pane,
                                                         &mut chat_widget,
+                                                        &preinstalled_run_control,
                                                     );
                                                     refresh_open_transcript_view(
                                                         &chat_widget,
@@ -6856,6 +7178,13 @@ pub(crate) async fn run_tui_session(
                                                         w,
                                                     );
                                                     handle_app_event(&ae, &mut bottom_pane, &mut status_indicator, &frame_requester);
+                                                    if apply_live_work_update_from_event(&ae, &task_board) {
+                                                        frame_requester.schedule_frame();
+                                                    }
+                                                    refresh_committed_work_graph_after_event(
+                                                        &ae,
+                                                        &plan_task_observer,
+                                                    );
                                                     let should_rearm_bash_detach =
                                                         !bash_detach_request_pending
                                                             && bash_detach_listener.is_none()
@@ -7037,7 +7366,7 @@ pub(crate) async fn run_tui_session(
                                                     frame_requester.schedule_frame();
                                                 }
                                                 _ = &mut itick => {
-                                                    drain_background_task_commands(
+                                                    let background_commands_mutated = drain_background_task_commands(
                                                         &bg_task_commands_for_turn,
                                                         &mut background_registry,
                                                         agent_spawner_for_cancel.as_ref(),
@@ -7064,8 +7393,6 @@ pub(crate) async fn run_tui_session(
                                                         &mut background_registry,
                                                         &server_agent_observer,
                                                         &mut server_agent_projection_sequence,
-                                                        &task_board,
-                                                        &plan_task_observer,
                                                         ViewActionBackends {
                                                             agent_spawner: agent_spawner_for_cancel.clone(),
                                                             delegation_engine: delegation_engine_for_control.clone(),
@@ -7126,6 +7453,15 @@ pub(crate) async fn run_tui_session(
                                                             }
                                                         }
                                                         local_agent_snapshot = next_snapshot;
+                                                        restored_local_agent_task_projections =
+                                                            persist_background_local_agent_task_projections_from_snapshot_if_changed(
+                                                                &local_agent_snapshot,
+                                                                &restored_local_agent_task_projections,
+                                                                background_registry_turn_session_id.as_deref(),
+                                                                background_registry_turn_model.as_deref(),
+                                                                &mut background_local_agent_projection_cache,
+                                                            )
+                                                            .await;
                                                         let changed = chat_widget
                                                             .reconcile_local_agent_snapshot(
                                                                 &local_agent_snapshot,
@@ -7177,7 +7513,7 @@ pub(crate) async fn run_tui_session(
                                                             history_cell::system::SystemCell::info(&message),
                                                         );
                                                     }
-                                                    if !bg_events.is_empty() {
+                                                    if background_commands_mutated || !bg_events.is_empty() {
                                                         persist_background_task_projections_if_changed(
                                                             &mut background_registry,
                                                             background_registry_turn_session_id.as_deref(),
@@ -7186,23 +7522,18 @@ pub(crate) async fn run_tui_session(
                                                         )
                                                         .await;
                                                     }
-                                                    // The tool executor reads this cache directly.
-                                                    // Refresh it during active turns too, including
-                                                    // immediately after a shell handoff or local `&`
-                                                    // launch, rather than exposing the last idle tick.
-                                                    let rows = background_task_rows_with_agent_snapshot(
+                                                    if refresh_background_task_surfaces(
                                                         &mut background_registry,
                                                         &local_agent_snapshot,
                                                         &restored_local_agent_task_projections,
-                                                    );
-                                                    *bg_task_list_cache_for_turn.write().await =
-                                                        render_background_task_rows_xml(&rows);
-                                                    sync_background_task_footer_from_rows(
+                                                        bg_task_list_cache_for_turn.as_ref(),
                                                         &mut bottom_pane,
-                                                        &rows,
-                                                    );
-                                                    if bottom_pane.accepts_background_task_rows() {
-                                                        bottom_pane.refresh_background_task_rows(rows);
+                                                        &mut next_background_surface_refresh,
+                                                        background_commands_mutated || !bg_events.is_empty(),
+                                                    )
+                                                    .await
+                                                    {
+                                                        frame_requester.schedule_frame();
                                                     }
                                                     // Refresh the permission-mode chip via the
                                                     // lock-free mirror — the agentic loop holds
@@ -7296,17 +7627,18 @@ pub(crate) async fn run_tui_session(
                                         );
                                     }
 
-                                    // Resolve the active-run intent ledger once the run ends.
-                                    // Applied events have already removed their identities. A
-                                    // normal completion must not turn an accepted submission
-                                    // into an inert draft merely because the model had already
-                                    // produced its visible answer before the next safe boundary.
-                                    let unapplied_user_intents =
-                                        bottom_pane.take_unapplied_user_intents();
-                                    let should_start_followups =
-                                        turn_result.is_ok()
-                                            && !state.last_turn_interrupted
-                                            && !exit_after_turn_settlement;
+                                    // Resolve only client-owned input once the run ends. The
+                                    // runtime performs a final durable intent poll before normal
+                                    // settlement, so AcceptedRemote guidance remains server-owned
+                                    // even when its Applied projection arrives after visible text.
+                                    let should_start_followups = should_start_queued_followups(
+                                        turn_result.is_ok(),
+                                        state.last_turn_interrupted,
+                                        foreground_lifecycle_transferred,
+                                        exit_after_turn_settlement,
+                                    );
+                                    let locally_owned_user_intents =
+                                        bottom_pane.take_client_recoverable_user_intents();
                                     if interrupt_pending {
                                         interrupt_pending = false;
                                         bottom_pane.interrupt_pending = false;
@@ -7315,7 +7647,7 @@ pub(crate) async fn run_tui_session(
                                         bottom_pane.take_queued_next_turn_submissions();
                                     if let Some(restored) = settle_followup_submissions(
                                         &mut queued_followup_submissions,
-                                        unapplied_user_intents
+                                        locally_owned_user_intents
                                             .iter()
                                             .map(|intent| intent.text.clone()),
                                         &mut post_output_submissions,
@@ -7392,13 +7724,11 @@ pub(crate) async fn run_tui_session(
                                     let turn_completion = state.total_completion_tokens - pre_completion_tokens;
                                     let turn_cache_read = state.total_cache_read_tokens - pre_cache_read;
                                     let turn_cache_creation = state.total_cache_creation_tokens - pre_cache_creation;
-                                    let turn_input =
-                                        astra_turn_types::NormalizedPromptCacheUsage::new(
-                                            turn_prompt,
-                                            turn_cache_read,
-                                            turn_cache_creation,
-                                        )
-                                        .total_input_tokens();
+                                    // Keep fresh input separate from cache reads in TurnStats so
+                                    // the renderer can show both total provider traffic and the
+                                    // cache hit ratio without confusing either with context size.
+                                    let turn_fresh_input =
+                                        turn_prompt.saturating_add(turn_cache_creation);
                                     let footer_context_trace = latest_context_trace_since(
                                         &state,
                                         pre_cached_context_trace_turn_id.as_deref(),
@@ -7425,7 +7755,7 @@ pub(crate) async fn run_tui_session(
                                         let ctx = chat_widget::TurnContext {
                                             elapsed_ms: Some(elapsed.as_millis() as u64),
                                             ttft_ms,
-                                            tokens_in: Some(turn_input),
+                                            tokens_in: Some(turn_fresh_input),
                                             tokens_out: Some(turn_completion),
                                             // Drive the `💾 N%` segment:
                                             // hit rate = cache_read / total_input.
@@ -7438,10 +7768,13 @@ pub(crate) async fn run_tui_session(
                                                 .then_some(turn_cache_read),
                                             tools: turn_tool_count,
                                             cumulative_tokens: Some(
-                                                state.total_prompt_tokens
-                                                    + state.total_completion_tokens
-                                                    + state.total_cache_read_tokens
-                                                    + state.total_cache_creation_tokens,
+                                                state
+                                                    .total_prompt_tokens
+                                                    .saturating_add(state.total_completion_tokens)
+                                                    .saturating_add(
+                                                        state.total_cache_creation_tokens,
+                                                    )
+                                                    .saturating_add(state.total_cache_read_tokens),
                                             ),
                                             cumulative_cost_usd: Some(state.total_session_cost),
                                         };
@@ -7524,8 +7857,6 @@ pub(crate) async fn run_tui_session(
                                     &mut background_registry,
                                     &server_agent_observer,
                                     &mut server_agent_projection_sequence,
-                                    &task_board,
-                                    &plan_task_observer,
                                     ViewActionBackends {
                                         agent_spawner: state.agent_spawner.clone(),
                                         delegation_engine: state.delegation_engine.clone(),
@@ -7818,11 +8149,10 @@ pub(crate) async fn run_tui_session(
                                     }
 
                                     // Session picker result → restore the selected session
-                                    // in-place. Its semantic intent is explicit, so a session
-                                    // id can never be misread as an unrelated picker label.
+                                    // in-place. Session selection has one product meaning:
+                                    // resuming canonical server-owned work.
                                     if let bottom_pane::view::ViewResult::Session {
                                         session_id: name,
-                                        intent: bottom_pane::view::SessionSelectionIntent::Resume,
                                     } = &result {
                                         let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
                                         let pre_sid = state.session_id.clone();
@@ -7863,55 +8193,6 @@ pub(crate) async fn run_tui_session(
                                                 &plan_task_observer,
                                                 &mut board_user_pin,
                                             );
-                                        }
-                                    } else if let bottom_pane::view::ViewResult::Session {
-                                        session_id: parent_id,
-                                        intent: bottom_pane::view::SessionSelectionIntent::Fork,
-                                    } = &result {
-                                        match crate::cli::slash::slash_session::fork_session_into_state(
-                                            parent_id,
-                                            None,
-                                            api,
-                                            profile,
-                                            &mut state,
-                                        )
-                                        .await
-                                        {
-                                            Ok(outcome) => {
-                                                let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
-                                                chat_widget = replay_session_into_widget(
-                                                    &mut guard,
-                                                    &outcome.new_session_id,
-                                                    w,
-                                                )
-                                                .await;
-                                                rebind_workbench_observers(
-                                                    Some(&outcome.new_session_id),
-                                                    &task_board,
-                                                    &server_agent_observer,
-                                                    &plan_task_observer,
-                                                    &mut board_user_pin,
-                                                );
-                                                let task_board_note = if outcome.preserved_existing_child_task_board {
-                                                    " · preserved the child task board"
-                                                } else {
-                                                    " · copied the parent task board"
-                                                };
-                                                chat_widget.commit_system(
-                                                    history_cell::system::SystemCell::response(format!(
-                                                        "Forked session {} from {} · copied {} journal events{}",
-                                                        outcome.new_session_id,
-                                                        parent_id,
-                                                        outcome.events_copied,
-                                                        task_board_note,
-                                                    )),
-                                                );
-                                            }
-                                            Err(error) => chat_widget.commit_system(
-                                                history_cell::system::SystemCell::error(format!(
-                                                    "Could not fork session: {error}"
-                                                )),
-                                            ),
                                         }
                                     } else {
                                         slash_dispatch::handle_view_result(
@@ -8060,6 +8341,16 @@ pub(crate) async fn run_tui_session(
             }
             Some(ae) = tui_rx.recv() => {
                 let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                if apply_live_session_binding(
+                    &ae,
+                    &mut chat_widget,
+                    &task_board,
+                    &server_agent_observer,
+                    &plan_task_observer,
+                    &mut board_user_pin,
+                ) {
+                    frame_requester.schedule_frame();
+                }
                 if let Some(new_ev) = chat_widget::translate(
                     ae.clone(),
                     chat_widget::TurnContext::default(),
@@ -8081,6 +8372,10 @@ pub(crate) async fn run_tui_session(
                 apply_tui_control_event(&ae, &mut bottom_pane, &mut chat_widget);
                 refresh_open_transcript_view(&chat_widget, &mut bottom_pane, w);
                 handle_app_event(&ae, &mut bottom_pane, &mut status_indicator, &frame_requester);
+                if apply_live_work_update_from_event(&ae, &task_board) {
+                    frame_requester.schedule_frame();
+                }
+                refresh_committed_work_graph_after_event(&ae, &plan_task_observer);
                 if should_flush_ambient_commits(pending_deferred_slash_flush) {
                     flush_chat_widget(&mut guard, &mut chat_widget, w);
                 }
@@ -8104,16 +8399,6 @@ pub(crate) async fn run_tui_session(
                 frame_requester.schedule_frame();
             }
             _ = &mut tick => {
-                if drain_plan_updates_into_workbench(
-                    &mut state,
-                    &mut chat_widget,
-                    &mut bottom_pane,
-                    &mut status_indicator,
-                    &frame_requester,
-                ) {
-                    let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
-                    refresh_open_transcript_view(&chat_widget, &mut bottom_pane, width);
-                }
                 drain_agent_workbench_outcomes(
                     &mut agent_workbench_rx,
                     background_registry_session_id.as_deref(),
@@ -8133,8 +8418,6 @@ pub(crate) async fn run_tui_session(
                     &mut background_registry,
                     &server_agent_observer,
                     &mut server_agent_projection_sequence,
-                    &task_board,
-                    &plan_task_observer,
                     ViewActionBackends {
                         agent_spawner: state.agent_spawner.clone(),
                         delegation_engine: state.delegation_engine.clone(),
@@ -8204,6 +8487,7 @@ pub(crate) async fn run_tui_session(
                 // machine so auto-open/hide never fights with the
                 // user's explicit Ctrl+T pin.
                 if state.session_id != background_registry_session_id {
+                    next_background_surface_refresh = std::time::Instant::now();
                     let first_session_binding = is_initial_session_binding(
                         background_registry_session_id.as_deref(),
                         state.session_id.as_deref(),
@@ -8345,8 +8629,6 @@ pub(crate) async fn run_tui_session(
                                 &mut background_registry,
                                 &server_agent_observer,
                                 &mut server_agent_projection_sequence,
-                                &task_board,
-                                &plan_task_observer,
                                 ViewActionBackends {
                                     agent_spawner: state.agent_spawner.clone(),
                                     delegation_engine: state.delegation_engine.clone(),
@@ -8441,6 +8723,15 @@ pub(crate) async fn run_tui_session(
                         );
                     }
                     local_agent_snapshot = next_local_agent_snapshot;
+                    restored_local_agent_task_projections =
+                        persist_background_local_agent_task_projections_from_snapshot_if_changed(
+                            &local_agent_snapshot,
+                            &restored_local_agent_task_projections,
+                            state.session_id.as_deref(),
+                            state.model.as_deref(),
+                            &mut background_local_agent_projection_cache,
+                        )
+                        .await;
                     let projection_changed = chat_widget.reconcile_local_agent_snapshot(
                         &local_agent_snapshot,
                         &restored_local_agent_task_projections,
@@ -8452,7 +8743,7 @@ pub(crate) async fn run_tui_session(
                         frame_requester.schedule_frame();
                     }
                 }
-                drain_background_task_commands(
+                let background_commands_mutated = drain_background_task_commands(
                     &state.bg_task_commands,
                     &mut background_registry,
                     state.agent_spawner.as_ref(),
@@ -8496,73 +8787,53 @@ pub(crate) async fn run_tui_session(
                     runtime_notification_turn_pending = true;
                     event_stream.push_front(TuiEvent::RuntimeNotificationTurn);
                 }
-                persist_background_task_projections_if_changed(
-                    &mut background_registry,
-                    state.session_id.as_deref(),
-                    state.model.as_deref(),
-                    &mut background_task_projection_cache,
-                )
-                .await;
-                restored_local_agent_task_projections =
-                    persist_background_local_agent_task_projections_from_snapshot_if_changed(
-                        &local_agent_snapshot,
-                        &restored_local_agent_task_projections,
+                if background_commands_mutated || !bg_events.is_empty() {
+                    persist_background_task_projections_if_changed(
+                        &mut background_registry,
                         state.session_id.as_deref(),
                         state.model.as_deref(),
-                        &mut background_local_agent_projection_cache,
+                        &mut background_task_projection_cache,
                     )
                     .await;
-                let rows_for_footer =
-                    background_task_rows_with_agent_snapshot(
-                        &mut background_registry,
-                        &local_agent_snapshot,
-                        &restored_local_agent_task_projections,
-                    );
-                // Refresh shared cache every tick so task_list_bg
-                // always sees the latest state without queue latency.
+                }
+                if refresh_background_task_surfaces(
+                    &mut background_registry,
+                    &local_agent_snapshot,
+                    &restored_local_agent_task_projections,
+                    state.bg_task_list_cache.as_ref(),
+                    &mut bottom_pane,
+                    &mut next_background_surface_refresh,
+                    background_commands_mutated || !bg_events.is_empty(),
+                )
+                .await
                 {
-                    let xml = render_background_task_rows_xml(&rows_for_footer);
-                    *state.bg_task_list_cache.write().await = xml;
-                }
-                if bottom_pane.accepts_background_task_rows() {
-                    bottom_pane.refresh_background_task_rows(rows_for_footer.clone());
                     frame_requester.schedule_frame();
                 }
-
-                // Surface bg task counts on the status line from the
-                // same typed rows used by the switcher. That keeps
-                // footer and list projection in lock-step as more
-                // task kinds land.
-                let bg_counts = status_line::BackgroundTaskCounts::from_rows(&rows_for_footer);
-                bottom_pane.footer.bg_task_counts = if bg_counts.is_empty() {
-                    None
-                } else {
-                    Some(bg_counts)
-                };
-                plan_task_observer.set_view_mode(task_board.view_mode());
                 plan_task_observer.maybe_refresh();
-                let plan_task_projection = plan_task_observer.projection();
-                let plan_task_truth = projected_truth_for_plan_task(plan_task_projection.truth_state);
-                task_board
-                    .set_projected_task_projection(plan_task_projection.tasks, plan_task_truth);
-                task_board
-                    .set_projected_multi_summaries(plan_task_projection.multi_session);
-                task_board.maybe_refresh();
-                let projection = task_board.active_projection();
-                if bottom_pane.refresh_task_board(&projection) {
-                    frame_requester.schedule_frame();
-                }
-                let (next_expanded, reset_pin) = super::board_pin::resolve_board_visibility(
-                    board_expanded,
-                    board_user_pin,
-                    projection.has_tasks(),
-                );
-                if reset_pin {
-                    board_user_pin = None;
-                }
-                if next_expanded != board_expanded {
-                    board_expanded = next_expanded;
-                    frame_requester.schedule_frame();
+                if let Some(plan_task_projection) =
+                    plan_task_observer.projection_after(plan_task_projection_sequence)
+                {
+                    plan_task_projection_sequence = Some(plan_task_projection.sequence);
+                    let plan_task_truth =
+                        projected_truth_for_plan_task(plan_task_projection.truth_state);
+                    let board_changed = task_board.set_projected_work_projection(
+                        plan_task_projection.work,
+                        plan_task_projection.tasks,
+                        plan_task_truth,
+                    );
+                    let projection = task_board.active_projection();
+                    let (next_expanded, reset_pin) = super::board_pin::resolve_board_visibility(
+                        board_user_pin,
+                        projection.has_tasks(),
+                        projection.has_open_work(),
+                    );
+                    if reset_pin {
+                        board_user_pin = None;
+                    }
+                    if board_changed || next_expanded != board_expanded {
+                        board_expanded = next_expanded;
+                        frame_requester.schedule_frame();
+                    }
                 }
             }
         }
@@ -8629,7 +8900,6 @@ pub(crate) async fn run_tui_session(
     drop(plan_task_observer);
     drop(server_agent_observer);
     state.tui_cancel_token = None;
-    drop(state.plan_handle.take());
 
     if let Some(spawner) = state.agent_spawner.take() {
         retire_local_agent_spawner_with_reason(
@@ -8655,8 +8925,8 @@ pub(crate) async fn run_tui_session(
     }
     slash_background_read_tasks.abort_all();
     while slash_background_read_tasks.join_next().await.is_some() {}
-    cancel_control_tasks.abort_all();
-    while cancel_control_tasks.join_next().await.is_some() {}
+    work_start_tasks.abort_all();
+    while work_start_tasks.join_next().await.is_some() {}
     // Post-commit projections are recoverable from the canonical journal.
     // Give the ordered worker a short graceful drain on exit, then cancel it
     // rather than trapping terminal teardown behind a slow filesystem/server.
@@ -8737,8 +9007,8 @@ pub(crate) async fn run_tui_session(
     drop(pipeline_modules);
     drop(guard);
     if let Some((label, command)) = resume_hint {
-        println!("{}", label.dim());
-        println!("  {}", command.cyan());
+        stdout_println!("{}", label.dim());
+        stdout_println!("  {}", command.cyan());
     }
     result
 }
@@ -8775,6 +9045,10 @@ fn handle_app_event(
         status_indicator.mark_dispatched();
     }
     match ev {
+        TuiAppEvent::SessionBound(_) | TuiAppEvent::RunBound(_) => {
+            // Session binding is consumed by the foreground workbench reducer
+            // before this presentation-only status reducer runs.
+        }
         TuiAppEvent::ContextWindowPolicy {
             raw_window_tokens,
             usable_input_tokens,
@@ -8864,12 +9138,15 @@ fn handle_app_event(
         }
         TuiAppEvent::AssistantOutputSettled
         | TuiAppEvent::TurnStreamClosed
+        | TuiAppEvent::TurnProjectionDrained
+        | TuiAppEvent::WorkTaskBoardUpdate(_)
         | TuiAppEvent::AgentLive(_)
         | TuiAppEvent::AgentLiveBatch(_)
         | TuiAppEvent::AgentLiveGap(_)
         | TuiAppEvent::AgentCommunication(_)
         | TuiAppEvent::StatusLine(_)
         | TuiAppEvent::UserIntentApplied { .. }
+        | TuiAppEvent::UserIntentReturned { .. }
         | TuiAppEvent::Compaction(_)
         | TuiAppEvent::ExplainReport(_)
         | TuiAppEvent::VerdictReport(_)
@@ -8884,20 +9161,626 @@ fn handle_app_event(
     fr.schedule_frame();
 }
 
+fn starts_model_output(event: &TuiAppEvent) -> bool {
+    matches!(
+        event,
+        TuiAppEvent::Token(_) | TuiAppEvent::ThinkingChunk(_) | TuiAppEvent::ToolStarted { .. }
+    )
+}
+
+/// Project a server-issued durable Work board event before requesting the
+/// slower canonical graph reconciliation. Assistant text and tool-card names
+/// are never used as task state.
+fn apply_live_work_update_from_event(
+    event: &TuiAppEvent,
+    task_board: &task_board_observer::TaskBoardObserver,
+) -> bool {
+    let TuiAppEvent::WorkTaskBoardUpdate(update) = event else {
+        return false;
+    };
+    match crate::tui::plan_task_observer::live_work_update_from_server_event(update) {
+        Ok(update) => task_board.apply_live_work_update(update),
+        Err(error) => {
+            tracing::warn!("ignoring invalid server-issued Work task-board event: {error}");
+            false
+        }
+    }
+}
+
+/// Invalidate the canonical Task Graph when a typed Work mutation reaches its
+/// terminal runtime event. The observer re-reads server truth after the live
+/// receipt above, so it reconciles rich graph state without creating a blank
+/// interval in the active execution surface.
+fn refresh_committed_work_graph_after_event(
+    event: &TuiAppEvent,
+    observer: &crate::tui::plan_task_observer::PlanTaskObserver,
+) {
+    if !event_may_have_committed_work_graph(event) {
+        return;
+    }
+    if observer.request_refresh() {
+        observer.maybe_refresh();
+    }
+}
+
+fn event_may_have_committed_work_graph(event: &TuiAppEvent) -> bool {
+    matches!(event, TuiAppEvent::WorkTaskBoardUpdate(_))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn primary_guidance_durable_disposition_maps_only_exact_identity() {
+        let applied = astra_thin_client::StreamEvent::RunUserIntentApplied {
+            run_id: "run-1".into(),
+            intent_id: "intent-1".into(),
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            event_index: 41,
+            content: "stop".into(),
+            index: 44,
+        };
+        assert!(matches!(
+            primary_guidance_disposition_event(applied.clone(), "run-1", "intent-1"),
+            Some(TuiAppEvent::UserIntentApplied {
+                event_index: 41,
+                content,
+                ..
+            }) if content == "stop"
+        ));
+        assert!(primary_guidance_disposition_event(applied, "run-2", "intent-1").is_none());
+
+        let returned = astra_thin_client::StreamEvent::RunUserIntentReturned {
+            run_id: "run-1".into(),
+            intent_id: "intent-1".into(),
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            event_index: 41,
+            content: "stop".into(),
+            index: 45,
+        };
+        assert!(matches!(
+            primary_guidance_disposition_event(returned, "run-1", "intent-1"),
+            Some(TuiAppEvent::UserIntentReturned {
+                event_index: 41,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn guidance_observer_claim_does_not_keep_a_finished_turn_alive() {
+        let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+        run_control.expect_remote_user_intent_disposition("intent-1", 7);
+        assert_eq!(run_control.claim_remote_disposition_observer(), Some(7));
+
+        let weak = std::sync::Arc::downgrade(&run_control);
+        let claim = PrimaryGuidanceObserverClaim(weak.clone());
+        assert_eq!(
+            std::sync::Arc::strong_count(&run_control),
+            1,
+            "observer ownership must be weak so a failed historical turn cannot leak a retry task"
+        );
+        drop(run_control);
+        assert!(weak.upgrade().is_none());
+        drop(claim);
+    }
+
+    #[tokio::test]
+    async fn guidance_observer_drops_a_never_yielding_stream_after_turn_owner_release() {
+        let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+        let weak = std::sync::Arc::downgrade(&run_control);
+        let mut stream = tokio_stream::pending::<()>();
+        let observer = tokio::spawn(async move {
+            next_guidance_stream_item_while_owner_alive(&mut stream, &weak).await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!observer.is_finished());
+        drop(run_control);
+        let result = tokio::time::timeout(Duration::from_secs(1), observer)
+            .await
+            .expect("owner release must stop a half-open stream within one check interval")
+            .expect("observer task");
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn guidance_observer_cancels_a_pending_auth_future_after_turn_owner_release() {
+        let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+        let weak = std::sync::Arc::downgrade(&run_control);
+        let observer = tokio::spawn(async move {
+            await_guidance_future_while_owner_alive(std::future::pending::<()>(), &weak).await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!observer.is_finished());
+        drop(run_control);
+        let result = tokio::time::timeout(Duration::from_secs(1), observer)
+            .await
+            .expect("owner release must cancel a pending auth request")
+            .expect("observer task");
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn active_guidance_submission_bounds_half_open_auth_or_post() {
+        let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+        let weak = std::sync::Arc::downgrade(&run_control);
+        let submission = tokio::spawn(async move {
+            await_active_guidance_submission(
+                std::future::pending::<()>(),
+                &weak,
+                Duration::from_millis(25),
+            )
+            .await
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(1), submission)
+            .await
+            .expect("the shared submission deadline must bound a half-open stage")
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(GuidanceSubmissionError::Unconfirmed(message))
+                if message.contains("bounded acknowledgement deadline")
+        ));
+    }
+
+    #[tokio::test]
+    async fn active_guidance_submission_cancels_when_turn_owner_drops() {
+        let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+        let weak = std::sync::Arc::downgrade(&run_control);
+        let submission = tokio::spawn(async move {
+            await_active_guidance_submission(
+                std::future::pending::<()>(),
+                &weak,
+                Duration::from_secs(30),
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!submission.is_finished());
+        drop(run_control);
+        let result = tokio::time::timeout(Duration::from_secs(1), submission)
+            .await
+            .expect("owner release must cancel a half-open submission")
+            .unwrap();
+        assert!(matches!(
+            result,
+            Err(GuidanceSubmissionError::Unconfirmed(message))
+                if message.contains("active turn ended")
+        ));
+    }
+
+    #[test]
+    fn ready_turn_remains_gated_by_late_submission_and_disposition() {
+        let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+        assert!(!active_guidance_closure_pending(&run_control, false));
+
+        // This models a guidance Enter after the turn's original settlement
+        // deadline already started. The gate depends on explicit ownership,
+        // not on relative timeout start times.
+        run_control.expect_remote_user_intent_submission("intent-late");
+        assert!(active_guidance_closure_pending(&run_control, true));
+        run_control.expect_remote_user_intent_disposition("intent-late", 91);
+        assert!(active_guidance_closure_pending(&run_control, false));
+        run_control.abandon_remote_user_intent_disposition("intent-late");
+        assert!(!active_guidance_closure_pending(&run_control, false));
+    }
+
+    #[test]
+    fn every_bash_handoff_outcome_waits_for_each_guidance_closure_barrier() {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum HandoffOutcome {
+            Success,
+            ChannelClosed,
+            TaskLimit,
+            AdoptionFailed,
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum PendingGuidanceClosure {
+            Submission,
+            Disposition,
+        }
+
+        for outcome in [
+            HandoffOutcome::Success,
+            HandoffOutcome::ChannelClosed,
+            HandoffOutcome::TaskLimit,
+            HandoffOutcome::AdoptionFailed,
+        ] {
+            for pending in [
+                PendingGuidanceClosure::Submission,
+                PendingGuidanceClosure::Disposition,
+            ] {
+                let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+                let mut ready = Some((outcome, pending));
+
+                assert!(
+                    take_ready_result_if_all_closure_barriers_clear(
+                        &mut ready,
+                        TurnClosureBarriers::capture(&run_control, false, true, false),
+                    )
+                    .is_none(),
+                    "{outcome:?} cannot finish before its Bash handoff closes"
+                );
+
+                match pending {
+                    PendingGuidanceClosure::Submission => {
+                        run_control.expect_remote_user_intent_submission("intent-matrix")
+                    }
+                    PendingGuidanceClosure::Disposition => {
+                        run_control.expect_remote_user_intent_disposition("intent-matrix", 41)
+                    }
+                }
+                assert!(
+                    take_ready_result_if_all_closure_barriers_clear(
+                        &mut ready,
+                        TurnClosureBarriers::capture(&run_control, false, false, false),
+                    )
+                    .is_none(),
+                    "{outcome:?} must not bypass {pending:?} closure after handoff"
+                );
+                assert!(ready.is_some(), "the ready turn result must remain owned");
+
+                match pending {
+                    PendingGuidanceClosure::Submission => {
+                        run_control.release_remote_user_intent_submission("intent-matrix")
+                    }
+                    PendingGuidanceClosure::Disposition => {
+                        run_control.abandon_remote_user_intent_disposition("intent-matrix")
+                    }
+                }
+                assert_eq!(
+                    take_ready_result_if_all_closure_barriers_clear(
+                        &mut ready,
+                        TurnClosureBarriers::capture(&run_control, false, false, false),
+                    ),
+                    Some((outcome, pending)),
+                    "{outcome:?} may finish only after every closure barrier clears"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_turn_waits_for_the_terminal_projection_drain() {
+        let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+        let mut ready = Some(Ok::<(), String>(()));
+
+        assert!(
+            take_ready_result_if_all_closure_barriers_clear(
+                &mut ready,
+                TurnClosureBarriers::capture(&run_control, false, false, true),
+            )
+            .is_none(),
+            "visible output settlement cannot substitute for the terminal stream drain"
+        );
+        assert!(ready.is_some());
+        assert_eq!(
+            take_ready_result_if_all_closure_barriers_clear(
+                &mut ready,
+                TurnClosureBarriers::capture(&run_control, false, false, false),
+            ),
+            Some(Ok(()))
+        );
+
+        let mut failed = Some(Err::<(), String>("failed after partial output".into()));
+        assert!(
+            take_ready_result_if_all_closure_barriers_clear(
+                &mut failed,
+                TurnClosureBarriers::capture(&run_control, false, false, true),
+            )
+            .is_none(),
+            "a failed turn cannot publish TurnError before accepted partial output is drained"
+        );
+        assert!(failed.is_some());
+        assert!(
+            take_ready_result_if_all_closure_barriers_clear(
+                &mut failed,
+                TurnClosureBarriers::capture(&run_control, false, false, false),
+            )
+            .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_io_failure_enters_the_same_terminal_projection_drain() {
+        let (tui_tx, mut tui_rx) = stream_bridge::create_channels();
+        let (stream_tx, bridge) = stream_bridge::create_controlled_per_turn_bridge(tui_tx);
+        stream_tx
+            .send(crate::cli::chat_stream::StreamEvent::Token(
+                "accepted-before-terminal-io-error".into(),
+            ))
+            .await
+            .expect("bridge open");
+        let mut ready = None;
+
+        begin_turn_result_closure(
+            &bridge,
+            &mut ready,
+            Err("failed to restore terminal input mode".into()),
+        );
+
+        assert!(matches!(
+            tui_rx.recv().await,
+            Some(TuiAppEvent::Token(text)) if text == "accepted-before-terminal-io-error"
+        ));
+        assert!(matches!(
+            tui_rx.recv().await,
+            Some(TuiAppEvent::TurnStreamClosed)
+        ));
+        assert!(matches!(
+            tui_rx.recv().await,
+            Some(TuiAppEvent::TurnProjectionDrained)
+        ));
+        assert!(matches!(ready, Some(Err(message)) if message.contains("terminal input mode")));
+    }
+
+    #[tokio::test]
+    async fn guidance_closure_exits_only_after_deadline_as_unconfirmed_without_next_turn() {
+        let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+        run_control.expect_remote_user_intent_submission("intent-submit");
+        run_control.expect_remote_user_intent_disposition("intent-disposition", 51);
+        let mut ready = Some("settled-turn");
+        let now = tokio::time::Instant::now();
+        let deadline = now + Duration::from_secs(30);
+
+        assert_eq!(
+            expire_guidance_closure_as_unconfirmed(&run_control, Some(deadline), now),
+            None,
+            "pending guidance cannot become unconfirmed before the deadline"
+        );
+        assert!(
+            take_ready_result_if_all_closure_barriers_clear(
+                &mut ready,
+                TurnClosureBarriers::capture(&run_control, false, false, false),
+            )
+            .is_none()
+        );
+
+        assert_eq!(
+            expire_guidance_closure_as_unconfirmed(&run_control, Some(deadline), deadline),
+            Some(vec![
+                "intent-disposition".to_string(),
+                "intent-submit".to_string(),
+            ])
+        );
+        assert_eq!(
+            take_ready_result_if_all_closure_barriers_clear(
+                &mut ready,
+                TurnClosureBarriers::capture(&run_control, false, false, false),
+            ),
+            Some("settled-turn")
+        );
+        assert!(run_control.pending_remote_submission_ids().is_empty());
+        assert!(run_control.pending_remote_disposition_ids().is_empty());
+        assert!(
+            !astra_runtime::turn::run_control::UserIntentProvider::has_pending_inputs(
+                &*run_control
+            ),
+            "deadline expiry records Unconfirmed closure; it must not synthesize a next-turn input"
+        );
+    }
+
+    #[tokio::test]
+    async fn guidance_disposition_waits_for_exact_reducer_ack_not_channel_enqueue() {
+        let run_control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+        run_control.expect_remote_user_intent_disposition("intent-1", 7);
+        assert_eq!(run_control.claim_remote_disposition_observer(), Some(7));
+        let weak = std::sync::Arc::downgrade(&run_control);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        tx.send(TuiAppEvent::StatusLine("occupy the channel".into()))
+            .await
+            .unwrap();
+
+        let projection = tokio::spawn(async move {
+            project_primary_guidance_disposition(
+                &tx,
+                &weak,
+                TuiAppEvent::UserIntentApplied {
+                    intent_id: "intent-1".into(),
+                    delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                    status: astra_turn_types::UserIntentStatus::Applied,
+                    event_index: 8,
+                    content: "do not modify files".into(),
+                },
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!projection.is_finished());
+        assert_eq!(
+            run_control.pending_remote_disposition_ids(),
+            vec!["intent-1".to_string()],
+            "settlement must remain blocked until the foreground can observe disposition"
+        );
+
+        assert!(matches!(rx.recv().await, Some(TuiAppEvent::StatusLine(_))));
+        tokio::task::yield_now().await;
+        assert!(
+            !projection.is_finished(),
+            "channel admission is not a reducer-completion acknowledgement"
+        );
+        let disposition = rx.recv().await.expect("queued guidance disposition");
+        assert!(matches!(
+            &disposition,
+            TuiAppEvent::UserIntentApplied { intent_id, .. } if intent_id == "intent-1"
+        ));
+        assert_eq!(
+            run_control.pending_remote_disposition_ids(),
+            vec!["intent-1".to_string()],
+            "settlement remains fenced until transcript and composer projections finish"
+        );
+
+        let mut bottom_pane = BottomPane::new();
+        bottom_pane.accept_user_intent(
+            "intent-1",
+            astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            astra_turn_types::UserIntentStatus::AcceptedRemote,
+            "do not modify files",
+        );
+        let mut chat_widget = chat_widget::ChatWidget::new(String::new());
+        apply_active_turn_tui_control_event(
+            &disposition,
+            &mut bottom_pane,
+            &mut chat_widget,
+            &run_control,
+        );
+        assert_eq!(
+            projection.await.unwrap(),
+            Some(true),
+            "the only pending disposition should release after its exact reducer ACK"
+        );
+        assert!(run_control.pending_remote_disposition_ids().is_empty());
+        let rendered = rendered_transcript_overlay(&chat_widget, 80);
+        assert_eq!(rendered.matches("do not modify files").count(), 1);
+
+        // A duplicate from the ordered main SSE or reconnecting observer is a
+        // projection no-op and cannot recreate the already-closed barrier.
+        apply_active_turn_tui_control_event(
+            &disposition,
+            &mut bottom_pane,
+            &mut chat_widget,
+            &run_control,
+        );
+        assert!(run_control.pending_remote_disposition_ids().is_empty());
+        assert_eq!(
+            rendered_transcript_overlay(&chat_widget, 80)
+                .matches("do not modify files")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn ttft_starts_on_first_model_content_not_only_answer_text() {
+        assert!(starts_model_output(&TuiAppEvent::ThinkingChunk(
+            "reasoning".into()
+        )));
+        assert!(starts_model_output(&TuiAppEvent::Token("answer".into())));
+        assert!(starts_model_output(&TuiAppEvent::ToolStarted {
+            name: "read_file".into(),
+            description: "Read a file".into(),
+            tool_use_id: "call-1".into(),
+            parent_tool_use_id: None,
+        }));
+        assert!(!starts_model_output(&TuiAppEvent::ThinkingStarted));
+        assert!(!starts_model_output(&TuiAppEvent::WaitingForModel));
+    }
+
+    fn running_work_update() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "work_id": "work-live",
+            "branch_id": "main",
+            "kind": "snapshot",
+            "goal": "Fetch two sources",
+            "graph_revision": 1,
+            "criteria_member_count": 0,
+            "tasks": [{
+                "item_id": "source-a",
+                "item_revision": 1,
+                "objective": "Fetch source A",
+                "expected_result": "One current item",
+                "declaration_state": "active",
+                "execution_status": "running",
+                "delivery_status": "unreported",
+                "delivery_summary": null,
+                "blocker_kind": null,
+                "unavailable_capabilities": []
+            }]
+        })
+    }
+
+    #[test]
+    fn work_start_request_identity_is_retry_stable_and_scope_sensitive() {
+        let first = work_start_request_id("session-a", "Ship the release");
+        assert_eq!(
+            first,
+            work_start_request_id("session-a", "Ship the release")
+        );
+        assert_ne!(
+            first,
+            work_start_request_id("session-b", "Ship the release")
+        );
+        assert_ne!(first, work_start_request_id("session-a", "Ship a hotfix"));
+        assert!(first.starts_with("tui-work-start-"));
+        assert!(first.len() <= 256);
+    }
     use crate::background_task_error::BackgroundTaskError;
+
     use crate::cli::turn::local_run_control::LocalRunControl;
     use crate::tui::background_tasks::BgTaskEvent;
-    use astra_runtime::turn::run_control::{
-        RunControlStatus, RunStatusProvider, UserIntentProvider,
-    };
+    use astra_runtime::turn::run_control::{RunControlStatus, RunStatusProvider};
     use astra_turn_core::orchestration_spawn_tool::{SpawnAgentInput, SpawnAgentOutput};
     use astra_turn_core::orchestration_types::{
         AgentStatus, SpawnedAgentInfo, SpawnedAgentMetrics,
     };
     use std::path::PathBuf;
+
+    #[test]
+    fn work_graph_refresh_trigger_requires_durable_board_event() {
+        assert!(event_may_have_committed_work_graph(
+            &TuiAppEvent::WorkTaskBoardUpdate(running_work_update())
+        ));
+        assert!(!event_may_have_committed_work_graph(
+            &TuiAppEvent::ToolCompleted {
+                name: "start_work".into(),
+                description: "Start work".into(),
+                status: "completed".into(),
+                duration_ms: 1,
+                output_summary: None,
+                output: Some(
+                    serde_json::json!({
+                        "task_board_update": running_work_update()
+                    })
+                    .to_string()
+                ),
+                tool_use_id: "call-1".into(),
+                parent_tool_use_id: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn durable_work_event_reaches_the_live_board_before_remote_reconciliation() {
+        let board = task_board_observer::TaskBoardObserver::new("session-a");
+        let update = serde_json::json!({
+                "schema_version": 1,
+                "work_id": "work-42",
+                "branch_id": "main",
+                "kind": "snapshot",
+                "goal": "Ship a reliable migration",
+                "graph_revision": 7,
+                "criteria_member_count": 0,
+                "tasks": [{
+                    "item_id": "apply",
+                    "item_revision": 1,
+                    "objective": "Apply migration",
+                    "expected_result": "All records use the new schema",
+                    "declaration_state": "active",
+                    "execution_status": "running",
+                    "delivery_status": "unreported",
+                    "delivery_summary": null,
+                    "blocker_kind": null,
+                    "unavailable_capabilities": []
+                }]
+        });
+        let event = TuiAppEvent::WorkTaskBoardUpdate(update);
+
+        assert!(apply_live_work_update_from_event(&event, &board));
+        let projection = board.active_projection();
+        assert!(projection.has_open_work());
+        assert_eq!(
+            projection.truth_state(),
+            task_board_observer::TaskBoardTruthState::Confirmed
+        );
+    }
 
     fn render_bottom_pane_text(bottom_pane: &BottomPane, width: u16, height: u16) -> String {
         let area = ratatui::layout::Rect::new(0, 0, width, height);
@@ -9119,6 +10002,45 @@ mod tests {
     }
 
     #[test]
+    fn detach_request_does_not_transfer_foreground_submission_authority() {
+        assert!(!submission_belongs_to_next_turn(false, false));
+        assert!(submission_belongs_to_next_turn(false, true));
+        assert!(submission_belongs_to_next_turn(true, false));
+    }
+
+    #[test]
+    fn active_slash_commands_never_enter_model_guidance() {
+        for command in [
+            "/session",
+            "  /model",
+            "/unknown-command",
+            "/plan inspect it",
+        ] {
+            assert!(
+                active_submission_belongs_to_next_turn(command, false, false),
+                "active slash command must be queued for local dispatch: {command:?}"
+            );
+        }
+        assert!(!active_submission_belongs_to_next_turn(
+            "please inspect the next file",
+            false,
+            false,
+        ));
+        assert!(active_submission_belongs_to_next_turn(
+            "please continue",
+            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn only_completed_ownership_transfer_can_replay_after_interrupted_parent() {
+        assert!(!should_start_queued_followups(false, true, false, false));
+        assert!(should_start_queued_followups(false, true, true, false));
+        assert!(!should_start_queued_followups(false, true, true, true));
+    }
+
+    #[test]
     fn staged_permission_selection_becomes_active_only_after_turn_settles() {
         let mut state = crate::cli::session::session_state::SessionState::default();
         let mut bottom_pane = BottomPane::new();
@@ -9174,111 +10096,6 @@ mod tests {
         item.run_id = Some("run-review".into());
         item
     }
-
-    #[test]
-    fn plan_updates_stay_in_the_workbench_and_reach_a_terminal_state() {
-        use crate::cli::plan::plan_executor::{self, PlanUpdate};
-
-        let mut state = crate::cli::session::session_state::SessionState::default();
-        let (handle, updates, _commands) = plan_executor::create_plan_channels();
-        state.plan_handle = Some(handle);
-        updates
-            .send(PlanUpdate::SubtaskStarted {
-                id: "step-1".to_string(),
-                title: "Inspect the worktree".to_string(),
-                index: 1,
-                total: 1,
-            })
-            .expect("plan update channel should be open");
-        updates
-            .send(PlanUpdate::PlanFinished {
-                pct: 100,
-                elapsed: std::time::Duration::from_secs(1),
-                outcome: astra_services::task_orchestrator::TaskOutcome::Success,
-            })
-            .expect("plan update channel should be open");
-        drop(updates);
-
-        let mut chat_widget = chat_widget::ChatWidget::new(String::new());
-        let mut bottom_pane = BottomPane::new();
-        let mut status_indicator = status_indicator::StatusIndicator::new();
-
-        assert!(drain_plan_updates_into_workbench(
-            &mut state,
-            &mut chat_widget,
-            &mut bottom_pane,
-            &mut status_indicator,
-            &FrameRequester::test_dummy(),
-        ));
-        assert!(state.plan_handle.is_none());
-        assert!(state.executing_plan.is_none());
-        assert!(!bottom_pane.footer.is_turn_active);
-        assert_eq!(chat_widget.history().len(), 2);
-    }
-
-    #[test]
-    fn closed_plan_executor_without_terminal_update_is_not_left_running() {
-        use crate::cli::plan::plan_executor;
-
-        let mut state = crate::cli::session::session_state::SessionState::default();
-        state.executing_plan = Some(astra_services::task_orchestrator::TaskPlan::default());
-        let (handle, updates, _commands) = plan_executor::create_plan_channels();
-        state.plan_handle = Some(handle);
-        drop(updates);
-
-        let mut chat_widget = chat_widget::ChatWidget::new(String::new());
-        let mut bottom_pane = BottomPane::new();
-        let mut status_indicator = status_indicator::StatusIndicator::new();
-
-        assert!(drain_plan_updates_into_workbench(
-            &mut state,
-            &mut chat_widget,
-            &mut bottom_pane,
-            &mut status_indicator,
-            &FrameRequester::test_dummy(),
-        ));
-        assert!(state.plan_handle.is_none());
-        assert!(state.executing_plan.is_none());
-        assert!(!state.plan_execution_paused);
-        assert!(state.plan_execution_last_error.is_some());
-        assert!(!bottom_pane.footer.is_turn_active);
-    }
-
-    #[test]
-    fn paused_plan_executor_remains_resumable_after_its_channel_closes() {
-        use crate::cli::plan::plan_executor::{self, PlanUpdate};
-
-        let mut state = crate::cli::session::session_state::SessionState::default();
-        state.executing_plan = Some(astra_services::task_orchestrator::TaskPlan::default());
-        let (handle, updates, _commands) = plan_executor::create_plan_channels();
-        state.plan_handle = Some(handle);
-        updates
-            .send(PlanUpdate::PlanPaused {
-                pct: 40,
-                remaining: 2,
-                elapsed: std::time::Duration::from_secs(3),
-                blocked_ids: Vec::new(),
-            })
-            .expect("plan update channel should be open");
-        drop(updates);
-
-        let mut chat_widget = chat_widget::ChatWidget::new(String::new());
-        let mut bottom_pane = BottomPane::new();
-        let mut status_indicator = status_indicator::StatusIndicator::new();
-
-        assert!(drain_plan_updates_into_workbench(
-            &mut state,
-            &mut chat_widget,
-            &mut bottom_pane,
-            &mut status_indicator,
-            &FrameRequester::test_dummy(),
-        ));
-        assert!(state.plan_handle.is_none());
-        assert!(state.executing_plan.is_some());
-        assert!(state.plan_execution_paused);
-        assert!(state.plan_execution_last_error.is_none());
-    }
-
     fn rendered_transcript_overlay(chat_widget: &chat_widget::ChatWidget, width: u16) -> String {
         let mut bottom_pane = BottomPane::new();
         let terminal_height = 120;
@@ -9825,7 +10642,7 @@ mod tests {
                     agent_id: "reviewer".into(),
                 },
             },
-            payload_kind: "review".into(),
+            payload_kind: astra_turn_types::AgentCommunicationPayloadKind::Text,
             summary: Some("lock ownership is unsafe".into()),
             response_accepted: None,
             related_message_id: None,
@@ -10240,6 +11057,7 @@ mod tests {
             spawn_tool_call_id: None,
             execution_metadata: None,
             delegation_chain: Vec::new(),
+            workspace_mutation: Default::default(),
         }
     }
 
@@ -10674,7 +11492,10 @@ mod tests {
         ]));
         let list_cache = Arc::new(tokio::sync::RwLock::new(String::new()));
 
-        drain_background_task_commands(&commands, &mut registry, None, &[], &list_cache).await;
+        assert!(
+            !drain_background_task_commands(&commands, &mut registry, None, &[], &list_cache).await,
+            "read-only output commands must not trigger workspace persistence"
+        );
 
         let snapshot = reply_rx
             .await
@@ -10717,7 +11538,10 @@ mod tests {
         ]));
         let list_cache = Arc::new(tokio::sync::RwLock::new(String::new()));
 
-        drain_background_task_commands(&commands, &mut registry, None, &[], &list_cache).await;
+        assert!(
+            !drain_background_task_commands(&commands, &mut registry, None, &[], &list_cache).await,
+            "read-only search commands must not trigger workspace persistence"
+        );
 
         let snapshot = reply_rx
             .await
@@ -10731,6 +11555,31 @@ mod tests {
         );
         assert!(snapshot.status.is_terminal());
         assert!(commands.lock_recover().is_empty());
+    }
+
+    #[tokio::test]
+    async fn foreground_tick_reports_typed_background_mutation() {
+        let temp = crate::tests::test_temp_dir();
+        let mut registry =
+            crate::tui::background_tasks::BackgroundTaskRegistry::new(temp.path().join("bg"));
+        let task_id = registry.spawn_shell("sleep 10", "long test");
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let commands = Arc::new(std::sync::Mutex::new(vec![
+            crate::edge_tools::BgTaskCommand::Kill {
+                task_id,
+                reply: reply_tx,
+            },
+        ]));
+        let list_cache = Arc::new(tokio::sync::RwLock::new(String::new()));
+
+        assert!(
+            drain_background_task_commands(&commands, &mut registry, None, &[], &list_cache).await,
+            "accepted lifecycle mutation must trigger immediate persistence"
+        );
+        reply_rx
+            .await
+            .expect("foreground tick must answer kill command")
+            .expect("live shell must accept cancellation");
     }
 
     #[tokio::test]
@@ -11044,8 +11893,7 @@ mod tests {
         let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
             temp.path().join("task-shortcut"),
         );
-        let store = Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new().with_validation());
-        let task_board = task_board_observer::TaskBoardObserver::new(store, "session-a");
+        let task_board = task_board_observer::TaskBoardObserver::new("session-a");
         let frame_requester = FrameRequester::test_dummy();
         let key = crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('t'),
@@ -11059,6 +11907,7 @@ mod tests {
         assert!(handle_task_surface_shortcut(
             &key,
             &task_board,
+            None,
             &mut expanded,
             &mut pin,
             &mut bottom_pane,
@@ -11066,10 +11915,6 @@ mod tests {
         ));
         assert!(expanded);
         assert_eq!(pin, Some(true));
-        assert!(
-            !bottom_pane.has_active_view(),
-            "Ctrl+T must not open the background-task panel even when background work exists"
-        );
         registry.kill(&background_task_id).unwrap();
 
         bottom_pane.push_view(Box::new(
@@ -11081,19 +11926,19 @@ mod tests {
         assert!(!handle_task_surface_shortcut(
             &key,
             &task_board,
+            None,
             &mut expanded,
             &mut pin,
             &mut bottom_pane,
             &frame_requester,
         ));
-        assert!(expanded);
+        assert!(expanded, "a focused modal must not alter task-board state");
         assert_eq!(pin, Some(true));
     }
 
     #[test]
-    fn ctrl_t_opens_canonical_task_board_over_a_conversation_tab() {
-        let store = Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new().with_validation());
-        let task_board = task_board_observer::TaskBoardObserver::new(store, "session-a");
+    fn ctrl_t_expands_canonical_task_board_beside_a_conversation_tab() {
+        let task_board = task_board_observer::TaskBoardObserver::new("session-a");
         let frame_requester = FrameRequester::test_dummy();
         let key = crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('t'),
@@ -11113,17 +11958,19 @@ mod tests {
         assert!(handle_task_surface_shortcut(
             &key,
             &task_board,
+            None,
             &mut expanded,
             &mut pin,
             &mut bottom_pane,
             &frame_requester,
         ));
-        assert!(bottom_pane.primary_workspace_is_open());
-        assert!(render_bottom_pane_text(&bottom_pane, 80, 16).contains("Task board"));
+        assert!(bottom_pane.conversation_tab_is_open());
+        assert!(expanded && pin == Some(true));
 
         assert!(handle_task_surface_shortcut(
             &key,
             &task_board,
+            None,
             &mut expanded,
             &mut pin,
             &mut bottom_pane,
@@ -11131,32 +11978,26 @@ mod tests {
         ));
         assert!(
             bottom_pane.conversation_tab_is_open(),
-            "a second Ctrl+T should return to the retained conversation"
+            "collapsing tasks should retain the current conversation"
         );
+        assert!(!expanded && pin == Some(false));
 
         assert!(handle_task_surface_shortcut(
             &key,
             &task_board,
+            None,
             &mut expanded,
             &mut pin,
             &mut bottom_pane,
             &frame_requester,
         ));
-
-        assert!(matches!(
-            bottom_pane.handle_key(crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Esc,
-                crossterm::event::KeyModifiers::NONE,
-            )),
-            crate::tui::bottom_pane::BottomPaneAction::ViewCompleted { .. }
-        ));
+        assert!(expanded && pin == Some(true));
         assert!(bottom_pane.conversation_tab_is_open());
     }
 
     #[test]
-    fn ctrl_t_switches_between_agent_monitor_and_task_board() {
-        let store = Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new().with_validation());
-        let task_board = task_board_observer::TaskBoardObserver::new(store, "session-a");
+    fn ctrl_t_expands_tasks_without_replacing_the_agent_monitor() {
+        let task_board = task_board_observer::TaskBoardObserver::new("session-a");
         let frame_requester = FrameRequester::test_dummy();
         let key = crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('t'),
@@ -11191,16 +12032,22 @@ mod tests {
         assert!(handle_task_surface_shortcut(
             &key,
             &task_board,
+            None,
             &mut expanded,
             &mut pin,
             &mut bottom_pane,
             &frame_requester,
         ));
-        assert!(bottom_pane.task_board_is_open());
+        assert!(bottom_pane.agent_monitor_is_open());
+        assert!(
+            expanded && pin == Some(true),
+            "Ctrl+T must expand the canonical task graph in the current canvas"
+        );
 
         assert!(handle_task_surface_shortcut(
             &key,
             &task_board,
+            None,
             &mut expanded,
             &mut pin,
             &mut bottom_pane,
@@ -11208,51 +12055,185 @@ mod tests {
         ));
         assert!(
             bottom_pane.agent_monitor_is_open(),
-            "closing Task Board should restore the retained Agent Monitor"
+            "collapsing tasks must retain the active Agent Monitor"
+        );
+        assert!(!expanded);
+    }
+
+    #[test]
+    fn primary_ctrl_t_toggles_the_inline_canonical_task_board() {
+        let task_board = task_board_observer::TaskBoardObserver::new("session-a");
+        let frame_requester = FrameRequester::test_dummy();
+        let key = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('t'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        let mut expanded = false;
+        let mut pin = None;
+        let mut bottom_pane = BottomPane::new();
+
+        assert!(is_primary_task_shortcut(&key));
+        assert!(handle_primary_task_shortcut(
+            &task_board,
+            None,
+            &mut expanded,
+            &mut pin,
+            &mut bottom_pane,
+            &frame_requester,
+        ));
+        assert!(
+            expanded && pin == Some(true),
+            "Ctrl+T must expand the task board without opening a separate page"
+        );
+
+        assert!(handle_primary_task_shortcut(
+            &task_board,
+            None,
+            &mut expanded,
+            &mut pin,
+            &mut bottom_pane,
+            &frame_requester,
+        ));
+        assert!(!expanded && pin == Some(false));
+    }
+
+    #[test]
+    fn first_stream_binding_scopes_the_live_work_event_before_turn_settlement() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
+            .expect("test API client");
+        let task_board = task_board_observer::TaskBoardObserver::new("");
+        let server_agents =
+            crate::tui::server_agent_observer::ServerAgentObserver::new(api.clone(), None, None);
+        let work_observer = crate::tui::plan_task_observer::PlanTaskObserver::new(api, None, None);
+        let mut chat = chat_widget::ChatWidget::new(String::new());
+        let mut pin = Some(false);
+
+        assert!(apply_live_session_binding(
+            &TuiAppEvent::SessionBound("session-live".into()),
+            &mut chat,
+            &task_board,
+            &server_agents,
+            &work_observer,
+            &mut pin,
+        ));
+        assert_eq!(chat.session_id(), "session-live");
+        assert_eq!(
+            task_board.truth_state(),
+            task_board_observer::TaskBoardTruthState::Loading
+        );
+        assert_eq!(pin, None, "a new session must not inherit a prior collapse");
+
+        let event = TuiAppEvent::WorkTaskBoardUpdate(running_work_update());
+        assert!(apply_live_work_update_from_event(&event, &task_board));
+        let projection = task_board.active_projection();
+        assert!(projection.has_open_work());
+        assert_eq!(
+            projection.truth_state(),
+            task_board_observer::TaskBoardTruthState::Confirmed
+        );
+        let (expanded, reset_pin) = crate::tui::board_pin::resolve_board_visibility(
+            pin,
+            projection.has_tasks(),
+            projection.has_open_work(),
+        );
+        assert!(
+            expanded,
+            "live Work must appear without a Ctrl+T discovery step"
+        );
+        assert!(!reset_pin);
+    }
+
+    #[test]
+    fn server_work_event_projects_before_graph_reconciliation() {
+        let task_board = task_board_observer::TaskBoardObserver::new("session-live");
+        let event = crate::tui::stream_bridge::map_stream_event(
+            crate::cli::chat_stream::StreamEvent::WorkTaskBoardUpdate(running_work_update()),
+        )
+        .expect("server Work event maps to the foreground reducer");
+
+        assert!(apply_live_work_update_from_event(&event, &task_board));
+        let projection = task_board.active_projection();
+        assert!(projection.has_open_work());
+        assert!(
+            crate::tui::board_pin::resolve_board_visibility(
+                None,
+                projection.has_tasks(),
+                projection.has_open_work(),
+            )
+            .0
         );
     }
 
     #[test]
-    fn ctrl_g_switches_from_task_board_to_the_agent_run_tree() {
-        let store = Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new().with_validation());
-        let task_board = task_board_observer::TaskBoardObserver::new(store, "session-a");
-        let mut bottom_pane = BottomPane::new();
-        bottom_pane.push_view(Box::new(
-            crate::tui::bottom_pane::task_board_view::TaskBoardView::new(
-                task_board.active_projection(),
-            ),
-        ));
-        let mut chat_widget = chat_widget::ChatWidget::new(String::new());
-        chat_widget.handle_event(chat_widget::AppEvent::wire(
-            crate::tui::chat_widget::WireEvent::AgentLive(
-                astra_turn_core::agent_live_event::AgentLiveEvent {
-                    run_id: "run-review".into(),
-                    agent_id: "reviewer@run-review".into(),
-                    kind: astra_turn_core::agent_live_event::AgentLiveEventKind::OutputDelta(
-                        "reviewing".into(),
-                    ),
-                },
-            ),
-        ));
+    fn tool_card_payload_cannot_create_task_rows() {
+        use astra_turn_core::agent_live_event::{AgentLiveEvent, AgentLiveEventKind};
 
-        assert!(handle_agent_monitor_shortcut(
-            &crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Char('g'),
-                crossterm::event::KeyModifiers::CONTROL,
-            ),
-            &mut chat_widget,
-            &mut bottom_pane,
-            &FrameRequester::test_dummy(),
+        let task_board = task_board_observer::TaskBoardObserver::new("session-live");
+        let event = TuiAppEvent::AgentLive(AgentLiveEvent {
+            run_id: "server-run".into(),
+            agent_id: "server-agent".into(),
+            kind: AgentLiveEventKind::ToolCompleted {
+                name: "bash".into(),
+                description: "Fetch source".into(),
+                status: "completed".into(),
+                duration_ms: 1,
+                output_summary: None,
+                output: Some("{\"task_board_update\":{}}".into()),
+                tool_use_id: "call-bash".into(),
+            },
+        });
+
+        assert!(!apply_live_work_update_from_event(&event, &task_board));
+        assert!(!task_board.active_projection().has_tasks());
+    }
+
+    #[test]
+    fn r_refreshes_only_an_open_empty_task_surface() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
+            .expect("test API client");
+        let observer =
+            crate::tui::plan_task_observer::PlanTaskObserver::new(api, None, Some("session-a"));
+        let frame_requester = FrameRequester::test_dummy();
+        let r = crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('r'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let mut bottom_pane = BottomPane::new();
+
+        assert!(handle_task_surface_refresh_shortcut(
+            &r,
+            &observer,
+            true,
+            &bottom_pane,
+            &frame_requester,
         ));
-        assert!(bottom_pane.agent_monitor_is_open());
+        assert!(
+            !handle_task_surface_refresh_shortcut(
+                &r,
+                &observer,
+                false,
+                &bottom_pane,
+                &frame_requester,
+            ),
+            "R is ordinary input unless the Work board is open"
+        );
+
+        bottom_pane.composer.set_text("draft");
+        assert!(
+            !handle_task_surface_refresh_shortcut(
+                &r,
+                &observer,
+                true,
+                &bottom_pane,
+                &frame_requester,
+            ),
+            "R must never steal a user's draft"
+        );
     }
 
     #[test]
     fn session_rebind_keeps_every_workbench_projection_in_one_scope() {
-        let task_board = task_board_observer::TaskBoardObserver::new(
-            Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new()),
-            "session-a",
-        );
+        let task_board = task_board_observer::TaskBoardObserver::new("session-a");
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:1", None)
             .expect("test API client");
         let server_agent_observer = crate::tui::server_agent_observer::ServerAgentObserver::new(
@@ -11308,9 +12289,8 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_t_opens_the_cross_session_board_even_before_it_has_rows() {
-        let store = Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new().with_validation());
-        let task_board = task_board_observer::TaskBoardObserver::new(store, "session-a");
+    fn ctrl_shift_t_uses_the_same_current_work_surface() {
+        let task_board = task_board_observer::TaskBoardObserver::new("session-a");
         let frame_requester = FrameRequester::test_dummy();
         let key = crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Char('t'),
@@ -11323,15 +12303,12 @@ mod tests {
         assert!(handle_task_surface_shortcut(
             &key,
             &task_board,
+            None,
             &mut expanded,
             &mut pin,
             &mut bottom_pane,
             &frame_requester,
         ));
-        assert_eq!(
-            task_board.view_mode(),
-            task_board_observer::ViewMode::AllSessions
-        );
         assert!(expanded);
         assert_eq!(pin, Some(true));
     }
@@ -11350,6 +12327,63 @@ mod tests {
         };
         assert!(error.contains("before timeout"));
         assert!(!handle.is_blocked());
+    }
+
+    #[tokio::test]
+    async fn background_surfaces_skip_unchanged_input_ticks() {
+        let temp = crate::tests::test_temp_dir();
+        let mut registry = crate::tui::background_tasks::BackgroundTaskRegistry::new(
+            temp.path().join("surface-refresh"),
+        );
+        let snapshot = crate::tui::local_agent_snapshot::LocalAgentSnapshot::default();
+        let cache = tokio::sync::RwLock::new("sentinel".to_string());
+        let mut bottom_pane = BottomPane::new();
+        let mut next_refresh = std::time::Instant::now() + Duration::from_secs(60);
+
+        assert!(
+            !refresh_background_task_surfaces(
+                &mut registry,
+                &snapshot,
+                &[],
+                &cache,
+                &mut bottom_pane,
+                &mut next_refresh,
+                false,
+            )
+            .await
+        );
+        assert_eq!(cache.read().await.as_str(), "sentinel");
+
+        assert!(
+            refresh_background_task_surfaces(
+                &mut registry,
+                &snapshot,
+                &[],
+                &cache,
+                &mut bottom_pane,
+                &mut next_refresh,
+                true,
+            )
+            .await
+        );
+        assert_eq!(
+            cache.read().await.as_str(),
+            "<background_tasks count=\"0\" />"
+        );
+
+        assert!(
+            !refresh_background_task_surfaces(
+                &mut registry,
+                &snapshot,
+                &[],
+                &cache,
+                &mut bottom_pane,
+                &mut next_refresh,
+                false,
+            )
+            .await,
+            "the following 50 ms input tick must not rebuild unchanged shared state"
+        );
     }
 
     #[tokio::test]
@@ -11868,34 +12902,21 @@ mod tests {
         assert!(bottom_pane.has_active_view());
     }
 
-    #[tokio::test]
-    async fn submit_active_run_guidance_enqueues_against_active_local_run_control() {
-        let run_control = Arc::new(std::sync::Mutex::new(Some(LocalRunControl::shared())));
-
-        let receipt = submit_active_run_guidance(
-            &run_control,
+    #[test]
+    fn active_run_guidance_preserves_typed_runtime_context() {
+        let input = LocalRunControl::guidance_input(
             "现在什么情况？",
             Some("<background_tasks count=\"1\"><task id=\"review-group\" kind=\"agent_fanout\" status=\"running\" /></background_tasks>"),
             &[],
         )
-            .await
-            .expect("user intent should be accepted");
-
-        let provider = astra_core::sync_poison::recover_mutex_lock(&run_control)
-            .clone()
-            .expect("run control should stay installed");
-        let polled = provider
-            .poll_user_intents("local-user", "run-local", 0)
-            .await;
-        assert_eq!(polled.inputs.len(), 1, "one user intent should be queued");
-        assert_eq!(polled.inputs[0].intent_id, receipt.intent_id);
-        assert_eq!(polled.inputs[0].input["content"], "现在什么情况？");
+        .expect("valid guidance input");
+        assert_eq!(input["content"], "现在什么情况？");
         assert_eq!(
-            polled.inputs[0].input["astra_runtime_context"]["schema"],
+            input["astra_runtime_context"]["schema"],
             "active_work_snapshot.v1"
         );
         assert_eq!(
-            polled.inputs[0].input["astra_runtime_context"]["background_work_snapshot"],
+            input["astra_runtime_context"]["background_work_snapshot"],
             "<background_tasks count=\"1\"><task id=\"review-group\" kind=\"agent_fanout\" status=\"running\" /></background_tasks>"
         );
     }
@@ -11905,7 +12926,6 @@ mod tests {
         let mut chat_widget = chat_widget::ChatWidget::new(String::new());
         let mut bottom_pane = BottomPane::new();
         let mut status_indicator = status_indicator::StatusIndicator::new();
-        let mut cancel_control_tasks = tokio::task::JoinSet::new();
         let started_at = std::time::Instant::now();
         bottom_pane.set_task_status(TaskStatus::TurnRunning { started_at });
         status_indicator.begin_turn(started_at);
@@ -11917,8 +12937,6 @@ mod tests {
             &mut chat_widget,
             &mut bottom_pane,
             &mut status_indicator,
-            &mut cancel_control_tasks,
-            None,
             &run_control,
             &cancel_token,
         );
@@ -11939,18 +12957,6 @@ mod tests {
                 .await
                 .expect("local control status"),
             Some(RunControlStatus::Cancelled)
-        );
-    }
-
-    #[tokio::test]
-    async fn submit_active_run_guidance_rejects_missing_local_run_control() {
-        let run_control = Arc::new(std::sync::Mutex::new(None));
-        let error = submit_active_run_guidance(&run_control, "先停下来吧", None, &[])
-            .await
-            .expect_err("missing run control must be rejected locally");
-        assert!(
-            error.contains("changing state"),
-            "missing run control should surface a user-facing transient-state error"
         );
     }
 
@@ -11985,7 +12991,52 @@ mod tests {
             1,
             "replayed applied event must not duplicate user history"
         );
-        assert!(bottom_pane.take_unapplied_user_intents().is_empty());
+        assert!(
+            bottom_pane
+                .take_client_recoverable_user_intents()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn guidance_submission_errors_preserve_ambiguous_commit_ownership() {
+        let rejected =
+            GuidanceSubmissionError::from_thin_client(astra_thin_client::ThinClientError::Api {
+                status: reqwest::StatusCode::CONFLICT,
+                body: "run already settled".into(),
+            });
+        assert!(matches!(rejected, GuidanceSubmissionError::Rejected(_)));
+
+        let server_failure =
+            GuidanceSubmissionError::from_thin_client(astra_thin_client::ThinClientError::Api {
+                status: reqwest::StatusCode::BAD_GATEWAY,
+                body: "upstream response lost".into(),
+            });
+        assert!(matches!(
+            server_failure,
+            GuidanceSubmissionError::Unconfirmed(_)
+        ));
+
+        let malformed_ack =
+            GuidanceSubmissionError::from_thin_client(astra_thin_client::ThinClientError::Json(
+                serde_json::from_str::<serde_json::Value>("{")
+                    .expect_err("malformed acknowledgement"),
+            ));
+        assert!(matches!(
+            malformed_ack,
+            GuidanceSubmissionError::Unconfirmed(_)
+        ));
+
+        let incompatible = GuidanceSubmissionError::from_thin_client(
+            astra_thin_client::ThinClientError::IncompatibleRuntime {
+                expected: "current".into(),
+                actual: "unknown".into(),
+            },
+        );
+        assert!(matches!(
+            incompatible,
+            GuidanceSubmissionError::Unconfirmed(_)
+        ));
     }
 
     #[test]
@@ -12017,7 +13068,7 @@ mod tests {
                     agent_id: "reviewer".into(),
                 },
             },
-            payload_kind: "text".into(),
+            payload_kind: astra_turn_types::AgentCommunicationPayloadKind::Text,
             summary: Some("User guidance".into()),
             response_accepted: None,
             related_message_id: None,
@@ -12790,17 +13841,14 @@ mod tests {
         let entered_empty = PlanModeUiSnapshot {
             active: true,
             goal: String::new(),
-            executing: false,
         };
         let entered_goal = PlanModeUiSnapshot {
             active: true,
             goal: "Implement auth middleware".into(),
-            executing: false,
         };
-        let exited_running = PlanModeUiSnapshot {
+        let exited = PlanModeUiSnapshot {
             active: false,
             goal: String::new(),
-            executing: true,
         };
 
         let enter_msg = plan_transition_notice(&inactive, &entered_empty, false)
@@ -12813,9 +13861,9 @@ mod tests {
         assert!(goal_msg.contains("Plan goal set"));
         assert!(goal_msg.contains("Implement auth middleware"));
 
-        let exit_msg = plan_transition_notice(&entered_goal, &exited_running, false)
-            .expect("background execution exit should be surfaced");
-        assert!(exit_msg.contains("running in the background"));
+        let exit_msg = plan_transition_notice(&entered_goal, &exited, false)
+            .expect("exiting plan mode should be surfaced");
+        assert!(exit_msg.contains("normal chat"));
 
         assert!(
             plan_transition_notice(&inactive, &inactive, true).is_none(),
@@ -13012,39 +14060,20 @@ mod tests {
     #[test]
     fn startup_observations_update_presentation_without_creating_user_input() {
         let mut bottom_pane = BottomPane::new();
-        let mut widget = chat_widget::ChatWidget::new("session-1");
+        let widget = chat_widget::ChatWidget::new("session-1");
 
-        assert!(!apply_startup_ui_effect(
-            StartupUiEffect::GitBranch(None),
-            &mut bottom_pane,
-            &mut widget,
-        ));
-        assert!(!apply_startup_ui_effect(
+        apply_startup_ui_effect(StartupUiEffect::GitBranch(None), &mut bottom_pane);
+        apply_startup_ui_effect(
             StartupUiEffect::GitBranch(Some("feature/fast-start".into())),
             &mut bottom_pane,
-            &mut widget,
-        ));
+        );
         assert_eq!(
             bottom_pane.footer.git_branch.as_deref(),
             Some("feature/fast-start")
         );
         assert!(widget.history().is_empty());
 
-        assert!(apply_startup_ui_effect(
-            StartupUiEffect::ResumeSummary(
-                "While you were away: 1 background shell finished (1 ok).".into()
-            ),
-            &mut bottom_pane,
-            &mut widget,
-        ));
-        assert!(matches!(
-            widget.history()[0].to_persist(),
-            Some(crate::tui::turn_event::TurnEvent::System {
-                level: crate::tui::turn_event::SystemLevel::Info,
-                text,
-                ..
-            }) if text == "While you were away: 1 background shell finished (1 ok)."
-        ));
+        assert!(widget.history().is_empty());
     }
 
     #[test]

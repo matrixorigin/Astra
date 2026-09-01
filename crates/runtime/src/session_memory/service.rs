@@ -34,7 +34,7 @@ use astra_services::event_ingestion::{IngestionEvent, IngestionSender};
 use astra_services::session_journal::{
     JournalEvent, SessionMemoryExtractionBreadcrumbs, SessionMemoryExtractionErrorReason,
     SessionMemoryExtractionOutcome, SessionMemoryExtractionSkipReason,
-    SessionMemoryExtractionSource,
+    SessionMemoryExtractionSource, SubsystemDiagnosticSeverity,
 };
 use astra_turn_core::cloud_session_memory_extract::SessionMemoryState;
 use astra_turn_types::is_runtime_owned_message;
@@ -51,21 +51,75 @@ use super::runner::{
     persist_local_session_memory_metadata, run_extraction,
 };
 
-type LocalJournalEventSink = dyn Fn(&JournalEvent) + Send + Sync + 'static;
+type LocalJournalEventSink = dyn Fn(&JournalEvent, &str) + Send + Sync + 'static;
 
 #[derive(Default)]
 struct SessionWorkCoordinator {
-    active_fingerprints: std::collections::HashMap<String, u64>,
+    active: std::collections::HashMap<String, ActiveSessionWork>,
     queued_latest: std::collections::HashMap<String, (ExtractionRequest, u64)>,
 }
 
+struct MemoryWorkerLifecycle {
+    accepting: bool,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Default for MemoryWorkerLifecycle {
+    fn default() -> Self {
+        Self {
+            accepting: true,
+            tasks: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ActiveSessionWork {
+    fingerprint: u64,
+    turn: u32,
+}
+
+/// Result of waiting for extraction work that belongs to one canonical turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionDrainOutcome {
+    /// All extraction work through the requested turn has completed.
+    Settled,
+    /// A newer canonical turn owns the session now. The older caller must not
+    /// publish governance derived from stale session facts.
+    Superseded,
+    /// Work for this turn made no progress within the per-attempt bound.
+    TimedOut,
+}
+
+/// Hard upper bound for one complete background extraction attempt. Memory is
+/// useful continuity, but it is not allowed to monopolize a session after the
+/// interactive turn has finished. Snapshot reads and durable persistence share
+/// this bounded worker budget.
+pub const EXTRACTION_WORK_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Hard upper bound on one LLM call. Memory extraction is background
-/// work; a hung call must never linger past this.
-pub const LLM_TIMEOUT: Duration = Duration::from_secs(30);
+/// work; a hung selector must not leave a visible thirty-second post-turn
+/// tail. The rule-based fallback remains authoritative when this budget is
+/// exhausted.
+pub const LLM_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Remote freshness is an optimization before extraction, not permission to
+/// consume the worker's whole deadline. A local snapshot (when configured)
+/// or an empty base remains a safe input when the remote read is slow.
+pub const CURRENT_SNAPSHOT_READ_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Keep enough of the end-to-end worker budget for the deterministic fallback
+/// and its durable write. Selector inference may use only the budget left
+/// after this reserve.
+pub const EXTRACTION_PERSIST_RESERVE: Duration = Duration::from_secs(7);
 
 /// Output token budget for the sparse JSON update. The canonical narrative is
 /// intentionally small; a larger budget would only invite history-log output.
 pub const EXTRACTION_MAX_OUTPUT_TOKENS: usize = 2048;
+/// Bound retained semantic fingerprints per authenticated owner. Durable
+/// freshness remains authoritative after eviction, so this cache may safely
+/// forget the oldest inactive session without losing memory correctness.
+const MAX_SESSION_STATES_PER_OWNER: usize = 1024;
 
 // ───────────────────────────────────────────────────────────────────────
 // Memory-inference resolution (async trait so tests can swap in a const)
@@ -122,11 +176,16 @@ pub struct MemoryExtractionService {
     /// Notifier the worker wakes when `pending` reaches zero. Pair with
     /// `pending` as a lightweight wait-for-empty primitive.
     pending_done: Arc<tokio::sync::Notify>,
+    /// Process-owned extraction tasks and their admission fence. Owner-scoped
+    /// services share this lifecycle so server shutdown can close every tenant
+    /// before the provider-settlement coordinator is drained.
+    worker_lifecycle: Arc<std::sync::Mutex<MemoryWorkerLifecycle>>,
     /// Per-session debounce state. Owned by the service so it survives
     /// the per-turn `AgenticLoopState` rebuild — the previous design
     /// stored this on `AgenticLoopState` and lost the last semantic
-    /// fingerprint every turn, defeating debounce. Entries are removed on
-    /// [`Self::forget_session`] (session end).
+    /// fingerprint every turn, defeating debounce. CLI teardown can remove a
+    /// known session through [`Self::forget_session`]; long-lived servers
+    /// retain a bounded oldest-inactive cache.
     session_states: Arc<std::sync::Mutex<std::collections::HashMap<String, SessionMemoryState>>>,
     /// Request-owner scoped service handles. Each owner gets isolated
     /// debounce/in-flight maps while endpoint health, shutdown accounting,
@@ -138,6 +197,7 @@ pub struct MemoryExtractionService {
     >,
     local_event_sink: Option<Arc<LocalJournalEventSink>>,
     require_local_current_snapshot: bool,
+    extraction_work_timeout: Duration,
 }
 
 impl std::fmt::Debug for MemoryExtractionService {
@@ -199,12 +259,14 @@ impl MemoryExtractionService {
             broker,
             pending: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pending_done: Arc::new(tokio::sync::Notify::new()),
+            worker_lifecycle: Arc::new(std::sync::Mutex::new(MemoryWorkerLifecycle::default())),
             session_states: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             owner_scoped_services: Arc::new(
                 std::sync::Mutex::new(std::collections::HashMap::new()),
             ),
             local_event_sink: None,
             require_local_current_snapshot: false,
+            extraction_work_timeout: EXTRACTION_WORK_TIMEOUT,
         }
     }
 
@@ -259,15 +321,20 @@ impl MemoryExtractionService {
             ingestion: self.ingestion.clone(),
             user_id: Some(Arc::from(scope.user_id.as_str())),
             health: Arc::clone(&self.health),
-            memoria_health: Arc::clone(&self.memoria_health),
+            // Memoria request failures may be owner-specific (binding, quota,
+            // or request data). Without typed endpoint-failure evidence, one
+            // tenant must never open another tenant's circuit breaker.
+            memoria_health: Arc::new(MemoriaHealth::new()),
             work: Arc::new(std::sync::Mutex::new(SessionWorkCoordinator::default())),
             broker: Arc::clone(&self.broker),
             pending: Arc::clone(&self.pending),
             pending_done: Arc::clone(&self.pending_done),
+            worker_lifecycle: Arc::clone(&self.worker_lifecycle),
             session_states: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             owner_scoped_services: Arc::clone(&self.owner_scoped_services),
             local_event_sink: self.local_event_sink.clone(),
             require_local_current_snapshot: self.require_local_current_snapshot,
+            extraction_work_timeout: self.extraction_work_timeout,
         });
         scoped.insert(scope.user_id, Arc::downgrade(&service));
         Ok(service)
@@ -374,6 +441,95 @@ impl MemoryExtractionService {
         }
     }
 
+    /// Close process-wide extraction admission, abort every process-owned
+    /// worker, and wait within one shared deadline for their RAII guards to
+    /// release durable inference ownership. This is a server-lifecycle fence,
+    /// not user cancellation; provider settlement is handed to the durable
+    /// coordinator by the dropped inference owner.
+    pub async fn stop_for_process_shutdown(&self, timeout: Duration) -> usize {
+        let tasks = {
+            let mut lifecycle = self
+                .worker_lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            lifecycle.accepting = false;
+            lifecycle.tasks.retain(|task| !task.is_finished());
+            let tasks = std::mem::take(&mut lifecycle.tasks);
+            for task in &tasks {
+                task.abort();
+            }
+            tasks
+        };
+        let deadline = Instant::now() + timeout;
+        let _ = tokio::time::timeout(timeout, async move {
+            for task in tasks {
+                let _ = task.await;
+            }
+        })
+        .await;
+        self.wait_for_pending(deadline.saturating_duration_since(Instant::now()))
+            .await
+    }
+
+    /// Wait only for extraction work owned by `session_id`.
+    ///
+    /// Server run finalization uses this instead of [`wait_for_pending`] so a
+    /// slow extraction in another user/session cannot delay this session's
+    /// governance or consume its cleanup timeout. Process shutdown still uses
+    /// the global drain method above.
+    pub async fn wait_for_session_pending_through(
+        &self,
+        session_id: &str,
+        turn: u32,
+        timeout: Duration,
+    ) -> SessionDrainOutcome {
+        if session_id.is_empty() {
+            return SessionDrainOutcome::Settled;
+        }
+        let mut deadline = Instant::now() + timeout;
+        let mut observed_active = None;
+        loop {
+            let state = {
+                let work = self
+                    .work
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let active = work.active.get(session_id).copied();
+                let queued_turn = work
+                    .queued_latest
+                    .get(session_id)
+                    .and_then(|(request, _)| request.turn_number());
+                (active, queued_turn)
+            };
+            let (Some(active), queued_turn) = state else {
+                return SessionDrainOutcome::Settled;
+            };
+            if active.turn > turn || queued_turn.is_some_and(|queued_turn| queued_turn > turn) {
+                return SessionDrainOutcome::Superseded;
+            }
+            if observed_active.is_some_and(|observed| observed != active) {
+                // Latest-wins coordination may legitimately execute one
+                // already-active snapshot followed by the requested one.
+                // Give each provider attempt its own bounded window instead
+                // of timing out the second attempt on the first one's clock.
+                deadline = Instant::now() + timeout;
+            }
+            observed_active = Some(active);
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return SessionDrainOutcome::TimedOut;
+            }
+            let notified = self.pending_done.notified();
+            tokio::pin!(notified);
+            if tokio::time::timeout(remaining, &mut notified)
+                .await
+                .is_err()
+            {
+                return SessionDrainOutcome::TimedOut;
+            }
+        }
+    }
+
     /// Consolidate the final canonical session snapshot through the same
     /// provider instance used for extraction and prompt recall. This keeps
     /// CLI+Server, Edge+Server, and Server Only on one ownership boundary;
@@ -434,6 +590,18 @@ impl MemoryExtractionService {
             );
             return SpawnDecision::Skipped;
         };
+        if !self
+            .worker_lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .accepting
+        {
+            tracing::debug!(
+                session_id = %session_id,
+                "skipping session-memory extraction after process shutdown admission closed"
+            );
+            return SpawnDecision::Skipped;
+        }
         let content_fingerprint = extraction_input_fingerprint(&req);
         // Breadcrumbs for sync-path skip events. `selector_model` and
         // `attempt` only make sense in the async worker after LLM
@@ -450,6 +618,7 @@ impl MemoryExtractionService {
         enum Admission {
             Spawn,
             Queue,
+            Superseded,
             Skip(SessionMemoryExtractionSkipReason),
         }
 
@@ -476,37 +645,55 @@ impl MemoryExtractionService {
             if let GateDecision::Skip(reason) = dec {
                 Admission::Skip(reason)
             } else {
-                match self.memoria_health.admit() {
-                    MemoriaAdmit::CoolingDown => {
-                        Admission::Skip(SessionMemoryExtractionSkipReason::MemoriaUnhealthy)
-                    }
-                    MemoriaAdmit::Ready => {
-                        let mut work = self
-                            .work
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        match work.active_fingerprints.get(&session_id).copied() {
-                            None => {
-                                work.active_fingerprints
-                                    .insert(session_id.clone(), content_fingerprint);
-                                Admission::Spawn
-                            }
-                            Some(active_fingerprint)
-                                if active_fingerprint == content_fingerprint
-                                    || work.queued_latest.get(&session_id).is_some_and(
-                                        |(_, queued_fingerprint)| {
-                                            *queued_fingerprint == content_fingerprint
-                                        },
-                                    ) =>
-                            {
-                                Admission::Skip(SessionMemoryExtractionSkipReason::InFlight)
-                            }
-                            Some(_) => {
-                                work.queued_latest
-                                    .insert(session_id.clone(), (req.clone(), content_fingerprint));
-                                Admission::Queue
-                            }
+                let mut work = self
+                    .work
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match work.active.get(&session_id).copied() {
+                    None => match self.memoria_health.admit() {
+                        MemoriaAdmit::CoolingDown => {
+                            Admission::Skip(SessionMemoryExtractionSkipReason::MemoriaUnhealthy)
                         }
+                        MemoriaAdmit::Ready => {
+                            work.active.insert(
+                                session_id.clone(),
+                                ActiveSessionWork {
+                                    fingerprint: content_fingerprint,
+                                    turn,
+                                },
+                            );
+                            Admission::Spawn
+                        }
+                    },
+                    Some(active)
+                        if active.turn > turn
+                            || work.queued_latest.get(&session_id).is_some_and(
+                                |(queued, _)| {
+                                    queued.turn_number().is_some_and(|queued| queued > turn)
+                                },
+                            ) =>
+                    {
+                        Admission::Superseded
+                    }
+                    Some(active)
+                        if active.fingerprint == content_fingerprint
+                            || work.queued_latest.get(&session_id).is_some_and(
+                                |(_, queued_fingerprint)| {
+                                    *queued_fingerprint == content_fingerprint
+                                },
+                            ) =>
+                    {
+                        // This request cannot spawn, so it must not consume a
+                        // scarce cooldown-recovery probe.
+                        Admission::Skip(SessionMemoryExtractionSkipReason::InFlight)
+                    }
+                    Some(_) => {
+                        // The existing owner will process the latest snapshot
+                        // before releasing the session slot. No second worker
+                        // or independent provider admission is created.
+                        work.queued_latest
+                            .insert(session_id.clone(), (req.clone(), content_fingerprint));
+                        Admission::Queue
                     }
                 }
             }
@@ -514,7 +701,22 @@ impl MemoryExtractionService {
 
         match admission {
             Admission::Spawn => {}
-            Admission::Queue => return SpawnDecision::Queued,
+            Admission::Queue => {
+                // Wake turn-scoped drain waiters so an older cleanup can
+                // observe that it has been superseded immediately.
+                self.pending_done.notify_waiters();
+                return SpawnDecision::Queued;
+            }
+            Admission::Superseded => {
+                self.emit_skip_event(
+                    user_id,
+                    Some(session_id.as_str()),
+                    turn,
+                    SessionMemoryExtractionSkipReason::Superseded,
+                    &skip_breadcrumbs,
+                );
+                return SpawnDecision::Skipped;
+            }
             Admission::Skip(reason) => {
                 let sid_opt = if session_id.is_empty() {
                     None
@@ -524,6 +726,24 @@ impl MemoryExtractionService {
                 self.emit_skip_event(user_id, sid_opt, turn, reason, &skip_breadcrumbs);
                 return SpawnDecision::Skipped;
             }
+        }
+
+        // Serialize the final admission check with process shutdown. Gate
+        // evaluation may race with shutdown, but no worker can be installed
+        // after the lifecycle fence closes.
+        let mut worker_lifecycle = self
+            .worker_lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !worker_lifecycle.accepting {
+            let mut work = self
+                .work
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            work.active.remove(&session_id);
+            work.queued_latest.remove(&session_id);
+            self.pending_done.notify_waiters();
+            return SpawnDecision::Skipped;
         }
 
         // Track in-flight workers so shutdown can drain them. The
@@ -539,15 +759,39 @@ impl MemoryExtractionService {
         let pending_done = Arc::clone(&self.pending_done);
         let pending_guard = PendingGuard::new(pending, pending_done);
         let work_guard = SessionWorkGuard::new(Arc::clone(&self.work), session_id.clone());
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let _pending_guard = pending_guard;
             let _work_guard = work_guard;
             let mut next = Some((req, content_fingerprint));
             while let Some((request, fingerprint)) = next {
-                Arc::clone(&svc).run_one(request, fingerprint).await;
+                let timeout_session_id = request
+                    .session_id()
+                    .map(str::to_string)
+                    .expect("admitted extraction request has a session id");
+                let timeout_turn = request
+                    .turn_number()
+                    .expect("admitted extraction request has a turn");
+                let timeout_messages_count = request.messages.len() as u32;
+                let started = Instant::now();
+                if tokio::time::timeout(
+                    svc.extraction_work_timeout,
+                    Arc::clone(&svc).run_one(request, fingerprint),
+                )
+                .await
+                .is_err()
+                {
+                    svc.record_extraction_deadline_exceeded(
+                        &timeout_session_id,
+                        timeout_turn,
+                        timeout_messages_count,
+                        started.elapsed().as_millis() as u64,
+                    );
+                }
                 next = svc.take_queued_or_release(&session_id);
             }
         });
+        worker_lifecycle.tasks.retain(|task| !task.is_finished());
+        worker_lifecycle.tasks.push(task);
         SpawnDecision::Spawned
     }
 
@@ -576,7 +820,9 @@ impl MemoryExtractionService {
         // spending selector tokens. A normal turn is idempotent once that
         // snapshot covers it; explicit correction/undo requests may replace a
         // same-turn snapshot with corrected state.
-        let current = self.load_current_memory_with_freshness(&session_id).await;
+        let current = self
+            .load_current_memory_with_freshness(&session_id, CURRENT_SNAPSHOT_READ_TIMEOUT)
+            .await;
         if current
             .as_ref()
             .and_then(|loaded| loaded.updated_turn)
@@ -634,6 +880,11 @@ impl MemoryExtractionService {
             });
         }
 
+        let selector_budget = LLM_TIMEOUT.min(
+            self.extraction_work_timeout
+                .saturating_sub(started.elapsed())
+                .saturating_sub(EXTRACTION_PERSIST_RESERVE),
+        );
         let artifacts = run_extraction(
             &self.memoria_client,
             &req.inference_scope,
@@ -642,13 +893,41 @@ impl MemoryExtractionService {
             &current_memory,
             &req.session_facts,
             &effective_selectors,
-            LLM_TIMEOUT,
+            selector_budget,
             EXTRACTION_MAX_OUTPUT_TOKENS,
         )
         .await;
         let duration_ms = started.elapsed().as_millis() as u64;
 
         match artifacts {
+            ExtractionArtifacts::NoChange {
+                selector_model,
+                failed_candidates,
+            } => {
+                self.record_selector_failures(&failed_candidates);
+                self.health.clear(&selector_model);
+                self.mark_session_extracted(&session_id, content_fingerprint, turn);
+                let breadcrumbs = SessionMemoryExtractionBreadcrumbs {
+                    messages_count: Some(messages_count),
+                    selector_model: Some(selector_model),
+                    attempt: None,
+                    llm_reason: None,
+                    llm_detail: None,
+                    persist_detail: None,
+                };
+                self.emit_skip_event(
+                    &user_id,
+                    Some(&session_id),
+                    turn,
+                    SessionMemoryExtractionSkipReason::NoSemanticChange,
+                    &breadcrumbs,
+                );
+                self.broker.emit(BackgroundActivity::NoChange {
+                    session_id,
+                    turn,
+                    duration_ms,
+                });
+            }
             ExtractionArtifacts::Persisted {
                 source,
                 bytes_written,
@@ -656,6 +935,7 @@ impl MemoryExtractionService {
                 content,
                 selector_model,
                 failed_candidates,
+                cleanup_error_reason,
             } => {
                 self.record_selector_failures(&failed_candidates);
                 // Memoria accepted a write → breaker closes (or stays
@@ -729,6 +1009,12 @@ impl MemoryExtractionService {
                     duration_ms,
                     &bc,
                 );
+                self.emit_cleanup_diagnostic(
+                    &user_id,
+                    Some(&session_id),
+                    turn,
+                    cleanup_error_reason,
+                );
                 self.persist_success_metadata(
                     &session_id,
                     turn,
@@ -744,6 +1030,7 @@ impl MemoryExtractionService {
                 content,
                 selector_model,
                 failed_candidates,
+                cleanup_error_reason,
             } => {
                 self.record_selector_failures(&failed_candidates);
                 // Memoria persist still succeeded on this branch, so
@@ -802,6 +1089,12 @@ impl MemoryExtractionService {
                     bytes_written,
                     duration_ms,
                     &bc,
+                );
+                self.emit_cleanup_diagnostic(
+                    &user_id,
+                    Some(&session_id),
+                    turn,
+                    cleanup_error_reason,
                 );
                 self.persist_success_metadata(
                     &session_id,
@@ -875,11 +1168,18 @@ impl MemoryExtractionService {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some((request, fingerprint)) = work.queued_latest.remove(session_id) {
-            work.active_fingerprints
-                .insert(session_id.to_string(), fingerprint);
+            let turn = request.turn_number().unwrap_or_default();
+            work.active.insert(
+                session_id.to_string(),
+                ActiveSessionWork { fingerprint, turn },
+            );
+            drop(work);
+            self.pending_done.notify_waiters();
             Some((request, fingerprint))
         } else {
-            work.active_fingerprints.remove(session_id);
+            work.active.remove(session_id);
+            drop(work);
+            self.pending_done.notify_waiters();
             None
         }
     }
@@ -905,9 +1205,10 @@ impl PendingGuard {
 impl Drop for PendingGuard {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering;
-        if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.pending_done.notify_waiters();
-        }
+        self.pending.fetch_sub(1, Ordering::AcqRel);
+        // Per-session drains must wake when any worker finishes; global drains
+        // simply re-check the aggregate counter and continue if needed.
+        self.pending_done.notify_waiters();
     }
 }
 
@@ -929,7 +1230,7 @@ impl Drop for SessionWorkGuard {
             .work
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        work.active_fingerprints.remove(&self.session_id);
+        work.active.remove(&self.session_id);
         work.queued_latest.remove(&self.session_id);
     }
 }
@@ -987,20 +1288,26 @@ fn extraction_input_fingerprint(req: &ExtractionRequest) -> u64 {
 }
 
 impl MemoryExtractionService {
-    pub async fn current_session_memory_entry_for_pipeline(
+    /// Resolve optional session memory under the interactive context-building
+    /// deadline. This is deliberately separate from extraction/governance
+    /// reads, whose maintenance semantics must not inherit a UI latency cap.
+    pub async fn current_session_memory_entry_for_pipeline_with_deadline(
         &self,
         session_id: &str,
+        deadline: Duration,
     ) -> Option<astra_turn_core::context_sources::MemoryEntry> {
         let loaded = if self.require_local_current_snapshot {
-            super::runner::load_current_session_memory_preferring_local_with_freshness(
+            super::runner::load_current_session_memory_preferring_local_with_deadline(
                 self.memoria_client.as_ref(),
                 session_id,
+                deadline,
             )
             .await?
         } else {
-            super::runner::load_current_session_memory_with_freshness(
+            super::runner::load_current_session_memory_with_deadline(
                 self.memoria_client.as_ref(),
                 session_id,
+                deadline,
             )
             .await?
         };
@@ -1030,25 +1337,65 @@ impl MemoryExtractionService {
             .session_states
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !map.contains_key(session_id) && map.len() >= MAX_SESSION_STATES_PER_OWNER {
+            let active = self
+                .work
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .active
+                .keys()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>();
+            let evict = map
+                .iter()
+                .filter(|(candidate, _)| !active.contains(*candidate))
+                .min_by_key(|(_, state)| state.last_extraction_time)
+                .map(|(candidate, _)| candidate.clone());
+            if let Some(evict) = evict {
+                map.remove(&evict);
+            }
+        }
         map.entry(session_id.to_string())
             .or_default()
             .mark_extracted(content_fingerprint, current_turn);
     }
 
+    /// Whether the exact request snapshot is known current for this service
+    /// owner. A positive answer is produced only after a durable write, a
+    /// verified existing snapshot, or a selector-confirmed semantic no-op;
+    /// it is therefore the safety precondition for destructive session-end
+    /// governance.
+    pub fn is_request_current(&self, request: &ExtractionRequest) -> bool {
+        let Some((session_id, _)) = request.session_coordinates() else {
+            return false;
+        };
+        let fingerprint = extraction_input_fingerprint(request);
+        self.session_states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .is_some_and(|state| {
+                state.initialized && state.content_fingerprint == Some(fingerprint)
+            })
+    }
+
     async fn load_current_memory_with_freshness(
         &self,
         session_id: &str,
+        deadline: Duration,
     ) -> Option<super::runner::LoadedSessionMemory> {
         if self.require_local_current_snapshot {
-            super::runner::load_current_session_memory_preferring_local_with_freshness(
+            super::runner::load_current_session_memory_preferring_local_with_deadline(
                 self.memoria_client.as_ref(),
                 session_id,
+                deadline,
             )
             .await
         } else {
-            super::runner::load_current_session_memory_with_freshness(
+            super::runner::load_current_session_memory_with_deadline(
                 self.memoria_client.as_ref(),
                 session_id,
+                deadline,
             )
             .await
         }
@@ -1058,7 +1405,7 @@ impl MemoryExtractionService {
 
     fn enqueue(&self, event: JournalEvent, user_id: &str) {
         if let Some(sink) = self.local_event_sink.as_ref() {
-            sink(&event);
+            sink(&event, user_id);
         }
         match IngestionEvent::from_journal_event(&event, user_id) {
             Ok(ingestion_event) => self.ingestion.enqueue(ingestion_event),
@@ -1067,6 +1414,31 @@ impl MemoryExtractionService {
                 error = %error,
                 "invalid session memory journal event for cloud ingestion"
             ),
+        }
+    }
+
+    fn emit_cleanup_diagnostic(
+        &self,
+        user_id: &str,
+        session_id: Option<&str>,
+        turn: u32,
+        reason: Option<SessionMemoryExtractionErrorReason>,
+    ) {
+        if matches!(
+            reason,
+            Some(SessionMemoryExtractionErrorReason::PurgeFailed)
+        ) {
+            self.enqueue(
+                JournalEvent::subsystem_diagnostic(
+                    session_id,
+                    turn,
+                    SubsystemDiagnosticSeverity::Warning,
+                    "session_memory",
+                    "stale_snapshot_cleanup",
+                    "purge_failed",
+                ),
+                user_id,
+            );
         }
     }
 
@@ -1134,6 +1506,47 @@ impl MemoryExtractionService {
             ),
             user_id,
         );
+    }
+
+    fn record_extraction_deadline_exceeded(
+        &self,
+        session_id: &str,
+        turn: u32,
+        messages_count: u32,
+        duration_ms: u64,
+    ) {
+        let Some(user_id) = self.user_id.as_deref() else {
+            return;
+        };
+        tracing::warn!(
+            session_id,
+            turn,
+            timeout_ms = self.extraction_work_timeout.as_millis(),
+            "session-memory extraction exceeded its total worker deadline"
+        );
+        let breadcrumbs = SessionMemoryExtractionBreadcrumbs {
+            messages_count: Some(messages_count),
+            selector_model: None,
+            attempt: None,
+            llm_reason: None,
+            llm_detail: None,
+            persist_detail: None,
+        };
+        self.emit_error_event(
+            user_id,
+            Some(session_id),
+            turn,
+            SessionMemoryExtractionErrorReason::DeadlineExceeded,
+            duration_ms,
+            &breadcrumbs,
+        );
+        self.broker.emit(BackgroundActivity::Errored {
+            session_id: session_id.to_string(),
+            turn,
+            reason: SessionMemoryExtractionErrorReason::DeadlineExceeded,
+            detail: Some("session-memory extraction deadline exceeded".to_string()),
+            duration_ms,
+        });
     }
 }
 
@@ -1232,6 +1645,16 @@ mod tests {
         bindings: Arc<Mutex<Vec<String>>>,
     }
 
+    #[derive(Debug)]
+    struct PendingMemoryInferenceResolver;
+
+    #[async_trait]
+    impl MemoryInferenceResolver for PendingMemoryInferenceResolver {
+        async fn resolve_candidates(&self, _user_id: &str) -> Vec<MemoryInferenceClient> {
+            std::future::pending().await
+        }
+    }
+
     #[async_trait]
     impl MemoriaPort for OwnerBindingMemoria {
         fn bind_owner(&self, user_id: &str) -> Result<Arc<dyn MemoriaPort>, String> {
@@ -1298,6 +1721,53 @@ mod tests {
         assert!(alice_a.peek_state("same-session").is_some());
         assert!(bob.peek_state("same-session").is_none());
         assert!(Arc::ptr_eq(&alice_a.pending, &bob.pending));
+        assert!(!Arc::ptr_eq(&alice_a.memoria_health, &bob.memoria_health));
+        for _ in 0..crate::session_memory::health::MEMORIA_FAILURE_THRESHOLD {
+            alice_a.memoria_health.record_failure();
+        }
+        assert_eq!(alice_a.memoria_health.admit(), MemoriaAdmit::CoolingDown);
+        assert_eq!(
+            bob.memoria_health.admit(),
+            MemoriaAdmit::Ready,
+            "one owner's request failures must not suppress another owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_shutdown_closes_all_owner_admission_and_aborts_pending_workers() {
+        let memoria = Arc::new(OwnerBindingMemoria::default());
+        let (ingestion, _rx) = IngestionSender::for_tests(32);
+        let template = Arc::new(MemoryExtractionService::new_owner_scoped_template(
+            Arc::new(PendingMemoryInferenceResolver),
+            memoria,
+            ingestion,
+            Arc::new(BackgroundActivityBroker::new()),
+        ));
+        let alice = template.scoped_to_owner("alice").expect("bind alice");
+        let bob = template.scoped_to_owner("bob").expect("bind bob");
+        assert_eq!(
+            alice.maybe_spawn(sample_req("alice-pending-memory", 1_000, false)),
+            SpawnDecision::Spawned
+        );
+        assert_eq!(
+            bob.maybe_spawn(sample_req("bob-pending-memory", 1_000, false)),
+            SpawnDecision::Spawned
+        );
+        assert_eq!(template.pending_drain(), 2);
+
+        assert_eq!(
+            template
+                .stop_for_process_shutdown(Duration::from_secs(1))
+                .await,
+            0,
+            "shutdown must drop every owner-scoped provider producer"
+        );
+        assert_eq!(template.pending_drain(), 0);
+        assert_eq!(
+            alice.maybe_spawn(sample_req("alice-after-shutdown", 1_000, false)),
+            SpawnDecision::Skipped,
+            "process shutdown must permanently close new extraction admission"
+        );
     }
 
     #[test]
@@ -1329,6 +1799,51 @@ mod tests {
         assert_eq!(scoped.len(), 1, "dead owner keys must not accumulate");
         assert!(scoped.contains_key("bob"));
         assert!(!scoped.contains_key("alice"));
+    }
+
+    #[test]
+    fn cleanup_degradation_is_mirrored_with_authoritative_owner() {
+        let captured = Arc::new(Mutex::new(Vec::<(JournalEvent, String)>::new()));
+        let sink_capture = Arc::clone(&captured);
+        let (ingestion, _rx) = IngestionSender::for_tests(16);
+        let service = MemoryExtractionService::new(
+            Arc::new(ConstMemoryInferenceResolver(None)),
+            Arc::new(CapturingMemoria::default()),
+            ingestion,
+            "owner-a",
+            Arc::new(BackgroundActivityBroker::new()),
+        )
+        .with_local_event_sink(Arc::new(move |event, owner| {
+            sink_capture
+                .lock()
+                .unwrap()
+                .push((event.clone(), owner.to_string()));
+        }));
+
+        service.emit_cleanup_diagnostic(
+            "owner-a",
+            Some("session-a"),
+            7,
+            Some(SessionMemoryExtractionErrorReason::PurgeFailed),
+        );
+
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let (event, owner) = &events[0];
+        assert_eq!(owner, "owner-a");
+        assert_eq!(
+            event.event_type,
+            astra_services::session_journal::JournalEventType::SubsystemDiagnostic
+        );
+        assert_eq!(event.session_id.as_deref(), Some("session-a"));
+        assert_eq!(event.turn, Some(7));
+        assert_eq!(
+            event
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("code")),
+            Some(&serde_json::json!("purge_failed"))
+        );
     }
 
     async fn spawn_json_server_with_status(
@@ -1580,6 +2095,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_current_requires_the_exact_confirmed_snapshot() {
+        let ctx = build_ctx(None);
+        let sid = format!("request-current-{}", nanos());
+        let request = sample_req(&sid, 1_000, false);
+
+        assert!(!ctx.svc.is_request_current(&request));
+        assert_eq!(ctx.svc.maybe_spawn(request.clone()), SpawnDecision::Spawned);
+        assert_eq!(ctx.svc.wait_for_pending(Duration::from_secs(2)).await, 0);
+        assert!(ctx.svc.is_request_current(&request));
+
+        let mut changed = request;
+        changed.messages.push(json!({
+            "role": "assistant",
+            "content": "A later canonical state needs a fresh durable snapshot."
+        }));
+        assert!(
+            !ctx.svc.is_request_current(&changed),
+            "a prior write must not authorize governance for a different request snapshot"
+        );
+    }
+
+    #[tokio::test]
     async fn ingestion_event_uses_service_owner_as_the_only_authoritative_user() {
         let (ingestion, mut rx) = IngestionSender::for_tests(8);
         let broker = Arc::new(BackgroundActivityBroker::new());
@@ -1644,6 +2181,67 @@ mod tests {
                 metadata["outcome"] == "skipped" && metadata["reason"] == "already_current"
             })
         }));
+    }
+
+    #[tokio::test]
+    async fn valid_empty_sparse_patch_marks_input_current_without_memoria_write() {
+        let (server_url, server_handle) = spawn_json_server_with_status(
+            Arc::new(|request: &str| {
+                assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
+            }),
+            200,
+            "OK",
+            json!({
+                "choices": [{
+                    "message": { "content": "{}" }
+                }]
+            }),
+        )
+        .await;
+        let selector = DirectMemoryInferenceClient {
+            base_url: format!("{server_url}/v1"),
+            api_key: "test-key".to_string(),
+            model_name: "semantic-selector".to_string(),
+            wire_model_name: None,
+            provider: "openai".to_string(),
+            request_body_overrides: None,
+            header_overrides: std::collections::HashMap::new(),
+            completions_url_override: None,
+            request_timeout: None,
+        };
+        let memoria = Arc::new(CapturingMemoria::default());
+        let (svc, mut ingestion_rx, broker) =
+            build_ctx_with_memoria(Some(selector), Arc::clone(&memoria) as Arc<dyn MemoriaPort>);
+        let mut activity_rx = broker.subscribe();
+        let req = sample_req("no-semantic-change", 1_000, false);
+
+        assert_eq!(svc.maybe_spawn(req.clone()), SpawnDecision::Spawned);
+        assert_eq!(svc.wait_for_pending(Duration::from_secs(2)).await, 0);
+        server_handle.await.unwrap();
+
+        assert!(memoria.stored.lock().unwrap().is_empty());
+        assert!(svc.peek_state("no-semantic-change").is_some());
+        assert_eq!(
+            svc.maybe_spawn(req),
+            SpawnDecision::Skipped,
+            "a proven no-op must not re-enter the selector on identical input"
+        );
+        let events = collect_extraction_events(&mut ingestion_rx);
+        assert!(events.iter().any(|event| {
+            event.metadata.as_ref().is_some_and(|metadata| {
+                metadata["outcome"] == "skipped"
+                    && metadata["reason"] == "no_semantic_change"
+                    && metadata["selector_model"] == "semantic-selector"
+            })
+        }));
+        assert!(matches!(
+            activity_rx.try_recv().unwrap(),
+            BackgroundActivity::Started { .. }
+        ));
+        assert!(matches!(
+            activity_rx.try_recv().unwrap(),
+            BackgroundActivity::NoChange { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1775,7 +2373,13 @@ mod tests {
         let fingerprint = extraction_input_fingerprint(&req);
         {
             let mut work = ctx.svc.work.lock().unwrap();
-            work.active_fingerprints.insert(sid.clone(), fingerprint);
+            work.active.insert(
+                sid.clone(),
+                ActiveSessionWork {
+                    fingerprint,
+                    turn: req.turn_number().unwrap(),
+                },
+            );
         }
         assert_eq!(ctx.svc.maybe_spawn(req), SpawnDecision::Skipped);
 
@@ -1798,8 +2402,13 @@ mod tests {
         }));
         {
             let mut work = ctx.svc.work.lock().unwrap();
-            work.active_fingerprints
-                .insert(sid.clone(), extraction_input_fingerprint(&active));
+            work.active.insert(
+                sid.clone(),
+                ActiveSessionWork {
+                    fingerprint: extraction_input_fingerprint(&active),
+                    turn: active.turn_number().unwrap(),
+                },
+            );
         }
 
         assert_eq!(ctx.svc.maybe_spawn(changed.clone()), SpawnDecision::Queued);
@@ -1954,13 +2563,83 @@ mod tests {
             "pending counter must be decremented even if the worker panics"
         );
         assert!(
-            !svc.work
-                .lock()
-                .unwrap()
-                .active_fingerprints
-                .contains_key(&sid),
+            !svc.work.lock().unwrap().active.contains_key(&sid),
             "in-flight slot must be released even if the worker panics"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn total_worker_deadline_releases_the_session_slot_with_typed_evidence() {
+        struct BlockingMemoria {
+            retrieval_started: tokio::sync::Notify,
+        }
+
+        #[async_trait]
+        impl MemoriaPort for BlockingMemoria {
+            async fn retrieve_ext(
+                &self,
+                _: &str,
+                _: Option<&str>,
+                _: usize,
+                _: bool,
+            ) -> Result<Vec<MemoriaMemory>, String> {
+                self.retrieval_started.notify_one();
+                std::future::pending().await
+            }
+
+            async fn store(
+                &self,
+                _: &str,
+                _: &str,
+                _: Option<&str>,
+                _: Option<&str>,
+            ) -> Result<String, String> {
+                Ok("unreachable".into())
+            }
+
+            async fn purge_working(&self, _: &str) -> Result<u64, String> {
+                Ok(0)
+            }
+        }
+
+        let (ingestion, _rx) = IngestionSender::for_tests(16);
+        let broker = Arc::new(BackgroundActivityBroker::new());
+        let mut activity = broker.subscribe();
+        let memoria = Arc::new(BlockingMemoria {
+            retrieval_started: tokio::sync::Notify::new(),
+        });
+        let mut service = MemoryExtractionService::new(
+            Arc::new(ConstMemoryInferenceResolver(None)),
+            Arc::clone(&memoria) as Arc<dyn MemoriaPort>,
+            ingestion,
+            "deadline-test-user",
+            Arc::clone(&broker),
+        );
+        service.extraction_work_timeout = Duration::from_secs(1);
+        let svc = Arc::new(service);
+        let sid = format!("deadline-release-{}", nanos());
+        let retrieval_started = memoria.retrieval_started.notified();
+
+        assert_eq!(
+            svc.maybe_spawn(sample_req(&sid, 1_000, false)),
+            SpawnDecision::Spawned
+        );
+        retrieval_started.await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        assert_eq!(svc.wait_for_pending(Duration::from_secs(1)).await, 0);
+        assert!(
+            !svc.work.lock().unwrap().active.contains_key(&sid),
+            "an expired worker must release its session slot"
+        );
+        assert!(matches!(
+            activity.try_recv(),
+            Ok(BackgroundActivity::Errored {
+                reason: SessionMemoryExtractionErrorReason::DeadlineExceeded,
+                ..
+            })
+        ));
     }
 
     // ── unhappy paths ─────────────────────────────────────────────────
@@ -2147,6 +2826,175 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_millis(50),
             "should not sleep when nothing is in flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_drain_is_not_blocked_by_unrelated_session_work() {
+        let (svc, _rx, _broker) = build_ctx_with_memoria(
+            None,
+            Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>,
+        );
+        let session_a = "drain-session-a".to_string();
+        let session_b = "drain-session-b".to_string();
+        {
+            let mut work = svc.work.lock().unwrap();
+            work.active.insert(
+                session_a.clone(),
+                ActiveSessionWork {
+                    fingerprint: 1,
+                    turn: 3,
+                },
+            );
+            work.active.insert(
+                session_b.clone(),
+                ActiveSessionWork {
+                    fingerprint: 2,
+                    turn: 9,
+                },
+            );
+        }
+
+        let waiter = {
+            let svc = Arc::clone(&svc);
+            let session_a = session_a.clone();
+            tokio::spawn(async move {
+                svc.wait_for_session_pending_through(&session_a, 3, Duration::from_secs(1))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        svc.work.lock().unwrap().active.remove(&session_a);
+        svc.pending_done.notify_waiters();
+
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), waiter)
+                .await
+                .expect("session drain should wake independently")
+                .unwrap(),
+            SessionDrainOutcome::Settled
+        );
+        assert!(
+            svc.work.lock().unwrap().active.contains_key(&session_b),
+            "unrelated work must remain active without delaying session A"
+        );
+        svc.work.lock().unwrap().active.remove(&session_b);
+    }
+
+    #[tokio::test]
+    async fn older_drain_is_superseded_by_newer_session_work() {
+        let (svc, _rx, _broker) = build_ctx_with_memoria(
+            None,
+            Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>,
+        );
+        let session_id = "drain-superseded";
+        svc.work.lock().unwrap().active.insert(
+            session_id.to_string(),
+            ActiveSessionWork {
+                fingerprint: 7,
+                turn: 4,
+            },
+        );
+
+        assert_eq!(
+            svc.wait_for_session_pending_through(session_id, 3, Duration::from_secs(30))
+                .await,
+            SessionDrainOutcome::Superseded,
+            "an old cleanup must not wait on or govern a newer canonical turn"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn latest_drain_gives_each_coalesced_attempt_its_own_window() {
+        let (svc, _rx, _broker) = build_ctx_with_memoria(
+            None,
+            Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>,
+        );
+        let session_id = "drain-progress".to_string();
+        svc.work.lock().unwrap().active.insert(
+            session_id.clone(),
+            ActiveSessionWork {
+                fingerprint: 1,
+                turn: 5,
+            },
+        );
+        let waiter = {
+            let svc = Arc::clone(&svc);
+            let session_id = session_id.clone();
+            tokio::spawn(async move {
+                svc.wait_for_session_pending_through(&session_id, 5, Duration::from_secs(30))
+                    .await
+            })
+        };
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(29)).await;
+        svc.work.lock().unwrap().active.insert(
+            session_id.clone(),
+            ActiveSessionWork {
+                fingerprint: 2,
+                turn: 5,
+            },
+        );
+        svc.pending_done.notify_waiters();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(29)).await;
+        assert!(
+            !waiter.is_finished(),
+            "the second owned attempt must not inherit the first attempt's deadline"
+        );
+        svc.work.lock().unwrap().active.remove(&session_id);
+        svc.pending_done.notify_waiters();
+
+        assert_eq!(waiter.await.unwrap(), SessionDrainOutcome::Settled);
+    }
+
+    #[tokio::test]
+    async fn late_cleanup_cannot_replace_newer_queued_memory() {
+        let mut ctx = build_ctx(None);
+        let session_id = format!("late-cleanup-{}", nanos());
+        let mut old = sample_req(&session_id, 50_000, false);
+        old.inference_scope = extraction_scope(session_id.clone(), 3);
+        ctx.svc.work.lock().unwrap().active.insert(
+            session_id.clone(),
+            ActiveSessionWork {
+                fingerprint: 99,
+                turn: 4,
+            },
+        );
+
+        assert_eq!(ctx.svc.maybe_spawn(old), SpawnDecision::Skipped);
+        assert!(
+            ctx.svc.work.lock().unwrap().queued_latest.is_empty(),
+            "an older cleanup snapshot must never be queued behind newer work"
+        );
+        let events = collect_extraction_events(&mut ctx.rx);
+        assert!(events.iter().any(|event| {
+            event
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata["reason"] == "superseded")
+        }));
+    }
+
+    #[test]
+    fn retained_session_fingerprints_are_bounded_per_owner() {
+        let (svc, _rx, _broker) = build_ctx_with_memoria(
+            None,
+            Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>,
+        );
+        svc.mark_session_extracted("session-0", 0, 0);
+        std::thread::sleep(Duration::from_millis(1));
+        for index in 1..=MAX_SESSION_STATES_PER_OWNER {
+            svc.mark_session_extracted(&format!("session-{index}"), index as u64, index as u32);
+        }
+
+        let states = svc.session_states.lock().unwrap();
+        assert_eq!(states.len(), MAX_SESSION_STATES_PER_OWNER);
+        assert!(states.contains_key(&format!("session-{MAX_SESSION_STATES_PER_OWNER}")));
+        assert!(
+            !states.contains_key("session-0"),
+            "the oldest inactive fingerprint should be evicted first"
         );
     }
 
@@ -2467,9 +3315,12 @@ mod tests {
         let skipped_req = sample_req(&skipped_sid, 20_000, false);
         {
             let mut work = svc.work.lock().unwrap();
-            work.active_fingerprints.insert(
+            work.active.insert(
                 skipped_sid.clone(),
-                extraction_input_fingerprint(&skipped_req),
+                ActiveSessionWork {
+                    fingerprint: extraction_input_fingerprint(&skipped_req),
+                    turn: skipped_req.turn_number().unwrap(),
+                },
             );
         }
         assert_eq!(
@@ -2479,7 +3330,7 @@ mod tests {
         );
         {
             let mut work = svc.work.lock().unwrap();
-            work.active_fingerprints.remove(&skipped_sid);
+            work.active.remove(&skipped_sid);
         }
 
         let next_sid = format!("next-probe-{}", nanos());

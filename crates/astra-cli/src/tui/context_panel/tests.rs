@@ -623,7 +623,6 @@ fn session_summary_flows_through_snapshot() {
         turn: 5,
         model: Some("test-model-x".into()),
         total_cost: 0.1234,
-        max_budget: 1.0,
         prompt_tokens: 12_000,
         completion_tokens: 3_000,
         cache_read_tokens: 8_000,

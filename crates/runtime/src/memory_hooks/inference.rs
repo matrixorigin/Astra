@@ -167,7 +167,8 @@ impl MemoryInferencePort for DurableMemoryInferenceClient {
                 },
                 request.deadline,
             )
-            .await?;
+            .await
+            .into_result()?;
         Ok(result.full_text)
     }
 }

@@ -490,7 +490,7 @@ pub fn make_args_preview(tool_name: &str, args: &Value) -> Option<String> {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string()),
                 "blame" => args
-                    .get("file")
+                    .get("path")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string()),
                 _ => None,

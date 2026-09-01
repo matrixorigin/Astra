@@ -1,0 +1,96 @@
+name: work_implicit_replacement_journey
+description: |
+  **What**: Exercise a natural cancel-and-add request where the user names two desired outcomes
+  but does not invent a third outcome for the replacement.
+  **Tests**: Admission preserves cancel and add as two atomic operations, the runtime
+  cancels the still-unexecuted original before executing the fresh task, and no unrelated domain is
+  fabricated merely to make the graph look dynamic.
+  **Pass means**: Two initial serial tasks are established; after the first settles, the second is
+  cancelled without settlement; a semantically identical fresh task is added and delivered.
+  **Fail means**: Both original tasks execute, a delivered task is retroactively called cancelled,
+  an unrelated third task is invented, or the turn closes with blocked/unsettled Work.
+prompt: |
+  实验一下 task 系统：先建立两个串行 task，分别确认根目录 README 的第一行和根
+  Cargo.toml 的 workspace/package 名称。第一个完成后，cancel 尚未执行的第二个，
+  再用新 task 承接它尚未完成的目标。完成全部有效任务，并简洁总结真实状态变化。
+prompt_variants:
+  - id: zh_reordered
+    prompt: |
+      请实际走一遍 task 流程。初始建立两个按顺序执行的任务：先确认仓库根目录 README
+      的第一行，再确认根 Cargo.toml 的 workspace/package 名称。第一个完成后，不要执行
+      第二个，先取消它，再新增一个任务承接这个尚未完成的目标。最终完成全部有效任务，
+      并只简述真实发生的状态变化。
+  - id: en_paraphrase
+    prompt: |
+      Exercise the task system with two initially serial tasks: first verify the first line of the
+      repository-root README, then verify the workspace/package name in the root Cargo.toml. After
+      the first task completes, cancel the still-unexecuted second task and add a fresh task for
+      that same outstanding outcome. Finish all effective work and briefly report only the state
+      changes that actually occurred.
+models:
+  - deepseek-v4-flash
+capability: "custom:work_implicit_replacement_journey"
+difficulty: 5
+weight: 4.0
+timeout_seconds: 240
+debug_log: true
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: start_work
+    min: 1
+    max: 1
+  - type: journal_tool_call_count
+    name: start_work
+    min: 1
+    max: 1
+    document: result
+    path: /initial_item_count
+    equals: 2
+  - type: journal_work_graph_patch
+    require_addition: true
+    require_retired_revision: true
+    require_cancelled_revision: true
+    require_atomic_retire_and_add: true
+  - type: journal_tool_json
+    name: propose_work_plan
+    document: result
+    path: /active_attempt_present
+    equals: false
+  - type: journal_tool_json
+    name: propose_work_plan
+    document: result
+    path: /next_action
+    equals: call_run_next_work_item
+  - type: journal_tool_call_count
+    name: settle_work_item
+    min: 2
+    max: 2
+  - type: journal_tool_outcome_count
+    name: settle_work_item
+    ok: true
+    min: 2
+    max: 2
+  - type: journal_tool_outcome_count
+    name: settle_work_item
+    ok: false
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: settle_work_item
+    min: 0
+    max: 0
+    document: result
+    path: /item_id
+    equals: task-2
+  - type: journal_tool_call_count
+    name: ask_user
+    min: 0
+    max: 0
+  - type: tools_count_between
+    min: 6
+    max: 18
+  - type: turn_rounds_between
+    min: 5
+    max: 20

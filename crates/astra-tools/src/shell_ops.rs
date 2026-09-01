@@ -176,7 +176,7 @@ impl<'a> Drop for DetachHandleGuard<'a> {
 
 use crate::detach::{
     detach_signal_observed, restore_detach_signal_receiver, sigkill_process_group,
-    terminate_child_gracefully, terminate_detached_payload,
+    sigkill_process_group_id, terminate_child_gracefully, terminate_detached_payload,
 };
 
 const GLOB_TIMEOUT: Duration = Duration::from_secs(15);
@@ -536,7 +536,23 @@ pub(crate) struct ReadOnlyCommandOutput {
     pub(crate) cancelled: bool,
     pub(crate) stdout_capped: bool,
     pub(crate) stderr_capped: bool,
+    /// True when the invocation settled under either an owned cgroup or a
+    /// foreground process-group fallback.
+    pub(crate) scope_settled: bool,
+    pub(crate) scope_ownership: Option<astra_sandbox::ScopeOwnership>,
+    /// Executor-observed fact that live descendants remained after the target
+    /// exited and were settled before this result was returned.
+    pub(crate) descendants_terminated: bool,
+    /// True when stream ownership could not be proven after the child ended.
+    /// This never authorizes a receipt; it forces workspace attribution
+    /// quarantine until a later authoritative observation.
+    pub(crate) scope_quarantined: bool,
 }
+
+const INTERNAL_SCOPE_SETTLED_FIELD: &str = "_astra_scope_settled";
+const INTERNAL_SCOPE_OWNERSHIP_FIELD: &str = "_astra_scope_ownership";
+const INTERNAL_SCOPE_QUARANTINED_FIELD: &str = "_astra_scope_quarantined";
+const INTERNAL_EXECUTION_STARTED_FIELD: &str = "_astra_execution_started";
 
 struct EnumeratedSearchFiles {
     files: Vec<String>,
@@ -860,6 +876,17 @@ pub(crate) fn parse_bash_timeout_secs_for(args: &Value, command: &str) -> f64 {
     default_bash_timeout_for(command).clamp(BASH_TIMEOUT_MIN_SECS, BASH_TIMEOUT_MAX_SECS)
 }
 
+/// Whether a completed Bash call has only weak process ownership and enough
+/// mutation capability that a late escaped writer must disable future
+/// fingerprint attribution.
+pub fn bash_scope_requires_attribution_quarantine(
+    command: &str,
+    ownership: Option<astra_sandbox::ScopeOwnership>,
+) -> bool {
+    !crate::workspace_observation::bash_command_is_detachable_safe(command)
+        && ownership.is_some_and(|ownership| !ownership.is_authoritative())
+}
+
 /// Execute a bash command with bounded partial-output capture.
 pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
     execute_bash_with_environment(ctx, args, &[]).await
@@ -869,6 +896,312 @@ pub async fn execute_bash(ctx: &crate::ToolContext, args: &Value) -> ToolResult 
 /// call-scoped process environment. Callers must never persist these values or
 /// expose them in model-visible tool arguments or output.
 pub async fn execute_bash_with_environment(
+    ctx: &crate::ToolContext,
+    args: &Value,
+    environment: &[(String, String)],
+) -> ToolResult {
+    if args.get("run_in_background").is_some()
+        || args.get("ready_check").is_some()
+        || args.get("background_ttl").is_some()
+    {
+        return ToolResult::error(
+            "Error: managed background fields are unavailable on this foreground-only Bash executor; no command was run"
+                .to_string(),
+        );
+    }
+    let explicit_verification =
+        crate::workspace_observation::is_explicit_workspace_verification_request("bash", args);
+    let needs_observation = args
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|command| !command.trim().is_empty());
+    // `run_script` owns the exclusive writer generation for its whole
+    // lifetime because the Python child can write the workspace directly. A
+    // Bash invoked through that script's authenticated RPC bridge reuses the
+    // parent authority instead of trying to acquire the same lock again.
+    // The parent script can still write concurrently, so this nested Bash is
+    // deliberately ineligible for a fingerprint-derived durable receipt.
+    let nested_in_run_script = crate::rpc_bridge::is_run_script_rpc_dispatch();
+    let _observation_lease = if needs_observation && !nested_in_run_script {
+        let wait = args
+            .get("command")
+            .and_then(Value::as_str)
+            .map(|command| parse_bash_timeout_secs_for(args, command))
+            .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS);
+        let lease = crate::workspace_observation::acquire_workspace_observation_lease_with_options(
+            &ctx.workspace_root,
+            ctx.cancel_token.as_deref(),
+            Duration::from_secs_f64(wait),
+        )
+        .await;
+        match lease {
+            Some(guard) => Some(guard),
+            None => {
+                if ctx
+                    .cancel_token
+                    .as_ref()
+                    .is_some_and(|token| token.is_cancelled())
+                {
+                    return crate::cancelled_tool_result("bash", false);
+                }
+                return ToolResult::error(
+                    "Error: workspace coordination lock is unavailable, contended past the command deadline, or the host temporary lock namespace is not trustworthy; no bash command was run. Retry after the active workspace writer finishes or repair the host temporary-directory ownership and sticky-bit permissions.".into(),
+                );
+            }
+        }
+    } else {
+        None
+    };
+    // A cancellation can race the lease CAS.  Re-check after ownership is
+    // acquired so a waiter that was cancelled at the boundary never starts a
+    // shell or captures an unowned observation window.
+    if ctx
+        .cancel_token
+        .as_ref()
+        .is_some_and(|token| token.is_cancelled())
+    {
+        return crate::cancelled_tool_result("bash", false);
+    }
+    let before = if needs_observation && !nested_in_run_script {
+        let root = ctx.workspace_root.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::workspace_observation::WorkspaceFingerprint::capture(&root)
+        })
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
+    let verification_fingerprint_unavailable = explicit_verification && before.is_none();
+
+    if ctx
+        .cancel_token
+        .as_ref()
+        .is_some_and(|token| token.is_cancelled())
+    {
+        return crate::cancelled_tool_result("bash", false);
+    }
+
+    let mut result = execute_bash_inner(ctx, args, environment).await;
+    let scope_settled = result
+        .metadata
+        .as_ref()
+        .and_then(|fields| fields.get(INTERNAL_SCOPE_SETTLED_FIELD))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let scope_ownership = result
+        .metadata
+        .as_ref()
+        .and_then(|fields| fields.get(INTERNAL_SCOPE_OWNERSHIP_FIELD))
+        .and_then(Value::as_str)
+        .and_then(parse_scope_ownership);
+    let scope_quarantined = result
+        .metadata
+        .as_ref()
+        .and_then(|fields| fields.get(INTERNAL_SCOPE_QUARANTINED_FIELD))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let execution_started = result
+        .metadata
+        .as_ref()
+        .and_then(|fields| fields.get(INTERNAL_EXECUTION_STARTED_FIELD))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if let Some(fields) = result.metadata.as_mut() {
+        fields.remove(INTERNAL_SCOPE_SETTLED_FIELD);
+        fields.remove(INTERNAL_SCOPE_OWNERSHIP_FIELD);
+        fields.remove(INTERNAL_SCOPE_QUARANTINED_FIELD);
+        fields.remove(INTERNAL_EXECUTION_STARTED_FIELD);
+    }
+    let detached = result
+        .metadata
+        .as_ref()
+        .and_then(|fields| fields.get("background_task_id"))
+        .and_then(Value::as_str)
+        .is_some();
+    let coordination_unsettled = _observation_lease
+        .as_ref()
+        .is_some_and(|lease| !lease.integrity_valid());
+    if coordination_unsettled {
+        crate::workspace_observation::mark_workspace_observation_unsettled(&ctx.workspace_root);
+    }
+    if let Some(before) = before.filter(|_| !detached) {
+        let root = ctx.workspace_root.clone();
+        let after = tokio::task::spawn_blocking(move || {
+            crate::workspace_observation::WorkspaceFingerprint::capture(&root)
+        })
+        .await
+        .ok()
+        .flatten();
+        let after_captured = after.is_some();
+        let workspace_changed = before.changed_from(after);
+        // The pre-execution check cannot authorize a receipt after a slow
+        // fingerprint capture: binding/lease integrity must still hold at the
+        // exact mint boundary.
+        let coordination_integrity_valid_at_mint = !coordination_unsettled
+            && _observation_lease.as_ref().is_none_or(
+                crate::workspace_observation::WorkspaceObservationLease::integrity_valid,
+            );
+        let verification_receipt_valid = explicit_verification
+            && !result.is_error
+            && result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("exit_code"))
+                .and_then(Value::as_i64)
+                == Some(0)
+            && coordination_integrity_valid_at_mint
+            && scope_settled
+            && !scope_quarantined
+            && after_captured
+            && !workspace_changed
+            && scope_ownership.is_some_and(|ownership| ownership.is_authoritative());
+        if verification_receipt_valid {
+            result
+                .metadata
+                .get_or_insert_with(serde_json::Map::new)
+                .extend(crate::workspace_observation::explicit_workspace_verification_receipt());
+        } else if explicit_verification {
+            if verification_fingerprint_unavailable || !after_captured {
+                result = result.with_failure_evidence(
+                    crate::workspace_observation::
+                        explicit_workspace_verification_unavailable_evidence(),
+                );
+                result
+                    .metadata
+                    .get_or_insert_with(serde_json::Map::new)
+                    .insert(
+                        "workspace_observation_retry_scope".to_string(),
+                        Value::String("workspace_generation".to_string()),
+                    );
+                result.output.push_str("\n\n");
+                result.output.push_str(
+                    crate::workspace_observation::EXPLICIT_WORKSPACE_VERIFICATION_UNAVAILABLE_MESSAGE,
+                );
+            } else {
+                result.is_error = true;
+                result.output.push_str(
+                    "\n\nError: verify-mode command did not produce an authoritative unchanged-workspace observation receipt.",
+                );
+            }
+        }
+        if !coordination_unsettled && scope_settled && workspace_changed {
+            if let Some(ownership) = scope_ownership {
+                if ownership.is_authoritative() {
+                    result
+                        .metadata
+                        .get_or_insert_with(serde_json::Map::new)
+                        .extend(
+                            crate::workspace_observation::changed_receipt_with_ownership(
+                                ownership.as_str(),
+                            ),
+                        );
+                } else {
+                    result
+                        .metadata
+                        .get_or_insert_with(serde_json::Map::new)
+                        .extend(
+                            crate::workspace_observation::changed_receipt_with_ownership(
+                                ownership.as_str(),
+                            ),
+                        );
+                    crate::workspace_observation::quarantine_after_weak_receipt(
+                        &ctx.workspace_root,
+                        Some(ownership.as_str()),
+                    );
+                }
+            } else {
+                crate::workspace_observation::quarantine_after_weak_receipt(
+                    &ctx.workspace_root,
+                    None,
+                );
+            }
+        }
+    }
+    if explicit_verification
+        && !result.is_error
+        && !result.metadata.as_ref().is_some_and(|fields| {
+            fields
+                .get(crate::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+                .is_some_and(
+                    crate::workspace_observation::is_explicit_workspace_verification_receipt,
+                )
+        })
+    {
+        if verification_fingerprint_unavailable {
+            result = result.with_failure_evidence(
+                crate::workspace_observation::explicit_workspace_verification_unavailable_evidence(
+                ),
+            );
+            result
+                .metadata
+                .get_or_insert_with(serde_json::Map::new)
+                .insert(
+                    "workspace_observation_retry_scope".to_string(),
+                    Value::String("workspace_generation".to_string()),
+                );
+            result.output.push_str("\n\n");
+            result.output.push_str(
+                crate::workspace_observation::EXPLICIT_WORKSPACE_VERIFICATION_UNAVAILABLE_MESSAGE,
+            );
+        } else {
+            result.is_error = true;
+            result.output.push_str(
+                "\n\nError: verify-mode command did not produce an authoritative unchanged-workspace observation receipt.",
+            );
+        }
+    }
+    finalize_bash_scope_quarantine(
+        &ctx.workspace_root,
+        execution_started,
+        scope_quarantined,
+        scope_ownership,
+        args.get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    );
+    result
+}
+
+fn finalize_bash_scope_quarantine(
+    workspace_root: &Path,
+    execution_started: bool,
+    scope_quarantined: bool,
+    scope_ownership: Option<astra_sandbox::ScopeOwnership>,
+    command: &str,
+) {
+    if execution_started && scope_ownership.is_none() {
+        crate::workspace_observation::mark_workspace_observation_unsettled(workspace_root);
+        return;
+    }
+    // Preserve current-chain evidence before making the weak-ownership
+    // quarantine sticky. Quarantining first would make the post fingerprint
+    // disappear and erase the only truthful evidence this call can provide.
+    if scope_quarantined {
+        if scope_ownership.is_some() {
+            crate::workspace_observation::quarantine_after_weak_receipt(
+                workspace_root,
+                scope_ownership.as_ref().map(|ownership| ownership.as_str()),
+            );
+        } else {
+            crate::workspace_observation::mark_workspace_observation_unsettled(workspace_root);
+        }
+    }
+    // A foreground process group is useful current-call evidence, but it
+    // cannot rule out a descendant that escaped with `setsid` and writes
+    // later. Quarantine future fingerprint attribution for commands with
+    // mutation potential even when the immediate pre/post state is clean.
+    // Proven mutation-free shapes retain the ordinary non-quarantining UX.
+    if bash_scope_requires_attribution_quarantine(command, scope_ownership) {
+        crate::workspace_observation::quarantine_after_weak_receipt(
+            workspace_root,
+            scope_ownership.as_ref().map(|ownership| ownership.as_str()),
+        );
+    }
+}
+
+async fn execute_bash_inner(
     ctx: &crate::ToolContext,
     args: &Value,
     environment: &[(String, String)],
@@ -887,19 +1220,98 @@ pub async fn execute_bash_with_environment(
     };
     let timeout_secs = parse_bash_timeout_secs_for(args, command);
 
+    // A detach handle is only a transport affordance; it is not permission
+    // to let an arbitrary shell outlive this call.  In particular, a detached
+    // child has no executor-owned post-execution observation window, so a
+    // writer (including an opaque script) would be able to mutate the bound
+    // workspace without a receipt.  Keep unsafe commands in the foreground,
+    // where the outer execute_bash wrapper owns the lease and captures the
+    // post-state.  This gate lives here as well as in the edge adapter because
+    // server/RPC paths can reach the shared DefaultToolExecutor directly.
+    let detachable_requested = ctx.detach_shell_handle.is_some()
+        && crate::workspace_observation::bash_command_is_detachable_safe(command);
+
     if let Err(reason) = validate_execute_bash_command_in_workspace(command, workspace_root) {
         return ToolResult::error(reason);
     }
 
-    let timeout = Duration::from_secs_f64(timeout_secs);
-    let mut cmd = Command::new("bash");
-    if should_enable_pipefail(command) {
-        cmd.arg("-o").arg("pipefail").arg("-c").arg(command);
-    } else {
-        cmd.arg("-c").arg(command);
+    let explicit_source_artifacts = args
+        .get(crate::source_preimage::SOURCE_ARTIFACTS_FIELD)
+        .is_some();
+    let mut source_preimages = match crate::source_preimage::prepare(
+        workspace_root,
+        args,
+        &format!("{}:{}", ctx.user_id, ctx.session_id),
+    ) {
+        Ok(plan) => plan,
+        Err(reason) => return ToolResult::error(format!("Error: {reason}")),
+    };
+    // Automatic inference is deliberately advisory: only attempt it when the
+    // caller did not opt into the hard source_artifacts contract, and never
+    // let an inference/store failure prevent an ordinary shell command. A
+    // detached command has no terminal receipt path yet, so it remains
+    // outside this best-effort lane.
+    if source_preimages.is_none() && !explicit_source_artifacts && !detachable_requested {
+        source_preimages = crate::source_preimage::prepare_inferred(
+            workspace_root,
+            command,
+            &format!("{}:{}", ctx.user_id, ctx.session_id),
+        )
+        .unwrap_or(None);
     }
+    // A detached process outlives this call. Until the background registry can
+    // carry the prepared receipt through terminal completion, fail closed
+    // rather than claiming that a running command's sources are unchanged.
+    if source_preimages.is_some() && detachable_requested {
+        return ToolResult::error(
+            "Error: source_artifacts cannot be combined with detached bash until terminal receipt tracking is available".into(),
+        );
+    }
+
+    let timeout = Duration::from_secs_f64(timeout_secs);
+    let mut bash_args = Vec::new();
+    if should_enable_pipefail(command) {
+        bash_args.extend(["-o".to_string(), "pipefail".to_string()]);
+    }
+    bash_args.extend(["-c".to_string(), command.to_string()]);
+    let mut foreground_owner = None;
+    let mut cmd = if detachable_requested {
+        let mut command = Command::new("bash");
+        command.args(&bash_args);
+        command
+    } else {
+        let (mut command, owner) =
+            match astra_sandbox::BashInvocationOwner::prepare("bash", &bash_args) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    return ToolResult::error(format!(
+                        "Error: unable to establish Bash invocation owner: {error}"
+                    ));
+                }
+            };
+        if let Err(error) = owner.install(&mut command) {
+            return ToolResult::error(format!(
+                "Error: unable to install Bash invocation owner: {error}"
+            ));
+        }
+        foreground_owner = Some(owner);
+        Command::from(command)
+    };
     cmd.current_dir(workspace_root).kill_on_drop(true);
     cmd.envs(environment.iter().map(|(key, value)| (key, value)));
+    // Never let a caller-controlled shell startup hook execute in the tool
+    // process.  Detached commands additionally receive a minimal environment
+    // below, but foreground commands need the same invariant.
+    cmd.env_remove("BASH_ENV").env_remove("ENV");
+    if detachable_requested {
+        cmd.env_clear()
+            .env("PATH", crate::workspace_observation::DETACHABLE_PATH)
+            .env("LC_ALL", "C")
+            // Keep the invariant explicit even on platforms/runtimes where
+            // environment clearing is emulated by the process launcher.
+            .env("BASH_ENV", "")
+            .env("ENV", "");
+    }
 
     let output_limit = per_tool_output_limit("bash");
     let raw_stdout_limit = output_limit.saturating_mul(2).max(16_384);
@@ -915,7 +1327,9 @@ pub async fn execute_bash_with_environment(
     // tracks ownership. Callers must explicitly restore() on error
     // paths or take() on success paths where the handle is consumed.
     // Guard's drop logs a warning if the handle is still present (leak).
-    let detach_slot = ctx.detach_shell_handle.as_ref().cloned();
+    let detach_slot = detachable_requested
+        .then(|| ctx.detach_shell_handle.as_ref().cloned())
+        .flatten();
     let mut detach_handle_guard = DetachHandleGuard::new(
         detach_slot.as_ref(),
         if let Some(slot) = detach_slot.as_ref() {
@@ -1025,8 +1439,9 @@ pub async fn execute_bash_with_environment(
             }
         }
     } else {
-        match run_readonly_command_with_partial(
+        match run_owned_bash_command_with_partial(
             &mut cmd,
+            foreground_owner.expect("foreground Bash owner prepared"),
             timeout,
             raw_stdout_limit,
             raw_stderr_limit,
@@ -1036,7 +1451,7 @@ pub async fn execute_bash_with_environment(
         .await
         {
             Ok(output) => output,
-            Err(e) => return ToolResult::error(e),
+            Err(e) => return attach_source_preimage(ToolResult::error(e), source_preimages),
         }
     };
 
@@ -1054,6 +1469,11 @@ pub async fn execute_bash_with_environment(
         result.push_str("stderr:\n");
         result.push_str(&output.stderr);
     }
+
+    // Establish the credential boundary before any user-visible output
+    // truncation. A secret that crosses the raw capture limit must not leave a
+    // partial value in stdout/stderr for a later pass to miss.
+    result = crate::credential_redaction::redact_credentials_for_display(&result).0;
 
     let mut cap_notes = Vec::new();
     if output.stdout_capped {
@@ -1088,9 +1508,21 @@ pub async fn execute_bash_with_environment(
         } else {
             result = format!("Error: bash timed out after {timeout_secs}s with no captured output");
         }
-        return ToolResult::error(truncate_output(result, output_limit))
-            .with_exit_semantics(ExitSemantics::TimedOut)
-            .with_exit_code(output.exit_code);
+        return attach_scope_settled(
+            attach_source_preimage(
+                ToolResult::error(crate::credential_redaction::truncate_redacted_output(
+                    result,
+                    output_limit,
+                ))
+                .with_exit_semantics(ExitSemantics::TimedOut)
+                .with_exit_code(output.exit_code),
+                source_preimages,
+            ),
+            output.scope_settled,
+            output.scope_ownership,
+            output.scope_quarantined,
+            output.descendants_terminated,
+        );
     }
 
     if output.cancelled {
@@ -1099,9 +1531,21 @@ pub async fn execute_bash_with_environment(
         } else {
             result = "Error: bash cancelled before any output was captured".into();
         }
-        return ToolResult::error(truncate_output(result, output_limit))
-            .with_exit_semantics(ExitSemantics::Cancelled)
-            .with_exit_code(output.exit_code);
+        return attach_scope_settled(
+            attach_source_preimage(
+                ToolResult::error(crate::credential_redaction::truncate_redacted_output(
+                    result,
+                    output_limit,
+                ))
+                .with_exit_semantics(ExitSemantics::Cancelled)
+                .with_exit_code(output.exit_code),
+                source_preimages,
+            ),
+            output.scope_settled,
+            output.scope_ownership,
+            output.scope_quarantined,
+            output.descendants_terminated,
+        );
     }
 
     let exit_semantics = classify_exit(command, output.exit_code);
@@ -1113,41 +1557,82 @@ pub async fn execute_bash_with_environment(
     );
     if output.exit_code != 0 || result_class.is_tool_error() {
         let exit_code = output.exit_code;
-        let output_text = truncate_output(result, output_limit);
+        let output_text =
+            crate::credential_redaction::truncate_redacted_output(result, output_limit);
         if exit_semantics.is_tool_error() || result_class.is_tool_error() {
-            return ToolResult::error(output_text)
-                .with_exit_semantics(exit_semantics)
-                .with_result_class(result_class)
-                .with_exit_code(exit_code);
+            return attach_scope_settled(
+                attach_source_preimage(
+                    ToolResult::error(output_text)
+                        .with_failure_evidence(crate::exit_semantics::command_failed_evidence())
+                        .with_exit_semantics(exit_semantics)
+                        .with_result_class(result_class)
+                        .with_exit_code(exit_code),
+                    source_preimages,
+                ),
+                output.scope_settled,
+                output.scope_ownership,
+                output.scope_quarantined,
+                output.descendants_terminated,
+            );
         }
-        return ToolResult::text(output_text)
-            .with_exit_semantics(exit_semantics)
-            .with_result_class(result_class)
-            .with_exit_code(exit_code);
+        return attach_scope_settled(
+            attach_source_preimage(
+                ToolResult::text(output_text)
+                    .with_exit_semantics(exit_semantics)
+                    .with_result_class(result_class)
+                    .with_exit_code(exit_code),
+                source_preimages,
+            ),
+            output.scope_settled,
+            output.scope_ownership,
+            output.scope_quarantined,
+            output.descendants_terminated,
+        );
     }
 
-    if command_has_background_operator(command) {
+    if output.descendants_terminated {
         if !result.is_empty() && !result.ends_with('\n') {
             result.push('\n');
         }
         result.push_str(
-            "\n⚠ Background process (`&`) started. Background processes do not persist \
-             across bash tool calls — each call runs in an isolated shell. If you need \
-             the process running for a subsequent call, start it and test it within the \
-             same command.",
+            "\n⚠ Live descendant processes were terminated when this foreground bash call ended; \
+             they are not running now. This includes programs that daemonize themselves, even \
+             when the command contains no `&`. This executor provides no process-persistence \
+             guarantee.",
         );
     }
 
     if result.is_empty() {
-        ToolResult::text("(command completed with no output)".into())
-            .with_exit_semantics(ExitSemantics::Success)
-            .with_result_class(result_class)
-            .with_exit_code(output.exit_code)
+        attach_scope_settled(
+            attach_source_preimage(
+                ToolResult::text("(command completed with no output)".into())
+                    .with_exit_semantics(ExitSemantics::Success)
+                    .with_result_class(result_class)
+                    .with_exit_code(output.exit_code),
+                source_preimages,
+            ),
+            output.scope_settled,
+            output.scope_ownership,
+            output.scope_quarantined,
+            output.descendants_terminated,
+        )
     } else {
-        ToolResult::text(truncate_output(result, output_limit))
-            .with_exit_semantics(ExitSemantics::Success)
-            .with_result_class(result_class)
-            .with_exit_code(output.exit_code)
+        attach_scope_settled(
+            attach_source_preimage(
+                ToolResult::text(crate::credential_redaction::truncate_redacted_output(
+                    result,
+                    output_limit,
+                ))
+                .with_exit_semantics(ExitSemantics::Success)
+                .with_result_class(result_class)
+                .with_exit_code(output.exit_code),
+                source_preimages,
+            ),
+            output.scope_settled,
+            output.scope_ownership,
+            output.scope_quarantined,
+            output.descendants_terminated,
+        )
     }
 }
 
@@ -1223,7 +1708,92 @@ pub async fn execute_bash_with_filesystem_boundary(
     .with_exit_code(exit_code)
 }
 
-fn should_enable_pipefail(command: &str) -> bool {
+fn attach_scope_settled(
+    mut result: ToolResult,
+    settled: bool,
+    ownership: Option<astra_sandbox::ScopeOwnership>,
+    quarantined: bool,
+    descendants_terminated: bool,
+) -> ToolResult {
+    result
+        .metadata
+        .get_or_insert_with(serde_json::Map::new)
+        .insert(
+            INTERNAL_EXECUTION_STARTED_FIELD.to_string(),
+            Value::Bool(true),
+        );
+    result
+        .metadata
+        .get_or_insert_with(serde_json::Map::new)
+        .insert(
+            INTERNAL_SCOPE_SETTLED_FIELD.to_string(),
+            Value::Bool(settled),
+        );
+    if let Some(ownership) = ownership {
+        result
+            .metadata
+            .as_mut()
+            .expect("scope metadata inserted")
+            .insert(
+                INTERNAL_SCOPE_OWNERSHIP_FIELD.to_string(),
+                Value::String(ownership.as_str().to_string()),
+            );
+    }
+    result
+        .metadata
+        .as_mut()
+        .expect("scope metadata inserted")
+        .insert(
+            INTERNAL_SCOPE_QUARANTINED_FIELD.to_string(),
+            Value::Bool(quarantined),
+        );
+    if descendants_terminated {
+        let metadata = result.metadata.as_mut().expect("scope metadata inserted");
+        metadata.insert("background_children_reaped".to_string(), Value::Bool(true));
+        metadata.insert("descendant_persistence".to_string(), Value::Bool(false));
+    }
+    result
+}
+
+fn parse_scope_ownership(value: &str) -> Option<astra_sandbox::ScopeOwnership> {
+    match value {
+        crate::workspace_observation::INVOCATION_CGROUP_OWNERSHIP => {
+            Some(astra_sandbox::ScopeOwnership::InvocationCgroup)
+        }
+        crate::workspace_observation::INVOCATION_SUPERVISOR_OWNERSHIP => {
+            Some(astra_sandbox::ScopeOwnership::InvocationSupervisor)
+        }
+        crate::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP => {
+            Some(astra_sandbox::ScopeOwnership::ForegroundProcessGroup)
+        }
+        _ => None,
+    }
+}
+
+fn attach_source_preimage(
+    mut result: ToolResult,
+    plan: Option<crate::source_preimage::PreparedSourcePreimages>,
+) -> ToolResult {
+    if let Some(mut plan) = plan {
+        let finished = plan.finish();
+        if let Some(advisory) = crate::source_preimage::advisory_text(&finished) {
+            if !result.output.is_empty() {
+                result.output.push_str("\n\n");
+            }
+            result.output.push_str(&advisory);
+        }
+        let metadata = result.metadata.get_or_insert_with(serde_json::Map::new);
+        metadata.extend(finished);
+    }
+    result
+}
+
+/// Whether a Bash command contains a real (unquoted, non-`||`) pipeline.
+///
+/// Every Bash execution transport must use this same structural decision so
+/// an upstream command failure cannot be rewritten as success by `tail`,
+/// `head`, or another presentation-only final stage.
+pub fn should_enable_pipefail(command: &str) -> bool {
     command_has_pipeline_operator(command)
 }
 
@@ -1254,8 +1824,10 @@ fn command_has_pipeline_operator(command: &str) -> bool {
     false
 }
 
-/// Returns true if the command uses `&` to background a process (not `&&`).
-fn command_has_background_operator(command: &str) -> bool {
+/// Returns true if the command uses `&` to background a process. Shell fd
+/// duplication/redirection (`2>&1`, `>&2`, `&>file`), `&&`, and `|&` are not
+/// process-background operators.
+pub fn command_has_background_operator(command: &str) -> bool {
     let chars: Vec<char> = command.chars().collect();
     let mut in_single = false;
     let mut in_double = false;
@@ -1273,9 +1845,12 @@ fn command_has_background_operator(command: &str) -> bool {
                 in_double = !in_double;
             }
             '&' if !in_single && !in_double => {
-                let prev_amp = i > 0 && chars[i - 1] == '&';
-                let next_amp = chars.get(i + 1) == Some(&'&');
-                if !prev_amp && !next_amp {
+                let prev = i.checked_sub(1).and_then(|index| chars.get(index));
+                let next = chars.get(i + 1);
+                let control_and = prev == Some(&'&') || next == Some(&'&');
+                let fd_redirection = matches!(prev.copied(), Some('>' | '<' | '|'));
+                let combined_output_redirection = next == Some(&'>');
+                if !control_and && !fd_redirection && !combined_output_redirection {
                     return true;
                 }
             }
@@ -1403,6 +1978,10 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         cancelled,
         stdout_capped,
         stderr_capped: _stderr_capped,
+        scope_settled: _scope_settled,
+        scope_ownership: _scope_ownership,
+        scope_quarantined: _scope_quarantined,
+        descendants_terminated: _descendants_terminated,
     } = match command_output {
         Ok(output) => output,
         Err(e) => return ToolResult::error(e),
@@ -1414,12 +1993,12 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         } else {
             format!("No matches found (warnings: {})", stderr.trim())
         };
-        return grep_process_result(output, exit_code, timed_out, cancelled);
+        return search_process_result(output, exit_code, timed_out, cancelled);
     }
 
     if stdout.trim().is_empty() && exit_code != 0 {
         if cancelled {
-            return grep_process_result(
+            return search_process_result(
                 "Error: grep was cancelled before returning results.".into(),
                 exit_code,
                 timed_out,
@@ -1427,7 +2006,7 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
             );
         }
         if timed_out {
-            return grep_process_result(
+            return search_process_result(
                 "Error: grep timed out after 20s with no results. Narrow the search with 'path', 'include'/'glob', 'type', or a more specific pattern.".into(),
                 exit_code,
                 timed_out,
@@ -1440,7 +2019,7 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         } else {
             format!("Error: {}", stderr.trim())
         };
-        return grep_process_result(output, exit_code, timed_out, cancelled);
+        return search_process_result(output, exit_code, timed_out, cancelled);
     }
 
     let filtered = if output_mode == SearchOutputMode::Count {
@@ -1483,7 +2062,7 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         &gitignored_paths,
     );
     if lines.is_empty() {
-        return grep_process_result(
+        return search_process_result(
             no_visible_results_message(
                 "matches",
                 timed_out,
@@ -1498,7 +2077,7 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
     }
     let paged_lines = if offset > 0 {
         if offset >= lines.len() {
-            return grep_process_result(
+            return search_process_result(
                 no_more_results_message(
                     offset,
                     lines.len(),
@@ -1580,10 +2159,10 @@ pub async fn grep(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         result_text = annotate_grep_with_scope(&result_text, workspace_root);
     }
 
-    grep_process_result(result_text, exit_code, timed_out, cancelled)
+    search_process_result(result_text, exit_code, timed_out, cancelled)
 }
 
-fn grep_process_result(
+fn search_process_result(
     output: String,
     exit_code: i32,
     timed_out: bool,
@@ -1686,10 +2265,18 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         cancelled,
         stdout_capped,
         stderr_capped: _stderr_capped,
+        scope_settled: _scope_settled,
+        scope_ownership: _scope_ownership,
+        scope_quarantined: _scope_quarantined,
+        descendants_terminated: _descendants_terminated,
     } = match command_output {
         Ok(output) => output,
         Err(e) => return ToolResult::error(e),
     };
+
+    if stdout.trim().is_empty() && exit_code == 1 && !timed_out && !cancelled {
+        return search_process_result("No files found".into(), exit_code, false, false);
+    }
 
     if stdout.trim().is_empty() && exit_code != 0 && !timed_out && !cancelled {
         return if stderr.trim().is_empty() {
@@ -1796,7 +2383,7 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         ));
     }
 
-    ToolResult::text(result_text)
+    search_process_result(result_text, exit_code, timed_out, cancelled)
 }
 
 fn ripgrep_available() -> bool {
@@ -2703,6 +3290,10 @@ async fn run_grep_with_grep(
         cancelled,
         stdout_capped,
         stderr_capped: false,
+        scope_settled: false,
+        scope_ownership: None,
+        scope_quarantined: false,
+        descendants_terminated: false,
     })
 }
 
@@ -2791,6 +3382,10 @@ async fn run_grep_multiline_locally(
         cancelled,
         stdout_capped,
         stderr_capped: false,
+        scope_settled: false,
+        scope_ownership: None,
+        scope_quarantined: false,
+        descendants_terminated: false,
     })
 }
 
@@ -3229,6 +3824,48 @@ async fn run_readonly_command_with_partial(
     cancel_token: Option<&CancellationToken>,
     command_kind: &str,
 ) -> Result<ReadOnlyCommandOutput, String> {
+    run_command_with_partial(
+        cmd,
+        None,
+        timeout,
+        max_stdout_bytes,
+        max_stderr_bytes,
+        cancel_token,
+        command_kind,
+    )
+    .await
+}
+
+async fn run_owned_bash_command_with_partial(
+    cmd: &mut Command,
+    owner: astra_sandbox::BashInvocationOwner,
+    timeout: Duration,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
+    cancel_token: Option<&CancellationToken>,
+    command_kind: &str,
+) -> Result<ReadOnlyCommandOutput, String> {
+    run_command_with_partial(
+        cmd,
+        Some(owner),
+        timeout,
+        max_stdout_bytes,
+        max_stderr_bytes,
+        cancel_token,
+        command_kind,
+    )
+    .await
+}
+
+async fn run_command_with_partial(
+    cmd: &mut Command,
+    mut invocation_owner: Option<astra_sandbox::BashInvocationOwner>,
+    timeout: Duration,
+    max_stdout_bytes: usize,
+    max_stderr_bytes: usize,
+    cancel_token: Option<&CancellationToken>,
+    command_kind: &str,
+) -> Result<ReadOnlyCommandOutput, String> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     // Put the child into its own process group so `kill -9 -<pgid>` on
@@ -3238,9 +3875,47 @@ async fn run_readonly_command_with_partial(
     #[cfg(unix)]
     cmd.process_group(0);
 
+    let process_scope = invocation_owner
+        .is_none()
+        .then(astra_sandbox::apply_process_scope);
+    if let Some(process_scope) = process_scope.as_ref() {
+        process_scope.attach_child(cmd);
+    }
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Error: failed to start {command_kind}: {e}"))?;
+    if let Some(pid) = child.id() {
+        if let Some(owner) = invocation_owner.take() {
+            let (owner, started) = tokio::task::spawn_blocking(move || {
+                let mut owner = owner;
+                let started = owner.started(pid);
+                (owner, started)
+            })
+            .await
+            .map_err(|error| format!("Error: Bash owner worker failed: {error}"))?;
+            invocation_owner = Some(owner);
+            if let Err(error) = started {
+                let ownership = terminate_owned_tokio_child(
+                    &mut child,
+                    invocation_owner.take().expect("owner restored"),
+                    Some(pid),
+                )
+                .await;
+                return Err(format!(
+                    "Error: failed to start {command_kind} ownership boundary: {error}; settled={}",
+                    ownership.is_some()
+                ));
+            }
+        } else if let Some(process_scope) = process_scope.as_ref()
+            && let Err(error) = process_scope.join_child(pid)
+        {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(format!(
+                "Error: failed to join {command_kind} process scope: {error}"
+            ));
+        }
+    }
     let stdout = child
         .stdout
         .take()
@@ -3262,6 +3937,9 @@ async fn run_readonly_command_with_partial(
     let mut exit_code = None;
     let mut timed_out = false;
     let mut cancelled = false;
+    let mut scope_quarantined = false;
+    let mut descendants_terminated = false;
+    let mut scope_ownership;
 
     loop {
         drain_command_chunks(
@@ -3274,22 +3952,53 @@ async fn run_readonly_command_with_partial(
             &mut stderr_capped,
         );
 
+        // Capture the group leader id before try_wait reaps it.  A shell can
+        // exit successfully while a background child still runs; kill that
+        // process group before releasing the observation lease and before
+        // draining pipes, otherwise a late write can be attributed to the
+        // next tool call.
+        let leader_pid = child.id();
         match child.try_wait() {
             Ok(Some(status)) => {
+                let settlement = if let Some(owner) = invocation_owner.take() {
+                    settle_owned_owner_detailed(owner, leader_pid).await
+                } else {
+                    process_scope
+                        .as_ref()
+                        .and_then(|scope| scope.settle_for_observation_detailed(leader_pid))
+                };
+                scope_ownership = settlement.map(|settlement| settlement.ownership);
+                descendants_terminated =
+                    settlement.is_some_and(|settlement| settlement.descendants_terminated);
+                sigkill_process_group_id(leader_pid);
                 exit_code = Some(exit_code_from_status(&status));
                 break;
             }
             Ok(None) => {
                 if tokio::time::Instant::now() >= deadline {
                     timed_out = true;
-                    terminate_child_gracefully(&mut child, TERM_GRACE_PERIOD).await;
+                    scope_ownership = if let Some(owner) = invocation_owner.take() {
+                        terminate_owned_tokio_child(&mut child, owner, leader_pid).await
+                    } else {
+                        terminate_child_gracefully(&mut child, TERM_GRACE_PERIOD).await;
+                        process_scope
+                            .as_ref()
+                            .and_then(|scope| scope.settle_for_observation(leader_pid))
+                    };
                     break;
                 }
                 if let Some(token) = cancel_token {
                     tokio::select! {
                         _ = token.cancelled() => {
                             cancelled = true;
-                            terminate_child_gracefully(&mut child, TERM_GRACE_PERIOD).await;
+                            scope_ownership = if let Some(owner) = invocation_owner.take() {
+                                terminate_owned_tokio_child(&mut child, owner, leader_pid).await
+                            } else {
+                                terminate_child_gracefully(&mut child, TERM_GRACE_PERIOD).await;
+                                process_scope
+                                    .as_ref()
+                                    .and_then(|scope| scope.settle_for_observation(leader_pid))
+                            };
                             break;
                         }
                         _ = tokio::time::sleep(Duration::from_millis(25)) => {}
@@ -3300,9 +4009,19 @@ async fn run_readonly_command_with_partial(
             }
             Err(e) => {
                 let error_msg = format!("Error: {command_kind} failed: {e}");
-                terminate_child_gracefully(&mut child, TERM_GRACE_PERIOD).await;
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
+                let mut scope_ownership = if let Some(owner) = invocation_owner.take() {
+                    terminate_owned_tokio_child(&mut child, owner, leader_pid).await
+                } else {
+                    terminate_child_gracefully(&mut child, TERM_GRACE_PERIOD).await;
+                    process_scope
+                        .as_ref()
+                        .and_then(|scope| scope.settle_for_observation(leader_pid))
+                };
+                let streams_settled = join_command_streams_bounded(stdout_task, stderr_task).await;
+                if !streams_settled {
+                    scope_ownership = None;
+                    scope_quarantined = true;
+                }
                 drain_command_chunks(
                     &mut rx,
                     &mut stdout_text,
@@ -3312,13 +4031,42 @@ async fn run_readonly_command_with_partial(
                     max_stderr_bytes,
                     &mut stderr_capped,
                 );
-                return Err(error_msg);
+                if !stderr_text.is_empty() && !stderr_text.ends_with('\n') {
+                    stderr_text.push('\n');
+                }
+                stderr_text.push_str(&error_msg);
+                if stdout_capped {
+                    truncate_partial_line(&mut stdout_text);
+                }
+                if stderr_capped {
+                    truncate_partial_line(&mut stderr_text);
+                }
+                return Ok(ReadOnlyCommandOutput {
+                    stdout: stdout_text,
+                    stderr: stderr_text,
+                    exit_code: -1,
+                    timed_out: false,
+                    cancelled: false,
+                    stdout_capped,
+                    stderr_capped,
+                    scope_settled: scope_ownership.is_some(),
+                    scope_ownership,
+                    scope_quarantined,
+                    descendants_terminated: false,
+                });
             }
         }
     }
 
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
+    // A timed-out or cancelled leader can leave a descendant holding one of
+    // the inherited pipes (for example after a new-session escape). Never
+    // wait for that descendant indefinitely: the tool boundary must return a
+    // typed timeout/cancellation result, and an unsettled stream cannot
+    // support a trusted workspace receipt.
+    if !join_command_streams_bounded(stdout_task, stderr_task).await {
+        scope_ownership = None;
+        scope_quarantined = true;
+    }
     drain_command_chunks(
         &mut rx,
         &mut stdout_text,
@@ -3329,6 +4077,12 @@ async fn run_readonly_command_with_partial(
         &mut stderr_capped,
     );
 
+    if stdout_capped {
+        truncate_partial_line(&mut stdout_text);
+    }
+    if stderr_capped {
+        truncate_partial_line(&mut stderr_text);
+    }
     if timed_out || cancelled {
         truncate_partial_line(&mut stdout_text);
         truncate_partial_line(&mut stderr_text);
@@ -3342,7 +4096,100 @@ async fn run_readonly_command_with_partial(
         cancelled,
         stdout_capped,
         stderr_capped,
+        scope_settled: scope_ownership.is_some(),
+        scope_ownership,
+        scope_quarantined,
+        descendants_terminated,
     })
+}
+
+const COMMAND_STREAM_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn settle_owned_owner(
+    owner: astra_sandbox::BashInvocationOwner,
+    leader_pid: Option<u32>,
+) -> Option<astra_sandbox::ScopeOwnership> {
+    tokio::task::spawn_blocking(move || {
+        let mut owner = owner;
+        owner.settle_after_exit(leader_pid)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn settle_owned_owner_detailed(
+    owner: astra_sandbox::BashInvocationOwner,
+    leader_pid: Option<u32>,
+) -> Option<astra_sandbox::ScopeSettlement> {
+    tokio::task::spawn_blocking(move || {
+        let mut owner = owner;
+        owner.settle_after_exit_detailed(leader_pid)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn terminate_owned_tokio_child(
+    child: &mut tokio::process::Child,
+    owner: astra_sandbox::BashInvocationOwner,
+    leader_pid: Option<u32>,
+) -> Option<astra_sandbox::ScopeOwnership> {
+    if !owner.is_supervised() {
+        terminate_child_gracefully(child, TERM_GRACE_PERIOD).await;
+        return settle_owned_owner(owner, leader_pid).await;
+    }
+
+    let owner = match tokio::task::spawn_blocking(move || {
+        let mut owner = owner;
+        let _ = owner.request_supervised_termination();
+        owner
+    })
+    .await
+    {
+        Ok(owner) => owner,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return None;
+        }
+    };
+    if tokio::time::timeout(Duration::from_secs(3), child.wait())
+        .await
+        .is_err()
+    {
+        // Killing the helper destroys its adoption boundary. Never promote
+        // this fallback to ownership authority.
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return None;
+    }
+    settle_owned_owner(owner, leader_pid).await
+}
+
+/// Join shell output pumps without allowing an escaped descendant to hold a
+/// tool call open forever. A bounded join is also an ownership signal: when
+/// it expires, the caller must not publish a trusted workspace receipt.
+async fn join_command_streams_bounded(
+    mut stdout_task: tokio::task::JoinHandle<()>,
+    mut stderr_task: tokio::task::JoinHandle<()>,
+) -> bool {
+    let joined = tokio::time::timeout(COMMAND_STREAM_JOIN_TIMEOUT, async {
+        let stdout_result = (&mut stdout_task).await;
+        let stderr_result = (&mut stderr_task).await;
+        (stdout_result, stderr_result)
+    })
+    .await;
+    if matches!(joined, Ok((Ok(()), Ok(())))) {
+        return true;
+    }
+
+    stdout_task.abort();
+    stderr_task.abort();
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+    false
 }
 
 /// Detach-aware bash runner. Same shape as
@@ -3588,6 +4435,10 @@ pub(crate) async fn run_bash_with_detach(
         cancelled,
         stdout_capped,
         stderr_capped,
+        scope_settled: false,
+        scope_ownership: None,
+        scope_quarantined: false,
+        descendants_terminated: false,
     }))
 }
 
@@ -3985,6 +4836,133 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(source_preimage_env)]
+    async fn bash_source_artifacts_preserves_receipt_and_runs_after_capture() {
+        let store = tempdir().unwrap();
+        // Keep this test's durable receipt store isolated from a developer's
+        // real session data. The production path never mutates this env var.
+        unsafe { std::env::set_var("_ASTRA_SOURCE_PREIMAGE_ROOT", store.path()) };
+        let workspace = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(workspace.path());
+        std::fs::write(workspace.path().join("source.bin"), b"evidence").unwrap();
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({
+                "command": "rm source.bin; touch command-ran",
+                "source_artifacts": ["source.bin"]
+            }),
+        )
+        .await;
+
+        assert!(!result.is_error, "command should run after a valid capture");
+        assert!(workspace.path().join("command-ran").exists());
+        assert!(!workspace.path().join("source.bin").exists());
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["source_preimage"]["status"],
+            "changed"
+        );
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["source_preimage"]["entries"][0]["status"],
+            "deleted"
+        );
+        unsafe { std::env::remove_var("_ASTRA_SOURCE_PREIMAGE_ROOT") };
+    }
+
+    #[tokio::test]
+    #[serial(source_preimage_env)]
+    async fn bash_source_artifacts_failure_does_not_spawn_the_command() {
+        let store = tempdir().unwrap();
+        unsafe { std::env::set_var("_ASTRA_SOURCE_PREIMAGE_ROOT", store.path()) };
+        let workspace = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(workspace.path());
+        std::fs::write(workspace.path().join("source.bin"), b"evidence").unwrap();
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({
+                "command": "touch command-must-not-run",
+                "source_artifacts": ["source.bin", "missing.bin"]
+            }),
+        )
+        .await;
+
+        assert!(result.is_error);
+        assert!(!workspace.path().join("command-must-not-run").exists());
+        assert!(result.output.contains("source artifact"));
+        unsafe { std::env::remove_var("_ASTRA_SOURCE_PREIMAGE_ROOT") };
+    }
+
+    #[tokio::test]
+    #[serial(source_preimage_env)]
+    async fn bash_stateful_operand_inference_is_advisory_and_auditable() {
+        let store = tempdir().unwrap();
+        unsafe { std::env::set_var("_ASTRA_SOURCE_PREIMAGE_ROOT", store.path()) };
+        let workspace = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(workspace.path());
+        std::fs::write(workspace.path().join("source.bin"), b"evidence").unwrap();
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({"command": "cp source.bin copy.bin"}),
+        )
+        .await;
+
+        assert!(!result.is_error, "inferred bash should remain executable");
+        assert!(workspace.path().join("copy.bin").exists());
+        let preimage = &result.metadata.as_ref().unwrap()["source_preimage"];
+        assert_eq!(preimage["mode"], "inferred_advisory");
+        assert_eq!(preimage["guarantee"], false);
+        assert_eq!(preimage["entries"][0]["path"], "source.bin");
+        unsafe { std::env::remove_var("_ASTRA_SOURCE_PREIMAGE_ROOT") };
+    }
+
+    #[tokio::test]
+    #[serial(source_preimage_env)]
+    async fn bash_inferred_change_surfaces_recovery_advisory_to_model() {
+        let store = tempdir().unwrap();
+        unsafe { std::env::set_var("_ASTRA_SOURCE_PREIMAGE_ROOT", store.path()) };
+        let workspace = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(workspace.path());
+        std::fs::write(workspace.path().join("source.bin"), b"evidence").unwrap();
+
+        let result = execute_bash(&ctx, &serde_json::json!({"command": "rm source.bin"})).await;
+
+        assert!(!result.is_error);
+        assert!(
+            result.output.contains("source preimage advisory")
+                && result.output.contains("receipt_id="),
+            "changed inferred sources need a model-visible recovery path: {}",
+            result.output
+        );
+        assert_eq!(
+            result.metadata.as_ref().unwrap()["source_preimage"]["mode"],
+            "inferred_advisory"
+        );
+        unsafe { std::env::remove_var("_ASTRA_SOURCE_PREIMAGE_ROOT") };
+    }
+
+    #[tokio::test]
+    #[serial(source_preimage_env)]
+    async fn bash_benign_command_does_not_create_inferred_receipt() {
+        let store = tempdir().unwrap();
+        unsafe { std::env::set_var("_ASTRA_SOURCE_PREIMAGE_ROOT", store.path()) };
+        let workspace = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(workspace.path());
+
+        let result = execute_bash(&ctx, &serde_json::json!({"command": "echo hi"})).await;
+
+        assert!(!result.is_error);
+        assert!(
+            result
+                .metadata
+                .as_ref()
+                .is_none_or(|metadata| !metadata.contains_key("source_preimage"))
+        );
+        unsafe { std::env::remove_var("_ASTRA_SOURCE_PREIMAGE_ROOT") };
+    }
+
+    #[tokio::test]
     async fn grep_count_mode_filters_zeroes_and_honors_head_limit() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
@@ -4050,7 +5028,7 @@ mod tests {
 
     #[test]
     fn grep_backend_error_result_is_structured_execution_error() {
-        let result = grep_process_result("Error: grep failed".to_string(), 2, false, false);
+        let result = search_process_result("Error: grep failed".to_string(), 2, false, false);
 
         assert!(
             result.is_error,
@@ -4762,6 +5740,35 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
+    async fn glob_no_match_is_a_typed_empty_result() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        std::fs::write(dir.path().join("present.txt"), "").unwrap();
+
+        let result = glob(
+            &ctx,
+            &serde_json::json!({"pattern": "missing.yml", "path": "."}),
+        )
+        .await;
+
+        assert!(
+            !result.is_error,
+            "no-match is not a tool failure: {result:?}"
+        );
+        assert_eq!(result.output, "No files found");
+        assert_eq!(result.exit_semantics, Some(ExitSemantics::EmptyResult));
+        let metadata = result
+            .metadata
+            .as_ref()
+            .expect("empty glob result must preserve process semantics");
+        assert_eq!(metadata.get("exit_code").and_then(Value::as_i64), Some(1));
+        assert_eq!(
+            metadata.get("result_class").and_then(Value::as_str),
+            Some("empty_result")
+        );
+    }
+
+    #[tokio::test]
     async fn glob_offset_beyond_end_reports_no_more_results() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
@@ -4903,6 +5910,30 @@ printf 'probe.txt:1:needle\n'
     fn validate_execute_bash_rejects_empty_command() {
         assert!(validate_execute_bash_command("").is_err());
         assert!(validate_execute_bash_command("  \t").is_err());
+    }
+
+    #[test]
+    fn weak_scope_quarantine_uses_general_mutation_classifier() {
+        let weak = Some(astra_sandbox::ScopeOwnership::ForegroundProcessGroup);
+        let authoritative = Some(astra_sandbox::ScopeOwnership::InvocationCgroup);
+
+        assert!(!bash_scope_requires_attribution_quarantine("true", weak));
+        assert!(!bash_scope_requires_attribution_quarantine(
+            "printf harmless",
+            weak
+        ));
+        assert!(bash_scope_requires_attribution_quarantine(
+            "python3 worker.py",
+            weak
+        ));
+        assert!(!bash_scope_requires_attribution_quarantine(
+            "python3 worker.py",
+            authoritative
+        ));
+        assert!(!bash_scope_requires_attribution_quarantine(
+            "python3 worker.py",
+            None
+        ));
     }
 
     #[test]
@@ -5220,6 +6251,24 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
+    async fn foreground_only_bash_rejects_unadvertised_managed_background_fields() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({
+                "command": "printf should-not-run",
+                "run_in_background": true,
+                "ready_check": "true"
+            }),
+        )
+        .await;
+        assert!(result.is_error);
+        assert!(result.output.contains("foreground-only"));
+        assert!(!result.output.contains("should-not-run"));
+    }
+
+    #[tokio::test]
     async fn bash_non_zero_exit_is_reported_as_error() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
@@ -5435,6 +6484,27 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
+    async fn bash_redacts_a_bare_huggingface_token_before_returning_output() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        let token = "hf_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({"command": format!("printf '%s\\n' '{token}'")}),
+        )
+        .await;
+
+        assert!(!result.is_error, "unexpected bash failure: {result:?}");
+        assert!(!result.output.contains(token));
+        assert!(
+            result.output.contains("[REDACTED:HUGGINGFACE_TOKEN]"),
+            "got: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
     async fn bash_masked_missing_command_is_env_failure() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
@@ -5494,6 +6564,180 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
+    async fn bash_verify_mode_requires_an_unchanged_authoritative_workspace() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({"command": "printf verified", "mode": "verify"}),
+        )
+        .await;
+        let receipt = result
+            .metadata
+            .as_ref()
+            .and_then(|fields| fields.get(crate::workspace_observation::OBSERVATION_RECEIPT_FIELD));
+        if astra_sandbox::apply_process_scope().ownership_guaranteed() {
+            assert!(!result.is_error, "verify result: {result:?}");
+            assert!(receipt.is_some_and(
+                crate::workspace_observation::is_explicit_workspace_verification_receipt,
+            ));
+        } else {
+            assert!(result.is_error, "weak scope must not mint receipt");
+            assert!(receipt.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_verify_mode_rejects_a_workspace_mutation() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({"command": "printf changed > changed.txt", "mode": "verify"}),
+        )
+        .await;
+
+        assert!(
+            result.is_error,
+            "a verify command may not mutate: {result:?}"
+        );
+        assert!(dir.path().join("changed.txt").is_file());
+        assert!(result.metadata.as_ref().is_none_or(|fields| {
+            !fields
+                .get(crate::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+                .is_some_and(
+                    crate::workspace_observation::is_explicit_workspace_verification_receipt,
+                )
+        }));
+    }
+
+    #[tokio::test]
+    async fn bash_verify_mode_rejects_nonzero_exit() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({"command": "exit 7", "mode": "verify"}),
+        )
+        .await;
+
+        assert!(result.is_error);
+        assert!(result.metadata.as_ref().is_none_or(|fields| {
+            !fields
+                .get(crate::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+                .is_some_and(
+                    crate::workspace_observation::is_explicit_workspace_verification_receipt,
+                )
+        }));
+    }
+
+    #[tokio::test]
+    async fn bash_verify_mode_rejects_domain_negative_exit_one() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({"command": "false", "mode": "verify"}),
+        )
+        .await;
+
+        assert!(
+            result.is_error,
+            "verify mode requires exit zero: {result:?}"
+        );
+        assert!(result.metadata.as_ref().is_none_or(|fields| {
+            !fields
+                .get(crate::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+                .is_some_and(
+                    crate::workspace_observation::is_explicit_workspace_verification_receipt,
+                )
+        }));
+    }
+
+    #[test]
+    fn started_core_bash_without_settled_ownership_quarantines_before_delayed_daemon_write() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let delayed_root = workspace.path().to_path_buf();
+        let delayed_daemon = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            std::fs::write(delayed_root.join("core-daemon-late.txt"), "late")
+                .expect("delayed daemon write");
+        });
+
+        finalize_bash_scope_quarantine(
+            workspace.path(),
+            true,
+            false,
+            None,
+            "setsid sh -c 'write later'",
+        );
+
+        assert_eq!(
+            crate::workspace_observation::workspace_ownership_is_unsettled(workspace.path()),
+            Some(true),
+            "a trusted started marker with no settled owner must quarantine even without an immediate delta"
+        );
+        delayed_daemon.join().expect("delayed daemon");
+        assert!(
+            crate::workspace_observation::WorkspaceFingerprint::capture(workspace.path()).is_none(),
+            "the daemon's delayed write cannot be attributed to a later core invocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_timeout_keeps_partial_workspace_receipt_when_scope_settles() {
+        let dir = tempdir().unwrap();
+        let scope_guaranteed = astra_sandbox::apply_process_scope().ownership_guaranteed();
+        let expected_ownership = if scope_guaranteed {
+            Some(crate::workspace_observation::INVOCATION_CGROUP_OWNERSHIP)
+        } else if cfg!(unix) {
+            Some(crate::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP)
+        } else {
+            None
+        };
+        let ctx = crate::ToolContext::test(dir.path());
+
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({
+                "command": "printf x > partial.txt; sleep 5",
+                "timeout": 0.2
+            }),
+        )
+        .await;
+
+        assert!(result.is_error, "timed out bash should remain an error");
+        assert!(dir.path().join("partial.txt").is_file());
+        let fields = result.metadata.as_ref();
+        assert_eq!(
+            fields
+                .and_then(|fields| fields.get(crate::workspace_observation::OBSERVED_FIELD))
+                .and_then(serde_json::Value::as_bool),
+            expected_ownership.map(|_| true),
+            "partial mutation receipt must be published only after settled ownership"
+        );
+        assert_eq!(
+            fields
+                .and_then(|fields| fields.get(crate::workspace_observation::OWNERSHIP_FIELD))
+                .and_then(serde_json::Value::as_str),
+            expected_ownership,
+        );
+        if expected_ownership
+            == Some(crate::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP)
+        {
+            assert_eq!(
+                crate::workspace_observation::workspace_observation_is_quarantined(dir.path()),
+                Some(true),
+                "weak current-chain receipt must be published before future captures are quarantined"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn bash_cancellation_keeps_partial_output() {
         let dir = tempdir().unwrap();
         let token = Arc::new(CancellationToken::new());
@@ -5538,6 +6782,60 @@ printf 'probe.txt:1:needle\n'
         assert_eq!(
             result.exit_semantics,
             Some(crate::exit_semantics::ExitSemantics::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_cancellation_keeps_partial_workspace_receipt_when_scope_settles() {
+        let dir = tempdir().unwrap();
+        let scope_guaranteed = astra_sandbox::apply_process_scope().ownership_guaranteed();
+        let expected_ownership = if scope_guaranteed {
+            Some(crate::workspace_observation::INVOCATION_CGROUP_OWNERSHIP)
+        } else if cfg!(unix) {
+            Some(crate::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP)
+        } else {
+            None
+        };
+        let token = Arc::new(CancellationToken::new());
+        let trigger = token.clone();
+        let marker = dir.path().join("cancelled.txt");
+        let marker_for_trigger = marker.clone();
+        tokio::spawn(async move {
+            for _ in 0..200 {
+                if marker_for_trigger.exists() {
+                    trigger.cancel();
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            trigger.cancel();
+        });
+
+        let mut ctx = crate::ToolContext::test(dir.path());
+        ctx.cancel_token = Some(token);
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({
+                "command": "printf x > cancelled.txt; sleep 5"
+            }),
+        )
+        .await;
+
+        assert!(result.is_error, "cancelled bash should remain an error");
+        assert!(marker.is_file());
+        let fields = result.metadata.as_ref();
+        assert_eq!(
+            fields
+                .and_then(|fields| fields.get(crate::workspace_observation::OBSERVED_FIELD))
+                .and_then(serde_json::Value::as_bool),
+            expected_ownership.map(|_| true),
+            "partial cancellation receipt must be published only after settled ownership"
+        );
+        assert_eq!(
+            fields
+                .and_then(|fields| fields.get(crate::workspace_observation::OWNERSHIP_FIELD))
+                .and_then(serde_json::Value::as_str),
+            expected_ownership,
         );
     }
 
@@ -5951,27 +7249,25 @@ printf 'probe.txt:1:needle\n'
         let (slot, listener) = crate::detach::new_slot_with_handle();
         ctx.detach_shell_handle = Some(slot);
 
-        // Long-running command — gives the test a window to fire
-        // the detach signal mid-stream. printf+sleep produces some
-        // bytes the runner consumes before signal so we can verify
-        // partial-output capture.
+        // Long-running pure sleep gives the test a window to fire the
+        // detach signal. Commands with shell control or filesystem
+        // effects deliberately stay foreground so the executor can own
+        // their post-execution workspace receipt.
         let bash_fut = tokio::spawn({
             let ctx = ctx.clone();
             async move {
                 execute_bash(
                     &ctx,
                     &serde_json::json!({
-                        "command": "printf 'before\\n'; sleep 1; printf 'after\\n'"
+                        "command": "sleep 1"
                     }),
                 )
                 .await
             }
         });
 
-        // Wait for the runner to consume the initial 'before' bytes
-        // and reach its idle-poll branch where the detach select is
-        // armed. 200ms is comfortably more than the 25ms tick
-        // without entering the post-sleep `after` window.
+        // Wait for the runner to reach its idle-poll branch where the
+        // detach select is armed.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         listener.signal_tx.send(true).expect("detach signal send");
 
@@ -5979,15 +7275,7 @@ printf 'probe.txt:1:needle\n'
             .payload_rx
             .await
             .expect("listener must receive detached payload");
-        assert_eq!(
-            payload.command,
-            "printf 'before\\n'; sleep 1; printf 'after\\n'"
-        );
-        assert!(
-            payload.partial_stdout.contains("before"),
-            "partial stdout must include the bytes consumed before detach: {:?}",
-            payload.partial_stdout
-        );
+        assert_eq!(payload.command, "sleep 1");
         payload
             .adoption_tx
             .send(Ok("bg-shell-test".into()))
@@ -6073,7 +7361,7 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
-    async fn bash_detach_signal_wins_for_noisy_output() {
+    async fn bash_detach_signal_wins_for_long_running_builtin() {
         let dir = tempdir().unwrap();
         let mut ctx = crate::ToolContext::test(dir.path());
         let (slot, listener) = crate::detach::new_slot_with_handle();
@@ -6085,7 +7373,7 @@ printf 'probe.txt:1:needle\n'
                 execute_bash(
                     &ctx,
                     &serde_json::json!({
-                        "command": "i=0; while true; do printf 'line-%s\\n' \"$i\"; i=$((i+1)); done"
+                        "command": "sleep 1"
                     }),
                 )
                 .await
@@ -6109,10 +7397,6 @@ printf 'probe.txt:1:needle\n'
             .await
             .expect("noisy bash must hand off promptly after Ctrl+B")
             .expect("listener must receive noisy bash payload");
-        assert!(
-            payload.partial_stdout.contains("line-"),
-            "partial stdout should include noisy command output"
-        );
         payload
             .adoption_tx
             .send(Ok("bg-shell-noisy".into()))
@@ -6131,6 +7415,132 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
+    async fn unsafe_bash_with_detach_slot_stays_foreground_and_emits_receipt() {
+        let dir = tempdir().unwrap();
+        let ownership_guaranteed = astra_sandbox::apply_process_scope().ownership_guaranteed();
+        let expected_ownership = if ownership_guaranteed {
+            Some(crate::workspace_observation::INVOCATION_CGROUP_OWNERSHIP)
+        } else if cfg!(unix) {
+            Some(crate::workspace_observation::FOREGROUND_PROCESS_GROUP_OWNERSHIP)
+        } else {
+            None
+        };
+        let mut ctx = crate::ToolContext::test(dir.path());
+        let (slot, listener) = crate::detach::new_slot_with_handle();
+        ctx.detach_shell_handle = Some(slot);
+
+        // The presence of a detach slot must not turn an opaque writer into
+        // an unobserved background process.  It runs to completion under the
+        // normal pre/post fingerprint boundary instead.
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({
+                "command": "printf x > generated.txt; sleep 0.05"
+            }),
+        )
+        .await;
+
+        assert!(!result.output.contains("bash_detached"), "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("generated.txt")).unwrap(),
+            "x"
+        );
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get(crate::workspace_observation::OBSERVED_FIELD))
+                .and_then(serde_json::Value::as_bool),
+            expected_ownership.map(|_| true),
+            "receipt must be issued only when the executor proves process ownership"
+        );
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get(crate::workspace_observation::OWNERSHIP_FIELD))
+                .and_then(serde_json::Value::as_str),
+            expected_ownership,
+        );
+        assert!(
+            !listener.is_active(),
+            "unsafe command must never arm detach"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(detached_bash_environment)]
+    async fn detached_bash_clears_inherited_startup_environment() {
+        let dir = tempdir().unwrap();
+        let marker = dir.path().join("bash-env-marker");
+        let startup = dir.path().join("startup.sh");
+        // BASH_ENV is process-global in this test process.  Other shell
+        // tests run concurrently, so make the probe side-effect conditional
+        // on this invocation's unique workspace instead of letting unrelated
+        // children write our marker while the variable is temporarily set.
+        std::fs::write(
+            &startup,
+            format!(
+                "if [ \"$PWD\" = \"{}\" ]; then printf sourced > {}; fi\n",
+                dir.path().display(),
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let previous = std::env::var_os("BASH_ENV");
+        // Rust 2024 marks process-environment mutation unsafe. The test is
+        // serialized because BASH_ENV is process-global; production code
+        // only clears the child command's environment.
+        unsafe { std::env::set_var("BASH_ENV", &startup) };
+
+        let mut ctx = crate::ToolContext::test(dir.path());
+        let (slot, listener) = crate::detach::new_slot_with_handle();
+        ctx.detach_shell_handle = Some(slot);
+        let bash_fut = tokio::spawn({
+            let ctx = ctx.clone();
+            async move {
+                execute_bash(
+                    &ctx,
+                    &serde_json::json!({
+                        "command": "sleep 1"
+                    }),
+                )
+                .await
+            }
+        });
+        for _ in 0..50 {
+            if listener.is_active() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(listener.is_active(), "detach listener should become active");
+        listener.signal_tx.send(true).expect("detach signal send");
+        let payload = tokio::time::timeout(Duration::from_secs(1), listener.payload_rx)
+            .await
+            .expect("detached command should hand off")
+            .expect("detach payload");
+        payload
+            .adoption_tx
+            .send(Ok("bg-env-test".into()))
+            .expect("ack adoption");
+        let result = tokio::time::timeout(Duration::from_secs(1), bash_fut)
+            .await
+            .expect("bash result timeout")
+            .expect("bash task");
+        assert!(result.output.contains("bash_detached"), "{result:?}");
+        assert!(
+            !marker.exists(),
+            "detached bash must not source inherited BASH_ENV"
+        );
+
+        match previous {
+            Some(value) => unsafe { std::env::set_var("BASH_ENV", value) },
+            None => unsafe { std::env::remove_var("BASH_ENV") },
+        }
+    }
+
+    #[tokio::test]
     async fn bash_detach_without_payload_channel_kills_child_and_errors() {
         let dir = tempdir().unwrap();
         let mut ctx = crate::ToolContext::test(dir.path());
@@ -6145,7 +7555,7 @@ printf 'probe.txt:1:needle\n'
                 execute_bash(
                     &ctx,
                     &serde_json::json!({
-                        "command": "printf 'before\\n'; sleep 30; printf 'after\\n'"
+                        "command": "sleep 30"
                     }),
                 )
                 .await
@@ -6184,7 +7594,7 @@ printf 'probe.txt:1:needle\n'
                 execute_bash(
                     &ctx,
                     &serde_json::json!({
-                        "command": "printf 'before\\n'; sleep 30; printf 'after\\n'"
+                        "command": "sleep 30"
                     }),
                 )
                 .await
@@ -6221,7 +7631,7 @@ printf 'probe.txt:1:needle\n'
                 execute_bash(
                     &ctx,
                     &serde_json::json!({
-                        "command": "printf 'before\\n'; sleep 30; printf 'after\\n'"
+                        "command": "sleep 30"
                     }),
                 )
                 .await
@@ -6254,7 +7664,7 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
-    async fn bash_detach_after_stdout_eof_still_hands_off_child() {
+    async fn bash_detach_after_no_output_still_hands_off_child() {
         let dir = tempdir().unwrap();
         let mut ctx = crate::ToolContext::test(dir.path());
         let (slot, listener) = crate::detach::new_slot_with_handle();
@@ -6266,7 +7676,7 @@ printf 'probe.txt:1:needle\n'
                 execute_bash(
                     &ctx,
                     &serde_json::json!({
-                        "command": "exec 1>&-; sleep 30"
+                        "command": "sleep 30"
                     }),
                 )
                 .await
@@ -6278,9 +7688,9 @@ printf 'probe.txt:1:needle\n'
 
         let payload = tokio::time::timeout(Duration::from_secs(1), listener.payload_rx)
             .await
-            .expect("stdout-closed bash must still hand off promptly")
-            .expect("listener must receive payload for stdout-closed bash");
-        assert_eq!(payload.command, "exec 1>&-; sleep 30");
+            .expect("silent bash must still hand off promptly")
+            .expect("listener must receive payload for silent bash");
+        assert_eq!(payload.command, "sleep 30");
         payload
             .adoption_tx
             .send(Ok("bg-shell-stdout-eof".into()))
@@ -6319,7 +7729,7 @@ printf 'probe.txt:1:needle\n'
                 execute_bash(
                     &ctx,
                     &serde_json::json!({
-                        "command": "printf 'before-second\\n'; sleep 1; printf 'after-second\\n'"
+                        "command": "sleep 1"
                     }),
                 )
                 .await
@@ -6332,11 +7742,6 @@ printf 'probe.txt:1:needle\n'
             .payload_rx
             .await
             .expect("listener must receive second bash payload");
-        assert!(
-            payload.partial_stdout.contains("before-second"),
-            "second bash must still observe Ctrl+B after first normal completion: {:?}",
-            payload.partial_stdout
-        );
         payload
             .adoption_tx
             .send(Ok("bg-shell-second".into()))
@@ -6399,19 +7804,146 @@ printf 'probe.txt:1:needle\n'
 
     // ── background process warning ────────────────────────────────────────────
 
+    #[test]
+    fn background_operator_excludes_shell_redirections() {
+        for command in [
+            "cargo test 2>&1",
+            "cargo test >&2",
+            "cargo test &>/tmp/test.log",
+            "cargo test 2>>/tmp/test.log",
+            "producer |& consumer",
+            "first && second",
+            "echo '&'",
+        ] {
+            assert!(
+                !command_has_background_operator(command),
+                "redirection/control syntax is not a background child: {command}"
+            );
+        }
+        for command in ["first & second", "worker&", "worker & > /tmp/shell.log"] {
+            assert!(
+                command_has_background_operator(command),
+                "real process backgrounding must remain detected: {command}"
+            );
+        }
+    }
+
     #[tokio::test]
-    async fn bash_background_process_appends_warning() {
+    async fn bash_live_background_process_appends_warning() {
         let dir = tempdir().unwrap();
         let ctx = crate::ToolContext::test(dir.path());
         let result = execute_bash(
             &ctx,
-            &serde_json::json!({"command": "echo started & echo done"}),
+            &serde_json::json!({"command": "sleep 60 & echo done"}),
         )
         .await;
         assert!(
-            result.output.to_lowercase().contains("background"),
-            "expected background process warning, got: {}",
+            result.output.contains("were terminated"),
+            "expected actual descendant-settlement warning, got: {}",
             result.output
+        );
+        let metadata = result.metadata.expect("typed descendant settlement");
+        assert_eq!(metadata["background_children_reaped"], true);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn bash_self_daemon_reports_actual_reaping_without_background_syntax() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        let command =
+            "python3 -c 'import os,time; p=os.fork(); os._exit(0) if p else time.sleep(60)'";
+        assert!(!command_has_background_operator(command));
+
+        let result = execute_bash(&ctx, &serde_json::json!({"command": command})).await;
+
+        assert!(!result.is_error, "{}", result.output);
+        assert!(
+            result.output.contains("daemonize themselves"),
+            "{}",
+            result.output
+        );
+        let metadata = result.metadata.expect("typed descendant settlement");
+        assert_eq!(metadata["background_children_reaped"], true);
+        assert_eq!(metadata["descendant_persistence"], false);
+    }
+
+    #[tokio::test]
+    async fn bash_joined_background_work_does_not_report_reaping() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        let result = execute_bash(
+            &ctx,
+            &serde_json::json!({"command": "sleep 0.02 & wait; echo done"}),
+        )
+        .await;
+
+        assert!(!result.is_error, "{}", result.output);
+        assert!(result.output.contains("done"), "{}", result.output);
+        assert!(
+            !result.output.contains("were terminated"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result
+                .metadata
+                .as_ref()
+                .is_none_or(|metadata| !metadata.contains_key("background_children_reaped"))
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn parallel_bash_invocations_do_not_cross_contaminate_reaping_receipts() {
+        let daemon_dir = tempdir().unwrap();
+        let bounded_dir = tempdir().unwrap();
+        let daemon_ctx = crate::ToolContext::test(daemon_dir.path());
+        let bounded_ctx = crate::ToolContext::test(bounded_dir.path());
+        let daemon_args = serde_json::json!({
+            "command": "python3 -c 'import os,time; p=os.fork(); os._exit(0) if p else time.sleep(60)'"
+        });
+        let bounded_args = serde_json::json!({"command": "sleep 0.05; echo bounded"});
+        let daemon = execute_bash(&daemon_ctx, &daemon_args);
+        let bounded = execute_bash(&bounded_ctx, &bounded_args);
+
+        let (daemon, bounded) = tokio::join!(daemon, bounded);
+        assert_eq!(
+            daemon
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata["background_children_reaped"].as_bool()),
+            Some(true)
+        );
+        assert!(bounded.output.contains("bounded"), "{}", bounded.output);
+        assert!(
+            bounded
+                .metadata
+                .as_ref()
+                .is_none_or(|metadata| !metadata.contains_key("background_children_reaped"))
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn bash_background_child_cannot_write_after_leader_completion() {
+        let dir = tempdir().unwrap();
+        let ctx = crate::ToolContext::test(dir.path());
+        let marker = dir.path().join("late-marker");
+        let command = format!(
+            "(sleep 1; printf late > '{}') & echo started",
+            marker.display()
+        );
+        let result = execute_bash(&ctx, &serde_json::json!({"command": command})).await;
+        assert!(
+            result.output.contains("started"),
+            "leader output: {}",
+            result.output
+        );
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert!(
+            !marker.exists(),
+            "background child survived leader completion and wrote after the lease closed"
         );
     }
 

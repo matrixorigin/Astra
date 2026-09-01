@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
 use unicode_normalization::UnicodeNormalization;
 
 /// Canonical form for agent identity comparison.
@@ -51,7 +51,8 @@ use astra_services::delegated_findings::{
     truncate_chars,
 };
 use astra_services::runs::{
-    DurableRunStatusKind, durable_run_status_kind, durable_run_status_to_subrun_state,
+    DurableRunStatusKind, RequestedTurnInteractionMode, durable_run_status_kind,
+    durable_run_status_to_subrun_state,
 };
 use astra_services::{AdmittedModelExecution, BubbleUpTarget, DatabaseStateProjectionStore};
 
@@ -61,7 +62,7 @@ use astra_core::{
     STATUS_PAUSED, STATUS_RUNNING, STATUS_VERIFICATION_FAILED, STATUS_WAITING,
 };
 
-use crate::server::run::engine::RunEngine;
+use crate::server::run::engine::{RunEngine, RunExecutionAuthority};
 use astra_messaging::router::AgentMailboxRouter;
 use astra_prompts::team_prompts;
 
@@ -357,6 +358,30 @@ fn durable_status_for_agent_result(status: &str) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DurableLifecycleDisposition {
+    /// The executor owns all generation-fenced durable writes. The scheduler
+    /// may only reread the winning fact, including on timeout/panic paths.
+    ExecutorOwned { owner_generation: u64 },
+    /// No exact execution authority survived (for example an uncorrelated
+    /// panic projection). Fail closed by rereading only.
+    ReadOnly,
+    /// A quiescent scheduler-owned executor produced this result. The
+    /// scheduler may commit it only with the exact admission generation.
+    SchedulerOwned { owner_generation: u64 },
+}
+
+fn durable_lifecycle_disposition(
+    executor: &dyn SubRunExecutor,
+    owner_generation: u64,
+) -> DurableLifecycleDisposition {
+    if executor.owns_durable_run_lifecycle() {
+        DurableLifecycleDisposition::ExecutorOwned { owner_generation }
+    } else {
+        DurableLifecycleDisposition::SchedulerOwned { owner_generation }
+    }
+}
+
 /// Commit an executor result and return the outcome permitted by durable
 /// authority. A pause/cancel/terminal CAS winner must shape the result returned
 /// to the parent; otherwise the database, tracker, and aggregation can report
@@ -364,23 +389,47 @@ fn durable_status_for_agent_result(status: &str) -> &'static str {
 async fn reconcile_agent_result_with_durable_authority(
     run_engine: &RunEngine,
     user_id: &str,
+    expected_session_id: &str,
+    disposition: DurableLifecycleDisposition,
     mut result: AgentResult,
 ) -> AgentResult {
     let attempted_status = durable_status_for_agent_result(&result.status);
-    let persistence = run_engine
-        .persist_delegation_outcome_status(
-            user_id,
-            &result.run_id,
-            attempted_status,
-            None,
-            result.error.as_deref(),
-        )
-        .await;
+    let persistence = match disposition {
+        DurableLifecycleDisposition::ExecutorOwned { .. }
+        | DurableLifecycleDisposition::ReadOnly => {
+            // The executor already committed with its exact owner generation.
+            // A second outer write would allow a stale executor to overwrite
+            // the owner that recovered an expired lease.
+            Ok(false)
+        }
+        DurableLifecycleDisposition::SchedulerOwned { owner_generation } => {
+            run_engine
+                .persist_delegation_outcome_status_if_current_owner(
+                    user_id,
+                    expected_session_id,
+                    &result.run_id,
+                    owner_generation,
+                    attempted_status,
+                    None,
+                    result.error.as_deref(),
+                )
+                .await
+        }
+    };
     if matches!(persistence, Ok(true)) {
         return result;
     }
 
     let persistence_detail = match &persistence {
+        Ok(false)
+            if matches!(
+                disposition,
+                DurableLifecycleDisposition::ExecutorOwned { .. }
+                    | DurableLifecycleDisposition::ReadOnly
+            ) =>
+        {
+            "executor-owned durable lifecycle requires authoritative reread".to_string()
+        }
         Ok(false) => "outcome lost its durable status compare-and-set".to_string(),
         Err(error) => format!("could not commit delegated outcome: {error}"),
         Ok(true) => unreachable!(),
@@ -408,9 +457,21 @@ async fn reconcile_agent_result_with_durable_authority(
     };
 
     // A replay can lose its CAS because the exact same terminal fact is
-    // already durable. Preserve the richer executor taxonomy/output in that
-    // idempotent case; no competing authority disagrees with it.
-    if durable.status == attempted_status {
+    // already durable. Status equality alone is insufficient: a recovered
+    // generation can independently reach the same terminal status with a
+    // different output. Preserve local output only when the durable winner is
+    // the exact execution generation that produced it. Read-only projections
+    // carry no such proof and therefore never retain local output.
+    let expected_owner_generation = match disposition {
+        DurableLifecycleDisposition::ExecutorOwned { owner_generation }
+        | DurableLifecycleDisposition::SchedulerOwned { owner_generation } => {
+            Some(owner_generation)
+        }
+        DurableLifecycleDisposition::ReadOnly => None,
+    };
+    if durable.status == attempted_status
+        && expected_owner_generation == Some(durable.run_generation)
+    {
         return result;
     }
 
@@ -423,6 +484,9 @@ async fn reconcile_agent_result_with_durable_authority(
         "replaced stale delegated executor outcome with durable authority"
     );
     result.output = None;
+    result.prompt_tokens = durable.total_prompt_tokens;
+    result.completion_tokens = durable.total_completion_tokens;
+    result.tool_calls = durable.total_tool_calls;
     match durable_run_status_kind(&durable.status) {
         DurableRunStatusKind::Running => {
             // `running` is not a terminal AgentResult. Project it as a
@@ -459,6 +523,8 @@ async fn reconcile_agent_result_with_durable_authority(
 async fn reconcile_after_parent_cancellation_bounded(
     run_engine: &RunEngine,
     user_id: &str,
+    expected_session_id: &str,
+    disposition: DurableLifecycleDisposition,
     result: AgentResult,
     deadline: &mut Option<tokio::time::Instant>,
     scope: &'static str,
@@ -468,7 +534,13 @@ async fn reconcile_after_parent_cancellation_bounded(
     let result = await_with_shared_deadline(
         deadline,
         DELEGATION_RECONCILIATION_TIMEOUT,
-        reconcile_agent_result_with_durable_authority(run_engine, user_id, result),
+        reconcile_agent_result_with_durable_authority(
+            run_engine,
+            user_id,
+            expected_session_id,
+            disposition,
+            result,
+        ),
     )
     .await;
     match result {
@@ -674,6 +746,96 @@ async fn bubble_up_critical_finding_from_tracker(
 
 // ─── Sub-run Executor Trait ─────────────────────────────────────────────────
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecutionOwnerGenerationPublication {
+    Preparing { expected_initial_generation: u64 },
+    Acquired(u64),
+    StoppedBeforeAcquisition { expected_initial_generation: u64 },
+}
+
+/// Local handoff between dynamic-child durable start and cancellation.
+/// Cancellation aborts the executor before awaiting durability, so it must be
+/// able to distinguish "not published yet" from "no row can still be
+/// created" without guessing from a run id.
+pub struct ExecutionOwnerGenerationSink {
+    state: watch::Sender<ExecutionOwnerGenerationPublication>,
+    #[cfg(test)]
+    wait_after_preparing_hook:
+        std::sync::Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
+}
+
+impl ExecutionOwnerGenerationSink {
+    pub fn preparing(expected_initial_generation: u64) -> Self {
+        let (state, _) = watch::channel(ExecutionOwnerGenerationPublication::Preparing {
+            expected_initial_generation,
+        });
+        Self {
+            state,
+            #[cfg(test)]
+            wait_after_preparing_hook: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn publish(&self, generation: u64) {
+        self.state
+            .send_replace(ExecutionOwnerGenerationPublication::Acquired(generation));
+    }
+
+    pub fn guard(self: &Arc<Self>) -> ExecutionOwnerGenerationGuard {
+        ExecutionOwnerGenerationGuard {
+            sink: Arc::clone(self),
+        }
+    }
+
+    pub async fn wait_until_published_or_stopped(&self) -> ExecutionOwnerGenerationPublication {
+        let mut observed = self.state.subscribe();
+        loop {
+            let state = *observed.borrow_and_update();
+            if !matches!(state, ExecutionOwnerGenerationPublication::Preparing { .. }) {
+                return state;
+            }
+            #[cfg(test)]
+            let wait_hook = self
+                .wait_after_preparing_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            #[cfg(test)]
+            if let Some((preparing_observed, release_wait)) = wait_hook {
+                preparing_observed.notify_one();
+                release_wait.notified().await;
+            }
+            // watch versions the publication even when publish/guard drop
+            // races exactly after the Preparing read and before this await.
+            observed
+                .changed()
+                .await
+                .expect("generation sink retains its publication sender");
+        }
+    }
+}
+
+pub struct ExecutionOwnerGenerationGuard {
+    sink: Arc<ExecutionOwnerGenerationSink>,
+}
+
+impl Drop for ExecutionOwnerGenerationGuard {
+    fn drop(&mut self) {
+        self.sink.state.send_if_modified(|state| {
+            let ExecutionOwnerGenerationPublication::Preparing {
+                expected_initial_generation,
+            } = *state
+            else {
+                return false;
+            };
+            *state = ExecutionOwnerGenerationPublication::StoppedBeforeAcquisition {
+                expected_initial_generation,
+            };
+            true
+        });
+    }
+}
+
 /// Configuration for a sub-run spawned by delegation.
 pub struct SubRunConfig {
     /// Unique ID for this sub-run.
@@ -690,6 +852,15 @@ pub struct SubRunConfig {
     pub session_id: String,
     /// User ID owning the delegation.
     pub user_id: String,
+    /// Exact durable execution-owner epoch returned when this child row was
+    /// created. `None` is valid only when the executor itself will create the
+    /// row; an already-existing durable child must carry matching authority.
+    pub execution_owner_generation: Option<u64>,
+    /// Optional process-local observer for the exact durable generation
+    /// acquired by this executor. Dynamic-agent cancellation uses it to fence
+    /// runtime-owned durable intent; user lineage cancellation does not need
+    /// generation authority.
+    pub execution_owner_generation_sink: Option<Arc<ExecutionOwnerGenerationSink>>,
     /// Optional output from previous pipeline stage.
     pub previous_output: Option<String>,
     /// Context key-value pairs from the delegation request.
@@ -699,12 +870,20 @@ pub struct SubRunConfig {
     /// Short-lived execution material inherited from the admitted parent run.
     /// It is sideband state and is never serialized into delegation context.
     pub admitted_model_execution: Option<AdmittedModelExecution>,
+    /// Effective interaction policy for this exact child invocation. It is
+    /// resolved once from the durable parent and carried on the run config so
+    /// executors, retries, and descendants cannot invent a new default.
+    pub interaction_mode: RequestedTurnInteractionMode,
     /// Request-scoped capability constraints inherited from the parent runtime request.
     pub request_constraints: RequestConstraints,
     /// Current nested agent/sub-run depth for the child loop.
     pub recursion_depth: u8,
     /// Optional explicit turn budget for the child loop.
     pub max_turns: Option<u32>,
+    /// Optional initial adaptive slice. When `max_turns` is absent this value
+    /// is only a convergence checkpoint and can renew up to the runtime
+    /// ceiling while concrete progress continues.
+    pub initial_turns: Option<u32>,
     /// Cooperative pause flag — checked between turns by the sub-run loop.
     /// When set to `true`, the sub-run should yield with status "paused".
     pub pause_flag: Option<Arc<AtomicBool>>,
@@ -733,11 +912,52 @@ pub struct SubRunConfig {
     /// `AgenticLoopState` inherits this so subsequent delegations
     /// from the child can detect cycles like A→B→C→A.
     pub delegation_chain: Vec<String>,
+    /// Exact canonical WorkItem revision assigned to this run. It remains a
+    /// typed sideband value and is validated before durable run creation.
+    pub work_item: Option<astra_turn_core::orchestration_spawn_tool::WorkItemExecutionSpec>,
     /// Parent session's harness snapshot sink for observe-only sub-run
     /// observation. When set, the sub-run creates a sink-only HarnessSlot
     /// so sub-run snapshots appear in the parent's history.
     #[cfg(feature = "harness")]
     pub harness_sink: Option<Arc<dyn astra_harness::SnapshotSink>>,
+}
+
+impl SubRunConfig {
+    /// Bind the exact authority returned by durable child admission into the
+    /// configuration that will construct the child loop. A durable executor
+    /// may never reconstruct this capability from the current database row,
+    /// while a process-local executor may not consume a durable capability.
+    pub(crate) fn bind_execution_authority(
+        &mut self,
+        durable_executor: bool,
+        authority: Option<RunExecutionAuthority>,
+    ) -> Result<(), String> {
+        match (durable_executor, authority) {
+            (true, Some(authority)) => {
+                if let Some(expected) = self.execution_owner_generation
+                    && expected != authority.owner_generation
+                {
+                    return Err(format!(
+                        "durable sub-run execution authority changed during admission: expected generation {expected}, admitted generation {}",
+                        authority.owner_generation
+                    ));
+                }
+                self.execution_owner_generation = Some(authority.owner_generation);
+                Ok(())
+            }
+            (true, None) => {
+                Err("durable sub-run admission returned no execution authority".to_string())
+            }
+            (false, Some(_)) => Err(
+                "process-local sub-run executor received durable execution authority".to_string(),
+            ),
+            (false, None) if self.execution_owner_generation.is_some() => Err(
+                "process-local sub-run executor cannot consume durable execution authority"
+                    .to_string(),
+            ),
+            (false, None) => Ok(()),
+        }
+    }
 }
 
 impl std::fmt::Debug for SubRunConfig {
@@ -748,15 +968,21 @@ impl std::fmt::Debug for SubRunConfig {
             .field("task", &self.task)
             .field("session_id", &self.session_id)
             .field("user_id", &self.user_id)
+            .field(
+                "execution_owner_generation",
+                &self.execution_owner_generation,
+            )
             .field("previous_output", &self.previous_output)
             .field("forward_headers", &!self.forward_headers.is_empty())
             .field(
                 "admitted_model_execution",
                 &self.admitted_model_execution.is_some(),
             )
+            .field("interaction_mode", &self.interaction_mode)
             .field("request_constraints", &self.request_constraints)
             .field("recursion_depth", &self.recursion_depth)
             .field("max_turns", &self.max_turns)
+            .field("initial_turns", &self.initial_turns)
             .field("pause_flag", &self.pause_flag.is_some())
             .field("checkpoint_gate", &self.checkpoint_gate.is_some())
             .field("mailbox", &self.mailbox.is_some())
@@ -774,6 +1000,13 @@ impl std::fmt::Debug for SubRunConfig {
 pub trait SubRunExecutor: Send + Sync {
     /// Execute a sub-run and return the result.
     async fn execute(&self, config: SubRunConfig) -> Result<AgentResult, String>;
+
+    /// True when the executor itself owns generation-fenced durable lifecycle
+    /// commits. Schedulers must then reconcile by rereading durable authority,
+    /// never by issuing a second un-fenced status write.
+    fn owns_durable_run_lifecycle(&self) -> bool {
+        false
+    }
 }
 
 /// No-op executor that immediately returns "completed" results.
@@ -1199,6 +1432,19 @@ impl DelegationTracker {
 
     /// Record a sub-run spawned by a delegation, persisting to journal if configured.
     pub async fn record_sub_run(&self, record: SubRunRecord) {
+        self.record_sub_run_with_progress(record, true).await;
+    }
+
+    /// Record durable lineage while keeping lifecycle publication under the
+    /// producer that actually owns the spawn.
+    ///
+    /// `DynamicAgentSpawner` registers mailboxes through `DelegationLookup`
+    /// and then publishes a richer spawn event containing the exact agent
+    /// type and fanout slot. Letting this bookkeeping callback publish too
+    /// creates two conflicting `agent_spawned` rows for one child. Native
+    /// delegation callers continue to use `record_sub_run`, which remains the
+    /// lifecycle owner for that path.
+    async fn record_sub_run_with_progress(&self, record: SubRunRecord, publish_progress: bool) {
         let run_id = record.run_id.clone();
         let parent_id = record.parent_run_id.clone();
         let delegation_id = record.delegation_id.clone();
@@ -1229,7 +1475,7 @@ impl DelegationTracker {
         drop(state);
 
         // Emit SSE event for web clients
-        if let Some(ref broadcaster) = self.progress_broadcaster {
+        if publish_progress && let Some(ref broadcaster) = self.progress_broadcaster {
             use crate::orchestration::{AgentProgressEvent, ProgressEventType};
             broadcaster.emit(AgentProgressEvent {
                 agent_id: agent_id.clone(),
@@ -1737,7 +1983,9 @@ impl DelegationTracker {
             // Emit completion SSE event for web clients
             if emit_completion_event {
                 if let Some(ref broadcaster) = self.progress_broadcaster {
-                    use crate::orchestration::{AgentProgressEvent, ProgressEventType};
+                    use crate::orchestration::{
+                        AgentProgressEvent, CancellationOrigin, ProgressEventType,
+                    };
                     // Canonical wire string — `as_str()` is what every other
                     // SSE/JSON site uses (line 1096 above, and the trace
                     // emitters). Using `{:?}` here leaked Rust enum casing
@@ -1766,6 +2014,7 @@ impl DelegationTracker {
                         },
                         SubRunState::Cancelled => ProgressEventType::Cancelled {
                             reason: format!("Sub-run {} cancelled", run_id),
+                            origin: CancellationOrigin::Unverified,
                         },
                         _ => ProgressEventType::Failed {
                             error: format!("Sub-run terminal state: {}", status_str),
@@ -1921,15 +2170,18 @@ impl astra_messaging::DelegationLookup for DelegationTracker {
         self.get_depth(run_id).await
     }
     async fn record_sub_run(&self, info: astra_messaging::SubRunInfo) {
-        self.record_sub_run(SubRunRecord {
-            run_id: info.run_id,
-            parent_run_id: info.parent_run_id,
-            delegation_id: info.delegation_id,
-            agent_id: info.agent_id,
-            depth: info.depth,
-            state: SubRunState::Created,
-            retry_of: None,
-        })
+        self.record_sub_run_with_progress(
+            SubRunRecord {
+                run_id: info.run_id,
+                parent_run_id: info.parent_run_id,
+                delegation_id: info.delegation_id,
+                agent_id: info.agent_id,
+                depth: info.depth,
+                state: SubRunState::Created,
+                retry_of: None,
+            },
+            false,
+        )
         .await;
     }
 }
@@ -1989,6 +2241,35 @@ impl DelegationEngine {
         );
         context.remove(Self::SESSION_ID_CONTEXT_KEY);
         context
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn start_delegated_run(
+        &self,
+        run_id: &str,
+        user_id: &str,
+        session_id: &str,
+        parent_run_id: &str,
+        delegation_id: &str,
+        agent_id: &str,
+        retry_of: Option<&str>,
+        interaction_mode: RequestedTurnInteractionMode,
+    ) -> Result<RunExecutionAuthority, String> {
+        self.run_engine
+            .start_run_ext_with_context(
+                run_id,
+                user_id,
+                session_id,
+                Some(parent_run_id),
+                Some(delegation_id),
+                Some(agent_id),
+                retry_of,
+                crate::server::run::engine::RunStartContext {
+                    interaction_mode,
+                    ..Default::default()
+                },
+            )
+            .await
     }
 
     pub fn new(
@@ -2276,6 +2557,7 @@ impl DelegationEngine {
     async fn apply_gate(
         &self,
         user_id: &str,
+        expected_session_id: &str,
         result: AgentResult,
         delegation_id: &str,
         parent_run_id: &str,
@@ -2303,7 +2585,12 @@ impl DelegationEngine {
                     // Persist retry count to durable store for crash recovery
                     astra_core::log_persist!(
                         self.run_engine
-                            .persist_retry_count(user_id, &current.run_id, attempt)
+                            .persist_retry_count(
+                                user_id,
+                                expected_session_id,
+                                &current.run_id,
+                                attempt,
+                            )
                             .await,
                         "delegation",
                         &current.run_id,
@@ -2315,6 +2602,7 @@ impl DelegationEngine {
                         self.run_engine
                             .append_event(
                                 user_id,
+                                expected_session_id,
                                 &current.run_id,
                                 serde_json::json!({
                                     "event_type": "verification_gate_failed",
@@ -2387,22 +2675,32 @@ impl DelegationEngine {
                         };
                     }
 
-                    astra_core::log_persist!(
-                        self.run_engine
-                            .start_run_ext(
-                                &retry_run_id,
-                                &retry_config.user_id,
-                                &retry_config.session_id,
-                                Some(parent_run_id),
-                                Some(delegation_id),
-                                Some(&retry_config.agent_profile.agent_id),
-                                Some(&original_run_id),
-                            )
-                            .await,
-                        "delegation",
-                        &retry_run_id,
-                        "start_retry_run"
-                    );
+                    let retry_authority = match self
+                        .start_delegated_run(
+                            &retry_run_id,
+                            &retry_config.user_id,
+                            &retry_config.session_id,
+                            parent_run_id,
+                            delegation_id,
+                            &retry_config.agent_profile.agent_id,
+                            Some(&original_run_id),
+                            retry_config.interaction_mode,
+                        )
+                        .await
+                    {
+                        Ok(authority) => authority,
+                        Err(error) => {
+                            return AgentResult {
+                                status: STATUS_FAILED.to_string(),
+                                error: Some(format!(
+                                    "failed to establish durable verification retry: {error}"
+                                )),
+                                ..current
+                            };
+                        }
+                    };
+                    retry_config.execution_owner_generation =
+                        Some(retry_authority.owner_generation);
 
                     // Record retry sub-run with linkage to original
                     self.tracker
@@ -2461,19 +2759,14 @@ impl DelegationEngine {
                         ),
                     );
 
-                    // Close the original attempt before retrying. The original
-                    // executor success was deliberately not committed yet;
-                    // verification is part of the terminal outcome contract.
-                    let rejected = reconcile_agent_result_with_durable_authority(
-                        &self.run_engine,
-                        user_id,
-                        AgentResult {
-                            status: STATUS_VERIFICATION_FAILED.to_string(),
-                            error: Some(reason.clone()),
-                            ..current.clone()
-                        },
-                    )
-                    .await;
+                    // Verification is a parent-level evaluation fact. The
+                    // physical child execution may already be durably
+                    // completed, so the gate must not rewrite that lifecycle.
+                    let rejected = AgentResult {
+                        status: STATUS_VERIFICATION_FAILED.to_string(),
+                        error: Some(reason.clone()),
+                        ..current.clone()
+                    };
                     let rejected_state = agent_result_status_to_subrun_state(&rejected.status);
                     self.tracker
                         .apply_sub_run_result_state(
@@ -2524,18 +2817,40 @@ impl DelegationEngine {
                     } else {
                         retry_exec.await
                     } {
-                        Ok(result) => current = result,
+                        Ok(result) => {
+                            current = reconcile_agent_result_with_durable_authority(
+                                &self.run_engine,
+                                user_id,
+                                expected_session_id,
+                                durable_lifecycle_disposition(
+                                    self.executor.as_ref(),
+                                    retry_authority.owner_generation,
+                                ),
+                                result,
+                            )
+                            .await;
+                        }
                         Err(e) => {
-                            return AgentResult {
-                                agent_id: retry_agent_id,
-                                run_id: retry_run_id,
-                                status: STATUS_FAILED.to_string(),
-                                error: Some(format!("retry execution failed: {e}")),
-                                output: None,
-                                prompt_tokens: 0,
-                                completion_tokens: 0,
-                                tool_calls: 0,
-                            };
+                            return reconcile_agent_result_with_durable_authority(
+                                &self.run_engine,
+                                user_id,
+                                expected_session_id,
+                                durable_lifecycle_disposition(
+                                    self.executor.as_ref(),
+                                    retry_authority.owner_generation,
+                                ),
+                                AgentResult {
+                                    agent_id: retry_agent_id,
+                                    run_id: retry_run_id,
+                                    status: STATUS_FAILED.to_string(),
+                                    error: Some(format!("retry execution failed: {e}")),
+                                    output: None,
+                                    prompt_tokens: 0,
+                                    completion_tokens: 0,
+                                    tool_calls: 0,
+                                },
+                            )
+                            .await;
                         }
                     }
                 }
@@ -2632,9 +2947,12 @@ impl DelegationEngine {
             )?;
 
         let session_id = Self::session_id_for(&request);
-        self.run_engine
+        let parent_run = self
+            .run_engine
             .require_delegation_parent(&request.user_id, &session_id, &request.parent_run_id)
             .await?;
+        let interaction_mode =
+            crate::server::run::engine::durable_run_effective_interaction_mode(&parent_run);
 
         // Extract pattern name and agent_ids for journal event.
         let (pattern_name, agent_ids_for_journal): (&str, Vec<String>) = match &request.pattern {
@@ -2726,6 +3044,7 @@ impl DelegationEngine {
                     admitted_model_execution.as_ref(),
                     &request_constraints,
                     child_recursion_depth,
+                    interaction_mode,
                     *timeout_sec,
                     cancel_token.as_ref(),
                     live_event_sink.as_ref(),
@@ -2745,6 +3064,7 @@ impl DelegationEngine {
                     admitted_model_execution.as_ref(),
                     &request_constraints,
                     child_recursion_depth,
+                    interaction_mode,
                     *timeout_sec,
                     cancel_token.as_ref(),
                     live_event_sink.as_ref(),
@@ -2764,6 +3084,7 @@ impl DelegationEngine {
                     admitted_model_execution.as_ref(),
                     &request_constraints,
                     child_recursion_depth,
+                    interaction_mode,
                     *timeout_sec,
                     cancel_token.as_ref(),
                     live_event_sink.as_ref(),
@@ -2786,6 +3107,7 @@ impl DelegationEngine {
                     admitted_model_execution.as_ref(),
                     &request_constraints,
                     child_recursion_depth,
+                    interaction_mode,
                     *timeout_sec,
                     cancel_token.as_ref(),
                     live_event_sink.as_ref(),
@@ -2809,6 +3131,7 @@ impl DelegationEngine {
                     admitted_model_execution.as_ref(),
                     &request_constraints,
                     child_recursion_depth,
+                    interaction_mode,
                     *timeout_sec,
                     cancel_token.as_ref(),
                     live_event_sink.as_ref(),
@@ -2896,6 +3219,7 @@ impl DelegationEngine {
         admitted_model_execution: Option<&AdmittedModelExecution>,
         request_constraints: &RequestConstraints,
         child_recursion_depth: u8,
+        interaction_mode: RequestedTurnInteractionMode,
         timeout_sec: u64,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
         live_event_sink: Option<&astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
@@ -2914,21 +3238,24 @@ impl DelegationEngine {
 
         // Build configs + create runs in parallel
         let mut configs = Vec::new();
+        let mut owner_generations = HashMap::new();
+        let session_id = Self::session_id_for(request);
         for agent_id in agent_ids {
             let sub_run_id = uuid::Uuid::new_v4().to_string();
-            let session_id = Self::session_id_for(request);
 
-            self.run_engine
-                .start_run_ext(
+            let execution_authority = self
+                .start_delegated_run(
                     &sub_run_id,
                     &request.user_id,
                     &session_id,
-                    Some(&request.parent_run_id),
-                    Some(&request.delegation_id),
-                    Some(agent_id),
+                    &request.parent_run_id,
+                    &request.delegation_id,
+                    agent_id,
                     None,
+                    interaction_mode,
                 )
                 .await?;
+            owner_generations.insert(sub_run_id.clone(), execution_authority.owner_generation);
 
             self.tracker
                 .record_sub_run(SubRunRecord {
@@ -2955,14 +3282,22 @@ impl DelegationEngine {
             }
 
             self.run_engine
-                .persist_delegation_outcome_status(
+                .transition_status_with_events_if_current_owner(
                     &request.user_id,
+                    &session_id,
                     &sub_run_id,
+                    &[STATUS_RUNNING],
+                    execution_authority.owner_generation,
                     STATUS_RUNNING,
                     Some("agent_execution"),
                     None,
+                    &[],
                 )
-                .await?;
+                .await?
+                .then_some(())
+                .ok_or_else(|| {
+                    format!("fan-out child {sub_run_id} lost durable execution authority")
+                })?;
 
             let pause_flag = self.tracker.register_pause_flag(&sub_run_id).await;
             // Create a per-child cancel token derived from the parent's token.
@@ -3044,13 +3379,17 @@ impl DelegationEngine {
                 task: enhanced_task,
                 session_id: Self::session_id_for(request),
                 user_id: request.user_id.clone(),
+                execution_owner_generation: Some(execution_authority.owner_generation),
+                execution_owner_generation_sink: None,
                 previous_output: None,
                 context: Self::child_task_context(request),
                 forward_headers: forward_headers.clone(),
                 admitted_model_execution: admitted_model_execution.cloned(),
+                interaction_mode,
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
                 max_turns: None,
+                initial_turns: None,
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
                 mailbox,
@@ -3059,7 +3398,7 @@ impl DelegationEngine {
                 cancel_token: Some(child_cancel),
                 inherited_prefix,
                 execution_metadata: request.execution_metadata.clone(),
-
+                work_item: None,
                 delegation_chain,
                 #[cfg(feature = "harness")]
                 harness_sink: None,
@@ -3307,6 +3646,44 @@ impl DelegationEngine {
             }
         }
 
+        // Settle the physical execution lifecycle before applying the
+        // verification policy. Verification is a parent-level evaluation
+        // fact; it must not retroactively rewrite a child execution that has
+        // already committed its durable terminal state.
+        let mut authoritative_results = Vec::with_capacity(results.len());
+        for result in results {
+            let disposition = owner_generations
+                .get(&result.run_id)
+                .copied()
+                .map(|owner_generation| {
+                    durable_lifecycle_disposition(self.executor.as_ref(), owner_generation)
+                })
+                .unwrap_or(DurableLifecycleDisposition::ReadOnly);
+            let result = if cancel_token.is_some_and(|token| token.is_cancelled()) {
+                reconcile_after_parent_cancellation_bounded(
+                    &self.run_engine,
+                    &request.user_id,
+                    &session_id,
+                    disposition,
+                    result,
+                    &mut cancellation_reconciliation_deadline,
+                    "fanout",
+                )
+                .await
+            } else {
+                reconcile_agent_result_with_durable_authority(
+                    &self.run_engine,
+                    &request.user_id,
+                    &session_id,
+                    disposition,
+                    result,
+                )
+                .await
+            };
+            authoritative_results.push(result);
+        }
+        let mut results = authoritative_results;
+
         // ── Verification gate: check each result before aggregation ──
         if self.gate.is_some() {
             let delegation_id = request.delegation_id.clone();
@@ -3326,6 +3703,7 @@ impl DelegationEngine {
                 let gated = self
                     .apply_gate(
                         &request.user_id,
+                        &session_id,
                         result,
                         &did,
                         &request.parent_run_id,
@@ -3356,13 +3734,17 @@ impl DelegationEngine {
                                 task,
                                 session_id: sess,
                                 user_id: uid,
+                                execution_owner_generation: None,
+                                execution_owner_generation_sink: None,
                                 previous_output: None,
                                 context: ctx,
                                 forward_headers: forward_headers.clone(),
                                 admitted_model_execution: admitted_model_execution.cloned(),
+                                interaction_mode,
                                 request_constraints: request_constraints.clone(),
                                 recursion_depth: child_recursion_depth,
                                 max_turns: None,
+                                initial_turns: None,
                                 pause_flag: None,
                                 checkpoint_gate: None,
                                 mailbox: None,
@@ -3371,7 +3753,7 @@ impl DelegationEngine {
                                 cancel_token: cancel_for_retry.clone(),
                                 inherited_prefix,
                                 execution_metadata: request.execution_metadata.clone(),
-
+                                work_item: None,
                                 delegation_chain,
                                 #[cfg(feature = "harness")]
                                 harness_sink: None,
@@ -3384,25 +3766,8 @@ impl DelegationEngine {
             results = gated_results;
         }
 
-        let mut authoritative_results = Vec::with_capacity(results.len());
+        let mut tracked_results = Vec::with_capacity(results.len());
         for result in results {
-            let result = if cancel_token.is_some_and(|token| token.is_cancelled()) {
-                reconcile_after_parent_cancellation_bounded(
-                    &self.run_engine,
-                    &request.user_id,
-                    result,
-                    &mut cancellation_reconciliation_deadline,
-                    "fanout",
-                )
-                .await
-            } else {
-                reconcile_agent_result_with_durable_authority(
-                    &self.run_engine,
-                    &request.user_id,
-                    result,
-                )
-                .await
-            };
             let final_state = agent_result_status_to_subrun_state(&result.status);
             self.tracker
                 .apply_sub_run_result_state(
@@ -3412,9 +3777,9 @@ impl DelegationEngine {
                     result.output.as_deref(),
                 )
                 .await;
-            authoritative_results.push(result);
+            tracked_results.push(result);
         }
-        let results = authoritative_results;
+        let results = tracked_results;
 
         let aggregated = aggregate_results(aggregation, &results);
         Ok(DelegationResult::from_results(
@@ -3435,6 +3800,7 @@ impl DelegationEngine {
         admitted_model_execution: Option<&AdmittedModelExecution>,
         request_constraints: &RequestConstraints,
         child_recursion_depth: u8,
+        interaction_mode: RequestedTurnInteractionMode,
         timeout_sec: u64,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
         live_event_sink: Option<&astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
@@ -3462,15 +3828,16 @@ impl DelegationEngine {
             let sub_run_id = uuid::Uuid::new_v4().to_string();
             let session_id = Self::session_id_for(request);
 
-            self.run_engine
-                .start_run_ext(
+            let execution_authority = self
+                .start_delegated_run(
                     &sub_run_id,
                     &request.user_id,
                     &session_id,
-                    Some(&request.parent_run_id),
-                    Some(&request.delegation_id),
-                    Some(agent_id),
+                    &request.parent_run_id,
+                    &request.delegation_id,
+                    agent_id,
                     None,
+                    interaction_mode,
                 )
                 .await?;
 
@@ -3499,14 +3866,22 @@ impl DelegationEngine {
             }
 
             self.run_engine
-                .persist_delegation_outcome_status(
+                .transition_status_with_events_if_current_owner(
                     &request.user_id,
+                    &session_id,
                     &sub_run_id,
+                    &[STATUS_RUNNING],
+                    execution_authority.owner_generation,
                     STATUS_RUNNING,
                     Some("agent_execution"),
                     None,
+                    &[],
                 )
-                .await?;
+                .await?
+                .then_some(())
+                .ok_or_else(|| {
+                    format!("sequential child {sub_run_id} lost durable execution authority")
+                })?;
 
             let pause_flag = self.tracker.register_pause_flag(&sub_run_id).await;
             let child_cancel = cancel_token
@@ -3574,13 +3949,17 @@ impl DelegationEngine {
                 task: enhanced_task,
                 session_id: Self::session_id_for(request),
                 user_id: request.user_id.clone(),
+                execution_owner_generation: Some(execution_authority.owner_generation),
+                execution_owner_generation_sink: None,
                 previous_output: previous_output.clone(),
                 context: Self::child_task_context(request),
                 forward_headers: forward_headers.clone(),
                 admitted_model_execution: admitted_model_execution.cloned(),
+                interaction_mode,
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
                 max_turns: None,
+                initial_turns: None,
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
                 mailbox,
@@ -3589,7 +3968,7 @@ impl DelegationEngine {
                 cancel_token: Some(child_cancel),
                 inherited_prefix: None,
                 execution_metadata: request.execution_metadata.clone(),
-
+                work_item: None,
                 delegation_chain: delegation_chain.clone(),
                 #[cfg(feature = "harness")]
                 harness_sink: None,
@@ -3620,6 +3999,17 @@ impl DelegationEngine {
                     tool_calls: 0,
                 },
             };
+            let result = reconcile_agent_result_with_durable_authority(
+                &self.run_engine,
+                &request.user_id,
+                &session_id,
+                durable_lifecycle_disposition(
+                    self.executor.as_ref(),
+                    execution_authority.owner_generation,
+                ),
+                result,
+            )
+            .await;
             // ── Verification gate with retry for sequential sub-runs ──
             let result = if self.gate.is_some() {
                 let delegation_id = request.delegation_id.clone();
@@ -3633,6 +4023,7 @@ impl DelegationEngine {
                 let retry_agent_id = agent_id.clone();
                 self.apply_gate(
                     &request.user_id,
+                    &session_id,
                     result,
                     &delegation_id,
                     &request.parent_run_id,
@@ -3651,6 +4042,8 @@ impl DelegationEngine {
                             task: retry_task.clone(),
                             session_id: sess.clone(),
                             user_id: uid.clone(),
+                            execution_owner_generation: None,
+                            execution_owner_generation_sink: None,
                             previous_output: prev.clone(),
                             context: clone_delegation_context(
                                 astra_core::history_work::HistoryWorkSite::DelegationRetryContextClone,
@@ -3658,9 +4051,11 @@ impl DelegationEngine {
                             ),
                             forward_headers: forward_headers.clone(),
                             admitted_model_execution: admitted_model_execution.cloned(),
+                            interaction_mode,
                             request_constraints: request_constraints.clone(),
                             recursion_depth: child_recursion_depth,
                             max_turns: None,
+                            initial_turns: None,
                             pause_flag: None,
                             checkpoint_gate: None,
                             mailbox: None,
@@ -3669,7 +4064,7 @@ impl DelegationEngine {
                             cancel_token: cancel_for_retry.clone(),
                             inherited_prefix: None,
                             execution_metadata: request.execution_metadata.clone(),
-
+                            work_item: None,
                             delegation_chain: delegation_chain.clone(),
                             #[cfg(feature = "harness")]
                             harness_sink: None,
@@ -3680,12 +4075,6 @@ impl DelegationEngine {
             } else {
                 result
             };
-            let result = reconcile_agent_result_with_durable_authority(
-                &self.run_engine,
-                &request.user_id,
-                result,
-            )
-            .await;
             let final_state = agent_result_status_to_subrun_state(&result.status);
             self.tracker
                 .apply_sub_run_result_state(
@@ -3724,6 +4113,7 @@ impl DelegationEngine {
         admitted_model_execution: Option<&AdmittedModelExecution>,
         request_constraints: &RequestConstraints,
         child_recursion_depth: u8,
+        interaction_mode: RequestedTurnInteractionMode,
         timeout_sec: u64,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
         live_event_sink: Option<&astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
@@ -3759,15 +4149,16 @@ impl DelegationEngine {
             // ── Producer sub-run ──
             let prod_run_id = uuid::Uuid::new_v4().to_string();
             let session_id = Self::session_id_for(request);
-            self.run_engine
-                .start_run_ext(
+            let prod_execution_authority = self
+                .start_delegated_run(
                     &prod_run_id,
                     &request.user_id,
                     &session_id,
-                    Some(&request.parent_run_id),
-                    Some(&request.delegation_id),
-                    Some(producer_id),
+                    &request.parent_run_id,
+                    &request.delegation_id,
+                    producer_id,
                     None,
+                    interaction_mode,
                 )
                 .await?;
             self.tracker
@@ -3792,14 +4183,22 @@ impl DelegationEngine {
                 );
             }
             self.run_engine
-                .persist_delegation_outcome_status(
+                .transition_status_with_events_if_current_owner(
                     &request.user_id,
+                    &session_id,
                     &prod_run_id,
+                    &[STATUS_RUNNING],
+                    prod_execution_authority.owner_generation,
                     STATUS_RUNNING,
                     Some("produce"),
                     None,
+                    &[],
                 )
-                .await?;
+                .await?
+                .then_some(())
+                .ok_or_else(|| {
+                    format!("producer child {prod_run_id} lost durable execution authority")
+                })?;
             let prod_pause = self.tracker.register_pause_flag(&prod_run_id).await;
             let prod_cancel = cancel_token
                 .map(|token| Arc::new(token.child_token()))
@@ -3810,6 +4209,7 @@ impl DelegationEngine {
             self.run_engine
                 .append_event(
                     &request.user_id,
+                    &session_id,
                     &prod_run_id,
                     serde_json::json!({"event_type": "adversarial_round", "data": {"round": round, "role": "producer"}}),
                 )
@@ -3861,13 +4261,17 @@ impl DelegationEngine {
                 task: prod_enhanced_task,
                 session_id: Self::session_id_for(request),
                 user_id: request.user_id.clone(),
+                execution_owner_generation: Some(prod_execution_authority.owner_generation),
+                execution_owner_generation_sink: None,
                 previous_output: last_producer_output.clone(),
                 context: Self::child_task_context(request),
                 forward_headers: forward_headers.clone(),
                 admitted_model_execution: admitted_model_execution.cloned(),
+                interaction_mode,
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
                 max_turns: None,
+                initial_turns: None,
                 pause_flag: Some(prod_pause.clone()),
                 checkpoint_gate: None,
                 mailbox: prod_mailbox,
@@ -3876,7 +4280,7 @@ impl DelegationEngine {
                 cancel_token: Some(prod_cancel),
                 inherited_prefix: None,
                 execution_metadata: request.execution_metadata.clone(),
-
+                work_item: None,
                 delegation_chain: producer_delegation_chain.clone(),
                 #[cfg(feature = "harness")]
                 harness_sink: None,
@@ -3907,6 +4311,17 @@ impl DelegationEngine {
                     tool_calls: 0,
                 },
             };
+            let prod_result = reconcile_agent_result_with_durable_authority(
+                &self.run_engine,
+                &request.user_id,
+                &session_id,
+                durable_lifecycle_disposition(
+                    self.executor.as_ref(),
+                    prod_execution_authority.owner_generation,
+                ),
+                prod_result,
+            )
+            .await;
             // ── Gate on producer output before reviewer sees it ──
             let prod_result = if self.gate.is_some() {
                 let did = request.delegation_id.clone();
@@ -3918,6 +4333,7 @@ impl DelegationEngine {
                 let pp = producer_profile.clone();
                 self.apply_gate(
                     &request.user_id,
+                    &session_id,
                     prod_result,
                     &did,
                     &request.parent_run_id,
@@ -3930,6 +4346,8 @@ impl DelegationEngine {
                             task: prod_retry_task.clone(),
                             session_id: sess.clone(),
                             user_id: uid.clone(),
+                            execution_owner_generation: None,
+                            execution_owner_generation_sink: None,
                             previous_output: prev.clone(),
                             context: clone_delegation_context(
                                 astra_core::history_work::HistoryWorkSite::DelegationRetryContextClone,
@@ -3937,9 +4355,11 @@ impl DelegationEngine {
                             ),
                             forward_headers: forward_headers.clone(),
                             admitted_model_execution: admitted_model_execution.cloned(),
+                            interaction_mode,
                             request_constraints: request_constraints.clone(),
                             recursion_depth: child_recursion_depth,
                             max_turns: None,
+                            initial_turns: None,
                             pause_flag: None,
                             checkpoint_gate: None,
                             mailbox: None,
@@ -3948,7 +4368,7 @@ impl DelegationEngine {
                             cancel_token: cancel_for_retry.clone(),
                             inherited_prefix: None,
                             execution_metadata: request.execution_metadata.clone(),
-
+                            work_item: None,
                             delegation_chain: producer_delegation_chain.clone(),
                             #[cfg(feature = "harness")]
                             harness_sink: None,
@@ -3959,12 +4379,6 @@ impl DelegationEngine {
             } else {
                 prod_result
             };
-            let prod_result = reconcile_agent_result_with_durable_authority(
-                &self.run_engine,
-                &request.user_id,
-                prod_result,
-            )
-            .await;
             let final_state = agent_result_status_to_subrun_state(&prod_result.status);
             self.tracker
                 .apply_sub_run_result_state(
@@ -3980,15 +4394,16 @@ impl DelegationEngine {
 
             // ── Reviewer sub-run ──
             let rev_run_id = uuid::Uuid::new_v4().to_string();
-            self.run_engine
-                .start_run_ext(
+            let rev_execution_authority = self
+                .start_delegated_run(
                     &rev_run_id,
                     &request.user_id,
                     &session_id,
-                    Some(&request.parent_run_id),
-                    Some(&request.delegation_id),
-                    Some(reviewer_id),
+                    &request.parent_run_id,
+                    &request.delegation_id,
+                    reviewer_id,
                     None,
+                    interaction_mode,
                 )
                 .await?;
             self.tracker
@@ -4013,14 +4428,22 @@ impl DelegationEngine {
                 );
             }
             self.run_engine
-                .persist_delegation_outcome_status(
+                .transition_status_with_events_if_current_owner(
                     &request.user_id,
+                    &session_id,
                     &rev_run_id,
+                    &[STATUS_RUNNING],
+                    rev_execution_authority.owner_generation,
                     STATUS_RUNNING,
                     Some("review"),
                     None,
+                    &[],
                 )
-                .await?;
+                .await?
+                .then_some(())
+                .ok_or_else(|| {
+                    format!("reviewer child {rev_run_id} lost durable execution authority")
+                })?;
             let rev_pause = self.tracker.register_pause_flag(&rev_run_id).await;
             let rev_cancel = cancel_token
                 .map(|token| Arc::new(token.child_token()))
@@ -4031,6 +4454,7 @@ impl DelegationEngine {
             self.run_engine
                 .append_event(
                     &request.user_id,
+                    &session_id,
                     &rev_run_id,
                     serde_json::json!({"event_type": "adversarial_round", "data": {"round": round, "role": "reviewer"}}),
                 )
@@ -4070,13 +4494,17 @@ impl DelegationEngine {
                 task: rev_enhanced_task,
                 session_id: Self::session_id_for(request),
                 user_id: request.user_id.clone(),
+                execution_owner_generation: Some(rev_execution_authority.owner_generation),
+                execution_owner_generation_sink: None,
                 previous_output: last_producer_output.clone(),
                 context: Self::child_task_context(request),
                 forward_headers: forward_headers.clone(),
                 admitted_model_execution: admitted_model_execution.cloned(),
+                interaction_mode,
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
                 max_turns: None,
+                initial_turns: None,
                 pause_flag: Some(rev_pause),
                 checkpoint_gate: None,
                 mailbox: rev_mailbox,
@@ -4085,7 +4513,7 @@ impl DelegationEngine {
                 cancel_token: Some(rev_cancel),
                 inherited_prefix: None,
                 execution_metadata: request.execution_metadata.clone(),
-
+                work_item: None,
                 delegation_chain: reviewer_delegation_chain.clone(),
                 #[cfg(feature = "harness")]
                 harness_sink: None,
@@ -4119,6 +4547,11 @@ impl DelegationEngine {
             let rev_result = reconcile_agent_result_with_durable_authority(
                 &self.run_engine,
                 &request.user_id,
+                &session_id,
+                durable_lifecycle_disposition(
+                    self.executor.as_ref(),
+                    rev_execution_authority.owner_generation,
+                ),
                 rev_result,
             )
             .await;
@@ -4157,6 +4590,7 @@ impl DelegationEngine {
         admitted_model_execution: Option<&AdmittedModelExecution>,
         request_constraints: &RequestConstraints,
         child_recursion_depth: u8,
+        interaction_mode: RequestedTurnInteractionMode,
         timeout_sec: u64,
         cancel_token: Option<&Arc<tokio_util::sync::CancellationToken>>,
         live_event_sink: Option<&astra_turn_core::agent_live_event::SharedAgentLiveEventSink>,
@@ -4196,18 +4630,19 @@ impl DelegationEngine {
         };
         let mut handles: tokio::task::JoinSet<(AgentResult, String, String)> =
             tokio::task::JoinSet::new();
-        let mut fork_id_map: HashMap<tokio::task::Id, (String, String)> = HashMap::new();
+        let mut fork_id_map: HashMap<tokio::task::Id, (String, String, u64)> = HashMap::new();
         for (i, task) in tasks.iter().enumerate() {
             let run_id = uuid::Uuid::new_v4().to_string();
-            self.run_engine
-                .start_run_ext(
+            let execution_authority = self
+                .start_delegated_run(
                     &run_id,
                     &request.user_id,
                     &session_id,
-                    Some(&request.parent_run_id),
-                    Some(&request.delegation_id),
-                    Some(agent_id),
+                    &request.parent_run_id,
+                    &request.delegation_id,
+                    agent_id,
                     None,
+                    interaction_mode,
                 )
                 .await?;
             self.tracker
@@ -4231,21 +4666,32 @@ impl DelegationEngine {
                     "Fork: transition to Running failed for {run_id}: {e:?}"
                 );
             }
-            if let Err(e) = self
+            match self
                 .run_engine
-                .persist_delegation_outcome_status(
+                .transition_status_with_events_if_current_owner(
                     &request.user_id,
+                    &session_id,
                     &run_id,
+                    &[STATUS_RUNNING],
+                    execution_authority.owner_generation,
                     STATUS_RUNNING,
                     Some("fork"),
                     None,
+                    &[],
                 )
                 .await
             {
-                astra_core::agent_warn!(
-                    "delegation",
-                    "Fork: failed to persist running status for {run_id}: {e}"
-                );
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(format!(
+                        "fork child {run_id} lost durable execution authority before activation"
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "failed to activate durable fork child {run_id}: {error}"
+                    ));
+                }
             }
             let pause_flag = self.tracker.register_pause_flag(&run_id).await;
             let child_cancel = cancel_token
@@ -4308,13 +4754,17 @@ impl DelegationEngine {
                 task: fork_task,
                 session_id: session_id.clone(),
                 user_id: request.user_id.clone(),
+                execution_owner_generation: Some(execution_authority.owner_generation),
+                execution_owner_generation_sink: None,
                 previous_output: None,
                 context: fork_context,
                 forward_headers: forward_headers.clone(),
                 admitted_model_execution: admitted_model_execution.cloned(),
+                interaction_mode,
                 request_constraints: request_constraints.clone(),
                 recursion_depth: child_recursion_depth,
                 max_turns: None,
+                initial_turns: None,
                 pause_flag: Some(pause_flag),
                 checkpoint_gate: None,
                 mailbox: fork_mailbox,
@@ -4323,13 +4773,17 @@ impl DelegationEngine {
                 cancel_token: Some(child_cancel),
                 inherited_prefix: None,
                 execution_metadata: request.execution_metadata.clone(),
-
+                work_item: None,
                 delegation_chain: fork_delegation_chain.clone(),
                 #[cfg(feature = "harness")]
                 harness_sink: None,
             };
 
             let executor = self.executor.clone();
+            let durable_disposition = durable_lifecycle_disposition(
+                executor.as_ref(),
+                execution_authority.owner_generation,
+            );
             let run_engine = self.run_engine.clone();
             let tracker = self.tracker.clone();
             let sem = fork_semaphore.clone();
@@ -4343,6 +4797,7 @@ impl DelegationEngine {
             let captured_agent_id = config.agent_profile.agent_id.clone();
             let captured_run_id = config.run_id.clone();
             let request_user_id = config.user_id.clone();
+            let request_session_id = config.session_id.clone();
             let abort_handle = handles.spawn(async move {
                 let run_id = config.run_id.clone();
                 let agent_id = config.agent_profile.agent_id.clone();
@@ -4407,6 +4862,8 @@ impl DelegationEngine {
                 let result = reconcile_agent_result_with_durable_authority(
                     &run_engine,
                     &request_user_id,
+                    &request_session_id,
+                    durable_disposition,
                     result,
                 )
                 .await;
@@ -4421,7 +4878,14 @@ impl DelegationEngine {
                     .await;
                 (result, agent_id, run_id)
             });
-            fork_id_map.insert(abort_handle.id(), (captured_agent_id, captured_run_id));
+            fork_id_map.insert(
+                abort_handle.id(),
+                (
+                    captured_agent_id,
+                    captured_run_id,
+                    execution_authority.owner_generation,
+                ),
+            );
         }
 
         // As in the regular fanout path, first let cancellation propagate to
@@ -4478,14 +4942,24 @@ impl DelegationEngine {
             match join_result {
                 Ok((result, _, _)) => results.push(result),
                 Err(e) => {
-                    let (panic_agent_id, panic_run_id) = fork_id_map
+                    let (panic_agent_id, panic_run_id, panic_owner_generation) = fork_id_map
                         .get(&e.id())
                         .cloned()
-                        .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string()));
+                        .unwrap_or_else(|| ("unknown".to_string(), "unknown".to_string(), 0));
+                    let panic_disposition = if panic_run_id == "unknown" {
+                        DurableLifecycleDisposition::ReadOnly
+                    } else {
+                        durable_lifecycle_disposition(
+                            self.executor.as_ref(),
+                            panic_owner_generation,
+                        )
+                    };
                     if e.is_cancelled() && cancel_token.is_some_and(|token| token.is_cancelled()) {
                         let reconciled = reconcile_after_parent_cancellation_bounded(
                             &self.run_engine,
                             &request.user_id,
+                            &session_id,
+                            panic_disposition,
                             cancelled_agent_result(&panic_agent_id, &panic_run_id),
                             &mut cancellation_reconciliation_deadline,
                             "fork",
@@ -4506,6 +4980,8 @@ impl DelegationEngine {
                     let panic_result = reconcile_agent_result_with_durable_authority(
                         &self.run_engine,
                         &request.user_id,
+                        &session_id,
+                        panic_disposition,
                         AgentResult {
                             agent_id: panic_agent_id,
                             run_id: panic_run_id.clone(),
@@ -4536,13 +5012,15 @@ impl DelegationEngine {
                 .iter()
                 .map(|result| result.run_id.clone())
                 .collect::<HashSet<_>>();
-            for (agent_id, run_id) in fork_id_map.values() {
+            for (agent_id, run_id, owner_generation) in fork_id_map.values() {
                 if !settled_run_ids.insert(run_id.clone()) {
                     continue;
                 }
                 let reconciled = reconcile_after_parent_cancellation_bounded(
                     &self.run_engine,
                     &request.user_id,
+                    &session_id,
+                    durable_lifecycle_disposition(self.executor.as_ref(), *owner_generation),
                     cancelled_agent_result(agent_id, run_id),
                     &mut cancellation_reconciliation_deadline,
                     "fork",
@@ -4584,7 +5062,13 @@ impl DelegationEngine {
 
     // ── Pause / Resume API ──────────────────────────────────────────────────
 
-    async fn pause_live_sub_run(&self, user_id: &str, run_id: &str, waiting_for: &str) -> bool {
+    async fn pause_live_sub_run(
+        &self,
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+        waiting_for: &str,
+    ) -> bool {
         if self.tracker.get_pause_flag(run_id).await.is_none()
             || self
                 .tracker
@@ -4602,6 +5086,7 @@ impl DelegationEngine {
             .run_engine
             .transition_status_with_event_if_current(
                 user_id,
+                expected_session_id,
                 run_id,
                 &[STATUS_RUNNING],
                 STATUS_PAUSED,
@@ -4625,7 +5110,13 @@ impl DelegationEngine {
         }
     }
 
-    async fn resume_live_sub_run(&self, user_id: &str, run_id: &str, source: &str) -> bool {
+    async fn resume_live_sub_run(
+        &self,
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+        source: &str,
+    ) -> bool {
         if !self.tracker.is_paused(run_id).await
             || self
                 .tracker
@@ -4643,6 +5134,7 @@ impl DelegationEngine {
             .run_engine
             .transition_status_with_event_if_current(
                 user_id,
+                expected_session_id,
                 run_id,
                 &[STATUS_PAUSED],
                 STATUS_RUNNING,
@@ -4670,11 +5162,21 @@ impl DelegationEngine {
     ///
     /// Sets cooperative pause flags — sub-runs check these between turns and
     /// yield with status "paused" at the next turn boundary.
-    pub async fn pause_delegation(&self, user_id: &str, delegation_id: &str) -> usize {
+    pub async fn pause_delegation(
+        &self,
+        user_id: &str,
+        expected_session_id: &str,
+        delegation_id: &str,
+    ) -> usize {
         let mut count = 0;
         for record in self.tracker.get_sub_runs(delegation_id).await {
             if self
-                .pause_live_sub_run(user_id, &record.run_id, "delegation_pause")
+                .pause_live_sub_run(
+                    user_id,
+                    expected_session_id,
+                    &record.run_id,
+                    "delegation_pause",
+                )
                 .await
             {
                 count += 1;
@@ -4686,11 +5188,21 @@ impl DelegationEngine {
     /// Resume all sub-runs belonging to a delegation.
     ///
     /// Clears cooperative pause flags so sub-runs continue executing.
-    pub async fn resume_delegation(&self, user_id: &str, delegation_id: &str) -> usize {
+    pub async fn resume_delegation(
+        &self,
+        user_id: &str,
+        expected_session_id: &str,
+        delegation_id: &str,
+    ) -> usize {
         let mut count = 0;
         for record in self.tracker.get_sub_runs(delegation_id).await {
             if self
-                .resume_live_sub_run(user_id, &record.run_id, "delegation_resume")
+                .resume_live_sub_run(
+                    user_id,
+                    expected_session_id,
+                    &record.run_id,
+                    "delegation_resume",
+                )
                 .await
             {
                 count += 1;
@@ -4700,11 +5212,16 @@ impl DelegationEngine {
     }
 
     /// Pause all sub-runs spawned by a parent run (across all delegations).
-    pub async fn pause_children_of(&self, user_id: &str, parent_run_id: &str) -> usize {
+    pub async fn pause_children_of(
+        &self,
+        user_id: &str,
+        expected_session_id: &str,
+        parent_run_id: &str,
+    ) -> usize {
         let mut count = 0;
         for child_id in self.tracker.get_children(parent_run_id).await {
             if self
-                .pause_live_sub_run(user_id, &child_id, "parent_pause")
+                .pause_live_sub_run(user_id, expected_session_id, &child_id, "parent_pause")
                 .await
             {
                 count += 1;
@@ -4714,11 +5231,16 @@ impl DelegationEngine {
     }
 
     /// Resume all sub-runs spawned by a parent run.
-    pub async fn resume_children_of(&self, user_id: &str, parent_run_id: &str) -> usize {
+    pub async fn resume_children_of(
+        &self,
+        user_id: &str,
+        expected_session_id: &str,
+        parent_run_id: &str,
+    ) -> usize {
         let mut count = 0;
         for child_id in self.tracker.get_children(parent_run_id).await {
             if self
-                .resume_live_sub_run(user_id, &child_id, "parent_resume")
+                .resume_live_sub_run(user_id, expected_session_id, &child_id, "parent_resume")
                 .await
             {
                 count += 1;
@@ -4773,9 +5295,25 @@ impl DelegationExecutor for DelegationEngine {
         &self,
         request: DelegationRequest,
         source_agent_id: &str,
+        profile_snapshot: AgentProfileRegistry,
         cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     ) -> Result<DelegationResult, String> {
-        self.execute(request, source_agent_id, cancel_token).await
+        // Team profiles are request authority. Execute against an isolated,
+        // immutable snapshot instead of publishing user-defined naked IDs to
+        // the process-global builtin registry.
+        let isolated = Self {
+            registry: Arc::new(RwLock::new(profile_snapshot)),
+            run_engine: self.run_engine.clone(),
+            tracker: self.tracker.clone(),
+            executor: self.executor.clone(),
+            gate: self.gate.clone(),
+            mailbox_router: self.mailbox_router.clone(),
+            prefix_store: self.prefix_store.clone(),
+            projection_store: self.projection_store.clone(),
+        };
+        isolated
+            .execute(request, source_agent_id, cancel_token)
+            .await
     }
 
     async fn get_delegation_progress(&self, delegation_id: &str) -> Option<DelegationProgress> {
@@ -4854,6 +5392,63 @@ mod tests {
         let tracker = Arc::new(DelegationTracker::new());
 
         (Arc::new(RwLock::new(reg)), engine, tracker)
+    }
+
+    #[tokio::test]
+    async fn generation_publish_between_preparing_read_and_wait_is_observed() {
+        let sink = Arc::new(ExecutionOwnerGenerationSink::preparing(3));
+        let preparing_observed = Arc::new(tokio::sync::Notify::new());
+        let release_wait = Arc::new(tokio::sync::Notify::new());
+        *sink
+            .wait_after_preparing_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((Arc::clone(&preparing_observed), Arc::clone(&release_wait)));
+        let waiter = {
+            let sink = Arc::clone(&sink);
+            tokio::spawn(async move { sink.wait_until_published_or_stopped().await })
+        };
+
+        preparing_observed.notified().await;
+        sink.publish(4);
+        release_wait.notify_one();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                .await
+                .expect("versioned publication cannot lose the wakeup")
+                .expect("publication waiter must not panic"),
+            ExecutionOwnerGenerationPublication::Acquired(4)
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_guard_drop_between_preparing_read_and_wait_is_observed() {
+        let sink = Arc::new(ExecutionOwnerGenerationSink::preparing(7));
+        let owner = sink.guard();
+        let preparing_observed = Arc::new(tokio::sync::Notify::new());
+        let release_wait = Arc::new(tokio::sync::Notify::new());
+        *sink
+            .wait_after_preparing_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((Arc::clone(&preparing_observed), Arc::clone(&release_wait)));
+        let waiter = {
+            let sink = Arc::clone(&sink);
+            tokio::spawn(async move { sink.wait_until_published_or_stopped().await })
+        };
+
+        preparing_observed.notified().await;
+        drop(owner);
+        release_wait.notify_one();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                .await
+                .expect("versioned guard drop cannot lose the wakeup")
+                .expect("publication waiter must not panic"),
+            ExecutionOwnerGenerationPublication::StoppedBeforeAcquisition {
+                expected_initial_generation: 7,
+            }
+        );
     }
 
     /// Establish the production precondition for a delegation test: the
@@ -5769,6 +6364,8 @@ mod tests {
         task_context: HashMap<String, serde_json::Value>,
         has_live_event_sink: bool,
         cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
+        execution_owner_generation: Option<u64>,
+        interaction_mode: RequestedTurnInteractionMode,
     }
 
     struct CaptureRunBindingExecutor {
@@ -5784,6 +6381,8 @@ mod tests {
                 task_context: config.context.clone(),
                 has_live_event_sink: config.live_event_sink.is_some(),
                 cancel_token: config.cancel_token.clone(),
+                execution_owner_generation: config.execution_owner_generation,
+                interaction_mode: config.interaction_mode,
             });
             Ok(AgentResult {
                 agent_id: config.agent_profile.agent_id,
@@ -5884,6 +6483,10 @@ mod tests {
         );
         assert!(bindings[0].has_live_event_sink);
         assert!(bindings[0].cancel_token.is_some());
+        assert_eq!(
+            bindings[0].interaction_mode,
+            RequestedTurnInteractionMode::Headless
+        );
     }
 
     #[tokio::test]
@@ -6732,6 +7335,7 @@ mod tests {
                 "http://catalog:8081/api/v1/chat/completions".to_string(),
                 "Bearer test".to_string(),
                 Some(2500),
+                128_000,
             )),
         )
         .await
@@ -6975,6 +7579,8 @@ mod tests {
     async fn stub_executor_returns_completed() {
         let executor = StubSubRunExecutor;
         let config = SubRunConfig {
+            execution_owner_generation: None,
+            execution_owner_generation_sink: None,
             run_id: "r1".into(),
             parent_run_id: "parent-r1".into(),
             agent_profile: AgentProfile::new("test", "Test", AgentTier::User),
@@ -6985,9 +7591,11 @@ mod tests {
             context: HashMap::new(),
             forward_headers: HashMap::new(),
             admitted_model_execution: None,
+            interaction_mode: RequestedTurnInteractionMode::Headless,
             request_constraints: Default::default(),
             recursion_depth: 1,
             max_turns: None,
+            initial_turns: None,
             pause_flag: None,
             checkpoint_gate: None,
             mailbox: None,
@@ -6996,7 +7604,7 @@ mod tests {
             cancel_token: None,
             inherited_prefix: None,
             execution_metadata: None,
-
+            work_item: None,
             delegation_chain: Vec::new(),
             #[cfg(feature = "harness")]
             harness_sink: None,
@@ -7018,7 +7626,9 @@ mod tests {
         assert_eq!(result.agent_results.len(), 2);
 
         // Pause all children of parent-1 (sub-runs are already completed)
-        let paused = de.pause_children_of("user-1", "parent-1").await;
+        let paused = de
+            .pause_children_of("user-1", "test-session", "parent-1")
+            .await;
         assert_eq!(paused, 0);
 
         // A terminal task cannot observe cooperative flags.
@@ -7037,7 +7647,9 @@ mod tests {
         }
 
         // Resume does not claim to revive completed work.
-        let resumed = de.resume_children_of("user-1", "parent-1").await;
+        let resumed = de
+            .resume_children_of("user-1", "test-session", "parent-1")
+            .await;
         assert_eq!(resumed, 0);
         for ar in &result.agent_results {
             assert!(!tracker.is_paused(&ar.run_id).await);
@@ -7053,7 +7665,7 @@ mod tests {
             .await
             .unwrap();
 
-        let paused = de.pause_delegation("user-1", "del-1").await;
+        let paused = de.pause_delegation("user-1", "test-session", "del-1").await;
         assert_eq!(paused, 0);
 
         let subs = tracker.get_sub_runs("del-1").await;
@@ -7068,7 +7680,9 @@ mod tests {
             assert_eq!(run.status, "completed");
         }
 
-        let resumed = de.resume_delegation("user-1", "del-1").await;
+        let resumed = de
+            .resume_delegation("user-1", "test-session", "del-1")
+            .await;
         assert_eq!(resumed, 0);
         for sub in &subs {
             assert!(!tracker.is_paused(&sub.run_id).await);
@@ -7107,7 +7721,11 @@ mod tests {
             .await;
         tracker.register_pause_flag("sub-live").await;
 
-        assert_eq!(de.pause_children_of("user-1", "parent-live").await, 1);
+        assert_eq!(
+            de.pause_children_of("user-1", "session-live", "parent-live")
+                .await,
+            1
+        );
         assert!(tracker.is_paused("sub-live").await);
         let paused = engine
             .load_run("user-1", "sub-live")
@@ -7118,7 +7736,11 @@ mod tests {
         assert_eq!(paused.waiting_for.as_deref(), Some("parent_pause"));
         assert_eq!(paused.events.last().unwrap()["event_type"], "run_paused");
 
-        assert_eq!(de.resume_children_of("user-1", "parent-live").await, 1);
+        assert_eq!(
+            de.resume_children_of("user-1", "session-live", "parent-live")
+                .await,
+            1
+        );
         assert!(!tracker.is_paused("sub-live").await);
         let resumed = engine
             .load_run("user-1", "sub-live")
@@ -7165,6 +7787,7 @@ mod tests {
             engine
                 .persist_delegation_outcome_status(
                     "user-1",
+                    "session-live",
                     "sub-waiting",
                     STATUS_WAITING,
                     Some("user_input"),
@@ -7174,7 +7797,11 @@ mod tests {
                 .unwrap()
         );
 
-        assert_eq!(de.pause_children_of("user-1", "parent-live").await, 0);
+        assert_eq!(
+            de.pause_children_of("user-1", "session-live", "parent-live")
+                .await,
+            0
+        );
         assert!(!tracker.is_paused("sub-waiting").await);
         let durable = engine
             .load_run("user-1", "sub-waiting")
@@ -7199,6 +7826,7 @@ mod tests {
             engine
                 .persist_status(
                     "user-1",
+                    "session-1",
                     run_id,
                     durable_status,
                     Some("control-plane"),
@@ -7210,6 +7838,10 @@ mod tests {
             let authoritative = reconcile_agent_result_with_durable_authority(
                 &engine,
                 "user-1",
+                "session-1",
+                DurableLifecycleDisposition::SchedulerOwned {
+                    owner_generation: 0,
+                },
                 AgentResult {
                     agent_id: "coder".into(),
                     run_id: run_id.into(),
@@ -7234,6 +7866,221 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn executor_owned_durable_lifecycle_never_issues_unfenced_outer_terminal_write() {
+        let store = Arc::new(InMemoryRunStateStore::new());
+        let engine = RunEngine::new(store.clone());
+        let authority = engine
+            .start_run("executor-owned-stale-result", "user-1", "session-1")
+            .await
+            .expect("start durable child run");
+        assert_eq!(authority.owner_generation, 0);
+
+        let claimed = store
+            .claim_recoverable_active_runs(1)
+            .await
+            .expect("recovery claims the expired execution owner");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].run_generation, 1);
+
+        let authoritative = reconcile_agent_result_with_durable_authority(
+            &engine,
+            "user-1",
+            "session-1",
+            DurableLifecycleDisposition::ExecutorOwned {
+                owner_generation: authority.owner_generation,
+            },
+            AgentResult {
+                agent_id: "coder".into(),
+                run_id: "executor-owned-stale-result".into(),
+                status: STATUS_COMPLETED.into(),
+                output: Some("stale executor output".into()),
+                error: None,
+                prompt_tokens: 3,
+                completion_tokens: 5,
+                tool_calls: 1,
+            },
+        )
+        .await;
+
+        assert_eq!(authoritative.status, STATUS_WAITING);
+        assert!(authoritative.output.is_none());
+        let durable = engine
+            .load_run("user-1", "executor-owned-stale-result")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.status, STATUS_RUNNING);
+        assert_eq!(durable.run_generation, 1);
+    }
+
+    #[tokio::test]
+    async fn same_terminal_status_from_new_generation_does_not_preserve_stale_output() {
+        let store = Arc::new(InMemoryRunStateStore::new());
+        let engine = RunEngine::new(store.clone());
+        let authority = engine
+            .start_run("executor-owned-same-status-race", "user-1", "session-1")
+            .await
+            .expect("start durable child run");
+
+        let claimed = store
+            .claim_recoverable_active_runs(1)
+            .await
+            .expect("recovery claims the expired execution owner");
+        let winner_generation = claimed[0].run_generation;
+        assert_ne!(winner_generation, authority.owner_generation);
+        assert!(
+            engine
+                .persist_delegation_outcome_status_if_current_owner(
+                    "user-1",
+                    "session-1",
+                    "executor-owned-same-status-race",
+                    winner_generation,
+                    STATUS_COMPLETED,
+                    None,
+                    None,
+                )
+                .await
+                .expect("recovered owner commits its completed result")
+        );
+
+        let authoritative = reconcile_agent_result_with_durable_authority(
+            &engine,
+            "user-1",
+            "session-1",
+            DurableLifecycleDisposition::ExecutorOwned {
+                owner_generation: authority.owner_generation,
+            },
+            AgentResult {
+                agent_id: "coder".into(),
+                run_id: "executor-owned-same-status-race".into(),
+                status: STATUS_COMPLETED.into(),
+                output: Some("stale generation output".into()),
+                error: None,
+                prompt_tokens: 3,
+                completion_tokens: 5,
+                tool_calls: 1,
+            },
+        )
+        .await;
+
+        assert_eq!(authoritative.status, STATUS_COMPLETED);
+        assert!(authoritative.output.is_none());
+        assert_eq!(authoritative.prompt_tokens, 0);
+        assert_eq!(authoritative.completion_tokens, 0);
+        assert_eq!(authoritative.tool_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn scheduler_cas_loser_does_not_preserve_same_status_from_stale_generation() {
+        let store = Arc::new(InMemoryRunStateStore::new());
+        let engine = RunEngine::new(store.clone());
+        let authority = engine
+            .start_run("scheduler-owned-same-status-race", "user-1", "session-1")
+            .await
+            .expect("start durable child run");
+        let claimed = store
+            .claim_recoverable_active_runs(1)
+            .await
+            .expect("recovery claims the expired execution owner");
+        let winner_generation = claimed[0].run_generation;
+        assert!(
+            engine
+                .persist_delegation_outcome_status_if_current_owner(
+                    "user-1",
+                    "session-1",
+                    "scheduler-owned-same-status-race",
+                    winner_generation,
+                    STATUS_COMPLETED,
+                    None,
+                    None,
+                )
+                .await
+                .expect("recovered owner commits its completed result")
+        );
+
+        let authoritative = reconcile_agent_result_with_durable_authority(
+            &engine,
+            "user-1",
+            "session-1",
+            DurableLifecycleDisposition::SchedulerOwned {
+                owner_generation: authority.owner_generation,
+            },
+            AgentResult {
+                agent_id: "offline-executor".into(),
+                run_id: "scheduler-owned-same-status-race".into(),
+                status: STATUS_COMPLETED.into(),
+                output: Some("stale scheduler output".into()),
+                error: None,
+                prompt_tokens: 8,
+                completion_tokens: 13,
+                tool_calls: 2,
+            },
+        )
+        .await;
+
+        assert_eq!(authoritative.status, STATUS_COMPLETED);
+        assert!(authoritative.output.is_none());
+        assert_eq!(authoritative.prompt_tokens, 0);
+        assert_eq!(authoritative.completion_tokens, 0);
+        assert_eq!(authoritative.tool_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn scheduler_owned_terminal_commits_replay_events_with_the_owner_cas() {
+        for (run_id, status, error, expected_event_types) in [
+            (
+                "scheduler-owned-completed",
+                STATUS_COMPLETED,
+                None,
+                vec!["run_finished"],
+            ),
+            (
+                "scheduler-owned-failed",
+                STATUS_FAILED,
+                Some("offline executor failed"),
+                vec!["run_error", "run_finished"],
+            ),
+        ] {
+            let (_, engine, _) = setup();
+            let authority = engine
+                .start_run(run_id, "user-1", "session-1")
+                .await
+                .expect("start scheduler-owned run");
+
+            let authoritative = reconcile_agent_result_with_durable_authority(
+                &engine,
+                "user-1",
+                "session-1",
+                DurableLifecycleDisposition::SchedulerOwned {
+                    owner_generation: authority.owner_generation,
+                },
+                AgentResult {
+                    agent_id: "offline-executor".into(),
+                    run_id: run_id.into(),
+                    status: status.into(),
+                    output: (status == STATUS_COMPLETED).then(|| "answer".into()),
+                    error: error.map(str::to_string),
+                    prompt_tokens: 3,
+                    completion_tokens: 5,
+                    tool_calls: 1,
+                },
+            )
+            .await;
+
+            assert_eq!(authoritative.status, status);
+            let durable = engine.load_run("user-1", run_id).await.unwrap().unwrap();
+            assert_eq!(durable.status, status);
+            let event_types = durable
+                .events
+                .iter()
+                .filter_map(|event| event.get("event_type").and_then(serde_json::Value::as_str))
+                .filter(|event_type| matches!(*event_type, "run_error" | "run_finished"))
+                .collect::<Vec<_>>();
+            assert_eq!(event_types, expected_event_types);
+        }
+    }
+
+    #[tokio::test]
     async fn identical_terminal_replay_preserves_richer_agent_result() {
         let (_, engine, _) = setup();
         let run_id = "completed-result-replay";
@@ -7243,7 +8090,14 @@ mod tests {
             .unwrap();
         assert!(
             engine
-                .persist_delegation_outcome_status("user-1", run_id, STATUS_COMPLETED, None, None,)
+                .persist_delegation_outcome_status(
+                    "user-1",
+                    "session-1",
+                    run_id,
+                    STATUS_COMPLETED,
+                    None,
+                    None,
+                )
                 .await
                 .unwrap()
         );
@@ -7251,6 +8105,10 @@ mod tests {
         let replayed = reconcile_agent_result_with_durable_authority(
             &engine,
             "user-1",
+            "session-1",
+            DurableLifecycleDisposition::SchedulerOwned {
+                owner_generation: 0,
+            },
             AgentResult {
                 agent_id: "coder".into(),
                 run_id: run_id.into(),
@@ -7458,6 +8316,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gate_retry_carries_the_exact_durable_execution_authority() {
+        let (registry, run_engine, tracker) = setup();
+        let bindings = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let executor = Arc::new(CaptureRunBindingExecutor {
+            bindings: bindings.clone(),
+        });
+        let engine = DelegationEngine::with_executor(registry, run_engine, tracker, executor)
+            .with_gate(Arc::new(FailThenPassGate::new(1)));
+        let request = DelegationRequest {
+            session_id: "test-session".into(),
+            delegation_id: "gate-retry-authority".into(),
+            parent_run_id: "gate-retry-parent".into(),
+            task: "verify retry authority".into(),
+            pattern: CoordinationPattern::Sequential {
+                agent_ids: vec!["coder".into()],
+                stop_on_success: false,
+                timeout_sec: 0,
+            },
+            user_id: "user-1".into(),
+            depth: 0,
+            delegation_chain: Vec::new(),
+            context: HashMap::new(),
+            execution_metadata: None,
+        };
+
+        let result = execute_with_durable_parent(&engine, request, "orch", None)
+            .await
+            .expect("retry completes");
+        assert_eq!(result.agent_results[0].status, STATUS_COMPLETED);
+        let bindings = bindings.lock().unwrap();
+        assert_eq!(bindings.len(), 2);
+        assert!(
+            bindings
+                .iter()
+                .all(|binding| binding.execution_owner_generation == Some(0)),
+            "both the initial execution and the pre-started retry must carry their exact generation"
+        );
+    }
+
+    #[tokio::test]
     async fn gate_retry_preserves_sequential_coordination_prompt() {
         let (reg, engine, tracker, _) = setup_with_executor(Arc::new(EchoExecutor));
         let gate = Arc::new(FailThenPassGate::new(1));
@@ -7544,7 +8442,7 @@ mod tests {
         assert!(tracker.get_pause_flag(&chain[0]).await.is_some());
         assert!(tracker.get_pause_flag(&chain[1]).await.is_some());
         assert_eq!(
-            de.pause_delegation("user-1", "del-1").await,
+            de.pause_delegation("user-1", "test-session", "del-1").await,
             0,
             "completed retry attempts must not be advertised as cooperatively paused"
         );
@@ -7947,7 +8845,10 @@ mod tests {
             0
         );
 
-        engine.persist_retry_count("u1", "run-1", 2).await.unwrap();
+        engine
+            .persist_retry_count("u1", "s1", "run-1", 2)
+            .await
+            .unwrap();
         assert_eq!(
             store
                 .load_run("u1", "run-1")
@@ -7995,8 +8896,10 @@ mod tests {
                 agent_binding_schema_version: None,
                 model_offering_id: None,
                 resolved_model_name: None,
+                capability_server_refs_json: None,
                 runtime_profile: None,
-                provider_request_fingerprint: None,
+                start_request_fingerprint: None,
+                work_binding: None,
                 events: vec![],
                 created_at: "2026-01-01T00:00:00Z".into(),
                 updated_at: "2026-01-01T00:00:00Z".into(),
@@ -8032,8 +8935,10 @@ mod tests {
                 agent_binding_schema_version: None,
                 model_offering_id: None,
                 resolved_model_name: None,
+                capability_server_refs_json: None,
                 runtime_profile: None,
-                provider_request_fingerprint: None,
+                start_request_fingerprint: None,
+                work_binding: None,
                 events: vec![],
                 created_at: "2026-01-01T00:00:00Z".into(),
                 updated_at: "2026-01-01T00:00:00Z".into(),
@@ -8069,8 +8974,10 @@ mod tests {
                 agent_binding_schema_version: None,
                 model_offering_id: None,
                 resolved_model_name: None,
+                capability_server_refs_json: None,
                 runtime_profile: None,
-                provider_request_fingerprint: None,
+                start_request_fingerprint: None,
+                work_binding: None,
                 events: vec![],
                 created_at: "2026-01-01T00:00:00Z".into(),
                 updated_at: "2026-01-01T00:00:00Z".into(),
@@ -8107,8 +9014,10 @@ mod tests {
                 agent_binding_schema_version: None,
                 model_offering_id: None,
                 resolved_model_name: None,
+                capability_server_refs_json: None,
                 runtime_profile: None,
-                provider_request_fingerprint: None,
+                start_request_fingerprint: None,
+                work_binding: None,
                 events: vec![],
                 created_at: "2026-01-01T00:00:00Z".into(),
                 updated_at: "2026-01-01T00:00:00Z".into(),
@@ -8245,6 +9154,52 @@ mod tests {
         for ar in &result.agent_results {
             assert_eq!(ar.status, "completed");
             assert!(ar.output.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_children_inherit_and_persist_durable_parent_interaction_mode() {
+        let (registry, run_engine, tracker) = setup();
+        let bindings = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = DelegationEngine::with_executor(
+            registry,
+            run_engine.clone(),
+            tracker,
+            Arc::new(CaptureRunBindingExecutor {
+                bindings: bindings.clone(),
+            }),
+        );
+        let request = fork_request("del-fork-auto", vec!["task-a", "task-b"], "writer");
+        run_engine
+            .start_run_with_context(
+                &request.parent_run_id,
+                &request.user_id,
+                &request.session_id,
+                crate::server::run::engine::RunStartContext {
+                    interaction_mode: RequestedTurnInteractionMode::Auto,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("persist Auto parent");
+
+        let result = engine.execute(request, "orch", None).await.unwrap();
+        let bindings = bindings.lock().unwrap();
+        assert_eq!(bindings.len(), 2);
+        assert!(
+            bindings
+                .iter()
+                .all(|binding| { binding.interaction_mode == RequestedTurnInteractionMode::Auto })
+        );
+        drop(bindings);
+
+        for child in result.agent_results {
+            let durable = run_engine
+                .load_run("user-1", &child.run_id)
+                .await
+                .unwrap()
+                .expect("durable fork child");
+            assert_eq!(durable.events[0]["data"]["interaction_mode"], "auto");
         }
     }
 
@@ -8707,6 +9662,38 @@ mod tests {
         assert_eq!(records[0].state, SubRunState::Created);
         assert_eq!(tracker.get_depth("r1").await, Some(1));
         assert_eq!(tracker.get_agent_id("r1").await.as_deref(), Some("a1"));
+    }
+
+    #[tokio::test]
+    async fn mailbox_lineage_registration_does_not_publish_a_second_spawn() {
+        use astra_messaging::DelegationLookup;
+        let broadcaster = Arc::new(crate::orchestration::ProgressBroadcaster::new(8));
+        let mut events = broadcaster.subscribe();
+        let tracker = DelegationTracker::new().with_progress_broadcaster(broadcaster);
+
+        DelegationLookup::record_sub_run(
+            &tracker,
+            astra_messaging::SubRunInfo {
+                run_id: "child-run".into(),
+                parent_run_id: "root-run".into(),
+                delegation_id: "root-run".into(),
+                agent_id: "reviewer-1".into(),
+                depth: 1,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            tracker.get_parent("child-run").await.as_deref(),
+            Some("root-run")
+        );
+        assert!(
+            matches!(
+                events.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "mailbox lineage bookkeeping must leave lifecycle publication to the spawner"
+        );
     }
 
     #[tokio::test]

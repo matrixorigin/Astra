@@ -26,6 +26,7 @@ fn stats_history_no_sessions_does_not_panic() {
 #[test]
 fn stats_current_session_reads_journal() {
     let _creds = isolate_credentials();
+    let (_sessions_tmp, _sessions_guard) = isolated_sessions_dir();
     use astra_services::session_analytics;
 
     // Create a real journal with known events
@@ -89,6 +90,7 @@ fn stats_current_session_reads_journal() {
 #[test]
 fn stats_history_aggregates_multiple_sessions() {
     let _creds = isolate_credentials();
+    let (_sessions_tmp, _sessions_guard) = isolated_sessions_dir();
     use astra_services::session_analytics;
 
     // Create two sessions

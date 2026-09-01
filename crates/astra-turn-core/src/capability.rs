@@ -30,6 +30,10 @@ pub enum Capability {
     LocalBackgroundTasks,
     /// Persisted session reflection service used by `reflect`.
     ReflectService,
+    /// Canonical Work planning bound to the current owner and session branch.
+    WorkPlanning,
+    /// Ability to establish canonical Work around the current durable run.
+    WorkLifecycle,
 }
 
 impl Capability {
@@ -44,6 +48,8 @@ impl Capability {
             Capability::PlanLifecycle => "plan_lifecycle",
             Capability::LocalBackgroundTasks => "local_background_tasks",
             Capability::ReflectService => "reflect_service",
+            Capability::WorkPlanning => "work_planning",
+            Capability::WorkLifecycle => "work_lifecycle",
         }
     }
 
@@ -51,10 +57,13 @@ impl Capability {
     ///
     /// An executor-gated capability cannot be satisfied by a service or static
     /// feature flag; the runtime must have an active executor handle (e.g., a
-    /// spawn-context for AgentSpawner) for tools requiring this capability to
-    /// pass admission.
+    /// spawn-context for AgentSpawner or an owner-scoped credential provider)
+    /// for tools requiring this capability to pass admission.
     pub fn is_executor_gated(self) -> bool {
-        matches!(self, Capability::AgentSpawner)
+        matches!(
+            self,
+            Capability::AgentSpawner | Capability::GitHubAuth | Capability::LocalBackgroundTasks
+        )
     }
 }
 
@@ -79,6 +88,8 @@ impl CapabilitySet {
             .with(Capability::LSPServer)
             .with(Capability::PlanLifecycle)
             .with(Capability::ReflectService)
+            .with(Capability::WorkPlanning)
+            .with(Capability::WorkLifecycle)
         // NOTE: LocalBackgroundTasks is intentionally excluded — it is an
         // edge-only capability (typed background tasks like bg-shell).
         // Server-side ToolEngine has no handlers for task_output / task_stop
@@ -96,6 +107,11 @@ impl CapabilitySet {
         } else {
             self
         }
+    }
+
+    pub fn without(mut self, capability: Capability) -> Self {
+        self.capabilities.remove(&capability);
+        self
     }
 
     pub fn has(&self, capability: Capability) -> bool {
@@ -147,6 +163,7 @@ mod tests {
             Capability::LSPServer,
             Capability::PlanLifecycle,
             Capability::ReflectService,
+            Capability::WorkPlanning,
         ] {
             assert!(caps.has(capability), "missing {capability:?}");
         }

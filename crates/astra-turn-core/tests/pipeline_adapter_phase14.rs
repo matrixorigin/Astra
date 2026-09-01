@@ -4,8 +4,6 @@
 //! Instead, it takes the data products that AgenticLoopState holds and packages them
 //! into ContextSources. The runtime wires this at the call site.
 
-use std::collections::HashMap;
-
 use astra_turn_core::context_sources::*;
 use astra_turn_core::microcompact::ProviderCacheStrategy;
 use astra_turn_core::optimize_limits::OptimizeLimits;
@@ -65,8 +63,6 @@ impl MockLoopState {
                 0,
             ),
             active_skills: self.active_skills.clone(),
-            recent_file_reads: HashMap::new(),
-            remaining_turns: 20,
             turn_index: self.turn_index,
             recovery: RecoveryState::default(),
             last_user_message: self

@@ -1,6 +1,4 @@
-use crate::data_layer::storage::{
-    bump_agent_session_event_count, insert_trace_event, touch_agent_session_activity,
-};
+use crate::data_layer::storage::{insert_trace_event, touch_agent_session_activity};
 use crate::server::run::lifecycle::{
     TranscriptPersistItem, TranscriptPersistPayload, persist_session_transcript_items_inner_in_tx,
 };
@@ -173,6 +171,44 @@ fn record_session_event_delta(
     }
 }
 
+type SessionEventDeltas = std::collections::BTreeMap<(String, String), (i64, Option<String>)>;
+
+async fn admit_event_owners_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    owners: impl IntoIterator<Item = (String, String)>,
+) -> Result<(), String> {
+    let owners = owners
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    for (user_id, session_id) in owners {
+        astra_services::storage::admit_session_event_write(tx, &session_id, &user_id, true)
+            .await
+            .map_err(|error| format!("admit session event write for {session_id}: {error}"))?;
+    }
+    Ok(())
+}
+
+async fn apply_touched_session_deltas_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    deltas: &SessionEventDeltas,
+) -> Result<(), String> {
+    for ((user_id, session_id), (delta, last_event_id)) in deltas {
+        if *delta <= 0 {
+            continue;
+        }
+        astra_services::storage::add_agent_session_event_count_or_create(
+            tx,
+            session_id,
+            user_id,
+            *delta,
+            last_event_id.as_deref(),
+        )
+        .await
+        .map_err(|error| format!("apply agent session event delta for {session_id}: {error}"))?;
+    }
+    Ok(())
+}
+
 fn bridge_transcript_item(event: &TurnCoreEventRecord) -> Option<TranscriptPersistItem> {
     let role = match event.event_type.as_str() {
         "user_query" => "user",
@@ -304,6 +340,7 @@ impl TurnCoreEventWriter for DatabaseTurnCoreEventWriter {
             .chain(plan.llm_response_event.iter())
             .filter_map(bridge_transcript_item)
             .collect::<Vec<_>>();
+        admit_event_owners_in_tx(&mut tx, transcript_owner.clone()).await?;
         let mut deltas =
             std::collections::BTreeMap::<(String, String), (i64, Option<String>)>::new();
         if let Some(event) = plan.user_query_event.as_ref() {
@@ -334,17 +371,7 @@ impl TurnCoreEventWriter for DatabaseTurnCoreEventWriter {
             .await
             .map_err(|error| format!("persist bridge transcript items: {error}"))?;
         }
-        for ((user_id, session_id), (delta, last_event_id)) in deltas {
-            bump_agent_session_event_count(
-                &mut *tx,
-                &session_id,
-                &user_id,
-                delta,
-                last_event_id.as_deref(),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        }
+        apply_touched_session_deltas_in_tx(&mut tx, &deltas).await?;
         tx.commit().await.map_err(|error| error.to_string())?;
         if let Some(snapshot_link_plan) = plan.snapshot_link_plan.as_ref()
             && let Err(error) = update_snapshot_llm_ids(&pool, snapshot_link_plan).await
@@ -378,7 +405,14 @@ impl TurnToolEventWriter for DatabaseTurnToolEventWriter {
         .await
         .map_err(|error| error.to_string())?;
         let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
-        let mut deltas = std::collections::BTreeMap::<(String, String), i64>::new();
+        admit_event_owners_in_tx(
+            &mut tx,
+            plan.events
+                .iter()
+                .map(|event| (event.user_id.clone(), event.session_id.clone())),
+        )
+        .await?;
+        let mut deltas = SessionEventDeltas::new();
         for event in &plan.events {
             if insert_tool_turn_event(
                 &mut tx,
@@ -388,16 +422,14 @@ impl TurnToolEventWriter for DatabaseTurnToolEventWriter {
             .await
             .map_err(|error| error.to_string())?
             {
-                *deltas
+                let entry = deltas
                     .entry((event.user_id.clone(), event.session_id.clone()))
-                    .or_default() += 1;
+                    .or_default();
+                entry.0 += 1;
+                entry.1 = Some(event.event_id.clone());
             }
         }
-        for ((user_id, session_id), delta) in deltas {
-            bump_agent_session_event_count(&mut *tx, &session_id, &user_id, delta, None)
-                .await
-                .map_err(|error| error.to_string())?;
-        }
+        apply_touched_session_deltas_in_tx(&mut tx, &deltas).await?;
         tx.commit().await.map_err(|error| error.to_string())?;
         Ok(())
     }
@@ -418,7 +450,10 @@ impl TraceEventWriter for DatabaseTraceEventWriter {
             .begin()
             .await
             .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
-        DatabaseTraceEventWriter::write_many_in_tx(&mut tx, events).await?;
+        let deltas = DatabaseTraceEventWriter::write_many_in_tx(&mut tx, events).await?;
+        apply_touched_session_deltas_in_tx(&mut tx, &deltas)
+            .await
+            .map_err(TraceWriteError::Persist)?;
         tx.commit()
             .await
             .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
@@ -432,36 +467,36 @@ impl DatabaseTraceEventWriter {
     pub(crate) async fn write_many_in_tx(
         tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
         events: Vec<TraceEvent>,
-    ) -> Result<(), TraceWriteError> {
+    ) -> Result<SessionEventDeltas, TraceWriteError> {
         if events.is_empty() {
-            return Ok(());
+            return Ok(SessionEventDeltas::new());
         }
-        let mut touched_sessions =
-            std::collections::BTreeMap::<(String, String), (i64, Option<String>)>::new();
+        admit_event_owners_in_tx(
+            tx,
+            events
+                .iter()
+                .map(|event| (event.user_id.clone(), event.session_id.clone())),
+        )
+        .await
+        .map_err(TraceWriteError::Persist)?;
+        let mut deltas = SessionEventDeltas::new();
         for event in &events {
             if insert_trace_event(tx, event)
                 .await
                 .map_err(|error| TraceWriteError::Persist(error.to_string()))?
             {
-                let entry = touched_sessions
+                let entry = deltas
                     .entry((event.user_id.clone(), event.session_id.clone()))
                     .or_default();
                 entry.0 += 1;
                 entry.1 = Some(event.event_id.clone());
             }
         }
-        for ((user_id, session_id), (delta, last_event_id)) in touched_sessions {
-            bump_agent_session_event_count(
-                &mut **tx,
-                &session_id,
-                &user_id,
-                delta,
-                last_event_id.as_deref(),
-            )
-            .await
-            .map_err(|error| TraceWriteError::Persist(error.to_string()))?;
-        }
-        Ok(())
+        // Session summary updates are deliberately deferred until the owning
+        // transaction commits. They use the actual INSERT IGNORE delta, not a
+        // COUNT(*) scan that would lock/scan the shared event table under
+        // concurrent fanout.
+        Ok(deltas)
     }
 }
 
@@ -472,6 +507,26 @@ impl TurnHookDbWriter for DatabaseTurnHookDbWriter {
             return Ok(());
         }
         let pool = self.get_pool()?;
+        // Resolve catalog metadata before opening the write transaction. This
+        // lookup uses the pool itself; doing it after `begin()` would hold one
+        // connection while waiting for a second connection and can deadlock a
+        // small pool (and unnecessarily consumes two leases in production).
+        let skill_versions = if let Some(skill_selection) = plan.skill_selection.as_ref() {
+            Some(
+                resolve_active_skill_versions(
+                    &pool,
+                    skill_selection
+                        .selected_skills
+                        .iter()
+                        .map(String::as_str)
+                        .collect(),
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+            )
+        } else {
+            None
+        };
         let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
         if let Some(decision_audit) = plan.decision_audit.as_ref() {
             insert_turn_decision_audit(&mut tx, decision_audit)
@@ -479,21 +534,13 @@ impl TurnHookDbWriter for DatabaseTurnHookDbWriter {
                 .map_err(|error| error.to_string())?;
         }
         if let Some(skill_selection) = plan.skill_selection.as_ref() {
-            let skill_versions = resolve_active_skill_versions(
-                &pool,
-                skill_selection
-                    .selected_skills
-                    .iter()
-                    .map(String::as_str)
-                    .collect(),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
             insert_turn_skill_selection(&mut tx, skill_selection)
                 .await
                 .map_err(|error| error.to_string())?;
             if let Some(first_skill_name) = skill_selection.selected_skills.first()
-                && let Some(skill_version) = skill_versions.get(first_skill_name)
+                && let Some(skill_version) = skill_versions
+                    .as_ref()
+                    .and_then(|versions| versions.get(first_skill_name))
             {
                 update_turn_skill_selection_version(
                     &mut tx,
@@ -631,7 +678,14 @@ impl TurnAuxiliaryEventWriter for DatabaseTurnAuxiliaryEventWriter {
         }
         let pool = self.get_pool()?;
         let mut tx = pool.begin().await.map_err(|error| error.to_string())?;
-        let mut deltas = std::collections::BTreeMap::<(String, String), i64>::new();
+        admit_event_owners_in_tx(
+            &mut tx,
+            events
+                .iter()
+                .map(|event| (event.user_id.clone(), event.session_id.clone())),
+        )
+        .await?;
+        let mut deltas = SessionEventDeltas::new();
         for event in events {
             let meta_tool_name = metadata_tool_name(event.metadata.as_ref());
             let meta_duration_ms = event
@@ -675,16 +729,14 @@ impl TurnAuxiliaryEventWriter for DatabaseTurnAuxiliaryEventWriter {
                 )
                 .await
                 .map_err(|error| error.to_string())?;
-                *deltas
+                let entry = deltas
                     .entry((event.user_id.clone(), event.session_id.clone()))
-                    .or_default() += 1;
+                    .or_default();
+                entry.0 += 1;
+                entry.1 = Some(event.event_id.clone());
             }
         }
-        for ((user_id, session_id), delta) in deltas {
-            bump_agent_session_event_count(&mut *tx, &session_id, &user_id, delta, None)
-                .await
-                .map_err(|error| error.to_string())?;
-        }
+        apply_touched_session_deltas_in_tx(&mut tx, &deltas).await?;
         tx.commit().await.map_err(|error| error.to_string())?;
         Ok(())
     }

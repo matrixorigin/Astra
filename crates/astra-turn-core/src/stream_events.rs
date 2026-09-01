@@ -384,6 +384,8 @@ pub fn build_approval_batch_required_event(
 pub fn build_tool_request_event(
     tool_call: &Map<String, Value>,
     identity: &EdgeDispatchIdentity,
+    execution_timeout_ms: u64,
+    execution_deadline_unix_ms: u64,
 ) -> Map<String, Value> {
     let edge = build_edge_tool_call_event(tool_call);
     let tool = edge
@@ -408,6 +410,21 @@ pub fn build_tool_request_event(
         (
             "request_id".to_string(),
             Value::String(identity.request_id.clone()),
+        ),
+        // The Server emits tool_request only after checking the exact tool
+        // against the wire-visible schema for this run/turn.  Edge executors
+        // consume this typed fact instead of independently reconstructing
+        // deferred activation from a different local prompt surface.
+        ("schema_admitted_by_server".to_string(), Value::Bool(true)),
+        // This is an execution authority issued by the server after policy
+        // admission. Edge must not extend it from a locally inferred default.
+        (
+            "execution_timeout_ms".to_string(),
+            Value::from(execution_timeout_ms),
+        ),
+        (
+            "execution_deadline_unix_ms".to_string(),
+            Value::from(execution_deadline_unix_ms),
         ),
         ("tool".to_string(), tool),
         ("args".to_string(), args),
@@ -578,7 +595,7 @@ mod tests {
             ),
         ]);
         let identity = EdgeDispatchIdentity::new("u1", "s1", "r1", "chain1", "call_abc");
-        let ev = build_tool_request_event(&tc, &identity);
+        let ev = build_tool_request_event(&tc, &identity, 300_000, 1_700_000_300_000);
         assert_eq!(ev.get("type").and_then(Value::as_str), Some("tool_request"));
         assert_eq!(ev.get("session_id").and_then(Value::as_str), Some("s1"));
         assert_eq!(ev.get("run_id").and_then(Value::as_str), Some("r1"));
@@ -589,6 +606,14 @@ mod tests {
         assert_eq!(
             ev.get("request_id").and_then(Value::as_str),
             Some("call_abc")
+        );
+        assert_eq!(
+            ev.get("schema_admitted_by_server").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            ev.get("execution_timeout_ms").and_then(Value::as_u64),
+            Some(300_000)
         );
         assert_eq!(ev.get("tool").and_then(Value::as_str), Some("bash"));
     }
@@ -1013,7 +1038,7 @@ mod tests {
             json!({"name": "read_file", "arguments": "{}"}),
         )]);
         let identity = EdgeDispatchIdentity::new("u1", "s1", "r1", "chain1", "call_missing");
-        let ev = build_tool_request_event(&tc, &identity);
+        let ev = build_tool_request_event(&tc, &identity, 300_000, 1_700_000_300_000);
         assert_eq!(
             ev.get("request_id").and_then(Value::as_str),
             Some("call_missing")

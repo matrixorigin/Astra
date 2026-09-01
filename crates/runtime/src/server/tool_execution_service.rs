@@ -1177,7 +1177,8 @@ mod tests {
     fn default_service_uses_the_canonical_builtin_registry() {
         let service = ToolExecutionService::new_for_test();
 
-        assert!(service.tool_registry().get("task_board").is_some());
+        assert!(service.tool_registry().get("task_board").is_none());
+        assert!(service.tool_registry().get("inspect_work_plan").is_some());
         assert!(service.tool_registry().get("read_file").is_some());
     }
 

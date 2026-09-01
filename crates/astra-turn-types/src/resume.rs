@@ -3,9 +3,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    CONVERSATION_PROJECTION_SCHEMA_VERSION, DEFAULT_CONVERSATION_BRANCH_ID,
-    SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION, SESSION_CURSOR_SCHEMA_VERSION,
-    SessionCursorV1, canonical_conversation_root,
+    CONVERSATION_PROJECTION_SCHEMA_VERSION, SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION,
+    SESSION_CURSOR_SCHEMA_VERSION, SessionCursorV1, canonical_conversation_root,
 };
 
 pub const CAUSAL_PROJECTION_ENVELOPE_SCHEMA_VERSION: u32 = 1;
@@ -24,7 +23,7 @@ pub enum CursorRelationV1 {
     Ahead,
     Divergent,
     DifferentIdentity,
-    LegacyUnknown,
+    UnsupportedSchema,
 }
 
 pub fn cursor_relation(candidate: &SessionCursorV1, head: &SessionCursorV1) -> CursorRelationV1 {
@@ -34,8 +33,10 @@ pub fn cursor_relation(candidate: &SessionCursorV1, head: &SessionCursorV1) -> C
     {
         return CursorRelationV1::DifferentIdentity;
     }
-    if candidate.schema_version == 0 || head.schema_version == 0 {
-        return CursorRelationV1::LegacyUnknown;
+    if candidate.schema_version != SESSION_CURSOR_SCHEMA_VERSION
+        || head.schema_version != SESSION_CURSOR_SCHEMA_VERSION
+    {
+        return CursorRelationV1::UnsupportedSchema;
     }
     if candidate == head {
         return CursorRelationV1::Exact;
@@ -84,15 +85,6 @@ pub struct CausalProjectionEnvelopeV1<T> {
 }
 
 impl<T> CausalProjectionEnvelopeV1<T> {
-    pub fn unversioned(payload: T) -> Self {
-        Self {
-            schema_version: CAUSAL_PROJECTION_ENVELOPE_SCHEMA_VERSION,
-            source_cursor: None,
-            verified_through_root: None,
-            payload,
-        }
-    }
-
     pub fn at_cursor(cursor: SessionCursorV1, payload: T) -> Self {
         Self {
             schema_version: CAUSAL_PROJECTION_ENVELOPE_SCHEMA_VERSION,
@@ -117,7 +109,7 @@ impl<T> CausalProjectionEnvelopeV1<T> {
             CursorRelationV1::Ahead
             | CursorRelationV1::Divergent
             | CursorRelationV1::DifferentIdentity
-            | CursorRelationV1::LegacyUnknown => false,
+            | CursorRelationV1::UnsupportedSchema => false,
         }
     }
 }
@@ -154,8 +146,6 @@ impl ResumeSourceV1 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ResumeDegradedReasonV1 {
-    LegacyCursorUnknown,
-    ProjectionCursorMissing,
     ProjectionCorrupt,
     ProjectionBehind,
     ProjectionDivergent,
@@ -195,30 +185,6 @@ pub struct ResumeActivationProjectionV1 {
     pub deferred_tool_names: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct ResumeTaskProjectionV1 {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub executing_plan_json: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_goal: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan_config_json: Option<String>,
-    #[serde(default)]
-    pub plan_execution_rounds: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub contract_json: Option<String>,
-}
-
-impl ResumeTaskProjectionV1 {
-    pub fn is_empty(&self) -> bool {
-        self.executing_plan_json.is_none()
-            && self.plan_goal.is_none()
-            && self.plan_config_json.is_none()
-            && self.plan_execution_rounds == 0
-            && self.contract_json.is_none()
-    }
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResumeProviderProjectionV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -243,8 +209,6 @@ pub struct ResumeProjectionSetV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<CausalProjectionEnvelopeV1<ResumeCheckpointProjectionV1>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task: Option<CausalProjectionEnvelopeV1<ResumeTaskProjectionV1>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<CausalProjectionEnvelopeV1<ResumeProviderProjectionV1>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation: Option<CausalProjectionEnvelopeV1<ResumeActivationProjectionV1>>,
@@ -255,9 +219,6 @@ impl ResumeProjectionSetV1 {
         Self {
             checkpoint: self
                 .checkpoint
-                .filter(|projection| projection.is_admissible_at(selected)),
-            task: self
-                .task
                 .filter(|projection| projection.is_admissible_at(selected)),
             provider: self
                 .provider
@@ -273,13 +234,6 @@ impl ResumeProjectionSetV1 {
         selected: &SessionCursorV1,
     ) -> Option<&ResumeCheckpointProjectionV1> {
         self.checkpoint
-            .as_ref()
-            .filter(|projection| projection.is_admissible_at(selected))
-            .map(|projection| &projection.payload)
-    }
-
-    pub fn task_at(&self, selected: &SessionCursorV1) -> Option<&ResumeTaskProjectionV1> {
-        self.task
             .as_ref()
             .filter(|projection| projection.is_admissible_at(selected))
             .map(|projection| &projection.payload)
@@ -426,21 +380,9 @@ pub enum ResumeSelectionError {
     UnsupportedCursorSchema(u32),
     #[error("resume projection schema {0} is unsupported")]
     UnsupportedProjectionSchema(u32),
-    #[error("legacy resume cursor carries versioned sequence or projection metadata")]
-    InvalidLegacyCursor,
 }
 
 fn validate_cursor_schema(cursor: &SessionCursorV1) -> Result<(), ResumeSelectionError> {
-    if cursor.schema_version == 0 {
-        if cursor.projection_schema != 0
-            || cursor.journal_event_seq != 0
-            || cursor.conversation_seq != 0
-            || cursor.compaction_generation != 0
-        {
-            return Err(ResumeSelectionError::InvalidLegacyCursor);
-        }
-        return Ok(());
-    }
     if cursor.schema_version != SESSION_CURSOR_SCHEMA_VERSION {
         return Err(ResumeSelectionError::UnsupportedCursorSchema(
             cursor.schema_version,
@@ -505,7 +447,7 @@ pub fn select_resume_candidate_index(
                     CursorRelationV1::Ahead => &candidate.cursor,
                     CursorRelationV1::Divergent
                     | CursorRelationV1::DifferentIdentity
-                    | CursorRelationV1::LegacyUnknown => {
+                    | CursorRelationV1::UnsupportedSchema => {
                         return Err(ResumeSelectionError::DivergentCanonicalHeads);
                     }
                 },
@@ -606,32 +548,11 @@ fn validates_materialized_root(
 ) -> bool {
     let root = canonical_conversation_root(messages);
     match cursor.projection_schema {
-        0 | CONVERSATION_PROJECTION_SCHEMA_VERSION => root == cursor.canonical_root_hash,
+        CONVERSATION_PROJECTION_SCHEMA_VERSION => root == cursor.canonical_root_hash,
         SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION => {
             source == ResumeSourceV1::CanonicalJournal && materialized_root == Some(root.as_str())
         }
         _ => false,
-    }
-}
-
-pub fn legacy_resume_cursor(
-    owner_id: &str,
-    session_id: &str,
-    completed_turn: u32,
-    messages: &[Value],
-) -> SessionCursorV1 {
-    SessionCursorV1 {
-        schema_version: 0,
-        owner_id: owner_id.to_string(),
-        session_id: session_id.to_string(),
-        branch_id: DEFAULT_CONVERSATION_BRANCH_ID.to_string(),
-        completed_turn,
-        journal_event_seq: 0,
-        conversation_seq: 0,
-        canonical_root_hash: canonical_conversation_root(messages),
-        projection_schema: 0,
-        compaction_generation: 0,
-        config_version_id: None,
     }
 }
 
@@ -741,48 +662,29 @@ mod tests {
     }
 
     #[test]
-    fn legacy_checkpoint_is_explicitly_degraded() {
-        let messages = vec![json!({"role": "user", "content": "legacy"})];
-        let candidate = ResumeCandidateV1 {
-            source: ResumeSourceV1::Checkpoint,
-            cursor: legacy_resume_cursor("owner", "session", 7, &messages),
-            conversation_messages: messages,
-            materialized_conversation_root_hash: None,
-            degraded_reasons: vec![
-                ResumeDegradedReasonV1::LegacyCursorUnknown,
-                ResumeDegradedReasonV1::CheckpointFallback,
-            ],
-            repair_actions: vec![ResumeRepairActionV1::InspectCanonicalJournal],
-            projections: ResumeProjectionSetV1::default(),
-        };
-        let selected = select_resume_bundle(None, [candidate]).unwrap();
-        assert!(selected.is_degraded());
-        assert_eq!(selected.cursor.schema_version, 0);
-    }
-
-    #[test]
-    fn equal_legacy_cursors_never_admit_a_side_projection_as_exact() {
-        let messages = vec![json!({"role": "user", "content": "legacy"})];
-        let cursor = legacy_resume_cursor("owner", "session", 7, &messages);
-        let envelope = CausalProjectionEnvelopeV1::at_cursor(cursor.clone(), json!({"state": 1}));
-
-        assert_eq!(
-            cursor_relation(&cursor, &cursor),
-            CursorRelationV1::LegacyUnknown
-        );
-        assert!(!envelope.is_admissible_at(&cursor));
-    }
-
-    #[test]
-    fn legacy_cursor_cannot_smuggle_a_versioned_ordering_clock() {
+    fn schema_zero_cursor_is_rejected_instead_of_degraded() {
         let mut descriptor = candidate(ResumeSourceV1::Checkpoint, 9, "candidate").descriptor();
         descriptor.cursor.schema_version = 0;
         descriptor.cursor.projection_schema = 0;
 
         assert_eq!(
             select_resume_candidate_index(None, &[descriptor]),
-            Err(ResumeSelectionError::InvalidLegacyCursor)
+            Err(ResumeSelectionError::UnsupportedCursorSchema(0))
         );
+    }
+
+    #[test]
+    fn schema_zero_cursor_never_admits_a_side_projection() {
+        let mut invalid = cursor(7, "invalid");
+        invalid.schema_version = 0;
+        invalid.projection_schema = 0;
+        let envelope = CausalProjectionEnvelopeV1::at_cursor(invalid.clone(), json!({"state": 1}));
+
+        assert_eq!(
+            cursor_relation(&invalid, &invalid),
+            CursorRelationV1::UnsupportedSchema
+        );
+        assert!(!envelope.is_admissible_at(&invalid));
     }
 
     #[test]
@@ -831,12 +733,6 @@ mod tests {
                     ..Default::default()
                 },
             )),
-            task: Some(CausalProjectionEnvelopeV1::unversioned(
-                ResumeTaskProjectionV1 {
-                    plan_goal: Some("unversioned task".into()),
-                    ..Default::default()
-                },
-            )),
             provider: None,
             activation: Some(CausalProjectionEnvelopeV1::at_cursor(
                 selected_cursor.clone(),
@@ -854,10 +750,6 @@ mod tests {
                 .checkpoint_at(&selected.cursor)
                 .is_none(),
             "an older checkpoint is not ancestry proof"
-        );
-        assert!(
-            selected.projections.task_at(&selected.cursor).is_none(),
-            "an unversioned task projection must not resume into a typed generation"
         );
         assert!(
             selected

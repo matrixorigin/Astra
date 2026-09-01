@@ -8,6 +8,7 @@ export const PATH_AUTH_LOGIN = "/auth/login";
 export const PATH_AUTH_REFRESH = "/auth/refresh";
 export const PATH_AUTH_LOGOUT = "/auth/logout";
 export const PATH_AUTH_ME = "/auth/me";
+export const PATH_AUTH_REAUTHENTICATE = "/auth/reauthenticate";
 
 export const PATH_SESSIONS = "/sessions";
 
@@ -27,6 +28,9 @@ export const PATH_SKILLS = "/skills";
 export const PATH_SKILLS_PUBLISH = "/skills/publish";
 
 export const PATH_RUNS = "/runs";
+export const PATH_WORKS = "/v1/works";
+export const ASTRA_WORK_API_MAJOR_HEADER = "x-astra-work-api-major";
+export const ASTRA_WORK_API_MAJOR = "1";
 
 export const PATH_EVENTS = "/events";
 
@@ -50,6 +54,294 @@ export function joinApiPath(
 
 export function sessionPath(sessionId: string): string {
   return `${PATH_SESSIONS}/${encodeURIComponent(sessionId)}`;
+}
+
+export function workPath(workId: string): string {
+  if (
+    workId === "." ||
+    workId === ".." ||
+    workId.length === 0 ||
+    Array.from(workId).length > 64 ||
+    !/^[A-Za-z0-9._-]+$/u.test(workId)
+  ) {
+    throw new TypeError("workId is not a canonical Work resource identity");
+  }
+  return `${PATH_WORKS}/${encodeURIComponent(workId)}`;
+}
+
+export function workSessionBindingPath(sessionId: string): string {
+  if (
+    sessionId === "." ||
+    sessionId === ".." ||
+    sessionId.length === 0 ||
+    Array.from(sessionId).length > 128 ||
+    !/^[A-Za-z0-9._-]+$/u.test(sessionId)
+  ) {
+    throw new TypeError("sessionId is not a canonical Work binding identity");
+  }
+  return `${PATH_WORKS}/session-bindings/${encodeURIComponent(sessionId)}`;
+}
+
+export function workReadCursorPath(workId: string): string {
+  return `${workPath(workId)}/read-cursor`;
+}
+
+export function workEventsPath(workId: string): string {
+  return `${workPath(workId)}/events`;
+}
+
+export function workBranchesPath(workId: string): string {
+  return `${workPath(workId)}/branches`;
+}
+
+export function workArchivedBranchesPath(workId: string): string {
+  return `${workBranchesPath(workId)}/archived`;
+}
+
+export function workBranchComparisonsPath(workId: string): string {
+  return `${workPath(workId)}/branch-comparisons`;
+}
+
+export function workActionsPath(workId: string): string {
+  return `${workPath(workId)}/actions`;
+}
+
+export function workCriteriaPath(workId: string): string {
+  return `${workPath(workId)}/criteria`;
+}
+
+function workBranchPath(
+  workId: string,
+  branchId: string,
+): string {
+  if (
+    branchId === "." ||
+    branchId === ".." ||
+    branchId.length === 0 ||
+    Array.from(branchId).length > 64 ||
+    !/^[A-Za-z0-9._-]+$/u.test(branchId)
+  ) {
+    throw new TypeError("branchId is not a canonical Work resource identity");
+  }
+  return `${workPath(workId)}/branches/${encodeURIComponent(branchId)}`;
+}
+
+export function workBranchTurnsPath(workId: string, branchId: string): string {
+  return `${workBranchPath(workId, branchId)}/turns`;
+}
+
+export function workBranchActionsPath(workId: string, branchId: string): string {
+  return `${workBranchPath(workId, branchId)}/actions`;
+}
+
+export function workBranchPatchArtifactPath(
+  workId: string,
+  branchId: string,
+  patchArtifactId: string,
+): string {
+  if (
+    patchArtifactId === "." ||
+    patchArtifactId === ".." ||
+    patchArtifactId.length === 0 ||
+    Array.from(patchArtifactId).length > 64 ||
+    !/^[A-Za-z0-9._-]+$/u.test(patchArtifactId)
+  ) {
+    throw new TypeError("patchArtifactId is not a canonical Work resource identity");
+  }
+  return `${workBranchPath(workId, branchId)}/patch-artifacts/${encodeURIComponent(patchArtifactId)}`;
+}
+
+export function workBranchPatchArtifactsPath(
+  workId: string,
+  branchId: string,
+): string {
+  return `${workBranchPath(workId, branchId)}/patch-artifacts`;
+}
+
+export function workBranchPatchArtifactContentPath(
+  workId: string,
+  branchId: string,
+  patchArtifactId: string,
+): string {
+  return `${workBranchPatchArtifactPath(workId, branchId, patchArtifactId)}/content`;
+}
+
+export function workPatchMaterializationsPath(
+  workId: string,
+  branchId: string,
+): string {
+  return `${workBranchPath(workId, branchId)}/patch-materializations`;
+}
+
+export function workPatchMaterializationPath(
+  workId: string,
+  branchId: string,
+  operationId: string,
+): string {
+  if (
+    operationId === "." ||
+    operationId === ".." ||
+    operationId.length === 0 ||
+    Array.from(operationId).length > 64 ||
+    !/^[A-Za-z0-9._-]+$/u.test(operationId)
+  ) {
+    throw new TypeError("operationId is not a canonical Work resource identity");
+  }
+  return `${workPatchMaterializationsPath(workId, branchId)}/${encodeURIComponent(operationId)}`;
+}
+
+export function workPatchCommitsPath(workId: string, branchId: string): string {
+  return `${workBranchPath(workId, branchId)}/patch-commits`;
+}
+
+export function workPatchCommitPath(
+  workId: string,
+  branchId: string,
+  operationId: string,
+): string {
+  if (
+    operationId === "." ||
+    operationId === ".." ||
+    operationId.length === 0 ||
+    Array.from(operationId).length > 64 ||
+    !/^[A-Za-z0-9._-]+$/u.test(operationId)
+  ) {
+    throw new TypeError("operationId is not a canonical Work resource identity");
+  }
+  return `${workPatchCommitsPath(workId, branchId)}/${encodeURIComponent(operationId)}`;
+}
+
+export function workBranchTranscriptPath(workId: string, branchId: string): string {
+  return `${workBranchPath(workId, branchId)}/transcript`;
+}
+
+export function workBranchAttachmentsPath(workId: string, branchId: string): string {
+  return `${workBranchPath(workId, branchId)}/attachments`;
+}
+
+export function workBranchAttachmentPath(
+  workId: string,
+  branchId: string,
+  attachmentId: string,
+): string {
+  if (
+    attachmentId === "." ||
+    attachmentId === ".." ||
+    attachmentId.length === 0 ||
+    Array.from(attachmentId).length > 128 ||
+    !/^[A-Za-z0-9._:-]+$/u.test(attachmentId)
+  ) {
+    throw new TypeError("attachmentId is not a canonical Work resource identity");
+  }
+  return `${workBranchAttachmentsPath(workId, branchId)}/${encodeURIComponent(attachmentId)}`;
+}
+
+export function workBranchControlOperationsPath(
+  workId: string,
+  branchId: string,
+): string {
+  return `${workBranchPath(workId, branchId)}/control-operations`;
+}
+
+export function workBranchControlOperationPath(
+  workId: string,
+  branchId: string,
+  operationId: string,
+): string {
+  if (
+    operationId === "." ||
+    operationId === ".." ||
+    operationId.length === 0 ||
+    Array.from(operationId).length > 64 ||
+    !/^[A-Za-z0-9._-]+$/u.test(operationId)
+  ) {
+    throw new TypeError("operationId is not a canonical Work resource identity");
+  }
+  return `${workBranchControlOperationsPath(workId, branchId)}/${encodeURIComponent(operationId)}`;
+}
+
+export function workBranchForksPath(workId: string, branchId: string): string {
+  return `${workBranchPath(workId, branchId)}/forks`;
+}
+
+export function workBranchForkPath(
+  workId: string,
+  branchId: string,
+  operationId: string,
+): string {
+  if (
+    operationId === "." ||
+    operationId === ".." ||
+    operationId.length === 0 ||
+    Array.from(operationId).length > 64 ||
+    !/^[A-Za-z0-9._-]+$/u.test(operationId)
+  ) {
+    throw new TypeError("operationId is not a canonical Work resource identity");
+  }
+  return `${workBranchForksPath(workId, branchId)}/${encodeURIComponent(operationId)}`;
+}
+
+export function workBranchDeletionOperationsPath(
+  workId: string,
+  branchId: string,
+): string {
+  return `${workBranchPath(workId, branchId)}/deletion-operations`;
+}
+
+export function workBranchDeletionOperationPath(
+  workId: string,
+  branchId: string,
+  operationId: string,
+): string {
+  if (
+    operationId === "." ||
+    operationId === ".." ||
+    operationId.length === 0 ||
+    Array.from(operationId).length > 64 ||
+    !/^[A-Za-z0-9._-]+$/u.test(operationId)
+  ) {
+    throw new TypeError("operationId is not a canonical Work resource identity");
+  }
+  return `${workBranchDeletionOperationsPath(workId, branchId)}/${encodeURIComponent(operationId)}`;
+}
+
+export function workBranchTaskGraphPath(
+  workId: string,
+  branchId: string,
+): string {
+  return `${workBranchPath(workId, branchId)}/task-graph`;
+}
+
+export function workBranchCriteriaProposalsPath(
+  workId: string,
+  branchId: string,
+): string {
+  return `${workBranchPath(workId, branchId)}/criteria-proposals`;
+}
+
+export function workBranchCriteriaProposalPath(
+  workId: string,
+  branchId: string,
+  proposalId: string,
+): string {
+  if (
+    proposalId === "." ||
+    proposalId === ".." ||
+    proposalId.length === 0 ||
+    Array.from(proposalId).length > 64 ||
+    !/^[A-Za-z0-9._-]+$/u.test(proposalId)
+  ) {
+    throw new TypeError("proposalId is not a canonical Work resource identity");
+  }
+  return `${workBranchCriteriaProposalsPath(workId, branchId)}/${encodeURIComponent(proposalId)}`;
+}
+
+export function workBranchCriteriaProposalDecisionPath(
+  workId: string,
+  branchId: string,
+  proposalId: string,
+): string {
+  return `${workBranchCriteriaProposalPath(workId, branchId, proposalId)}/decision`;
 }
 
 export function sessionAuditSummaryPath(sessionId: string): string {

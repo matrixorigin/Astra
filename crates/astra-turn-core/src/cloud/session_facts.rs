@@ -76,17 +76,28 @@ fn upsert_file(facts: &mut SessionFacts, path: String, action: String, turn: u32
 /// Uses `file_path` field if available, falls back to parsing `args_full` (untruncated)
 /// and finally `args_preview` (which may be truncated mid-path).
 fn extract_file_path(tc: &ToolCallRecord) -> Option<String> {
-    if let Some(fp) = &tc.file_path
-        && !fp.is_empty()
-    {
-        return Some(fp.clone());
-    }
-    if let Some(full) = tc.args_full.as_deref()
+    if let Some(full) = tc.authoritative_args_full()
         && let Some(path) = parse_path_from_json_preview(full)
     {
         return Some(path);
     }
+    // A live record with malformed/unavailable raw authority must not fall
+    // back to its display projection: `file_path` can itself be a redaction
+    // marker for a credential-shaped filename. Restored records may use the
+    // durable field only when it is plainly an ordinary path.
+    if tc.runtime_args_full.is_some() {
+        return None;
+    }
+    if let Some(fp) = &tc.file_path
+        && !fp.is_empty()
+        && !fp.contains("[REDACTED:")
+    {
+        return Some(fp.clone());
+    }
     let preview = tc.args_preview.as_deref()?;
+    if preview.contains("[REDACTED:") {
+        return None;
+    }
     parse_path_from_json_preview(preview)
 }
 
@@ -135,6 +146,7 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use astra_services::session_journal::{JournalEvent, JournalEventType, ToolCallRecord};
+    use serde_json::json;
 
     fn make_tc(
         name: &str,
@@ -264,6 +276,30 @@ mod tests {
             "crates/astra-cli/src/edge_tools/file_state_legacy_helpers.rs",
             "extractor must read the untruncated args_full, not the truncated preview"
         );
+    }
+
+    #[test]
+    fn live_path_authority_wins_over_redacted_file_projection() {
+        let raw_path = "/workspace/password=super_secret_value_123456";
+        let mut tc = make_tc(
+            "read_file",
+            true,
+            Some("[REDACTED:SECRET_ASSIGNMENT]"),
+            None,
+        );
+        tc.args_full = Some(json!({"path": "[REDACTED:SECRET_ASSIGNMENT]"}).to_string());
+        tc.runtime_args_full = Some(json!({"path": raw_path}).to_string());
+        let mut event = make_event(1, vec![tc]);
+
+        let mut facts = SessionFacts::default();
+        update_from_journal_event(&mut facts, &event);
+        assert_eq!(facts.active_files[0].path, raw_path);
+
+        let mut restored = event.tool_calls.take().unwrap().pop().unwrap();
+        restored.runtime_args_full = None;
+        let mut facts = SessionFacts::default();
+        update_from_journal_event(&mut facts, &make_event(1, vec![restored]));
+        assert!(facts.active_files.is_empty());
     }
 
     #[test]

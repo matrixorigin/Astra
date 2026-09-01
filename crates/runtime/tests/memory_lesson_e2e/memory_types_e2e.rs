@@ -145,7 +145,7 @@ fn extraction_to_batch_payload_full_pipeline() {
                 "content": encode(*cat, text),
                 "memory_type": cat.memoria_type(),
                 "trust_tier": cat.trust_tier(),
-                "source": {"agent": "extraction"},
+                "source": "astra:extraction",
             })
         })
         .collect();
@@ -159,7 +159,8 @@ fn extraction_to_batch_payload_full_pipeline() {
     );
     assert_eq!(batch[0]["memory_type"], "semantic");
     assert_eq!(batch[0]["trust_tier"], "T2");
-    assert_eq!(batch[0]["source"]["agent"], "extraction");
+    assert_eq!(batch[0]["source"], "astra:extraction");
+    assert!(batch[0]["source"].is_string());
 
     assert_eq!(batch[1]["memory_type"], "profile");
     assert_eq!(batch[1]["trust_tier"], "T1");

@@ -8,14 +8,14 @@
 //!
 //! **Edge → Server** (JSON text frames):
 //! ```text
-//! {"type": "edge_auth", "edge_agent_id": "...", "hostname": "...", "workspace_dir": "..."}
+//! {"type": "edge_auth", "edge_agent_id": "...", "interaction_api_major": "3", "hostname": "...", "workspace_dir": "..."}
 //! {"type": "edge_tool_result", "request_id": "...", "output": "...", "is_error": false, "tool_result_fields": {"exit_code": 0}}
 //! {"type": "edge_ping"}
 //! ```
 //!
 //! **Server → Edge** (JSON text frames):
 //! ```text
-//! {"type": "edge_auth_ok", "user_id": "..."}
+//! {"type": "edge_auth_ok", "user_id": "...", "interaction_api_major": "3"}
 //! {"type": "edge_auth_error", "message": "..."}
 //! {"type": "edge_tool_request", "request_id": "...", "tool": "...", "args": {...}}
 //! {"type": "edge_pong"}
@@ -69,8 +69,21 @@ impl std::fmt::Debug for RuntimeProcessAuthorizationContext {
     }
 }
 
-/// Timeout for tool execution on the edge agent.
+/// Default timeout for tool execution on the edge agent.
 pub const EDGE_TOOL_TIMEOUT_SECS: u64 = 300; // 5 minutes
+
+/// Hard upper bound for one edge invocation.
+///
+/// Long-session policies may extend a normal command beyond the interactive
+/// default, but every participant still needs a finite common custody window:
+/// the server's socket waiter, edge executor, and callback ledger must agree
+/// on this bound.  Thirty minutes covers ordinary dependency installation and
+/// builds without turning a cancelled invocation into an unbounded lease.
+pub const MAX_EDGE_TOOL_TIMEOUT_SECS: u64 = 1_800;
+
+/// Time reserved after edge execution ends for its durable result callback.
+/// This is transport settlement time, not additional tool execution time.
+pub const EDGE_TOOL_RESULT_GRACE_SECS: u64 = 10;
 
 /// Timeout for the initial auth message after WebSocket upgrade.
 pub const EDGE_AUTH_TIMEOUT_SECS: u64 = 30;
@@ -80,7 +93,7 @@ pub const EDGE_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 
 /// Messages sent from edge agent to server.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum EdgeClientMessage {
     /// Declare the authenticated edge agent's identity and capabilities.
     ///
@@ -89,6 +102,7 @@ pub enum EdgeClientMessage {
     #[serde(rename = "edge_auth")]
     Auth {
         edge_agent_id: String,
+        interaction_api_major: String,
         #[serde(default)]
         hostname: Option<String>,
         #[serde(default)]
@@ -114,16 +128,19 @@ pub enum EdgeClientMessage {
 
     /// Edge heartbeat.
     #[serde(rename = "edge_ping")]
-    Ping,
+    Ping {},
 }
 
 /// Messages sent from server to edge agent.
 #[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(tag = "type")]
+#[serde(tag = "type", deny_unknown_fields)]
 pub enum EdgeServerMessage {
     /// Authentication succeeded.
     #[serde(rename = "edge_auth_ok")]
-    AuthOk { user_id: String },
+    AuthOk {
+        user_id: String,
+        interaction_api_major: String,
+    },
 
     /// Authentication failed.
     #[serde(rename = "edge_auth_error")]
@@ -153,7 +170,7 @@ pub enum EdgeServerMessage {
 
     /// Server heartbeat response.
     #[serde(rename = "edge_pong")]
-    Pong,
+    Pong {},
 
     /// Server is closing the connection.
     #[serde(rename = "edge_closing")]
@@ -185,7 +202,7 @@ impl EdgeServerMessage {
             EdgeServerMessage::AuthOk { .. } => "auth_ok",
             EdgeServerMessage::AuthError { .. } => "auth_error",
             EdgeServerMessage::ToolRequest { .. } => "tool_request",
-            EdgeServerMessage::Pong => "pong",
+            EdgeServerMessage::Pong {} => "pong",
             EdgeServerMessage::Closing { .. } => "closing",
             EdgeServerMessage::ToolCancel { .. } => "tool_cancel",
             EdgeServerMessage::ToolResultAck { .. } => "tool_result_ack",
@@ -211,6 +228,7 @@ mod tests {
         let msg: EdgeClientMessage = serde_json::from_value(json!({
             "type": "edge_auth",
             "edge_agent_id": "my-edge",
+            "interaction_api_major": crate::AGENT_INTERACTION_API_MAJOR,
             "hostname": "laptop",
             "workspace_dir": "/home/user/project"
         }))
@@ -218,14 +236,56 @@ mod tests {
         match msg {
             EdgeClientMessage::Auth {
                 edge_agent_id,
+                interaction_api_major,
                 hostname,
                 ..
             } => {
                 assert_eq!(edge_agent_id, "my-edge");
+                assert_eq!(interaction_api_major, crate::AGENT_INTERACTION_API_MAJOR);
                 assert_eq!(hostname.as_deref(), Some("laptop"));
             }
             _ => panic!("expected Auth"),
         }
+    }
+
+    #[test]
+    fn edge_auth_requires_interaction_contract_identity() {
+        assert!(
+            serde_json::from_value::<EdgeClientMessage>(json!({
+                "type": "edge_auth",
+                "edge_agent_id": "legacy-edge",
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn edge_messages_reject_unknown_or_retired_fields() {
+        assert!(
+            serde_json::from_value::<EdgeClientMessage>(json!({
+                "type": "edge_auth",
+                "edge_agent_id": "edge-a",
+                "interaction_api_major": crate::AGENT_INTERACTION_API_MAJOR,
+                "token": "retired-inline-secret"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<EdgeClientMessage>(json!({
+                "type": "edge_ping",
+                "request_id": "retired"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<EdgeServerMessage>(json!({
+                "type": "edge_tool_cancel",
+                "request_id": "req-1",
+                "delivery_generation": 1,
+                "tool_call_id": "retired"
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -326,12 +386,12 @@ mod tests {
     #[test]
     fn edge_ping_deserializes() {
         let msg: EdgeClientMessage = serde_json::from_value(json!({"type": "edge_ping"})).unwrap();
-        assert!(matches!(msg, EdgeClientMessage::Ping));
+        assert!(matches!(msg, EdgeClientMessage::Ping {}));
     }
 
     #[test]
     fn edge_pong_serializes() {
-        let msg = EdgeServerMessage::Pong;
+        let msg = EdgeServerMessage::Pong {};
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "edge_pong");
     }
@@ -340,16 +400,22 @@ mod tests {
     fn edge_auth_ok_serializes() {
         let msg = EdgeServerMessage::AuthOk {
             user_id: "u-123".into(),
+            interaction_api_major: crate::AGENT_INTERACTION_API_MAJOR.into(),
         };
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "edge_auth_ok");
         assert_eq!(v["user_id"], "u-123");
+        assert_eq!(
+            v["interaction_api_major"],
+            crate::AGENT_INTERACTION_API_MAJOR
+        );
     }
 
     #[test]
     fn edge_client_auth_serializes() {
         let msg = EdgeClientMessage::Auth {
             edge_agent_id: "e1".into(),
+            interaction_api_major: crate::AGENT_INTERACTION_API_MAJOR.into(),
             hostname: Some("h".into()),
             workspace_dir: None,
             capabilities: Some(json!({
@@ -405,7 +471,7 @@ mod tests {
 
     #[test]
     fn edge_client_ping_serializes() {
-        let v = serde_json::to_value(&EdgeClientMessage::Ping).unwrap();
+        let v = serde_json::to_value(&EdgeClientMessage::Ping {}).unwrap();
         assert_eq!(v["type"], "edge_ping");
     }
 
@@ -445,15 +511,19 @@ mod tests {
 
     #[test]
     fn edge_server_auth_ok_deserializes() {
-        let msg: EdgeServerMessage =
-            serde_json::from_value(json!({"type": "edge_auth_ok", "user_id": "u1"})).unwrap();
+        let msg: EdgeServerMessage = serde_json::from_value(json!({
+            "type": "edge_auth_ok",
+            "user_id": "u1",
+            "interaction_api_major": crate::AGENT_INTERACTION_API_MAJOR,
+        }))
+        .unwrap();
         assert!(matches!(msg, EdgeServerMessage::AuthOk { .. }));
     }
 
     #[test]
     fn edge_server_pong_deserializes() {
         let msg: EdgeServerMessage = serde_json::from_value(json!({"type": "edge_pong"})).unwrap();
-        assert!(matches!(msg, EdgeServerMessage::Pong));
+        assert!(matches!(msg, EdgeServerMessage::Pong {}));
     }
 
     #[test]

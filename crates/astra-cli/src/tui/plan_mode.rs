@@ -7,7 +7,6 @@
 pub(crate) struct PlanModeUiSnapshot {
     pub(crate) active: bool,
     pub(crate) goal: String,
-    pub(crate) executing: bool,
 }
 
 pub(crate) fn capture_plan_mode_ui_snapshot(
@@ -20,7 +19,6 @@ pub(crate) fn capture_plan_mode_ui_snapshot(
             .as_ref()
             .map(|ps| ps.goal.trim().to_string())
             .unwrap_or_default(),
-        executing: state.executing_plan.is_some() || state.plan_handle.is_some(),
     }
 }
 
@@ -42,22 +40,19 @@ pub(crate) fn plan_transition_notice(
         (false, true) => {
             if after.goal.is_empty() {
                 Some(
-                    "Plan mode active - describe your goal. Use `go` to run once a plan is ready, or `/plan` to exit.".into(),
+                    "Plan mode active - describe your goal. Execution begins only after you approve the plan review; use `/plan` to exit.".into(),
                 )
             } else {
                 Some(format!(
-                    "Plan mode active - goal: {}. Send edits, `show` to inspect, `go` to run, `/plan` to exit.",
+                    "Plan mode active - goal: {}. Send refinements; execution begins only after you approve the plan review. Use `/plan` to exit.",
                     summarize_plan_goal(&after.goal)
                 ))
             }
         }
         (true, true) if before.goal != after.goal && !after.goal.is_empty() => Some(format!(
-            "Plan goal set - {}. Send edits, `show` to inspect, `go` to run, `/plan` to exit.",
+            "Plan goal set - {}. Send refinements; execution begins only after you approve the plan review. Use `/plan` to exit.",
             summarize_plan_goal(&after.goal)
         )),
-        (true, false) if after.executing => {
-            Some("Plan mode closed - execution is running in the background.".into())
-        }
         (true, false) => Some("Plan mode closed - back to normal chat.".into()),
         _ => None,
     }

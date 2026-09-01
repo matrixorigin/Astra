@@ -13,10 +13,48 @@ use axum::{Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, query};
 
+use crate::model_request_context::{ModelRequestContextRecord, ModelRequestEventStage};
+
 mod observation;
 mod request;
 use observation::{build_observation_envelope, graph_decision_ref, graph_event_ref};
 pub use request::ReflectRequest;
+
+// `agent_events.event_type` is a machine-owned discriminator. Reflection must
+// classify failure evidence from this closed set, never from substrings in a
+// newly introduced event name.
+const REFLECT_OVERVIEW_SQL: &str = "SELECT \
+       COUNT(*) AS total_events, \
+       COUNT(DISTINCT COALESCE(NULLIF(skill_name, ''), NULLIF(meta_tool_name, ''))) AS unique_skills, \
+       CAST(COALESCE(SUM(CASE WHEN event_type IN ('turn_error', 'error', 'tool_call_failed', 'tool_call_rejected', 'stall_detected', 'pipeline_alert') \
+            THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, \
+       CAST(MIN(created_at) AS CHAR) AS first_event, \
+       CAST(MAX(created_at) AS CHAR) AS last_event \
+     FROM agent_events WHERE session_id = ? AND user_id = ?";
+
+const REFLECT_ERROR_PATTERNS_SQL: &str = "SELECT COALESCE(NULLIF(skill_name, ''), NULLIF(meta_tool_name, ''), 'unknown') AS skill_name, event_type, COUNT(*) AS fail_count, \
+       SUBSTRING(COALESCE(MIN(content), ''), 1, 100) AS sample_error \
+     FROM agent_events \
+     WHERE session_id = ? AND user_id = ? \
+       AND event_type IN ('turn_error', 'error', 'tool_call_failed', 'tool_call_rejected', 'stall_detected', 'pipeline_alert') \
+     GROUP BY COALESCE(NULLIF(skill_name, ''), NULLIF(meta_tool_name, ''), 'unknown'), event_type \
+     ORDER BY fail_count DESC LIMIT 10";
+
+const REFLECT_RAW_ERRORS_SQL: &str = "SELECT COALESCE(NULLIF(skill_name, ''), NULLIF(meta_tool_name, ''), 'unknown') AS skill_name, event_type, \
+       SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 300) AS content \
+     FROM agent_events \
+     WHERE session_id = ? AND user_id = ? \
+       AND event_type IN ('turn_error', 'error', 'tool_call_failed', 'tool_call_rejected', 'stall_detected', 'pipeline_alert') \
+     ORDER BY created_at DESC LIMIT 30";
+
+const REFLECT_LLM_ROUND_LATENCY_SQL: &str = "SELECT \
+       COUNT(*) AS round_count, \
+       CAST(COALESCE(SUM(meta_duration_ms), 0) AS SIGNED) AS total_duration_ms, \
+       CAST(COALESCE(AVG(meta_duration_ms), 0) AS SIGNED) AS avg_duration_ms, \
+       CAST(COALESCE(MAX(meta_duration_ms), 0) AS SIGNED) AS max_duration_ms \
+     FROM agent_events \
+     WHERE session_id = ? AND user_id = ? \
+       AND event_type = 'llm_round' AND meta_duration_ms IS NOT NULL";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -62,6 +100,124 @@ pub struct AgentDeliveryRollup {
     pub failed: usize,
     pub cancelled: usize,
     pub other_terminal: usize,
+}
+
+/// Bounded, content-free performance facts sourced from the per-request
+/// context ledger. Keeping this separate from error diagnoses prevents
+/// reflection from guessing latency or cache behavior from tool names/prose.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct ModelRequestSummary {
+    terminal_requests: u64,
+    input: astra_turn_types::NormalizedPromptCacheUsage,
+    output_tokens: u64,
+    cache_invalidations: u64,
+}
+
+/// Bounded latency facts from durable `llm_round` events. This is deliberately
+/// an aggregate: reflection must explain where time went without replaying or
+/// returning prompt content.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct LlmRoundLatencySummary {
+    round_count: u64,
+    total_duration_ms: u64,
+    avg_duration_ms: u64,
+    max_duration_ms: u64,
+}
+
+impl LlmRoundLatencySummary {
+    fn from_parts(
+        round_count: i64,
+        total_duration_ms: i64,
+        avg_duration_ms: i64,
+        max_duration_ms: i64,
+    ) -> Option<Self> {
+        let values = [
+            round_count,
+            total_duration_ms,
+            avg_duration_ms,
+            max_duration_ms,
+        ];
+        if values.iter().any(|value| *value < 0) || round_count == 0 {
+            return None;
+        }
+        Some(Self {
+            round_count: round_count as u64,
+            total_duration_ms: total_duration_ms as u64,
+            avg_duration_ms: avg_duration_ms as u64,
+            max_duration_ms: max_duration_ms as u64,
+        })
+    }
+
+    fn render(&self) -> String {
+        format!(
+            "LLM latency: {} rounds; total {} ms, average {} ms, max {} ms.",
+            self.round_count, self.total_duration_ms, self.avg_duration_ms, self.max_duration_ms,
+        )
+    }
+}
+
+fn llm_round_latency_summary_from_row(
+    row: &impl ReflectRow,
+) -> Result<Option<LlmRoundLatencySummary>, sqlx::Error> {
+    Ok(LlmRoundLatencySummary::from_parts(
+        row.i64_column("round_count")?,
+        row.i64_column("total_duration_ms")?,
+        row.i64_column("avg_duration_ms")?,
+        row.i64_column("max_duration_ms")?,
+    ))
+}
+
+impl ModelRequestSummary {
+    fn from_records(records: &[ModelRequestContextRecord]) -> Option<Self> {
+        let mut summary = Self::default();
+        for record in records {
+            if record.stage != ModelRequestEventStage::Terminal {
+                continue;
+            }
+            summary.terminal_requests = summary.terminal_requests.saturating_add(1);
+            if let Some(usage) = record.event.usage.as_ref() {
+                summary.input.fresh_input_tokens = summary
+                    .input
+                    .fresh_input_tokens
+                    .saturating_add(usage.input.fresh_input_tokens);
+                summary.output_tokens = summary.output_tokens.saturating_add(usage.output_tokens);
+                summary.input.cache_read_tokens = summary
+                    .input
+                    .cache_read_tokens
+                    .saturating_add(usage.input.cache_read_tokens);
+                summary.input.cache_creation_tokens = summary
+                    .input
+                    .cache_creation_tokens
+                    .saturating_add(usage.input.cache_creation_tokens);
+            }
+            if !record.event.cache.invalidation_reasons.is_empty() {
+                summary.cache_invalidations = summary.cache_invalidations.saturating_add(1);
+            }
+        }
+        (summary.terminal_requests > 0).then_some(summary)
+    }
+
+    fn render(&self) -> String {
+        let total_input_tokens = self.input.total_input_tokens();
+        let cache_share = if total_input_tokens == 0 {
+            "unknown".to_string()
+        } else {
+            format!(
+                "{:.1}%",
+                self.input.cache_read_tokens as f64 / total_input_tokens as f64 * 100.0
+            )
+        };
+        format!(
+            "Model requests: {} terminal; cache read {cache_share} ({}/{} total input; {} fresh, {} cache write), {} model-context invalidation record(s), {} output tokens. Pipeline cache-break alerts, when present, are reported separately as session issues.",
+            self.terminal_requests,
+            self.input.cache_read_tokens,
+            total_input_tokens,
+            self.input.fresh_input_tokens,
+            self.input.cache_creation_tokens,
+            self.cache_invalidations,
+            self.output_tokens,
+        )
+    }
 }
 
 impl AgentDeliveryRollup {
@@ -125,9 +281,49 @@ pub(crate) struct Diagnosis {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct Insight {
     pub severity: String,
-    pub category: String,
+    pub kind: InsightKind,
     pub message: String,
     pub evidence: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum InsightKind {
+    ErrorRate,
+    ToolFailure { tool: String },
+    ToolConcentration { tool: String },
+    ModelFanout { decision_type: String },
+    EmptySession,
+    DecisionStall,
+}
+
+impl InsightKind {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::ErrorRate => "error_rate",
+            Self::ToolFailure { .. } => "tool_failure",
+            Self::ToolConcentration { .. } => "tool_concentration",
+            Self::ModelFanout { .. } => "model_fanout",
+            Self::EmptySession => "empty_session",
+            Self::DecisionStall => "decision_stall",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ReflectRecommendationSource {
+    Diagnosis {
+        category: astra_core::ErrorKind,
+        affected_tool: String,
+    },
+    Insight(InsightKind),
+    Session,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ReflectRecommendation {
+    pub summary: String,
+    pub source: ReflectRecommendationSource,
 }
 
 /// Raw error record fetched from DB for content analysis.
@@ -567,7 +763,7 @@ pub(crate) fn build_diagnoses(raw_errors: &[RawError]) -> Vec<Diagnosis> {
             let samples: Vec<String> = errors
                 .iter()
                 .filter_map(|e| {
-                    let snippet: String = e.content.chars().take(150).collect();
+                    let snippet = raw_error_evidence_summary(e);
                     if seen.insert(snippet.clone()) {
                         Some(snippet)
                     } else {
@@ -601,6 +797,23 @@ pub(crate) fn build_diagnoses(raw_errors: &[RawError]) -> Vec<Diagnosis> {
     });
 
     diagnoses
+}
+
+/// Preserve the distinction between an execution outcome and its emitted
+/// bytes. A non-zero command status says the command did not complete
+/// successfully; it does not retroactively make captured stdout fictitious.
+/// Reflection consumers still need to verify whether partial output is
+/// sufficient for the claim they are evaluating.
+fn raw_error_evidence_summary(error: &RawError) -> String {
+    let content: String = error.content.chars().take(150).collect();
+    if error.event_type == "tool_call_failed" {
+        format!(
+            "{} failed; captured output is observable, but command completeness is not established: {content}",
+            error.skill_name
+        )
+    } else {
+        format!("{} ({}): {content}", error.event_type, error.skill_name)
+    }
 }
 
 fn severity_for(kind: astra_core::ErrorKind, count: i64) -> &'static str {
@@ -665,6 +878,9 @@ fn summary_for(kind: astra_core::ErrorKind, tool: &str, count: i64) -> String {
         K::BudgetExhausted => {
             format!("Turn/session budget exhausted ({tool}): {count} occurrences")
         }
+        K::ProviderDeadline => {
+            format!("Provider inference deadline reached ({tool}): {count} occurrences")
+        }
         K::ToolRoundsExhausted => format!("Tool-round cap hit ({tool}): {count} occurrences"),
         K::ConnectionPoolExhausted => {
             format!(
@@ -697,14 +913,14 @@ pub(crate) fn generate_insights(
     if overview.total_events > 0 && overview.error_rate_pct > 30.0 {
         insights.push(Insight {
             severity: "critical".into(),
-            category: "error_pattern".into(),
+            kind: InsightKind::ErrorRate,
             message: format!("High error rate: {:.0}%", overview.error_rate_pct),
             evidence: format!("{}/{} events", overview.error_count, overview.total_events),
         });
     } else if overview.total_events > 0 && overview.error_rate_pct > 15.0 {
         insights.push(Insight {
             severity: "warning".into(),
-            category: "error_pattern".into(),
+            kind: InsightKind::ErrorRate,
             message: format!("Elevated error rate: {:.0}%", overview.error_rate_pct),
             evidence: format!("{}/{} events", overview.error_count, overview.total_events),
         });
@@ -714,7 +930,9 @@ pub(crate) fn generate_insights(
         if ep.fail_count >= 3 {
             insights.push(Insight {
                 severity: "warning".into(),
-                category: "tool_usage".into(),
+                kind: InsightKind::ToolFailure {
+                    tool: ep.skill_name.clone(),
+                },
                 message: format!("{} failed {} times", ep.skill_name, ep.fail_count),
                 evidence: ep.sample_error.clone(),
             });
@@ -728,7 +946,9 @@ pub(crate) fn generate_insights(
         if pct > 60.0 {
             insights.push(Insight {
                 severity: "info".into(),
-                category: "tool_usage".into(),
+                kind: InsightKind::ToolConcentration {
+                    tool: skill.clone(),
+                },
                 message: format!("Over-reliance on {skill}: {pct:.0}%"),
                 evidence: format!("{count}/{}", overview.total_events),
             });
@@ -739,7 +959,9 @@ pub(crate) fn generate_insights(
         if da.models_used > 2 && da.cnt >= 5 {
             insights.push(Insight {
                 severity: "info".into(),
-                category: "performance".into(),
+                kind: InsightKind::ModelFanout {
+                    decision_type: da.decision_type.clone(),
+                },
                 message: format!("{} used {} models", da.decision_type, da.models_used),
                 evidence: format!("{} decisions", da.cnt),
             });
@@ -749,7 +971,7 @@ pub(crate) fn generate_insights(
     if overview.total_events == 0 {
         insights.push(Insight {
             severity: "info".into(),
-            category: "performance".into(),
+            kind: InsightKind::EmptySession,
             message: "Empty session — no events recorded".into(),
             evidence: "0 events".into(),
         });
@@ -758,7 +980,7 @@ pub(crate) fn generate_insights(
     if overview.total_events > 20 && overview.total_decisions == 0 {
         insights.push(Insight {
             severity: "warning".into(),
-            category: "stall".into(),
+            kind: InsightKind::DecisionStall,
             message: "Many events but no decisions — possible routing issue".into(),
             evidence: format!("{} events, 0 decisions", overview.total_events),
         });
@@ -771,29 +993,42 @@ pub(crate) fn generate_recommendations(
     overview: &SessionOverview,
     diagnoses: &[Diagnosis],
     insights: &[Insight],
-) -> Vec<String> {
+) -> Vec<ReflectRecommendation> {
     let mut recs = Vec::new();
 
     // Priority: diagnoses first (specific, actionable)
     for d in diagnoses {
         let fix_hint = d.fix_hint.trim();
         if (d.severity == "critical" || d.severity == "warning") && !fix_hint.is_empty() {
-            recs.push(fix_hint.to_string());
+            recs.push(ReflectRecommendation {
+                summary: fix_hint.to_string(),
+                source: ReflectRecommendationSource::Diagnosis {
+                    category: d.category,
+                    affected_tool: d.affected_tool.clone(),
+                },
+            });
         }
     }
 
     // Then generic insight recommendations
     for insight in insights {
-        match (insight.severity.as_str(), insight.category.as_str()) {
-            (_, "tool_usage") if insight.message.contains("Over-reliance") => {
-                recs.push("Consider using more diverse tools for better coverage".into());
+        let summary = match insight.kind {
+            InsightKind::ToolConcentration { .. } => {
+                Some("Consider using more diverse tools for better coverage")
             }
-            (_, "stall") => {
-                recs.push(
-                    "Review agent routing — events without decisions may be misconfigured".into(),
-                );
+            InsightKind::DecisionStall => {
+                Some("Review agent routing — events without decisions may be misconfigured")
             }
-            _ => {}
+            InsightKind::ErrorRate
+            | InsightKind::ToolFailure { .. }
+            | InsightKind::ModelFanout { .. }
+            | InsightKind::EmptySession => None,
+        };
+        if let Some(summary) = summary {
+            recs.push(ReflectRecommendation {
+                summary: summary.to_string(),
+                source: ReflectRecommendationSource::Insight(insight.kind.clone()),
+            });
         }
     }
 
@@ -801,7 +1036,10 @@ pub(crate) fn generate_recommendations(
         && dur > 30.0
         && overview.total_events > 100
     {
-        recs.push("Long session — consider breaking into smaller tasks".into());
+        recs.push(ReflectRecommendation {
+            summary: "Long session — consider breaking into smaller tasks".into(),
+            source: ReflectRecommendationSource::Session,
+        });
     }
 
     recs.dedup();
@@ -872,7 +1110,8 @@ impl DatabaseReflectService {
         let event_rows = query(
             "SELECT event_id, event_type, \
                SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 180) AS content, \
-               skill_name, parent_event_id, causal_chain_id, \
+               COALESCE(NULLIF(skill_name, ''), NULLIF(meta_tool_name, '')) AS skill_name, \
+               parent_event_id, causal_chain_id, \
                DATE_FORMAT(created_at, '%Y-%m-%dT%H:%i:%s') AS created_at \
              FROM agent_events \
              WHERE session_id = ? AND user_id = ? \
@@ -995,21 +1234,12 @@ impl ReflectService for DatabaseReflectService {
         // ── Aggregate queries (no raw row fetches) ───────────────────────
 
         // Overview counts
-        let overview_row = query(
-            "SELECT \
-               COUNT(*) AS total_events, \
-               COUNT(DISTINCT skill_name) AS unique_skills, \
-               CAST(COALESCE(SUM(CASE WHEN event_type IN ('error', 'tool_call_failed', 'stall_detected') \
-                    OR event_type LIKE '%error%' OR event_type LIKE '%fail%' THEN 1 ELSE 0 END), 0) AS SIGNED) AS error_count, \
-               CAST(MIN(created_at) AS CHAR) AS first_event, \
-               CAST(MAX(created_at) AS CHAR) AS last_event \
-             FROM agent_events WHERE session_id = ? AND user_id = ?",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .fetch_one(&pool)
-        .await
-        .map_err(|e| internal_error(format!("overview query: {e}")))?;
+        let overview_row = query(REFLECT_OVERVIEW_SQL)
+            .bind(session_id)
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+            .map_err(|e| internal_error(format!("overview query: {e}")))?;
 
         let overview_agg = reflect_overview_agg_from_row(&overview_row)?;
 
@@ -1028,6 +1258,70 @@ impl ReflectService for DatabaseReflectService {
         .await
         .map_err(|e| internal_error(format!("agent delivery query: {e}")))?;
         let agent_delivery = agent_delivery_rollup_from_row(&agent_delivery_row)?;
+
+        // The request-context ledger is the authoritative, content-free
+        // source for prompt-cache accounting. Read a bounded session window
+        // only for an explicit reflection request; this keeps the hot turn
+        // path untouched while making cache misses explainable to the user.
+        let model_request_summary = if let Some(shared_pool) = self.pool.as_ref() {
+            match crate::model_request_context::list_model_request_context_events(
+                shared_pool,
+                user_id,
+                session_id,
+                500,
+            )
+            .await
+            {
+                Ok(records) => ModelRequestSummary::from_records(&records),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "astra_services::reflect",
+                        user_id = %user_id,
+                        session_id = %session_id,
+                        error = %error,
+                        "model request context unavailable during reflection"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // `agent_events.meta_duration_ms` is the durable timing projection
+        // for model rounds. Keep this optional like cache-context telemetry so
+        // older deployments can still produce the causal report when the
+        // metadata column is unavailable.
+        let llm_latency_summary = match query(REFLECT_LLM_ROUND_LATENCY_SQL)
+            .bind(session_id)
+            .bind(user_id)
+            .fetch_one(&pool)
+            .await
+        {
+            Ok(row) => match llm_round_latency_summary_from_row(&row) {
+                Ok(summary) => summary,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "astra_services::reflect",
+                        user_id = %user_id,
+                        session_id = %session_id,
+                        error = %error,
+                        "llm round latency row could not be decoded during reflection"
+                    );
+                    None
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_services::reflect",
+                    user_id = %user_id,
+                    session_id = %session_id,
+                    error = %error,
+                    "llm round latency unavailable during reflection"
+                );
+                None
+            }
+        };
 
         // Compute duration in Rust from timestamp strings
         let duration_minutes = compute_duration_minutes(
@@ -1060,9 +1354,12 @@ impl ReflectService for DatabaseReflectService {
 
         // Top skills
         let skill_rows = query(
-            "SELECT skill_name, COUNT(*) AS cnt \
-             FROM agent_events WHERE session_id = ? AND user_id = ? AND skill_name IS NOT NULL \
-             GROUP BY skill_name ORDER BY cnt DESC LIMIT 5",
+            "SELECT COALESCE(NULLIF(skill_name, ''), NULLIF(meta_tool_name, '')) AS skill_name, \
+               COUNT(*) AS cnt \
+             FROM agent_events WHERE session_id = ? AND user_id = ? \
+               AND COALESCE(NULLIF(skill_name, ''), NULLIF(meta_tool_name, '')) IS NOT NULL \
+             GROUP BY COALESCE(NULLIF(skill_name, ''), NULLIF(meta_tool_name, '')) \
+             ORDER BY cnt DESC LIMIT 5",
         )
         .bind(session_id)
         .bind(user_id)
@@ -1098,20 +1395,12 @@ impl ReflectService for DatabaseReflectService {
 
         // Error patterns (aggregated, for insights)
         let error_patterns = if analysis_view_queries_error_patterns(&request.analysis_view) {
-            let ep_rows = query(
-                "SELECT IFNULL(skill_name, 'unknown') AS skill_name, event_type, COUNT(*) AS fail_count, \
-                   SUBSTRING(COALESCE(MIN(content), ''), 1, 100) AS sample_error \
-                 FROM agent_events \
-                 WHERE session_id = ? AND user_id = ? AND (event_type IN ('error', 'tool_call_failed', 'stall_detected') \
-                   OR event_type LIKE '%error%' OR event_type LIKE '%fail%') \
-                 GROUP BY skill_name, event_type \
-                 ORDER BY fail_count DESC LIMIT 10",
-            )
-            .bind(session_id)
-            .bind(user_id)
-            .fetch_all(&pool)
-            .await
-            .map_err(|e| internal_error(format!("error patterns query: {e}")))?;
+            let ep_rows = query(REFLECT_ERROR_PATTERNS_SQL)
+                .bind(session_id)
+                .bind(user_id)
+                .fetch_all(&pool)
+                .await
+                .map_err(|e| internal_error(format!("error patterns query: {e}")))?;
 
             ep_rows
                 .iter()
@@ -1124,19 +1413,12 @@ impl ReflectService for DatabaseReflectService {
         // ── Diagnostic: fetch recent ACTUAL error content for root-cause analysis
         // Limit to 30 most recent errors — enough for pattern detection, bounded cost
         let raw_errors = {
-            let err_rows = query(
-                "SELECT IFNULL(skill_name, 'unknown') AS skill_name, event_type, \
-                   SUBSTRING(COALESCE(CAST(content AS CHAR), ''), 1, 300) AS content \
-                 FROM agent_events \
-                 WHERE session_id = ? AND user_id = ? AND (event_type IN ('error', 'tool_call_failed', 'stall_detected') \
-                   OR event_type LIKE '%error%' OR event_type LIKE '%fail%') \
-                 ORDER BY created_at DESC LIMIT 30",
-            )
-            .bind(session_id)
-            .bind(user_id)
-            .fetch_all(&pool)
-            .await
-            .map_err(|e| internal_error(format!("raw errors query: {e}")))?;
+            let err_rows = query(REFLECT_RAW_ERRORS_SQL)
+                .bind(session_id)
+                .bind(user_id)
+                .fetch_all(&pool)
+                .await
+                .map_err(|e| internal_error(format!("raw errors query: {e}")))?;
 
             err_rows
                 .iter()
@@ -1184,6 +1466,14 @@ impl ReflectService for DatabaseReflectService {
         if let Some(agent_delivery) = agent_delivery.render_session_summary() {
             summary.push(' ');
             summary.push_str(&agent_delivery);
+        }
+        if let Some(model_request_summary) = model_request_summary {
+            summary.push(' ');
+            summary.push_str(&model_request_summary.render());
+        }
+        if let Some(llm_latency_summary) = llm_latency_summary {
+            summary.push(' ');
+            summary.push_str(&llm_latency_summary.render());
         }
         let graph_slice = build_reflect_graph_slice(
             evidence_graph,
@@ -1352,14 +1642,19 @@ fn build_reflect_graph_slice(
 fn analysis_view_queries_error_patterns(analysis_view: &str) -> bool {
     matches!(
         analysis_view,
-        "overview" | "execution_errors" | "execution_tools" | "execution_trace"
+        "overview"
+            | "execution_errors"
+            | "execution_tools"
+            | "execution_trace"
+            | "runtime_errors"
+            | "runtime_trace"
     )
 }
 
 fn analysis_view_queries_recent_evidence_graph(analysis_view: &str) -> bool {
     matches!(
         analysis_view,
-        "overview" | "execution_tools" | "execution_trace"
+        "overview" | "execution_tools" | "execution_trace" | "runtime_trace"
     )
 }
 
@@ -1412,6 +1707,11 @@ use astra_core::ObservationGraphEdge;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_request_context::{
+        ModelRequestCache, ModelRequestCompaction, ModelRequestContextEvent,
+        ModelRequestContextRecord, ModelRequestIdentity, ModelRequestLineage, ModelRequestTopology,
+        ModelRequestUsage, ModelRequestWireComposition,
+    };
     use astra_core::EvidenceRef;
 
     #[test]
@@ -1429,6 +1729,114 @@ mod tests {
         assert!(summary.contains("3 interrupted"), "{summary}");
         assert!(summary.contains("0 other terminal"), "{summary}");
         assert!(!summary.contains("validated"), "{summary}");
+    }
+
+    #[test]
+    fn model_request_summary_uses_terminal_typed_cache_facts() {
+        let identity = ModelRequestIdentity {
+            request_id: "request-1".into(),
+            provider_response_id: Some("response-1".into()),
+            owner_scope: "user-1".into(),
+            session_id: Some("session-1".into()),
+            run_id: Some("run-1".into()),
+            harness_run_id: None,
+            turn: Some(1),
+            round: Some(0),
+            logical_attempt: 0,
+            physical_attempt: 0,
+            actor_id: Some("actor-1".into()),
+            execution_principal: Some("server".into()),
+            billing_scope: Some("user-1".into()),
+            auth_session_id: None,
+            device_instance_id: None,
+            agent_id: Some("agent-1".into()),
+            parent_run_id: None,
+            topology: ModelRequestTopology::ServerOnly,
+            interaction_owner: "server".into(),
+            loop_owner: "server".into(),
+            execution_binding: "server".into(),
+            provider: "openai".into(),
+            model: "deepseek-v4-flash".into(),
+            offering_id: "offering-1".into(),
+            inference_purpose: "primary_agent".into(),
+            provider_protocol: "openai".into(),
+            provider_wire_hash: "hash".into(),
+            provider_wire_bytes: 100,
+        };
+        let event = ModelRequestContextEvent {
+            schema: crate::model_request_context::MODEL_REQUEST_CONTEXT_SCHEMA.into(),
+            stage: ModelRequestEventStage::Terminal,
+            identity,
+            lineage: ModelRequestLineage::default(),
+            budget: Default::default(),
+            usage: Some(ModelRequestUsage {
+                input: astra_turn_types::NormalizedPromptCacheUsage::new(50, 950, 50),
+                output_tokens: 10,
+            }),
+            composition: Default::default(),
+            wire_composition: ModelRequestWireComposition::default(),
+            cache: ModelRequestCache {
+                invalidation_reasons: vec!["tool_schemas_changed".into()],
+                ..Default::default()
+            },
+            compaction: ModelRequestCompaction::default(),
+            terminal_status: Some("succeeded".into()),
+            usage_status: Some("provider_exact".into()),
+            error_kind: None,
+        };
+        let record = ModelRequestContextRecord {
+            event_id: "event-1".into(),
+            stage: ModelRequestEventStage::Terminal,
+            terminal_status: Some("succeeded".into()),
+            event,
+            created_at: chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0)
+                .unwrap()
+                .naive_utc(),
+        };
+
+        let summary =
+            ModelRequestSummary::from_records(&[record]).expect("terminal request summary");
+        assert_eq!(summary.terminal_requests, 1);
+        assert_eq!(
+            summary.input,
+            astra_turn_types::NormalizedPromptCacheUsage::new(50, 950, 50)
+        );
+        assert_eq!(summary.cache_invalidations, 1);
+        assert!(
+            summary
+                .render()
+                .contains("cache read 90.5% (950/1050 total input; 50 fresh, 50 cache write)"),
+            "{}",
+            summary.render()
+        );
+    }
+
+    #[test]
+    fn model_request_cache_share_uses_all_disjoint_input_buckets() {
+        let summary = ModelRequestSummary {
+            terminal_requests: 3,
+            input: astra_turn_types::NormalizedPromptCacheUsage::new(222, 76_800, 0),
+            output_tokens: 176,
+            cache_invalidations: 0,
+        };
+
+        let rendered = summary.render();
+        assert!(
+            rendered.contains("cache read 99.7% (76800/77022 total input; 222 fresh"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("34594"), "{rendered}");
+    }
+
+    #[test]
+    fn llm_round_latency_summary_is_bounded_and_content_free() {
+        let summary = LlmRoundLatencySummary::from_parts(13, 35_200, 2_707, 4_754)
+            .expect("valid latency aggregate");
+        assert_eq!(summary.round_count, 13);
+        assert!(summary.render().contains("total 35200 ms"));
+        assert!(summary.render().contains("max 4754 ms"));
+        assert!(LlmRoundLatencySummary::from_parts(0, 0, 0, 0).is_none());
+        assert!(LlmRoundLatencySummary::from_parts(1, -1, 0, 0).is_none());
     }
 
     fn make_overview(
@@ -1925,7 +2333,7 @@ mod tests {
         let ins = generate_insights(&ov, &[], &[]);
         assert!(
             ins.iter()
-                .any(|i| i.severity == "critical" && i.category == "error_pattern")
+                .any(|i| i.severity == "critical" && i.kind == InsightKind::ErrorRate)
         );
 
         // elevated (warning, 20%)
@@ -1933,20 +2341,20 @@ mod tests {
         let ins = generate_insights(&ov, &[], &[]);
         assert!(
             ins.iter()
-                .any(|i| i.severity == "warning" && i.category == "error_pattern")
+                .any(|i| i.severity == "warning" && i.kind == InsightKind::ErrorRate)
         );
 
         // low (no warning)
         let ov = make_overview(100, 5, vec![], 5, None);
         let ins = generate_insights(&ov, &[], &[]);
-        assert!(!ins.iter().any(|i| i.category == "error_pattern"));
+        assert!(!ins.iter().any(|i| i.kind == InsightKind::ErrorRate));
 
         // 100% (critical)
         let ov = make_overview(10, 10, vec![], 0, None);
         let ins = generate_insights(&ov, &[], &[]);
         assert!(
             ins.iter()
-                .any(|i| i.severity == "critical" && i.category == "error_pattern")
+                .any(|i| i.severity == "critical" && i.kind == InsightKind::ErrorRate)
         );
     }
 
@@ -1957,7 +2365,7 @@ mod tests {
         assert!(
             insights
                 .iter()
-                .any(|i| i.severity == "warning" && i.category == "error_pattern")
+                .any(|i| i.severity == "warning" && i.kind == InsightKind::ErrorRate)
         );
     }
 
@@ -1965,7 +2373,7 @@ mod tests {
     fn insight_no_error_rate_warning_when_low() {
         let overview = make_overview(100, 5, vec![], 5, None);
         let insights = generate_insights(&overview, &[], &[]);
-        assert!(!insights.iter().any(|i| i.category == "error_pattern"));
+        assert!(!insights.iter().any(|i| i.kind == InsightKind::ErrorRate));
     }
 
     #[test]
@@ -1981,7 +2389,7 @@ mod tests {
         let ins = generate_insights(&ov, &patterns, &[]);
         assert!(
             ins.iter()
-                .any(|i| i.category == "tool_usage" && i.message.contains("bash"))
+                .any(|i| matches!(&i.kind, InsightKind::ToolFailure { tool } if tool == "bash"))
         );
 
         // low count does not trigger
@@ -1994,7 +2402,7 @@ mod tests {
         let ins = generate_insights(&ov, &patterns, &[]);
         assert!(
             !ins.iter()
-                .any(|i| i.category == "tool_usage" && i.message.contains("bash"))
+                .any(|i| matches!(&i.kind, InsightKind::ToolFailure { tool } if tool == "bash"))
         );
     }
 
@@ -2003,7 +2411,11 @@ mod tests {
         // over-reliance detected
         let ov = make_overview(100, 0, vec![("bash".into(), 75)], 5, None);
         let ins = generate_insights(&ov, &[], &[]);
-        assert!(ins.iter().any(|i| i.message.contains("Over-reliance")));
+        assert!(
+            ins.iter().any(
+                |i| matches!(&i.kind, InsightKind::ToolConcentration { tool } if tool == "bash")
+            )
+        );
 
         // balanced usage — no warning
         let ov = make_overview(
@@ -2037,7 +2449,11 @@ mod tests {
     fn insight_stall_many_events_no_decisions() {
         let overview = make_overview(50, 0, vec![], 0, None);
         let insights = generate_insights(&overview, &[], &[]);
-        assert!(insights.iter().any(|i| i.category == "stall"));
+        assert!(
+            insights
+                .iter()
+                .any(|i| i.kind == InsightKind::DecisionStall)
+        );
     }
 
     #[test]
@@ -2047,7 +2463,7 @@ mod tests {
         assert!(
             insights
                 .iter()
-                .any(|i| i.severity == "critical" && i.category == "error_pattern")
+                .any(|i| i.severity == "critical" && i.kind == InsightKind::ErrorRate)
         );
     }
 
@@ -2065,6 +2481,16 @@ mod tests {
             insights.is_empty(),
             "large but healthy sessions should not produce low-signal insights: {insights:?}"
         );
+    }
+
+    #[test]
+    fn runtime_error_view_queries_error_patterns() {
+        assert!(analysis_view_queries_error_patterns("runtime_errors"));
+        assert!(analysis_view_queries_error_patterns("runtime_trace"));
+        assert!(analysis_view_queries_recent_evidence_graph("runtime_trace"));
+        assert!(!analysis_view_queries_recent_evidence_graph(
+            "runtime_errors"
+        ));
     }
 
     #[test]
@@ -2093,7 +2519,7 @@ mod tests {
         }];
         let insights = vec![Insight {
             severity: "warning".into(),
-            category: "stall".into(),
+            kind: InsightKind::DecisionStall,
             message: "Many events but no decisions — possible routing issue".into(),
             evidence: "50 events, 0 decisions".into(),
         }];
@@ -2101,17 +2527,21 @@ mod tests {
         let recs = generate_recommendations(&overview, &diagnoses, &insights);
 
         assert_eq!(
-            recs,
-            vec!["Review agent routing — events without decisions may be misconfigured"]
+            recs[0].summary,
+            "Review agent routing — events without decisions may be misconfigured"
         );
-        assert!(recs.iter().all(|rec| !rec.trim().is_empty()));
+        assert_eq!(
+            recs[0].source,
+            ReflectRecommendationSource::Insight(InsightKind::DecisionStall)
+        );
+        assert!(recs.iter().all(|rec| !rec.summary.trim().is_empty()));
     }
 
     #[test]
     fn recommendations_long_session() {
         let overview = make_overview(200, 0, vec![], 10, Some(45.0));
         let recs = generate_recommendations(&overview, &[], &[]);
-        assert!(recs.iter().any(|r| r.contains("breaking")));
+        assert!(recs.iter().any(|r| r.summary.contains("breaking")));
     }
 
     #[test]
@@ -2141,7 +2571,13 @@ mod tests {
             affected_tool: "bash".into(),
             fix_hint: "Narrow Command Scope".into(),
         }];
-        let recommendations = vec![" narrow   command scope ".to_string()];
+        let recommendations = vec![ReflectRecommendation {
+            summary: " narrow   command scope ".to_string(),
+            source: ReflectRecommendationSource::Diagnosis {
+                category: astra_core::ErrorKind::ToolTimeout,
+                affected_tool: "bash".to_string(),
+            },
+        }];
 
         let (summary, observations, evidence, action_hints, failure_clusters) =
             build_observation_envelope(
@@ -2191,6 +2627,97 @@ mod tests {
     }
 
     #[test]
+    fn recommendation_wording_cannot_spoof_an_observation_source() {
+        let request = ReflectRequest::from_observation_params(
+            Some("execution"),
+            Some("errors"),
+            None,
+            None,
+            20,
+            "what next?",
+        );
+        let overview = make_overview(10, 3, vec![("bash".into(), 5)], 2, Some(3.0));
+        let diagnoses = vec![Diagnosis {
+            category: astra_core::ErrorKind::ToolTimeout,
+            severity: "warning".into(),
+            summary: "bash timed out".into(),
+            samples: vec!["timeout".into()],
+            occurrences: 1,
+            affected_tool: "bash".into(),
+            fix_hint: "Narrow Command Scope".into(),
+        }];
+        let deceptive = ReflectRecommendation {
+            summary: "Narrow Command Scope".into(),
+            source: ReflectRecommendationSource::Insight(InsightKind::EmptySession),
+        };
+
+        let (_, _, _, hints, _) = build_observation_envelope(
+            "sess-no-text-join",
+            &request,
+            &overview,
+            &diagnoses,
+            &[],
+            &[deceptive],
+            None,
+        );
+
+        assert_eq!(hints.len(), 1);
+        assert!(hints[0].observation_refs.is_empty());
+        assert_eq!(hints[0].confidence.classification, Some(0.50));
+    }
+
+    #[test]
+    fn diagnosis_observation_identity_is_stable_across_reordering() {
+        let request = ReflectRequest::from_observation_params(
+            Some("execution"),
+            Some("errors"),
+            None,
+            None,
+            20,
+            "what failed?",
+        );
+        let overview = make_overview(10, 3, vec![], 2, Some(3.0));
+        let timeout = Diagnosis {
+            category: astra_core::ErrorKind::ToolTimeout,
+            severity: "warning".into(),
+            summary: "bash timed out".into(),
+            samples: vec![],
+            occurrences: 1,
+            affected_tool: "bash".into(),
+            fix_hint: "narrow scope".into(),
+        };
+        let database = Diagnosis {
+            category: astra_core::ErrorKind::DatabaseError,
+            severity: "critical".into(),
+            summary: "database unavailable".into(),
+            samples: vec![],
+            occurrences: 1,
+            affected_tool: "work_repository".into(),
+            fix_hint: "retry after recovery".into(),
+        };
+        let refs = |diagnoses: &[Diagnosis]| {
+            let (_, observations, _, _, _) = build_observation_envelope(
+                "sess-stable-refs",
+                &request,
+                &overview,
+                diagnoses,
+                &[],
+                &[],
+                None,
+            );
+            observations
+                .into_iter()
+                .map(|observation| observation.ref_id)
+                .collect::<BTreeSet<_>>()
+        };
+
+        assert_eq!(
+            refs(&[timeout.clone(), database.clone()]),
+            refs(&[database, timeout])
+        );
+    }
+
+    #[test]
     fn observation_envelope_classifies_diagnoses_independent_of_overview_request() {
         let request =
             ReflectRequest::from_observation_params(None, None, None, None, 20, "what went wrong?");
@@ -2235,21 +2762,20 @@ mod tests {
         let insights = vec![
             Insight {
                 severity: "warning".into(),
-                category: "stall".into(),
+                kind: InsightKind::DecisionStall,
                 message: "Many events but no decisions - possible routing issue".into(),
                 evidence: "80 events, 0 decisions".into(),
             },
             Insight {
                 severity: "info".into(),
-                category: "tool_usage".into(),
+                kind: InsightKind::ToolConcentration {
+                    tool: "bash".into(),
+                },
                 message: "Over-reliance on bash: 80%".into(),
                 evidence: "64/80".into(),
             },
         ];
-        let recommendations = vec![
-            "Review agent routing — EVENTS WITHOUT DECISIONS may be misconfigured".to_string(),
-            "Consider using more DIVERSE TOOLS for better coverage".to_string(),
-        ];
+        let recommendations = generate_recommendations(&overview, &[], &insights);
 
         let (_, observations, _, action_hints, failure_clusters) = build_observation_envelope(
             "sess-insights",
@@ -2448,7 +2974,13 @@ mod tests {
             &overview,
             &diagnoses,
             &[],
-            &["narrow command scope".to_string()],
+            &[ReflectRecommendation {
+                summary: "narrow command scope".to_string(),
+                source: ReflectRecommendationSource::Diagnosis {
+                    category: astra_core::ErrorKind::ToolTimeout,
+                    affected_tool: "bash".to_string(),
+                },
+            }],
             Some(&graph),
         );
         let graph_slice = build_reflect_graph_slice(
@@ -2842,23 +3374,19 @@ mod tests {
              FROM agent_events WHERE session_id = ? AND user_id = ? \
              GROUP BY event_type ORDER BY cnt DESC LIMIT 5",
             // skills
-            "SELECT skill_name, COUNT(*) AS cnt \
-             FROM agent_events WHERE session_id = ? AND user_id = ? AND skill_name IS NOT NULL \
-             GROUP BY skill_name ORDER BY cnt DESC LIMIT 5",
+            "SELECT COALESCE(NULLIF(skill_name, ''), NULLIF(meta_tool_name, '')) AS skill_name, \
+               COUNT(*) AS cnt \
+             FROM agent_events WHERE session_id = ? AND user_id = ? \
+               AND COALESCE(NULLIF(skill_name, ''), NULLIF(meta_tool_name, '')) IS NOT NULL \
+             GROUP BY COALESCE(NULLIF(skill_name, ''), NULLIF(meta_tool_name, '')) \
+             ORDER BY cnt DESC LIMIT 5",
             // decisions
             "SELECT d.decision_type, COUNT(*) AS cnt, \
                COUNT(DISTINCT d.model_used) AS models_used \
              FROM ctx_decision_audits d \
              WHERE d.user_id = ? AND d.session_id = ? \
              GROUP BY d.decision_type ORDER BY cnt DESC LIMIT 5",
-            // error patterns
-            "SELECT IFNULL(skill_name, 'unknown') AS skill_name, event_type, COUNT(*) AS fail_count, \
-               SUBSTRING(COALESCE(MIN(content), ''), 1, 100) AS sample_error \
-             FROM agent_events \
-             WHERE session_id = ? AND user_id = ? AND (event_type IN ('error', 'tool_call_failed', 'stall_detected') \
-               OR event_type LIKE '%error%' OR event_type LIKE '%fail%') \
-             GROUP BY skill_name, event_type \
-             ORDER BY fail_count DESC LIMIT 10",
+            REFLECT_ERROR_PATTERNS_SQL,
         ];
 
         for sql in &queries {
@@ -2925,11 +3453,52 @@ mod tests {
                 } else {
                     base
                 };
+                if base.starts_with("COALESCE(") {
+                    assert!(
+                        ["SKILL_NAME", "META_TOOL_NAME"].iter().all(|column| {
+                            group_cols.iter().any(|grouped| grouped.contains(column))
+                        }),
+                        "COALESCE identity columns are not grouped: {group_cols:?}\nQuery: {sql}"
+                    );
+                    continue;
+                }
                 assert!(
                     group_cols.iter().any(|g| g.contains(check_col)),
                     "SELECT column '{col}' not in GROUP BY {group_cols:?}\nQuery: {sql}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn reflection_failure_queries_use_only_explicit_event_discriminators() {
+        for sql in [
+            REFLECT_OVERVIEW_SQL,
+            REFLECT_ERROR_PATTERNS_SQL,
+            REFLECT_RAW_ERRORS_SQL,
+        ] {
+            assert!(!sql.to_ascii_uppercase().contains(" LIKE "), "{sql}");
+            for event_type in [
+                "'turn_error'",
+                "'error'",
+                "'tool_call_failed'",
+                "'tool_call_rejected'",
+                "'stall_detected'",
+                "'pipeline_alert'",
+            ] {
+                assert!(sql.contains(event_type), "missing {event_type} in {sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn reflection_failure_queries_recover_tool_identity_from_trace_metadata() {
+        for sql in [REFLECT_ERROR_PATTERNS_SQL, REFLECT_RAW_ERRORS_SQL] {
+            assert!(
+                sql.contains("NULLIF(skill_name, '')")
+                    && sql.contains("NULLIF(meta_tool_name, '')"),
+                "live trace events store tool identity in meta_tool_name: {sql}"
+            );
         }
     }
 
@@ -3112,6 +3681,25 @@ mod tests {
     }
 
     #[test]
+    fn failed_command_evidence_does_not_erase_captured_output() {
+        let errors = vec![RawError {
+            skill_name: "bash".into(),
+            event_type: "tool_call_failed".into(),
+            content: "exit code 2\nstdout:\nsrc/lib.rs:42: matched evidence".into(),
+        }];
+
+        let diagnoses = build_diagnoses(&errors);
+        let sample = &diagnoses[0].samples[0];
+        assert!(sample.contains("bash failed"), "{sample}");
+        assert!(sample.contains("captured output is observable"), "{sample}");
+        assert!(
+            sample.contains("command completeness is not established"),
+            "{sample}"
+        );
+        assert!(sample.contains("matched evidence"), "{sample}");
+    }
+
+    #[test]
     fn diagnoses_empty_on_no_errors() {
         assert!(build_diagnoses(&[]).is_empty());
     }
@@ -3147,7 +3735,14 @@ mod tests {
             fix_hint: "Check ulimit -u".into(),
         }];
         let recs = generate_recommendations(&overview, &diags, &[]);
-        assert_eq!(recs, vec!["Check ulimit -u"]);
+        assert_eq!(recs[0].summary, "Check ulimit -u");
+        assert_eq!(
+            recs[0].source,
+            ReflectRecommendationSource::Diagnosis {
+                category: astra_core::ErrorKind::ResourceLimit,
+                affected_tool: "bash".into(),
+            }
+        );
     }
 
     #[test]

@@ -1492,8 +1492,6 @@ async fn run_cli_turn(
         .arg(&tenant.session_id)
         .arg("--bare")
         .arg("--no-instructions")
-        .arg("--max-turns")
-        .arg("2")
         .arg("--yes")
         .arg(prompt)
         .env("ASTRA_CLI_CREDENTIALS_DIR", credentials_dir)

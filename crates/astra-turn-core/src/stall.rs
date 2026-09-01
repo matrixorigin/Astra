@@ -749,9 +749,11 @@ mod tests {
     // ── CLI agentic: sig/name helpers + name-only stall ──
 
     #[test]
-    fn round_tool_call_sig_and_names_shapes() {
-        // Flat shape
-        let c1 = vec![serde_json::json!({"name": "read_file", "arguments": {"path": "a.rs"}})];
+    fn round_tool_call_sig_and_names_records_exact_canonical_calls() {
+        let c1 = vec![serde_json::json!({
+            "id": "call_1", "type": "function",
+            "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}
+        })];
         let (sigs, names) = round_tool_call_sig_and_names(&c1);
         assert!(
             sigs.iter()
@@ -759,15 +761,14 @@ mod tests {
         );
         assert!(names.contains("read_file"));
 
-        // Canonical (OpenAI) shape
         let c2 = vec![serde_json::json!({
-            "id": "call_1", "type": "function",
-            "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}
+            "id": "call_2", "type": "function",
+            "function": {"name": "read_file", "arguments": "{\"path\":\"b.rs\"}"}
         })];
         let (sigs, names) = round_tool_call_sig_and_names(&c2);
         assert!(
             sigs.iter()
-                .any(|s| s.contains("read_file") && s.contains("a.rs"))
+                .any(|s| s.contains("read_file") && s.contains("b.rs"))
         );
         assert!(names.contains("read_file"));
     }

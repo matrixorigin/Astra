@@ -2,7 +2,7 @@
 //!
 //! These signals suppress repeated best-effort work; they are not safety or
 //! permission boundaries. Selector failures are keyed by model. Memoria uses
-//! one endpoint-wide exponential cooldown with no half-open probe state.
+//! an owner-scoped exponential cooldown with one time-bounded recovery probe.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -79,12 +79,13 @@ struct MemoriaHealthInner {
     retry_after: Option<Instant>,
 }
 
-/// Endpoint-wide availability hint for background extraction.
+/// Owner-scoped availability hint for background extraction.
 ///
-/// A cooldown is deliberately simpler than a three-state circuit breaker:
-/// after enough consecutive failures, calls pause until `retry_after`. The
-/// first caller after that time retries normally; there is no probe slot to
-/// leak or special cancellation path to maintain.
+/// After enough consecutive failures, calls pause until `retry_after`. The
+/// first caller after that time reserves the next cooldown interval as a
+/// recovery probe; concurrent callers remain suppressed. Success clears the
+/// state, failure extends exponential backoff, and a cancelled probe becomes
+/// retryable when its bounded reservation expires.
 #[derive(Debug)]
 pub struct MemoriaHealth {
     inner: Mutex<MemoriaHealthInner>,
@@ -112,16 +113,17 @@ impl MemoriaHealth {
     }
 
     pub fn admit(&self) -> MemoriaAdmit {
-        let Ok(inner) = self.inner.lock() else {
+        let Ok(mut inner) = self.inner.lock() else {
             return MemoriaAdmit::Ready;
         };
-        if inner
-            .retry_after
-            .is_some_and(|retry_at| Instant::now() < retry_at)
-        {
-            MemoriaAdmit::CoolingDown
-        } else {
-            MemoriaAdmit::Ready
+        let now = Instant::now();
+        match inner.retry_after {
+            Some(retry_at) if now < retry_at => MemoriaAdmit::CoolingDown,
+            Some(_) => {
+                inner.retry_after = Some(now + self.base_cooldown);
+                MemoriaAdmit::Ready
+            }
+            None => MemoriaAdmit::Ready,
         }
     }
 
@@ -202,6 +204,11 @@ mod tests {
         assert_eq!(health.admit(), MemoriaAdmit::CoolingDown);
         std::thread::sleep(Duration::from_millis(15));
         assert_eq!(health.admit(), MemoriaAdmit::Ready);
+        assert_eq!(
+            health.admit(),
+            MemoriaAdmit::CoolingDown,
+            "only one recovery probe may run per cooldown window"
+        );
     }
 
     #[test]
@@ -224,5 +231,16 @@ mod tests {
         health.record_failure();
         std::thread::sleep(Duration::from_millis(25));
         assert_eq!(health.admit(), MemoriaAdmit::CoolingDown);
+    }
+
+    #[test]
+    fn abandoned_probe_becomes_retryable_after_bounded_reservation() {
+        let health = MemoriaHealth::with_config(1, Duration::from_millis(10));
+        health.record_failure();
+        std::thread::sleep(Duration::from_millis(15));
+        assert_eq!(health.admit(), MemoriaAdmit::Ready);
+        assert_eq!(health.admit(), MemoriaAdmit::CoolingDown);
+        std::thread::sleep(Duration::from_millis(15));
+        assert_eq!(health.admit(), MemoriaAdmit::Ready);
     }
 }

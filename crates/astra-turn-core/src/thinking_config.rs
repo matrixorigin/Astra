@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 /// | `Enabled{budget}` | `additionalModelRequestFields.thinking` | `thinking` | provider-specific (`enable_thinking` for DashScope/Qwen) |
 /// | `Adaptive{effort}` | `additionalModelRequestFields.{thinking,output_config}` | `thinking` + `output_config.effort` | `reasoning_effort` (or provider-specific thinking flag) |
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ThinkingConfig {
     /// Thinking disabled (default).
     #[default]
@@ -44,6 +44,22 @@ pub enum ThinkingEffort {
     Medium,
     High,
     Max,
+}
+
+/// Native wire controls for thinking on OpenAI-compatible endpoints.
+///
+/// This is endpoint protocol knowledge, not a model-name heuristic.  The
+/// runtime uses it only after the route has been admitted, so an ordinary
+/// OpenAI-compatible proxy never receives an extension field it did not
+/// advertise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAiThinkingControl {
+    /// DashScope/Qwen-compatible `enable_thinking` flag.
+    EnableThinkingFlag,
+    /// DeepSeek V4-compatible `thinking: {type: disabled|enabled}` object.
+    ThinkingObject,
+    /// No known native suppression wire format.
+    None,
 }
 
 fn default_effort() -> ThinkingEffort {
@@ -148,8 +164,14 @@ impl ThinkingConfig {
         if !self.is_off() {
             return;
         }
-        if needs_dashscope_thinking_flag(provider, base_url) {
-            body["enable_thinking"] = json!(false);
+        match openai_thinking_control(provider, base_url) {
+            OpenAiThinkingControl::EnableThinkingFlag => {
+                body["enable_thinking"] = json!(false);
+            }
+            OpenAiThinkingControl::ThinkingObject => {
+                body["thinking"] = json!({"type": "disabled"});
+            }
+            OpenAiThinkingControl::None => {}
         }
     }
 
@@ -160,21 +182,12 @@ impl ThinkingConfig {
 
     /// Deserialize from the `thinking` field in the chat payload.
     ///
-    /// Accepts both:
-    /// - New format: `{"mode": "enabled", "budget_tokens": N}` / `{"mode": "adaptive", ...}` / `"off"`
-    /// - Legacy format: `{"budget_tokens": N}` (treated as Enabled)
-    pub fn from_payload_value(v: &Value) -> Self {
-        // Try new tagged format first.
-        if let Ok(cfg) = serde_json::from_value::<Self>(v.clone()) {
-            return cfg;
-        }
-        // Legacy fallback: bare `{"budget_tokens": N}` from older CLIs.
-        if let Some(n) = v.get("budget_tokens").and_then(Value::as_u64) {
-            return Self::Enabled {
-                budget_tokens: n as u32,
-            };
-        }
-        Self::default()
+    /// Only the current tagged wire shape is accepted. Malformed or unknown
+    /// control input is an admission error, never an implicit request to turn
+    /// reasoning off.
+    pub fn from_payload_value(v: &Value) -> Result<Self, String> {
+        serde_json::from_value::<Self>(v.clone())
+            .map_err(|error| format!("invalid thinking configuration: {error}"))
     }
 }
 
@@ -455,7 +468,7 @@ pub fn resolve_model_thinking(model_selector: &str) -> (&str, ThinkingConfig) {
 /// A selectable thinking option shown in the /model second-level prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThinkingOption {
-    /// Display label (e.g., "Normal", "Thinking (Low)", "Thinking (High)")
+    /// Display label (e.g., "Normal", "Thinking (High)", "Thinking (Max)")
     pub label: &'static str,
     /// The ThinkingConfig to use when this option is selected.
     pub config: ThinkingConfig,
@@ -466,7 +479,7 @@ pub struct ThinkingOption {
 /// Returns thinking options for a model based on its probed `thinking_capability`.
 ///
 /// - `"both"` → Normal / Thinking picker (provider-appropriate format).
-/// - `"effort_only"` → Thinking (Low) / Thinking (High) (no Normal — can't turn off).
+/// - `"effort_only"` → Low / High / Max effort without Normal.
 /// - `"native_only"` → no picker (always thinks, no control).
 /// - `"none"` → no picker (doesn't think).
 /// - `None` (unprobed) → no picker (safe default until probed).
@@ -517,6 +530,13 @@ fn thinking_options_for_adaptive_reasoning() -> Vec<ThinkingOption> {
             },
             is_default: true,
         },
+        ThinkingOption {
+            label: "Thinking (Max)",
+            config: ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Max,
+            },
+            is_default: false,
+        },
     ]
 }
 
@@ -535,6 +555,13 @@ fn thinking_options_for_effort_only() -> Vec<ThinkingOption> {
                 effort: ThinkingEffort::High,
             },
             is_default: true,
+        },
+        ThinkingOption {
+            label: "Thinking (Max)",
+            config: ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Max,
+            },
+            is_default: false,
         },
     ]
 }
@@ -575,6 +602,42 @@ pub fn needs_dashscope_thinking_flag(provider: &str, base_url: &str) -> bool {
     }
     let u = base_url.to_ascii_lowercase();
     u.contains("dashscope") || u.contains("aliyun")
+}
+
+/// Return the native thinking control for an admitted OpenAI-compatible route.
+///
+/// Matching is deliberately limited to provider protocol identifiers and the
+/// parsed endpoint authority.  Model names and user text are never consulted.
+pub fn openai_thinking_control(provider: &str, base_url: &str) -> OpenAiThinkingControl {
+    if needs_dashscope_thinking_flag(provider, base_url) {
+        return OpenAiThinkingControl::EnableThinkingFlag;
+    }
+    if is_deepseek_endpoint(provider, base_url) {
+        return OpenAiThinkingControl::ThinkingObject;
+    }
+    OpenAiThinkingControl::None
+}
+
+fn is_deepseek_endpoint(provider: &str, base_url: &str) -> bool {
+    let provider = provider.trim().to_ascii_lowercase();
+    if provider == "deepseek" || provider.starts_with("deepseek-") {
+        return true;
+    }
+    let authority = base_url
+        .trim()
+        .strip_prefix("https://")
+        .or_else(|| base_url.trim().strip_prefix("http://"))
+        .and_then(|rest| rest.split('/').next())
+        .unwrap_or_default()
+        .split('@')
+        .next_back()
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    authority == "api.deepseek.com" || authority.ends_with(".deepseek.com")
 }
 
 /// Strip `<think>...</think>` XML tags from model output, returning only
@@ -766,7 +829,7 @@ mod tests {
         ];
         for cfg in configs {
             let v = cfg.to_payload_value();
-            let restored = ThinkingConfig::from_payload_value(&v);
+            let restored = ThinkingConfig::from_payload_value(&v).unwrap();
             assert_eq!(cfg, restored);
         }
     }
@@ -788,16 +851,20 @@ mod tests {
     }
 
     #[test]
-    fn effort_only_returns_effort_picker_no_normal() {
-        let opts = thinking_options_with_capability(
-            "deepseek-v4-flash",
-            Some("openai"),
-            Some("effort_only"),
-        );
-        assert_eq!(opts.len(), 2);
+    fn effort_only_returns_low_high_and_max_without_normal() {
+        let opts =
+            thinking_options_with_capability("adaptive-model", Some("openai"), Some("effort_only"));
+        assert_eq!(opts.len(), 3);
         assert_eq!(opts[0].label, "Thinking (Low)");
         assert_eq!(opts[1].label, "Thinking (High)");
+        assert_eq!(opts[2].label, "Thinking (Max)");
         assert!(opts[1].is_default);
+        assert_eq!(
+            opts[2].config,
+            ThinkingConfig::Adaptive {
+                effort: ThinkingEffort::Max
+            }
+        );
     }
 
     #[test]
@@ -833,26 +900,30 @@ mod tests {
             Some("bedrock"),
             Some("both"),
         );
-        assert_eq!(opts.len(), 3);
+        assert_eq!(opts.len(), 4);
         assert_eq!(opts[0].label, "Normal");
         assert_eq!(opts[1].label, "Thinking (Low)");
         assert_eq!(opts[2].label, "Thinking (High)");
+        assert_eq!(opts[3].label, "Thinking (Max)");
         assert!(opts[2].is_default);
+        assert_eq!(thinking_suffix_for(&opts[3].config), "(thinking:max)");
     }
 
     #[test]
     fn both_anthropic_returns_adaptive() {
         let opts =
             thinking_options_with_capability("claude-sonnet-4", Some("anthropic"), Some("both"));
-        assert_eq!(opts.len(), 3);
+        assert_eq!(opts.len(), 4);
         assert_eq!(opts[2].label, "Thinking (High)");
+        assert_eq!(opts[3].label, "Thinking (Max)");
     }
 
     #[test]
     fn both_openai_returns_adaptive() {
         let opts = thinking_options_with_capability("gpt-5", Some("openai"), Some("both"));
-        assert_eq!(opts.len(), 3);
+        assert_eq!(opts.len(), 4);
         assert_eq!(opts[2].label, "Thinking (High)");
+        assert_eq!(opts[3].label, "Thinking (Max)");
     }
 
     #[test]
@@ -1015,27 +1086,16 @@ mod tests {
         assert_eq!(body["output_config"], json!({"effort": "high"}));
     }
 
-    /// Fix #2: `from_payload_value` must gracefully accept the legacy wire format
-    /// `{"thinking_budget_tokens": N}` emitted by older CLIs, mapping it to
-    /// `Enabled { budget_tokens: N }`. The new format MUST still take precedence.
     #[test]
-    fn from_payload_value_supports_legacy_budget_field() {
-        // Legacy format: just a number (seen in older payloads as top-level field)
-        let legacy = json!({ "budget_tokens": 8000 });
-        let cfg = ThinkingConfig::from_payload_value(&legacy);
-        assert_eq!(
-            cfg,
-            ThinkingConfig::Enabled {
-                budget_tokens: 8000
-            },
-            "Legacy {{budget_tokens}} object must map to Enabled"
-        );
+    fn from_payload_value_rejects_removed_bare_budget_shape() {
+        let retired = json!({ "budget_tokens": 8000 });
+        assert!(ThinkingConfig::from_payload_value(&retired).is_err());
     }
 
     #[test]
     fn from_payload_value_new_format_still_works() {
         let new = json!({ "mode": "enabled", "budget_tokens": 12000 });
-        let cfg = ThinkingConfig::from_payload_value(&new);
+        let cfg = ThinkingConfig::from_payload_value(&new).unwrap();
         assert_eq!(
             cfg,
             ThinkingConfig::Enabled {
@@ -1045,12 +1105,9 @@ mod tests {
     }
 
     #[test]
-    fn from_payload_value_unknown_shape_defaults_off() {
+    fn from_payload_value_unknown_shape_is_rejected() {
         let garbage = json!({ "foo": "bar" });
-        assert_eq!(
-            ThinkingConfig::from_payload_value(&garbage),
-            ThinkingConfig::Off
-        );
+        assert!(ThinkingConfig::from_payload_value(&garbage).is_err());
     }
 
     // ─── Dynamic budget scaling ─────────────────────────────────────────
@@ -1219,6 +1276,18 @@ mod tests {
             "https://api.openai.com/v1",
         );
         assert!(body.get("enable_thinking").is_none());
+        // DeepSeek V4 uses a typed thinking object rather than the DashScope
+        // boolean flag. Endpoint protocol selects the wire shape.
+        let mut body = json!({"model": "deepseek-v4-flash", "messages": []});
+        ThinkingConfig::Off.apply_openai_suppression(
+            &mut body,
+            "openai",
+            "https://api.deepseek.com",
+        );
+        assert_eq!(body["thinking"]["type"], "disabled");
+        let mut body = json!({"model": "deepseek-v4-flash", "messages": []});
+        ThinkingConfig::Off.apply_openai_suppression(&mut body, "deepseek", "");
+        assert_eq!(body["thinking"]["type"], "disabled");
         // Enabled thinking is noop (don't suppress)
         let mut body = json!({"model": "qwen3.5-flash", "messages": []});
         ThinkingConfig::Enabled {
@@ -1310,6 +1379,35 @@ mod tests {
             "openai",
             "https://api.deepseek.com"
         ));
+    }
+
+    #[test]
+    fn openai_thinking_control_is_endpoint_protocol_scoped() {
+        assert_eq!(
+            openai_thinking_control("openai", "https://api.deepseek.com/v1"),
+            OpenAiThinkingControl::ThinkingObject
+        );
+        assert_eq!(
+            openai_thinking_control(
+                "openai",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1"
+            ),
+            OpenAiThinkingControl::EnableThinkingFlag
+        );
+        assert_eq!(
+            openai_thinking_control("openai", "https://openai.example.com/v1"),
+            OpenAiThinkingControl::None
+        );
+        assert_eq!(
+            openai_thinking_control("deepseek", ""),
+            OpenAiThinkingControl::ThinkingObject
+        );
+        // An unrelated proxy hostname must not opt a route into a provider
+        // extension field.
+        assert_eq!(
+            openai_thinking_control("openai", "https://deepseek-proxy.example.com/v1"),
+            OpenAiThinkingControl::None
+        );
     }
 }
 

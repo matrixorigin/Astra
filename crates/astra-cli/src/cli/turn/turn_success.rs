@@ -49,11 +49,37 @@ pub(crate) async fn apply_turn_success_async(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     line: &str,
-    result: StreamResult,
+    mut result: StreamResult,
     turn_start: Instant,
     ui: &mut dyn crate::cli::ui_adapter::ReplUiAdapter,
     post_commit_tx: Option<&tokio::sync::mpsc::Sender<TurnPostCommitJob>>,
 ) {
+    // A dedicated durable control-tail observer may receive Applied after the
+    // primary live SSE fanout closed. Merge that exact fact before snapshotting
+    // or committing the turn so local history matches the server transcript.
+    let active_run_control =
+        astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control)
+            .as_ref()
+            .cloned();
+    if let Some(run_control) = active_run_control {
+        if !run_control
+            .wait_for_remote_user_intent_dispositions(std::time::Duration::from_secs(5))
+            .await
+        {
+            ui.show_warning(
+                "Turn completed, but durable guidance disposition reconciliation timed out; canonical server history remains authoritative.",
+            );
+        }
+        for intent in run_control.take_remotely_applied_user_intents() {
+            if !result
+                .applied_user_intents
+                .iter()
+                .any(|existing| existing.intent_id == intent.intent_id)
+            {
+                result.applied_user_intents.push(intent);
+            }
+        }
+    }
     // Primary settlement projects the continuation anchor from typed message
     // semantics. Keep the messages on `result` until that synchronous state
     // transition completes; the deferred CSL worker receives its own owned
@@ -237,6 +263,8 @@ struct TurnSuccessLiveSnapshot {
     runtime_pipeline_state: Option<serde_json::Value>,
     runtime_compaction_state: Option<serde_json::Value>,
     runtime_consecutive_context_window_errors: u32,
+    workspace_observation_quarantine:
+        Option<astra_pipeline::step_protocol::WorkspaceObservationQuarantineV1>,
     last_turn_event: Option<session_journal::JournalEvent>,
     observability_session: Option<
         std::sync::Arc<std::sync::RwLock<astra_runtime::observability::ObservabilitySession>>,
@@ -277,6 +305,7 @@ impl TurnSuccessLiveSnapshot {
             runtime_compaction_state: state.runtime_compaction_state.clone(),
             runtime_consecutive_context_window_errors: state
                 .runtime_consecutive_context_window_errors,
+            workspace_observation_quarantine: state.workspace_observation_quarantine.clone(),
             last_turn_event: state.last_turn_event.clone(),
             observability_session: state.observability_session.clone(),
             pending_adaptive_state: state.pending_adaptive_state.clone(),
@@ -286,6 +315,20 @@ impl TurnSuccessLiveSnapshot {
     }
 
     fn restore(self, state: &mut SessionState) {
+        // A quarantine is sticky safety state.  If this turn discovered one
+        // and the journal commit later failed, rolling the rest of the live
+        // projection back must not erase it.  Only merge it when the failed
+        // commit stayed on the same session; a session rebind must restore the
+        // old snapshot without importing state from the new session.
+        let same_session = self.session_id == state.session_id;
+        let quarantine_after_rollback = if same_session {
+            state
+                .workspace_observation_quarantine
+                .clone()
+                .or_else(|| self.workspace_observation_quarantine.clone())
+        } else {
+            self.workspace_observation_quarantine.clone()
+        };
         state.journal = None;
         match self.session_id.as_deref() {
             Some(session_id) => {
@@ -319,6 +362,7 @@ impl TurnSuccessLiveSnapshot {
         state.runtime_compaction_state = self.runtime_compaction_state;
         state.runtime_consecutive_context_window_errors =
             self.runtime_consecutive_context_window_errors;
+        state.workspace_observation_quarantine = quarantine_after_rollback;
         state.last_turn_event = self.last_turn_event;
         state.observability_session = self.observability_session;
         state.pending_adaptive_state = self.pending_adaptive_state;
@@ -693,7 +737,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn apply_turn_success_keeps_evaluation_out_of_canonical_history() {
+    fn apply_turn_success_keeps_transient_evaluation_out_of_canonical_history() {
         let (_tmp, _g) = crate::tests::isolated_sessions_dir();
         let mut state = SessionState::default();
         let mut result = crate::tests::stub_stream_result_with_records(
@@ -729,9 +773,20 @@ mod tests {
             history_text, "Done.\n\n[Turn context: failed: read_file | tool_calls: 1]",
             "canonical history should contain only the assistant response and the structured tool projection"
         );
+        let feedback = state
+            .latest_turn_quality_feedback
+            .as_ref()
+            .expect("a failed tool outcome should guide the next turn");
         assert!(
-            state.latest_turn_quality_feedback.is_none(),
-            "turn-finalization may consume transient quality feedback, but it must never serialize it into canonical history"
+            feedback
+                .findings
+                .iter()
+                .any(|finding| finding.contains("tool outcome failure")),
+            "the transient runtime feedback should retain the actionable tool failure"
+        );
+        assert!(
+            !history_text.contains(&feedback.recommended_action),
+            "next-turn runtime feedback must not become canonical conversation history"
         );
     }
 
@@ -875,6 +930,20 @@ mod tests {
         result.cache_read_tokens = 17;
         result.cache_creation_tokens = 19;
         result.tools_used = vec!["bash".into()];
+        result.last_heavy_checkpoint = Some(heavy_checkpoint_with_runtime_state(
+            serde_json::json!({"stats": {"ema": 0.4}}),
+            serde_json::json!({"attempt_count": 1}),
+            1,
+        ));
+        if let Some(astra_pipeline::step_protocol::StepCheckpoint::Heavy(heavy)) =
+            result.last_heavy_checkpoint.as_mut()
+        {
+            heavy.workspace_observation_quarantine = Some(
+                astra_pipeline::step_protocol::WorkspaceObservationQuarantineV1::weak_process_ownership(
+                    Some("failed-commit-call".into()),
+                ),
+            );
+        }
 
         let outcome =
             apply_turn_success_sync(&mut state, None, "new question", result, Instant::now());
@@ -898,6 +967,13 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("append turn event")
+        );
+        assert_eq!(
+            state
+                .workspace_observation_quarantine
+                .as_ref()
+                .and_then(|q| q.source_tool_call_id.as_deref()),
+            Some("failed-commit-call")
         );
     }
 
@@ -980,7 +1056,6 @@ mod tests {
         assert!(state.csl_manager.is_none());
         assert!(state.observability_session.is_none());
         assert!(state.last_turn_interrupted);
-        assert_eq!(state.task_manager.session_id(), "");
         assert!(state.pending_adaptive_state.is_some());
         assert!(
             !crate::cli::session::session_recovery::io::csl_log_path_for(&sid).exists(),
@@ -1064,6 +1139,62 @@ mod tests {
         assert!(projected_events.iter().any(|event| {
             event.event_type == session_journal::JournalEventType::TurnEvaluation
         }));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn durable_tail_guidance_is_included_when_primary_live_fanout_closed() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let sid = format!("remote-guidance-commit-{}", uuid::Uuid::new_v4());
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let control = crate::cli::turn::local_run_control::LocalRunControl::shared();
+        control.expect_remote_user_intent_disposition("intent-tail", 1);
+        control.record_remotely_applied_user_intent(
+            crate::cli::stream::streaming_types::AppliedStreamUserIntent {
+                intent_id: "intent-tail".into(),
+                delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+                status: astra_turn_types::UserIntentStatus::Applied,
+                event_index: 17,
+                content: "wait".into(),
+            },
+        );
+        let mut state = SessionState {
+            session_id: Some(sid.clone()),
+            journal: Some(session_journal::JournalWriter::new(&sid).unwrap()),
+            model: Some("test-model".into()),
+            ..Default::default()
+        };
+        *astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control) =
+            Some(control);
+        let mut result = crate::tests::stub_stream_result("done");
+        result.final_messages = vec![
+            serde_json::json!({"role":"user","content":"original"}),
+            serde_json::json!({"role":"assistant","content":"done"}),
+        ];
+        let mut ui = crate::tests::TestUi::default();
+
+        apply_turn_success_async(
+            &mut state,
+            &api,
+            None,
+            "original",
+            result,
+            Instant::now(),
+            &mut ui,
+            None,
+        )
+        .await;
+
+        let event = state.last_turn_event.as_ref().expect("turn event");
+        let applied = event
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("user_intents"))
+            .and_then(serde_json::Value::as_array)
+            .expect("applied guidance metadata");
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0]["intent_id"], "intent-tail");
+        assert_eq!(applied[0]["content"], "wait");
     }
 
     #[test]

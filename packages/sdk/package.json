@@ -43,7 +43,8 @@
   },
   "overrides": {
     "esbuild": "^0.28.1",
-    "undici": "7.28.0"
+    "postcss": "^8.5.23",
+    "undici": "7.29.0"
   },
   "devDependencies": {
     "@testing-library/dom": "^10.4.1",

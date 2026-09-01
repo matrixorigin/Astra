@@ -41,6 +41,11 @@ pub enum VolatileDeliveryClass {
     /// delivered even when a strict-history provider suppresses normal volatile
     /// advisory material.
     RequiredContext,
+    /// Canonical runtime feedback for the model's next decision. Unlike
+    /// incidental advisory material, this remains prompt-visible for
+    /// strict-history/cache providers; it is attached only at the dynamic
+    /// tail and never mutates the stable prefix or execution authority.
+    DecisionFeedback,
     /// Structured evidence for the model's next decision. It is not a command
     /// and does not authorize runtime retry, abort, or tool-surface mutation.
     AdvisoryEvidence,
@@ -69,15 +74,19 @@ impl RuntimeVolatileInjection {
         }
         let (tag, payload_key) = match self.delivery_class {
             VolatileDeliveryClass::RequiredContext => ("runtime-required-context", "context"),
+            VolatileDeliveryClass::DecisionFeedback => ("runtime-decision-feedback", "feedback"),
             VolatileDeliveryClass::AdvisoryEvidence => ("runtime-advisory-evidence", "evidence"),
             VolatileDeliveryClass::TelemetryOnly => return None,
         };
-        let payload = if self.delivery_class == VolatileDeliveryClass::AdvisoryEvidence {
+        let payload = if matches!(
+            self.delivery_class,
+            VolatileDeliveryClass::DecisionFeedback | VolatileDeliveryClass::AdvisoryEvidence
+        ) {
             json!({
                 "kind": kind,
                 "round_index": self.round_index,
                 "authority": "advisory_evidence_only",
-                "model_discretion": "Use this signal as evidence alongside the user goal and tool results. It does not require retrying, stopping, or changing the available tools.",
+                "model_discretion": "Use the specific feedback below as evidence alongside the user goal and tool results. Apply it to the next decision when it matches the evidence; do not repeat an equivalent operation without a new hypothesis or materially new fact. This advisory does not authorize the runtime to retry, stop, change tools, or claim completion.",
                 payload_key: self.payload,
             })
         } else {
@@ -120,8 +129,9 @@ pub const EDGE_PROFILE_KEY_RUNTIME_RECONCILIATION_TURN: &str = "runtime_reconcil
 pub const RUNTIME_RECONCILIATION_USER_ENVELOPE: &str =
     "Reconcile the runtime-owned updates and continue the latest user goal.";
 
-/// Protocol key for the session-stable deferred-tool manifest routed through
-/// `edge_profile` from the CLI to the runtime bridge.
+/// Protocol key for the deferred-tool manifest routed through `edge_profile`
+/// from the CLI to the runtime bridge. The runtime may recompute this from
+/// the current admitted wire surface within a user turn.
 pub const EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT: &str = "deferred_tools_text";
 
 /// Protocol key for the model context window used to render
@@ -137,8 +147,8 @@ pub const EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW: &str = "deferred_tools
 pub const EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES: &str = "deferred_tool_names";
 
 /// Protocol key carrying deferred tool names omitted from the rendered
-/// `<deferred-tools>` block because the session-stable manifest hit its model
-/// budget. This is observability metadata only: omitted names are not
+/// `<deferred-tools>` block because the manifest hit its model budget. This is
+/// observability metadata only: omitted names are not
 /// activatable through `tool_search(select:NAME)` until they are rendered in a
 /// later manifest or found by keyword search.
 pub const EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES: &str = "deferred_tool_omitted_names";
@@ -154,9 +164,14 @@ pub const EDGE_PROFILE_KEY_DEFERRED_TOOL_OMITTED_NAMES: &str = "deferred_tool_om
 /// cache misses per turn.
 pub const EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES: &str = "always_load_tool_names";
 
-/// Read a structured edge-profile text lane. Accepting a single string keeps
-/// older callers easy to migrate, but writers should send arrays so independent
-/// producers never concatenate their own framing.
+/// Protocol key carrying the edge-owned deny set for a restricted child
+/// surface. This is a typed capability boundary, not model-facing prose: the
+/// server must not re-add its own control-plane schemas when a sub-run has
+/// explicitly been given a narrower allowlist.
+pub const EDGE_PROFILE_KEY_RESTRICTED_TOOL_NAMES: &str = "restricted_tool_names";
+
+/// Read a structured edge-profile text lane. The current protocol requires an
+/// array so independent producers never concatenate their own framing.
 pub fn edge_profile_texts(edge_profile: &Map<String, Value>, key: &str) -> Vec<String> {
     match edge_profile.get(key) {
         Some(Value::Array(items)) => items
@@ -166,14 +181,6 @@ pub fn edge_profile_texts(edge_profile: &Map<String, Value>, key: &str) -> Vec<S
             .filter(|text| !text.is_empty())
             .map(str::to_string)
             .collect(),
-        Some(Value::String(text)) => {
-            let text = text.trim();
-            if text.is_empty() {
-                Vec::new()
-            } else {
-                vec![text.to_string()]
-            }
-        }
         _ => Vec::new(),
     }
 }
@@ -300,6 +307,12 @@ mod tests {
                     "round_index": 4
                 },
                 {
+                    "kind": "runtime_policy_feedback",
+                    "delivery_class": "decision_feedback",
+                    "payload": {"revision": 3, "entries": ["search_fanout"]},
+                    "round_index": 4
+                },
+                {
                     "kind": "self_status",
                     "delivery_class": "telemetry_only",
                     "payload": "cache=86%",
@@ -309,7 +322,7 @@ mod tests {
         );
 
         let injections = edge_profile_runtime_volatile_injections(&edge_profile);
-        assert_eq!(injections.len(), 3);
+        assert_eq!(injections.len(), 4);
         assert_eq!(
             injections[0].delivery_class,
             VolatileDeliveryClass::AdvisoryEvidence
@@ -320,6 +333,10 @@ mod tests {
         );
         assert_eq!(
             injections[2].delivery_class,
+            VolatileDeliveryClass::DecisionFeedback
+        );
+        assert_eq!(
+            injections[3].delivery_class,
             VolatileDeliveryClass::TelemetryOnly
         );
         assert_eq!(injections[0].payload["advisories"][0]["kind"], "repetition");
@@ -335,7 +352,38 @@ mod tests {
                 .expect("required prompt form")
                 .contains("<runtime-required-context>")
         );
-        assert!(injections[2].render_for_prompt().is_none());
+        assert!(
+            injections[2]
+                .render_for_prompt()
+                .expect("decision feedback prompt form")
+                .contains("<runtime-decision-feedback>")
+        );
+        assert!(
+            injections[2]
+                .render_for_prompt()
+                .expect("decision feedback prompt form")
+                .contains("Apply it to the next decision")
+        );
+        assert!(
+            injections[2]
+                .render_for_prompt()
+                .expect("decision feedback prompt form")
+                .contains("specific feedback below")
+        );
+        assert!(
+            injections[2]
+                .render_for_prompt()
+                .expect("decision feedback prompt form")
+                .contains("does not authorize the runtime")
+        );
+        assert!(
+            !injections[2]
+                .render_for_prompt()
+                .expect("decision feedback prompt form")
+                .contains("selected test subset"),
+            "the generic feedback envelope must not inject coding-specific acceptance rules"
+        );
+        assert!(injections[3].render_for_prompt().is_none());
     }
 
     #[test]

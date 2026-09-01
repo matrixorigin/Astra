@@ -147,14 +147,20 @@ async fn build_sse_chunks(
     let ev1 = sse_event(json!({ "type": "text_delta", "content": "Let me look." }));
     let ev2 = sse_event(json!({
         "type": "tool_call",
-        "id": "c1",
-        "function": { "name": "read_file", "arguments": "{\"path\":\"/x/a.txt\"}" }
+        "tool_call": {
+            "id": "c1",
+            "type": "function",
+            "function": { "name": "read_file", "arguments": "{\"path\":\"/x/a.txt\"}" }
+        }
     }));
     let ev3 = sse_event(json!({ "type": "text_delta", "content": "...still thinking..." }));
     let ev4 = sse_event(json!({
         "type": "tool_call",
-        "id": "c2",
-        "function": { "name": "grep", "arguments": "{\"pattern\":\"hello\"}" }
+        "tool_call": {
+            "id": "c2",
+            "type": "function",
+            "function": { "name": "grep", "arguments": "{\"pattern\":\"hello\"}" }
+        }
     }));
     let ev5 = sse_event(json!({ "type": "turn_complete", "has_tool_calls": true }));
 

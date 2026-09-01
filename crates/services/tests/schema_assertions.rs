@@ -43,6 +43,148 @@ async fn core_schema_catalog_matches_live_idempotent_bootstrap() {
         .collect::<Vec<_>>();
     assert!(missing.is_empty(), "missing catalog tables: {missing:?}");
     assert!(contracts.iter().all(|table| table.ddl_sha256.len() == 64));
+    for expected in ["work_proposal_sequences", "work_proposals"] {
+        assert!(
+            contracts.iter().any(|table| table.name == expected),
+            "canonical proposal owner is missing from schema authority: {expected}"
+        );
+        assert!(
+            existing.contains(expected),
+            "missing live table: {expected}"
+        );
+    }
+    for retired in ["work_plan_proposal_sequences", "work_plan_proposals"] {
+        assert!(
+            !contracts.iter().any(|table| table.name == retired),
+            "type-specific proposal table must not become a second schema owner: {retired}"
+        );
+        assert!(
+            !existing.contains(retired),
+            "retired proposal table must not survive the clean schema cut: {retired}"
+        );
+    }
+    let proposal_columns = column_names(&pool, &schema, "work_proposals").await;
+    for expected in [
+        "proposal_kind",
+        "criterion_count",
+        "item_change_count",
+        "dependency_change_count",
+        "resolution_ref",
+        "result_work_revision",
+        "result_criteria_set_revision",
+        "result_branch_revision",
+        "result_graph_revision",
+    ] {
+        assert!(
+            proposal_columns.iter().any(|column| column == expected),
+            "work_proposals is missing acceptance fact {expected}"
+        );
+    }
+    for retired in ["addition_count", "dependency_count"] {
+        assert!(
+            !proposal_columns.iter().any(|column| column == retired),
+            "retired additive-only proposal column must not survive the clean schema cut: {retired}"
+        );
+    }
+    assert!(
+        !column_names(&pool, &schema, "work_proposal_sequences")
+            .await
+            .iter()
+            .any(|column| column == "pending_count"),
+        "pending rows are the sole bounded queue truth; do not restore a mutable counter"
+    );
+    assert_eq!(
+        index_columns(&pool, &schema, "work_branches", "uq_work_branches_session").await,
+        ["owner_id", "session_id"],
+        "session-to-Work lookup must be owner-scoped and index-bounded"
+    );
+    assert_eq!(
+        unique_key_columns(
+            &pool,
+            &schema,
+            "work_patch_commit_operations",
+            "uq_work_patch_commit_active_target"
+        )
+        .await,
+        ["owner_id", "work_id", "active_target_branch_id"],
+        "concurrent commit admission must have a database-enforced target owner"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "work_runtime_event_outbox_slots",
+            "idx_work_runtime_event_pending",
+        )
+        .await,
+        ["has_pending", "updated_at", "owner_id", "work_id"],
+        "runtime projection polling must scale with dirty Work, not retained Work"
+    );
+    assert_eq!(
+        unique_key_columns(
+            &pool,
+            &schema,
+            "work_item_attempts",
+            "uq_work_item_attempt_identity",
+        )
+        .await,
+        ["owner_id", "attempt_id"],
+        "attempt identity must be owner-scoped and independent of its execution carrier"
+    );
+    let attempt_columns = column_names(&pool, &schema, "work_item_attempts").await;
+    for retired in ["terminal_graph_revision", "terminal_control_epoch"] {
+        assert!(
+            !attempt_columns.iter().any(|column| column == retired),
+            "terminal authority must not be split across nullable attempt column {retired}"
+        );
+    }
+    assert_eq!(
+        column_names(&pool, &schema, "work_terminal_cuts").await,
+        [
+            "owner_id",
+            "work_id",
+            "branch_id",
+            "graph_revision",
+            "attempt_id",
+            "control_epoch",
+        ],
+        "terminal cut must remain one minimal, non-null authority relation"
+    );
+    assert_eq!(
+        primary_key_columns(&pool, &schema, "work_terminal_cuts").await,
+        ["owner_id", "work_id", "branch_id", "graph_revision"],
+        "one Work branch graph revision can have exactly one terminal settlement"
+    );
+    assert_eq!(
+        unique_key_columns(
+            &pool,
+            &schema,
+            "work_terminal_cuts",
+            "uq_work_terminal_cut_attempt",
+        )
+        .await,
+        ["owner_id", "attempt_id"],
+        "one immutable attempt can publish at most one terminal graph cut"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "work_item_attempts",
+            "idx_work_item_attempt_latest",
+        )
+        .await,
+        [
+            "owner_id",
+            "work_id",
+            "branch_id",
+            "work_item_id",
+            "work_item_revision",
+            "started_at",
+            "attempt_id"
+        ],
+        "delivery projection lookup must remain tenant-scoped and bounded to one item revision"
+    );
 
     let contracts = sqlx::query(
         "SELECT COUNT(*) AS count FROM astra_schema_contracts WHERE component = 'astra-core'",
@@ -90,6 +232,8 @@ async fn schema_rationalization_runtime_contract() {
         "skill_marketplace_stats",
         "skill_quality_reports",
         "task_verification_results",
+        "task_contracts",
+        "verification_results",
     ] {
         assert!(
             !table_exists(&pool, &schema, removed).await,
@@ -286,13 +430,6 @@ async fn schema_rationalization_runtime_contract() {
         "deprecated singular session_artifact_grants table must not exist"
     );
 
-    let agent_tasks = column_names(&pool, &schema, "agent_tasks").await;
-    for expected in ["task_id", "user_id", "session_id", "parent_task_id"] {
-        assert!(
-            agent_tasks.iter().any(|column| column == expected),
-            "agent_tasks missing {expected}"
-        );
-    }
     assert_eq!(
         primary_key_columns(&pool, &schema, "agent_runs").await,
         ["user_id", "run_id"],
@@ -304,177 +441,10 @@ async fn schema_rationalization_runtime_contract() {
         "prompt_request_records primary key must carry the owner boundary"
     );
     assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "agent_tasks",
-            "idx_tasks_owner_session_updated"
-        )
-        .await,
-        ["user_id", "session_id", "updated_at"],
-        "session task lists and session lifecycle deletes must use owner/session ordering"
-    );
-    for removed_index in ["idx_tasks_session_updated", "idx_tasks_parent_updated"] {
-        assert!(
-            index_columns(&pool, &schema, "agent_tasks", removed_index)
-                .await
-                .is_empty(),
-            "agent_tasks must not keep obsolete ownerless index {removed_index}"
-        );
-    }
-
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "task_leases").await,
-        ["user_id", "task_id"],
-        "task leases must be owned at the physical identity boundary"
-    );
-    assert_eq!(
-        index_columns(&pool, &schema, "task_leases", "idx_task_leases_expires").await,
-        ["expires_at"],
-        "task lease retention cleanup must have a purpose-built global expiry index"
-    );
-    assert!(
-        index_columns(
-            &pool,
-            &schema,
-            "task_leases",
-            "idx_task_leases_user_expires"
-        )
-        .await
-        .is_empty(),
-        "task_leases must not keep the old owner-prefixed index that cannot serve global expiry cleanup"
-    );
-
-    assert_eq!(
         primary_key_columns(&pool, &schema, "edge_agent_registry").await,
         ["user_id", "registry_id"],
         "edge registry identity must be owner-bound so registry_id lookups never scan across tenants"
     );
-
-    let task_contracts = column_names(&pool, &schema, "task_contracts").await;
-    for expected in ["user_id", "session_id", "contract_id", "task_id"] {
-        assert!(
-            task_contracts.iter().any(|column| column == expected),
-            "task_contracts missing {expected}"
-        );
-    }
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "task_contracts").await,
-        ["user_id", "contract_id"],
-        "task_contracts primary key must make contract identity owner-scoped"
-    );
-    for column in ["user_id", "session_id", "contract_id", "task_id"] {
-        assert!(
-            column_character_maximum_length(&pool, &schema, "task_contracts", column).await
-                >= Some(64),
-            "task_contracts.{column} must not assume 36-character UUID-only identifiers"
-        );
-    }
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "task_contracts",
-            "idx_tc_owner_task_status_version"
-        )
-        .await,
-        ["user_id", "task_id", "status", "version"],
-        "durable task contract lookup must be owner-bound before task/status/version ordering"
-    );
-    assert!(
-        index_columns(&pool, &schema, "task_contracts", "idx_tc_task")
-            .await
-            .is_empty(),
-        "task_contracts must not keep obsolete ownerless task index idx_tc_task"
-    );
-
-    let verification_results = column_names(&pool, &schema, "verification_results").await;
-    for expected in [
-        "user_id",
-        "session_id",
-        "contract_id",
-        "task_id",
-        "status",
-        "subtask_id",
-    ] {
-        assert!(
-            verification_results.iter().any(|column| column == expected),
-            "verification_results missing {expected}"
-        );
-    }
-    assert!(
-        !verification_results.iter().any(|column| column == "passed"),
-        "verification_results must derive pass/fail from status instead of a redundant passed column"
-    );
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "verification_results").await,
-        ["user_id", "result_id"],
-        "verification_results result_id is the owner-scoped row identity; contract history uses explicit secondary indexes"
-    );
-    assert_eq!(
-        column_nullable(&pool, &schema, "verification_results", "user_id").await,
-        Some(false),
-        "verification results must be owner-scoped at write time"
-    );
-    for column in [
-        "user_id",
-        "session_id",
-        "contract_id",
-        "task_id",
-        "result_id",
-    ] {
-        assert!(
-            column_character_maximum_length(&pool, &schema, "verification_results", column).await
-                >= Some(64),
-            "verification_results.{column} must not assume 36-character UUID-only identifiers"
-        );
-    }
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "verification_results",
-            "idx_verification_results_contract_created"
-        )
-        .await,
-        ["user_id", "contract_id", "created_at", "result_id"],
-        "verification history reads must use owner/contract ordering"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "verification_results",
-            "idx_verification_results_contract_subtask"
-        )
-        .await,
-        ["user_id", "contract_id", "subtask_id", "created_at"],
-        "verification subtask history reads must use owner/contract/subtask ordering"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "verification_results",
-            "idx_verification_results_status_created"
-        )
-        .await,
-        ["user_id", "status", "created_at"],
-        "verification review/failure scans must be owner/status scoped"
-    );
-    for removed_index in [
-        "idx_tvr_task_subtask",
-        "idx_tvr_contract",
-        "idx_tvr_owner_task_subtask",
-        "idx_tvr_owner_contract",
-    ] {
-        assert!(
-            index_columns(&pool, &schema, "verification_results", removed_index)
-                .await
-                .is_empty(),
-            "verification_results must not keep obsolete task_verification_results index {removed_index}"
-        );
-    }
 
     for table in [
         "harness_items",
@@ -624,6 +594,211 @@ async fn schema_rationalization_runtime_contract() {
 
 #[tokio::test]
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
+async fn work_foundation_schema_has_single_owner_and_session_binding() {
+    let pool = common::setup_pool().await;
+    let schema = current_schema(&pool).await;
+
+    for (table, primary_key) in [
+        ("works", &["owner_id", "work_id"][..]),
+        (
+            "work_goal_revisions",
+            &["owner_id", "work_id", "revision"][..],
+        ),
+        (
+            "work_criteria",
+            &["owner_id", "work_id", "criterion_id"][..],
+        ),
+        (
+            "work_criterion_revisions",
+            &["owner_id", "work_id", "criterion_id", "revision"][..],
+        ),
+        (
+            "work_criterion_sets",
+            &["owner_id", "work_id", "revision"][..],
+        ),
+        (
+            "work_graph_revisions",
+            &["owner_id", "work_id", "revision"][..],
+        ),
+        ("work_graph_sequences", &["owner_id", "work_id"][..]),
+        ("work_items", &["owner_id", "work_id", "item_id"][..]),
+        (
+            "work_item_revisions",
+            &["owner_id", "work_id", "item_id", "revision"][..],
+        ),
+        (
+            "work_item_edges",
+            &[
+                "owner_id",
+                "work_id",
+                "graph_revision",
+                "predecessor_item_id",
+                "successor_item_id",
+                "edge_kind",
+            ][..],
+        ),
+        (
+            "work_item_attempts",
+            &[
+                "owner_id",
+                "work_id",
+                "branch_id",
+                "work_item_id",
+                "work_item_revision",
+                "attempt_id",
+            ][..],
+        ),
+        (
+            "work_terminal_cuts",
+            &["owner_id", "work_id", "branch_id", "graph_revision"][..],
+        ),
+        ("work_branches", &["owner_id", "work_id", "branch_id"][..]),
+        (
+            "work_branch_deletion_operations",
+            &["owner_id", "work_id", "branch_id", "operation_id"][..],
+        ),
+        (
+            "work_patch_commit_operations",
+            &["owner_id", "work_id", "operation_id"][..],
+        ),
+    ] {
+        assert_eq!(
+            primary_key_columns(&pool, &schema, table).await,
+            primary_key,
+            "{table} identity must remain owner scoped"
+        );
+    }
+
+    assert_eq!(
+        unique_key_columns(&pool, &schema, "work_branches", "uq_work_branches_session").await,
+        ["owner_id", "session_id"],
+        "one owner-scoped internal session must never back multiple Work branches"
+    );
+    let branch_columns = column_names(&pool, &schema, "work_branches").await;
+    for expected in ["deletion_operation_id", "deletion_requested_at"] {
+        assert!(
+            branch_columns.iter().any(|column| column == expected),
+            "pending deletion ownership requires branch marker {expected}"
+        );
+    }
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "work_branches",
+            "idx_work_branches_deletion"
+        )
+        .await,
+        ["owner_id", "deletion_operation_id", "deletion_requested_at"],
+        "branch deletion ownership lookup must remain tenant scoped"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "work_branch_deletion_operations",
+            "idx_work_branch_deletion_pending"
+        )
+        .await,
+        [
+            "operation_state",
+            "executor_lease_expires_at",
+            "created_at",
+            "operation_id"
+        ],
+        "deletion recovery must claim bounded pending operations without a tenant-wide scan"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "work_patch_commit_operations",
+            "idx_work_patch_commit_recovery"
+        )
+        .await,
+        ["operation_state", "recovery_after", "operation_id"],
+        "patch commit recovery must remain bounded across tenants"
+    );
+    assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "work_patch_commit_operations",
+            "idx_work_patch_commit_target"
+        )
+        .await,
+        [
+            "owner_id",
+            "work_id",
+            "target_branch_id",
+            "operation_state",
+            "created_at",
+            "operation_id"
+        ],
+        "patch commit target exclusion must remain owner scoped"
+    );
+    assert_eq!(
+        unique_key_columns(&pool, &schema, "works", "uq_works_public_identity").await,
+        ["work_id"],
+        "work_id must be a globally stable public identity"
+    );
+
+    assert!(
+        column_names(&pool, &schema, "work_criterion_sets")
+            .await
+            .iter()
+            .any(|column| column == "member_count"),
+        "criterion-set summaries must not deserialize full manifests"
+    );
+    let graph_columns = column_names(&pool, &schema, "work_graph_revisions").await;
+    for expected in ["item_count", "edge_count"] {
+        assert!(
+            graph_columns.iter().any(|column| column == expected),
+            "graph summaries require bounded {expected} metadata"
+        );
+    }
+    assert!(
+        column_names(&pool, &schema, "work_items")
+            .await
+            .iter()
+            .any(|column| column == "last_revision"),
+        "WorkItem identities require one global revision allocator across sibling branches"
+    );
+    assert!(
+        column_names(&pool, &schema, "work_item_revisions")
+            .await
+            .iter()
+            .any(|column| column == "parent_revision"),
+        "immutable WorkItem replacements must retain their exact parent revision"
+    );
+
+    let contracts = load_core_schema_table_contracts(pool.get())
+        .await
+        .expect("load generated core schema table authority");
+    for table in [
+        "works",
+        "work_goal_revisions",
+        "work_criteria",
+        "work_criterion_revisions",
+        "work_criterion_sets",
+        "work_graph_revisions",
+        "work_graph_sequences",
+        "work_items",
+        "work_item_revisions",
+        "work_item_edges",
+        "work_branches",
+        "work_branch_deletion_operations",
+    ] {
+        let contract = contracts
+            .iter()
+            .find(|contract| contract.name == table)
+            .unwrap_or_else(|| panic!("missing lifecycle contract for {table}"));
+        assert_eq!(contract.owner, "work", "{table} must have one Work owner");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn evaluation_schema_supports_calibration_reads() {
     let pool = common::setup_pool().await;
     let schema = current_schema(&pool).await;
@@ -694,6 +869,7 @@ async fn column_names(pool: &astra_core::SharedPool, schema: &str, table: &str) 
     .expect("load columns")
     .into_iter()
     .map(|row| row.try_get::<String, _>("COLUMN_NAME").unwrap())
+    .filter(|column| !column.starts_with("__mo_"))
     .collect()
 }
 
@@ -1083,6 +1259,17 @@ async fn phase1_run_durability_schema_contract() {
         "agent_run_events must dedupe idempotency_key per owner/run"
     );
     assert_eq!(
+        index_columns(
+            &pool,
+            &schema,
+            "agent_run_events",
+            "idx_agent_run_events_control_type_idx"
+        )
+        .await,
+        ["user_id", "run_id", "event_type", "event_idx"],
+        "agent_run_events control admission must seek typed events without scanning run history"
+    );
+    assert_eq!(
         unique_key_columns(
             &pool,
             &schema,
@@ -1391,17 +1578,6 @@ async fn phase1_run_durability_schema_contract() {
             "quarantine_id"
         ],
         "divergent local roots must be quarantined inside the complete SessionKey"
-    );
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "session_publish_receipts").await,
-        [
-            "isolation_domain",
-            "owner_user_id",
-            "session_id",
-            "branch_id",
-            "local_event_id"
-        ],
-        "publish receipts must map local and Server roots inside the complete SessionKey"
     );
     assert_eq!(
         primary_key_columns(&pool, &schema, "session_attachments").await,
@@ -2343,99 +2519,6 @@ async fn phase4_state_projection_schema_contract() {
         "conversation_log must not keep obsolete session-only turn index"
     );
 
-    let todo_counter_columns = column_names(&pool, &schema, "session_todo_counters").await;
-    for expected in ["user_id", "session_id", "next_id", "version"] {
-        assert!(
-            todo_counter_columns.iter().any(|column| column == expected),
-            "session_todo_counters missing {expected}"
-        );
-    }
-    assert!(
-        column_default(&pool, &schema, "session_todo_counters", "user_id")
-            .await
-            .is_none_or(|default| !default.trim_matches('\'').is_empty()),
-        "session_todo_counters.user_id must not use an empty-string owner sentinel"
-    );
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "session_todo_counters").await,
-        ["user_id", "session_id"],
-        "session todo counters must be owner-bound at the uniqueness boundary"
-    );
-    assert!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_todo_counters",
-            "idx_session_todo_counters_owner_session"
-        )
-        .await
-        .is_empty(),
-        "session_todo_counters must not keep a redundant owner/session secondary index"
-    );
-
-    let session_todos = column_names(&pool, &schema, "session_todos").await;
-    for expected in ["user_id", "session_id", "todo_id", "ordinal", "status"] {
-        assert!(
-            session_todos.iter().any(|column| column == expected),
-            "session_todos missing {expected}"
-        );
-    }
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "session_todos").await,
-        ["user_id", "session_id", "todo_id"],
-        "session_todos must be owner-bound at the uniqueness boundary"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_todos",
-            "idx_session_todos_owner_session_ordinal"
-        )
-        .await,
-        ["user_id", "session_id", "ordinal"],
-        "session_todos load path must be owner/session ordered"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_todos",
-            "idx_session_todos_owner_session_status_updated"
-        )
-        .await,
-        ["user_id", "session_id", "status", "updated_at"],
-        "session_todos active path must be owner/session/status scoped"
-    );
-    assert_eq!(
-        index_columns(
-            &pool,
-            &schema,
-            "session_todos",
-            "idx_session_todos_user_status_updated"
-        )
-        .await,
-        ["user_id", "status", "updated_at"],
-        "cross-session user todo views must stay owner-bound"
-    );
-    for removed_index in [
-        "idx_session_todos_status_updated_owner",
-        "idx_session_todos_archived_gc_owner",
-        "idx_session_todos_session_status_updated",
-    ] {
-        assert!(
-            index_columns(&pool, &schema, "session_todos", removed_index)
-                .await
-                .is_empty(),
-            "global todo lifecycle must not depend on obsolete index {removed_index}"
-        );
-    }
-    assert_eq!(
-        primary_key_columns(&pool, &schema, "session_todo_idempotency").await,
-        ["user_id", "session_id", "action", "idempotency_key"],
-        "todo idempotency ledger must dedupe by owner/session/action/key"
-    );
-
     let session_checkpoints = column_names(&pool, &schema, "session_checkpoints").await;
     for expected in ["user_id", "session_id", "number", "turn", "state_json"] {
         assert!(
@@ -3054,15 +3137,15 @@ async fn phase5_personal_skill_schema_contract() {
     }
 
     let installations = column_names(&pool, &schema, "skill_installations").await;
-    for expected in [
+    for obsolete in [
         "scope",
         "session_id",
         "workspace_id",
         "auto_activate_on_topic_match",
     ] {
         assert!(
-            installations.iter().any(|column| column == expected),
-            "skill_installations missing Phase 5 column {expected}"
+            !installations.iter().any(|column| column == obsolete),
+            "skill_installations must not keep retired personal-skill column {obsolete}"
         );
     }
 }

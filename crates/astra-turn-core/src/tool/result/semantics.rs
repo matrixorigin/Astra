@@ -112,7 +112,10 @@ pub fn cloud_tool_result_status_label(output: &str) -> &'static str {
     match classify_tool_result_status(output) {
         ToolResultStatus::Failed => "failed",
         ToolResultStatus::Completed => "completed",
-        ToolResultStatus::Skipped => "skipped",
+        // A suppressed invocation did not produce a successful tool outcome.
+        // Edge callbacks must fail closed unless they replay the original
+        // cached terminal result for the same durable invocation.
+        ToolResultStatus::Skipped => "failed",
     }
 }
 

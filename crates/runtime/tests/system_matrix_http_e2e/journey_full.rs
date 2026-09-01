@@ -21,7 +21,6 @@ async fn run_tool_backed_chat_turn(
     auth_header: &str,
     session_id: &str,
     agent_id: &str,
-    test_secret: &str,
 ) -> String {
     let read_file_tool = json!({
         "type": "function",
@@ -37,36 +36,55 @@ async fn run_tool_backed_chat_turn(
     });
     let payload = json!({
         "agent_id": agent_id,
-        "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
         "session_id": session_id,
-        "messages": [{ "role": "user", "content": "read README through a tool" }],
+        "edge_executor_id": ctx.edge_agent_id,
+        "workspace_binding": {
+            "kind": "edge_workspace",
+            "display_name": "system-matrix-edge",
+            "root": "/tmp/astra-system-matrix-edge",
+            "authority": "read_write"
+        },
+        "executor_binding": {
+            "kind": "edge_agent",
+            "executor_id": ctx.edge_agent_id,
+            "display_name": "system-matrix-edge",
+            "transport": "edge_ledger",
+            "status": "online"
+        },
+        "message": "read README through a tool",
         "model_selection": seeded_model_selection(ctx),
-        "edge_tools": [read_file_tool],
-        "test_llm_rounds": [
-            {
-                "tool_calls": [{
-                    "id": "ctx-trace-tool-1",
-                    "type": "function",
-                    "function": {
-                        "name": "read_file",
-                        "arguments": "{\"path\":\"README.md\"}"
-                    }
-                }]
+        "context": {
+            "edge_profile": {
+                "cwd": "/tmp/astra-system-matrix-edge",
+                "edge_agent_id": ctx.edge_agent_id,
+                "hostname": "system-matrix-edge"
             },
-            {
-                "full_text": "tool-backed calibration reply",
-                "reasoning": "",
-                "usage": { "prompt_tokens": 7, "completion_tokens": 9, "total_tokens": 16 }
-            }
-        ]
+            "edge_tools": [read_file_tool],
+            "test_llm_rounds": [
+                {
+                    "tool_calls": [{
+                        "id": "ctx-trace-tool-1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"README.md\"}"
+                        }
+                    }]
+                },
+                {
+                    "full_text": "tool-backed calibration reply",
+                    "reasoning": "",
+                    "usage": { "prompt_tokens": 7, "completion_tokens": 9, "total_tokens": 16 }
+                }
+            ]
+        }
     });
 
-    let req = Request::builder()
+    let req = axum::http::Request::builder()
         .method("POST")
-        .uri("/chat/turn")
+        .uri("/chat/stream")
         .header("authorization", auth_header)
         .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", test_secret)
         .body(Body::from(payload.to_string()))
         .expect("tool-backed chat request");
     let response = app
@@ -77,13 +95,12 @@ async fn run_tool_backed_chat_turn(
     assert_eq!(
         response.status(),
         StatusCode::OK,
-        "tool-backed chat/turn should return 200"
+        "tool-backed chat/stream should return 200"
     );
 
     let mut stream = response.into_body().into_data_stream();
     let mut acc = Vec::new();
     let mut posted_result = false;
-    let mut saw_turn_complete = false;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.expect("tool-backed sse chunk");
         acc.extend_from_slice(&chunk);
@@ -93,7 +110,7 @@ async fn run_tool_backed_chat_turn(
                 s.as_ref(),
                 "ctx-trace-tool-1",
                 &ctx.edge_agent_id,
-                "ok",
+                "completed",
                 "# README\nfrom tool-backed matrix e2e\n",
                 0,
             )
@@ -107,10 +124,6 @@ async fn run_tool_backed_chat_turn(
             );
             posted_result = true;
         }
-        if s.contains("turn_complete") {
-            saw_turn_complete = true;
-            break;
-        }
     }
 
     assert!(
@@ -118,11 +131,30 @@ async fn run_tool_backed_chat_turn(
         "tool-backed chat never emitted tool_request; SSE: {}",
         String::from_utf8_lossy(&acc)
     );
-    assert!(
-        saw_turn_complete,
-        "tool-backed chat never reached turn_complete"
+    let full = String::from_utf8_lossy(&acc).into_owned();
+    let events = full
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .collect::<Vec<_>>();
+    let terminals = events
+        .iter()
+        .filter(|event| event["type"].as_str() == Some("turn_complete"))
+        .collect::<Vec<_>>();
+    assert_eq!(terminals.len(), 1, "one server stream terminal: {full}");
+    assert_eq!(
+        terminals[0]["continuation_owner"].as_str(),
+        Some("server"),
+        "tool callback must continue in the same server-owned stream: {full}"
     );
-    String::from_utf8_lossy(&acc).into_owned()
+    assert!(
+        events.iter().any(|event| {
+            event["type"].as_str() == Some("text_delta")
+                && event["content"].as_str() == Some("tool-backed calibration reply")
+        }),
+        "server stream must consume the callback and emit the final model round: {full}"
+    );
+    full
 }
 
 pub async fn run_product_matrix_full_journey(
@@ -747,7 +779,7 @@ pub async fn run_product_matrix_full_journey(
             turn_chain_id: format!("matrix-tool-chain-{suffix}"),
             request_id: "matrix-tool-req-1".to_string(),
             edge_agent_id: edge_agent_id.clone(),
-            status: "ok".to_string(),
+            status: "completed".to_string(),
             output: "done".to_string(),
             duration_ms: 12,
             tool_result_fields: None,
@@ -802,43 +834,6 @@ pub async fn run_product_matrix_full_journey(
         cpl_j.is_array(),
         "checkpoints list should be a JSON array: {cpl_j}"
     );
-
-    let (st_task, task_j) = post_json(
-        app,
-        "/tasks",
-        Some(auth_header),
-        json!({
-            "title": "matrix e2e task",
-            "description": "exercise task endpoint",
-            "session_id": session_id
-        }),
-    )
-    .await;
-    assert_eq!(st_task, StatusCode::CREATED, "submit task: {task_j}");
-    let task_id = task_j["task_id"].as_str().expect("task_id").to_string();
-
-    let (st_gj, gj) = get_json(app, &format!("/tasks/{task_id}"), Some(auth_header), &[]).await;
-    assert_eq!(st_gj, StatusCode::OK, "get task: {gj}");
-    assert_eq!(gj["status"].as_str(), Some("pending"));
-
-    let (st_wh, wh_j) = put_json(
-        app,
-        &format!("/tasks/{task_id}/status"),
-        Some(auth_header),
-        json!({
-            "status": "completed"
-        }),
-    )
-    .await;
-    assert_eq!(st_wh, StatusCode::OK, "task status update: {wh_j}");
-
-    let (st_gj2, gj2) = get_json(app, &format!("/tasks/{task_id}"), Some(auth_header), &[]).await;
-    assert_eq!(
-        st_gj2,
-        StatusCode::OK,
-        "get task after status update: {gj2}"
-    );
-    assert_eq!(gj2["status"].as_str(), Some("completed"));
 
     let sb_name = format!("sb_{suffix}");
     let (st_sb, sb_j) = post_json(
@@ -981,8 +976,8 @@ pub async fn run_product_matrix_full_journey(
     let (st_models, models_j) = get_json(app, "/models", Some(auth_header), &[]).await;
     assert_eq!(st_models, StatusCode::OK, "list models: {models_j}");
     assert!(
-        models_j.as_array().is_some(),
-        "GET /models should return array: {models_j}"
+        models_j["items"].as_array().is_some(),
+        "GET /models should return a paginated envelope: {models_j}"
     );
 
     let (st_drift, drift) = get_json(
@@ -1005,25 +1000,24 @@ pub async fn run_product_matrix_full_journey(
     const LLM_TEXT: &str = "product-matrix-e2e-reply";
     let chat_body = json!({
         "agent_id": agent_id,
-        "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
         "session_id": session_id,
-        "messages": [{ "role": "user", "content": "matrix journey ping" }],
+        "message": "matrix journey ping",
         "model_selection": seeded_model_selection(ctx),
-        "edge_tools": [],
-        "test_llm_rounds": [{
-            "full_text": LLM_TEXT,
-            "reasoning": "",
-            "usage": { "prompt_tokens": 5, "completion_tokens": 15, "total_tokens": 20 }
-        }]
+        "context": {
+            "edge_tools": [],
+            "test_llm_rounds": [{
+                "full_text": LLM_TEXT,
+                "reasoning": "",
+                "usage": { "prompt_tokens": 5, "completion_tokens": 15, "total_tokens": 20 }
+            }]
+        }
     });
 
-    let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
-    let chat_req = Request::builder()
+    let chat_req = axum::http::Request::builder()
         .method("POST")
-        .uri("/chat/turn")
+        .uri("/chat/stream")
         .header("authorization", auth_header)
         .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", &test_secret)
         .body(Body::from(chat_body.to_string()))
         .expect("chat request");
 
@@ -1031,24 +1025,30 @@ pub async fn run_product_matrix_full_journey(
     assert_eq!(
         response.status(),
         StatusCode::OK,
-        "chat/turn should return 200"
+        "chat/stream should return 200"
     );
 
     let mut stream = response.into_body().into_data_stream();
     let mut acc = Vec::new();
-    let mut saw_turn_complete = false;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.expect("sse chunk");
         acc.extend_from_slice(&chunk);
-        if String::from_utf8_lossy(&acc).contains("turn_complete") {
-            saw_turn_complete = true;
-            break;
-        }
     }
-    assert!(
-        saw_turn_complete,
-        "expected turn_complete in SSE, got: {}",
-        String::from_utf8_lossy(&acc)
+    let full = String::from_utf8_lossy(&acc).into_owned();
+    let events = full
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .collect::<Vec<_>>();
+    let terminals = events
+        .iter()
+        .filter(|event| event["type"].as_str() == Some("turn_complete"))
+        .collect::<Vec<_>>();
+    assert_eq!(terminals.len(), 1, "one server stream terminal: {full}");
+    assert_eq!(
+        terminals[0]["continuation_owner"].as_str(),
+        Some("server"),
+        "stream terminal must be server-owned: {full}"
     );
 
     wait_for_agent_event_types(
@@ -1077,7 +1077,7 @@ pub async fn run_product_matrix_full_journey(
             row_get_str(r, "event_type") == "user_query"
                 && row_get_str(r, "content").contains("matrix journey ping")
         })
-        .expect("user_query event from chat/turn");
+        .expect("user_query event from chat/stream");
     assert_eq!(row_get_str(user_q, "session_id"), session_id);
     assert_eq!(row_get_str(user_q, "user_id"), user_id);
     assert!(!row_get_str(user_q, "event_id").is_empty());
@@ -1093,7 +1093,7 @@ pub async fn run_product_matrix_full_journey(
             row_get_str(r, "event_type") == "llm_response"
                 && row_get_str(r, "content").contains(LLM_TEXT)
         })
-        .expect("llm_response from chat/turn with expected assistant text");
+        .expect("llm_response from chat/stream with expected assistant text");
     assert_eq!(row_get_str(llm, "session_id"), session_id);
     assert_eq!(row_get_str(llm, "user_id"), user_id);
     let llm_content = row_get_str(llm, "content");
@@ -1108,12 +1108,22 @@ pub async fn run_product_matrix_full_journey(
         "llm_response should parent to user_query"
     );
 
-    assert_eq!(row_get_opt_i64(llm, "token_input"), Some(5));
-    assert_eq!(row_get_opt_i64(llm, "token_output"), Some(15));
-    assert_eq!(row_get_opt_i64(llm, "token_total"), Some(20));
+    let llm_round = recs
+        .iter()
+        .find(|r| {
+            row_get_str(r, "event_type") == "llm_round_completed"
+                && row_get_str(r, "event_id").starts_with("trace:round_done:")
+        })
+        .expect("llm_round_completed event from server-owned stream");
+    assert_eq!(row_get_opt_i64(llm_round, "token_input"), Some(5));
+    assert_eq!(row_get_opt_i64(llm_round, "token_output"), Some(15));
+    assert_eq!(row_get_opt_i64(llm_round, "token_total"), Some(20));
     assert_eq!(
-        row_get_opt_str(llm, "llm_model_used").as_deref(),
-        Some("bridge-e2e-mock")
+        row_get_opt_str(llm_round, "llm_model_used")
+            .as_deref()
+            .is_some_and(|model| model.starts_with("mock-")),
+        true,
+        "server-owned stream should persist the seeded mock model"
     );
     assert!(
         row_get_opt_str(llm, "reasoning_content")
@@ -1209,7 +1219,7 @@ pub async fn run_product_matrix_full_journey(
     let n_turns: i64 = turn_cnt_row.try_get("c").unwrap_or(0);
     assert!(
         n_turns >= 1,
-        "expected >=1 session turn events after chat/turn for audit detail, got {n_turns}"
+        "expected >=1 session turn events after chat/stream for audit detail, got {n_turns}"
     );
     let last_turn_n = n_turns as u32;
     let turn_detail_path = format!("/sessions/{session_id}/audit/turns/{last_turn_n}");
@@ -1227,8 +1237,7 @@ pub async fn run_product_matrix_full_journey(
     );
 
     let tool_turn_sse =
-        run_tool_backed_chat_turn(app, ctx, auth_header, &session_id, &agent_id, &test_secret)
-            .await;
+        run_tool_backed_chat_turn(app, ctx, auth_header, &session_id, &agent_id).await;
     assert!(
         tool_turn_sse.contains("\"type\":\"tool_request\""),
         "tool-backed chat should emit tool_request: {tool_turn_sse}"
@@ -1308,7 +1317,6 @@ pub async fn run_product_matrix_full_journey(
             .is_some_and(|tools_available| tools_available >= 1),
         "context trace event should persist available tool count"
     );
-
     let assessment_row = sqlx::query(
         "SELECT score, step_count \
          FROM eval_quality_assessments \
@@ -1345,10 +1353,29 @@ pub async fn run_product_matrix_full_journey(
 
     let replay_cmp_path = format!("/sessions/{session_id}/replay/compare");
     let (st_rcmp, rcmp_j) = get_json(app, &replay_cmp_path, Some(auth_header), &[]).await;
-    assert_eq!(st_rcmp, StatusCode::OK, "replay compare: {rcmp_j}");
+    assert_eq!(
+        st_rcmp,
+        StatusCode::NOT_IMPLEMENTED,
+        "replay compare must remain unavailable: {rcmp_j}"
+    );
     assert!(
-        rcmp_j["original_event_count"].as_i64().unwrap_or(0) > 0,
-        "replay compare should count non-replay events: {rcmp_j}"
+        rcmp_j["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("replay") && detail.contains("unavailable")),
+        "replay compare should explain the unavailable capability: {rcmp_j}"
+    );
+    let replay_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events \
+         WHERE session_id = ? AND user_id = ? AND event_type = 'replay'",
+    )
+    .bind(&session_id)
+    .bind(&user_id)
+    .fetch_one(pool)
+    .await
+    .expect("replay rows after unavailable compare");
+    assert_eq!(
+        replay_rows, 0,
+        "compare guardrail must not write replay rows"
     );
 
     cleanup_session_data(&ctx.shared_pool, &user_id, &session_id).await;

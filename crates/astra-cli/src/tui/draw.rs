@@ -8,7 +8,7 @@
 //!
 //! See `ARCHITECTURE.md` for the visual-hierarchy grammar.
 
-use astra_tools::task_mgmt::TaskStoreHealth;
+use super::work_board_projection::TaskStoreHealth;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -20,9 +20,7 @@ use super::bottom_pane::{BottomPane, ConversationTab, footer::Footer};
 use super::history_cell::assistant::AssistantCell;
 use super::render::line_utils::sanitize_lines_for_terminal;
 use super::render::renderable::{FlexRenderable, Renderable, RenderableItem};
-use super::task_board_observer::{
-    ProjectedTaskTruthState, TaskBoardObserver, TaskBoardProjection, TaskBoardTruthState,
-};
+use super::task_board_observer::{TaskBoardObserver, TaskBoardProjection, TaskBoardTruthState};
 use super::terminal::TerminalGuard;
 use super::{chat_widget, status_indicator, task_list};
 use crate::cli::effects::truncate_label;
@@ -349,7 +347,7 @@ pub(crate) struct ViewportFrame {
 
 fn task_board_truth_line(
     state: TaskBoardTruthState,
-    store_health: TaskStoreHealth,
+    _store_health: TaskStoreHealth,
     width: u16,
 ) -> Option<Line<'static>> {
     if width == 0 {
@@ -361,82 +359,23 @@ fn task_board_truth_line(
         // take from this surface. Rendering it beside an active run falsely
         // reads as a run lifecycle failure, so keep the optional lane absent.
         TaskBoardTruthState::Unbound => return None,
-        TaskBoardTruthState::Loading => ("Checklist · syncing", theme.dim),
+        TaskBoardTruthState::Loading => ("Work · syncing", theme.dim),
         TaskBoardTruthState::Confirmed => return None,
         // A normal background refresh does not change the last confirmed
         // truth and must not add a transient row. Adding/removing this line on
         // every poll changed the viewport height and produced a blue flash.
         TaskBoardTruthState::Refreshing => return None,
-        TaskBoardTruthState::Stale => match store_health {
-            TaskStoreHealth::AuthenticationRequired => (
-                "Checklist sync needs sign-in · showing last confirmed checklist",
-                theme.warn,
-            ),
-            TaskStoreHealth::SessionUnavailable => (
-                "Checklist sync unavailable for this session · showing last confirmed checklist",
-                theme.warn,
-            ),
-            TaskStoreHealth::ServiceUnavailable => (
-                "Checklist storage unavailable · showing confirmed checklist · Ctrl+T → R refresh",
-                theme.warn,
-            ),
-            TaskStoreHealth::TransportUnavailable => (
-                "Checklist server unreachable · showing confirmed checklist · Ctrl+T → R refresh",
-                theme.warn,
-            ),
-            TaskStoreHealth::ProtocolMismatch => (
-                "Checklist sync protocol mismatch · showing last confirmed checklist",
-                theme.warn,
-            ),
-            TaskStoreHealth::Unknown | TaskStoreHealth::Ready => (
-                "Checklist sync delayed · showing last confirmed checklist · Ctrl+T → R refresh",
-                theme.warn,
-            ),
-        },
-        TaskBoardTruthState::Unavailable => match store_health {
-            TaskStoreHealth::AuthenticationRequired => ("Checklist sync needs sign-in", theme.warn),
-            TaskStoreHealth::SessionUnavailable => {
-                ("Checklist sync unavailable for this session", theme.warn)
-            }
-            TaskStoreHealth::ServiceUnavailable => (
-                "Checklist storage unavailable · Ctrl+T → R refresh",
-                theme.warn,
-            ),
-            TaskStoreHealth::TransportUnavailable => (
-                "Checklist server unreachable · Ctrl+T → R refresh",
-                theme.warn,
-            ),
-            TaskStoreHealth::ProtocolMismatch => (
-                "Checklist sync protocol mismatch · check client/server versions",
-                theme.warn,
-            ),
-            TaskStoreHealth::Unknown | TaskStoreHealth::Ready => (
-                "Checklist sync unavailable · Ctrl+T → R refresh",
-                theme.warn,
-            ),
-        },
+        TaskBoardTruthState::Stale => (
+            "Work state delayed · showing the last confirmed graph · Ctrl+T → R refresh",
+            theme.warn,
+        ),
+        TaskBoardTruthState::Unavailable => {
+            ("Work state unavailable · Ctrl+T → R refresh", theme.warn)
+        }
     };
     Some(Line::from(Span::styled(
         truncate_state_line(text, width as usize),
         Style::default().fg(color),
-    )))
-}
-
-/// A degraded canonical plan source must be visible when we are still showing
-/// its last confirmed steps. Do not render an initial unavailable/loading
-/// source: a session without a plan should stay quiet instead of suggesting a
-/// work failure that may not exist.
-fn projected_task_truth_line(state: ProjectedTaskTruthState, width: u16) -> Option<Line<'static>> {
-    if width == 0 || state != ProjectedTaskTruthState::Stale {
-        return None;
-    }
-    let theme = crate::tui::theme::current();
-    Some(Line::from(Span::styled(
-        truncate_state_line(
-            "Plan state delayed · showing last confirmed steps",
-            width as usize,
-        ),
-        Style::default().fg(theme.warn),
     )))
 }
 
@@ -465,7 +404,7 @@ pub(crate) fn active_viewport(
     chat_widget: &chat_widget::ChatWidget,
     status: &status_indicator::StatusIndicator,
     board: Option<&TaskBoardObserver>,
-    board_expanded: bool,
+    _board_expanded: bool,
     board_user_pin: Option<bool>,
     width: u16,
     rows: u16,
@@ -508,7 +447,14 @@ pub(crate) fn active_viewport(
             .collect();
 
         let any_live = cells.iter().any(|entry| entry.state.is_actionable_active());
-        let any_recently_terminal = !any_live
+        // A terminal-only strip is a brief within-turn transition cue, not
+        // durable workspace chrome. Once the parent turn settles, retained
+        // conversations remain available through Ctrl+G/Shift+Down but the
+        // active viewport must return to idle immediately. This also avoids a
+        // timer-only row becoming stuck when no event schedules a frame after
+        // the linger deadline.
+        let any_recently_terminal = status.turn_is_open()
+            && !any_live
             && agent_ids.iter().any(|id| {
                 chat_widget
                     .agent_run_terminal_at(id)
@@ -543,16 +489,6 @@ pub(crate) fn active_viewport(
             Some((lines, cell.is_live()))
         }
     });
-    // Pump the observer before reading its snapshot. Without this,
-    // mid-turn `task_board.create` / `task_board.update` calls land in
-    // `session_todos` but never propagate into the snapshot until
-    // the outer-tick branch fires `maybe_refresh()` — which can
-    // be 30+ seconds for a long agentic loop. The observer's own
-    // dirty/window gating makes per-frame calls cheap (no fetch
-    // unless something actually changed).
-    if let Some(b) = board {
-        b.maybe_refresh();
-    }
     // Rows and confidence are cloned under one observer lock. Reading them
     // separately could pair a pre-refresh cache with post-refresh confidence.
     let projection = board.map(TaskBoardObserver::active_projection);
@@ -573,11 +509,11 @@ pub(crate) fn active_viewport(
     // Resolve board visibility from the FRESH snapshot every frame.
     // This is the critical fix: previously, resolve_board_visibility
     // only ran in the outer-tick, so in-turn draws always saw the
-    // stale `board_expanded = false` from turn start. Now every draw
-    // self-corrects — if task_board.create lands mid-turn, the board opens
+    // stale window state from turn start. Now every draw self-corrects — if
+    // a Work task lands mid-turn, the board opens
     // on the very next frame (≤50ms).
     let (resolved_expanded, _reset_pin) =
-        super::board_pin::resolve_board_visibility(board_expanded, board_user_pin, has_tasks);
+        super::board_pin::resolve_board_visibility(board_user_pin, has_tasks, has_open_work);
 
     // Three-mode board:
     //   - hidden                       → render nothing
@@ -591,29 +527,14 @@ pub(crate) fn active_viewport(
         .as_ref()
         .map(TaskBoardProjection::store_health)
         .unwrap_or_default();
-    let mut state_lines = Vec::with_capacity(2);
-    // Do not surface an automatically-refreshing optional checklist lane during
-    // startup when it contributes no task. Once the user opens the board or
-    // there is any displayable work, show its independently attributable
-    // health without hiding the canonical task projection.
-    let checklist_lane_is_relevant =
-        has_open_work || resolved_expanded || board_user_pin == Some(true);
-    if checklist_lane_is_relevant
+    let mut state_lines = Vec::with_capacity(1);
+    // Keep an unrequested, empty Work lane quiet during startup. Once the user
+    // opens it or real rows exist, surface its exact observation state.
+    let work_lane_is_relevant = has_open_work || resolved_expanded || board_user_pin == Some(true);
+    if work_lane_is_relevant
         && let Some(line) =
             truth_state.and_then(|state| task_board_truth_line(state, store_health, width))
     {
-        state_lines.push(line);
-    }
-    if let Some(line) = projection.as_ref().and_then(|projection| match projection {
-        TaskBoardProjection::Single {
-            projected_truth_state,
-            ..
-        }
-        | TaskBoardProjection::All {
-            projected_truth_state,
-            ..
-        } => projected_task_truth_line(*projected_truth_state, width),
-    }) {
         state_lines.push(line);
     }
     let row_budget = rows.saturating_sub(state_lines.len() as u16);
@@ -625,21 +546,8 @@ pub(crate) fn active_viewport(
                 // observer reconciliation look like unstable content.
                 task_list::render(&snapshot.tasks, width, row_budget, true)
             }
-            Some(TaskBoardProjection::All { snapshot, .. }) if resolved_expanded => {
-                task_list::render_multi(&snapshot.per_session, width, row_budget)
-            }
             Some(TaskBoardProjection::Single { snapshot, .. }) if has_open_work => {
                 task_list::render_collapsed_active_summary(&snapshot.tasks, width)
-                    .into_iter()
-                    .collect()
-            }
-            Some(TaskBoardProjection::All { snapshot, .. }) if has_open_work => {
-                let tasks = snapshot
-                    .per_session
-                    .iter()
-                    .flat_map(|(_, tasks)| tasks.iter().cloned())
-                    .collect::<Vec<_>>();
-                task_list::render_collapsed_multi_summary(&tasks, width)
                     .into_iter()
                     .collect()
             }
@@ -763,7 +671,6 @@ pub(crate) fn do_draw(
         .map_err(|e| format!("failed to restore terminal input mode: {e}"))?;
     if let Some((board, expanded)) = task_board {
         sync_task_footer(&mut bottom_pane.footer, board, expanded);
-        bottom_pane.refresh_task_board(&board.active_projection());
     }
     bottom_pane.pre_draw_tick(std::time::Instant::now());
 
@@ -1083,98 +990,21 @@ mod active_view_priority_tests {
 
 #[cfg(test)]
 mod task_board_draw_tests {
-    use super::{
-        ActiveView, active_viewport, projected_task_truth_line, sync_task_footer,
-        task_board_truth_line,
+    use super::super::work_board_projection::{
+        SessionTask, SessionTaskStatusKind, TaskStoreHealth,
     };
+    use super::{ActiveView, active_viewport, sync_task_footer, task_board_truth_line};
     use crate::tui::{
         bottom_pane::footer::Footer,
         chat_widget, status_indicator,
-        task_board_observer::{ProjectedTaskTruthState, TaskBoardTruthState},
+        task_board_observer::{
+            LiveWorkTaskBoardUpdate, ProjectedTaskTruthState, TaskBoardTruthState, WorkBoardContext,
+        },
     };
-    use astra_tools::task_mgmt::{
-        InMemoryTaskStore, SessionTask, SessionTaskStatusKind, TaskManager, TaskStore,
-        TaskStoreHealth,
-    };
-    use async_trait::async_trait;
-    use std::collections::VecDeque;
-    use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
     use unicode_width::UnicodeWidthStr;
-
-    type SingleLoadResult = Result<Vec<SessionTask>, String>;
-    type MultiLoadResult = Result<Vec<(String, Vec<SessionTask>)>, String>;
-
-    async fn wait_until<F: Fn() -> bool>(cond: F, timeout_ms: u64, pump: impl Fn()) {
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        while !cond() && Instant::now() < deadline {
-            pump();
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-
-    struct DrawScriptStore {
-        single: Mutex<VecDeque<SingleLoadResult>>,
-        all: Mutex<VecDeque<MultiLoadResult>>,
-        notify: tokio::sync::broadcast::Sender<String>,
-    }
-
-    impl DrawScriptStore {
-        fn new(single: Vec<SingleLoadResult>, all: Vec<MultiLoadResult>) -> Arc<Self> {
-            let (notify, _) = tokio::sync::broadcast::channel(8);
-            Arc::new(Self {
-                single: Mutex::new(single.into()),
-                all: Mutex::new(all.into()),
-                notify,
-            })
-        }
-
-        fn mark_changed(&self, session_id: &str) {
-            let _ = self.notify.send(session_id.to_string());
-        }
-    }
-
-    #[async_trait]
-    impl TaskStore for DrawScriptStore {
-        async fn load(&self, _session_id: &str) -> Result<Vec<SessionTask>, String> {
-            self.single
-                .lock()
-                .expect("single draw script lock")
-                .pop_front()
-                .unwrap_or_else(|| Err("single draw script exhausted".to_string()))
-        }
-
-        async fn load_open_sessions(
-            &self,
-            _limit: usize,
-        ) -> Result<Vec<(String, Vec<SessionTask>)>, String> {
-            self.all
-                .lock()
-                .expect("all-session draw script lock")
-                .pop_front()
-                .unwrap_or_else(|| Err("all-session draw script exhausted".to_string()))
-        }
-
-        async fn save(&self, _session_id: &str, _tasks: Vec<SessionTask>) -> Result<(), String> {
-            Ok(())
-        }
-
-        async fn next_task_id(&self, _session_id: &str) -> Result<u32, String> {
-            Ok(1)
-        }
-
-        async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
-            Ok(1)
-        }
-
-        fn subscribe(&self) -> Option<tokio::sync::broadcast::Receiver<String>> {
-            Some(self.notify.subscribe())
-        }
-    }
 
     fn draw_task(id: &str, title: &str) -> SessionTask {
         SessionTask {
-            archived_at: None,
             id: id.to_string(),
             title: title.to_string(),
             description: None,
@@ -1190,6 +1020,22 @@ mod task_board_draw_tests {
         }
     }
 
+    fn draw_work_task(id: &str, title: &str, execution: &str) -> SessionTask {
+        let mut task = draw_task(&format!("work:work-1:main:{id}"), title);
+        task.status = match execution {
+            "running" => SessionTaskStatusKind::InProgress,
+            _ => SessionTaskStatusKind::Pending,
+        };
+        task.metadata = Some(serde_json::Map::from_iter([
+            ("source".into(), serde_json::json!("work_task_graph")),
+            ("declaration_state".into(), serde_json::json!("active")),
+            ("execution_status".into(), serde_json::json!(execution)),
+            ("delivery_status".into(), serde_json::json!("unreported")),
+            ("verification_status".into(), serde_json::json!("unknown")),
+        ]));
+        task
+    }
+
     fn board_text(frame: &super::ViewportFrame) -> String {
         frame
             .task_board
@@ -1200,19 +1046,6 @@ mod task_board_draw_tests {
             .map(|span| span.content.as_ref())
             .collect::<Vec<_>>()
             .join("\n")
-    }
-
-    async fn wait_for_truth(
-        observer: &crate::tui::task_board_observer::TaskBoardObserver,
-        expected: crate::tui::task_board_observer::TaskBoardTruthState,
-    ) {
-        wait_until(
-            || observer.truth_state() == expected,
-            500,
-            || observer.maybe_refresh(),
-        )
-        .await;
-        assert_eq!(observer.truth_state(), expected);
     }
 
     #[test]
@@ -1257,67 +1090,25 @@ mod task_board_draw_tests {
     }
 
     #[test]
-    fn stale_plan_projection_is_visible_but_absent_plan_is_quiet() {
-        let stale = projected_task_truth_line(ProjectedTaskTruthState::Stale, 80)
-            .expect("stale plan rows need an attribution notice");
-        let text = stale
+    fn unavailable_work_notice_is_bounded_and_actionable() {
+        let line =
+            task_board_truth_line(TaskBoardTruthState::Unavailable, TaskStoreHealth::Ready, 48)
+                .expect("notice");
+        let text = line
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        assert!(text.contains("last confirmed steps"));
-        assert!(projected_task_truth_line(ProjectedTaskTruthState::Loading, 80).is_none());
-        assert!(projected_task_truth_line(ProjectedTaskTruthState::Unavailable, 80).is_none());
-    }
-
-    #[test]
-    fn task_truth_notice_uses_structured_store_health() {
-        let text = |health| {
-            task_board_truth_line(TaskBoardTruthState::Unavailable, health, 100)
-                .expect("notice")
-                .spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-        };
-
-        let service = text(TaskStoreHealth::ServiceUnavailable);
-        assert!(
-            service.contains("Checklist storage unavailable"),
-            "{service}"
-        );
-        assert!(service.contains("Ctrl+T → R refresh"), "{service}");
-
-        let transport = text(TaskStoreHealth::TransportUnavailable);
-        assert!(
-            transport.contains("Checklist server unreachable"),
-            "{transport}"
-        );
-
-        let auth = text(TaskStoreHealth::AuthenticationRequired);
-        assert!(auth.contains("needs sign-in"), "{auth}");
-        assert!(!auth.contains("R refresh"), "{auth}");
-
-        let session = text(TaskStoreHealth::SessionUnavailable);
-        assert!(session.contains("this session"), "{session}");
-        assert!(!session.contains("R refresh"), "{session}");
-
-        let protocol = text(TaskStoreHealth::ProtocolMismatch);
-        assert!(protocol.contains("protocol mismatch"), "{protocol}");
-        assert!(!protocol.contains("R refresh"), "{protocol}");
+        assert!(text.width() <= 48, "{text}");
+        assert!(text.contains("Work state unavailable"), "{text}");
     }
 
     #[tokio::test]
     async fn first_read_failure_renders_unavailable_without_leaking_diagnostics() {
-        use crate::tui::task_board_observer::{TaskBoardObserver, TaskBoardTruthState};
+        use crate::tui::task_board_observer::TaskBoardObserver;
 
-        let store = DrawScriptStore::new(
-            vec![Err("SECRET database topology and credentials".to_string())],
-            Vec::new(),
-        );
-        let observer = TaskBoardObserver::new(store as Arc<dyn TaskStore>, "draw-failed");
-        observer.maybe_refresh();
-        wait_for_truth(&observer, TaskBoardTruthState::Unavailable).await;
+        let observer = TaskBoardObserver::new("draw-failed");
+        observer.set_projected_task_projection(Vec::new(), ProjectedTaskTruthState::Unavailable);
 
         let frame = active_viewport(
             &chat_widget::ChatWidget::new(String::new()),
@@ -1334,16 +1125,11 @@ mod task_board_draw_tests {
     }
 
     #[tokio::test]
-    async fn unavailable_empty_checklist_is_explained_after_the_user_opens_the_board() {
-        use crate::tui::task_board_observer::{TaskBoardObserver, TaskBoardTruthState};
+    async fn unavailable_empty_work_is_explained_after_the_user_opens_the_board() {
+        use crate::tui::task_board_observer::TaskBoardObserver;
 
-        let store = DrawScriptStore::new(
-            vec![Err("SECRET database topology and credentials".to_string())],
-            Vec::new(),
-        );
-        let observer = TaskBoardObserver::new(store as Arc<dyn TaskStore>, "draw-failed");
-        observer.maybe_refresh();
-        wait_for_truth(&observer, TaskBoardTruthState::Unavailable).await;
+        let observer = TaskBoardObserver::new("draw-failed");
+        observer.set_projected_task_projection(Vec::new(), ProjectedTaskTruthState::Unavailable);
 
         let frame = active_viewport(
             &chat_widget::ChatWidget::new(String::new()),
@@ -1355,26 +1141,20 @@ mod task_board_draw_tests {
             24,
         );
         let text = board_text(&frame);
-        assert!(text.contains("Checklist sync unavailable"), "{text}");
+        assert!(text.contains("Work state unavailable"), "{text}");
         assert!(text.contains("Ctrl+T → R refresh"), "{text}");
         assert!(!text.contains("SECRET"), "{text}");
     }
 
     #[tokio::test]
-    async fn confirmed_plan_work_remains_visible_when_checklist_sync_fails() {
-        use crate::tui::task_board_observer::{TaskBoardObserver, TaskBoardTruthState};
+    async fn stale_work_remains_visible_without_leaking_diagnostics() {
+        use crate::tui::task_board_observer::TaskBoardObserver;
 
-        let store = DrawScriptStore::new(
-            vec![Err("SECRET checklist endpoint failure".to_string())],
-            Vec::new(),
-        );
-        let observer = TaskBoardObserver::new(store as Arc<dyn TaskStore>, "draw-plan");
+        let observer = TaskBoardObserver::new("draw-plan");
         observer.set_projected_task_projection(
-            vec![draw_task("plan:plan-9:step-1", "verify durable plan work")],
-            ProjectedTaskTruthState::Confirmed,
+            vec![draw_task("work:work-9:main:item-1", "verify durable work")],
+            ProjectedTaskTruthState::Stale,
         );
-        observer.maybe_refresh();
-        wait_for_truth(&observer, TaskBoardTruthState::Unavailable).await;
 
         let frame = active_viewport(
             &chat_widget::ChatWidget::new(String::new()),
@@ -1386,30 +1166,30 @@ mod task_board_draw_tests {
             24,
         );
         let text = board_text(&frame);
-        assert!(text.contains("verify durable plan work"), "{text}");
-        assert!(text.contains("Checklist sync unavailable"), "{text}");
+        assert!(text.contains("verify durable work"), "{text}");
+        assert!(text.contains("Work state delayed"), "{text}");
         assert!(!text.contains("SECRET"), "{text}");
     }
 
     #[tokio::test]
     async fn stale_notice_keeps_last_confirmed_task_visible() {
-        use crate::tui::task_board_observer::{TaskBoardObserver, TaskBoardTruthState};
+        use crate::tui::task_board_observer::TaskBoardObserver;
 
-        let store = DrawScriptStore::new(
-            vec![
-                Ok(vec![draw_task("task-1", "keep confirmed work visible")]),
-                Err("SECRET refresh failure".to_string()),
-            ],
-            Vec::new(),
+        let observer = TaskBoardObserver::new("draw-stale");
+        observer.set_projected_task_projection(
+            vec![draw_task(
+                "work:work-1:main:item-1",
+                "keep confirmed work visible",
+            )],
+            ProjectedTaskTruthState::Confirmed,
         );
-        let observer = TaskBoardObserver::new(store.clone() as Arc<dyn TaskStore>, "draw-stale");
-        observer.maybe_refresh();
-        wait_for_truth(&observer, TaskBoardTruthState::Confirmed).await;
-
-        store.mark_changed("draw-stale");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        observer.maybe_refresh();
-        wait_for_truth(&observer, TaskBoardTruthState::Stale).await;
+        observer.set_projected_task_projection(
+            vec![draw_task(
+                "work:work-1:main:item-1",
+                "keep confirmed work visible",
+            )],
+            ProjectedTaskTruthState::Stale,
+        );
 
         let frame = active_viewport(
             &chat_widget::ChatWidget::new(String::new()),
@@ -1421,33 +1201,20 @@ mod task_board_draw_tests {
             24,
         );
         let text = board_text(&frame);
-        assert!(text.contains("Checklist sync delayed"), "{text}");
+        assert!(text.contains("Work state delayed"), "{text}");
         assert!(text.contains("keep confirmed work visible"), "{text}");
         assert!(!text.contains("SECRET"), "{text}");
     }
 
     #[tokio::test]
-    async fn all_sessions_visibility_does_not_inherit_single_session_empty_hidden_state() {
-        use crate::tui::task_board_observer::{TaskBoardObserver, TaskBoardTruthState};
+    async fn active_canonical_work_auto_expands_the_task_board() {
+        use crate::tui::task_board_observer::TaskBoardObserver;
 
-        let store = DrawScriptStore::new(
-            vec![Ok(Vec::new())],
-            vec![Ok(vec![(
-                "cloud-session".to_string(),
-                vec![draw_task("task-cloud", "visible cross-session work")],
-            )])],
+        let observer = TaskBoardObserver::new("draw-single-empty");
+        observer.set_projected_task_projection(
+            vec![draw_work_task("item-1", "visible Work item", "not_started")],
+            ProjectedTaskTruthState::Confirmed,
         );
-        let observer = TaskBoardObserver::new(store as Arc<dyn TaskStore>, "draw-single-empty");
-        observer.maybe_refresh();
-        wait_for_truth(&observer, TaskBoardTruthState::Confirmed).await;
-        assert!(
-            observer.snapshot().hidden,
-            "confirmed empty single lane hides itself"
-        );
-
-        observer.toggle_view_mode();
-        observer.maybe_refresh();
-        wait_for_truth(&observer, TaskBoardTruthState::Confirmed).await;
         let frame = active_viewport(
             &chat_widget::ChatWidget::new(String::new()),
             &status_indicator::StatusIndicator::new(),
@@ -1458,28 +1225,111 @@ mod task_board_draw_tests {
             24,
         );
         let text = board_text(&frame);
-        assert!(text.contains("visible cross-session work"), "{text}");
+        assert!(frame.resolved_board_expanded);
+        assert!(text.contains("Tasks"), "{text}");
+        assert!(text.contains("visible Work item"), "{text}");
+    }
+
+    #[test]
+    fn live_receipt_auto_expands_before_a_remote_graph_read() {
+        use crate::tui::task_board_observer::TaskBoardObserver;
+
+        let observer = TaskBoardObserver::new("draw-live-receipt");
+        let mut active = draw_work_task("item-1", "execute without polling", "running");
+        active.status = SessionTaskStatusKind::InProgress;
+        assert!(
+            observer.apply_live_work_update(LiveWorkTaskBoardUpdate::Snapshot {
+                work: WorkBoardContext {
+                    work_id: "work-1".into(),
+                    branch_id: "main".into(),
+                    goal: "Show durable work immediately".into(),
+                    graph_revision: 1,
+                    criteria_member_count: 0,
+                    milestone_count: 0,
+                },
+                tasks: vec![active],
+            })
+        );
+
+        let frame = active_viewport(
+            &chat_widget::ChatWidget::new(String::new()),
+            &status_indicator::StatusIndicator::new(),
+            Some(&observer),
+            false,
+            None,
+            80,
+            24,
+        );
+        let text = board_text(&frame);
+        assert!(frame.resolved_board_expanded);
+        assert!(text.contains("execute without polling"), "{text}");
+        assert!(!text.contains("Work state unavailable"), "{text}");
+    }
+
+    #[test]
+    fn inline_board_tracks_canonical_graph_growth_and_execution_changes() {
+        use crate::tui::task_board_observer::TaskBoardObserver;
+
+        let observer = TaskBoardObserver::new("draw-dynamic-work");
+        observer.set_projected_task_projection(
+            vec![
+                draw_work_task("inspect", "Inspect the failing path", "not_started"),
+                draw_work_task("repair", "Repair the invariant", "not_started"),
+            ],
+            ProjectedTaskTruthState::Confirmed,
+        );
+        let initial = active_viewport(
+            &chat_widget::ChatWidget::new(String::new()),
+            &status_indicator::StatusIndicator::new(),
+            Some(&observer),
+            true,
+            Some(true),
+            100,
+            32,
+        );
+        let initial_text = board_text(&initial);
+        assert!(initial_text.contains("2 queued"), "{initial_text}");
+        assert!(
+            initial_text.contains("Inspect the failing path"),
+            "{initial_text}"
+        );
+        assert!(
+            initial_text.contains("Repair the invariant"),
+            "{initial_text}"
+        );
+
+        observer.set_projected_task_projection(
+            vec![
+                draw_work_task("inspect", "Inspect the failing path", "running"),
+                draw_work_task("repair", "Repair the invariant", "not_started"),
+                draw_work_task("verify", "Verify the repaired behavior", "not_started"),
+            ],
+            ProjectedTaskTruthState::Confirmed,
+        );
+        let advanced = active_viewport(
+            &chat_widget::ChatWidget::new(String::new()),
+            &status_indicator::StatusIndicator::new(),
+            Some(&observer),
+            true,
+            Some(true),
+            100,
+            32,
+        );
+        let advanced_text = board_text(&advanced);
+        assert!(advanced_text.contains("1 working"), "{advanced_text}");
+        assert!(advanced_text.contains("2 queued"), "{advanced_text}");
+        assert!(
+            advanced_text.contains("Verify the repaired behavior"),
+            "{advanced_text}"
+        );
     }
 
     #[tokio::test]
     async fn terminal_history_does_not_keep_compact_surface_alive() {
-        let store = Arc::new(InMemoryTaskStore::new());
-        let obs = crate::tui::task_board_observer::TaskBoardObserver::new(
-            store.clone() as Arc<dyn TaskStore>,
-            "draw-hidden",
-        );
-        let mgr = TaskManager::new("draw-hidden", store as Arc<dyn TaskStore>);
-        mgr.create(&serde_json::json!({"title": "done"})).await;
-        mgr.update(&serde_json::json!({"task_id": "task-1", "new_status": "in_progress"}))
-            .await;
-        mgr.update(&serde_json::json!({"task_id": "task-1", "new_status": "completed"}))
-            .await;
-        wait_until(
-            || obs.snapshot().tasks.len() == 1,
-            500,
-            || obs.maybe_refresh(),
-        )
-        .await;
+        let obs = crate::tui::task_board_observer::TaskBoardObserver::new("draw-hidden");
+        let mut done = draw_task("work:work-1:main:done", "done");
+        done.status = SessionTaskStatusKind::Completed;
+        obs.set_projected_task_projection(vec![done], ProjectedTaskTruthState::Confirmed);
         let frame = active_viewport(
             &chat_widget::ChatWidget::new(String::new()),
             &status_indicator::StatusIndicator::new(),
@@ -1501,44 +1351,17 @@ mod task_board_draw_tests {
             footer.task_counts, None,
             "terminal history remains available through Ctrl+T without a sticky footer chip"
         );
-
-        assert!(obs.request_refresh());
-        let refreshing_frame = active_viewport(
-            &chat_widget::ChatWidget::new(String::new()),
-            &status_indicator::StatusIndicator::new(),
-            Some(&obs),
-            false,
-            Some(false),
-            80,
-            24,
-        );
-        assert_eq!(obs.truth_state(), TaskBoardTruthState::Refreshing);
-        assert!(
-            refreshing_frame.task_board.is_none(),
-            "quiet reconciliation of explicitly collapsed terminal history must not flash a foreground loading row: {:?}",
-            refreshing_frame.task_board
-        );
     }
 
     #[tokio::test]
     async fn footer_retains_lifecycle_progress_while_open_work_remains() {
-        let store = Arc::new(InMemoryTaskStore::new());
-        let obs = crate::tui::task_board_observer::TaskBoardObserver::new(
-            store.clone() as Arc<dyn TaskStore>,
-            "draw-mixed-progress",
+        let obs = crate::tui::task_board_observer::TaskBoardObserver::new("draw-mixed-progress");
+        let mut done = draw_task("work:work-1:main:done", "done");
+        done.status = SessionTaskStatusKind::Completed;
+        obs.set_projected_task_projection(
+            vec![done, draw_task("work:work-1:main:open", "still open")],
+            ProjectedTaskTruthState::Confirmed,
         );
-        let mgr = TaskManager::new("draw-mixed-progress", store as Arc<dyn TaskStore>);
-        mgr.create(&serde_json::json!({"title": "done"})).await;
-        mgr.update(&serde_json::json!({"task_id": "task-1", "new_status": "completed"}))
-            .await;
-        mgr.create(&serde_json::json!({"title": "still open"}))
-            .await;
-        wait_until(
-            || obs.snapshot().tasks.len() == 2,
-            500,
-            || obs.maybe_refresh(),
-        )
-        .await;
 
         let mut footer = Footer::new();
         sync_task_footer(&mut footer, &obs, false);
@@ -1551,30 +1374,11 @@ mod task_board_draw_tests {
 
     #[tokio::test]
     async fn expanded_task_board_falls_back_to_hint_when_terminal_too_short() {
-        let store = Arc::new(InMemoryTaskStore::new());
-        let obs = crate::tui::task_board_observer::TaskBoardObserver::new(
-            store.clone() as Arc<dyn TaskStore>,
-            "draw-short",
+        let obs = crate::tui::task_board_observer::TaskBoardObserver::new("draw-short");
+        obs.set_projected_task_projection(
+            vec![draw_task("work:work-1:main:item-1", "fit me somewhere")],
+            ProjectedTaskTruthState::Confirmed,
         );
-        let mgr = TaskManager::new("draw-short", store as Arc<dyn TaskStore>);
-        mgr.create(&serde_json::json!({"title": "fit me somewhere"}))
-            .await;
-        wait_until(
-            || obs.snapshot().tasks.len() == 1,
-            500,
-            || obs.maybe_refresh(),
-        )
-        .await;
-        // Let the create notification settle, then reconcile once so this
-        // test measures the confirmed short-terminal layout rather than an
-        // observer transition that may still be in flight.
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        obs.maybe_refresh();
-        wait_for_truth(
-            &obs,
-            crate::tui::task_board_observer::TaskBoardTruthState::Confirmed,
-        )
-        .await;
 
         let frame = active_viewport(
             &chat_widget::ChatWidget::new(String::new()),
@@ -1617,20 +1421,11 @@ mod task_board_draw_tests {
         // in the ViewportFrame — the board is no longer on the
         // priority chain that `active` lives on.
         use crate::tui::chat_widget::WireEvent;
-        let store = Arc::new(InMemoryTaskStore::new());
-        let obs = crate::tui::task_board_observer::TaskBoardObserver::new(
-            store.clone() as Arc<dyn TaskStore>,
-            "draw-coexist",
+        let obs = crate::tui::task_board_observer::TaskBoardObserver::new("draw-coexist");
+        obs.set_projected_task_projection(
+            vec![draw_task("work:work-1:main:item-1", "pending task")],
+            ProjectedTaskTruthState::Confirmed,
         );
-        let mgr = TaskManager::new("draw-coexist", store as Arc<dyn TaskStore>);
-        mgr.create(&serde_json::json!({"title": "pending task"}))
-            .await;
-        wait_until(
-            || obs.snapshot().tasks.len() == 1,
-            500,
-            || obs.maybe_refresh(),
-        )
-        .await;
 
         // Parent-level streaming tool cell (what used to steal the slot).
         let mut widget = chat_widget::ChatWidget::new(String::new());
@@ -1666,6 +1461,8 @@ mod task_board_draw_tests {
         use crate::tui::chat_widget::WireEvent;
 
         let mut widget = chat_widget::ChatWidget::new(String::new());
+        let mut status = status_indicator::StatusIndicator::new();
+        status.begin_turn(std::time::Instant::now());
         widget.handle_event(chat_widget::AppEvent::wire(
             WireEvent::AgentControlCompleted {
                 action: "get_result".into(),
@@ -1685,6 +1482,38 @@ mod task_board_draw_tests {
             },
         ));
 
+        let frame = active_viewport(&widget, &status, None, false, None, 80, 24);
+
+        assert!(
+            frame.multi_agent.is_some(),
+            "freshly completed logical agents should linger even when child duration exceeds the local registry elapsed time"
+        );
+    }
+
+    #[test]
+    fn completed_agent_strip_dismisses_when_the_parent_turn_settles() {
+        use crate::tui::chat_widget::WireEvent;
+
+        let mut widget = chat_widget::ChatWidget::new(String::new());
+        widget.handle_event(chat_widget::AppEvent::wire(
+            WireEvent::AgentControlCompleted {
+                action: "get_result".into(),
+                label: "reviewer".into(),
+                status: "completed".into(),
+                duration_ms: 50,
+                output: Some(
+                    serde_json::json!({
+                        "agent_id": "reviewer@settled",
+                        "status": "completed",
+                        "result": "done"
+                    })
+                    .to_string(),
+                ),
+                tool_use_id: "tu_get_result_settled".into(),
+                agent_id: Some("reviewer@settled".into()),
+            },
+        ));
+
         let frame = active_viewport(
             &widget,
             &status_indicator::StatusIndicator::new(),
@@ -1696,9 +1525,10 @@ mod task_board_draw_tests {
         );
 
         assert!(
-            frame.multi_agent.is_some(),
-            "freshly completed logical agents should linger even when child duration exceeds the local registry elapsed time"
+            frame.multi_agent.is_none(),
+            "terminal agent history remains in Ctrl+G and must not pin the idle viewport"
         );
+        assert_eq!(widget.agent_monitor_snapshot(5).len(), 1);
     }
 
     #[test]

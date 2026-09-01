@@ -15,9 +15,17 @@ use crate::runner::RunOutcome;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FailureClass {
     InfraAuth,
+    /// The agent process reached the runtime, but a durable control-plane or
+    /// persistence dependency failed before a canonical run boundary. This is
+    /// distinct from credentials: retrying login cannot repair a blocked
+    /// database/ledger admission.
+    InfraRuntime,
+    InfraQuota,
     InfraTimeout,
     InfraModelInactive,
-    InfraProviderError { provider: String },
+    InfraProviderError {
+        provider: String,
+    },
     InfraRateLimit,
     InfraVerificationUnavailable,
     PlatformSetupFailed,
@@ -26,6 +34,11 @@ pub enum FailureClass {
     ModelCapability,
     ModelQualityLow,
     EfficiencyBoundsExceeded,
+    /// The process completed, but a hard typed oracle rejected the observed
+    /// behavior. This deliberately does not guess whether the model, runtime,
+    /// or their interaction owns the fault; the failed criterion and journal
+    /// carry that causal evidence.
+    BehaviorContractViolation,
     ToolUnavailable,
     Unknown,
 }
@@ -34,6 +47,8 @@ impl fmt::Display for FailureClass {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InfraAuth => write!(f, "InfraAuth"),
+            Self::InfraRuntime => write!(f, "InfraRuntime"),
+            Self::InfraQuota => write!(f, "InfraQuota"),
             Self::InfraTimeout => write!(f, "InfraTimeout"),
             Self::InfraModelInactive => write!(f, "InfraModelInactive"),
             Self::InfraProviderError { provider } => write!(f, "InfraProviderError({provider})"),
@@ -45,6 +60,7 @@ impl fmt::Display for FailureClass {
             Self::ModelCapability => write!(f, "ModelCapability"),
             Self::ModelQualityLow => write!(f, "ModelQualityLow"),
             Self::EfficiencyBoundsExceeded => write!(f, "EfficiencyBoundsExceeded"),
+            Self::BehaviorContractViolation => write!(f, "BehaviorContractViolation"),
             Self::ToolUnavailable => write!(f, "ToolUnavailable"),
             Self::Unknown => write!(f, "Unknown"),
         }
@@ -53,9 +69,17 @@ impl fmt::Display for FailureClass {
 
 /// Classify a failure based on outcome signals and criteria results.
 pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> FailureClass {
-    // Exit code 124 = timeout (POSIX convention).
+    // Exit 124 only proves that the outer deadline fired. If typed execution
+    // evidence already proves model/tool progress, calling it an infrastructure
+    // outage hides the product's pacing failure and tells reviewers to paper it
+    // over by increasing the timeout. Reserve InfraTimeout for runs that never
+    // crossed a model/tool boundary.
     if outcome.exit_code == 124 {
-        return FailureClass::InfraTimeout;
+        return if timeout_has_execution_progress(outcome, criteria_results) {
+            FailureClass::EfficiencyBoundsExceeded
+        } else {
+            FailureClass::InfraTimeout
+        };
     }
 
     let stderr = &outcome.stderr;
@@ -64,14 +88,26 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
         return FailureClass::InfraAuth;
     }
 
+    let stderr_lower = stderr.to_lowercase();
+    if stderr_lower.contains("database_error")
+        || stderr_lower.contains("durable inference ledger")
+        || stderr_lower.contains("logical_invocation_admission")
+        || stderr_lower.contains("database connection")
+    {
+        return FailureClass::InfraRuntime;
+    }
+    if stderr_lower.contains("quota exceeded")
+        || stderr_lower.contains("daily_sessions")
+        || stderr_lower.contains("daily session limit reached")
+    {
+        return FailureClass::InfraQuota;
+    }
+
     if stderr.contains("is inactive (connectivity failed or disabled)") {
         return FailureClass::InfraModelInactive;
     }
 
-    if stderr.contains("429")
-        || stderr.contains("rate limit")
-        || stderr.contains("Too many requests")
-    {
+    if outcome_is_rate_limited(outcome) {
         return FailureClass::InfraRateLimit;
     }
 
@@ -84,12 +120,19 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
         return FailureClass::InfraProviderError { provider };
     }
 
-    // astra exits 3 on auth failure with empty response.
-    if outcome.exit_code == 3
-        && outcome.text.is_empty()
-        && !stderr.contains("is inactive (connectivity failed or disabled)")
-    {
-        return FailureClass::InfraAuth;
+    // Some provider/auth failures exit 3 without a structured envelope, but
+    // an empty response alone is not evidence of credentials. Durable ledger
+    // failures also exit 3; classify those above and keep remaining
+    // no-evidence process failures honest instead of telling users to log in.
+    if outcome.exit_code == 3 && outcome.text.is_empty() {
+        if stderr_lower.contains("auth")
+            || stderr_lower.contains("credential")
+            || stderr_lower.contains("api key")
+            || stderr_lower.contains("login")
+        {
+            return FailureClass::InfraAuth;
+        }
+        return FailureClass::Unknown;
     }
 
     // Criterion-based classification.
@@ -181,13 +224,59 @@ pub fn classify(outcome: &RunOutcome, criteria_results: &[CriterionResult]) -> F
         return FailureClass::EfficiencyBoundsExceeded;
     }
 
+    // A successful process with failed typed hard evidence is neither an
+    // infrastructure outage nor an unknowable failure. Keep the classification
+    // ownership-neutral: a durable oracle can expose model behavior, runtime
+    // behavior, or a broken interaction contract, and the evidence should be
+    // inspected before assigning blame.
+    let hard_contract_failed = criteria_results.iter().any(|result| {
+        !result.passed
+            && result.severity == crate::criteria::CriterionSeverity::Hard
+            && !matches!(result.criterion, Criterion::HardJudger { .. })
+    });
+    if outcome.exit_code == 0 && hard_contract_failed {
+        return FailureClass::BehaviorContractViolation;
+    }
+
     FailureClass::Unknown
+}
+
+/// A rate-limit classification requires typed failed terminal evidence.
+/// Successful answers may legitimately discuss rate limits and must never be
+/// relabelled as infrastructure failures by substring matching.
+pub(crate) fn outcome_is_rate_limited(outcome: &RunOutcome) -> bool {
+    if outcome.exit_code == 0
+        || !matches!(
+            outcome.final_state.as_deref(),
+            Some("interrupted") | Some("failed")
+        )
+    {
+        return false;
+    }
+    let diagnostic = outcome.stderr.to_ascii_lowercase();
+    let text_signal = diagnostic.contains("too many requests")
+        || diagnostic.contains("rate_limit")
+        || diagnostic.contains("rate limit")
+        || diagnostic.contains("[rate_limit]")
+        || (diagnostic.contains("429")
+            && (diagnostic.contains("error") || diagnostic.contains("http")));
+    let typed_signal = outcome.interruption_kind.as_deref().is_some_and(|kind| {
+        let kind = kind.to_ascii_lowercase();
+        kind.contains("rate") || kind.contains("quota") || kind.contains("429")
+    });
+    text_signal && typed_signal
 }
 
 /// Returns a one-line suggested action for the failure class.
 pub fn suggested_action(class: &FailureClass) -> &'static str {
     match class {
         FailureClass::InfraAuth => "Check credentials: run `astra admin login` or verify API keys",
+        FailureClass::InfraRuntime => {
+            "Check Astra server/database/ledger health, let pending settlements drain, then re-run"
+        }
+        FailureClass::InfraQuota => {
+            "Use a fresh authorized test account, raise its quota, or wait for the quota window to reset"
+        }
         FailureClass::InfraTimeout => "Increase timeout or check network connectivity to provider",
         FailureClass::InfraModelInactive => {
             "Model is inactive on the server; run `astra admin model check <model>` or load an active model"
@@ -215,13 +304,75 @@ pub fn suggested_action(class: &FailureClass) -> &'static str {
             "Model completed the task but judger scored quality below threshold"
         }
         FailureClass::EfficiencyBoundsExceeded => {
-            "Task completed correctly but exceeded efficiency bounds (tokens/duration/turns)"
+            "Execution exceeded its efficiency bound; inspect task scope and round pacing before increasing the limit"
+        }
+        FailureClass::BehaviorContractViolation => {
+            "Inspect the failed typed criterion and durable journal before assigning the fault to model or runtime"
         }
         FailureClass::ToolUnavailable => {
             "A required tool was not exposed at runtime; check tool registry and selector config"
         }
         FailureClass::Unknown => "Inspect stderr and session journal for clues",
     }
+}
+
+fn timeout_has_execution_progress(
+    outcome: &RunOutcome,
+    criteria_results: &[CriterionResult],
+) -> bool {
+    if outcome.turn_rounds > 0
+        || outcome.tool_calls_count > 0
+        || stream_has_execution_progress(&outcome.stderr)
+    {
+        return true;
+    }
+    criteria_results.iter().any(|result| {
+        result.passed
+            && match &result.criterion {
+                Criterion::JournalToolCallCount { min, .. }
+                | Criterion::JournalToolOutcomeCount { min, .. } => *min > 0,
+                Criterion::JournalToolJson { .. }
+                | Criterion::JournalToolJsonContains { .. }
+                | Criterion::JournalToolValueFlowBound { .. }
+                | Criterion::JournalArtifactConsumed { .. }
+                | Criterion::JournalToolValueFlow { .. }
+                | Criterion::JournalToolSequence { .. }
+                | Criterion::JournalToolPrecedence { .. }
+                | Criterion::JournalWorkItemExecutionFromStart { .. }
+                | Criterion::JournalWorkGraphPatch { .. } => true,
+                Criterion::TurnRoundsBetween { min, .. } => *min > 0,
+                _ => false,
+            }
+    })
+}
+
+/// The CLI's `--stream-events` channel is the last live evidence available
+/// when the outer timeout kills the process before the JSON terminal envelope
+/// is printed. Count only producer-owned execution events; session/run
+/// binding and context-window estimates prove setup, not model progress.
+fn stream_has_execution_progress(stderr: &str) -> bool {
+    const EXECUTION_EVENTS: &[&str] = &[
+        "model_responding",
+        "token",
+        "thinking_chunk",
+        "tool_started",
+        "tool_completed",
+        "agent_control_started",
+        "agent_control_completed",
+        "assistant_output_settled",
+        "turn_complete",
+    ];
+    stderr.lines().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|event| {
+                event
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|event_type| EXECUTION_EVENTS.contains(&event_type))
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn extract_provider(model: &str, stderr: &str) -> String {
@@ -270,6 +421,7 @@ fn is_deterministic(criterion: &Criterion) -> bool {
             | Criterion::ToolsCountBetween { .. }
             | Criterion::StderrMatches { .. }
             | Criterion::TextContains { .. }
+            | Criterion::TextNotContains { .. }
     )
 }
 
@@ -300,15 +452,122 @@ mod tests {
     }
 
     #[test]
+    fn deadline_after_model_progress_is_an_efficiency_failure() {
+        let mut outcome = make_outcome().with_exit_code(124);
+        outcome.turn_rounds = 3;
+        assert_eq!(
+            classify(&outcome, &[]),
+            FailureClass::EfficiencyBoundsExceeded
+        );
+
+        // A killed CLI may not flush its terminal summary. Durable journal
+        // criteria still prove that the product crossed execution boundaries.
+        let outcome = make_outcome().with_exit_code(124);
+        let evidence = CriterionResult {
+            criterion: Criterion::JournalToolCallCount {
+                name: "run_next_work_item".into(),
+                min: 1,
+                max: 2,
+                document: None,
+                path: None,
+                equals: None,
+            },
+            severity: crate::criteria::CriterionSeverity::Hard,
+            passed: true,
+            detail: String::new(),
+            full_detail: None,
+            score: None,
+        };
+        assert_eq!(
+            classify(&outcome, &[evidence]),
+            FailureClass::EfficiencyBoundsExceeded
+        );
+    }
+
+    #[test]
+    fn stream_progress_reclassifies_timeout_without_a_terminal_envelope() {
+        let outcome = make_outcome().with_exit_code(124).with_stderr(
+            "{\"type\":\"session_bound\",\"session_id\":\"s\"}\n{\"type\":\"model_responding\"}\n",
+        );
+        assert_eq!(
+            classify(&outcome, &[]),
+            FailureClass::EfficiencyBoundsExceeded
+        );
+
+        let setup_only = make_outcome()
+            .with_exit_code(124)
+            .with_stderr(
+                "{\"type\":\"session_bound\",\"session_id\":\"s\"}\n{\"type\":\"context_window_estimated\"}\n",
+            );
+        assert_eq!(classify(&setup_only, &[]), FailureClass::InfraTimeout);
+    }
+
+    #[test]
+    fn vacuous_zero_call_evidence_does_not_reclassify_infra_timeout() {
+        let outcome = make_outcome().with_exit_code(124);
+        let absence_check = CriterionResult {
+            criterion: Criterion::JournalToolCallCount {
+                name: "ask_user".into(),
+                min: 0,
+                max: 0,
+                document: None,
+                path: None,
+                equals: None,
+            },
+            severity: crate::criteria::CriterionSeverity::Hard,
+            passed: true,
+            detail: String::new(),
+            full_detail: None,
+            score: None,
+        };
+        assert_eq!(
+            classify(&outcome, &[absence_check]),
+            FailureClass::InfraTimeout
+        );
+    }
+
+    #[test]
     fn auth_from_stderr() {
-        let outcome = make_outcome().with_stderr("Could not validate credentials");
+        let outcome = make_outcome()
+            .with_exit_code(3)
+            .with_stderr("Could not validate credentials");
         assert_eq!(classify(&outcome, &[]), FailureClass::InfraAuth);
     }
 
     #[test]
+    fn durable_ledger_timeout_is_runtime_infrastructure_not_auth() {
+        let outcome = make_outcome().with_exit_code(3).with_stderr(
+            "Error: [database_error] durable inference ledger timed out during logical_invocation_admission",
+        );
+        assert_eq!(classify(&outcome, &[]), FailureClass::InfraRuntime);
+        assert!(suggested_action(&FailureClass::InfraRuntime).contains("database"));
+    }
+
+    #[test]
     fn rate_limit_429() {
-        let outcome = make_outcome().with_stderr("error: 429 Too many requests");
+        let outcome = make_outcome()
+            .with_exit_code(1)
+            .with_final_state("interrupted")
+            .with_interruption_kind("rate_limit")
+            .with_stderr("error: 429 Too many requests");
         assert_eq!(classify(&outcome, &[]), FailureClass::InfraRateLimit);
+
+        let successful_discussion = make_outcome()
+            .with_exit_code(0)
+            .with_final_state("completed")
+            .with_stderr("investigation found a rate limit implementation");
+        assert_ne!(
+            classify(&successful_discussion, &[]),
+            FailureClass::InfraRateLimit
+        );
+    }
+
+    #[test]
+    fn daily_session_quota_is_not_misclassified_as_auth() {
+        let outcome = make_outcome().with_exit_code(3).with_stderr(
+            "Error: Per-user session quota exceeded (daily_sessions): daily session limit reached (50/50)",
+        );
+        assert_eq!(classify(&outcome, &[]), FailureClass::InfraQuota);
     }
 
     #[test]
@@ -338,9 +597,9 @@ mod tests {
     }
 
     #[test]
-    fn exit_3_empty_text_is_auth() {
+    fn exit_3_empty_text_without_auth_evidence_is_unknown() {
         let outcome = make_outcome().with_exit_code(3);
-        assert_eq!(classify(&outcome, &[]), FailureClass::InfraAuth);
+        assert_eq!(classify(&outcome, &[]), FailureClass::Unknown);
     }
 
     #[test]
@@ -402,6 +661,27 @@ mod tests {
     }
 
     #[test]
+    fn successful_process_with_failed_typed_oracle_is_not_unknown() {
+        let outcome = make_outcome()
+            .with_exit_code(0)
+            .with_final_state("completed");
+        let result = cr(
+            Criterion::JournalToolOutcomeCount {
+                name: "settle_work_item".into(),
+                ok: false,
+                min: 0,
+                max: 0,
+            },
+            false,
+        );
+
+        assert_eq!(
+            classify(&outcome, &[result]),
+            FailureClass::BehaviorContractViolation
+        );
+    }
+
+    #[test]
     fn tool_unavailable_generic_tool_name() {
         // Generic pattern: "don't have a <any_tool> tool available/in" should match
         let outcome =
@@ -433,8 +713,11 @@ mod tests {
     fn every_class_has_suggested_action() {
         let classes = [
             FailureClass::InfraAuth,
+            FailureClass::InfraRuntime,
+            FailureClass::InfraQuota,
             FailureClass::InfraTimeout,
             FailureClass::InfraRateLimit,
+            FailureClass::BehaviorContractViolation,
             FailureClass::ToolUnavailable,
             FailureClass::Unknown,
         ];

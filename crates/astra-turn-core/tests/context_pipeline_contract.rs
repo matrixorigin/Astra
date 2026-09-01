@@ -18,7 +18,6 @@ use astra_turn_core::section_types::{
 };
 use astra_turn_core::session_latches::SessionLatches;
 use astra_turn_core::token_accounting::TokenAccounting;
-use std::collections::HashMap;
 
 fn build_sources() -> (
     StaticSections,
@@ -60,8 +59,6 @@ fn build_sources() -> (
             tool_results: vec![],
             tokens: TokenAccounting::from_fields(5000, 1000, 0, 0),
             active_skills: vec!["code_review".into()],
-            recent_file_reads: HashMap::new(),
-            remaining_turns: 10,
             turn_index: 1,
             recovery: RecoveryState::default(),
             last_user_message: "hello".into(),

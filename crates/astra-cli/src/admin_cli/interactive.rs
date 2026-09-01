@@ -18,6 +18,7 @@ use crate::cli::auth_flow::{parse_auth_tokens, save_refreshed_profile_tokens};
 use crate::cli::cli_config::cli_utils::{
     credential_store, get_profile_and_token, load_credentials, profile_name,
 };
+use crate::cli::session::session_runtime;
 
 const ADMIN_COMMANDS: &[(&str, &str)] = &[
     ("whoami", "Show current user info"),
@@ -284,7 +285,9 @@ pub(crate) async fn run_interactive(api: &ThinClient, profile: Option<&str>) -> 
             Ok(())
         } else if line.eq("model list") {
             let (_, _, _, token) = get_profile_and_token(profile)?;
-            let body = api.get_models_text(&token).await.map_err(map_thin_err)?;
+            let body = session_runtime::load_server_model_catalog_json(api, &token)
+                .await
+                .map_err(|error| error.to_string())?;
             print_json_or_raw(&body);
             Ok(())
         } else if let Some(model_name) = line.strip_prefix("model check ") {

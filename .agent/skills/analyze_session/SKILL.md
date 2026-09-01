@@ -1,6 +1,6 @@
 ---
 name: analyze-session
-description: "Analyze local Astra session journals using `astra journal digest` plus optional checkpoints/debug dumps. Use for stalls, tool failures, compaction, token/context pressure, guard escalation, and error cascades."
+description: "Analyze a current or past Astra session from structured runtime observation, with journal digests and debug artifacts as targeted forensic fallbacks. Use for stalls, tool failures, compaction, token/context pressure, guard escalation, and error cascades."
 user_invocable: true
 when_to_use: "When the user wants to analyze a past or current Astra session for stalls, slow turns, looping, wrong tool selection, token waste, compaction, turn errors, or failed tool calls."
 arguments:
@@ -11,6 +11,8 @@ arguments:
     description: "Focus: context, tools, tokens, errors, flow, debug, or all. Default: all."
     required: false
 allowed_tools:
+  - introspect
+  - reflect
   - bash
   - read_file
   - grep
@@ -19,20 +21,34 @@ allowed_tools:
 
 # Analyze Session
 
-Use machine-generated evidence first. `astra journal digest` is the primary source;
-raw JSONL parsing is a fallback only when digest is unavailable or missing a field.
-Before synthesizing session metrics or causes, run the digest command for the
-resolved session. Generic reflection/introspection output does not satisfy this
-evidence boundary. If no executable can produce a digest, report that limitation
-instead of estimating or filling in metrics.
+Use the smallest authoritative evidence path that answers the question. For the
+active session, structured observation is primary: call `introspect` once with
+`facet=overview`, `depth=diagnostic`, and `horizon=recent`, then call `reflect`
+at most once with `topic=overview`, `facet=overview`, `depth=diagnostic`,
+`horizon=session`, and a concrete causal question. These overview calls are
+composite snapshots; do not scan individual facets unless their result identifies
+a specific evidence gap.
+
+Use `astra journal digest` for a named past/offline session, exact aggregate
+metrics, durable-event ordering, or a concrete gap reported by structured
+observation. Raw JSONL parsing is a fallback only when the digest is unavailable
+or missing a required field. Never estimate missing metrics or describe session
+memory, assistant prose, or a prior answer as live runtime evidence.
 
 ## Task
 
 $ARGUMENTS
 
-## Phase 1: Resolve Target
+## Phase 1: Choose The Evidence Boundary
 
-Use the most recent local session unless a target is provided.
+For an ordinary retrospective of the active session, use the single composite
+`introspect` and optional single composite `reflect` calls above. Stop observing
+when they answer the user's question; repeated observation adds latency and can
+create contradictory evidence.
+
+Resolve and run a journal digest only if the user names a past session, requests
+exact persisted metrics/event order, or structured observation reports a concrete
+coverage gap:
 
 ```bash
 command -v astra
@@ -41,17 +57,16 @@ astra journal digest <SESSION_ID> --format json
 astra journal digest <SESSION_ID> --focus summary --format json
 ```
 
-If `astra` is not on `PATH`, try an existing local binary such as
-`target/debug/astra` or `target/release/astra`.
+If `astra` is not on `PATH`, check for one known local binary and invoke it
+directly, rather than issuing repeated discovery and retry calls. Prefer
+`./target/debug/astra` in a development checkout, then `./target/release/astra`.
 
-Record the exact executable used and its build timestamp before comparing the
-session with current source:
+Record executable provenance only when comparing recorded behavior with current
+source. Do this in the same shell call as the digest when possible:
 
 ```bash
-ASTRA_BIN="$(command -v astra 2>/dev/null || true)"
-test -n "$ASTRA_BIN" || ASTRA_BIN=target/debug/astra
-readlink -f "$ASTRA_BIN"
-stat "$ASTRA_BIN"
+readlink -f ./target/debug/astra
+stat ./target/debug/astra
 git log -1 --format='%H %cI'
 ```
 
@@ -63,7 +78,13 @@ the session reproduces on HEAD.
 For `/tmp/debug-*.json` input, skip digest metrics and use the debug dump only for
 the message/tool/prompt snapshot it contains.
 
-## Phase 2: Trust The Digest Schema
+## Phase 2: Trust The Selected Evidence
+
+For structured observation, distinguish live `introspect` facts from persisted
+`reflect` evidence and cite that boundary in the answer. Do not turn the user's
+request for a retrospective into an exhaustive telemetry inventory.
+
+When a digest is required, trust its stable schema:
 
 Stable schema: `schema_version = "astra-journal-digest-v2"` from
 `crates/astra-cli/src/cli/journal_digest.rs`.

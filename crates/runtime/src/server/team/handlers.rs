@@ -71,6 +71,23 @@ fn require_delegation_engine(
     })
 }
 
+fn validate_team_execution_session(
+    session: &astra_services::SessionRecord,
+    expected_user_id: &str,
+    expected_session_id: &str,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    if session.session_id != expected_session_id
+        || session.user_id != expected_user_id
+        || session.status != "active"
+    {
+        return Err(error_response(
+            StatusCode::CONFLICT,
+            "team execution requires an active session owned by the authenticated user",
+        ));
+    }
+    Ok(())
+}
+
 async fn load_team_by_name_or_id(
     store: &Arc<dyn TeamPersistenceService>,
     user_id: &str,
@@ -324,20 +341,23 @@ pub(crate) async fn execute_team_handler(
     Json(body): Json<ExecuteTeamRequest>,
 ) -> Result<Json<TeamExecuteResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    if body.session_id.is_empty() || body.session_id.trim() != body.session_id {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "team execution requires an exact non-empty session_id",
+        ));
+    }
+    let session = state
+        .session_service
+        .get_session(body.session_id.clone(), user.user_id.clone())
+        .await?;
+    validate_team_execution_session(&session, &user.user_id, &body.session_id)?;
     let team_store: Arc<dyn TeamPersistenceService> =
         require_owner_team_store(&state, &user.user_id)
             .await?
             .clone();
     let engine = require_delegation_engine(&state)?;
 
-    let session_id = body
-        .session_id
-        .clone()
-        .unwrap_or_else(|| "team-http-session".to_string());
-    let source_agent_id = body
-        .source_agent_id
-        .clone()
-        .unwrap_or_else(|| "orchestrator".to_string());
     let delegation_engine: Arc<dyn DelegationExecutor> = engine.clone();
     let delegation_tracker: Arc<dyn DelegationTracking> = engine.tracker().clone();
     let run_engine: Arc<dyn RunPersistence> = engine.run_engine().clone();
@@ -351,8 +371,10 @@ pub(crate) async fn execute_team_handler(
         profile_registry,
         OrchestratorConfig {
             user_id: user.user_id.clone(),
-            session_id,
-            source_agent_id,
+            session_id: body.session_id,
+            // HTTP callers never choose execution identity. The selected
+            // server profile is part of server composition.
+            source_agent_id: "orchestrator".to_string(),
             progress: None,
         },
     );
@@ -390,12 +412,10 @@ fn map_team_execution_report_to_http(
 // ─── Request / Response Types ───────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ExecuteTeamRequest {
     pub task: String,
-    #[serde(default)]
-    pub session_id: Option<String>,
-    #[serde(default)]
-    pub source_agent_id: Option<String>,
+    pub session_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -740,5 +760,71 @@ mod tests {
             invalid_time.cursor().unwrap_err().0,
             StatusCode::BAD_REQUEST
         );
+    }
+
+    fn session_record(
+        user_id: &str,
+        session_id: &str,
+        status: &str,
+    ) -> astra_services::SessionRecord {
+        astra_services::SessionRecord {
+            session_id: session_id.to_string(),
+            user_id: user_id.to_string(),
+            agent_id: None,
+            title: None,
+            metadata: serde_json::Map::new(),
+            status: status.to_string(),
+            event_count: 0,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: None,
+            ended_at: None,
+        }
+    }
+
+    #[test]
+    fn team_execution_session_must_match_exact_owner_identity_and_be_active() {
+        let owned = session_record("user-a", "session-a", "active");
+        validate_team_execution_session(&owned, "user-a", "session-a").unwrap();
+        assert_eq!(
+            validate_team_execution_session(&owned, "user-b", "session-a")
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            validate_team_execution_session(&owned, "user-a", "session-b")
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+        let deleting = session_record("user-a", "session-a", "deleting");
+        assert_eq!(
+            validate_team_execution_session(&deleting, "user-a", "session-a")
+                .unwrap_err()
+                .0,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn team_execute_request_requires_session_and_rejects_source_identity() {
+        assert!(
+            serde_json::from_value::<ExecuteTeamRequest>(serde_json::json!({"task": "do it"}))
+                .is_err()
+        );
+        assert!(
+            serde_json::from_value::<ExecuteTeamRequest>(serde_json::json!({
+                "task": "do it",
+                "session_id": "session-a",
+                "source_agent_id": "attacker"
+            }))
+            .is_err()
+        );
+        let request = serde_json::from_value::<ExecuteTeamRequest>(serde_json::json!({
+            "task": "do it",
+            "session_id": "session-a"
+        }))
+        .unwrap();
+        assert_eq!(request.session_id, "session-a");
     }
 }

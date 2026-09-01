@@ -17,15 +17,18 @@
 
 use crate::agent_live_event::{AgentLiveEvent, AgentLiveEventKind, AgentLiveGap, AgentLiveSignal};
 use crate::chat_turn_sse_dispatch::{
-    ChatTurnEdgePending, ChatTurnSseAccum, ChatTurnSseFramer, EdgeApprovalRequest, SseRenderEffect,
-    dispatch_chat_turn_sse_event_block,
+    ChatTurnEdgePending, ChatTurnSseAccum, ChatTurnSseFramer, DurableRunTerminal,
+    DurableRunTerminalStatus, EdgeApprovalRequest, SseRenderEffect, StreamRootIdentity,
+    dispatch_chat_turn_sse_event_block, durable_run_terminal_from_event,
 };
+use crate::sse::blocks::SseBlankLineUtf8Buf;
 use crate::sse::data_lines::{json_events_from_sse_event_block, validate_sse_event_block_json};
 pub use crate::tool::policy::is_tool_concurrency_safe;
 use crate::tool::policy::tool_batch_coalesce_duration;
 use astra_thin_client::ApprovalKind;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::collections::{HashMap, VecDeque};
 
 /// Stream idle watchdog default: abort SSE consumption if no chunk arrives within this time.
 ///
@@ -44,6 +47,87 @@ pub const STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
 /// `text_delta` events. A 5-minute post-progress window avoids false aborts while
 /// still catching genuinely stalled connections.
 pub const STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS: u64 = 300_000;
+
+/// Bound bytes read ahead while an Edge callback is executing. The server is
+/// normally waiting for that callback and emits only lifecycle/control frames;
+/// this cap prevents a faulty producer from turning cancellation observation
+/// into per-session unbounded memory growth.
+const MAX_EDGE_EXECUTION_READ_AHEAD_BYTES: usize = 1024 * 1024;
+
+#[derive(Default)]
+struct DurableTerminalProbe {
+    frames: SseBlankLineUtf8Buf,
+    identity: StreamRootIdentity,
+}
+
+impl DurableTerminalProbe {
+    fn bind_accumulator_root(&mut self, run_id: &str) -> Result<(), String> {
+        self.identity.bind_legacy_hint(run_id)
+    }
+
+    fn push_bytes(&mut self, bytes: &[u8]) -> Result<Option<DurableRunTerminal>, String> {
+        let blocks = self
+            .frames
+            .push_bytes(bytes)
+            .map_err(|error| error.to_string())?;
+        for block in blocks {
+            for event in json_events_from_sse_event_block(&block).events {
+                let event_type = event.get("type").and_then(Value::as_str);
+                self.identity.observe_event(&event)?;
+                if event_type == Some("run_finished") {
+                    // Descendant lifecycle is observability data on the root
+                    // stream, not root control. Scope by producer identity
+                    // before strict status parsing so a malformed or newer
+                    // child payload cannot terminate its healthy parent.
+                    let event_run_id = event
+                        .get("run_id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            "run_finished event omitted its durable run_id".to_string()
+                        })?;
+                    if self.identity.run_id() != Some(event_run_id) {
+                        continue;
+                    }
+                    if let Some(terminal) = durable_run_terminal_from_event(&event)? {
+                        return Ok(Some(terminal));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn take_trailing_terminal(&mut self) -> Result<Option<DurableRunTerminal>, String> {
+        let mut tail = self.frames.take_buf().map_err(|error| error.to_string())?;
+        if tail.trim().is_empty() {
+            return Ok(None);
+        }
+        // EOF is the only point where an unterminated final SSE block becomes
+        // dispatchable. Reuse the exact normal probe path by supplying the
+        // missing framing boundary after ownership of the tail is taken.
+        tail.push_str("\n\n");
+        self.push_bytes(tail.as_bytes())
+    }
+}
+
+/// Convert a durable terminal authored by the root run into the exact local
+/// abort kind.  A legacy/malformed failed terminal without classification is a
+/// protocol failure, not evidence of provider overload.
+fn durable_terminal_abort_kind(terminal: &DurableRunTerminal) -> Option<astra_core::ErrorKind> {
+    match terminal.status {
+        DurableRunTerminalStatus::Cancelled => Some(astra_core::ErrorKind::Cancelled),
+        DurableRunTerminalStatus::Failed => Some(
+            terminal
+                .error_kind
+                .unwrap_or(astra_core::ErrorKind::ContractViolation),
+        ),
+        DurableRunTerminalStatus::Completed
+        | DurableRunTerminalStatus::Delegated
+        | DurableRunTerminalStatus::Paused => None,
+    }
+}
 
 /// Stream idle timeout (pre-progress), fixed at [`STREAM_IDLE_TIMEOUT_MS`].
 pub fn stream_idle_timeout() -> std::time::Duration {
@@ -65,7 +149,9 @@ pub struct EdgeToolExecResult {
     pub args: Value,
     pub output: String,
     pub tool_result_fields: Option<serde_json::Map<String, Value>>,
-    /// Semantic label: `"ok"`, `"error"`, etc.
+    /// Machine-owned terminal status such as `"completed"`, `"failed"`, or
+    /// `"skipped"`.  It is authoritative transport evidence, not prose for
+    /// the model to interpret.
     pub status: String,
     pub duration_ms: u64,
 }
@@ -79,6 +165,9 @@ impl crate::headless_tool_assembly::EdgeToolRoundRow for EdgeToolExecResult {
     }
     fn tool_output(&self) -> &str {
         &self.output
+    }
+    fn tool_execution_status(&self) -> Option<&str> {
+        Some(&self.status)
     }
     fn tool_result_fields(&self) -> Option<&serde_json::Map<String, Value>> {
         self.tool_result_fields.as_ref()
@@ -114,6 +203,10 @@ pub struct ToolBatchRequest {
     pub run_id: String,
     pub turn_chain_id: String,
     pub request_id: String,
+    /// Immutable execution budget issued by the server for this invocation.
+    pub execution_timeout_ms: u64,
+    /// Immutable absolute server deadline retained until this exact invocation starts.
+    pub execution_deadline_unix_ms: u64,
     pub tool: String,
     pub args: Value,
 }
@@ -238,6 +331,21 @@ pub trait SseStreamHost: Send {
     /// Hosts must treat the corresponding transcript/projection as incomplete
     /// until it has been reconciled from durable state.
     fn on_agent_live_gap(&mut self, _gap: AgentLiveGap) {}
+
+    /// Reconcile the Server's exact wire-schema admission before an Edge
+    /// executor applies its local binding, argument, permission and sandbox
+    /// gates. Hosts without a second local tool surface need no action.
+    fn on_server_tool_surface_admission(&mut self, _tool: &str) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Whether a terminal host-side control-plane failure has made additional
+    /// edge work unsafe. Implementations set this after an approval/tool-result
+    /// callback cannot be acknowledged; the protocol loop then stops before a
+    /// coalesced mutating tool can execute on stale local approval state.
+    fn should_abort_edge_work(&self) -> bool {
+        false
+    }
 
     /// Execute a tool request that arrived via `tool_request` SSE event.
     /// Returns the execution result (output, status, duration).
@@ -365,6 +473,9 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
     let mut abort_message: Option<String> = None;
     let mut first_sse_frame_seen = false;
     let mut reported_session_id: Option<String> = None;
+    let mut terminal_probe = DurableTerminalProbe::default();
+    let mut read_ahead = VecDeque::<Vec<u8>>::new();
+    let mut read_ahead_bytes = 0usize;
 
     host.on_before_sse_read_loop();
 
@@ -382,7 +493,13 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         };
         // Inner loop: retry with short ticks so on_idle_tick can refresh the UI,
         // but accumulate elapsed time toward the full idle_timeout.
+        let mut chunk_was_probed = false;
         let chunk_result = 'wait: {
+            if let Some(bytes) = read_ahead.pop_front() {
+                read_ahead_bytes = read_ahead_bytes.saturating_sub(bytes.len());
+                chunk_was_probed = true;
+                break 'wait Some(Some(Ok(bytes)));
+            }
             let mut elapsed = std::time::Duration::ZERO;
             loop {
                 let remaining = idle.saturating_sub(elapsed);
@@ -427,6 +544,29 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
             abort = Some(astra_core::ErrorKind::StreamTransport);
             break;
         };
+        match if chunk_was_probed {
+            Ok(None)
+        } else {
+            terminal_probe.push_bytes(&bytes)
+        } {
+            Ok(Some(terminal)) if terminal.status.is_unsuccessful() => {
+                if let Some(token) = cancel_token {
+                    // `consume_turn_sse` supplies a physical-stream child
+                    // token, so remote terminal control cannot cancel a
+                    // sibling or the caller's reusable session token.
+                    token.cancel();
+                }
+                abort = durable_terminal_abort_kind(&terminal);
+                accum.run_terminal = Some(terminal);
+                break;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                abort = Some(astra_core::ErrorKind::StreamTransport);
+                abort_message = Some(format!("Error: invalid durable run lifecycle: {error}"));
+                break;
+            }
+        }
         let event_blocks = match framer.push_bytes(&bytes) {
             Ok(blocks) => blocks,
             Err(error) => {
@@ -470,28 +610,112 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         // for a tiny window; side-effectful tools still execute inline to avoid
         // the bridge/result deadlock guarded by `tool_request_executes_inline_not_deferred`.
         while !terminal_marker_seen && pending_is_coalescible_tool_batch(&pending) {
-            let next = if let Some(token) = cancel_token {
+            let (next, reached_eof) = if let Some(token) = cancel_token {
                 tokio::select! {
                     biased;
                     _ = token.cancelled() => {
                         abort = Some(astra_core::ErrorKind::Cancelled);
-                        None
+                        (None, false)
                     }
                     r = tokio::time::timeout(
                         tool_batch_coalesce_duration(),
                         chunks.next(),
-                    ) => r.ok().flatten(),
+                    ) => match r {
+                        Ok(Some(item)) => (Some(item), false),
+                        Ok(None) => (None, true),
+                        Err(_) => (None, false),
+                    },
                 }
             } else {
-                tokio::time::timeout(tool_batch_coalesce_duration(), chunks.next())
-                    .await
-                    .ok()
-                    .flatten()
+                match tokio::time::timeout(tool_batch_coalesce_duration(), chunks.next()).await {
+                    Ok(Some(item)) => (Some(item), false),
+                    Ok(None) => (None, true),
+                    Err(_) => (None, false),
+                }
             };
 
-            let Some(next) = next else { break };
+            let Some(next) = next else {
+                if reached_eof {
+                    match terminal_probe.take_trailing_terminal() {
+                        Ok(Some(terminal)) if terminal.status.is_unsuccessful() => {
+                            if let Some(token) = cancel_token {
+                                token.cancel();
+                            }
+                            abort = durable_terminal_abort_kind(&terminal);
+                            accum.run_terminal = Some(terminal);
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            abort = Some(astra_core::ErrorKind::StreamTransport);
+                            abort_message =
+                                Some(format!("Error: invalid durable run lifecycle: {error}"));
+                            if let Some(token) = cancel_token {
+                                token.cancel();
+                            }
+                        }
+                    }
+                    if abort.is_none() {
+                        match framer.take_trailing_dispatch_blob() {
+                            Ok(tail) if !tail.trim().is_empty() => {
+                                match process_sse_event_block(
+                                    &tail,
+                                    host,
+                                    &mut accum,
+                                    &mut pending,
+                                    &mut first_sse_frame_seen,
+                                    &mut reported_session_id,
+                                )
+                                .await
+                                {
+                                    Ok(_) => {
+                                        terminal_marker_seen |= accum.stream_complete;
+                                    }
+                                    Err(error) => {
+                                        abort = Some(astra_core::ErrorKind::StreamTransport);
+                                        abort_message =
+                                            Some(format!("Error: invalid SSE protocol: {error}"));
+                                    }
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                abort = Some(astra_core::ErrorKind::StreamTransport);
+                                abort_message = Some(format!(
+                                    "Error: invalid UTF-8 in model SSE response: {error}"
+                                ));
+                            }
+                        }
+                    }
+                }
+                break;
+            };
             match next {
                 Ok(bytes) => {
+                    // Coalescing is still physical stream consumption. Every
+                    // chunk must pass through the same root identity and
+                    // terminal gate before dispatch; otherwise a cancellation
+                    // arriving inside this short window can be observed only
+                    // as data while the now-cancelled tool still executes.
+                    match terminal_probe.push_bytes(&bytes) {
+                        Ok(Some(terminal)) if terminal.status.is_unsuccessful() => {
+                            if let Some(token) = cancel_token {
+                                token.cancel();
+                            }
+                            abort = durable_terminal_abort_kind(&terminal);
+                            accum.run_terminal = Some(terminal);
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            abort = Some(astra_core::ErrorKind::StreamTransport);
+                            abort_message =
+                                Some(format!("Error: invalid durable run lifecycle: {error}"));
+                            if let Some(token) = cancel_token {
+                                token.cancel();
+                            }
+                            break;
+                        }
+                    }
                     let mut saw_event = false;
                     let mut all_events_extended_batch = true;
                     let event_blocks = match framer.push_bytes(&bytes) {
@@ -547,27 +771,154 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
         // Skill-exclusivity: reorder so skill calls execute before
         // non-skill calls within the same batch.
         prioritize_skill_tools(&mut pending);
-        flush_pending_via_host(
-            &mut pending,
-            host,
-            accum.session_id.as_deref(),
-            accum.run_id.as_deref(),
-            &mut tool_results,
-            &mut approval_results,
-        )
-        .await;
+        if !pending.is_empty() {
+            if let Some(run_id) = accum.run_id.as_deref()
+                && let Err(error) = terminal_probe.bind_accumulator_root(run_id)
+            {
+                abort = Some(astra_core::ErrorKind::StreamTransport);
+                abort_message = Some(format!("Error: invalid durable run lifecycle: {error}"));
+                break;
+            }
+            // Edge execution must not stop reading the control plane. Keep a
+            // bounded read-ahead lane alive so an exact-owner run_finished can
+            // cancel a long local tool/approval immediately. Ordinary frames
+            // remain queued and are dispatched in wire order after execution.
+            let flush = flush_pending_via_host(
+                &mut pending,
+                host,
+                accum.session_id.as_deref(),
+                accum.run_id.as_deref(),
+                &mut tool_results,
+                &mut approval_results,
+            );
+            tokio::pin!(flush);
+            let cancel_wait = async {
+                match cancel_token {
+                    Some(token) => token.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(cancel_wait);
+            let mut settlement_only = false;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut flush => break,
+                    _ = &mut cancel_wait, if !settlement_only => {
+                        abort.get_or_insert(astra_core::ErrorKind::Cancelled);
+                        settlement_only = true;
+                    }
+                    next = chunks.next(), if !settlement_only => {
+                        let Some(next) = next else {
+                            match terminal_probe.take_trailing_terminal() {
+                                Ok(Some(terminal)) if terminal.status.is_unsuccessful() => {
+                                    abort = durable_terminal_abort_kind(&terminal);
+                                    accum.run_terminal = Some(terminal);
+                                    if let Some(token) = cancel_token {
+                                        token.cancel();
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(error) => {
+                                    abort = Some(astra_core::ErrorKind::StreamTransport);
+                                    abort_message = Some(format!(
+                                        "Error: invalid durable run lifecycle: {error}"
+                                    ));
+                                    if let Some(token) = cancel_token {
+                                        token.cancel();
+                                    }
+                                }
+                            }
+                            settlement_only = true;
+                            continue;
+                        };
+                        let bytes = match next {
+                            Ok(bytes) => bytes,
+                            Err(_) => {
+                                abort = Some(astra_core::ErrorKind::StreamTransport);
+                                if let Some(token) = cancel_token {
+                                    token.cancel();
+                                }
+                                settlement_only = true;
+                                continue;
+                            }
+                        };
+                        match terminal_probe.push_bytes(&bytes) {
+                            Ok(Some(terminal)) if terminal.status.is_unsuccessful() => {
+                                abort = durable_terminal_abort_kind(&terminal);
+                                accum.run_terminal = Some(terminal);
+                                if let Some(token) = cancel_token {
+                                    token.cancel();
+                                }
+                                settlement_only = true;
+                            }
+                            Ok(_) => {
+                                read_ahead_bytes = read_ahead_bytes.saturating_add(bytes.len());
+                                if read_ahead_bytes > MAX_EDGE_EXECUTION_READ_AHEAD_BYTES {
+                                    abort = Some(astra_core::ErrorKind::StreamTransport);
+                                    abort_message = Some(format!(
+                                        "Error: SSE control read-ahead exceeded {} bytes while Edge work was running",
+                                        MAX_EDGE_EXECUTION_READ_AHEAD_BYTES
+                                    ));
+                                    if let Some(token) = cancel_token {
+                                        token.cancel();
+                                    }
+                                    settlement_only = true;
+                                } else {
+                                    read_ahead.push_back(bytes);
+                                }
+                            }
+                            Err(error) => {
+                                abort = Some(astra_core::ErrorKind::StreamTransport);
+                                abort_message = Some(format!(
+                                    "Error: invalid durable run lifecycle: {error}"
+                                ));
+                                if let Some(token) = cancel_token {
+                                    token.cancel();
+                                }
+                                settlement_only = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if abort.is_some() {
+            break;
+        }
         if terminal_marker_seen {
             break;
         }
     }
 
-    // Tombstone on abort (timeout or cancellation).
-    if matches!(
-        abort,
-        Some(astra_core::ErrorKind::StreamIdle)
-            | Some(astra_core::ErrorKind::Cancelled)
-            | Some(astra_core::ErrorKind::StreamTransport)
-    ) {
+    // EOF makes a final unterminated SSE block dispatchable. Observe its root
+    // control state before ordinary tail dispatch (and, critically, before any
+    // pending Edge work could be flushed by future refactors).
+    if abort.is_none() {
+        match terminal_probe.take_trailing_terminal() {
+            Ok(Some(terminal)) if terminal.status.is_unsuccessful() => {
+                if let Some(token) = cancel_token {
+                    token.cancel();
+                }
+                abort = durable_terminal_abort_kind(&terminal);
+                accum.run_terminal = Some(terminal);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                abort = Some(astra_core::ErrorKind::StreamTransport);
+                abort_message = Some(format!("Error: invalid durable run lifecycle: {error}"));
+                if let Some(token) = cancel_token {
+                    token.cancel();
+                }
+            }
+        }
+    }
+
+    // Every abort is terminal for this physical stream.  Tombstone partial
+    // output and pending Edge work for exact durable error kinds too; limiting
+    // this cleanup to transport/cancellation used to leak state when a typed
+    // budget or auth failure closed the root run.
+    if abort.is_some() {
         accum.stream_complete = false;
         accum.error_kind = abort;
         accum.full_text.clear();
@@ -586,11 +937,37 @@ pub async fn consume_sse_stream_cancellable<H: SseStreamHost>(
                     timeout_used.as_millis()
                 )
             }
-            Some(astra_core::ErrorKind::Cancelled) => "Cancelled by user".to_string(),
-            Some(astra_core::ErrorKind::StreamTransport) => abort_message.unwrap_or_else(|| {
-                "Error: stream transport ended while reading model response".to_string()
-            }),
-            _ => "Unknown abort".to_string(),
+            Some(astra_core::ErrorKind::Cancelled) => accum
+                .run_terminal
+                .as_ref()
+                .map(|terminal| format!("Server run {} was cancelled", terminal.run_id))
+                .unwrap_or_else(|| "Cancelled by user".to_string()),
+            Some(astra_core::ErrorKind::ServerError) => accum
+                .run_terminal
+                .as_ref()
+                .map(|terminal| {
+                    terminal
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| format!("Server run {} failed", terminal.run_id))
+                })
+                .unwrap_or_else(|| "Server run failed".to_string()),
+            Some(astra_core::ErrorKind::StreamTransport) => abort_message
+                .or_else(|| {
+                    accum
+                        .run_terminal
+                        .as_ref()
+                        .and_then(|terminal| terminal.error.clone())
+                })
+                .unwrap_or_else(|| {
+                    "Error: stream transport ended while reading model response".to_string()
+                }),
+            Some(kind) => accum
+                .run_terminal
+                .as_ref()
+                .and_then(|terminal| terminal.error.clone())
+                .unwrap_or_else(|| format!("Server run failed [{}]", kind.as_str())),
+            None => unreachable!("abort tombstone requires an abort kind"),
         };
         accum.error_message = Some(msg);
         host.on_render_effects(vec![SseRenderEffect::StopThinkingSpinner])
@@ -914,6 +1291,8 @@ async fn flush_pending_via_host<H: SseStreamHost>(
     approval_results: &mut Vec<EdgeApprovalResult>,
 ) {
     let items = std::mem::take(pending);
+    // Retain the server clock authority until the concrete edge executor can
+    // both enforce it and post an authenticated terminal callback.
     let mut tool_batch: Vec<ToolBatchRequest> = Vec::new();
     let mut approval_requests: Vec<EdgeApprovalRequest> = Vec::new();
 
@@ -924,6 +1303,9 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                 run_id,
                 turn_chain_id,
                 request_id,
+                schema_admitted_by_server,
+                execution_deadline_unix_ms,
+                execution_timeout_ms,
                 tool,
                 args,
             } => {
@@ -940,29 +1322,64 @@ async fn flush_pending_via_host<H: SseStreamHost>(
                 } else {
                     run_id
                 };
+                if !schema_admitted_by_server {
+                    continue;
+                }
+                if let Err(error) = host.on_server_tool_surface_admission(&tool) {
+                    let result = EdgeToolExecResult {
+                        request_id,
+                        tool,
+                        args,
+                        output: error,
+                        tool_result_fields: None,
+                        status: "failed".to_string(),
+                        duration_ms: 0,
+                    };
+                    host.on_tool_result(&result);
+                    tool_results.push(result);
+                    continue;
+                }
                 tool_batch.push(ToolBatchRequest {
                     session_id,
                     run_id,
                     turn_chain_id,
                     request_id,
+                    execution_timeout_ms,
+                    execution_deadline_unix_ms,
                     tool,
                     args,
                 });
             }
             ChatTurnEdgePending::ApprovalRequired {
+                session_id,
+                run_id,
                 request_id,
                 tool,
                 approval_kind,
                 detail,
                 display_label,
             } => approval_requests.push(EdgeApprovalRequest {
+                session_id,
+                run_id,
                 request_id,
                 tool,
                 approval_kind,
                 detail,
                 display_label,
             }),
-            ChatTurnEdgePending::ApprovalBatchRequired { requests } => {
+            ChatTurnEdgePending::ApprovalBatchRequired {
+                session_id,
+                run_id,
+                mut requests,
+            } => {
+                for request in &mut requests {
+                    if request.session_id.is_none() {
+                        request.session_id.clone_from(&session_id);
+                    }
+                    if request.run_id.is_none() {
+                        request.run_id.clone_from(&run_id);
+                    }
+                }
                 approval_requests.extend(requests);
             }
         }
@@ -980,24 +1397,43 @@ async fn flush_pending_via_host<H: SseStreamHost>(
     // Practical impact: a `str_replace` whose `approval_required`
     // event arrived just before its `tool_request` would otherwise
     // execute the edit BEFORE the user / ledger granted permission.
-    if approval_requests.len() > 1 {
-        approval_results.extend(
-            host.resolve_approvals_batch(&approval_requests, fallback_session_id, fallback_run_id)
+    // Preserve the producer-authored durable identity. A live stream can
+    // legitimately contain projected interactions for concurrent descendants;
+    // grouping only by the consuming stream would post an approval to the
+    // wrong run and strand the actual owner until its long timeout.
+    let scoped_approval_groups =
+        group_approval_requests(approval_requests, fallback_session_id, fallback_run_id);
+    for (session_id, run_id, requests) in scoped_approval_groups {
+        // A callback failure makes the durable owner unknown. Do not prompt or
+        // post approvals for unrelated descendants after that point: besides
+        // being unsafe, each callback has its own bounded retry and would turn
+        // one failure into O(number of runs) user-visible latency.
+        if host.should_abort_edge_work() {
+            break;
+        }
+        if requests.len() > 1 {
+            approval_results.extend(
+                host.resolve_approvals_batch(&requests, session_id.as_deref(), run_id.as_deref())
+                    .await,
+            );
+        } else if let Some(request) = requests.into_iter().next() {
+            approval_results.push(
+                host.resolve_approval(
+                    &request.request_id,
+                    &request.tool,
+                    request.approval_kind,
+                    session_id.as_deref(),
+                    run_id.as_deref(),
+                    request.detail.as_deref(),
+                    request.display_label.as_deref(),
+                )
                 .await,
-        );
-    } else if let Some(request) = approval_requests.into_iter().next() {
-        approval_results.push(
-            host.resolve_approval(
-                &request.request_id,
-                &request.tool,
-                request.approval_kind,
-                fallback_session_id,
-                fallback_run_id,
-                request.detail.as_deref(),
-                request.display_label.as_deref(),
-            )
-            .await,
-        );
+            );
+        }
+    }
+
+    if host.should_abort_edge_work() {
+        return;
     }
 
     // Execute tools — the host decides whether to parallelize.
@@ -1008,6 +1444,43 @@ async fn flush_pending_via_host<H: SseStreamHost>(
             tool_results.push(result);
         }
     }
+}
+
+type ScopedApprovalGroup = (Option<String>, Option<String>, Vec<EdgeApprovalRequest>);
+
+/// Group approvals by their durable owner in first-seen order.
+///
+/// A hash index keeps this O(n) for concurrent multi-session streams while the
+/// separate vector preserves deterministic prompt/result ordering. Producer
+/// identity always wins; the consuming stream is only a legacy fallback.
+fn group_approval_requests(
+    requests: Vec<EdgeApprovalRequest>,
+    fallback_session_id: Option<&str>,
+    fallback_run_id: Option<&str>,
+) -> Vec<ScopedApprovalGroup> {
+    let mut groups = Vec::<ScopedApprovalGroup>::new();
+    let mut group_indexes = HashMap::<(Option<String>, Option<String>), usize>::new();
+
+    for request in requests {
+        let session_id = request
+            .session_id
+            .clone()
+            .or_else(|| fallback_session_id.map(ToString::to_string));
+        let run_id = request
+            .run_id
+            .clone()
+            .or_else(|| fallback_run_id.map(ToString::to_string));
+        let key = (session_id.clone(), run_id.clone());
+        if let Some(index) = group_indexes.get(&key).copied() {
+            groups[index].2.push(request);
+        } else {
+            let index = groups.len();
+            group_indexes.insert(key, index);
+            groups.push((session_id, run_id, vec![request]));
+        }
+    }
+
+    groups
 }
 
 // ─── Headless (no-op) host ───────────────────────────────────────────────────
@@ -1068,7 +1541,10 @@ struct RecordingSseStreamHost {
     render_effects: Vec<SseRenderEffect>,
     tool_outputs: std::collections::HashMap<String, String>,
     approval_kinds: Vec<ApprovalKind>,
+    approval_session_ids: Vec<Option<String>>,
     approval_run_ids: Vec<Option<String>>,
+    abort_edge_work_after_approval: bool,
+    edge_work_aborted: bool,
     agent_communications: Vec<astra_turn_types::AgentCommunicationEvent>,
     agent_live_events: Vec<AgentLiveEvent>,
     agent_live_gaps: Vec<AgentLiveGap>,
@@ -1085,7 +1561,10 @@ impl RecordingSseStreamHost {
             render_effects: Vec::new(),
             tool_outputs: std::collections::HashMap::new(),
             approval_kinds: Vec::new(),
+            approval_session_ids: Vec::new(),
             approval_run_ids: Vec::new(),
+            abort_edge_work_after_approval: false,
+            edge_work_aborted: false,
             agent_communications: Vec::new(),
             agent_live_events: Vec::new(),
             agent_live_gaps: Vec::new(),
@@ -1106,6 +1585,11 @@ impl RecordingSseStreamHost {
         self.strict_sse_json = true;
         self
     }
+
+    fn abort_edge_work_after_approval(mut self) -> Self {
+        self.abort_edge_work_after_approval = true;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -1113,6 +1597,10 @@ impl RecordingSseStreamHost {
 impl SseStreamHost for RecordingSseStreamHost {
     fn requires_strict_sse_json(&self) -> bool {
         self.strict_sse_json
+    }
+
+    fn should_abort_edge_work(&self) -> bool {
+        self.edge_work_aborted
     }
 
     async fn on_accepted_sse_event(&mut self, event: &Value) -> Result<(), String> {
@@ -1173,14 +1661,17 @@ impl SseStreamHost for RecordingSseStreamHost {
         request_id: &str,
         _tool: &str,
         approval_kind: ApprovalKind,
-        _session_id: Option<&str>,
+        session_id: Option<&str>,
         run_id: Option<&str>,
         _detail: Option<&str>,
         _display_label: Option<&str>,
     ) -> EdgeApprovalResult {
         self.approval_kinds.push(approval_kind);
+        self.approval_session_ids
+            .push(session_id.map(std::string::ToString::to_string));
         self.approval_run_ids
             .push(run_id.map(std::string::ToString::to_string));
+        self.edge_work_aborted |= self.abort_edge_work_after_approval;
         EdgeApprovalResult {
             request_id: request_id.to_string(),
             decision: "allow".to_string(),
@@ -1198,11 +1689,57 @@ mod tests {
     use futures_util::stream;
 
     fn sse_event(typ: &str, extra: &str) -> String {
-        format!("data: {{\"type\":\"{typ}\"{extra}}}\n\n")
+        let admission = if typ == "tool_request" {
+            ",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":4102444800000"
+        } else {
+            ""
+        };
+        format!("data: {{\"type\":\"{typ}\"{admission}{extra}}}\n\n")
     }
 
     fn chunks_from_sse(events: &str) -> Vec<Result<Vec<u8>, String>> {
         vec![Ok(events.as_bytes().to_vec())]
+    }
+
+    #[test]
+    fn late_session_info_promotes_probe_before_root_terminal_scope() {
+        let mut probe = DurableTerminalProbe::default();
+        assert!(
+            probe
+                .push_bytes(sse_event("run_started", ",\"run_id\":\"legacy-root\"").as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            probe
+                .push_bytes(sse_event("session_info", ",\"run_id\":\"canonical-root\"").as_bytes())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            probe
+                .push_bytes(
+                    sse_event(
+                        "run_finished",
+                        ",\"run_id\":\"legacy-root\",\"status\":\"cancelled\""
+                    )
+                    .as_bytes()
+                )
+                .unwrap()
+                .is_none(),
+            "the provisional legacy producer must lose root control"
+        );
+        let terminal = probe
+            .push_bytes(
+                sse_event(
+                    "run_finished",
+                    ",\"run_id\":\"canonical-root\",\"status\":\"cancelled\"",
+                )
+                .as_bytes(),
+            )
+            .unwrap()
+            .expect("authoritative root terminal");
+        assert_eq!(terminal.run_id, "canonical-root");
     }
 
     #[tokio::test]
@@ -1225,6 +1762,524 @@ mod tests {
         assert_eq!(result.accum.full_text, "hello world");
         assert!(result.tool_results.is_empty());
         assert!(result.approval_results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_cancel_is_observed_while_edge_tool_is_running() {
+        struct CancelAwareToolHost {
+            token: tokio_util::sync::CancellationToken,
+            observed_cancel: bool,
+        }
+
+        #[async_trait]
+        impl SseStreamHost for CancelAwareToolHost {
+            async fn on_render_effects(&mut self, _effects: Vec<SseRenderEffect>) {}
+
+            fn on_stream_complete(&mut self) {}
+
+            async fn execute_tool(
+                &mut self,
+                request_id: &str,
+                tool: &str,
+                args: &Value,
+            ) -> EdgeToolExecResult {
+                self.token.cancelled().await;
+                self.observed_cancel = true;
+                EdgeToolExecResult {
+                    request_id: request_id.to_string(),
+                    tool: tool.to_string(),
+                    args: args.clone(),
+                    output: "cancelled locally".to_string(),
+                    tool_result_fields: None,
+                    status: "failed".to_string(),
+                    duration_ms: 1,
+                }
+            }
+
+            async fn resolve_approval(
+                &mut self,
+                request_id: &str,
+                _tool: &str,
+                _approval_kind: ApprovalKind,
+                _session_id: Option<&str>,
+                _run_id: Option<&str>,
+                _detail: Option<&str>,
+                _display_label: Option<&str>,
+            ) -> EdgeApprovalResult {
+                EdgeApprovalResult {
+                    request_id: request_id.to_string(),
+                    decision: "allow".to_string(),
+                    reason: None,
+                }
+            }
+        }
+
+        let first = format!(
+            "{}{}",
+            // The live POST response binds its root identity in the transport
+            // bootstrap `session_info`; a separate run_started frame is not
+            // guaranteed. Cancellation probing must follow that real wire
+            // contract rather than a replay-only fixture shape.
+            sse_event(
+                "session_info",
+                ",\"session_id\":\"session-1\",\"run_id\":\"root-run\""
+            ),
+            sse_event(
+                "tool_request",
+                ",\"session_id\":\"session-1\",\"run_id\":\"root-run\",\"turn_chain_id\":\"chain-1\",\"request_id\":\"tool-1\",\"tool\":\"bash\",\"args\":{}"
+            )
+        );
+        let second = format!(
+            "{}{}{}",
+            // Root streams are aggregate observability surfaces: fanout child
+            // lifecycle is legal here and must not steal terminal authority.
+            sse_event("run_started", ",\"run_id\":\"child-run\""),
+            sse_event(
+                "run_finished",
+                ",\"run_id\":\"child-run\",\"status\":\"future_child_state\"",
+            ),
+            sse_event(
+                "run_finished",
+                ",\"run_id\":\"root-run\",\"status\":\"cancelled\"",
+            )
+        );
+        let source = stream::iter(vec![Ok(first.into_bytes())]).chain(stream::once(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            Ok(second.into_bytes())
+        }));
+        let mut source = Box::pin(source);
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut host = CancelAwareToolHost {
+            token: token.clone(),
+            observed_cancel: false,
+        };
+
+        let (result, abort) = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            consume_sse_stream_cancellable(
+                &mut source,
+                &mut host,
+                stream_idle_timeout(),
+                Some(&token),
+                None,
+            ),
+        )
+        .await
+        .expect("durable cancellation must not wait for the Edge tool deadline");
+
+        assert_eq!(abort, Some(astra_core::ErrorKind::Cancelled));
+        assert!(host.observed_cancel);
+        let terminal = result.accum.run_terminal.expect("typed terminal retained");
+        assert_eq!(terminal.run_id, "root-run");
+        assert_eq!(terminal.status, DurableRunTerminalStatus::Cancelled);
+        assert!(result.accum.tool_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unterminated_eof_cancel_interrupts_running_edge_tool() {
+        struct WaitingToolHost {
+            token: tokio_util::sync::CancellationToken,
+            settled: bool,
+        }
+
+        #[async_trait]
+        impl SseStreamHost for WaitingToolHost {
+            async fn on_render_effects(&mut self, _effects: Vec<SseRenderEffect>) {}
+            fn on_stream_complete(&mut self) {}
+
+            async fn execute_tool(
+                &mut self,
+                request_id: &str,
+                tool: &str,
+                args: &Value,
+            ) -> EdgeToolExecResult {
+                self.token.cancelled().await;
+                self.settled = true;
+                EdgeToolExecResult {
+                    request_id: request_id.to_string(),
+                    tool: tool.to_string(),
+                    args: args.clone(),
+                    output: "cancelled locally".to_string(),
+                    tool_result_fields: None,
+                    status: "failed".to_string(),
+                    duration_ms: 0,
+                }
+            }
+
+            async fn resolve_approval(
+                &mut self,
+                request_id: &str,
+                _tool: &str,
+                _approval_kind: ApprovalKind,
+                _session_id: Option<&str>,
+                _run_id: Option<&str>,
+                _detail: Option<&str>,
+                _display_label: Option<&str>,
+            ) -> EdgeApprovalResult {
+                EdgeApprovalResult {
+                    request_id: request_id.to_string(),
+                    decision: "allow".to_string(),
+                    reason: None,
+                }
+            }
+        }
+
+        let first = format!(
+            "{}{}",
+            sse_event(
+                "session_info",
+                ",\"session_id\":\"session-1\",\"run_id\":\"root-run\""
+            ),
+            sse_event(
+                "tool_request",
+                ",\"session_id\":\"session-1\",\"run_id\":\"root-run\",\"request_id\":\"tool-1\",\"tool\":\"bash\",\"args\":{}"
+            )
+        );
+        let terminal =
+            "data: {\"type\":\"run_finished\",\"run_id\":\"root-run\",\"status\":\"cancelled\"}";
+        let source = stream::iter(vec![Ok(first.into_bytes())]).chain(stream::once(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            Ok(terminal.as_bytes().to_vec())
+        }));
+        let mut source = Box::pin(source);
+        let token = tokio_util::sync::CancellationToken::new();
+        let mut host = WaitingToolHost {
+            token: token.clone(),
+            settled: false,
+        };
+
+        let (result, abort) = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            consume_sse_stream_cancellable(
+                &mut source,
+                &mut host,
+                stream_idle_timeout(),
+                Some(&token),
+                None,
+            ),
+        )
+        .await
+        .expect("EOF-tail cancellation must interrupt an already-running Edge tool");
+
+        assert_eq!(abort, Some(astra_core::ErrorKind::Cancelled));
+        assert!(host.settled);
+        assert_eq!(
+            result.accum.run_terminal.map(|terminal| terminal.status),
+            Some(DurableRunTerminalStatus::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_cancel_inside_coalesce_window_prevents_tool_execution() {
+        struct CountingToolHost(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+        #[async_trait]
+        impl SseStreamHost for CountingToolHost {
+            async fn on_render_effects(&mut self, _effects: Vec<SseRenderEffect>) {}
+            fn on_stream_complete(&mut self) {}
+
+            async fn execute_tool(
+                &mut self,
+                request_id: &str,
+                tool: &str,
+                args: &Value,
+            ) -> EdgeToolExecResult {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                EdgeToolExecResult {
+                    request_id: request_id.to_string(),
+                    tool: tool.to_string(),
+                    args: args.clone(),
+                    output: "must not execute".to_string(),
+                    tool_result_fields: None,
+                    status: "completed".to_string(),
+                    duration_ms: 0,
+                }
+            }
+
+            async fn resolve_approval(
+                &mut self,
+                request_id: &str,
+                _tool: &str,
+                _approval_kind: ApprovalKind,
+                _session_id: Option<&str>,
+                _run_id: Option<&str>,
+                _detail: Option<&str>,
+                _display_label: Option<&str>,
+            ) -> EdgeApprovalResult {
+                EdgeApprovalResult {
+                    request_id: request_id.to_string(),
+                    decision: "allow".to_string(),
+                    reason: None,
+                }
+            }
+        }
+
+        let first = format!(
+            "{}{}",
+            sse_event(
+                "session_info",
+                ",\"session_id\":\"session-1\",\"run_id\":\"root-run\""
+            ),
+            sse_event(
+                "tool_request",
+                ",\"session_id\":\"session-1\",\"run_id\":\"root-run\",\"request_id\":\"tool-1\",\"tool\":\"read_file\",\"args\":{\"path\":\"README.md\"}"
+            )
+        );
+        let terminal = sse_event(
+            "run_finished",
+            ",\"run_id\":\"root-run\",\"status\":\"cancelled\"",
+        );
+        let source = stream::iter(vec![Ok(first.into_bytes())]).chain(stream::once(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            Ok(terminal.into_bytes())
+        }));
+        let mut source = Box::pin(source);
+        let executions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut host = CountingToolHost(executions.clone());
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let (result, abort) = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            consume_sse_stream_cancellable(
+                &mut source,
+                &mut host,
+                stream_idle_timeout(),
+                Some(&token),
+                None,
+            ),
+        )
+        .await
+        .expect("coalesce-window cancellation must settle promptly");
+
+        assert_eq!(abort, Some(astra_core::ErrorKind::Cancelled));
+        assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(result.tool_results.is_empty());
+        assert_eq!(
+            result.accum.run_terminal.map(|terminal| terminal.status),
+            Some(DurableRunTerminalStatus::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn unterminated_eof_cancel_prevents_pending_tool_execution() {
+        struct CountingToolHost(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+        #[async_trait]
+        impl SseStreamHost for CountingToolHost {
+            async fn on_render_effects(&mut self, _effects: Vec<SseRenderEffect>) {}
+            fn on_stream_complete(&mut self) {}
+
+            async fn execute_tool(
+                &mut self,
+                request_id: &str,
+                tool: &str,
+                args: &Value,
+            ) -> EdgeToolExecResult {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                EdgeToolExecResult {
+                    request_id: request_id.to_string(),
+                    tool: tool.to_string(),
+                    args: args.clone(),
+                    output: "must not execute".to_string(),
+                    tool_result_fields: None,
+                    status: "completed".to_string(),
+                    duration_ms: 0,
+                }
+            }
+
+            async fn resolve_approval(
+                &mut self,
+                request_id: &str,
+                _tool: &str,
+                _approval_kind: ApprovalKind,
+                _session_id: Option<&str>,
+                _run_id: Option<&str>,
+                _detail: Option<&str>,
+                _display_label: Option<&str>,
+            ) -> EdgeApprovalResult {
+                EdgeApprovalResult {
+                    request_id: request_id.to_string(),
+                    decision: "allow".to_string(),
+                    reason: None,
+                }
+            }
+        }
+
+        let bytes = format!(
+            "{}{}{}",
+            sse_event(
+                "session_info",
+                ",\"session_id\":\"session-1\",\"run_id\":\"root-run\""
+            ),
+            sse_event(
+                "tool_request",
+                ",\"session_id\":\"session-1\",\"run_id\":\"root-run\",\"request_id\":\"tool-1\",\"tool\":\"read_file\",\"args\":{\"path\":\"README.md\"}"
+            ),
+            // Deliberately no final blank-line boundary.
+            "data: {\"type\":\"run_finished\",\"run_id\":\"root-run\",\"status\":\"cancelled\"}"
+        );
+        let mut source = stream::iter(vec![Ok(bytes.into_bytes())]);
+        let executions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut host = CountingToolHost(executions.clone());
+        let token = tokio_util::sync::CancellationToken::new();
+
+        let (result, abort) = consume_sse_stream_cancellable(
+            &mut source,
+            &mut host,
+            stream_idle_timeout(),
+            Some(&token),
+            None,
+        )
+        .await;
+
+        assert_eq!(abort, Some(astra_core::ErrorKind::Cancelled));
+        assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(result.tool_results.is_empty());
+        assert_eq!(
+            result.accum.run_terminal.map(|terminal| terminal.status),
+            Some(DurableRunTerminalStatus::Cancelled)
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_failed_terminal_preserves_budget_and_prevents_pending_tool_execution() {
+        let first = format!(
+            "{}{}{}",
+            sse_event(
+                "session_info",
+                ",\"session_id\":\"session-1\",\"run_id\":\"root-run\""
+            ),
+            sse_event("text_delta", ",\"content\":\"partial answer\""),
+            sse_event(
+                "tool_request",
+                ",\"session_id\":\"session-1\",\"run_id\":\"root-run\",\"request_id\":\"tool-1\",\"tool\":\"read_file\",\"args\":{\"path\":\"README.md\"}"
+            )
+        );
+        let terminal = sse_event(
+            "run_finished",
+            ",\"run_id\":\"root-run\",\"status\":\"failed\",\"error\":\"LLM time budget exhausted\",\"error_kind\":\"budget_exhausted\"",
+        );
+        let mut source = stream::iter(vec![Ok(first.into_bytes()), Ok(terminal.into_bytes())]);
+        let mut host = NoopSseStreamHost;
+
+        let (result, abort) = consume_sse_stream(
+            &mut source,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+
+        assert_eq!(abort, Some(astra_core::ErrorKind::BudgetExhausted));
+        assert_eq!(
+            result.accum.error_kind,
+            Some(astra_core::ErrorKind::BudgetExhausted)
+        );
+        assert_eq!(
+            result.accum.error_message.as_deref(),
+            Some("LLM time budget exhausted")
+        );
+        assert!(result.accum.full_text.is_empty());
+        assert!(result.accum.tool_calls.is_empty());
+        assert!(result.tool_results.is_empty());
+        let terminal = result.accum.run_terminal.expect("typed root terminal");
+        assert_eq!(
+            terminal.error_kind,
+            Some(astra_core::ErrorKind::BudgetExhausted)
+        );
+    }
+
+    #[tokio::test]
+    async fn unterminated_eof_failed_terminal_preserves_exact_error_kind() {
+        let bytes = format!(
+            "{}{}",
+            sse_event(
+                "session_info",
+                ",\"session_id\":\"session-1\",\"run_id\":\"root-run\""
+            ),
+            // Deliberately no final blank-line boundary.
+            "data: {\"type\":\"run_finished\",\"run_id\":\"root-run\",\"status\":\"failed\",\"error_kind\":\"budget_exhausted\"}"
+        );
+        let mut source = stream::iter(vec![Ok(bytes.into_bytes())]);
+        let mut host = NoopSseStreamHost;
+
+        let (result, abort) = consume_sse_stream(
+            &mut source,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+
+        assert_eq!(abort, Some(astra_core::ErrorKind::BudgetExhausted));
+        assert_eq!(
+            result.accum.error_kind,
+            Some(astra_core::ErrorKind::BudgetExhausted)
+        );
+        assert_eq!(
+            result
+                .accum
+                .run_terminal
+                .as_ref()
+                .and_then(|terminal| terminal.error_kind),
+            Some(astra_core::ErrorKind::BudgetExhausted)
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_terminal_without_error_kind_is_not_guessed_as_server_overload() {
+        let events = format!(
+            "{}{}",
+            sse_event(
+                "session_info",
+                ",\"session_id\":\"session-1\",\"run_id\":\"root-run\""
+            ),
+            sse_event(
+                "run_finished",
+                ",\"run_id\":\"root-run\",\"status\":\"failed\",\"error\":\"legacy unclassified failure\""
+            )
+        );
+        let mut source = stream::iter(chunks_from_sse(&events));
+        let mut host = NoopSseStreamHost;
+
+        let (result, abort) = consume_sse_stream(
+            &mut source,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+
+        assert_eq!(abort, Some(astra_core::ErrorKind::ContractViolation));
+        assert_eq!(
+            result.accum.error_kind,
+            Some(astra_core::ErrorKind::ContractViolation)
+        );
+        assert_ne!(abort, Some(astra_core::ErrorKind::ServerError));
+    }
+
+    #[tokio::test]
+    async fn explicit_server_error_terminal_retains_overload_classification() {
+        let events = format!(
+            "{}{}",
+            sse_event("session_info", ",\"run_id\":\"root-run\""),
+            sse_event(
+                "run_finished",
+                ",\"run_id\":\"root-run\",\"status\":\"failed\",\"error_kind\":\"server_error\""
+            )
+        );
+        let mut source = stream::iter(chunks_from_sse(&events));
+        let mut host = NoopSseStreamHost;
+
+        let (result, abort) = consume_sse_stream(
+            &mut source,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+
+        assert_eq!(abort, Some(astra_core::ErrorKind::ServerError));
+        assert_eq!(
+            result.accum.error_kind,
+            Some(astra_core::ErrorKind::ServerError)
+        );
     }
 
     #[tokio::test]
@@ -1626,6 +2681,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approval_uses_event_owner_instead_of_consuming_stream_fallback() {
+        let events = format!(
+            "{}{}",
+            sse_event(
+                "session_info",
+                ",\"session_id\":\"shared-session\",\"run_id\":\"consumer-run\""
+            ),
+            sse_event(
+                "approval_required",
+                ",\"session_id\":\"shared-session\",\"run_id\":\"approval-owner-run\",\"request_id\":\"ap-cross-run\",\"tool\":\"bash\",\"approval_kind\":\"explicit\",\"detail\":\"echo safe\"",
+            )
+        );
+        let mut stream = stream::iter(chunks_from_sse(&events));
+        let mut host = RecordingSseStreamHost::new();
+
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+
+        assert!(abort.is_none());
+        assert_eq!(result.approval_results.len(), 1);
+        assert_eq!(
+            host.approval_session_ids,
+            vec![Some("shared-session".to_string())]
+        );
+        assert_eq!(
+            host.approval_run_ids,
+            vec![Some("approval-owner-run".to_string())],
+            "concurrent child approval identity must not be replaced by the consuming stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_callback_failure_stops_coalesced_tool_before_execution() {
+        let events = format!(
+            "{}{}",
+            sse_event(
+                "approval_required",
+                ",\"session_id\":\"session-safe\",\"run_id\":\"run-safe\",\"request_id\":\"same-id\",\"tool\":\"bash\",\"approval_kind\":\"explicit\"",
+            ),
+            sse_event(
+                "tool_request",
+                ",\"session_id\":\"session-safe\",\"run_id\":\"run-safe\",\"request_id\":\"same-id\",\"tool\":\"bash\",\"args\":{\"command\":\"touch must-not-run\"}",
+            )
+        );
+        let mut stream = stream::iter(vec![Ok(events.into_bytes())]);
+        let mut host = RecordingSseStreamHost::new().abort_edge_work_after_approval();
+
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+
+        assert!(abort.is_none());
+        assert_eq!(result.approval_results.len(), 1);
+        assert!(
+            result.tool_results.is_empty(),
+            "a tool must not execute after its approval callback channel fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_callback_failure_stops_remaining_owner_groups() {
+        let events = format!(
+            "{}{}",
+            sse_event(
+                "approval_required",
+                ",\"session_id\":\"session-a\",\"run_id\":\"run-a\",\"request_id\":\"approval-a\",\"tool\":\"bash\",\"approval_kind\":\"explicit\"",
+            ),
+            sse_event(
+                "approval_required",
+                ",\"session_id\":\"session-b\",\"run_id\":\"run-b\",\"request_id\":\"approval-b\",\"tool\":\"bash\",\"approval_kind\":\"explicit\"",
+            )
+        );
+        let mut stream = stream::iter(vec![Ok(events.into_bytes())]);
+        let mut host = RecordingSseStreamHost::new().abort_edge_work_after_approval();
+
+        let (result, abort) = consume_sse_stream(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_millis(STREAM_IDLE_TIMEOUT_MS),
+        )
+        .await;
+
+        assert!(abort.is_none());
+        assert_eq!(
+            result.approval_results.len(),
+            1,
+            "the first terminal callback failure must stop later owner groups"
+        );
+        assert_eq!(host.approval_run_ids, vec![Some("run-a".to_string())]);
+    }
+
+    #[test]
+    fn approval_grouping_is_session_isolated_ordered_and_linear_indexed() {
+        const SESSION_COUNT: usize = 128;
+        const REQUEST_COUNT: usize = 4_096;
+        let requests = (0..REQUEST_COUNT)
+            .map(|index| {
+                let session = index % SESSION_COUNT;
+                EdgeApprovalRequest {
+                    session_id: Some(format!("session-{session}")),
+                    run_id: Some(format!("run-{session}")),
+                    request_id: format!("approval-{index}"),
+                    tool: "bash".to_string(),
+                    approval_kind: ApprovalKind::Explicit,
+                    detail: Some("echo safe".to_string()),
+                    display_label: None,
+                }
+            })
+            .collect();
+
+        let groups =
+            group_approval_requests(requests, Some("fallback-session"), Some("fallback-run"));
+
+        assert_eq!(groups.len(), SESSION_COUNT);
+        for (expected, (session_id, run_id, approvals)) in groups.iter().enumerate() {
+            assert_eq!(
+                session_id.as_deref(),
+                Some(format!("session-{expected}").as_str())
+            );
+            assert_eq!(run_id.as_deref(), Some(format!("run-{expected}").as_str()));
+            assert_eq!(approvals.len(), REQUEST_COUNT / SESSION_COUNT);
+            assert!(approvals.iter().all(|approval| {
+                approval.session_id.as_deref() == session_id.as_deref()
+                    && approval.run_id.as_deref() == run_id.as_deref()
+            }));
+        }
+    }
+
+    #[test]
+    fn approval_grouping_uses_fallback_only_for_missing_identity() {
+        let request = |request_id: &str, session_id: Option<&str>, run_id: Option<&str>| {
+            EdgeApprovalRequest {
+                session_id: session_id.map(ToString::to_string),
+                run_id: run_id.map(ToString::to_string),
+                request_id: request_id.to_string(),
+                tool: "bash".to_string(),
+                approval_kind: ApprovalKind::Explicit,
+                detail: None,
+                display_label: None,
+            }
+        };
+        let groups = group_approval_requests(
+            vec![
+                request("legacy", None, None),
+                request("owned", Some("producer-session"), Some("producer-run")),
+            ],
+            Some("consumer-session"),
+            Some("consumer-run"),
+        );
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].0.as_deref(), Some("consumer-session"));
+        assert_eq!(groups[0].1.as_deref(), Some("consumer-run"));
+        assert_eq!(groups[1].0.as_deref(), Some("producer-session"));
+        assert_eq!(groups[1].1.as_deref(), Some("producer-run"));
+    }
+
+    #[tokio::test]
     async fn empty_request_ids_are_skipped() {
         let events = format!(
             "{}{}",
@@ -1692,6 +2912,14 @@ mod tests {
 
             fn on_stream_complete(&mut self) {}
 
+            fn on_server_tool_surface_admission(&mut self, tool: &str) -> Result<(), String> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(format!("admission:{tool}"));
+                Ok(())
+            }
+
             fn on_session_id(&mut self, session_id: &str) {
                 self.0
                     .lock()
@@ -1750,7 +2978,11 @@ mod tests {
         assert_eq!(result.accum.session_id.as_deref(), Some("sess-hook"));
         assert_eq!(
             astra_core::sync_poison::recover_mutex_lock(&order).as_slice(),
-            &["session:sess-hook".to_string(), "tool:tr-1".to_string()]
+            &[
+                "session:sess-hook".to_string(),
+                "admission:bash".to_string(),
+                "tool:tr-1".to_string(),
+            ]
         );
     }
 
@@ -2219,6 +3451,9 @@ mod tests {
             run_id: "r1".to_string(),
             turn_chain_id: "c1".to_string(),
             request_id: format!("req-{tool}"),
+            schema_admitted_by_server: true,
+            execution_deadline_unix_ms: 4_102_444_800_000,
+            execution_timeout_ms: 300_000,
             tool: tool.to_string(),
             args: serde_json::json!({}),
         }
@@ -2535,7 +3770,7 @@ mod tests {
         // only one \n\n at the end). This simulates them arriving in the
         // same TCP chunk as a single framed event.
         let block = format!(
-            "data: {{\"type\":\"tool_request\",\"request_id\":\"t-bash\",\"tool\":\"bash\",\"args\":{{}}}}\ndata: {{\"type\":\"tool_request\",\"request_id\":\"t-skill\",\"tool\":\"{}\",\"args\":{{}}}}\n\n",
+            "data: {{\"type\":\"tool_request\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":4102444800000,\"request_id\":\"t-bash\",\"tool\":\"bash\",\"args\":{{}}}}\ndata: {{\"type\":\"tool_request\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":4102444800000,\"request_id\":\"t-skill\",\"tool\":\"{}\",\"args\":{{}}}}\n\n",
             "skill"
         );
         let chunks: Vec<Result<Vec<u8>, String>> = vec![Ok(block.into_bytes())];
@@ -2613,8 +3848,7 @@ mod tests {
         // trailing \n\n — it stays in the framer buffer and gets flushed
         // as the tail blob after the stream ends.
         let complete = sse_event("text_delta", ",\"content\":\"hi\"");
-        let partial_tool =
-            "data: {\"type\":\"tool_request\",\"request_id\":\"t1\",\"tool\":\"bash\",\"args\":{}}";
+        let partial_tool = "data: {\"type\":\"tool_request\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":4102444800000,\"request_id\":\"t1\",\"tool\":\"bash\",\"args\":{}}";
         let chunks: Vec<Result<Vec<u8>, String>> =
             vec![Ok(format!("{complete}{partial_tool}").into_bytes())];
         let mut stream = stream::iter(chunks);

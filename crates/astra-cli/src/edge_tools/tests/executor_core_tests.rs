@@ -4,8 +4,7 @@ use astra_services::session_journal::{self, JournalDirGuard, JournalEvent, Journ
 use astra_services::session_workspace::{self, ContextTraceSignal, WorkspaceMetadata};
 use chrono::Utc;
 use serde_json::json;
-use wiremock::matchers::{body_json, header, method, path, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::MockServer;
 
 // ── ToolExecutor ──────────────────────────────────────────────────────────
 
@@ -42,6 +41,33 @@ async fn execute_unknown_tool_returns_error() {
     assert!(
         result.contains("not available"),
         "error must use the canonical 'not available' phrasing so dispatchers can pattern-match — got: {result}"
+    );
+}
+
+#[tokio::test]
+async fn legacy_task_board_has_no_edge_execution_backdoor() {
+    let executor = test_executor();
+
+    assert!(
+        !astra_tools::schemas::schema_exists_for_tool("task_board"),
+        "the removed authority must not be model-discoverable"
+    );
+    let result = astra_tools::ToolExecutor::execute_with_metadata(
+        &executor,
+        "task_board",
+        &json!({"action": "list"}),
+    )
+    .await;
+
+    assert!(result.is_error, "{result:?}");
+    assert_eq!(
+        result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("error_kind"))
+            .and_then(serde_json::Value::as_str),
+        Some(astra_core::ErrorKind::ToolBinding.as_str()),
+        "direct execution must fail at the runtime-binding boundary: {result:?}"
     );
 }
 
@@ -235,6 +261,12 @@ async fn execute_with_metadata_bash_non_zero_exit_is_structured_failure() {
             .and_then(serde_json::Value::as_str),
         Some("execution_error")
     );
+    assert_eq!(
+        fields.get("error_kind").and_then(serde_json::Value::as_str),
+        Some("unknown")
+    );
+    assert_eq!(fields["recovery_evidence"]["cause"], "command_failed");
+    assert_eq!(fields["retryable"], false);
 }
 
 #[tokio::test]
@@ -287,11 +319,20 @@ async fn execute_with_metadata_bash_non_zero_exit_preserves_structured_failure()
             .and_then(serde_json::Value::as_str),
         Some("execution_error")
     );
+    assert_eq!(
+        fields.get("error_kind").and_then(serde_json::Value::as_str),
+        Some("unknown")
+    );
+    assert_eq!(fields["recovery_evidence"]["cause"], "command_failed");
+    assert_eq!(fields["retryable"], false);
 }
 
 #[tokio::test]
 async fn execute_with_metadata_bash_empty_result_is_structured_non_error() {
     let executor = test_executor();
+    let aggregate_before = executor
+        .aggregate_output_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
     let outcome = executor
         .execute_with_metadata_cancelable(
             "bash",
@@ -317,6 +358,17 @@ async fn execute_with_metadata_bash_empty_result_is_structured_non_error() {
             .get("result_class")
             .and_then(serde_json::Value::as_str),
         Some("empty_result")
+    );
+    assert!(
+        !outcome.output.is_empty(),
+        "cancel-aware async bash must normalize an empty command result"
+    );
+    assert_eq!(
+        executor
+            .aggregate_output_bytes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        aggregate_before + outcome.output.len(),
+        "cancel-aware async bash output must be accounted exactly once"
     );
 }
 
@@ -410,29 +462,6 @@ async fn agent_rejects_wrapper_shapes_outside_its_public_contract() {
     assert_tool_invalid_args(&result);
 }
 
-/// `task` is only the durable checklist surface. Background process
-/// control belongs to the typed `task_output`/`task_stop`/`task_list`
-/// tools; if old background actions arrive on `task`, treat them as
-/// ordinary unknown task actions rather than preserving migration branches.
-#[tokio::test]
-async fn task_background_actions_are_plain_unknown_task_actions() {
-    let executor = test_executor();
-    for action in ["background_shell", "background_agent", "output", "kill"] {
-        let result = astra_tools::ToolExecutor::execute_with_metadata(
-            &executor,
-            "task_board",
-            &json!({
-                "action": action,
-                "command": "echo hi",
-                "prompt": "hi",
-                "task_id": "bg-shell-1",
-            }),
-        )
-        .await;
-        assert_tool_invalid_args(&result);
-    }
-}
-
 #[tokio::test]
 async fn session_rejects_actions_outside_its_public_contract() {
     let executor = test_executor();
@@ -452,103 +481,46 @@ async fn exit_plan_mode_ignores_model_supplied_approval_without_overlay() {
     // LLM/tool arguments are not a trusted approval source. Even if the
     // model passes `approved: true`, exit_plan_mode must require the
     // interactive plan-review overlay before unlocking writes.
-    for (label, use_cloud, status, plan_id) in [
-        ("cloud planning", true, "planning", "plan-cloud-plan"),
-        ("cloud refining", true, "refining", "plan-cloud-ref"),
-        ("offline", false, "planning", ""),
-    ] {
+    for (label, use_cloud) in [("cloud configured", true), ("offline", false)] {
         let session_id = format!("sess-{label}");
-
-        if use_cloud {
-            let server = MockServer::start().await;
-            mock_authoring_plan_present(&server, &session_id, plan_id, status).await;
-
-            let temp = tempfile::tempdir().unwrap();
-            let executor = ToolExecutor::new(temp.path().to_path_buf())
+        let server = MockServer::start().await;
+        let temp = tempfile::tempdir().unwrap();
+        let executor = if use_cloud {
+            ToolExecutor::new(temp.path().to_path_buf())
                 .with_active_session_id(&session_id)
-                .with_cloud(server.uri(), "token");
-
-            let result = executor
-                .execute(
-                    "exit_plan_mode",
-                    &json!({"plan": "1. Ship auth", "approved": true}),
-                )
-                .await;
-
-            assert!(
-                result.contains("trusted interactive plan-review overlay"),
-                "[{label}] model-supplied approval must not bypass UI review. Got: {result}"
-            );
-            assert_eq!(
-                executor.take_pending_permission_mode_change(),
-                None,
-                "[{label}] no trusted approval means no permission-mode change"
-            );
+                .with_cloud(server.uri(), "token")
         } else {
-            let temp = tempfile::tempdir().unwrap();
-            let executor =
-                ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id(&session_id);
+            ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id(&session_id)
+        };
 
-            let enter_result = executor
-                .execute("enter_plan_mode", &json!({"goal": "Ship auth"}))
-                .await;
-            assert!(
-                !enter_result.starts_with("Error:"),
-                "[{label}] offline enter should succeed. Got: {enter_result}"
-            );
-            assert_eq!(
-                executor.take_pending_permission_mode_change(),
-                Some(crate::cli::permission_manager::PermissionMode::Plan),
-                "[{label}] enter must stage Plan"
-            );
+        let result = executor
+            .execute(
+                "exit_plan_mode",
+                &json!({"plan": "1. Ship auth", "approved": true}),
+            )
+            .await;
 
-            let exit_result = executor
-                .execute(
-                    "exit_plan_mode",
-                    &json!({"approved": true, "plan": "1. Ship auth"}),
-                )
-                .await;
-            assert!(
-                exit_result.contains("trusted interactive plan-review overlay"),
-                "[{label}] model-supplied approval must not bypass local UI review. Got: {exit_result}"
-            );
-            assert_eq!(
-                executor.take_pending_permission_mode_change(),
-                None,
-                "[{label}] no trusted approval means local plan mode stays active"
-            );
-        }
+        assert!(
+            result.contains("trusted interactive plan-review overlay"),
+            "[{label}] model-supplied approval must not bypass UI review. Got: {result}"
+        );
+        assert_eq!(executor.take_pending_permission_mode_change(), None);
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 }
 
 #[tokio::test]
 async fn plan_mode_write_guard_cache_is_invalidated_when_session_changes() {
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/plans"))
-        .and(query_param("session_id", "sess-plan"))
-        .and(query_param("active_session_only", "true"))
-        .and(query_param("limit", "1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "plans": [{ "plan_id": "plan-1", "goal": "Ship auth", "status": "planning" }]
-        })))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/plans"))
-        .and(query_param("session_id", "sess-normal"))
-        .and(query_param("active_session_only", "true"))
-        .and(query_param("limit", "1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "plans": []
-        })))
-        .mount(&server)
-        .await;
-
     let temp = tempfile::tempdir().unwrap();
-    let executor = ToolExecutor::new(temp.path().to_path_buf())
-        .with_active_session_id("sess-plan")
-        .with_cloud(server.uri(), "token");
+    let executor = ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id("sess-plan");
+
+    executor
+        .execute("enter_plan_mode", &json!({"goal": "Ship auth"}))
+        .await;
+    assert_eq!(
+        executor.take_pending_permission_mode_change(),
+        Some(crate::cli::permission_manager::PermissionMode::Plan)
+    );
 
     let blocked = executor
         .execute("bash", &json!({ "command": "true" }))
@@ -596,7 +568,7 @@ async fn exit_plan_mode_overlay_paths() {
             decision: Some(PlanReviewDecision::Approve {
                 mode: PermissionMode::Auto,
             }),
-            expect_starts_with: "Exited plan mode.",
+            expect_starts_with: "Exited plan mode",
             expect_contains: &["auto"],
             expect_not_contains: &["Error"],
             expect_pending_mode: Some(PermissionMode::Auto),
@@ -625,46 +597,15 @@ async fn exit_plan_mode_overlay_paths() {
     ];
 
     for case in &cases {
-        let plan_id = format!("plan-{}-{}", case.label, Utc::now().timestamp_millis());
         let plan_text = if case.label == "keep-planning" {
             "1. Draft"
         } else {
             "1. Ship auth"
         };
 
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/plans"))
-            .and(query_param("session_id", "sess-1"))
-            .and(query_param("active_session_only", "true"))
-            .and(query_param("limit", "1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "plans": [{ "plan_id": &plan_id, "goal": "Ship auth", "status": "planning" }]
-            })))
-            .mount(&server)
-            .await;
-
-        // Only approve / keep-planning paths hit the POST endpoint
-        if case.install_overlay {
-            let mock_approved = matches!(case.decision, Some(PlanReviewDecision::Approve { .. }));
-            Mock::given(method("POST"))
-                .and(path(format!("/plans/{plan_id}/exit-plan-mode")))
-                .and(body_json(json!({
-                    "approved": mock_approved,
-                    "plan_md": plan_text
-                })))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "plan_id": &plan_id,
-                    "phase": "refining"
-                })))
-                .mount(&server)
-                .await;
-        }
-
         let temp = tempfile::tempdir().unwrap();
-        let executor = ToolExecutor::new(temp.path().to_path_buf())
-            .with_active_session_id("sess-1")
-            .with_cloud(server.uri(), "token");
+        let executor =
+            ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id("sess-1");
 
         let mut overlay_task = None;
         if let Some(decision) = &case.decision {
@@ -737,18 +678,9 @@ async fn exit_plan_mode_overlay_paths() {
 async fn enter_plan_mode_stages_permission_mode_plan() {
     for (label, use_cloud) in [("offline", false), ("cloud", true)] {
         let temp = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
 
         let executor = if use_cloud {
-            let server = MockServer::start().await;
-            Mock::given(method("POST"))
-                .and(path("/plans"))
-                .and(header("authorization", "Bearer token"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                    "plan_id": "plan-cloud-1",
-                    "phase": "planning"
-                })))
-                .mount(&server)
-                .await;
             ToolExecutor::new(temp.path().to_path_buf())
                 .with_active_session_id("sess-cloud")
                 .with_cloud(server.uri(), "token")
@@ -769,25 +701,21 @@ async fn enter_plan_mode_stages_permission_mode_plan() {
             Some(crate::cli::permission_manager::PermissionMode::Plan),
             "[{label}] must stage Plan on the pending permission-mode slot"
         );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "[{label}] model-driven plan entry must not create a second remote lifecycle"
+        );
     }
 }
 
 #[tokio::test]
 async fn exit_plan_mode_local_path_makes_zero_cloud_calls() {
-    // The local approval path may probe the active plan, but it neither mutates
-    // a cloud plan nor materializes a second session-todo representation.
+    // Approval is a local trusted overlay and never materializes a second
+    // session-todo representation.
     use crate::cli::chat_stream::PlanReviewDecision;
     use crate::cli::permission_manager::PermissionMode;
 
     let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/plans"))
-        .and(query_param("session_id", "sess-no-cloud"))
-        .and(query_param("active_session_only", "true"))
-        .and(query_param("limit", "1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"plans": []})))
-        .mount(&server)
-        .await;
     let temp = tempfile::tempdir().unwrap();
     let executor = ToolExecutor::new(temp.path().to_path_buf())
         .with_active_session_id("sess-no-cloud")
@@ -811,20 +739,7 @@ async fn exit_plan_mode_local_path_makes_zero_cloud_calls() {
     overlay_task.await.unwrap();
 
     let requests = server.received_requests().await.expect("captured requests");
-    assert!(
-        requests
-            .iter()
-            .all(|request| request.method.as_str() == "GET")
-    );
-    assert!(
-        executor
-            .task_manager
-            .snapshot()
-            .await
-            .expect("task snapshot")
-            .is_empty(),
-        "plan approval must not write a copied session-todo task"
-    );
+    assert!(requests.is_empty());
     assert_eq!(
         executor.take_pending_permission_mode_change(),
         Some(crate::cli::permission_manager::PermissionMode::Prompt),
@@ -911,55 +826,6 @@ async fn enter_plan_mode_then_exit_full_cycle_offline() {
 // `plan_mode_authoring_active`), but the CLI's local `ToolExecutor`
 // did NOT. These tests pin the parity contract.
 
-async fn mock_authoring_plan_present(
-    server: &MockServer,
-    session_id: &str,
-    plan_id: &str,
-    status: &str,
-) {
-    Mock::given(method("GET"))
-        .and(path("/plans"))
-        .and(header("authorization", "Bearer token"))
-        .and(query_param("session_id", session_id))
-        .and(query_param("active_session_only", "true"))
-        .and(query_param("limit", "1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "plans": [
-                { "plan_id": plan_id, "goal": "Ship auth", "status": status }
-            ]
-        })))
-        .mount(server)
-        .await;
-}
-
-async fn mock_planning_plan_present(server: &MockServer, session_id: &str, plan_id: &str) {
-    mock_authoring_plan_present(server, session_id, plan_id, "planning").await;
-}
-
-async fn mock_no_authoring_plan(server: &MockServer, session_id: &str) {
-    Mock::given(method("GET"))
-        .and(path("/plans"))
-        .and(header("authorization", "Bearer token"))
-        .and(query_param("session_id", session_id))
-        .and(query_param("active_session_only", "true"))
-        .and(query_param("limit", "1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"plans": []})))
-        .mount(server)
-        .await;
-}
-
-async fn setup_blocked_executor(
-    plan_status: &str,
-) -> (MockServer, ToolExecutor, tempfile::TempDir) {
-    let server = MockServer::start().await;
-    mock_authoring_plan_present(&server, "sess-1", "plan-9", plan_status).await;
-    let temp = tempfile::tempdir().unwrap();
-    let executor = ToolExecutor::new(temp.path().to_path_buf())
-        .with_active_session_id("sess-1")
-        .with_cloud(server.uri(), "token");
-    (server, executor, temp)
-}
-
 #[test]
 fn plan_mode_background_task_guard_blocks_stop_but_allows_reads() {
     assert!(crate::edge_tools::is_plan_mode_blocked_tool(
@@ -1013,16 +879,18 @@ fn plan_mode_guard_is_action_aware_for_git_github_and_memory() {
 
 #[tokio::test]
 async fn read_only_tools_are_not_blocked_while_plan_mode_is_authoring() {
-    let server = MockServer::start().await;
-    mock_planning_plan_present(&server, "sess-1", "plan-9").await;
-
     let temp = tempfile::tempdir().unwrap();
     let probe = temp.path().join("probe.txt");
     std::fs::write(&probe, "hello").unwrap();
 
-    let executor = ToolExecutor::new(temp.path().to_path_buf())
-        .with_active_session_id("sess-1")
-        .with_cloud(server.uri(), "token");
+    let executor = ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id("sess-1");
+    executor
+        .execute("enter_plan_mode", &json!({"goal": "Inspect safely"}))
+        .await;
+    assert_eq!(
+        executor.take_pending_permission_mode_change(),
+        Some(crate::cli::permission_manager::PermissionMode::Plan)
+    );
 
     let result = executor
         .execute("read_file", &json!({"path": probe.to_string_lossy()}))
@@ -1051,24 +919,16 @@ async fn read_only_tools_are_not_blocked_while_plan_mode_is_authoring() {
 
 #[tokio::test]
 async fn writes_are_unblocked_after_exit_plan_mode_approved() {
-    let server = MockServer::start().await;
-    // Initially a planning plan exists. exit_plan_mode flips the phase.
-    mock_planning_plan_present(&server, "sess-1", "plan-9").await;
-    Mock::given(method("POST"))
-        .and(path("/plans/plan-9/exit-plan-mode"))
-        .and(header("authorization", "Bearer token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "plan_id": "plan-9",
-            "phase": "refining"
-        })))
-        .mount(&server)
-        .await;
-
     let temp = tempfile::tempdir().unwrap();
     let target = temp.path().join("note.txt");
-    let executor = ToolExecutor::new(temp.path().to_path_buf())
-        .with_active_session_id("sess-1")
-        .with_cloud(server.uri(), "token");
+    let executor = ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id("sess-1");
+    executor
+        .execute("enter_plan_mode", &json!({"goal": "Ship safely"}))
+        .await;
+    assert_eq!(
+        executor.take_pending_permission_mode_change(),
+        Some(crate::cli::permission_manager::PermissionMode::Plan)
+    );
 
     // Sanity: blocked first.
     let blocked = executor
@@ -1101,7 +961,7 @@ async fn writes_are_unblocked_after_exit_plan_mode_approved() {
         .await;
     overlay_task.await.unwrap();
     assert!(
-        exit.starts_with("Exited plan mode."),
+        exit.starts_with("Exited plan mode"),
         "trusted overlay approval must succeed. Got: {exit}"
     );
 
@@ -1120,78 +980,20 @@ async fn writes_are_unblocked_after_exit_plan_mode_approved() {
 
 #[tokio::test]
 async fn write_guard_is_inactive_when_no_authoring_plan() {
-    // Guard must be inactive (fail open) when there's no authoring plan,
-    // regardless of whether cloud is configured or unavailable.
-    for (label, with_cloud, mock_plan) in [
-        ("no plan on cloud", true, true),
-        ("no cloud binding", false, false),
-    ] {
-        let temp = tempfile::tempdir().unwrap();
-        let target = temp.path().join("note.txt");
+    let temp = tempfile::tempdir().unwrap();
+    let target = temp.path().join("note.txt");
+    let executor = ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id("sess-1");
 
-        let executor = if with_cloud {
-            let server = MockServer::start().await;
-            if mock_plan {
-                mock_no_authoring_plan(&server, "sess-1").await;
-            }
-            ToolExecutor::new(temp.path().to_path_buf())
-                .with_active_session_id("sess-1")
-                .with_cloud(server.uri(), "token")
-        } else {
-            ToolExecutor::new(temp.path().to_path_buf()).with_active_session_id("sess-1")
-        };
-
-        let result = executor
-            .execute(
-                "write_file",
-                &json!({"path": target.to_string_lossy(), "content": "x"}),
-            )
-            .await;
-
-        assert!(
-            !result.contains("blocked while plan mode is active"),
-            "[{label}] guard must be inactive. Got: {result}"
-        );
-    }
-}
-
-/// Typed task-control tools are the model-facing entry points. They must
-/// dispatch to the background shell handlers instead of falling through to
-/// unknown-tool handling. Verified here with the cheapest possible smoke: an
-/// unwired CLI executor returns a known fail-fast string for each
-/// action (the BackgroundTaskRegistry is wired only inside the TUI
-/// REPL).
-#[tokio::test]
-async fn typed_background_task_tools_dispatch_through_executor() {
-    let executor = test_executor();
     let result = executor
         .execute(
-            "task_output",
-            &json!({"task_id": "bg-shell-1", "block": false}),
+            "write_file",
+            &json!({"path": target.to_string_lossy(), "content": "x"}),
         )
         .await;
-    assert!(
-        (result.contains("background") || result.contains("interactive REPL"))
-            && !result.contains("Unknown tool"),
-        "task_output should reach the registry-unwired fail-fast path. Got: {result}"
-    );
 
-    let result = executor
-        .execute("task_stop", &json!({"task_id": "bg-shell-1"}))
-        .await;
     assert!(
-        (result.contains("background")
-            || result.contains("interactive REPL")
-            || result.contains("Nothing to stop"))
-            && !result.contains("Unknown tool"),
-        "task_stop should reach the registry-unwired fail-fast path. Got: {result}"
-    );
-
-    let result = executor.execute("task_list", &json!({})).await;
-    assert!(
-        (result.contains("background") || result.contains("interactive REPL"))
-            && !result.contains("Unknown tool"),
-        "task_list should reach the registry-unwired fail-fast path. Got: {result}"
+        !result.contains("blocked while plan mode is active"),
+        "guard must be inactive before plan mode is entered. Got: {result}"
     );
 }
 

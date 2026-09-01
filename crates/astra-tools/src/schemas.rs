@@ -12,6 +12,10 @@ use serde_json::{Map, Value, json};
 pub const PER_ACTION_REQUIRED_KEY: &str = "x-astra-per-action-required";
 pub const PER_ACTION_ANY_OF_REQUIRED_KEY: &str = "x-astra-per-action-any-of-required";
 pub const PER_ACTION_ALLOWED_KEY: &str = "x-astra-per-action-allowed";
+pub const ACTION_SURFACES_KEY: &str = "x-astra-action-surfaces";
+pub const SURFACE_DESCRIPTIONS_KEY: &str = "x-astra-surface-descriptions";
+pub const SURFACE_DISCOVERY_SUMMARIES_KEY: &str = "x-astra-surface-discovery-summaries";
+
 /// Structured failure returned when model-authored arguments do not satisfy
 /// the invocation constraints encoded in the advertised built-in schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,9 +113,35 @@ fn value_is_present(value: Option<&Value>) -> bool {
     match value {
         None | Some(Value::Null) => false,
         Some(Value::String(value)) => !value.trim().is_empty(),
-        Some(Value::Array(values)) => !values.is_empty(),
+        // JSON Schema `required` constrains field presence, not array
+        // cardinality. Array emptiness is governed by the field's `minItems`
+        // contract; conflating the two rejects legitimate required `[]`
+        // values such as a dependency-free graph.
+        Some(Value::Array(_)) => true,
         Some(_) => true,
     }
+}
+
+fn value_satisfies_required_alternative(
+    parameters: &Map<String, Value>,
+    arguments: &Map<String, Value>,
+    field: &str,
+) -> bool {
+    let value = arguments.get(field);
+    if !value_is_present(value) {
+        return false;
+    }
+    let Some(values) = value.and_then(Value::as_array) else {
+        return true;
+    };
+    let minimum = parameters
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(field))
+        .and_then(|schema| schema.get("minItems"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    values.len() >= minimum as usize
 }
 
 fn schema_type_matches(value: &Value, expected: &Value) -> bool {
@@ -419,7 +449,7 @@ pub fn validate_tool_arguments(
         && !alternatives.iter().any(|fields| {
             fields
                 .iter()
-                .all(|field| value_is_present(arguments.get(field)))
+                .all(|field| value_satisfies_required_alternative(parameters, arguments, field))
         })
     {
         let rendered = alternatives
@@ -486,147 +516,321 @@ pub const SERVER_RUN_SCRIPT_RPC_TOOL_NAMES: &[&str] = &[
     "bash",
 ];
 
-fn task_board_schema() -> Value {
-    let mut subtask_props = serde_json::Map::new();
-    subtask_props.insert(
-        "id".to_string(),
-        json!({"type": "string", "minLength": 1, "maxLength": crate::task_mgmt::MAX_SUBTASK_ID_CHARS}),
-    );
-    subtask_props.insert(
-        "title".to_string(),
-        json!({"type": "string", "minLength": 1, "maxLength": crate::task_mgmt::MAX_SUBTASK_TITLE_CHARS}),
-    );
-    subtask_props.insert(
-        "description".to_string(),
-        json!({"type": "string", "maxLength": crate::task_mgmt::MAX_SUBTASK_DESCRIPTION_CHARS}),
-    );
-    subtask_props.insert(
-        "depends_on".to_string(),
-        json!({"type": "array", "items": {"type": "string"}, "description": "Sibling ids that must complete first."}),
-    );
-    subtask_props.insert(
-        "owner".to_string(),
-        json!({"type": "string", "minLength": 1, "maxLength": crate::task_mgmt::MAX_TASK_OWNER_CHARS}),
-    );
-
-    let mut props = serde_json::Map::new();
-    props.insert(
-        "action".to_string(),
-        json!({"type": "string", "enum": crate::task_tool_contract::TASK_ACTIONS, "description": "Task-board operation; use only fields allowed for this action."}),
-    );
-    props.insert(
-        "source_session_id".to_string(),
-        json!({"type": "string", "description": "(adopt) Source session id."}),
-    );
-    props.insert(
-        "older_than_days".to_string(),
-        json!({"type": "integer", "description": "(archive bulk) Completed items older than N days."}),
-    );
-    props.insert(
-        "user_status".to_string(),
-        json!({"type": "string", "enum": ["active","pending","in_progress","paused","completed","failed","cancelled","archived","all"], "description": "(list_user) Default active = pending + in_progress + paused."}),
-    );
-    props.insert(
-        "title".to_string(),
-        json!({"type": "string", "minLength": 1, "maxLength": crate::task_mgmt::MAX_TASK_TITLE_CHARS, "description": "(create/update) Task title."}),
-    );
-    props.insert(
-        "description".to_string(),
-        json!({"type": ["string", "null"], "maxLength": crate::task_mgmt::MAX_TASK_DESCRIPTION_CHARS, "description": "(create/update) Definition of done; update may pass null to clear it."}),
-    );
-    props.insert(
-        "task_id".to_string(),
-        json!({"type": "string", "description": "(update/get/stop/adopt/archive) Task id."}),
-    );
-    props.insert(
-        "new_status".to_string(),
-        json!({"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","deleted"], "description": "(update only; never with create) Parent/subtask outcome. Use completed only when the task's definition of done is satisfied; use failed when execution finished but the requested outcome was not achieved; paused when work is resumable. deleted keeps an audit tombstone."}),
-    );
-    props.insert(
-        "status_filter".to_string(),
-        json!({"type": "string", "enum": ["pending","in_progress","paused","completed","failed","cancelled","archived","deleted","all","active"], "description": "(list) Default active = pending + in_progress + paused. all includes tombstones."}),
-    );
-    props.insert(
-        "subtask_id".to_string(),
-        json!({"type": "string", "description": "(update) Subtask id."}),
-    );
-    props.insert(
-        "active_form".to_string(),
-        json!({"type": ["string", "null"], "minLength": 1, "maxLength": crate::task_mgmt::MAX_TASK_ACTIVE_FORM_CHARS, "description": "(create/update) Spinner text while in_progress; update may pass null to clear it."}),
-    );
-    props.insert(
-        "owner".to_string(),
-        json!({"type": ["string", "null"], "minLength": 1, "maxLength": crate::task_mgmt::MAX_TASK_OWNER_CHARS, "description": "(create/update) Owner; update may pass null to unassign."}),
-    );
-    props.insert(
-        "metadata".to_string(),
-        json!({"type": "object", "description": "(create/update) Key-value metadata; null deletes a key on update."}),
-    );
-    props.insert(
-        "add_blocks".to_string(),
-        json!({"type": "array", "items": {"type": "string"}, "description": "(create/update) Task ids this task blocks."}),
-    );
-    props.insert(
-        "add_blocked_by".to_string(),
-        json!({"type": "array", "items": {"type": "string"}, "description": "(create/update) Task ids blocking this task."}),
-    );
-    props.insert(
-        "remove_blocks".to_string(),
-        json!({"type": "array", "items": {"type": "string"}, "description": "(update) Remove blocks edges."}),
-    );
-    props.insert(
-        "remove_blocked_by".to_string(),
-        json!({"type": "array", "items": {"type": "string"}, "description": "(update) Remove blocked_by edges."}),
-    );
-    props.insert(
-        "subtasks".to_string(),
-        json!({
-            "type": "array",
-            "maxItems": crate::task_mgmt::MAX_CREATE_SUBTASKS,
-            "description": "(create only) Optional subtasks; update existing subtasks with subtask_id + new_status.",
-            "items": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": Value::Object(subtask_props),
-                "required": ["id", "title"]
-            }
-        }),
-    );
-    props.insert(
-        "reason".to_string(),
-        json!({"type": "string", "maxLength": crate::task_mgmt::MAX_TASK_STOP_REASON_CHARS, "description": "(update/stop/archive) Outcome evidence or subtask note. For terminal updates, state what was actually achieved or why it failed."}),
-    );
-    props.insert(
-        "error_message".to_string(),
-        json!({"type": "string", "maxLength": crate::task_mgmt::MAX_TASK_ERROR_MESSAGE_CHARS, "description": "(update) Failure/cancel reason."}),
-    );
-
-    let mut params = serde_json::Map::new();
-    params.insert("type".to_string(), json!("object"));
-    params.insert("additionalProperties".to_string(), json!(false));
-    params.insert("properties".to_string(), Value::Object(props));
-    params.insert("required".to_string(), json!(["action"]));
-    params.insert(
-        "x-astra-per-action-required".to_string(),
-        json!({
-            "create": ["title"],
-            "update": ["task_id"],
-            "get": ["task_id"],
-            "stop": ["task_id"],
-            "adopt": ["source_session_id", "task_id"]
-        }),
-    );
-    params.insert(
-        "x-astra-per-action-allowed".to_string(),
-        crate::task_tool_contract::task_action_allowed_fields_json(),
-    );
-
+fn start_work_schema() -> Value {
     json!({
         "type": "function",
         "function": {
-            "name": crate::task_tool_contract::TASK_BOARD_TOOL_NAME,
-            "description": "Durable task board. Pick one action; use only that action's allowed fields. create makes tasks; update changes status.",
-            "parameters": Value::Object(params)
+            "name": "start_work",
+            "description": "Establish one canonical Work and its initial ordered task list around the current durable conversation. Use this when the user's goal has multiple independently accepted outcomes or should continue as durable work; decide this from the goal's semantics without requiring the user to request a plan or use a command. Count user acceptance units, not response containers: explicitly requested A and B remain independent even when one final message presents both when each owes its own payload or evidence and either remains useful if the other fails; inputs used only for one combined conclusion are one outcome. An explicit same-turn multi-agent request without tracked lifecycle uses agent_fanout instead of Work. When a canonical Work already exists, use this same typed entrypoint for a follow-up task list; the server extends that branch without creating a second Work or asking the model to author graph identities. Do not use it for a simple question or one-shot response. Set activation=start for ordinary work that should proceed now. Set activation=defer only when the user explicitly wants a visible plan without execution yet. This lifecycle action declares work; it cannot claim completion. Supply the smallest useful sequence of independently executable, evidence-producing outcomes only: task identity, ordering, and execution dependencies are assigned by the server. Preserve staged chronology: when the user says an item should be added, discovered, or decided after a later event, omit it from this initial list and use the typed graph-update path only after that event occurs. If one bounded retrieval, inspection, or mutation produces all requested evidence, keep it as one task; do not split acquisition, extraction, and reporting of the same outcome into separate tasks. Remove any item whose sole expected result is to summarize, format, combine, report, or restate evidence from other items. Preserve explicitly named execution tracks one-for-one: N tracks means exactly N tasks unless the user changes scope. For example, `investigate A, investigate B, then answer` means two tasks (A and B), not a third answer task. The final response is outside the task list. A successful start result normally includes initial_task, the first durable primary-session assignment; execute it directly instead of spending another model round on run_next_work_item. Do not immediately revise a successful initial graph merely to rephrase it; revision requires new user guidance or newly observed evidence that materially changes scope, order, feasibility, or completion.",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "goal": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 16384,
+                        "description": "Concise outcome-oriented goal preserving the user's explicit constraints."
+                    },
+                    "activation": {
+                        "type": "string",
+                        "enum": ["start", "defer"],
+                        "description": "Whether to atomically assign the first task now, or leave the task list durably ready without creating an execution attempt."
+                    },
+                    "tasks": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 8,
+                        "description": "Small ordered list of evidence-producing outcomes executable at initial admission. Keep only meaningful independently verifiable units; this is not a transcript checklist. Omit tasks the user explicitly stages for later addition or discovery, and omit final synthesis/reporting items that merely combine other task evidence. Each task must have a narrow objective and an expected result that can end its attempt as soon as sufficient evidence exists. List order is the default primary-session execution order; the server owns IDs and dependency mechanics.",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "objective": {"type": "string", "minLength": 1, "maxLength": 8192},
+                                "expected_result": {"type": "string", "minLength": 1, "maxLength": 8192}
+                            },
+                            "required": ["objective", "expected_result"]
+                        }
+                    }
+                },
+                "required": ["goal", "activation", "tasks"]
+            }
+        }
+    })
+}
+
+fn run_next_work_item_schema() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "run_next_work_item",
+            "description": "Select and bind one next foreground canonical Work task only when no assignment was returned by start_work or settle_work_item. The server, not the model, selects the dependency-ready task and derives its immutable attempt and settlement authority. When start_work returns initial_task or settlement returns next_task, execute that assignment directly instead of calling this tool. The returned expected_result is the attempt's completion boundary: gather sufficient direct evidence, settle immediately once it is satisfied, and do not broaden into adjacent investigation. Create a child agent only for a real isolation or parallelism boundary, never merely because a Work task exists.",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {}
+            }
+        }
+    })
+}
+
+fn settle_work_item_schema() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "settle_work_item",
+            "description": "Report the typed delivery outcome for the exact canonical WorkItem attempt assigned to this run. Call exactly once after attempting the task and before the final response. Runtime completion is not delivery: use delivered only after a literal gap check proves that direct evidence contains every payload and verification field in expected_result. Every explicit conjunct, including a named behavior check, command, test, or observable workflow, requires direct successful evidence; an unrun or failed check remains a gap, and compilation, imports, or adjacent smoke checks do not substitute for it. A reachable/index/home page, category list, or successful action does not substitute for a requested item, value, article, result, or source. If any required field is absent, continue the focused evidence path; use blocked with a structured blocker when the dependency/capability is unavailable, or failed when execution itself failed. None of these outcomes means cancelled: a requested cancellation is a canonical graph revision with declaration_state=cancelled through the inspect/propose path, never a word in this summary. The summary is a derived progress note, not an authoritative evidence source: include every required observed payload field, copy exact values faithfully, identify direct tool/artifact sources when material, and never replace conflicting direct evidence with the summary. The server derives Work/item/attempt identity from the trusted current run. A successful result may atomically include next_task; when present, execute that assignment directly instead of calling run_next_work_item again.",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "outcome": {"type": "string", "enum": ["delivered", "blocked", "failed"]},
+                    "summary": {"type": "string", "minLength": 1, "maxLength": 8192},
+                    "blocker_kind": {
+                        "type": "string",
+                        "enum": ["capability_unavailable", "dependency_blocked", "policy_blocked", "external_unavailable"]
+                    },
+                    "unavailable_capabilities": {
+                        "type": "array",
+                        "maxItems": 16,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 128}
+                    }
+                },
+                "required": ["outcome", "summary"]
+            }
+        }
+    })
+}
+
+fn inspect_work_plan_schema() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "inspect_work_plan",
+            "description": "Read one bounded page of the content-addressed canonical Work planning context and its pinned observation fact, cause, and evidence references. Follow next_offset values with the same context_id to inspect larger plans; a changed context fails stale. Inspect before proposing any graph change; context_id is the exact optimistic-concurrency basis for propose_work_plan.",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "context_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 96,
+                        "description": "Omit on the first page; use the exact returned context_id on later pages."
+                    },
+                    "item_offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 256
+                    },
+                    "dependency_offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 1024
+                    }
+                },
+                "required": []
+            }
+        }
+    })
+}
+
+fn propose_work_plan_schema() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "propose_work_plan",
+            "description": "Persist a non-authoritative, revision-pinned Task Graph patch against an exact inspected Work context. Use it to keep the canonical graph current when execution evidence or the user's guidance changes scope, sequencing, or what should stop. Item identity is semantic: use an active successor revision only when the same durable unit of work continues; when work is retired or replaced, give the old item a cancelled or superseded revision and add the replacement under a fresh item_id. Retirement preserves execution and evidence history. A patch may also add or remove dependencies. Small purely additive patches may proceed without interruption; revisions and removals use the normal typed approval path. Preserve prior item text when only changing declaration_state, explain why the graph changed, trust the returned status, and never claim a pending proposal changed the accepted plan.",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "context_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 96,
+                        "description": "Exact context_id returned by inspect_work_plan."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 512,
+                        "description": "Concise fact-based reason for this graph change."
+                    },
+                    "additions": {
+                        "type": "array",
+                        "maxItems": 64,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "item_id": {"type": "string", "minLength": 1, "maxLength": 64, "description": "Fresh identity not present in the inspected graph. Never reuse the identity of an item being revised or retired in this patch."},
+                                "kind": {"type": "string", "enum": ["milestone", "task"]},
+                                "objective": {"type": "string", "minLength": 1, "maxLength": 8192},
+                                "expected_result": {"type": "string", "minLength": 1, "maxLength": 8192}
+                            },
+                            "required": ["item_id", "kind", "objective", "expected_result"]
+                        }
+                    },
+                    "revisions": {
+                        "type": "array",
+                        "maxItems": 64,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "item_id": {"type": "string", "minLength": 1, "maxLength": 64},
+                                "expected_revision": {"type": "integer", "minimum": 1},
+                                "kind": {"type": "string", "enum": ["milestone", "task"]},
+                                "objective": {"type": "string", "minLength": 1, "maxLength": 8192},
+                                "expected_result": {"type": "string", "minLength": 1, "maxLength": 8192},
+                                "declaration_state": {"type": "string", "enum": ["active", "superseded", "cancelled"], "description": "Use active only when the same semantic work item continues. Use superseded or cancelled to retire the old identity when replacement work receives a fresh addition identity."}
+                            },
+                            "required": ["item_id", "expected_revision", "kind", "objective", "expected_result", "declaration_state"]
+                        }
+                    },
+                    "dependencies": {
+                        "type": "array",
+                        "maxItems": 256,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "predecessor_item_id": {"type": "string", "minLength": 1, "maxLength": 64},
+                                "successor_item_id": {"type": "string", "minLength": 1, "maxLength": 64}
+                            },
+                            "required": ["predecessor_item_id", "successor_item_id"]
+                        }
+                    },
+                    "dependency_removals": {
+                        "type": "array",
+                        "maxItems": 256,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "predecessor_item_id": {"type": "string", "minLength": 1, "maxLength": 64},
+                                "successor_item_id": {"type": "string", "minLength": 1, "maxLength": 64}
+                            },
+                            "required": ["predecessor_item_id", "successor_item_id"]
+                        }
+                    }
+                },
+                "required": ["context_id", "reason", "additions", "revisions", "dependencies", "dependency_removals"]
+            }
+        }
+    })
+}
+
+fn inspect_work_criteria_schema() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "inspect_work_criteria",
+            "description": "Read one bounded page of the accepted Done-when criteria for the canonical Work branch bound to this session. The returned context_id pins Work, Goal, criterion-set, branch, and graph revisions. Follow next_offset with that exact context_id; inspect every page before proposing a complete replacement set.",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "context_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 96,
+                        "description": "Omit on the first page; use the exact returned context_id on continuation pages."
+                    },
+                    "offset": {"type": "integer", "minimum": 0, "maximum": 128}
+                },
+                "required": []
+            }
+        }
+    })
+}
+
+fn proposed_criterion_definition_schema() -> Value {
+    json!({
+        "anyOf": [
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "kind": {"type": "string", "enum": ["command_check"]},
+                    "statement": {"type": "string", "minLength": 1, "maxLength": 16384},
+                    "command": {"type": "string", "minLength": 1, "maxLength": 65536}
+                },
+                "required": ["kind", "statement", "command"]
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "kind": {"type": "string", "enum": ["test_check"]},
+                    "statement": {"type": "string", "minLength": 1, "maxLength": 16384},
+                    "command": {"type": "string", "minLength": 1, "maxLength": 65536}
+                },
+                "required": ["kind", "statement", "command"]
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "kind": {"type": "string", "enum": ["human_review"]},
+                    "statement": {"type": "string", "minLength": 1, "maxLength": 16384}
+                },
+                "required": ["kind", "statement"]
+            }
+        ]
+    })
+}
+
+fn propose_work_criteria_schema() -> Value {
+    let definition = proposed_criterion_definition_schema();
+    json!({
+        "type": "function",
+        "function": {
+            "name": "propose_work_criteria",
+            "description": "Persist a non-authoritative complete Done-when criterion-set proposal against one exact inspected Work context. Include every accepted existing member that should remain plus explicit new definitions. This tool never accepts its own proposal: trust the returned pending status and continue useful work without repeatedly asking; the user reviews it through the Work surface.",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "context_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 96,
+                        "description": "Exact context_id returned by inspect_work_criteria."
+                    },
+                    "members": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 128,
+                        "items": {
+                            "anyOf": [
+                                {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "member_kind": {"type": "string", "enum": ["existing"]},
+                                        "criterion_id": {"type": "string", "minLength": 1, "maxLength": 64},
+                                        "revision": {"type": "integer", "minimum": 1}
+                                    },
+                                    "required": ["member_kind", "criterion_id", "revision"]
+                                },
+                                {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "properties": {
+                                        "member_kind": {"type": "string", "enum": ["new"]},
+                                        "criterion_id": {"type": "string", "minLength": 1, "maxLength": 64},
+                                        "definition": definition
+                                    },
+                                    "required": ["member_kind", "criterion_id", "definition"]
+                                }
+                            ]
+                        }
+                    }
+                },
+                "required": ["context_id", "members"]
+            }
         }
     })
 }
@@ -657,6 +861,52 @@ pub fn all_tool_schemas() -> Vec<Value> {
     schemas
 }
 
+/// Add the managed environment-lifetime Bash contract only for an executor
+/// that actually implements it. Shared/server executors remain foreground-
+/// only, so models cannot send fields those executors would ignore.
+pub const fn managed_background_bash_supported() -> bool {
+    cfg!(unix)
+}
+
+pub fn enable_managed_background_bash_schema(schemas: &mut [Value]) {
+    // The Edge managed-service executor relies on Unix process/session
+    // primitives. Do not advertise arguments which the Windows executor
+    // rejects at runtime.
+    if !managed_background_bash_supported() {
+        return;
+    }
+    let Some(bash) = schemas
+        .iter_mut()
+        .find(|schema| schema.pointer("/function/name").and_then(Value::as_str) == Some("bash"))
+    else {
+        return;
+    };
+    if let Some(description) = bash.pointer_mut("/function/description") {
+        *description = Value::String(
+            "Files: use source_artifacts before spawn; checksum is not backup. Foreground has no persistence guarantee. Self-daemonizing services need run_in_background + ready_check."
+                .to_string(),
+        );
+    }
+    let Some(properties) = bash
+        .pointer_mut("/function/parameters/properties")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    properties.insert(
+        "run_in_background".to_string(),
+        json!({"type":"boolean","default":false,"description":"Start an authorized environment-lifetime service and return after ready_check succeeds. Use for every process that must survive the call, including self-daemonizing programs. Do not append &, nohup, or setsid."}),
+    );
+    properties.insert(
+        "ready_check".to_string(),
+        json!({"type":"string","description":"Required with run_in_background=true. An independent side-effect-free command that proves readiness."}),
+    );
+    properties.insert(
+        "background_ttl".to_string(),
+        json!({"type":"number","minimum":1,"maximum":3600,"default":900,"description":"Maximum managed service lifetime in seconds."}),
+    );
+}
+
 /// Check whether a tool name has a corresponding schema in the built-in
 /// registry. Used by [`super::tool_engine::ToolEngine::register_handler`]
 /// to detect schema↔handler mismatches at registration time rather than
@@ -669,6 +919,146 @@ pub fn schema_exists_for_tool(name: &str) -> bool {
             .and_then(Value::as_str)
             == Some(name)
     })
+}
+
+/// Project every action-shaped schema onto the selected execution surface.
+/// Action availability is declarative schema data, not a tool-name special
+/// case, so future consolidated tools inherit the same visibility invariant.
+pub fn project_action_schemas_for_surface(schemas: &mut [Value], surface: &str) {
+    for schema in schemas {
+        let surface_description = schema
+            .pointer("/function/parameters")
+            .and_then(Value::as_object)
+            .and_then(|parameters| parameters.get(SURFACE_DESCRIPTIONS_KEY))
+            .and_then(Value::as_object)
+            .and_then(|descriptions| descriptions.get(surface))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let Some(parameters) = schema
+            .pointer_mut("/function/parameters")
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        let Some(action_surfaces) = parameters
+            .get(ACTION_SURFACES_KEY)
+            .and_then(Value::as_object)
+            .cloned()
+        else {
+            continue;
+        };
+        let allowed_actions = action_surfaces
+            .iter()
+            .filter(|(_, surfaces)| {
+                surfaces.as_array().is_some_and(|surfaces| {
+                    surfaces.iter().any(|item| item.as_str() == Some(surface))
+                })
+            })
+            .map(|(action, _)| action.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let allowed_properties = parameters
+            .get(PER_ACTION_ALLOWED_KEY)
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|per_action| {
+                per_action.iter().filter_map(|(action, properties)| {
+                    allowed_actions
+                        .contains(action)
+                        .then_some(properties)
+                        .and_then(Value::as_array)
+                })
+            })
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<std::collections::HashSet<_>>();
+
+        if let Some(properties) = parameters
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+        {
+            if let Some(actions) = properties
+                .get_mut("action")
+                .and_then(Value::as_object_mut)
+                .and_then(|action| action.get_mut("enum"))
+                .and_then(Value::as_array_mut)
+            {
+                actions.retain(|action| {
+                    action
+                        .as_str()
+                        .is_some_and(|action| allowed_actions.contains(action))
+                });
+            }
+            if !allowed_properties.is_empty() {
+                properties.retain(|name, _| allowed_properties.contains(name));
+            }
+        }
+        for key in [
+            PER_ACTION_REQUIRED_KEY,
+            PER_ACTION_ANY_OF_REQUIRED_KEY,
+            PER_ACTION_ALLOWED_KEY,
+        ] {
+            if let Some(map) = parameters.get_mut(key).and_then(Value::as_object_mut) {
+                map.retain(|action, _| allowed_actions.contains(action));
+            }
+        }
+        if let Some(summary) = parameters
+            .get(SURFACE_DISCOVERY_SUMMARIES_KEY)
+            .and_then(Value::as_object)
+            .and_then(|summaries| summaries.get(surface))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        {
+            parameters.insert(
+                "x-astra-discovery-summary".to_string(),
+                Value::String(summary),
+            );
+        }
+        parameters.remove(ACTION_SURFACES_KEY);
+        parameters.remove(SURFACE_DESCRIPTIONS_KEY);
+        parameters.remove(SURFACE_DISCOVERY_SUMMARIES_KEY);
+        if let Some(description) = surface_description {
+            schema["function"]["description"] = Value::String(description);
+        }
+    }
+}
+
+/// Rebind stripped wire schemas to canonical action ownership before applying
+/// a second execution-surface projection. Thin/local clients intentionally
+/// remove internal ownership metadata from their provider schema; a server
+/// receiving that schema must recover ownership from its trusted catalog,
+/// never from client-authored declarations.
+pub fn project_action_schemas_for_surface_using_declarations(
+    schemas: &mut [Value],
+    declarations: &[Value],
+    surface: &str,
+) {
+    for schema in schemas.iter_mut() {
+        let Some(name) = schema
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        let Some(declaration) = declarations.iter().find(|declaration| {
+            declaration
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                == Some(name)
+        }) else {
+            continue;
+        };
+        if declaration
+            .pointer("/function/parameters")
+            .and_then(Value::as_object)
+            .is_some_and(|parameters| parameters.contains_key(ACTION_SURFACES_KEY))
+        {
+            *schema = declaration.clone();
+        }
+    }
+    project_action_schemas_for_surface(schemas, surface);
 }
 
 /// Replace the `run_script` schema with the narrowed server-side variant.
@@ -704,8 +1094,34 @@ fn run_script_schema_for(enabled_tool_names: &[&str]) -> Value {
     crate::run_script::build_run_script_schema(&enabled, crate::run_script::ExecutionMode::Project)
 }
 
+// Keep schema construction incremental. A `vec![large_json!, ...]` first
+// materializes the entire fixed-size element array on the caller's stack
+// before moving it into the Vec. The complete built-in registry is large
+// enough to overflow Tokio's default worker stack on a fresh process's first
+// tool validation. Repetition into individual `push` statements keeps only
+// one schema temporary live at a time while preserving order.
+#[inline(never)]
+fn push_built_in_schema(schemas: &mut Vec<Value>, build: impl FnOnce() -> Value) {
+    schemas.push(build());
+}
+
+macro_rules! heap_schema_vec {
+    ($($schema:expr),* $(,)?) => {{
+        let mut schemas = Vec::new();
+        $(push_built_in_schema(&mut schemas, || $schema);)*
+        schemas
+    }};
+}
+
 fn all_tool_schemas_core() -> Vec<Value> {
-    vec![
+    heap_schema_vec![
+        start_work_schema(),
+        run_next_work_item_schema(),
+        settle_work_item_schema(),
+        inspect_work_plan_schema(),
+        propose_work_plan_schema(),
+        inspect_work_criteria_schema(),
+        propose_work_criteria_schema(),
         json!({
             "type": "function",
             "function": {
@@ -727,14 +1143,29 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": "Execute a shell command. Use for builds, tests, installs, or actions with no dedicated tool. Identical commands are cached; set force=true to bypass.",
+            "description": "source_artifacts preserves them before spawn. Checksum alone is not a backup. Foreground calls provide no process-persistence guarantee.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
                         "command": {"type": "string", "description": "Shell command to run"},
-                        "timeout": {"type": "number", "default": crate::shell_ops::DEFAULT_BASH_TIMEOUT_SECS, "description": "Timeout in seconds. Use a larger value for long builds/tests, e.g. cargo build or full test suites."},
-                        "force": {"type": "boolean", "description": "Bypass the per-session identical-command cache."}
+                        "mode": {"type": "string", "enum": ["verify"], "description": "Optional explicit workspace verification contract. Use only for a foreground verification command after edits. It succeeds only when the command exits zero and the executor proves the bound workspace stayed unchanged; do not use it for commands that write files."},
+                    "timeout": {"type": "number", "default": crate::shell_ops::DEFAULT_BASH_TIMEOUT_SECS, "description": "Outer execution timeout in seconds. Set this field to a larger value for long builds/tests, e.g. cargo build or full test suites. A `timeout ...` program inside command does not extend Astra's outer timeout."},
+                        "force": {"type": "boolean", "description": "Bypass the per-session identical-command cache."},
+                        "source_artifacts": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": crate::source_preimage::MAX_SOURCE_ARTIFACTS,
+                            "items": {"type": "string", "minLength": 1},
+                            "description": "Optional hard evidence-preservation guarantee. List existing regular files relative to the workspace root before a command may open or transform irreplaceable inputs. Each file is copied and checksum-verified before the shell starts; any invalid path, capture failure, or race prevents execution. This is not a glob and a checksum alone is not a backup."
+                        },
+                        "external_state_paths": {
+                            "type": "array",
+                            "minItems": 1,
+                            "maxItems": 16,
+                            "items": {"type": "string", "minLength": 1},
+                            "description": "Optional executor-owned external-effect contract. For a requested change outside the bound workspace, list the smallest absolute external roots whose state must change. Astra captures bounded pre/post fingerprints and issues completion evidence only for an observed delta under authoritative process ownership. Paths inside or overlapping the workspace, relative/traversal paths, unobservable roots, background tasks, and unchanged state fail closed. Do not use this for workspace files."
+                        }
                     },
                     "required": ["command"]
                 }
@@ -744,7 +1175,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read file contents. Use exact fields only: path, start_line, end_line, outline. Line ranges are inclusive and 1-based. Omit end_line to read from start_line through the end of the file. For the first 50 lines: start_line=1, end_line=50. Set outline=true for function/class signatures only.",
+                "description": "Read file contents. Fields: path,start_line,end_line,outline; ranges are inclusive 1-based; omit end_line to read through EOF; outline=true returns signatures. Complete source-read opaque markers may be copied unchanged to the corresponding editor; never recover hidden text.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -753,6 +1184,25 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "start_line": {"type": "integer", "minimum": 1, "description": "1-based first line of an inclusive range."},
                         "end_line": {"type": "integer", "minimum": 1, "description": "1-based final line of an inclusive range. Omit to read to end."},
                         "outline": {"type": "boolean", "description": "Return only function/class/struct signatures with line numbers"}
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "publish_artifact",
+                "description": "Publish an existing workspace file as a durable session artifact for later preview or download. The file is copied into the authenticated session artifact store; this does not replace ordinary source edits or Work evidence. Paths must resolve under the bound workspace or /tmp, and files larger than 16 MiB are rejected.",
+                "parameters": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "path": {"type": "string", "minLength": 1, "description": "Existing file path under the bound workspace or /tmp."},
+                        "title": {"type": "string", "minLength": 1, "maxLength": 160, "description": "Optional display title; defaults to the filename."},
+                        "description": {"type": "string", "minLength": 1, "maxLength": 1000, "description": "Optional short description shown with the artifact."},
+                        "artifact_kind": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9_.-]+$", "description": "Optional stable artifact category; inferred from the file when omitted."},
+                        "content_type": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Optional MIME content type; inferred from the file when omitted."}
                     },
                     "required": ["path"]
                 }
@@ -783,7 +1233,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "str_replace",
-                "description": "Targeted text replacement in files. Single mode: path+old_str+new_str. Batch mode: edits[]. Do not use aliases. For large changes (>4KB), use write_file.",
+                "description": "Targeted replacement: single path+old_str+new_str or batch edits[]. Complete source-read opaque markers are safe old_str anchors; display-only/foreign/stale markers are invalid.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
@@ -821,16 +1271,16 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "rollback_file_edits",
-                "description": "List or restore file edits recorded by write_file and str_replace. Use scope=current_turn to undo this turn's recorded file edits, scope=file with path to restore the latest recorded edit for one file, scope=turn with turn_index to restore a previous turn, or scope=list to inspect available file edit rollback entries.",
+                "description": "List or restore file edits recorded by write_file and str_replace. Use scope=current_turn to undo this turn's recorded file edits, scope=file with path to restore the latest recorded edit for one file, scope=turn with turn_index to restore a previous turn, scope=list to inspect file edit entries, or scope=source_receipt with receipt_id to restore an executor-retained source preimage.",
                 "parameters": {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "scope": {"type": "string", "enum": ["current_turn","turn","file","list"], "description": "Rollback scope. Defaults to current_turn; path implies file scope."},
+                        "scope": {"type": "string", "enum": ["current_turn","turn","file","list","source_receipt"], "description": "Rollback scope. Defaults to current_turn; path implies file scope."},
                         "path": {"type": "string", "description": "File path for scope=file."},
+                        "receipt_id": {"type": "string", "description": "Opaque source preimage receipt ID for scope=source_receipt."},
                         "turn_index": {"type": "integer", "description": "Turn index for scope=turn."},
-                        "file_after_sequence": {"type": "integer", "description": "Only restore file edits recorded after this journal sequence."},
-                        "after_sequence": {"type": "integer", "description": "Alias for file_after_sequence."}
+                        "file_after_sequence": {"type": "integer", "description": "Only restore file edits recorded after this journal sequence."}
                     }
                 }
             }
@@ -916,7 +1366,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "properties": {
                         "url": {"type": "string", "description": "URL to fetch (http:// or https://)"},
                         "format": {"type": "string", "enum": ["markdown", "text"], "description": "Output format for extracted content (default: markdown)"},
-                        "max_content": {"type": "integer", "description": "Max extracted content characters (default 80000)"},
+                        "max_content": {"type": "integer", "description": "Max extracted content characters (default 24576; increase when the full page is needed)"},
                         "timeout": {"type": "integer", "description": "Timeout in seconds (default 30)"},
                         "max_links": {"type": "integer", "description": "Max navigation links to extract (default 25)"}
                     },
@@ -1018,6 +1468,18 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "type": "string",
                             "description": "Repository-relative file path. Used by: file_history (required)."
                         },
+                        "start_line": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 4294967295_u64,
+                            "description": "1-based first line for git(action=blame). Omit both line bounds to blame the whole file."
+                        },
+                        "end_line": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 4294967295_u64,
+                            "description": "1-based inclusive final line for git(action=blame). Defaults to start_line when only start_line is supplied."
+                        },
                         "ref": {
                             "type": "string",
                             "description": "Git ref — commit SHA, branch, or tag. Used by: diff (compares ref vs worktree), log (restrict to ref), checkout_file (required: ref to restore from). Defaults to HEAD when omitted."
@@ -1093,6 +1555,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     },
                     "required": ["action"],
                     "x-astra-per-action-required": {
+                        "blame": ["path"],
                         "commit": ["message"],
                         "revert_commit": ["commit_sha"],
                         "file_history": ["file"],
@@ -1140,7 +1603,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["remember","recall","session_audit","expand","forget","update","focus","reflect","profile","feedback"],
+                            "enum": ["remember","recall","session_audit","expand","forget","update","reflect","profile","feedback"],
                             "description": "Operation. session_audit reports extraction lifecycle, not stored records; recall is ranked, not a count."
                         },
                         "content": {"type": "string"},
@@ -1172,7 +1635,12 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "type": "string",
                             "enum": ["compact","overview","full"]
                         },
-                        "importance": {"type": "number"},
+                        "importance": {
+                            "type": "number",
+                            "minimum": 0.0,
+                            "maximum": 1.0,
+                            "description": "Optional numeric salience from 0.0 (low) to 1.0 (high); do not use labels such as low/high."
+                        },
                         "trust_tier": {"type": "string"},
                         "tags": {"type": "array", "items": {"type": "string"}},
                         "tags_add": {"type": "array", "items": {"type": "string"}},
@@ -1191,14 +1659,6 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "enum": ["abstract","overview","detail","linked"],
                             "description": "expand depth."
                         },
-                        "focus_type": {
-                            "type": "string",
-                            "enum": ["topic","tag","memory_id","session"],
-                            "description": "focus target type."
-                        },
-                        "focus_value": {"type": "string", "description": "Focus target value."},
-                        "boost": {"type": "number", "description": "Boost multiplier."},
-                        "ttl_secs": {"type": "integer", "description": "Boost TTL seconds."},
                         "signal": {
                             "type": "string",
                             "enum": ["useful","irrelevant","outdated","wrong"],
@@ -1285,8 +1745,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                     "properties": {
                         "scope": {"type": "string", "enum": ["current_turn", "turn", "list"], "description": "Rollback scope. Defaults to current_turn. Use list to inspect available rollback handles."},
                         "turn_index": {"type": "integer", "description": "Turn index when scope=turn."},
-                        "session_state_after_sequence": {"type": "integer", "description": "Only restore entries recorded after this rollback-journal sequence."},
-                        "after_sequence": {"type": "integer", "description": "Alias for session_state_after_sequence."}
+                        "session_state_after_sequence": {"type": "integer", "description": "Only restore entries recorded after this rollback-journal sequence."}
                     }
                 }
             }
@@ -1321,8 +1780,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "turn_index": {"type": "integer", "description": "Turn index when scope=turn."},
                         "snapshot_id": {"type": "string", "description": "Snapshot identifier when scope=snapshot."},
                         "database": {"type": "string", "description": "Optional database name when restoring a specific snapshot."},
-                        "database_after_sequence": {"type": "integer", "description": "Only restore database snapshot entries recorded after this journal sequence."},
-                        "after_sequence": {"type": "integer", "description": "Alias for database_after_sequence."}
+                        "database_after_sequence": {"type": "integer", "description": "Only restore database snapshot entries recorded after this journal sequence."}
                     }
                 }
             }
@@ -1332,9 +1790,9 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "function": {
                 "name": "agent",
                 "description": "Actions: spawn needs description+prompt (not task/type/agent_id; foreground fan-in by default; no background arg); get_result needs the returned agent_id of explicitly backgrounded work; run_chain needs name+description+steps.\n\n\
-         Multi-agent operations. Actions: spawn, get_result, run_chain, send_message.\n\n\
+         Multi-agent and local fixed-chain operations. Actions: spawn, get_result, run_chain, send_message. `run_chain` is a local executor pipeline, not a durable task list. If the user asks for task/Work tracking and `start_work` is visible, call `start_work` directly instead of using `agent`.\n\n\
          ## Required fields per action\n\
-         - `spawn`: REQUIRES `action`, `description`, `prompt`. (Optional: `agent_type`, `model`, `max_turns`, `complexity`, `isolated`, `allowed_tools`, `name`.)\n\
+         - `spawn`: REQUIRES `action`, `description`, `prompt`. (Optional: `agent_type`, `model`, `max_turns`, `max_output_tokens`, `complexity`, `isolated`, `allowed_tools`, `name`, `inherit_prefix`.)\n\
          - `get_result`: REQUIRES `action`, `agent_id`.\n\
          - `run_chain`: REQUIRES `action`, `name`, `description`, `steps`.\n\
          - `send_message`: REQUIRES `action`, `to`, `message`; returns `queued`, then the receiver emits an applied acknowledgement at its next model boundary.\n\n\
@@ -1348,14 +1806,28 @@ fn all_tool_schemas_core() -> Vec<Value> {
          For plan lifecycle, if `enter_plan_mode` / `exit_plan_mode` are visible in the current tool surface, call them directly; never wrap them in the `agent` `run_chain` action.\n\
          Do NOT pass an `agents:[...]` payload, do NOT pass a top-level `task` field, and do NOT wrap spawn arguments under a `spawn` field. `agent` launches one child; `agent_fanout` launches a fixed parallel group.
 
-         ## agent vs shell work vs task
+         ## Canonical Work and delegation
          - `agent(spawn)` + optional `agent(get_result)`: one foreground sub-agent, or one explicitly backgrounded child the user later inspects.
          - `agent_fanout`: fixed-size parallel sub-agent groups with target-count accounting.
          - Shell commands/processes are separate execution tools; do not represent them as sub-agents.
-         - `task_board`: session checklist / progress tracking — NOT an executor. Tasks track work; tools run it.",
+         - When no canonical Work exists and the current turn requires durable task tracking, establish it with `start_work` before delegating. When canonical Work already exists, keep that Work as the durable scope rather than trying to create another one. `agent` and `agent_fanout` do not themselves create or replace a canonical task list.
+         - `start_work` may return `initial_task`, and `settle_work_item` may return `next_task`. Each is already the server-selected primary-session assignment: execute it directly. Call `run_next_work_item({})` only when neither response supplied an assignment. Treat an assigned task's expected result as its stop boundary: gather sufficient direct evidence, settle immediately when satisfied, and do not expand into adjacent investigation. Generic `agent` and `agent_fanout` are reserved for real isolation or parallelism boundaries; a WorkItem alone is not a delegation reason.
+         - Background task tools only observe or control execution; they are not a planning system.",
                 "parameters": {
                     "type": "object",
-                    "x-astra-discovery-summary": "spawn: action+description+prompt; foreground fan-in unless the user backgrounds it. get_result: action+agent_id. run_chain: action+name+description+steps. send_message: action+to+message.",
+                    "x-astra-action-surfaces": {
+                        "spawn": ["local", "server"],
+                        "get_result": ["local", "server"],
+                        "run_chain": ["local"],
+                        "send_message": ["local", "server"]
+                    },
+                    "x-astra-surface-descriptions": {
+                        "server": "Server-owned single-agent lifecycle. Actions: spawn, get_result, send_message. This tool does not create a durable task list: when the user asks for task/Work tracking, call the visible start_work tool directly. For a fixed-size parallel group use agent_fanout."
+                    },
+                    "x-astra-surface-discovery-summaries": {
+                        "server": "spawn: action+description+prompt; foreground fan-in unless the user backgrounds it. get_result: action+agent_id. send_message: action+to+message. Durable task lists use start_work."
+                    },
+                    "x-astra-discovery-summary": "spawn: action+description+prompt; foreground fan-in unless the user backgrounds it. get_result: action+agent_id. run_chain: local fixed pipeline with action+name+description+steps, never a durable task list. send_message: action+to+message. Durable task lists use the separate start_work tool.",
                     "properties": {
                         "action": {"type": "string", "enum": ["spawn","get_result","run_chain","send_message"]},
                         "steps": {
@@ -1374,17 +1846,37 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                 "required": ["tool", "args"]
                             }
                         },
-                        "description": {"type": "string", "description": "Spawn UI summary or run_chain description."},
+                        "description": {"type": "string", "description": "Short operation description when required by the selected action."},
                         "prompt": {"type": "string", "description": "Full child task brief for spawn. Non-empty and required with description."},
                         "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Sub-agent persona (spawn). Default: general-purpose."},
                         "model": {"type": "string", "description": "Model override (spawn). Default: parent's model."},
-                        "name": {"type": "string", "description": "Spawn mailbox label or required run_chain name."},
+                        "name": {"type": "string", "description": "Action label when accepted by the selected action."},
                         "input": {"type": "object", "description": "Optional run_chain template input."},
                         "rollback_on_failure": {"type": "boolean", "description": "Rollback bounded chain mutations after failure."},
                         "max_turns": {"type": "integer", "minimum": 1, "description": "Numeric child ceiling. When complexity is also present, the smaller of the numeric and complexity-derived ceilings wins."},
+                        "max_output_tokens": {"type": "integer", "minimum": 1, "description": "Optional first child request output-token ceiling."},
+                        "inherit_prefix": {
+                            "type": ["object", "null"],
+                            "description": "Optional exact parent prefix-cache inheritance request. Omit for a fresh child prefix; set required=true only when fallback is unacceptable.",
+                            "properties": {
+                                "from_run_id": {"type": ["string", "null"]},
+                                "required": {"type": "boolean"}
+                            },
+                            "additionalProperties": false
+                        },
                         "complexity": {"type": "string", "enum": ["light","normal","deep"], "description": "Task-complexity ceiling: `light`≤10 turns, `normal`=agent default, `deep`=2× default. Prefer normal for scoped review/refactor work; use deep only when this child independently needs broad multi-step investigation. It never expands a smaller max_turns."},
                         "isolated": {"type": "boolean", "description": "Use isolated worktree (spawn)"},
                         "allowed_tools": {"type": "array", "items": {"type": "string"}, "description": "Tool allowlist (spawn)"},
+                        "work_item": {
+                            "type": "object",
+                            "description": "Optional exact canonical WorkItem revision assigned to this child. Use an item returned by start_work or inspect_work_plan; the server verifies current Work membership and derives the attempt from the child run.",
+                            "properties": {
+                                "item_id": {"type": "string", "minLength": 1},
+                                "item_revision": {"type": "integer", "minimum": 1}
+                            },
+                            "required": ["item_id", "item_revision"],
+                            "additionalProperties": false
+                        },
                         "agent_id": {"type": "string", "description": "ONLY for action='get_result'. Must be the exact runtime-generated agent_id returned by a prior spawn, not the optional spawn name. Never prefill this on spawn."},
                         "to": {"type": "string", "description": "REQUIRED for action='send_message'. Active child/peer agent_id, related exact run_id within the current delegation boundary, 'parent', or '*' for broadcast."},
                         "message": {"description": "REQUIRED for action='send_message'. Message content."},
@@ -1400,7 +1892,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "send_message": ["to", "message"]
                     },
                     "x-astra-per-action-allowed": {
-                        "spawn": ["action", "description", "prompt", "agent_type", "model", "name", "max_turns", "complexity", "isolated", "allowed_tools"],
+                        "spawn": ["action", "description", "prompt", "agent_type", "model", "name", "max_turns", "max_output_tokens", "complexity", "isolated", "allowed_tools", "inherit_prefix", "work_item"],
                         "get_result": ["action", "agent_id"],
                         "run_chain": ["action", "name", "description", "steps", "input", "rollback_on_failure"],
                         "send_message": ["action", "to", "message", "message_type", "request_id"]
@@ -1418,10 +1910,10 @@ fn all_tool_schemas_core() -> Vec<Value> {
          - `get_results`: requires `action` and returned `group_id` for an explicitly backgrounded group. It takes a short non-blocking snapshot; terminal updates also arrive through the parent mailbox, so do not busy-poll. Use optional `slot_index`, `offset`, and `max_bytes` for one bounded result window; `results[].next_call` gives the next window.\n\
          - `stop_slot`: requires `action`, `group_id`, and `slot_index`; it stops one running child.\n\n\
          - `stop_group`: requires `action` and `group_id`; it requests cancellation for every non-terminal child in one group operation.\n\n\
-         Use this for independent parallel work. Put each concise child instruction only in `slots[i].prompt`. Children share the bound workspace and must inspect files/diffs with their own tools: never paste file contents, diffs, or prior tool output into a slot prompt. Fanout already decomposes work: keep each slot narrowly scoped and normally use `normal` or an explicit bounded max_turns; do not mark every review slot `deep`. Use no brief/agents/background fields: never send top-level `brief`, `agents`, or `run_in_background`, and never put generated `agent_id` inside a slot. Start waits for accepted children concurrently and returns one canonical group result. In the terminal only the user may press Ctrl+B to hand the live group to the background; that explicit handoff returns stable child identities and later terminal results remain available through the group mailbox/get_results contract.",
+         Use this for independent parallel work only when the user request or loaded workflow contains an explicit topology directive. Quality, scope, and complexity requirements alone do not imply extra agents or parallel execution; when neither authority explicitly requires delegation or parallelism, keep the work in the parent turn. Put each concise child instruction only in `slots[i].prompt`. Children inherit the current execution binding; only tools exposed in a child's own tool surface are usable. If `agent_type` is omitted, the server uses the bounded read-only `explore` persona; request `task` or `general-purpose` explicitly for mutation or full-surface work. Do not start workspace-dependent slots when the current workspace provider is unavailable. Never paste file contents, diffs, or prior tool output into a slot prompt. Fanout already decomposes work: keep each slot narrowly scoped and normally use `normal`; omit `max_turns` unless the user supplied a bound or the slot is small enough to reserve its final model boundary for synthesis. Do not mark every review slot `deep`. A per-slot or shared tool allowlist is named `allowed_tools`; there is no `tools` field. Use no brief/agents/background fields: never send top-level `brief`, `agents`, or `run_in_background`, and never put generated `agent_id` inside a slot. Start waits for accepted children concurrently and returns one canonical group result. In the terminal only the user may press Ctrl+B to hand the live group to the background; that explicit handoff returns stable child identities and later terminal results remain available through the group mailbox/get_results contract.",
                 "parameters": {
                     "type": "object",
-                    "x-astra-discovery-summary": "start: target_count + exactly that many slots; each slot needs description+prompt; no brief/agents/background. Children inspect shared workspace; never embed diffs, files, or tool output. Config uses defaults.",
+                     "x-astra-discovery-summary": "start: target_count + exactly that many slots; description+prompt each; no brief/agents/background; never embed diffs. Omit agent_type=read-only explore; task/general-purpose=mutation. Child surface authoritative.",
                     "properties": {
                         "action": {"type": "string", "enum": ["start","get_results","stop_slot","stop_group"]},
                         "group_id": {"type": "string", "description": "Fanout group id. Optional on start; required for get_results, stop_slot, and stop_group."},
@@ -1436,8 +1928,8 @@ fn all_tool_schemas_core() -> Vec<Value> {
                                 "properties": {
                                     "id": {"type": "string", "description": "Optional stable caller-facing label for this slot. Returned in start/results/fanout projections. Not the runtime agent_id."},
                                     "description": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_DESCRIPTION_MAX_CHARS, "description": "Short UI summary for this slot."},
-                                    "prompt": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS, "description": "Concise child task brief. The child shares the workspace and should inspect files/diffs itself; never paste file contents, diffs, or prior tool output here."},
-                                    "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"]},
+                                    "prompt": {"type": "string", "maxLength": crate::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS, "description": "Concise child task brief. The child inherits current provider bindings and can use only its exposed tools; never paste file contents, diffs, or prior tool output here."},
+                                    "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Child persona. Omit for bounded read-only explore; choose task/general-purpose explicitly for mutation or full-surface work."},
                                     "model": {"type": "string"},
                                     "max_turns": {"type": "integer", "minimum": 1},
                                     "max_output_tokens": {"type": "integer"},
@@ -1453,7 +1945,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                             "description": "Shared runtime configuration inherited by every slot. Slot-level overrides take precedence.",
                             "additionalProperties": false,
                             "properties": {
-                                "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"]},
+                                "agent_type": {"type": "string", "enum": ["explore","code-review","task","general-purpose"], "description": "Shared child persona. Omit for bounded read-only explore; choose task/general-purpose explicitly for mutation or full-surface work."},
                                 "model": {"type": "string"},
                                 "max_turns": {"type": "integer", "minimum": 1},
                                 "max_output_tokens": {"type": "integer"},
@@ -1487,14 +1979,15 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "introspect",
-                "description": "Read the live observation snapshot for the running turn/session. Use for self-checks: token/cache pressure, step latency/performance, tool health, recent rounds, runtime errors, stall/noise state, working memory, and plan/task/session lifecycle/resume state including the last lifecycle event when available. Use artifact plus offset to read a bounded window from a persisted tool-result handle. CLI/Edge can also inspect local cache and session_memory artifacts. For persisted multi-turn causal analysis, use reflect.",
+                "description": "Read the live observation snapshot for the running turn/session. Call this before answering a user request to audit or reflect on runtime/session state, recent tool use, traces, or agent execution behavior; conversation history and session memory are not substitutes for runtime telemetry. Use for self-checks: token/cache pressure, step latency/performance, tool health, recent rounds, runtime errors, stall/noise state, working memory, and plan/task/session lifecycle/resume state including the last lifecycle event when available. Use artifact plus offset to read a bounded window from a persisted tool-result handle. CLI/Edge can also inspect local cache and session_memory artifacts. Introspect is live-only: a historical turn/session/cross-session horizon returns a clearly labeled recent live projection; use reflect for persisted causal evidence.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "topic": {"type": "string", "enum": ["overview","runtime","execution","knowledge"], "description": "Top-level observation area. Defaults to runtime; use execution for errors/trace and knowledge for session_memory/context artifacts."},
-                        "facet": {"type": "string", "enum": ["session","overview","recent","errors","trace","volatile","stall","noise","cache","session_memory"], "description": "Specific live view. cache and session_memory require CLI/Edge-local artifacts; unavailable providers are reported in data_coverage."},
-                        "depth": {"type": "string", "enum": ["hint","summary","diagnostic","forensic"], "description": "Output depth. hint is a compact nudge; diagnostic/forensic use the bounded full live renderer, including step latency/performance when available."},
-                        "horizon": {"type": "string", "enum": ["now","current_turn","recent","turn","session","cross_session"], "description": "Time range label. Choose trace-like content with facet=trace, not by changing horizon."},
+                        "facet": {"type": "string", "enum": ["session","overview","recent","errors","trace","volatile","stall","noise","cache","session_memory"], "description": "Specific live view. overview is the composite view and should be the single first call for a runtime retrospective: it includes session state, recent rounds/trace timing and tools, stall/noise, and errors. Do not fan out separate facets unless overview reports a concrete gap. cache and session_memory require CLI/Edge-local artifacts; unavailable providers are reported in data_coverage."},
+                        "depth": {"type": "string", "enum": ["hint","summary","diagnostic","forensic"], "description": "Output depth. hint is a compact nudge; diagnostic/forensic use the bounded full live renderer, including step latency/performance when available. Use diagnostic with facet=overview for one-call retrospective evidence."},
+                        "horizon": {"type": "string", "enum": ["now","current_turn","recent","turn","session","cross_session"], "description": "Observation window. now/current_turn/recent return live evidence directly. A historical turn/session/cross_session request returns a labeled recent live projection rather than failing; pair it with reflect for persisted evidence. Choose trace-like content with facet=trace, not by changing horizon."},
+                        "question": {"type": "string", "description": "Optional caller context label. It does not widen the live evidence horizon or replace reflect for persisted causal analysis."},
                         "source_policy": {"type": "string", "enum": ["auto","live_only","live_first","durable_first","local_only","cloud_only"], "description": "Preferred data source. Missing or unsatisfied providers are reported instead of fabricated."},
                         "include_context": {"type": "boolean", "description": "Request visible prompt/context facts when a provider is available; these are observed context, not durable truth."},
                         "format": {"type": "string", "enum": ["text","json"], "description": "Output format. text is default; json returns a structured read-only observation envelope."},
@@ -1510,19 +2003,19 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "reflect",
-                "description": "Analyze persisted observation evidence for the active session. Use for causal questions after errors, confusing tool choices, performance regressions, or trace review. Data may lag the current live turn; use introspect for immediate runtime health. Without an active session this returns reflect_requires_session.",
+                "description": "Analyze persisted observation evidence for the active session. Use for causal questions across prior turns after errors, confusing tool choices, performance regressions, or trace review. For a user-requested runtime/session retrospective, make one composite topic=overview facet=overview call with the concrete question; this combines decisions, tools, errors, trace and provider coverage, so do not fan out facets unless it reports a gap. Pair this persisted view with introspect's live snapshot and label the evidence sources separately. Data may lag the current live turn; use introspect for immediate runtime health. Without an active session this returns reflect_requires_session.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "topic": {
                             "type": "string",
                             "enum": ["overview", "runtime", "execution", "knowledge"],
-                            "description": "Top-level persisted evidence area. Use execution for errors/tools/trace, runtime for performance, knowledge for context/memory."
+                            "description": "Top-level persisted evidence area. overview is the composite default for retrospectives; use execution for a concrete errors/tools/trace gap, runtime for performance, knowledge for context/memory."
                         },
                         "facet": {
                             "type": "string",
                             "enum": ["overview", "performance", "errors", "tools", "trace", "context", "memory"],
-                            "description": "Persisted evidence view under the selected topic. Examples: topic=execution facet=errors, topic=execution facet=trace, topic=runtime facet=performance."
+                            "description": "Persisted evidence view under the selected topic. overview is the composite first call and includes decisions, tools, errors, trace and provider coverage. Do not fan out separate facets unless overview reports a concrete gap. Examples for targeted follow-up: topic=execution facet=errors, topic=execution facet=trace, topic=runtime facet=performance."
                         },
                         "depth": {
                             "type": "string",
@@ -1582,22 +2075,20 @@ fn all_tool_schemas_core() -> Vec<Value> {
             "function": {
                 "name": "tool_search",
                 "description":
-                    "Search deferred tools. Keywords list candidates. `select:NAME[,NAME]` \
-                     returns compact callable shape and queues schemas for the next request.",
+                    "Activate deferred tools by explicit catalog name. `select:NAME[,NAME]` \
+                     returns compact callable shape and queues schemas for the next request. \
+                     Natural-language intent matching is deliberately unsupported.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {
                             "type": "string",
                             "description":
-                                "Keyword query, `select:NAME`, or `select:NAME1,NAME2`."
-                        },
-                        "max_results": {
-                            "type": "integer",
-                            "description": "Keyword-mode result limit (default 5, max 20)."
+                                "Explicit `select:NAME` or `select:NAME1,NAME2` activation."
                         }
                     },
-                    "required": ["query"]
+                    "required": ["query"],
+                    "additionalProperties": false
                 }
             }
         }),
@@ -1656,8 +2147,6 @@ fn all_tool_schemas_core() -> Vec<Value> {
                 }
             }
         }),
-        // ── Durable task board ───────────────────────────────────────────
-        task_board_schema(),
         // ── background task control ─────────────────────────────────
         // Typed control surface for background tasks. Starting shell work stays
         // on Bash / Ctrl+B and local agents stay on agent(); control actions
@@ -1841,6 +2330,21 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn built_in_schema_construction_fits_default_tokio_worker_stack() {
+        // Call the uncached constructor directly: another schema test may
+        // already have initialized the process-global validation index.
+        let schemas = std::thread::Builder::new()
+            .name("fresh-built-in-schemas".to_string())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(all_tool_schemas_core)
+            .expect("spawn fresh schema constructor")
+            .join()
+            .expect("fresh schema construction must fit a default Tokio worker stack");
+        assert!(find_schema(&schemas, "tool_search").is_some());
+        assert!(find_schema(&schemas, "agent").is_some());
+    }
+
     fn schema_names(schemas: &[Value]) -> Vec<&str> {
         schemas
             .iter()
@@ -1858,6 +2362,67 @@ mod tests {
             .expect("schema must serialize")
             .len()
             .div_ceil(4)
+    }
+
+    #[test]
+    fn action_surface_projection_is_declarative_and_tool_agnostic() {
+        let mut schemas = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "future_consolidated_tool",
+                "description": "shared",
+                "parameters": {
+                    "type": "object",
+                    "x-astra-action-surfaces": {
+                        "shared": ["local", "server"],
+                        "local_only": ["local"]
+                    },
+                    "x-astra-surface-descriptions": {"server": "server projection"},
+                    "x-astra-surface-discovery-summaries": {"server": "shared only"},
+                    "properties": {
+                        "action": {"type": "string", "enum": ["shared", "local_only"]},
+                        "common": {"type": "string"},
+                        "local_arg": {"type": "string"}
+                    },
+                    "x-astra-per-action-required": {
+                        "shared": ["common"],
+                        "local_only": ["local_arg"]
+                    },
+                    "x-astra-per-action-allowed": {
+                        "shared": ["action", "common"],
+                        "local_only": ["action", "local_arg"]
+                    }
+                }
+            }
+        })];
+
+        project_action_schemas_for_surface(&mut schemas, "server");
+
+        let schema = &schemas[0];
+        assert_eq!(schema["function"]["description"], "server projection");
+        assert_eq!(
+            schema["function"]["parameters"]["properties"]["action"]["enum"],
+            json!(["shared"])
+        );
+        assert!(
+            schema["function"]["parameters"]["properties"]
+                .get("local_arg")
+                .is_none()
+        );
+        assert!(
+            schema["function"]["parameters"][PER_ACTION_ALLOWED_KEY]
+                .get("local_only")
+                .is_none()
+        );
+        assert_eq!(
+            schema["function"]["parameters"]["x-astra-discovery-summary"],
+            "shared only"
+        );
+        assert!(
+            schema["function"]["parameters"]
+                .get(ACTION_SURFACES_KEY)
+                .is_none()
+        );
     }
 
     fn required_fields(schema: &Value) -> Vec<String> {
@@ -1896,10 +2461,59 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn managed_background_bash_contract_is_executor_projected() {
+        let mut schemas = all_tool_schemas();
+        let base = find_schema(&schemas, "bash").expect("bash schema must exist");
+        let base_props = &base["function"]["parameters"]["properties"];
+        assert!(base_props.get("run_in_background").is_none());
+        assert!(base_props.get("ready_check").is_none());
+        assert!(base_props.get("background_ttl").is_none());
+        assert!(
+            base["function"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("no process-persistence guarantee")
+        );
+
+        enable_managed_background_bash_schema(&mut schemas);
+        let bash = find_schema(&schemas, "bash").expect("bash schema must exist");
+        let props = &bash["function"]["parameters"]["properties"];
+        assert_eq!(props["run_in_background"]["type"], "boolean");
+        assert_eq!(props["ready_check"]["type"], "string");
+        assert_eq!(props["background_ttl"]["maximum"], 3600);
+        let description = bash["function"]["description"].as_str().unwrap();
+        assert!(description.contains("Self-daemonizing"));
+        assert!(description.contains("no persistence guarantee"));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn managed_background_bash_contract_is_not_projected_when_unsupported() {
+        let mut schemas = all_tool_schemas();
+        enable_managed_background_bash_schema(&mut schemas);
+        let bash = find_schema(&schemas, "bash").expect("bash schema must exist");
+        let props = &bash["function"]["parameters"]["properties"];
+        assert!(props.get("run_in_background").is_none());
+        assert!(props.get("ready_check").is_none());
+        assert!(props.get("background_ttl").is_none());
+    }
+
     #[test]
     fn agent_fanout_schema_exposes_atomic_group_contract() {
         let schemas = all_tool_schemas();
         let fanout = find_schema(&schemas, "agent_fanout").expect("agent_fanout schema must exist");
+        let description = fanout["function"]["description"]
+            .as_str()
+            .expect("fanout description");
+        assert!(
+            description.contains(
+                "user request or loaded workflow contains an explicit topology directive"
+            )
+        );
+        assert!(description.contains("requirements alone do not imply extra agents"));
+        assert!(description.contains("omit `max_turns`"));
         let params = &fanout["function"]["parameters"];
 
         assert_eq!(params["additionalProperties"], false);
@@ -1945,11 +2559,33 @@ mod tests {
             slot_props["prompt"]["maxLength"],
             crate::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS
         );
+        let description = fanout["function"]["description"]
+            .as_str()
+            .expect("fanout description");
+        assert!(description.contains("allowed_tools"));
+        assert!(description.contains("no `tools` field"));
         assert!(
             fanout["function"]["description"]
                 .as_str()
-                .is_some_and(|description| description.contains("never paste file contents")),
+                .is_some_and(|description| description
+                    .to_ascii_lowercase()
+                    .contains("never paste file contents")),
             "the advertised contract must prevent large diff/tool-output embedding at generation time"
+        );
+        let description = fanout["function"]["description"]
+            .as_str()
+            .expect("fanout description");
+        assert!(
+            description.contains("only tools exposed in a child's own tool surface are usable")
+                && description.contains("workspace provider is unavailable"),
+            "fanout must distinguish inherited bindings from actual provider availability"
+        );
+        assert!(
+            !description.contains("Children share the bound workspace")
+                && !slot_props["prompt"]["description"]
+                    .as_str()
+                    .is_some_and(|prompt| prompt.contains("shares the workspace")),
+            "fanout must not promise a workspace that the current provider binding cannot supply"
         );
         assert!(
             slot_props.get("name").is_none(),
@@ -1961,6 +2597,20 @@ mod tests {
     fn agent_schema_structurally_owns_identity_fields_by_action() {
         let schemas = all_tool_schemas();
         let agent = find_schema(&schemas, "agent").expect("agent schema must exist");
+        let agent_description = agent["function"]["description"]
+            .as_str()
+            .expect("agent description");
+        assert!(agent_description.contains("initial_task"));
+        assert!(agent_description.contains("next_task"));
+        assert!(agent_description.contains("only when neither response supplied an assignment"));
+        assert!(
+            agent_description
+                .contains("Treat an assigned task's expected result as its stop boundary")
+        );
+        assert!(
+            !agent_description.contains("After Work exists, use `run_next_work_item({})`"),
+            "the agent and Work schemas must not give contradictory task-claim instructions"
+        );
         let params = &agent["function"]["parameters"];
         assert_eq!(params["additionalProperties"], false);
         assert_eq!(
@@ -1988,6 +2638,41 @@ mod tests {
             vec!["field(s) not allowed for action `spawn`: agent_id"]
         );
 
+        validate_tool_arguments(
+            "agent",
+            &json!({
+                "action": "spawn",
+                "description": "Probe inherited prefix",
+                "prompt": "Return the probe result",
+                "max_output_tokens": 256,
+                "inherit_prefix": {"required": false}
+            }),
+        )
+        .expect("advertised prefix-inheritance fields must match the runtime spawn input");
+        validate_tool_arguments(
+            "agent",
+            &json!({
+                "action": "spawn",
+                "description": "Implement canonical task",
+                "prompt": "Implement and verify the assigned task",
+                "work_item": {"item_id": "task-1", "item_revision": 2}
+            }),
+        )
+        .expect("typed WorkItem assignment must match the runtime spawn input");
+        assert_eq!(
+            params["properties"]["work_item"]["additionalProperties"],
+            false
+        );
+        let work_item_description = params["properties"]["work_item"]["description"]
+            .as_str()
+            .expect("WorkItem assignment description");
+        assert!(work_item_description.contains("start_work or inspect_work_plan"));
+        assert!(work_item_description.contains("server verifies current Work membership"));
+        assert_eq!(
+            params["properties"]["inherit_prefix"]["additionalProperties"],
+            false
+        );
+
         let result_with_mailbox_name = validate_tool_arguments(
             "agent",
             &json!({"action": "get_result", "agent_id": "runtime-id", "name": "mailbox"}),
@@ -1996,6 +2681,187 @@ mod tests {
         assert_eq!(
             result_with_mailbox_name.issues,
             vec!["field(s) not allowed for action `get_result`: name"]
+        );
+    }
+
+    #[test]
+    fn start_work_schema_exposes_a_small_server_owned_task_list() {
+        let schemas = all_tool_schemas();
+        let schema = find_schema(&schemas, "start_work").expect("start_work schema");
+        let description = schema["function"]["description"]
+            .as_str()
+            .expect("start_work description");
+        assert!(description.contains("initial_task"));
+        assert!(description.contains("Count user acceptance units"));
+        assert!(description.contains("each owes its own payload or evidence"));
+        assert!(description.contains("execute it directly"));
+        assert!(description.contains("extends that branch without creating a second Work"));
+        assert!(description.contains(
+            "task identity, ordering, and execution dependencies are assigned by the server"
+        ));
+        assert_eq!(
+            required_fields(schema),
+            vec![
+                "goal".to_string(),
+                "activation".to_string(),
+                "tasks".to_string()
+            ]
+        );
+        let parameters = &schema["function"]["parameters"];
+        assert!(
+            parameters["properties"]["tasks"]["description"]
+                .as_str()
+                .expect("task list description")
+                .contains("server owns IDs and dependency mechanics")
+                && parameters["properties"]["tasks"]["items"]["properties"]
+                    .get("item_id")
+                    .is_none()
+                && parameters["properties"]["tasks"]["items"]["properties"]
+                    .get("kind")
+                    .is_none(),
+            "task schema must not ask the model for identity, kind, or dependency fields"
+        );
+        assert_eq!(
+            parameters["properties"]["tasks"]["items"]["required"],
+            json!(["objective", "expected_result"]),
+        );
+        validate_tool_arguments(
+            "start_work",
+            &json!({
+                "goal": "Ship a verified change",
+                "activation": "start",
+                "tasks": [{
+                    "objective": "Verify the current behavior",
+                    "expected_result": "Reproducible evidence of the current behavior"
+                }]
+            }),
+        )
+        .expect("exact start input");
+        validate_tool_arguments(
+            "start_work",
+            &json!({
+                "goal": "Collect two evidence tracks before synthesis",
+                "activation": "defer",
+                "tasks": [
+                    {
+                        "objective": "Inspect the first evidence source",
+                        "expected_result": "A cited finding"
+                    },
+                    {
+                        "objective": "Synthesize the evidence",
+                        "expected_result": "A concise conclusion"
+                    }
+                ]
+            }),
+        )
+        .expect("ordered tasks are the initial Work contract");
+        for invalid in [
+            json!({}),
+            json!({"goal": "Ship it", "activation": "start", "tasks": []}),
+            json!({
+                "goal": "Ship it",
+                "activation": "start",
+                "tasks": [{
+                    "objective": "Do it",
+                    "expected_result": "It works"
+                }],
+                "dependencies": []
+            }),
+            json!({
+                "goal": "Ship it",
+                "activation": "start",
+                "tasks": [{
+                    "objective": "Do it",
+                    "expected_result": "It works",
+                    "status": "completed"
+                }]
+            }),
+        ] {
+            assert!(validate_tool_arguments("start_work", &invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn settlement_summary_is_explicitly_non_authoritative() {
+        let schemas = all_tool_schemas();
+        let schema = find_schema(&schemas, "settle_work_item").expect("settle schema");
+        let description = schema["function"]["description"]
+            .as_str()
+            .expect("settle description");
+        assert!(description.contains("derived progress note"));
+        assert!(description.contains("not an authoritative evidence source"));
+        assert!(description.contains("direct tool/artifact sources"));
+        assert!(description.contains("literal gap check"));
+        assert!(description.contains("index/home page"));
+        assert!(description.contains("every required observed payload field"));
+        assert!(description.contains("None of these outcomes means cancelled"));
+        assert!(description.contains("declaration_state=cancelled"));
+    }
+
+    #[test]
+    fn run_next_work_item_schema_leaves_task_selection_to_canonical_work() {
+        let schemas = all_tool_schemas();
+        let schema =
+            find_schema(&schemas, "run_next_work_item").expect("run_next_work_item schema");
+        let description = schema["function"]["description"]
+            .as_str()
+            .expect("description");
+        assert!(description.contains("expected_result is the attempt's completion boundary"));
+        assert!(description.contains("do not broaden"));
+        assert!(description.contains("only when no assignment was returned"));
+        assert!(description.contains("initial_task"));
+        assert!(description.contains("next_task"));
+        assert!(
+            !description.contains("Use after start_work and after each settlement"),
+            "run-next must not contradict direct server-issued assignments"
+        );
+        assert!(required_fields(schema).is_empty());
+        validate_tool_arguments("run_next_work_item", &json!({}))
+            .expect("canonical Work selects the next task");
+        assert!(
+            validate_tool_arguments(
+                "run_next_work_item",
+                &json!({"item_id": "model-must-not-select-a-task"}),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn settle_work_item_schema_exposes_only_typed_attempt_facts() {
+        let schemas = all_tool_schemas();
+        let schema = find_schema(&schemas, "settle_work_item").expect("settlement schema");
+        assert_eq!(
+            required_fields(schema),
+            vec!["outcome".to_string(), "summary".to_string()]
+        );
+        validate_tool_arguments(
+            "settle_work_item",
+            &json!({
+                "outcome": "blocked",
+                "summary": "Network tool is unavailable",
+                "blocker_kind": "capability_unavailable",
+                "unavailable_capabilities": ["web_fetch"]
+            }),
+        )
+        .expect("typed blocked settlement");
+        assert!(
+            validate_tool_arguments(
+                "settle_work_item",
+                &json!({
+                    "outcome": "completed",
+                    "summary": "free-text completion is not a delivery outcome"
+                })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_tool_arguments(
+                "settle_work_item",
+                &json!({"outcome": "delivered", "summary": "done", "run_id": "invented"})
+            )
+            .is_err(),
+            "the model cannot choose Work, item, or attempt identity"
         );
     }
 
@@ -2018,42 +2884,181 @@ mod tests {
     }
 
     #[test]
-    fn task_board_public_surface_is_single_action_resource_tool() {
+    fn legacy_task_board_is_absent_from_the_model_surface() {
         let schemas = all_tool_schemas();
         assert!(
-            find_schema(&schemas, "task").is_none(),
-            "model-facing task-board surface must not expose the old ambiguous task tool"
+            find_schema(&schemas, "task").is_none()
+                && find_schema(&schemas, "task_board").is_none(),
+            "model-facing planning must have one typed Work authority, not a legacy task mutation tool"
         );
-        let task_board = find_schema(&schemas, "task_board").expect("task_board schema must exist");
-        let params = &task_board["function"]["parameters"];
-        assert_eq!(params["additionalProperties"], false);
-        assert_eq!(required_fields(task_board), vec!["action".to_string()]);
-        assert_eq!(
-            params["properties"]["action"]["enum"]
-                .as_array()
-                .expect("task_board action enum")
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>(),
-            crate::task_tool_contract::TASK_ACTIONS
-        );
+        assert!(find_schema(&schemas, "inspect_work_plan").is_some());
+        assert!(find_schema(&schemas, "propose_work_plan").is_some());
     }
 
     #[test]
-    fn memory_and_task_board_schemas_stay_compact() {
+    fn work_planning_schemas_are_strict_typed_and_bounded() {
+        let schemas = all_tool_schemas();
+        let inspect = find_schema(&schemas, "inspect_work_plan").expect("inspect schema");
+        assert_eq!(
+            inspect["function"]["parameters"]["additionalProperties"],
+            false
+        );
+        assert!(required_fields(inspect).is_empty());
+        assert!(validate_tool_arguments("inspect_work_plan", &json!({})).is_ok());
+        assert!(
+            validate_tool_arguments(
+                "inspect_work_plan",
+                &json!({
+                    "context_id": format!("work-plan-context:{}", "a".repeat(64)),
+                    "item_offset": 8,
+                    "dependency_offset": 128
+                })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_tool_arguments("inspect_work_plan", &json!({"item_offset": 257})).is_err()
+        );
+        assert!(
+            validate_tool_arguments("inspect_work_plan", &json!({"query": "anything"})).is_err()
+        );
+
+        let propose = find_schema(&schemas, "propose_work_plan").expect("propose schema");
+        let parameters = &propose["function"]["parameters"];
+        assert_eq!(parameters["additionalProperties"], false);
+        assert_eq!(
+            required_fields(propose),
+            vec![
+                "context_id",
+                "reason",
+                "additions",
+                "revisions",
+                "dependencies",
+                "dependency_removals"
+            ]
+        );
+        assert_eq!(parameters["properties"]["additions"]["maxItems"], 64);
+        assert_eq!(parameters["properties"]["dependencies"]["maxItems"], 256);
+        assert_eq!(
+            parameters["properties"]["additions"]["items"]["properties"]["kind"]["enum"],
+            json!(["milestone", "task"])
+        );
+        assert_eq!(
+            parameters["properties"]["additions"]["items"]["additionalProperties"],
+            false
+        );
+        assert!(
+            propose["function"]["description"]
+                .as_str()
+                .is_some_and(
+                    |description| description.contains("same durable unit of work")
+                        && description.contains("fresh item_id")
+                )
+        );
+        assert!(
+            parameters["properties"]["additions"]["items"]["properties"]["item_id"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("Never reuse"))
+        );
+        let valid = json!({
+            "context_id": format!("work-plan-context:{}", "a".repeat(64)),
+            "reason": "Add the next independently verifiable task",
+            "additions": [{
+                "item_id": "task-1",
+                "kind": "task",
+                "objective": "Implement the bounded primitive",
+                "expected_result": "The primitive is deterministically verified"
+            }],
+            "revisions": [],
+            "dependencies": [],
+            "dependency_removals": []
+        });
+        validate_tool_arguments("propose_work_plan", &valid)
+            .unwrap_or_else(|error| panic!("valid typed Work proposal rejected: {error}"));
+        let mut unknown = valid.clone();
+        unknown["guess"] = Value::Bool(true);
+        assert!(validate_tool_arguments("propose_work_plan", &unknown).is_err());
+        let mut empty = valid;
+        empty["additions"] = json!([]);
+        assert!(
+            validate_tool_arguments("propose_work_plan", &empty).is_ok(),
+            "cross-array non-empty admission is enforced by the typed runtime boundary"
+        );
+
+        let inspect_criteria =
+            find_schema(&schemas, "inspect_work_criteria").expect("criteria inspect schema");
+        assert!(required_fields(inspect_criteria).is_empty());
+        assert!(validate_tool_arguments("inspect_work_criteria", &json!({})).is_ok());
+        assert!(
+            validate_tool_arguments(
+                "inspect_work_criteria",
+                &json!({"context_id": format!("work-plan-context:{}", "b".repeat(64)), "offset": 4})
+            )
+            .is_ok()
+        );
+        assert!(validate_tool_arguments("inspect_work_criteria", &json!({"offset": 129})).is_err());
+
+        let propose_criteria =
+            find_schema(&schemas, "propose_work_criteria").expect("criteria proposal schema");
+        assert_eq!(
+            required_fields(propose_criteria),
+            vec!["context_id", "members"]
+        );
+        assert_eq!(
+            propose_criteria["function"]["parameters"]["properties"]["members"]["maxItems"],
+            128
+        );
+        let criteria = json!({
+            "context_id": format!("work-plan-context:{}", "b".repeat(64)),
+            "members": [
+                {"member_kind": "existing", "criterion_id": "existing-check", "revision": 1},
+                {
+                    "member_kind": "new",
+                    "criterion_id": "tests-pass",
+                    "definition": {
+                        "kind": "test_check",
+                        "statement": "Relevant tests pass.",
+                        "command": "cargo test -p astra-runtime"
+                    }
+                }
+            ]
+        });
+        validate_tool_arguments("propose_work_criteria", &criteria)
+            .unwrap_or_else(|error| panic!("valid criteria proposal rejected: {error}"));
+        let mut wrong_variant = criteria.clone();
+        wrong_variant["members"][0]["definition"] =
+            json!({"kind": "human_review", "statement": "Review it."});
+        assert!(validate_tool_arguments("propose_work_criteria", &wrong_variant).is_err());
+        let mut unknown = criteria;
+        unknown["members"][1]["guess"] = json!(true);
+        assert!(validate_tool_arguments("propose_work_criteria", &unknown).is_err());
+    }
+
+    #[test]
+    fn memory_schema_stays_compact() {
         let schemas = all_tool_schemas();
         let memory = find_schema(&schemas, "memory").expect("memory schema must exist");
         let memory_tokens = schema_token_cost(memory);
-        let task_board = find_schema(&schemas, "task_board").expect("task_board schema must exist");
-        let task_board_tokens = schema_token_cost(task_board);
 
         assert!(
             memory_tokens <= 700,
             "memory schema regressed to {memory_tokens} tokens; keep it compact"
         );
+    }
+
+    #[test]
+    fn memory_importance_contract_is_numeric_and_bounded() {
+        let schemas = all_tool_schemas();
+        let memory = find_schema(&schemas, "memory").expect("memory schema must exist");
+        let importance = &memory["function"]["parameters"]["properties"]["importance"];
+
+        assert_eq!(importance["type"], "number");
+        assert_eq!(importance["minimum"], 0.0);
+        assert_eq!(importance["maximum"], 1.0);
         assert!(
-            task_board_tokens <= 1100,
-            "task_board schema regressed to {task_board_tokens} tokens; keep the resource tool compact"
+            importance["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("do not use labels"))
         );
     }
 
@@ -2067,7 +3072,6 @@ mod tests {
             ("memory", 120),
             ("ask_user", 180),
             ("notify", 180),
-            ("task_board", 140),
             ("tool_search", 240),
         ] {
             let schema = find_schema(&schemas, name).expect("schema must exist");
@@ -2094,111 +3098,6 @@ mod tests {
         assert!(
             notify_tokens <= NOTIFY_ALWAYS_LOAD_TOKEN_CEILING,
             "notify always-load cost is {notify_tokens} tokens; keep the status-update primitive compact"
-        );
-    }
-
-    #[test]
-    fn task_board_schema_exposes_lifecycle_progress_and_dependencies() {
-        let schemas = all_tool_schemas();
-        let task_board = find_schema(&schemas, "task_board").expect("task_board schema");
-        let properties = &task_board["function"]["parameters"]["properties"];
-
-        for field in ["active_form", "add_blocks", "add_blocked_by", "subtasks"] {
-            assert!(
-                properties.get(field).is_some(),
-                "task_board.create must expose {field}"
-            );
-        }
-        for field in [
-            "new_status",
-            "subtask_id",
-            "active_form",
-            "add_blocks",
-            "add_blocked_by",
-            "remove_blocks",
-            "remove_blocked_by",
-            "error_message",
-        ] {
-            assert!(
-                properties.get(field).is_some(),
-                "task_board.update must expose {field}"
-            );
-        }
-
-        assert_eq!(
-            properties["subtasks"]["maxItems"].as_u64(),
-            Some(crate::task_mgmt::MAX_CREATE_SUBTASKS as u64),
-            "create schema should expose the same subtask fan-out limit as TaskManager"
-        );
-        assert_eq!(
-            properties["subtasks"]["items"]["additionalProperties"], false,
-            "subtask schema should reject unknown fields"
-        );
-        assert!(
-            properties["subtasks"]["items"]["properties"]
-                .get("owner")
-                .is_some(),
-            "subtask schema should expose the supported owner field"
-        );
-        assert!(
-            properties["new_status"]["enum"]
-                .as_array()
-                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("paused"))),
-            "update schema should let the model intentionally pause/resume stale work"
-        );
-        for field in ["description", "active_form", "owner"] {
-            assert_eq!(
-                properties[field]["type"],
-                json!(["string", "null"]),
-                "update must be able to clear optional task field {field}"
-            );
-        }
-        assert!(
-            properties["status_filter"]["enum"]
-                .as_array()
-                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("deleted"))),
-            "list schema should let the model inspect deleted audit tombstones"
-        );
-        assert!(
-            properties["user_status"]["enum"]
-                .as_array()
-                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some("cancelled"))),
-            "cross-session list schema should expose cancelled tasks"
-        );
-        let per_action_required =
-            task_board["function"]["parameters"]["x-astra-per-action-required"]
-                .as_object()
-                .expect("task_board per-action required fields");
-        assert_eq!(
-            per_action_required["create"],
-            json!(["title"]),
-            "task_board.create required fields must stay explicit"
-        );
-        assert_eq!(
-            per_action_required["adopt"],
-            json!(["source_session_id", "task_id"]),
-            "task_board.adopt required fields must stay explicit"
-        );
-        let per_action_allowed = task_board["function"]["parameters"]["x-astra-per-action-allowed"]
-            .as_object()
-            .expect("task_board per-action allowed fields");
-        assert_eq!(
-            per_action_allowed["create"],
-            json!(crate::task_tool_contract::task_action_allowed_fields("create").unwrap()),
-            "task_board.create allowed fields must be generated from task_tool_contract"
-        );
-        assert!(
-            !per_action_allowed["create"]
-                .as_array()
-                .expect("create allowed fields")
-                .iter()
-                .any(|field| field.as_str() == Some("new_status")),
-            "task_board.create must not advertise update-only status fields"
-        );
-        assert_eq!(
-            per_action_allowed["update"],
-            json!(crate::task_tool_contract::task_action_allowed_fields("update").unwrap()),
-            "task_board.update allowed fields must be generated from task_tool_contract"
         );
     }
 
@@ -2244,6 +3143,27 @@ mod tests {
     }
 
     #[test]
+    fn git_schema_and_executor_share_the_blame_contract() {
+        let schemas = all_tool_schemas();
+        let git = find_schema(&schemas, "git").expect("git schema");
+        assert_eq!(
+            git.pointer("/function/parameters/x-astra-per-action-required/blame/0")
+                .and_then(Value::as_str),
+            Some("path")
+        );
+        validate_tool_arguments(
+            "git",
+            &json!({
+                "action": "blame",
+                "path": "src/lib.rs",
+                "start_line": 10,
+                "end_line": 20
+            }),
+        )
+        .expect("advertised blame request must validate");
+    }
+
+    #[test]
     fn git_schema_exposes_canonical_multi_path_diff_filters() {
         let schemas = all_tool_schemas();
         let git = find_schema(&schemas, "git").expect("git schema");
@@ -2283,9 +3203,32 @@ mod tests {
         let schemas = all_tool_schemas();
         let introspect = find_schema(&schemas, "introspect").expect("introspect schema must exist");
         let params = &introspect["function"]["parameters"];
+        let description = introspect["function"]["description"]
+            .as_str()
+            .expect("introspect description must be present");
+        assert!(description.contains("recent live projection"));
+        assert!(description.contains("use reflect"));
         let properties = introspect["function"]["parameters"]["properties"]
             .as_object()
             .expect("introspect parameters properties must be an object");
+        assert!(
+            properties["horizon"]["description"]
+                .as_str()
+                .expect("introspect horizon description")
+                .contains("rather than failing")
+        );
+        assert_eq!(
+            enum_values(&properties["horizon"]),
+            vec![
+                "now",
+                "current_turn",
+                "recent",
+                "turn",
+                "session",
+                "cross_session"
+            ],
+            "introspect must accept semantic historical requests and label its live projection"
+        );
         assert_eq!(
             params.get("additionalProperties").and_then(Value::as_bool),
             Some(false),
@@ -2321,6 +3264,7 @@ mod tests {
             "facet",
             "depth",
             "horizon",
+            "question",
             "source_policy",
             "include_context",
             "format",
@@ -2703,6 +3647,30 @@ mod tests {
                 .any(|value| value.as_str() == Some(*field))),
             "same-file batch mode must require path and edits: {batch_same_file:?}"
         );
+
+        let str_replace_description = str_replace
+            .pointer("/function/description")
+            .and_then(Value::as_str)
+            .expect("str_replace schema must include a description");
+        assert!(
+            str_replace_description.contains("source-read opaque markers")
+                && str_replace_description.contains("safe old_str anchors")
+                && str_replace_description.contains("display-only")
+                && str_replace_description.contains("foreign")
+                && str_replace_description.contains("stale"),
+            "str_replace must make the safe redacted-read edit contract discoverable: {str_replace_description}"
+        );
+
+        let read_file_description = find_schema(&schemas, "read_file")
+            .and_then(|schema| schema.pointer("/function/description"))
+            .and_then(Value::as_str)
+            .expect("read_file schema must include a description");
+        assert!(
+            read_file_description.contains("source-read opaque markers")
+                && read_file_description.contains("copied unchanged")
+                && read_file_description.contains("never recover"),
+            "read_file must describe how its opaque edit references flow to the editor: {read_file_description}"
+        );
         let batch_multi_file = per_action
             .get("batch_multi_file")
             .and_then(Value::as_array)
@@ -2745,10 +3713,40 @@ mod tests {
         let schemas = all_tool_schemas();
         let bash = find_schema(&schemas, "bash").expect("bash schema must exist");
         let ps = find_schema(&schemas, "powershell").expect("powershell schema must exist");
+        let bash_description = bash
+            .pointer("/function/description")
+            .and_then(Value::as_str)
+            .expect("bash schema must describe its execution contract");
+        assert!(bash_description.contains("source_artifacts"));
+        assert!(bash_description.contains("preserves them before spawn"));
+        assert!(bash_description.contains("Checksum alone is not a backup"));
+        assert_eq!(
+            bash.pointer("/function/parameters/properties/source_artifacts/minItems")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            bash.pointer("/function/parameters/properties/source_artifacts/maxItems")
+                .and_then(Value::as_u64),
+            Some(crate::source_preimage::MAX_SOURCE_ARTIFACTS as u64)
+        );
+        assert!(
+            bash.pointer("/function/parameters/properties/source_artifacts/description")
+                .and_then(Value::as_str)
+                .is_some_and(|description| description.contains("checksum alone is not a backup"))
+        );
         assert_eq!(
             bash.pointer("/function/parameters/properties/timeout/default")
                 .and_then(Value::as_f64),
             Some(crate::shell_ops::DEFAULT_BASH_TIMEOUT_SECS)
+        );
+        assert!(
+            bash.pointer("/function/parameters/properties/timeout/description")
+                .and_then(Value::as_str)
+                .is_some_and(|description| {
+                    description.contains("Outer execution timeout")
+                        && description.contains("does not extend Astra's outer timeout")
+                })
         );
         assert_eq!(
             ps.pointer("/function/parameters/properties/timeout/default")
@@ -2875,39 +3873,6 @@ mod tests {
                 "field `slots` item 0 missing non-empty required field `prompt`",
                 "field `target_count` must be at least 1",
             ]
-        );
-    }
-
-    #[test]
-    fn built_in_contract_enforces_action_owned_fields() {
-        validate_tool_arguments(
-            "task_board",
-            &json!({"action": "create", "title": "Implement canonical boundary"}),
-        )
-        .unwrap();
-
-        let error = validate_tool_arguments(
-            "task_board",
-            &json!({
-                "action": "create",
-                "title": "Implement canonical boundary",
-                "new_status": "completed"
-            }),
-        )
-        .unwrap_err();
-        assert_eq!(
-            error.issues,
-            vec!["field(s) not allowed for action `create`: new_status"]
-        );
-
-        let blank_owner = validate_tool_arguments(
-            "task_board",
-            &json!({"action": "create", "title": "Task", "owner": "   "}),
-        )
-        .unwrap_err();
-        assert_eq!(
-            blank_owner.issues,
-            vec!["field `owner` requires at least 1 character(s)"]
         );
     }
 

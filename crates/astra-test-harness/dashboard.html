@@ -244,6 +244,14 @@ body {
   background: var(--red);
   box-shadow: 0 0 8px rgba(239,68,68,0.4), 0 0 20px rgba(239,68,68,0.1);
 }
+.tl-dot.unavailable {
+  background: var(--yellow);
+  box-shadow: 0 0 8px rgba(234,179,8,0.35), 0 0 20px rgba(234,179,8,0.1);
+}
+.tl-dot.cancelled {
+  background: var(--yellow);
+  box-shadow: 0 0 8px rgba(234,179,8,0.35), 0 0 20px rgba(234,179,8,0.1);
+}
 .tl-dot.running {
   background: var(--accent);
   box-shadow: 0 0 8px rgba(59,130,246,0.4);
@@ -295,6 +303,8 @@ body {
 .tl-dot-preview .dp-badge.pass { background: var(--green-dim); color: var(--green); }
 .tl-dot-preview .dp-badge.warn { background: var(--yellow-dim); color: var(--yellow); }
 .tl-dot-preview .dp-badge.fail { background: var(--red-dim); color: var(--red); }
+.tl-dot-preview .dp-badge.unavailable { background: var(--yellow-dim); color: var(--yellow); }
+.tl-dot-preview .dp-badge.cancelled { background: var(--yellow-dim); color: var(--yellow); }
 .tl-dot-preview .dp-name {
   font-size: 12px; font-weight: 600; color: var(--text);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -350,6 +360,7 @@ body {
 .detail-modal .dm-badge.pass { background: var(--green-dim); color: var(--green); }
 .detail-modal .dm-badge.warn { background: var(--yellow-dim); color: var(--yellow); }
 .detail-modal .dm-badge.fail { background: var(--red-dim); color: var(--red); }
+.detail-modal .dm-badge.unavailable { background: var(--yellow-dim); color: var(--yellow); }
 .detail-modal .dm-title { font-size: 16px; font-weight: 700; }
 .detail-modal .dm-model { font-size: 13px; color: var(--dim); font-family: var(--mono); }
 @keyframes dotAppear {
@@ -641,6 +652,8 @@ body {
 .tl-row.pass .tl-row-icon { color: var(--green); }
 .tl-row.warn .tl-row-icon { color: var(--yellow); }
 .tl-row.fail .tl-row-icon { color: var(--red); }
+.tl-row.unavailable .tl-row-icon { color: var(--yellow); }
+.tl-row.cancelled .tl-row-icon { color: var(--yellow); }
 .tl-row.running .tl-row-icon { color: var(--accent); }
 .tl-row.queued .tl-row-icon { color: var(--dim); }
 
@@ -1669,8 +1682,8 @@ input[type="range"]::-moz-range-thumb {
             <div class="sb-setting">
               <label>Parallel</label>
               <div class="setting-val">
-                <input type="range" id="parallelSlider" min="1" max="16" value="2" />
-                <span class="val-num" id="parallelVal">2</span>
+                <input type="range" id="parallelSlider" min="1" max="16" value="1" />
+                <span class="val-num" id="parallelVal">1</span>
               </div>
             </div>
             <div class="sb-setting">
@@ -1719,7 +1732,7 @@ const S = {
   capFilter: '',
   caseSearch: '',
 
-  parallel: 2,
+  parallel: 1,
   noJudger: false,
   judgerModel: '',
 
@@ -1728,13 +1741,20 @@ const S = {
 
   // Run state
   runId: null,
-  runHistory: [], // [{runId, startTime, models, total, passed, failed}]
+  terminalRunId: null,
+  snapshotSequence: 0,
+  runError: null,
+  runHistory: [], // [{runId, startTime, models, total, passed, failed, cancelled, unavailable}]
   running: false,
   total: 0,
   completed: 0,
   passed: 0,
   failed: 0,
+  unavailable: 0,
+  cancelledCount: 0,
   runningSet: new Map(),
+  queuedSet: new Map(),
+  progressSet: new Map(),
   runs: [],
   startTime: null,
   suiteReport: null,
@@ -1757,6 +1777,21 @@ const S = {
 const $ = id => document.getElementById(id);
 const esc = s => { const d = document.createElement('div'); d.textContent = s; return d.innerHTML.replace(/"/g, '&quot;'); };
 const trunc = (s, n) => s && s.length > n ? s.slice(0, n) + '...' : (s || '');
+
+// CaseRunStatus is the authoritative report contract. The dashboard never
+// infers a green result from criteria or a stale boolean projection.
+const runStatus = run => run && run.status ? run.status : 'failed';
+const runPassed = run => runStatus(run) === 'passed';
+const runUnavailable = run => runStatus(run) === 'unavailable';
+const runCancelled = run => runStatus(run) === 'cancelled';
+const runFailed = run => runStatus(run) === 'failed';
+const runEvidence = run => !runUnavailable(run) && !runCancelled(run);
+const runVisualStatus = run => runPassed(run)
+  ? (run.has_warnings ? 'warn' : 'pass')
+  : runUnavailable(run) ? 'unavailable' : runCancelled(run) ? 'cancelled' : 'fail';
+const runVisualLabel = run => runPassed(run)
+  ? (run.has_warnings ? 'WARN' : 'PASS')
+  : runUnavailable(run) ? 'UNAVAILABLE' : runCancelled(run) ? 'CANCELLED' : 'FAIL';
 
 function formatDur(ms) {
   if (ms == null) return '--';
@@ -2054,7 +2089,7 @@ function renderPlanCard(plan) {
   html += '<div class="plan-row"><span class="plan-label">Models</span><span class="plan-value">' + models + '</span></div>';
   html += '<div class="plan-row"><span class="plan-label">Cases</span><span class="plan-value">' + cases.length + ' selected</span></div>';
   html += '<div class="plan-row"><span class="plan-label"></span><span class="plan-value">' + caseTags + more + '</span></div>';
-  html += '<div class="plan-row"><span class="plan-label">Parallel</span><span class="plan-value">' + (plan.parallel || 2) + '</span></div>';
+  html += '<div class="plan-row"><span class="plan-label">Parallel</span><span class="plan-value">' + (plan.parallel || 1) + '</span></div>';
   if (plan.explanation) {
     html += '<div class="plan-explanation">' + esc(plan.explanation) + '</div>';
   }
@@ -2077,7 +2112,7 @@ function renderPlanCard(plan) {
     const runBody = {
       models: plan.models || [],
       cases: plan.cases || [],
-      parallel: plan.parallel || 2,
+      parallel: plan.parallel || 1,
       no_judger: S.noJudger || false,
     };
     const jm = $('judgerModelIn').value.trim();
@@ -2145,8 +2180,8 @@ function addRailDot(type, label, targetEl, report) {
   dot.style.top = railDotY + 'px';
 
   if (report && report.case_name) {
-    const status = report.passed ? (report.has_warnings ? 'warn' : 'pass') : 'fail';
-    const badgeLabel = report.passed ? (report.has_warnings ? 'WARN' : 'PASS') : 'FAIL';
+    const status = runVisualStatus(report);
+    const badgeLabel = runVisualLabel(report);
     const tok = (report.outcome.prompt_tokens || 0) + (report.outcome.completion_tokens || 0);
     dot.innerHTML = `<div class="tl-dot-preview">
       <div class="dp-header">
@@ -2218,7 +2253,10 @@ function updateTimelineCard() {
   if (!counter || !fill) return;
 
   const pct = S.total > 0 ? Math.round((S.completed / S.total) * 100) : 0;
-  counter.textContent = '(' + S.completed + '/' + S.total + ')';
+  const active = S.runningSet.size;
+  const queued = S.queuedSet.size;
+  const queueLabel = queued > 0 ? ' · ' + active + ' running · ' + queued + ' queued' : '';
+  counter.textContent = '(' + S.completed + '/' + S.total + queueLabel + ')';
   fill.style.width = pct + '%';
   if (header) header.textContent = 'Running';
 }
@@ -2227,7 +2265,7 @@ function addTimelineRow(report) {
   const rows = $('tlRows');
   if (!rows) return;
 
-  const status = report.passed ? (report.has_warnings ? 'warn' : 'pass') : 'fail';
+  const status = runVisualStatus(report);
   const tok = (report.outcome.prompt_tokens || 0) + (report.outcome.completion_tokens || 0);
   const key = 'tlr_' + report.case_name + '_' + report.model + '_' + (report.run_index || 0);
 
@@ -2239,7 +2277,7 @@ function addTimelineRow(report) {
   el.className = 'tl-row ' + status;
   el.id = key;
   el.innerHTML = `
-    <span class="tl-row-icon">${report.passed ? (report.has_warnings ? '&#9888;' : '&#10004;') : '&#10008;'}</span>
+    <span class="tl-row-icon">${runPassed(report) ? (report.has_warnings ? '&#9888;' : '&#10004;') : (runUnavailable(report) || runCancelled(report)) ? '&#9888;' : '&#10008;'}</span>
     <span class="tl-row-name">${esc(report.case_name.replace(/_/g, ' '))}</span>
     <span class="tl-row-model">${esc(normModel(report.model))}</span>
     <span class="tl-row-metrics">
@@ -2258,7 +2296,9 @@ function addTimelineRunningRow(caseName, model, runIndex) {
   if (!rows) return;
 
   const key = 'tlr_' + caseName + '_' + model + '_' + (runIndex || 0);
-  if (document.getElementById(key)) return;
+  const existing = document.getElementById(key);
+  if (existing && existing.classList.contains('queued')) existing.remove();
+  else if (existing) return;
 
   const el = document.createElement('div');
   el.className = 'tl-row running';
@@ -2270,6 +2310,57 @@ function addTimelineRunningRow(caseName, model, runIndex) {
     <span class="tl-row-metrics" style="color:var(--accent)">running...</span>`;
   rows.appendChild(el);
   rows.scrollTop = rows.scrollHeight;
+}
+
+function addTimelineQueuedRow(caseName, model, runIndex, queuePosition) {
+  const rows = $('tlRows');
+  if (!rows) return;
+
+  const key = 'tlr_' + caseName + '_' + model + '_' + (runIndex || 0);
+  if (document.getElementById(key)) return;
+
+  const el = document.createElement('div');
+  el.className = 'tl-row queued';
+  el.id = key;
+  el.innerHTML = `
+    <span class="tl-row-icon">&#9203;</span>
+    <span class="tl-row-name">${esc(caseName.replace(/_/g, ' '))}</span>
+    <span class="tl-row-model">${esc(normModel(model))}</span>
+    <span class="tl-row-metrics" style="color:var(--dim)">queued #${queuePosition}</span>`;
+  rows.appendChild(el);
+  rows.scrollTop = rows.scrollHeight;
+}
+
+function updateTimelineProgress(caseName, model, runIndex, phase, elapsedMs) {
+  const key = 'tlr_' + caseName + '_' + model + '_' + (runIndex || 0);
+  const row = document.getElementById(key);
+  if (!row || !row.classList.contains('running')) return;
+  const metrics = row.querySelector('.tl-row-metrics');
+  if (metrics) {
+    metrics.textContent = phase === 'executing'
+      ? 'running ' + formatDur(elapsedMs || 0) + '...'
+      : phase + ' ' + formatDur(elapsedMs || 0);
+    metrics.style.color = 'var(--accent)';
+  }
+}
+
+function restoreLiveProgress(progress) {
+  if (!progress) return;
+  S.total = progress.total_cases || 0;
+  S.completed = progress.completed_cases || 0;
+  for (const item of Object.values(progress.queued || {})) {
+    const key = item.case_name + '/' + item.model + '/' + (item.run_index || 0);
+    S.queuedSet.set(key, item);
+    addTimelineQueuedRow(item.case_name, item.model, item.run_index, item.queue_position || 0);
+  }
+  for (const item of Object.values(progress.active || {})) {
+    const key = item.case_name + '/' + item.model + '/' + (item.run_index || 0);
+    S.runningSet.set(key, item);
+    S.progressSet.set(key, item);
+    addTimelineRunningRow(item.case_name, item.model, item.run_index);
+    updateTimelineProgress(item.case_name, item.model, item.run_index, item.phase, item.elapsed_ms);
+  }
+  updateTimelineCard();
 }
 
 /* ================================================================
@@ -2299,8 +2390,8 @@ function toggleCaseDetail(rowEl, report) {
 function openDetailModal(report) {
   const overlay = $('detailModalOverlay');
   const content = $('detailModalContent');
-  const status = report.passed ? (report.has_warnings ? 'warn' : 'pass') : 'fail';
-  const badgeLabel = report.passed ? (report.has_warnings ? 'WARN' : 'PASS') : 'FAIL';
+  const status = runVisualStatus(report);
+  const badgeLabel = runVisualLabel(report);
   content.innerHTML = `
     <div class="dm-header">
       <span class="dm-badge ${status}">${badgeLabel}</span>
@@ -2327,14 +2418,14 @@ if (document.readyState === 'loading') {
 }
 
 function buildCaseDetailHTML(report) {
-  const status = report.passed ? 'pass' : 'fail';
+  const status = runVisualStatus(report);
   const tok = (report.outcome.prompt_tokens || 0) + (report.outcome.completion_tokens || 0);
 
   let html = '';
 
   // Status + stats
   html += `<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
-    <span style="font-weight:700;font-size:13px;color:${report.passed ? 'var(--green)' : 'var(--red)'}">${report.passed ? 'PASS' : 'FAIL'}</span>
+    <span style="font-weight:700;font-size:13px;color:${runPassed(report) ? 'var(--green)' : (runUnavailable(report) || runCancelled(report)) ? 'var(--yellow)' : 'var(--red)'}">${runVisualLabel(report)}</span>
     <span style="font-size:12px;color:var(--muted)">${esc(report.case_name)}</span>
     <span style="font-size:11px;color:var(--dim);font-family:var(--mono)">${esc(normModel(report.model))}</span>
   </div>`;
@@ -2457,34 +2548,44 @@ function bindCollapseToggles(container) {
 /* ================================================================
    Report Card
    ================================================================ */
+function availableResultsLabel() {
+  const planned = S.completed - S.unavailable;
+  if (planned <= 0) return 'Not executed — no available evidence (' + S.unavailable + ' unavailable, ' + S.cancelledCount + ' cancelled)';
+  const rate = Math.round(S.passed / planned * 100);
+  return S.passed + '/' + planned + ' planned passed (' + rate + '%)';
+}
+
 function addReportCard() {
   const stats = modelStats();
   const entries = Object.entries(stats).sort((a, b) =>
     (b[1].pass / Math.max(b[1].total, 1)) - (a[1].pass / Math.max(a[1].total, 1))
   );
 
-  const rate = S.completed > 0 ? Math.round(S.passed / S.completed * 100) : 0;
+  const planned = S.completed - S.unavailable;
+  const rate = planned > 0 ? Math.round(S.passed / planned * 100) : null;
   const wallMs = S.suiteReport ? S.suiteReport.wall_time_ms : (S.startTime ? Date.now() - S.startTime : 0);
   const statusText = S.cancelled ? 'Cancelled' : 'Complete';
 
   let html = '<div class="report-card">';
   html += '<div class="report-header">';
   html += '<div class="report-header-left"><span style="font-size:18px">&#128202;</span>';
-  html += '<span class="report-title">Results: ' + S.passed + '/' + S.completed + ' passed (' + rate + '%)</span></div>';
-  html += '<span class="report-rate" style="color:' + rateFg(rate) + '">' + rate + '%</span>';
+  html += '<span class="report-title">Results: ' + availableResultsLabel() + '</span></div>';
+  html += '<span class="report-rate" style="color:' + (rate == null ? 'var(--muted)' : rateFg(rate)) + '">' + (rate == null ? 'N/A' : rate + '%') + '</span>';
   if (S.runId) {
     html += '<span style="font-size:11px;color:var(--dim);font-family:var(--mono);margin-left:8px">' + esc(S.runId) + '</span>';
   }
   html += '</div>';
 
   // Summary stats
-  const warnCount = S.runs.filter(r => r.passed && r.has_warnings).length;
+  const warnCount = S.runs.filter(r => runPassed(r) && r.has_warnings).length;
   html += '<div class="report-summary-row">';
   html += '<div class="report-stat"><div class="rs-val" style="color:var(--green)">' + S.passed + '</div><div class="rs-lbl">Passed</div></div>';
   if (warnCount > 0) {
     html += '<div class="report-stat"><div class="rs-val" style="color:var(--yellow)">' + warnCount + '</div><div class="rs-lbl">Warnings</div></div>';
   }
   html += '<div class="report-stat"><div class="rs-val" style="color:var(--red)">' + S.failed + '</div><div class="rs-lbl">Failed</div></div>';
+  html += '<div class="report-stat"><div class="rs-val" style="color:var(--yellow)">' + S.cancelledCount + '</div><div class="rs-lbl">Cancelled</div></div>';
+  html += '<div class="report-stat"><div class="rs-val" style="color:var(--yellow)">' + S.unavailable + '</div><div class="rs-lbl">Unavailable</div></div>';
   html += '<div class="report-stat"><div class="rs-val">' + formatDur(wallMs) + '</div><div class="rs-lbl">Wall Time</div></div>';
   html += '</div>';
 
@@ -2507,7 +2608,7 @@ function addReportCard() {
   }
 
   // Failed cases
-  const failedRuns = S.runs.filter(r => !r.passed);
+  const failedRuns = S.runs.filter(runFailed);
   if (failedRuns.length > 0) {
     html += '<div class="report-failures"><div class="cd-label" style="margin-bottom:6px">Failed cases</div>';
     for (const r of failedRuns) {
@@ -2517,6 +2618,33 @@ function addReportCard() {
       html += '<span class="rf-case">' + esc(r.case_name) + '</span>';
       html += '<span class="rf-model">' + esc(normModel(r.model)) + '</span>';
       if (fc) html += '<span class="rf-class">' + esc(trunc(fc, 30)) + '</span>';
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  const unavailableRuns = S.runs.filter(runUnavailable);
+  if (unavailableRuns.length > 0) {
+    html += '<div class="report-failures"><div class="cd-label" style="margin-bottom:6px;color:var(--yellow)">Unavailable cases</div>';
+    for (const r of unavailableRuns) {
+      const fc = r.failure_class ? (typeof r.failure_class === 'string' ? r.failure_class : JSON.stringify(r.failure_class)) : '';
+      html += '<div class="report-fail-row" data-fail-idx="' + S.runs.indexOf(r) + '">';
+      html += '<span class="rf-icon" style="color:var(--yellow)">&#9888;</span>';
+      html += '<span class="rf-case">' + esc(r.case_name) + '</span>';
+      html += '<span class="rf-model">' + esc(normModel(r.model)) + '</span>';
+      if (fc) html += '<span class="rf-class" style="color:var(--yellow)">' + esc(trunc(fc, 30)) + '</span>';
+      html += '</div>';
+    }
+    html += '</div>';
+  }
+  const cancelledRuns = S.runs.filter(runCancelled);
+  if (cancelledRuns.length > 0) {
+    html += '<div class="report-failures"><div class="cd-label" style="margin-bottom:6px;color:var(--yellow)">Cancelled cases</div>';
+    for (const r of cancelledRuns) {
+      html += '<div class="report-fail-row" data-fail-idx="' + S.runs.indexOf(r) + '">';
+      html += '<span class="rf-icon" style="color:var(--yellow)">&#9888;</span>';
+      html += '<span class="rf-case">' + esc(r.case_name) + '</span>';
+      html += '<span class="rf-model">' + esc(normModel(r.model)) + '</span>';
+      html += '<span class="rf-class" style="color:var(--yellow)">not executed</span>';
       html += '</div>';
     }
     html += '</div>';
@@ -2562,12 +2690,13 @@ function addReportCard() {
 function modelStats() {
   const out = {};
   for (const r of S.runs) {
-    const m = normModel(r.model);
+    if (!runEvidence(r)) continue;
+    const m = r.model;
     if (!out[m]) out[m] = { pass: 0, total: 0, passTok: 0, passDur: 0, passTurns: 0 };
     const s = out[m];
     s.total++;
     const tok = (r.outcome.prompt_tokens || 0) + (r.outcome.completion_tokens || 0);
-    if (r.passed) {
+    if (runPassed(r)) {
       s.pass++;
       s.passTok += tok;
       s.passDur += r.outcome.duration_ms || 0;
@@ -3140,22 +3269,85 @@ function connect() {
   ws.onmessage = e => {
     let ev;
     try { ev = JSON.parse(e.data); } catch { return; }
-    console.log('[ws]', ev.type, ev.type === 'case_completed' ? ev.report?.case_name : '');
+    console.log('[ws]', ev.type, ev.type === 'case_completed' ? ev.report?.case_name : (ev.case_name || ''));
     handleEvent(ev);
   };
 }
 
 function handleEvent(ev) {
+  // A reconnect may receive buffered events from an older run. The server's
+  // init snapshot establishes the active run identity; never project another
+  // run into the current timeline.
+  if (ev.type !== 'init' && ev.type !== 'run_reset' && ev.run_id && S.runId && ev.run_id !== S.runId) {
+    return;
+  }
+  if (ev.type !== 'init' && ev.run_id && ev.run_id === S.terminalRunId) {
+    return;
+  }
+  // The server sequence is a global watermark. A reconnect snapshot already
+  // contains every event up to its sequence, so queued older events are
+  // replay noise rather than new UI facts.
+  if (ev.type !== 'init' && Number.isInteger(ev.sequence)) {
+    if (ev.sequence <= S.snapshotSequence) return;
+    S.snapshotSequence = ev.sequence;
+  }
+  // An init/resync snapshot is authoritative for a completed or failed run.
+  // Events queued before that snapshot are replayed by the broadcast channel;
+  // do not apply them a second time to the same DOM/history projection.
+  if (!S.running && S.runId && ev.run_id === S.runId &&
+      ['case_queued', 'case_started', 'case_progress', 'case_completed', 'suite_completed', 'suite_failed'].includes(ev.type)) {
+    return;
+  }
   switch (ev.type) {
 
     case 'init': {
-      // Restore state after page refresh.
-      if (ev.report && ev.report.runs && ev.report.runs.length > 0) {
+      S.runId = ev.run_id || null;
+      S.snapshotSequence = Number.isInteger(ev.sequence) ? ev.sequence : S.snapshotSequence;
+      S.runError = ev.error || null;
+      S.running = ev.phase === 'running' || ev.running === true;
+      S.terminalRunId = S.running ? null
+        : (ev.phase === 'completed' || ev.phase === 'failed' ? S.runId : null);
+      // A running snapshot is authoritative even when it carries no report.
+      // Do not resurrect the previous run's completed projection.
+      if (S.running) {
+        clearTimelineRail();
+        const oldTimeline = document.getElementById('timelineRow');
+        if (oldTimeline) oldTimeline.remove();
+        const oldReport = document.getElementById('reportRow');
+        if (oldReport) oldReport.remove();
+        S.runs = [];
+        S.total = 0;
+        S.completed = 0;
+        S.passed = 0;
+        S.failed = 0;
+        S.unavailable = 0;
+        S.cancelledCount = 0;
+        S.runningSet.clear();
+        S.queuedSet.clear();
+        S.progressSet.clear();
+        S.suiteReport = null;
+        S.startTime = Date.now();
+        showTimelineRail();
+        createTimelineCard();
+        restoreLiveProgress(ev.progress);
+        addRailDot('plan', (S.runId || 'run') + ' resumed', null);
+        $('runBtn').disabled = true;
+        $('runBtn').textContent = 'Running...';
+        $('cancelBtn').classList.add('visible');
+      } else if (ev.report) {
         const r = ev.report;
-        S.runs = r.runs;
-        S.total = r.runs.length;
-        S.passed = r.runs.filter(x => x.passed).length;
-        S.failed = S.total - S.passed;
+        clearTimelineRail();
+        const oldTimeline = document.getElementById('timelineRow');
+        if (oldTimeline) oldTimeline.remove();
+        const oldReport = document.getElementById('reportRow');
+        if (oldReport) oldReport.remove();
+        S.runs = Array.isArray(r.runs) ? r.runs : [];
+        S.total = S.runs.length;
+        S.passed = r.runs.filter(runPassed).length;
+        S.failed = r.runs.filter(runFailed).length;
+        S.unavailable = r.runs.filter(runUnavailable).length;
+        S.cancelledCount = r.runs.filter(runCancelled).length;
+        S.cancelled = S.cancelledCount > 0;
         S.completed = S.total;
         S.suiteReport = r;
         S.running = false;
@@ -3165,18 +3357,41 @@ function handleEvent(ev) {
         showTimelineRail();
         addRailDot('plan', 'Restored run', null);
         createTimelineCard();
-        for (const run of r.runs) {
+        for (const run of S.runs) {
           addTimelineRow(run);
           const rowEl = document.getElementById(
             'tlr_' + run.case_name + '_' + run.model + '_' + (run.run_index || 0)
           );
-          addRailDot(run.passed ? 'pass' : 'fail',
+          addRailDot(runVisualStatus(run),
             run.case_name.replace(/_/g,' ') + ' × ' + normModel(run.model), rowEl, run);
         }
         updateTimelineCard();
         finalizeTimeline();
         addReportCard();
-        addRailDot('report', S.passed + '/' + S.completed + ' passed', null);
+        addRailDot('report', availableResultsLabel(), null);
+        S.runningSet.clear();
+        S.queuedSet.clear();
+        S.progressSet.clear();
+        resetRunBtn();
+      } else if (S.runError) {
+        clearTimelineRail();
+        const oldTimeline = document.getElementById('timelineRow');
+        if (oldTimeline) oldTimeline.remove();
+        const oldReport = document.getElementById('reportRow');
+        if (oldReport) oldReport.remove();
+        S.runs = [];
+        S.total = 0;
+        S.completed = 0;
+        S.passed = 0;
+        S.failed = 0;
+        S.unavailable = 0;
+        S.cancelledCount = 0;
+        S.suiteReport = null;
+        S.runningSet.clear();
+        S.queuedSet.clear();
+        S.progressSet.clear();
+        resetRunBtn();
+        toast('Run failed: ' + S.runError, 'error');
       }
       break;
     }
@@ -3192,12 +3407,19 @@ function handleEvent(ev) {
       S.completed = 0;
       S.passed = 0;
       S.failed = 0;
+      S.unavailable = 0;
+      S.cancelledCount = 0;
       S.runningSet.clear();
+      S.queuedSet.clear();
+      S.progressSet.clear();
       S.suiteReport = null;
       S.total = 0;
       S.startTime = null;
       S.cancelled = false;
       S.running = false;
+      S.runId = ev.run_id || null;
+      S.terminalRunId = null;
+      S.runError = null;
       S.timelineCardEl = null;
       break;
     }
@@ -3208,11 +3430,17 @@ function handleEvent(ev) {
       S.completed = 0;
       S.passed = 0;
       S.failed = 0;
+      S.unavailable = 0;
+      S.cancelledCount = 0;
       S.runs = [];
       S.runningSet.clear();
+      S.queuedSet.clear();
+      S.progressSet.clear();
       S.startTime = Date.now();
       S.suiteReport = null;
       S.cancelled = false;
+      S.runError = null;
+      S.terminalRunId = null;
       S.running = true;
 
       $('runBtn').disabled = true;
@@ -3228,9 +3456,25 @@ function handleEvent(ev) {
 
     case 'case_started': {
       const key = ev.case_name + '/' + ev.model + '/' + (ev.run_index || 0);
+      S.queuedSet.delete(key);
       S.runningSet.set(key, { case_name: ev.case_name, model: ev.model });
       addTimelineRunningRow(ev.case_name, ev.model, ev.run_index);
       updateTimelineCard();
+      break;
+    }
+
+    case 'case_queued': {
+      const key = ev.case_name + '/' + ev.model + '/' + (ev.run_index || 0);
+      S.queuedSet.set(key, { case_name: ev.case_name, model: ev.model });
+      addTimelineQueuedRow(ev.case_name, ev.model, ev.run_index, ev.queue_position || 0);
+      updateTimelineCard();
+      break;
+    }
+
+    case 'case_progress': {
+      const key = ev.case_name + '/' + ev.model + '/' + (ev.run_index || 0);
+      S.progressSet.set(key, { phase: ev.phase, elapsed_ms: ev.elapsed_ms || 0 });
+      updateTimelineProgress(ev.case_name, ev.model, ev.run_index, ev.phase, ev.elapsed_ms);
       break;
     }
 
@@ -3238,24 +3482,62 @@ function handleEvent(ev) {
       const r = ev.report;
       S.completed++;
       S.runs.push(r);
-      if (r.passed) S.passed++; else S.failed++;
+      if (runPassed(r)) S.passed++;
+      else if (runUnavailable(r)) S.unavailable++;
+      else if (runCancelled(r)) S.cancelledCount++;
+      else S.failed++;
       const key = r.case_name + '/' + r.model + '/' + (r.run_index || 0);
+      S.queuedSet.delete(key);
       S.runningSet.delete(key);
+      S.progressSet.delete(key);
 
       addTimelineRow(r);
       updateTimelineCard();
       // Add dot to the rail
       const rowEl = document.getElementById('tlr_' + r.case_name + '_' + r.model + '_' + (r.run_index || 0));
       const shortName = r.case_name.replace(/_/g, ' ');
-      const dotType = r.passed ? (r.has_warnings ? 'warn' : 'pass') : 'fail';
+      const dotType = runVisualStatus(r);
       addRailDot(dotType, shortName + ' × ' + normModel(r.model), rowEl, r);
       break;
     }
 
     case 'suite_completed': {
       S.suiteReport = ev.report || {};
+      // The suite report is the authoritative snapshot. A lagged WebSocket
+      // receiver can miss one or more case_completed events; rebuild the
+      // report backing data and counters instead of retaining a partial
+      // incremental projection.
+      if (Array.isArray(S.suiteReport.runs)) {
+        S.runs = S.suiteReport.runs;
+        S.total = S.runs.length;
+        S.completed = S.total;
+        S.passed = S.runs.filter(runPassed).length;
+        S.failed = S.runs.filter(runFailed).length;
+        S.unavailable = S.runs.filter(runUnavailable).length;
+        S.cancelledCount = S.runs.filter(runCancelled).length;
+        S.cancelled = S.cancelledCount > 0;
+      }
+      // The terminal report is authoritative even after a lagged receiver;
+      // rebuild rows/dots instead of merely fixing counters.
+      clearTimelineRail();
+      const oldTimeline = document.getElementById('timelineRow');
+      if (oldTimeline) oldTimeline.remove();
+      showTimelineRail();
+      createTimelineCard();
+      for (const run of S.runs) {
+        addTimelineRow(run);
+        const rowEl = document.getElementById(
+          'tlr_' + run.case_name + '_' + run.model + '_' + (run.run_index || 0)
+        );
+        addRailDot(runVisualStatus(run),
+          run.case_name.replace(/_/g,' ') + ' × ' + normModel(run.model), rowEl, run);
+      }
+      updateTimelineCard();
       S.runningSet.clear();
+      S.queuedSet.clear();
+      S.progressSet.clear();
       S.running = false;
+      S.terminalRunId = S.runId;
 
       // Record run in history for tracing
       S.runHistory.push({
@@ -3265,20 +3547,46 @@ function handleEvent(ev) {
         total: S.total,
         passed: S.passed,
         failed: S.failed,
-        models: [...new Set(S.runs.map(r => normModel(r.model)))],
+        cancelled: S.cancelledCount,
+        unavailable: S.unavailable,
+        models: [...new Set(S.runs.filter(runEvidence).map(r => r.model))],
       });
 
+      const completedRunId = ev.run_id;
       setTimeout(() => {
+        if (S.runId !== completedRunId || S.terminalRunId !== completedRunId) return;
         finalizeTimeline();
         addReportCard();
         resetRunBtn();
-        addRailDot('report', S.runId + ' — ' + S.passed + '/' + S.completed + ' passed', null);
+        addRailDot('report', completedRunId + ' — ' + availableResultsLabel(), null);
       }, 300);
       break;
     }
 
+    case 'suite_failed': {
+      S.runningSet.clear();
+      S.queuedSet.clear();
+      S.progressSet.clear();
+      S.running = false;
+      S.suiteReport = null;
+      S.runs = [];
+      S.total = 0;
+      S.completed = 0;
+      S.passed = 0;
+      S.failed = 0;
+      S.unavailable = 0;
+      S.cancelledCount = 0;
+      S.runError = ev.error || 'run failed without an error detail';
+      S.terminalRunId = S.runId;
+      finalizeTimeline();
+      resetRunBtn();
+      addRailDot('fail', S.runId + ' — run failed', null);
+      toast('Run failed: ' + S.runError, 'error');
+      break;
+    }
+
     case 'lagged': {
-      toast('Missed ' + (ev.missed || '?') + ' events (stream lag)', 'error');
+      toast('Stream lag detected; state resynchronized from the server', 'error');
       break;
     }
   }

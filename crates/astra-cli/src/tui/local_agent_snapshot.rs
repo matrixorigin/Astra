@@ -73,42 +73,6 @@ impl LocalAgentSnapshot {
             .collect()
     }
 
-    /// Immediate, model-free receipt for guidance accepted during an active
-    /// run. It confirms delivery and surfaces bounded current progress while
-    /// the foreground tool still owns the next model boundary.
-    pub(crate) fn active_guidance_receipt(&self) -> String {
-        let active_groups = self
-            .fanout_groups
-            .iter()
-            .filter(|group| !group.is_terminal())
-            .collect::<Vec<_>>();
-        if active_groups.len() == 1 {
-            let group = active_groups[0];
-            let summary = group.summary();
-            let title = group.title.trim();
-            let title = if title.is_empty() {
-                "Agent fanout"
-            } else {
-                title
-            };
-            return format!(
-                "Guidance queued · {title}: {}/{} settled, {} running · Shift+↓ inspect",
-                summary.terminal, summary.target_count, summary.active,
-            );
-        }
-        if !active_groups.is_empty() {
-            let running = active_groups
-                .iter()
-                .map(|group| group.summary().active)
-                .sum::<usize>();
-            return format!(
-                "Guidance queued · {} agent groups, {running} agents running · Shift+↓ inspect",
-                active_groups.len(),
-            );
-        }
-        "Guidance queued for the current run.".to_string()
-    }
-
     /// Describe newly launched user-visible work units without involving the
     /// model.  A fanout is one receipt even though its slots enter the runtime
     /// independently; emitting one line per child makes normal concurrency
@@ -460,7 +424,7 @@ impl LocalAgentSnapshot {
                             "failed": summary.failed,
                             "interrupted": summary.interrupted,
                             "cancelled_by_user": summary.cancelled_by_user,
-                            "cancelled_by_parent_budget": summary.cancelled_by_parent_budget,
+                            "cancelled_by_runtime": summary.cancelled_by_runtime,
                             "timed_out": summary.timed_out,
                             "spawn_rejected": summary.spawn_rejected,
                             "uncollected": summary.uncollected,
@@ -578,16 +542,6 @@ mod tests {
             running[0].wake_policy,
             WorkUnitWakePolicy::OnAttentionOrTerminal
         );
-        let receipt = LocalAgentSnapshot {
-            available: true,
-            fanout_groups: vec![group.clone()],
-            ..LocalAgentSnapshot::default()
-        }
-        .active_guidance_receipt();
-        assert!(receipt.contains("1/2 settled"), "{receipt}");
-        assert!(receipt.contains("1 running"), "{receipt}");
-        assert!(receipt.contains("Guidance queued"), "{receipt}");
-
         group
             .record_terminal_by_agent("reviewer-2", AgentFanoutSlotStatus::Completed, None)
             .unwrap();

@@ -14,7 +14,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::cli::effects::SecStatusLineKind;
 
-/// Shared label for [`PlanAssembleLineSpinner`] while building a normal-chat `/chat/turn` payload.
+/// Shared label for [`PlanAssembleLineSpinner`] while building a normal-chat `/chat/stream` payload.
 pub type ChatPrepPhaseLabel = Arc<RwLock<String>>;
 
 /// One stderr line, updated in place with elapsed whole seconds.

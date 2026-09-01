@@ -208,10 +208,9 @@ pub use astra_services::{
         ModelUpdateRequestData, PricingData, QuirksData, UnconfiguredModelService,
     },
     multi_agent::{
-        DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, DatabaseTaskLeaseService,
-        EdgeDispatchIdentity, EdgeDispatchRow, EdgeDispatchService, EdgeRegistryService,
-        TaskLeaseHoldCache, TaskLeaseService, UnconfiguredEdgeDispatchService,
-        UnconfiguredEdgeRegistryService, UnconfiguredTaskLeaseService,
+        DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, EdgeDispatchIdentity,
+        EdgeDispatchRow, EdgeDispatchService, EdgeRegistryService, UnconfiguredEdgeDispatchService,
+        UnconfiguredEdgeRegistryService,
     },
     reflect::{DatabaseReflectService, ReflectReport, ReflectService, UnconfiguredReflectService},
     replay::{DatabaseReplayService, ReplayService, UnconfiguredReplayService},
@@ -230,10 +229,6 @@ pub use astra_services::{
         DatabaseSkillConfigService, SkillConfigService, UnconfiguredSkillConfigService,
     },
     skills::{DatabaseSkillService, SkillRecord, SkillService, UnconfiguredSkillService},
-    task_orchestrator::{
-        MatrixOneTaskService, TaskCreateRequest, TaskRecord, TaskService, TaskStatus,
-        UnconfiguredTaskService,
-    },
     triggers::{DatabaseTriggerService, TriggerRecord, TriggerService, UnconfiguredTriggerService},
     workflows::{
         UnconfiguredWorkflowService, WorkflowDefRecord, WorkflowListItem, WorkflowRunRecord,
@@ -307,7 +302,7 @@ pub use astra_turn_core::{
     activity::SessionActivityUpdatePlan,
     cache::SessionCache,
     cloud_attachments::{
-        AttachmentBuilder, FileAttachment, PlanAttachment, PostCompactAttachments, SkillAttachment,
+        AttachmentBuilder, PlanAttachment, PostCompactAttachments, SkillAttachment,
     },
     cloud_cache_diagnostics::{
         CacheBreakCause, CacheBreakDetector, CacheBreakEvent, CacheFingerprint, diff_fingerprints,
@@ -326,10 +321,6 @@ pub use astra_turn_core::{
     },
     hook_plans::{SnapshotLinkPlan, build_snapshot_link_plan},
     observer::{build_observer_messages, should_run_observer},
-    persist::{
-        LlmResponsePersistPlan, PersistEventPayload, build_llm_response_persist_plan,
-        build_tool_call_event_payload, build_tool_result_event_payload,
-    },
     response_guard::{is_prompt_leaked, is_repetition_loop},
     routing::build_skipped_routing_metadata,
     stall::{

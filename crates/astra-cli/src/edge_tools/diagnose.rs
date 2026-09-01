@@ -176,7 +176,6 @@ impl ToolExecutor {
                     ),
                     ("search", vec!["grep", "glob", "symbols", "lsp"]),
                     ("git", vec!["git"]),
-                    ("tasks", vec!["task_board"]),
                     ("utility", vec!["bash", "web_fetch", "sleep", "ask_user"]),
                 ];
                 let mut cat_status = serde_json::Map::new();
@@ -203,64 +202,6 @@ impl ToolExecutor {
             }
 
             result.insert("tools".to_string(), json!(tools_info));
-        }
-
-        // Task status
-        if category == "all" || category == "tasks" {
-            let tasks = match self.task_manager.load_tasks().await {
-                Ok(tasks) => tasks,
-                Err(error) => {
-                    result.insert(
-                        "tasks".to_string(),
-                        json!({
-                            "available": false,
-                            "error": error,
-                            "message": "Task board could not be loaded; do not treat this as zero tasks.",
-                        }),
-                    );
-                    return json!(result).to_string();
-                }
-            };
-
-            let mut tasks_info = serde_json::Map::new();
-            tasks_info.insert("available".to_string(), json!(true));
-            tasks_info.insert("total".to_string(), json!(tasks.len()));
-
-            let pending = tasks.iter().filter(|t| t.status.is_pending()).count();
-            let in_progress = tasks.iter().filter(|t| t.status.is_in_progress()).count();
-            let paused = tasks
-                .iter()
-                .filter(|t| t.status == astra_tools::task_mgmt::SessionTaskStatusKind::Paused)
-                .count();
-            let completed = tasks.iter().filter(|t| t.status.is_completed()).count();
-            let failed = tasks.iter().filter(|t| t.status.is_unsuccessful()).count();
-
-            tasks_info.insert("pending".to_string(), json!(pending));
-            tasks_info.insert("in_progress".to_string(), json!(in_progress));
-            tasks_info.insert("paused".to_string(), json!(paused));
-            tasks_info.insert(
-                "open_work".to_string(),
-                json!(pending + in_progress + paused),
-            );
-            tasks_info.insert("completed".to_string(), json!(completed));
-            tasks_info.insert("failed_or_cancelled".to_string(), json!(failed));
-
-            if verbose && !tasks.is_empty() {
-                let task_list: Vec<Value> = tasks
-                    .iter()
-                    .map(|t| {
-                        json!({
-                            "id": t.id,
-                            "title": t.title,
-                            "status": t.status,
-                            "subtasks": t.subtasks.len()
-                        })
-                    })
-                    .collect();
-                tasks_info.insert("list".to_string(), json!(task_list));
-            }
-
-            result.insert("tasks".to_string(), json!(tasks_info));
         }
 
         // Session info

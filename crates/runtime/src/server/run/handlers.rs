@@ -18,6 +18,11 @@ pub(crate) fn transform_stream_run_events_for_client_with_pending(
 
     for event in events {
         let index = event.get("index").cloned();
+        let producer_run_id = event
+            .get("run_id")
+            .or_else(|| event.get("data").and_then(|data| data.get("run_id")))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         let event_type = event
             .get("event_type")
             .or_else(|| event.get("type"))
@@ -36,8 +41,16 @@ pub(crate) fn transform_stream_run_events_for_client_with_pending(
             .and_then(|data| data.get("interrupted"))
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
+        let run_finished_owner_generation = event
+            .get("data")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|data| data.get("owner_generation"))
+            .cloned();
 
-        if event_type == "run_error" {
+        let event_belongs_to_root = producer_run_id
+            .as_deref()
+            .is_none_or(|producer_run_id| producer_run_id == run_id);
+        if event_type == "run_error" && event_belongs_to_root {
             *pending_run_error = event
                 .get("data")
                 .and_then(serde_json::Value::as_object)
@@ -46,38 +59,129 @@ pub(crate) fn transform_stream_run_events_for_client_with_pending(
                 .map(ToOwned::to_owned);
         }
 
-        if event_type == "run_finished" {
+        // The shared physical stream may include descendant lifecycle events.
+        // Only its bound root owns root-level token/context accounting; a
+        // descendant's own physical stream still satisfies this predicate.
+        if event_type == "run_finished" && event_belongs_to_root {
             let data = event
                 .get("data")
                 .and_then(serde_json::Value::as_object)
                 .cloned()
                 .unwrap_or_default();
 
-            let mut usage = serde_json::Map::new();
-            usage.insert(
-                "type".to_string(),
-                serde_json::Value::String("usage".to_string()),
-            );
-            let mut has_usage = false;
-
-            for key in [
+            let has_token_usage = [
                 "prompt_tokens",
                 "completion_tokens",
                 "cache_read_tokens",
                 "cache_creation_tokens",
-                "tool_call_count",
-            ] {
-                if let Some(value) = data.get(key).cloned() {
-                    usage.insert(key.to_string(), value);
-                    has_usage = true;
+            ]
+            .iter()
+            .any(|key| data.contains_key(*key));
+
+            if has_token_usage {
+                let read = |key: &str| match data.get(key) {
+                    None => Some(0),
+                    Some(value) => value.as_u64(),
+                };
+                let normalized = match (
+                    read("prompt_tokens"),
+                    read("cache_read_tokens"),
+                    read("cache_creation_tokens"),
+                    read("completion_tokens"),
+                ) {
+                    (Some(input), Some(cached), Some(created), Some(output)) => {
+                        Some(crate::turn::token_usage::TokenUsage {
+                            input_tokens: input,
+                            cached_input_tokens: cached,
+                            cache_creation_tokens: created,
+                            output_tokens: output,
+                        })
+                    }
+                    _ => {
+                        tracing::warn!(
+                            run_id,
+                            index = ?index,
+                            "run terminal contained malformed token usage; suppressing its external usage projection"
+                        );
+                        None
+                    }
+                };
+                if let Some(normalized) = normalized {
+                    let mut usage = normalized.to_json_map();
+                    usage.insert(
+                        "type".to_string(),
+                        serde_json::Value::String("usage".to_string()),
+                    );
+                    usage.insert(
+                        "usage_scope".to_string(),
+                        serde_json::Value::String("run_total".to_string()),
+                    );
+                    if let Some(tool_call_count) = data
+                        .get("tool_call_count")
+                        .and_then(serde_json::Value::as_u64)
+                    {
+                        usage.insert(
+                            "tool_call_count".to_string(),
+                            serde_json::Value::from(tool_call_count),
+                        );
+                    }
+                    if let Some(index) = index.clone() {
+                        usage.insert("index".to_string(), index);
+                    }
+                    transformed_events.push(serde_json::Value::Object(usage));
                 }
             }
 
-            if has_usage {
-                if let Some(index) = index.clone() {
-                    usage.insert("index".to_string(), index);
+            // `run_finished` records an accounting total.  A separate,
+            // explicitly scoped event exposes the final physical request for
+            // context-window and cache-rate UI without guessing from totals.
+            let latest_request = data
+                .get("last_request_usage")
+                .and_then(serde_json::Value::as_object);
+            if let Some(latest_request) = latest_request {
+                let read = |key: &str| latest_request.get(key).and_then(serde_json::Value::as_u64);
+                match (
+                    read("prompt_tokens"),
+                    read("cache_read_tokens"),
+                    read("cache_creation_tokens"),
+                    read("completion_tokens"),
+                ) {
+                    (
+                        Some(input_tokens),
+                        Some(cached_input_tokens),
+                        Some(cache_creation_tokens),
+                        Some(output_tokens),
+                    ) => {
+                        let mut context_usage = serde_json::Map::new();
+                        context_usage.insert(
+                            "type".to_string(),
+                            serde_json::Value::String("context_usage".to_string()),
+                        );
+                        context_usage.insert(
+                            "input_tokens".to_string(),
+                            serde_json::Value::from(input_tokens),
+                        );
+                        context_usage.insert(
+                            "cached_input_tokens".to_string(),
+                            serde_json::Value::from(cached_input_tokens),
+                        );
+                        context_usage.insert(
+                            "cache_creation_tokens".to_string(),
+                            serde_json::Value::from(cache_creation_tokens),
+                        );
+                        context_usage.insert(
+                            "output_tokens".to_string(),
+                            serde_json::Value::from(output_tokens),
+                        );
+                        if let Some(index) = index.clone() {
+                            context_usage.insert("index".to_string(), index);
+                        }
+                        transformed_events.push(serde_json::Value::Object(context_usage));
+                    }
+                    _ => {
+                        tracing::warn!(run_id, index = ?index, "run terminal contained malformed latest request usage; suppressing its context projection")
+                    }
                 }
-                transformed_events.push(serde_json::Value::Object(usage));
             }
         }
 
@@ -97,12 +201,20 @@ pub(crate) fn transform_stream_run_events_for_client_with_pending(
         {
             obj.insert(
                 "run_id".to_string(),
-                serde_json::Value::String(run_id.to_string()),
+                serde_json::Value::String(
+                    producer_run_id
+                        .clone()
+                        .unwrap_or_else(|| run_id.to_string()),
+                ),
             );
         }
         if event_type == "run_finished"
+            && event_belongs_to_root
             && let Some(obj) = transformed.as_object_mut()
         {
+            if let Some(owner_generation) = run_finished_owner_generation {
+                obj.insert("owner_generation".to_string(), owner_generation);
+            }
             let status = if obj.get("status").is_some() {
                 None
             } else if run_finished_cancelled {
@@ -154,6 +266,7 @@ fn should_inject_run_id(event_type: &str) -> bool {
             | "provider_interaction_resolved"
             | "user_intent"
             | "user_intent_applied"
+            | "user_intent_returned"
             | "run_finished"
     ) || event_type == "run_blocked"
 }
@@ -558,6 +671,7 @@ pub(crate) struct RunUserIntentResponse {
     pub intent_id: String,
     pub status: astra_turn_types::UserIntentStatus,
     pub duplicate: bool,
+    pub event_index: i64,
 }
 
 pub(crate) async fn submit_run_user_intent_handler(
@@ -585,6 +699,7 @@ pub(crate) async fn submit_run_user_intent_handler(
         intent_id: result.intent_id,
         status: result.status,
         duplicate: result.duplicate,
+        event_index: result.event_index,
     }))
 }
 
@@ -954,6 +1069,47 @@ mod tests {
     }
 
     #[test]
+    fn transform_stream_run_events_for_client_projects_live_work_board_updates() {
+        // This is the actual HTTP/SSE boundary, not just the services
+        // projector.  A canonical Work receipt is emitted as a raw live
+        // event, whereas reconnect replay uses the durable event envelope.
+        // Both must reach interactive clients as the same small public shape.
+        let update = json!({
+            "schema_version": 1,
+            "work_id": "work-1",
+            "branch_id": "branch-1",
+            "kind": "snapshot",
+            "goal": "Inspect two files",
+            "graph_revision": 2,
+            "criteria_member_count": 0,
+            "tasks": []
+        });
+
+        let transformed = transform_stream_run_events_for_client(
+            "run-123",
+            vec![json!({
+                "type": "work_task_board_update",
+                "session_id": "session-1",
+                "tool_call_id": "call-1",
+                "task_board_update": update,
+                "internal_diagnostic": "must not cross the SSE boundary",
+                "index": 9,
+            })],
+        );
+
+        assert_eq!(
+            transformed,
+            vec![json!({
+                "type": "work_task_board_update",
+                "session_id": "session-1",
+                "tool_call_id": "call-1",
+                "task_board_update": update,
+                "index": 9,
+            })]
+        );
+    }
+
+    #[test]
     fn run_list_query_rejects_legacy_offset_param() {
         let legacy_uri: Uri = "/runs?limit=10&offset=5".parse().unwrap();
         assert!(
@@ -1016,7 +1172,17 @@ mod tests {
         );
         assert_eq!(
             transformed[1],
-            json!({"type": "usage", "prompt_tokens": 7, "completion_tokens": 3, "tool_call_count": 2, "index": 11})
+            json!({
+                "type": "usage",
+                "input_tokens": 7,
+                "cached_input_tokens": 0,
+                "cache_creation_tokens": 0,
+                "output_tokens": 3,
+                "total_tokens": 10,
+                "usage_scope": "run_total",
+                "tool_call_count": 2,
+                "index": 11
+            })
         );
         assert_eq!(
             transformed[2],
@@ -1032,11 +1198,122 @@ mod tests {
         );
         assert_eq!(
             transformed[3],
-            json!({"type": "usage", "prompt_tokens": 1, "completion_tokens": 0, "index": 12})
+            json!({
+                "type": "usage",
+                "input_tokens": 1,
+                "cached_input_tokens": 0,
+                "cache_creation_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 1,
+                "usage_scope": "run_total",
+                "index": 12
+            })
         );
         assert_eq!(
             transformed[4],
             json!({"type": "run_finished", "run_id": "run-123", "status": "cancelled", "index": 12})
+        );
+    }
+
+    #[test]
+    fn projected_terminal_usage_is_accepted_by_the_chat_sse_consumer() {
+        let projected = transform_stream_run_events_for_client(
+            "run-usage-boundary",
+            vec![json!({
+                "event_type": "run_finished",
+                "data": {
+                    "prompt_tokens": 7,
+                    "cache_read_tokens": 11,
+                    "cache_creation_tokens": 2,
+                    "completion_tokens": 3
+                },
+                "index": 4
+            })],
+        );
+        let usage = projected
+            .iter()
+            .find(|event| event["type"] == "usage")
+            .expect("terminal projection must include usage");
+        assert!(usage.get("prompt_tokens").is_none());
+        assert!(usage.get("completion_tokens").is_none());
+
+        let mut accumulated = astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum::default();
+        astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+            &format!("data: {}\n\n", serde_json::to_string(usage).unwrap()),
+            &mut accumulated,
+            &mut Vec::new(),
+        );
+
+        assert!(accumulated.error_message.is_none(), "{accumulated:?}");
+        assert!(accumulated.has_usage);
+        assert!(accumulated.usage_is_run_total);
+        assert_eq!(accumulated.current_request_usage, None);
+        assert_eq!(accumulated.prompt_tokens, 7);
+        assert_eq!(accumulated.cache_read_tokens, 11);
+        assert_eq!(accumulated.cache_creation_tokens, 2);
+        assert_eq!(accumulated.completion_tokens, 3);
+    }
+
+    #[test]
+    fn terminal_projection_keeps_accounting_total_separate_from_context_usage() {
+        let projected = transform_stream_run_events_for_client(
+            "run-usage-scope",
+            vec![json!({
+                "event_type": "run_finished",
+                "data": {
+                    "prompt_tokens": 2_127_556,
+                    "cache_read_tokens": 1_706_112,
+                    "cache_creation_tokens": 0,
+                    "completion_tokens": 34_000,
+                    "last_request_usage": {
+                        "prompt_tokens": 17_250,
+                        "cache_read_tokens": 85_248,
+                        "cache_creation_tokens": 0,
+                        "completion_tokens": 901
+                    }
+                }
+            })],
+        );
+        assert_eq!(projected[0]["type"], "usage");
+        assert_eq!(projected[0]["usage_scope"], "run_total");
+        assert_eq!(projected[1]["type"], "context_usage");
+
+        let mut accumulated = astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum::default();
+        for event in projected.iter().take(2) {
+            astra_turn_core::chat_turn_sse_dispatch::dispatch_chat_turn_sse_event_block(
+                &format!("data: {}\n\n", serde_json::to_string(event).unwrap()),
+                &mut accumulated,
+                &mut Vec::new(),
+            );
+        }
+        assert_eq!(accumulated.prompt_tokens, 2_127_556);
+        assert_eq!(
+            accumulated.current_request_usage,
+            Some(astra_turn_types::RequestTokenUsage {
+                fresh_input_tokens: 17_250,
+                cache_read_tokens: 85_248,
+                cache_creation_tokens: 0,
+                output_tokens: 901,
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_terminal_usage_is_not_relabelled_as_zero() {
+        let projected = transform_stream_run_events_for_client(
+            "run-malformed-usage",
+            vec![json!({
+                "event_type": "run_finished",
+                "data": {"prompt_tokens": "seven", "completion_tokens": 3},
+                "index": 4
+            })],
+        );
+
+        assert!(projected.iter().all(|event| event["type"] != "usage"));
+        assert!(
+            projected
+                .iter()
+                .any(|event| event["type"] == "run_finished")
         );
     }
 
@@ -1082,7 +1359,16 @@ mod tests {
         );
         assert_eq!(
             transformed[1],
-            json!({"type": "usage", "prompt_tokens": 7, "completion_tokens": 3, "index": 11})
+            json!({
+                "type": "usage",
+                "input_tokens": 7,
+                "cached_input_tokens": 0,
+                "cache_creation_tokens": 0,
+                "output_tokens": 3,
+                "total_tokens": 10,
+                "usage_scope": "run_total",
+                "index": 11
+            })
         );
         assert_eq!(
             transformed[2],
@@ -1216,6 +1502,35 @@ mod tests {
     }
 
     #[test]
+    fn transform_stream_run_events_for_client_preserves_returned_intent_identity() {
+        let transformed = transform_stream_run_events_for_client(
+            "run-123",
+            vec![json!({
+                "type": "user_intent_returned",
+                "intent_id": "input-8",
+                "delivery": "guide_current_run",
+                "status": "returned",
+                "event_index": 8,
+                "content": "preserve this draft",
+                "index": 9,
+            })],
+        );
+        assert_eq!(
+            transformed,
+            vec![json!({
+                "type": "user_intent_returned",
+                "run_id": "run-123",
+                "intent_id": "input-8",
+                "delivery": "guide_current_run",
+                "status": "returned",
+                "event_index": 8,
+                "content": "preserve this draft",
+                "index": 9,
+            })]
+        );
+    }
+
+    #[test]
     fn transform_stream_run_events_for_client_injects_run_id_into_blocked_events() {
         let transformed = transform_stream_run_events_for_client(
             "run-123",
@@ -1291,6 +1606,7 @@ mod tests {
         engine
             .append_event(
                 "u1",
+                "session-http",
                 "run-durable-http",
                 json!({"event_type": "text_done", "data": {"full_text": "durable final answer"}}),
             )
@@ -1299,6 +1615,7 @@ mod tests {
         engine
             .append_event(
                 "u1",
+                "session-http",
                 "run-durable-http",
                 json!({"event_type": "run_finished", "data": {"prompt_tokens": 2, "completion_tokens": 1}}),
             )
@@ -1307,6 +1624,7 @@ mod tests {
         engine
             .persist_status(
                 "u1",
+                "session-http",
                 "run-durable-http",
                 astra_core::STATUS_COMPLETED,
                 None,
@@ -1390,6 +1708,7 @@ mod tests {
         engine
             .append_event(
                 "provider-user-1",
+                "session-provider-stream",
                 "run-provider-stream",
                 json!({"event_type": "run_finished", "data": {"status": "completed"}}),
             )
@@ -1398,6 +1717,7 @@ mod tests {
         engine
             .persist_status(
                 "provider-user-1",
+                "session-provider-stream",
                 "run-provider-stream",
                 astra_core::STATUS_COMPLETED,
                 None,
@@ -1480,6 +1800,8 @@ mod tests {
         let run_id = format!("run-replay-http-it-{}", Uuid::new_v4());
         let session_id = format!("session-replay-http-it-{}", Uuid::new_v4());
         cleanup_run_http_fixture(&shared_pool, user_id, &run_id).await;
+        crate::server::run::insert_active_run_session_fixture(&shared_pool, user_id, &session_id)
+            .await;
 
         let store: Arc<dyn RunStateStore> = Arc::new(
             DatabaseRunStateStore::new(shared_pool.clone())
@@ -1529,6 +1851,7 @@ mod tests {
         let transitioned = engine
             .transition_status_with_events_if_current(
                 user_id,
+                &session_id,
                 &run_id,
                 &[astra_core::STATUS_RUNNING],
                 astra_core::STATUS_COMPLETED,
@@ -1641,6 +1964,7 @@ mod tests {
         );
 
         cleanup_run_http_fixture(&shared_pool, user_id, &run_id).await;
+        crate::server::run::cleanup_run_session_fixture(&shared_pool, user_id, &session_id).await;
     }
 
     #[tokio::test]
@@ -1657,6 +1981,7 @@ mod tests {
         engine
             .append_event(
                 "u1",
+                "session-projection",
                 "run-projection-http",
                 json!({
                     "event_type": "workspace_bound",
@@ -1683,6 +2008,7 @@ mod tests {
         engine
             .append_event(
                 "u1",
+                "session-projection",
                 "run-projection-http",
                 json!({"event_type": "injection_freshness", "data": {"fingerprint": "secret"}}),
             )
@@ -1691,6 +2017,7 @@ mod tests {
         engine
             .append_event(
                 "u1",
+                "session-projection",
                 "run-projection-http",
                 json!({"event_type": "text_done", "data": {"full_text": "durable answer"}}),
             )
@@ -1699,6 +2026,7 @@ mod tests {
         engine
             .append_event(
                 "u1",
+                "session-projection",
                 "run-projection-http",
                 json!({"event_type": "run_error", "data": {"error": "boom"}}),
             )
@@ -1707,18 +2035,20 @@ mod tests {
         engine
             .append_event(
                 "u1",
+                "session-projection",
                 "run-projection-http",
                 json!({"event_type": "run_finished", "data": {"prompt_tokens": 5, "completion_tokens": 2}}),
             )
             .await
             .expect("persist run finished");
         engine
-            .persist_usage("u1", "run-projection-http", 5, 2, 0)
+            .persist_usage("u1", "session-projection", "run-projection-http", 5, 2, 0)
             .await
             .expect("persist usage");
         engine
             .persist_checkpoint(
                 "u1",
+                "session-projection",
                 "run-projection-http",
                 r#"{"version":"checkpoint_v3","graceful":true,"last_batch_id":"batch-run-projection"}"#,
             )
@@ -1727,6 +2057,7 @@ mod tests {
         engine
             .persist_status(
                 "u1",
+                "session-projection",
                 "run-projection-http",
                 astra_core::STATUS_FAILED,
                 None,
@@ -1851,6 +2182,7 @@ mod tests {
         engine
             .transition_status_with_events_if_current(
                 "u1",
+                "session-projection",
                 "run-projection-repair-http",
                 &[astra_core::STATUS_RUNNING],
                 astra_core::STATUS_FAILED,
@@ -1934,6 +2266,8 @@ mod tests {
         let run_id = format!("run-http-it-{}", Uuid::new_v4());
         let session_id = format!("session-http-it-{}", Uuid::new_v4());
         cleanup_run_http_fixture(&shared_pool, user_id, &run_id).await;
+        crate::server::run::insert_active_run_session_fixture(&shared_pool, user_id, &session_id)
+            .await;
 
         let store: Arc<dyn RunStateStore> = Arc::new(
             DatabaseRunStateStore::new(shared_pool.clone())
@@ -1947,6 +2281,7 @@ mod tests {
         let checkpoint_saved = engine
             .persist_checkpoint(
                 user_id,
+                &session_id,
                 &run_id,
                 r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"http-repair-it"}"#,
             )
@@ -1956,6 +2291,7 @@ mod tests {
         let transitioned = engine
             .transition_status_with_events_if_current(
                 user_id,
+                &session_id,
                 &run_id,
                 &[astra_core::STATUS_RUNNING],
                 astra_core::STATUS_FAILED,
@@ -2078,6 +2414,7 @@ mod tests {
         assert_eq!(db_checkpoint_version.as_deref(), Some("checkpoint_v2"));
 
         cleanup_run_http_fixture(&shared_pool, user_id, &run_id).await;
+        crate::server::run::cleanup_run_session_fixture(&shared_pool, user_id, &session_id).await;
     }
 
     #[tokio::test]

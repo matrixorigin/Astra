@@ -3,6 +3,11 @@
 use std::pin::Pin;
 use std::time::Duration;
 
+use astra_server_types::{
+    WORK_API_MAJOR, WORK_API_MAJOR_HEADER, WorkBranchAttachRequestV1,
+    WorkBranchControlOperationRequestV1, WorkCreateRequestV1, WorkSessionBindingResponseV1,
+    WorkTurnRequestV1,
+};
 use astra_sync_protocol::{
     SYNC_OUTBOX_SIGNATURE_HEADER, SyncOutboxAck, sync_outbox_request_signature,
 };
@@ -22,13 +27,38 @@ use crate::protocol::{
     ApprovalRespondRequest, ChatStreamRequest, EdgeHeartbeatRequest, EdgeHeartbeatResponse,
     EdgeRegisterRequest, ProviderInteractionRespondRequest, RunUserIntentRequest,
     RunUserIntentResponse, SessionCreateRequest, SessionTranscriptPage, SessionTranscriptReadScope,
-    SessionUpdateRequest, StreamEvent, TaskLeaseMutationRequest, ToolResultRequest,
-    UserPromptRespondRequest,
+    SessionUpdateRequest, StreamEvent, ToolResultRequest, UserPromptRespondRequest,
 };
 use crate::sse::SseParser;
+use crate::work::WorkTaskGraphPageV2;
 
 const HTTP_STREAM_CONNECT_TIMEOUT_SECS: u64 = 60;
 const AUTHED_TEXT_REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Edge callbacks are control-plane acknowledgements, not long-lived streams.
+/// A peer that accepts bytes but never returns response headers must not stop
+/// the SSE consumer indefinitely. Server handlers are idempotent for an
+/// identical request, so one immediate transport retry is safe.
+const CONTROL_CALLBACK_TIMEOUT_SECS: u64 = 10;
+const CONTROL_CALLBACK_ATTEMPTS: usize = 2;
+const HEALTH_REQUEST_TIMEOUT_SECS: u64 = 10;
+
+fn stream_event_is_terminal(event: &StreamEvent) -> bool {
+    matches!(
+        event,
+        StreamEvent::TurnComplete { .. }
+            | StreamEvent::RunFinished { .. }
+            | StreamEvent::RunCancelled { .. }
+            | StreamEvent::RunError { .. }
+            | StreamEvent::RunInterrupted { .. }
+            | StreamEvent::RunPaused { .. }
+            | StreamEvent::RunWaiting { .. }
+            | StreamEvent::Done { .. }
+            | StreamEvent::Error {
+                retryable: false,
+                ..
+            }
+    )
+}
 
 #[cfg(test)]
 thread_local! {
@@ -37,7 +67,7 @@ thread_local! {
     /// <100ms instead of waiting for real backoffs. Production ignores this.
     static TEST_RETRY_SLEEP_OVERRIDE_MS: std::cell::RefCell<Option<u64>> =
         const { std::cell::RefCell::new(None) };
-    /// Test probe: the last `delay_secs` `post_chat_turn_retry_429` decided to
+    /// Test probe: the last retry delay selected for developer-loop admission.
     /// wait for. Recorded regardless of the sleep override, so tests can
     /// assert the policy (`Retry-After`, exponential) without relying on
     /// wall-clock timing.
@@ -192,6 +222,15 @@ impl ThinClient {
         h
     }
 
+    fn work_api_headers(token: &str) -> Result<HeaderMap, ThinClientError> {
+        let mut headers = Self::bearer_headers(token)?;
+        headers.insert(
+            WORK_API_MAJOR_HEADER,
+            HeaderValue::from_static(WORK_API_MAJOR),
+        );
+        Ok(headers)
+    }
+
     fn resolved_bearer_token<'a>(&'a self, token_override: Option<&'a str>) -> Option<&'a str> {
         token_override.or(self.bearer_token.as_deref())
     }
@@ -211,6 +250,20 @@ impl ThinClient {
             return Ok(Value::Null);
         }
         Ok(serde_json::from_str(&text)?)
+    }
+
+    /// Callback handlers commit the decision before replying and callers do
+    /// not consume a response payload. A successful status is therefore the
+    /// acknowledgement boundary; waiting for an optional JSON body can turn
+    /// an already-committed callback into a false failure when that body is
+    /// delayed or dropped.
+    async fn callback_ack_or_error(resp: Response) -> Result<Value, ThinClientError> {
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(Value::Null);
+        }
+        let body = resp.text().await.unwrap_or_default();
+        Err(ThinClientError::Api { status, body })
     }
 
     async fn typed_json_or_error<T: DeserializeOwned>(
@@ -363,7 +416,12 @@ impl ThinClient {
 
     pub async fn get_health_text(&self) -> Result<String, ThinClientError> {
         let url = self.url(paths::HEALTH)?;
-        let resp = self.http.get(url).send().await?;
+        let resp = self
+            .http
+            .get(url)
+            .timeout(Duration::from_secs(HEALTH_REQUEST_TIMEOUT_SECS))
+            .send()
+            .await?;
         Self::text_or_api(resp).await
     }
 
@@ -454,6 +512,19 @@ impl ThinClient {
         token: &str,
         timeout: Duration,
     ) -> Result<Response, ThinClientError> {
+        self.get_models_page_response_timeout(token, timeout, None)
+            .await
+    }
+
+    /// Fetch one authoritative model-catalog page. The cursor is the complete
+    /// `(provider, model_name, offering_id)` seek tuple; partial cursors are
+    /// rejected by the server rather than silently changing pagination mode.
+    pub async fn get_models_page_response_timeout(
+        &self,
+        token: &str,
+        timeout: Duration,
+        cursor: Option<(&str, &str, &str)>,
+    ) -> Result<Response, ThinClientError> {
         let url = self.url(paths::MODELS)?;
         tracing::debug!(
             target: "astra_cli::http_proxy",
@@ -463,13 +534,19 @@ impl ThinClient {
             token_len = token.len(),
             "get_models_response_timeout: sending GET /models via self.http (proxy-aware client)"
         );
-        let result = self
+        let mut request = self
             .http
             .get(url.clone())
             .headers(Self::bearer_headers(token)?)
-            .timeout(timeout)
-            .send()
-            .await;
+            .timeout(timeout);
+        if let Some((provider, model_name, model_id)) = cursor {
+            request = request.query(&[
+                ("after_provider", provider),
+                ("after_name", model_name),
+                ("after_offering_id", model_id),
+            ]);
+        }
+        let result = request.send().await;
         match &result {
             Ok(resp) => tracing::debug!(
                 target: "astra_cli::http_proxy",
@@ -487,30 +564,35 @@ impl ThinClient {
         Ok(result?)
     }
 
-    pub async fn get_models_text(&self, token: &str) -> Result<String, ThinClientError> {
-        let url = self.url(paths::MODELS)?;
-        let resp = self
-            .http
-            .get(url)
-            .headers(Self::bearer_headers(token)?)
-            .send()
-            .await?;
-        Self::text_or_api(resp).await
-    }
-
     pub async fn get_model_access_response_timeout(
         &self,
         token: &str,
         timeout: Duration,
     ) -> Result<Response, ThinClientError> {
+        self.get_model_access_page_response_timeout(token, timeout, None)
+            .await
+    }
+
+    pub async fn get_model_access_page_response_timeout(
+        &self,
+        token: &str,
+        timeout: Duration,
+        cursor: Option<(&str, &str, &str)>,
+    ) -> Result<Response, ThinClientError> {
         let url = self.url(paths::MODEL_ACCESS)?;
-        Ok(self
+        let mut request = self
             .http
             .get(url)
             .headers(Self::bearer_headers(token)?)
-            .timeout(timeout)
-            .send()
-            .await?)
+            .timeout(timeout);
+        if let Some((provider, model_name, model_id)) = cursor {
+            request = request.query(&[
+                ("after_provider", provider),
+                ("after_name", model_name),
+                ("after_offering_id", model_id),
+            ]);
+        }
+        Ok(request.send().await?)
     }
 
     pub async fn get_model_text(
@@ -592,6 +674,21 @@ impl ThinClient {
         Self::text_or_api(resp).await
     }
 
+    pub async fn post_session_cancel_text(
+        &self,
+        token: &str,
+        session_id: &str,
+    ) -> Result<String, ThinClientError> {
+        let url = self.url(&paths::session_cancel(session_id))?;
+        let resp = self
+            .http
+            .post(url)
+            .headers(Self::bearer_headers(token)?)
+            .send()
+            .await?;
+        Self::text_or_api(resp).await
+    }
+
     pub async fn delete_session_text(
         &self,
         token: &str,
@@ -605,87 +702,6 @@ impl ThinClient {
             .send()
             .await?;
         Self::text_or_api(resp).await
-    }
-
-    pub async fn post_plans_json(
-        &self,
-        token: &str,
-        body: &Value,
-    ) -> Result<Value, ThinClientError> {
-        let url = self.url(paths::PLANS)?;
-        let resp = self
-            .http
-            .post(url)
-            .headers(Self::bearer_headers(token)?)
-            .json(body)
-            .send()
-            .await?;
-        Self::json_or_error(resp).await
-    }
-
-    pub async fn get_plans_query_json(
-        &self,
-        token: &str,
-        query: &[(&str, String)],
-    ) -> Result<Value, ThinClientError> {
-        let url = self.url(paths::PLANS)?;
-        let resp = self
-            .http
-            .get(url)
-            .headers(Self::bearer_headers(token)?)
-            .query(query)
-            .send()
-            .await?;
-        Self::json_or_error(resp).await
-    }
-
-    pub async fn get_plan_json(
-        &self,
-        token: &str,
-        plan_id: &str,
-    ) -> Result<Value, ThinClientError> {
-        let url = self.url(&paths::plan(plan_id))?;
-        let resp = self
-            .http
-            .get(url)
-            .headers(Self::bearer_headers(token)?)
-            .send()
-            .await?;
-        Self::json_or_error(resp).await
-    }
-
-    pub async fn post_plan_exit_mode_json(
-        &self,
-        token: &str,
-        plan_id: &str,
-        body: &Value,
-    ) -> Result<Value, ThinClientError> {
-        let url = self.url(&paths::plan_exit_mode(plan_id))?;
-        let resp = self
-            .http
-            .post(url)
-            .headers(Self::bearer_headers(token)?)
-            .json(body)
-            .send()
-            .await?;
-        Self::json_or_error(resp).await
-    }
-
-    pub async fn post_plan_rewind_json(
-        &self,
-        token: &str,
-        plan_id: &str,
-        body: &Value,
-    ) -> Result<Value, ThinClientError> {
-        let url = self.url(&paths::plan_rewind(plan_id))?;
-        let resp = self
-            .http
-            .post(url)
-            .headers(Self::bearer_headers(token)?)
-            .json(body)
-            .send()
-            .await?;
-        Self::json_or_error(resp).await
     }
 
     pub async fn get_session_artifact_latest_text(
@@ -820,22 +836,6 @@ impl ThinClient {
         Self::text_or_api(resp).await
     }
 
-    pub async fn post_skills_test_json(
-        &self,
-        token: &str,
-        body: &Value,
-    ) -> Result<String, ThinClientError> {
-        let url = self.url(paths::SKILLS_TEST)?;
-        let resp = self
-            .http
-            .post(url)
-            .headers(Self::bearer_headers(token)?)
-            .json(body)
-            .send()
-            .await?;
-        Self::text_or_api(resp).await
-    }
-
     // ── Memory proxy ───────────────────────────────────────────────────────
 
     pub async fn post_memory_store_json(
@@ -897,23 +897,6 @@ impl ThinClient {
             .send()
             .await?)
     }
-    // ── Jobs (§5.5 state CRUD — `router_builder`) ───────────────────────────
-
-    pub async fn get_agent_jobs_query_text(
-        &self,
-        token: &str,
-        query: &[(&str, String)],
-    ) -> Result<String, ThinClientError> {
-        let url = self.url(paths::AGENT_JOBS)?;
-        let resp = self
-            .http
-            .get(url)
-            .headers(Self::bearer_headers(token)?)
-            .query(query)
-            .send()
-            .await?;
-        Self::text_or_api(resp).await
-    }
     // ── Context snapshots ──────────────────────────────────────────────────
     /// `POST /v1/chat/completions` — governed non-streaming model invocation.
     ///
@@ -940,6 +923,215 @@ impl ThinClient {
         Self::typed_json_or_error(resp).await
     }
 
+    // ── Work ───────────────────────────────────────────────────────────────
+
+    /// Atomically create one Work with a server-owned branch and conversation.
+    pub async fn post_work(
+        &self,
+        token: &str,
+        request: &WorkCreateRequestV1,
+    ) -> Result<Value, ThinClientError> {
+        let url = self.url(paths::WORKS)?;
+        let response = self
+            .http
+            .post(url)
+            .headers(Self::work_api_headers(token)?)
+            .json(request)
+            .send()
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// Read one bounded public Work observation.
+    pub async fn get_work(&self, token: &str, work_id: &str) -> Result<Value, ThinClientError> {
+        let path = paths::work(work_id)
+            .ok_or_else(|| ThinClientError::InvalidInput("invalid work_id".into()))?;
+        let response = self
+            .http
+            .get(self.url(&path)?)
+            .headers(Self::work_api_headers(token)?)
+            .send()
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// Resolve one already-known session to the public Work branch that owns
+    /// it. A session that is not Work-backed is a typed 404, never an empty or
+    /// guessed binding.
+    pub async fn get_work_session_binding(
+        &self,
+        token: &str,
+        session_id: &str,
+    ) -> Result<WorkSessionBindingResponseV1, ThinClientError> {
+        let path = paths::work_session_binding(session_id)
+            .ok_or_else(|| ThinClientError::InvalidInput("invalid session_id".into()))?;
+        let response = self
+            .http
+            .get(self.url(&path)?)
+            .headers(Self::work_api_headers(token)?)
+            .send()
+            .await?;
+        Self::typed_json_or_error(response).await
+    }
+
+    /// Promote an existing active conversation into canonical Work. The
+    /// server preserves the session identity and rejects promotion while a
+    /// run owns the session, so clients never need a local binding authority.
+    pub async fn post_work_session_binding(
+        &self,
+        token: &str,
+        session_id: &str,
+        request: &WorkCreateRequestV1,
+    ) -> Result<Value, ThinClientError> {
+        let path = paths::work_session_binding(session_id)
+            .ok_or_else(|| ThinClientError::InvalidInput("invalid session_id".into()))?;
+        let response = self
+            .http
+            .post(self.url(&path)?)
+            .headers(Self::work_api_headers(token)?)
+            .json(request)
+            .send()
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// Read one bounded Task Graph page for a Work branch. Continuation calls
+    /// must carry the exact graph revision returned by the first page so a
+    /// client cannot splice pages from concurrent replans.
+    pub async fn get_work_branch_task_graph_page(
+        &self,
+        token: &str,
+        work_id: &str,
+        branch_id: &str,
+        graph_revision: Option<i64>,
+        item_offset: u16,
+        dependency_offset: u16,
+    ) -> Result<WorkTaskGraphPageV2, ThinClientError> {
+        if (item_offset > 0 || dependency_offset > 0) && graph_revision.is_none() {
+            return Err(ThinClientError::InvalidInput(
+                "Task Graph continuation requires graph_revision".into(),
+            ));
+        }
+        if graph_revision.is_some_and(|revision| revision <= 0) {
+            return Err(ThinClientError::InvalidInput(
+                "invalid Task Graph revision".into(),
+            ));
+        }
+        let path = paths::work_branch_task_graph(work_id, branch_id)
+            .ok_or_else(|| ThinClientError::InvalidInput("invalid work_id or branch_id".into()))?;
+        let mut query = Vec::with_capacity(3);
+        if let Some(revision) = graph_revision {
+            query.push(("graph_revision", revision.to_string()));
+        }
+        if item_offset > 0 {
+            query.push(("item_offset", item_offset.to_string()));
+        }
+        if dependency_offset > 0 {
+            query.push(("dependency_offset", dependency_offset.to_string()));
+        }
+        let response = self.http.get(self.url(&path)?);
+        let response = if query.is_empty() {
+            response
+        } else {
+            response.query(&query)
+        }
+        .headers(Self::work_api_headers(token)?)
+        .send()
+        .await?;
+        let page: WorkTaskGraphPageV2 = Self::typed_json_or_error(response).await?;
+        page.validate().map_err(|reason| {
+            ThinClientError::Json(<serde_json::Error as serde::de::Error>::custom(reason))
+        })?;
+        Ok(page)
+    }
+
+    /// Establish a durable attachment to the current Work branch head.
+    pub async fn post_work_branch_attachment(
+        &self,
+        token: &str,
+        work_id: &str,
+        branch_id: &str,
+        request: &WorkBranchAttachRequestV1,
+    ) -> Result<Value, ThinClientError> {
+        let path = paths::work_branch_attachments(work_id, branch_id)
+            .ok_or_else(|| ThinClientError::InvalidInput("invalid work_id or branch_id".into()))?;
+        let response = self
+            .http
+            .post(self.url(&path)?)
+            .headers(Self::work_api_headers(token)?)
+            .json(request)
+            .send()
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// Submit one typed controller acquire/release/takeover operation.
+    pub async fn post_work_branch_control_operation(
+        &self,
+        token: &str,
+        work_id: &str,
+        branch_id: &str,
+        request: &WorkBranchControlOperationRequestV1,
+    ) -> Result<Value, ThinClientError> {
+        let path = paths::work_branch_control_operations(work_id, branch_id)
+            .ok_or_else(|| ThinClientError::InvalidInput("invalid work_id or branch_id".into()))?;
+        let response = self
+            .http
+            .post(self.url(&path)?)
+            .headers(Self::work_api_headers(token)?)
+            .json(request)
+            .send()
+            .await?;
+        Self::json_or_error(response).await
+    }
+
+    /// Release one exact read-only attachment after any controller authority
+    /// has been released through a control operation.
+    pub async fn delete_work_branch_attachment(
+        &self,
+        token: &str,
+        work_id: &str,
+        branch_id: &str,
+        attachment_id: &str,
+    ) -> Result<(), ThinClientError> {
+        let path =
+            paths::work_branch_attachment(work_id, branch_id, attachment_id).ok_or_else(|| {
+                ThinClientError::InvalidInput("invalid work_id, branch_id, or attachment_id".into())
+            })?;
+        let response = self
+            .http
+            .delete(self.url(&path)?)
+            .headers(Self::work_api_headers(token)?)
+            .send()
+            .await?;
+        Self::text_or_api(response).await.map(|_| ())
+    }
+
+    /// Start one server-owned Work turn and return its SSE response. The caller
+    /// may stream edge-tool callbacks while the response body remains open.
+    pub async fn post_work_branch_turn(
+        &self,
+        token: &str,
+        work_id: &str,
+        branch_id: &str,
+        request: &WorkTurnRequestV1,
+    ) -> Result<Response, ThinClientError> {
+        let path = paths::work_branch_turns(work_id, branch_id)
+            .ok_or_else(|| ThinClientError::InvalidInput("invalid work_id or branch_id".into()))?;
+        let mut headers = Self::work_api_headers(token)?;
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        Ok(self
+            .http_stream
+            .post(self.url(&path)?)
+            .headers(headers)
+            .json(request)
+            .send()
+            .await?)
+    }
+
     // ── Reflect / decision trace ─────────────────────────────────────────────
 
     /// `path_with_query` is relative to origin, e.g. `chat/session/sid/reflect?topic=execution&facet=trace`.
@@ -963,75 +1155,56 @@ impl ThinClient {
 
     // ── Chat turn (SSE) ─────────────────────────────────────────────────────
 
-    /// Single POST `/chat/turn` with SSE accept header.
-    pub async fn post_chat_turn(
+    /// Start one Server-owned developer loop and return its raw SSE response.
+    ///
+    /// The response remains raw because terminal clients execute typed edge
+    /// callbacks while the same HTTP body is open. The Server, not the client,
+    /// owns model rounds, continuation policy, and terminalization.
+    pub async fn post_developer_loop(
         &self,
         token: &str,
         payload: &Value,
     ) -> Result<Response, ThinClientError> {
-        let url = self.url(paths::CHAT_TURN)?;
+        let url = self.url(paths::CHAT_STREAM)?;
         tracing::debug!(
             target: "astra_cli::http_proxy",
             url = %url,
-            "post_chat_turn: sending POST /chat/turn via http_stream (proxy-aware streaming client)"
+            "starting Server-owned developer loop"
         );
         let mut headers = Self::bearer_headers(token)?;
         headers.insert(
             header::ACCEPT,
             HeaderValue::from_static("text/event-stream"),
         );
-        let result = self
-            .http_stream
-            .post(url.clone())
-            .headers(headers)
-            .json(payload)
-            .send()
-            .await;
-        match &result {
-            Ok(resp) => tracing::debug!(
-                target: "astra_cli::http_proxy",
-                url = %url,
-                status = %resp.status(),
-                "post_chat_turn: response received"
-            ),
-            Err(e) => tracing::warn!(
-                target: "astra_cli::http_proxy",
-                url = %url,
-                error = %e,
-                "post_chat_turn: request failed"
-            ),
-        }
-        Ok(result?)
-    }
-
-    /// Same as [`Self::post_chat_turn`] but with a per-request timeout (e.g. LLM tool-selection probe).
-    pub async fn post_chat_turn_timeout(
-        &self,
-        token: &str,
-        payload: &Value,
-        timeout: Duration,
-    ) -> Result<Response, ThinClientError> {
-        let url = self.url(paths::CHAT_TURN)?;
-        let mut headers = Self::bearer_headers(token)?;
-        headers.insert(
-            header::ACCEPT,
-            HeaderValue::from_static("text/event-stream"),
-        );
-        Ok(self
+        let response = self
             .http_stream
             .post(url)
-            .timeout(timeout)
             .headers(headers)
             .json(payload)
             .send()
-            .await?)
+            .await?;
+        if response.status().is_success() {
+            let actual = response
+                .headers()
+                .get(astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("missing");
+            if actual != astra_server_types::AGENT_INTERACTION_API_MAJOR {
+                return Err(ThinClientError::IncompatibleRuntime {
+                    expected: astra_server_types::AGENT_INTERACTION_API_MAJOR.to_string(),
+                    actual: actual.to_string(),
+                });
+            }
+        }
+        Ok(response)
     }
 
-    /// Retry on 429 and transport errors up to `max_attempts`, honouring `Retry-After` header.
+    /// Retry Server-owned loop admission on 429 and transport errors.
     ///
-    /// Transport errors (connection reset, timeout) are retried with exponential backoff.
-    /// The total retry budget is capped at `max_attempts` across both 429s and transport errors.
-    pub async fn post_chat_turn_retry_429(
+    /// A retry is safe only before response headers arrive. Once the response
+    /// is returned, durable run identity and stream reconciliation belong to
+    /// the Server lifecycle.
+    pub async fn post_developer_loop_retry_429(
         &self,
         token: &str,
         payload: &Value,
@@ -1040,7 +1213,7 @@ impl ThinClient {
     ) -> Result<Response, ThinClientError> {
         let mut last_err: Option<ThinClientError> = None;
         for attempt in 0..max_attempts {
-            match self.post_chat_turn(token, payload).await {
+            match self.post_developer_loop(token, payload).await {
                 Ok(resp) => {
                     if resp.status().as_u16() == 429 && attempt + 1 < max_attempts {
                         let delay_secs =
@@ -1052,7 +1225,7 @@ impl ThinClient {
                                 delay_secs,
                                 attempt = attempt + 1,
                                 max_attempts,
-                                "rate limited, retrying"
+                                "developer loop admission rate limited, retrying"
                             );
                             eprintln!("  ⏳ Rate limited (429), retrying in {delay_secs}s…");
                         }
@@ -1063,7 +1236,7 @@ impl ThinClient {
                 }
                 Err(e) => {
                     if attempt + 1 < max_attempts && e.is_transport() {
-                        let delay_secs = 1u64 << attempt; // 1s, 2s, 4s…
+                        let delay_secs = 1u64 << attempt;
                         if !quiet {
                             tracing::warn!(
                                 target: "astra.thin_client",
@@ -1071,7 +1244,7 @@ impl ThinClient {
                                 delay_secs,
                                 attempt = attempt + 1,
                                 max_attempts,
-                                "transport error, retrying"
+                                "developer loop admission transport error, retrying"
                             );
                             eprintln!("  ⏳ Transport error, retrying in {delay_secs}s… ({e})");
                         }
@@ -1126,10 +1299,14 @@ impl ThinClient {
             };
             let mut parser = SseParser::new();
             let mut byte_stream = resp.bytes_stream();
+            let mut saw_terminal = false;
             while let Some(chunk) = byte_stream.next().await {
                 let chunk = match chunk {
                     Ok(c) => c,
                     Err(e) => {
+                        if saw_terminal {
+                            return;
+                        }
                         yield Err(e.into());
                         return;
                     }
@@ -1137,10 +1314,14 @@ impl ThinClient {
                 match parser.push_bytes(&chunk) {
                     Ok(evs) => {
                         for ev in evs {
+                            saw_terminal |= stream_event_is_terminal(&ev);
                             yield Ok(ev);
                         }
                     }
                     Err(e) => {
+                        if saw_terminal {
+                            return;
+                        }
                         yield Err(e);
                         return;
                     }
@@ -1149,10 +1330,23 @@ impl ThinClient {
             match parser.finish() {
                 Ok(evs) => {
                     for ev in evs {
+                        saw_terminal |= stream_event_is_terminal(&ev);
                         yield Ok(ev);
                     }
                 }
-                Err(e) => yield Err(e),
+                Err(e) => {
+                    if saw_terminal {
+                        return;
+                    }
+                    yield Err(e);
+                    return;
+                }
+            }
+            if !saw_terminal {
+                yield Err(ThinClientError::SseParse(
+                    "SSE stream ended before a terminal event (run_finished, turn_complete, or interruption)"
+                        .to_string(),
+                ));
             }
         }
         .boxed()
@@ -1523,12 +1717,14 @@ impl ThinClient {
         &self,
         bearer_override: Option<&str>,
         run_id: &str,
+        expected_session_id: &str,
     ) -> Result<Value, ThinClientError> {
         let url = self.url(&paths::chat_run_delegations_pause(run_id))?;
         let resp = self
             .http
             .post(url)
             .headers(self.auth_headers_for(bearer_override))
+            .json(&serde_json::json!({"expected_session_id": expected_session_id}))
             .send()
             .await?;
         Self::json_or_error(resp).await
@@ -1539,12 +1735,14 @@ impl ThinClient {
         &self,
         bearer_override: Option<&str>,
         run_id: &str,
+        expected_session_id: &str,
     ) -> Result<Value, ThinClientError> {
         let url = self.url(&paths::chat_run_delegations_resume(run_id))?;
         let resp = self
             .http
             .post(url)
             .headers(self.auth_headers_for(bearer_override))
+            .json(&serde_json::json!({"expected_session_id": expected_session_id}))
             .send()
             .await?;
         Self::json_or_error(resp).await
@@ -1619,19 +1817,47 @@ impl ThinClient {
         edge_executor_id: Option<&str>,
         body: &ToolResultRequest,
     ) -> Result<Value, ThinClientError> {
+        self.post_tool_result_with_policy(
+            bearer_override,
+            edge_executor_id,
+            body,
+            Duration::from_secs(CONTROL_CALLBACK_TIMEOUT_SECS),
+            CONTROL_CALLBACK_ATTEMPTS,
+        )
+        .await
+    }
+
+    async fn post_tool_result_with_policy(
+        &self,
+        bearer_override: Option<&str>,
+        edge_executor_id: Option<&str>,
+        body: &ToolResultRequest,
+        timeout: Duration,
+        attempts: usize,
+    ) -> Result<Value, ThinClientError> {
         let url = self.url(paths::TOOLS_RESULT)?;
-        let mut req = self
-            .http
-            .post(url)
-            .headers(self.auth_headers_for(bearer_override))
-            .json(body);
-        if let Some(id) = edge_executor_id
-            && let Ok(v) = HeaderValue::from_str(id)
-        {
-            req = req.header(ASTRA_EDGE_ID_HEADER, v);
+        let attempts = attempts.max(1);
+        for attempt in 0..attempts {
+            let mut req = self
+                .http
+                .post(url.clone())
+                .headers(self.auth_headers_for(bearer_override))
+                .timeout(timeout)
+                .json(body);
+            if let Some(id) = edge_executor_id
+                && let Ok(v) = HeaderValue::from_str(id)
+            {
+                req = req.header(ASTRA_EDGE_ID_HEADER, v);
+            }
+            match req.send().await {
+                Ok(resp) => return Self::callback_ack_or_error(resp).await,
+                Err(error)
+                    if attempt + 1 < attempts
+                        && (error.is_connect() || error.is_timeout() || error.is_request()) => {}
+                Err(error) => return Err(error.into()),
+            }
         }
-        let resp = req.send().await?;
-        Self::json_or_error(resp).await
+        unreachable!("at least one callback attempt is required")
     }
 
     pub async fn post_approval(
@@ -1639,15 +1865,42 @@ impl ThinClient {
         bearer_override: Option<&str>,
         body: &ApprovalRespondRequest,
     ) -> Result<Value, ThinClientError> {
+        self.post_approval_with_policy(
+            bearer_override,
+            body,
+            Duration::from_secs(CONTROL_CALLBACK_TIMEOUT_SECS),
+            CONTROL_CALLBACK_ATTEMPTS,
+        )
+        .await
+    }
+
+    async fn post_approval_with_policy(
+        &self,
+        bearer_override: Option<&str>,
+        body: &ApprovalRespondRequest,
+        timeout: Duration,
+        attempts: usize,
+    ) -> Result<Value, ThinClientError> {
         let url = self.url(paths::APPROVAL_RESPOND)?;
-        let resp = self
-            .http
-            .post(url)
-            .headers(self.auth_headers_for(bearer_override))
-            .json(body)
-            .send()
-            .await?;
-        Self::json_or_error(resp).await
+        let attempts = attempts.max(1);
+        for attempt in 0..attempts {
+            match self
+                .http
+                .post(url.clone())
+                .headers(self.auth_headers_for(bearer_override))
+                .timeout(timeout)
+                .json(body)
+                .send()
+                .await
+            {
+                Ok(resp) => return Self::callback_ack_or_error(resp).await,
+                Err(error)
+                    if attempt + 1 < attempts
+                        && (error.is_connect() || error.is_timeout() || error.is_request()) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        unreachable!("at least one callback attempt is required")
     }
 
     /// Submit a response to a durable `ask_user` interaction.
@@ -1656,15 +1909,42 @@ impl ThinClient {
         bearer_override: Option<&str>,
         body: &UserPromptRespondRequest,
     ) -> Result<Value, ThinClientError> {
+        self.post_user_prompt_response_with_policy(
+            bearer_override,
+            body,
+            Duration::from_secs(CONTROL_CALLBACK_TIMEOUT_SECS),
+            CONTROL_CALLBACK_ATTEMPTS,
+        )
+        .await
+    }
+
+    async fn post_user_prompt_response_with_policy(
+        &self,
+        bearer_override: Option<&str>,
+        body: &UserPromptRespondRequest,
+        timeout: Duration,
+        attempts: usize,
+    ) -> Result<Value, ThinClientError> {
         let url = self.url(paths::USER_PROMPT_RESPOND)?;
-        let resp = self
-            .http
-            .post(url)
-            .headers(self.auth_headers_for(bearer_override))
-            .json(body)
-            .send()
-            .await?;
-        Self::json_or_error(resp).await
+        let attempts = attempts.max(1);
+        for attempt in 0..attempts {
+            match self
+                .http
+                .post(url.clone())
+                .headers(self.auth_headers_for(bearer_override))
+                .timeout(timeout)
+                .json(body)
+                .send()
+                .await
+            {
+                Ok(resp) => return Self::callback_ack_or_error(resp).await,
+                Err(error)
+                    if attempt + 1 < attempts
+                        && (error.is_connect() || error.is_timeout() || error.is_request()) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        unreachable!("at least one callback attempt is required")
     }
 
     /// Submit a response to a durable provider interaction.
@@ -1728,119 +2008,6 @@ impl ThinClient {
         let resp = req.send().await?;
         Self::typed_json_or_error(resp).await
     }
-    /// `POST /agent-jobs/{task_id}/lease/claim`
-    pub async fn post_agent_job_lease_claim(
-        &self,
-        bearer_override: Option<&str>,
-        edge_transport_id: Option<&str>,
-        task_id: &str,
-        body: &TaskLeaseMutationRequest,
-    ) -> Result<Value, ThinClientError> {
-        let url = self.url(&paths::agent_job_lease_claim(task_id))?;
-        let mut req = self
-            .http
-            .post(url)
-            .headers(self.auth_headers_for(bearer_override))
-            .json(body);
-        if let Some(id) = edge_transport_id
-            && let Ok(v) = HeaderValue::from_str(id)
-        {
-            req = req.header(ASTRA_EDGE_ID_HEADER, v);
-        }
-        let resp = req.send().await?;
-        Self::json_or_error(resp).await
-    }
-    // ── Plan lifecycle ─────────────────────────────────────────────────────
-
-    /// `POST /plans/{plan_id}/step-runs` — record the start of a subtask
-    /// attempt. Returns the `run_id` the server assigned so the caller can
-    /// pair a later finish call.
-    pub async fn post_plan_step_run_start(
-        &self,
-        token: &str,
-        plan_id: &str,
-        body: &Value,
-    ) -> Result<String, ThinClientError> {
-        let url = self.url(&paths::plan_step_runs(plan_id))?;
-        let resp = self
-            .http
-            .post(url)
-            .headers(Self::bearer_headers(token)?)
-            .json(body)
-            .send()
-            .await?;
-        Self::text_or_api(resp).await
-    }
-
-    /// `POST /plans/{plan_id}/step-runs/completed` — one-shot record of an
-    /// attempt that already reached a terminal state. Saves one HTTP round-trip
-    /// vs. the start + finish pair on the CLI's happy path.
-    pub async fn post_plan_step_run_completed(
-        &self,
-        token: &str,
-        plan_id: &str,
-        body: &Value,
-    ) -> Result<String, ThinClientError> {
-        let url = self.url(&paths::plan_step_run_completed(plan_id))?;
-        let resp = self
-            .http
-            .post(url)
-            .headers(Self::bearer_headers(token)?)
-            .json(body)
-            .send()
-            .await?;
-        Self::text_or_api(resp).await
-    }
-
-    /// `POST /plans/{plan_id}/step-runs/{run_id}/finish` — finalize an attempt.
-    pub async fn post_plan_step_run_finish(
-        &self,
-        token: &str,
-        plan_id: &str,
-        run_id: &str,
-        body: &Value,
-    ) -> Result<String, ThinClientError> {
-        let url = self.url(&paths::plan_step_run_finish(plan_id, run_id))?;
-        let resp = self
-            .http
-            .post(url)
-            .headers(Self::bearer_headers(token)?)
-            .json(body)
-            .send()
-            .await?;
-        Self::text_or_api(resp).await
-    }
-
-    /// `GET /plans/{plan_id}/step-runs` — list attempt history for audit UIs.
-    pub async fn get_plan_step_runs_text(
-        &self,
-        token: &str,
-        plan_id: &str,
-        subtask_id: Option<&str>,
-        limit: Option<i32>,
-    ) -> Result<String, ThinClientError> {
-        let mut path = paths::plan_step_runs(plan_id);
-        let mut sep = '?';
-        if let Some(sid) = subtask_id {
-            path.push(sep);
-            path.push_str("subtask_id=");
-            path.push_str(sid);
-            sep = '&';
-        }
-        if let Some(l) = limit {
-            path.push(sep);
-            path.push_str("limit=");
-            path.push_str(&l.to_string());
-        }
-        let url = self.url(&path)?;
-        let resp = self
-            .http
-            .get(url)
-            .headers(Self::bearer_headers(token)?)
-            .send()
-            .await?;
-        Self::text_or_api(resp).await
-    }
 }
 
 fn attachment_filename(headers: &HeaderMap) -> Option<String> {
@@ -1894,6 +2061,351 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn work_requests_share_the_canonical_wire_contract_and_version_header() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/works"))
+            .and(header("authorization", "Bearer work-token"))
+            .and(header(WORK_API_MAJOR_HEADER, WORK_API_MAJOR))
+            .and(body_json(serde_json::json!({
+                "request_id": "start-1",
+                "goal": "Ship the Work client boundary.",
+                "criteria": [{
+                    "kind": "test_check",
+                    "criterion_id": "tests",
+                    "statement": "The boundary tests pass.",
+                    "command": "cargo test -p astra-thin-client"
+                }]
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "overview": {"work_id": "work-1"}
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let response = client
+            .post_work(
+                "work-token",
+                &WorkCreateRequestV1 {
+                    request_id: "start-1".into(),
+                    goal: "Ship the Work client boundary.".into(),
+                    criteria: vec![astra_server_types::WorkCreateCriterionV1::TestCheck {
+                        criterion_id: "tests".into(),
+                        statement: "The boundary tests pass.".into(),
+                        command: "cargo test -p astra-thin-client".into(),
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.pointer("/overview/work_id"),
+            Some(&serde_json::json!("work-1"))
+        );
+    }
+
+    #[tokio::test]
+    async fn work_attachment_and_turn_keep_session_authority_server_side() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/works/work-1/branches/branch-1/attachments"))
+            .and(header("authorization", "Bearer work-token"))
+            .and(header(WORK_API_MAJOR_HEADER, WORK_API_MAJOR))
+            .and(body_json(serde_json::json!({"request_id": "attach-1"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "work_id": "work-1",
+                "branch_id": "branch-1",
+                "attachment_id": "attachment-1"
+            })))
+            .mount(&srv)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/works/work-1/branches/branch-1/turns"))
+            .and(header("authorization", "Bearer work-token"))
+            .and(header(WORK_API_MAJOR_HEADER, WORK_API_MAJOR))
+            .and(header("accept", "text/event-stream"))
+            .and(body_json(serde_json::json!({
+                "request_id": "turn-1",
+                "attachment_id": "attachment-1",
+                "message": "Continue from canonical Work state."
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "data: {\"type\":\"work_turn_started\",\"work_id\":\"work-1\"}\n\n",
+            ))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let attachment = client
+            .post_work_branch_attachment(
+                "work-token",
+                "work-1",
+                "branch-1",
+                &WorkBranchAttachRequestV1 {
+                    request_id: "attach-1".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            attachment.get("attachment_id"),
+            Some(&serde_json::json!("attachment-1"))
+        );
+
+        let response = client
+            .post_work_branch_turn(
+                "work-token",
+                "work-1",
+                "branch-1",
+                &WorkTurnRequestV1 {
+                    request_id: "turn-1".into(),
+                    attachment_id: "attachment-1".into(),
+                    message: "Continue from canonical Work state.".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        assert!(response.text().await.unwrap().contains("work_turn_started"));
+    }
+
+    #[tokio::test]
+    async fn work_task_graph_read_is_bounded_and_revision_pinned() {
+        let srv = MockServer::start().await;
+        let first: Value = serde_json::from_str(include_str!(
+            "../../../fixtures/contracts/work_task_graph_v2.json"
+        ))
+        .expect("shared Task Graph fixture");
+        Mock::given(method("GET"))
+            .and(path("/v1/works/work-1/branches/branch-1/task-graph"))
+            .and(header("authorization", "Bearer work-token"))
+            .and(header(WORK_API_MAJOR_HEADER, WORK_API_MAJOR))
+            .respond_with(ResponseTemplate::new(200).set_body_json(first.clone()))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let graph = client
+            .get_work_branch_task_graph_page("work-token", "work-1", "branch-1", None, 0, 0)
+            .await
+            .unwrap();
+        assert_eq!(graph.basis.work_id, "work-1");
+
+        let mut continuation = first;
+        continuation["cursor"] = serde_json::json!({
+            "graph_revision": 1,
+            "item_offset": 1,
+            "dependency_offset": 1
+        });
+        continuation["next_cursor"] = Value::Null;
+        continuation["items"]["offset"] = serde_json::json!(1);
+        continuation["items"]["entries"] = serde_json::json!([{
+            "item_id": "task-b",
+            "revision": 1,
+            "kind": "task",
+            "objective": "Implement task-b",
+            "expected_result": "Verify task-b",
+            "declaration_state": "active",
+            "execution": {"status": "not_started", "terminal": false, "run": null},
+            "delivery": {"status": "unreported", "summary": null, "blocker_kind": null, "unavailable_capabilities": []},
+            "verification": {"status": "unknown", "latest_check": null}
+        }]);
+        continuation["dependencies"]["offset"] = serde_json::json!(1);
+        continuation["dependencies"]["entries"] = serde_json::json!([]);
+        Mock::given(method("GET"))
+            .and(path("/v1/works/work-1/branches/branch-1/task-graph"))
+            .and(query_param("graph_revision", "1"))
+            .and(query_param("item_offset", "1"))
+            .and(query_param("dependency_offset", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(continuation))
+            .mount(&srv)
+            .await;
+        client
+            .get_work_branch_task_graph_page("work-token", "work-1", "branch-1", Some(1), 1, 1)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn work_session_binding_is_typed_owner_transport_and_path_safe() {
+        let srv = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/works/session-bindings/session-1"))
+            .and(header("authorization", "Bearer work-token"))
+            .and(header(WORK_API_MAJOR_HEADER, WORK_API_MAJOR))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": 1,
+                "work_id": "work-1",
+                "branch_id": "branch-1",
+                "graph_revision": 7
+            })))
+            .mount(&srv)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/works/session-bindings/session-1"))
+            .and(header("authorization", "Bearer work-token"))
+            .and(header(WORK_API_MAJOR_HEADER, WORK_API_MAJOR))
+            .and(body_json(serde_json::json!({
+                "request_id": "promote-1",
+                "goal": "Track this conversation as Work.",
+                "criteria": []
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "overview": {"work_id": "work-1"}
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let binding = client
+            .get_work_session_binding("work-token", "session-1")
+            .await
+            .unwrap();
+        assert_eq!(binding.work_id, "work-1");
+        assert_eq!(binding.branch_id, "branch-1");
+        assert_eq!(binding.graph_revision, 7);
+        let promoted = client
+            .post_work_session_binding(
+                "work-token",
+                "session-1",
+                &WorkCreateRequestV1 {
+                    request_id: "promote-1".into(),
+                    goal: "Track this conversation as Work.".into(),
+                    criteria: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            promoted.pointer("/overview/work_id"),
+            Some(&serde_json::json!("work-1"))
+        );
+
+        let unsafe_error = client
+            .get_work_session_binding("work-token", "../session")
+            .await
+            .expect_err("path fragments must fail before transport");
+        assert!(matches!(unsafe_error, ThinClientError::InvalidInput(_)));
+        let unsafe_error = client
+            .post_work_session_binding(
+                "work-token",
+                "../session",
+                &WorkCreateRequestV1 {
+                    request_id: "promote-unsafe".into(),
+                    goal: "Never send this request.".into(),
+                    criteria: Vec::new(),
+                },
+            )
+            .await
+            .expect_err("path fragments must fail before mutation transport");
+        assert!(matches!(unsafe_error, ThinClientError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn work_controller_release_and_attachment_delete_are_distinct_typed_calls() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(
+                "/v1/works/work-1/branches/branch-1/control-operations",
+            ))
+            .and(header("authorization", "Bearer work-token"))
+            .and(header(WORK_API_MAJOR_HEADER, WORK_API_MAJOR))
+            .and(body_json(serde_json::json!({
+                "request_id": "release-1",
+                "expected_branch_revision": 2,
+                "expected_writer_epoch": 7,
+                "expected_canonical_root_hash": "sha256:root",
+                "command": {
+                    "kind": "release_branch_control",
+                    "attachment_id": "attachment-1"
+                }
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "state": "succeeded",
+                "outcome": "released"
+            })))
+            .mount(&srv)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(
+                "/v1/works/work-1/branches/branch-1/attachments/attachment-1",
+            ))
+            .and(header("authorization", "Bearer work-token"))
+            .and(header(WORK_API_MAJOR_HEADER, WORK_API_MAJOR))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let operation = client
+            .post_work_branch_control_operation(
+                "work-token",
+                "work-1",
+                "branch-1",
+                &WorkBranchControlOperationRequestV1 {
+                    request_id: "release-1".into(),
+                    expected_branch_revision: 2,
+                    expected_writer_epoch: 7,
+                    expected_canonical_root_hash: Some("sha256:root".into()),
+                    command: astra_server_types::WorkBranchControlCommandV1::ReleaseBranchControl {
+                        attachment_id: "attachment-1".into(),
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(operation["outcome"], "released");
+        client
+            .delete_work_branch_attachment("work-token", "work-1", "branch-1", "attachment-1")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn work_resource_ids_fail_before_transport_when_they_are_path_fragments() {
+        let client = ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let error = client
+            .get_work("token", "work/other")
+            .await
+            .expect_err("path fragments must not reach transport");
+        assert!(matches!(error, ThinClientError::InvalidInput(_)));
+
+        let error = client
+            .delete_work_branch_attachment("token", "work-1", "branch-1", "../attachment")
+            .await
+            .expect_err("unsafe attachment identity must not reach transport");
+        assert!(matches!(error, ThinClientError::InvalidInput(_)));
+
+        let error = client
+            .get_work_branch_task_graph_page("token", "work-1", "../branch", None, 0, 0)
+            .await
+            .expect_err("unsafe Task Graph identity must not reach transport");
+        assert!(matches!(error, ThinClientError::InvalidInput(_)));
+
+        let error = client
+            .get_work_branch_task_graph_page("token", "work-1", "branch-1", None, 1, 0)
+            .await
+            .expect_err("unpinned continuation must fail before transport");
+        assert!(matches!(error, ThinClientError::InvalidInput(_)));
+
+        let error = client
+            .post_work_branch_turn(
+                "token",
+                "work-1",
+                "../branch",
+                &WorkTurnRequestV1 {
+                    request_id: "turn-1".into(),
+                    attachment_id: "attachment-1".into(),
+                    message: "Continue.".into(),
+                },
+            )
+            .await
+            .expect_err("unsafe branch identity must not reach transport");
+        assert!(matches!(error, ThinClientError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
     async fn wiremock_chat_stream_parses_events() {
         let srv = MockServer::start().await;
         let sse = concat!(
@@ -1937,6 +2449,7 @@ mod tests {
         let sse = concat!(
             "data: {\"type\":\"session_info\",\"session_id\":\"s-x\"}\n\n",
             "data: {\"type\":\"text_delta\",\"content\":\"hello\"}\n\n",
+            "data: {\"type\":\"turn_complete\",\"assistant_text\":\"hello\"}\n\n",
         );
         Mock::given(method("POST"))
             .and(path("/chat/stream"))
@@ -1948,7 +2461,7 @@ mod tests {
         let client = ThinClient::new(&srv.uri(), None).unwrap();
         let req = ChatStreamRequest::new("ping", "test-model");
         let evs = client.chat_stream_collect(&req, Some("tkn")).await.unwrap();
-        assert_eq!(evs.len(), 2);
+        assert_eq!(evs.len(), 3);
         assert!(matches!(
             evs[0],
             StreamEvent::SessionInfo {
@@ -1982,6 +2495,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v["session_id"], "new");
+    }
+
+    #[tokio::test]
+    async fn wiremock_session_cancel_uses_the_run_converging_endpoint() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sessions/session-1/cancel"))
+            .and(header("authorization", "Bearer tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "session-1",
+                "status": "cancelled"
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let response = client
+            .post_session_cancel_text("tok", "session-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&response).unwrap()["status"],
+            "cancelled"
+        );
     }
 
     #[tokio::test]
@@ -2030,105 +2567,6 @@ mod tests {
         assert_eq!(response.offering_id, "offer-memory");
         assert_eq!(response.first_text(), Some("summary"));
         assert_eq!(response.usage.unwrap().total_tokens, 10);
-    }
-
-    #[tokio::test]
-    async fn wiremock_plan_lifecycle_requests_hit_expected_paths() {
-        let srv = MockServer::start().await;
-
-        Mock::given(method("POST"))
-            .and(path("/plans"))
-            .and(header("authorization", "Bearer tkn"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "plan_id": "plan-1"
-            })))
-            .mount(&srv)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/plans"))
-            .and(header("authorization", "Bearer tkn"))
-            .and(query_param("session_id", "sess-1"))
-            .and(query_param("phase", "planning"))
-            .and(query_param("limit", "1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "plans": []
-            })))
-            .mount(&srv)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/plans/plan-1"))
-            .and(header("authorization", "Bearer tkn"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "plan_id": "plan-1",
-                "goal": "Ship auth",
-                "version": 7
-            })))
-            .mount(&srv)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path("/plans/plan-1/exit-plan-mode"))
-            .and(header("authorization", "Bearer tkn"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "plan_id": "plan-1",
-                "phase": "refining"
-            })))
-            .mount(&srv)
-            .await;
-
-        let client = ThinClient::new(&srv.uri(), None).unwrap();
-
-        let created = client
-            .post_plans_json("tkn", &serde_json::json!({"goal": "Ship auth"}))
-            .await
-            .unwrap();
-        assert_eq!(created["plan_id"], "plan-1");
-
-        let listed = client
-            .get_plans_query_json(
-                "tkn",
-                &[
-                    ("session_id", "sess-1".to_string()),
-                    ("phase", "planning".to_string()),
-                    ("limit", "1".to_string()),
-                ],
-            )
-            .await
-            .unwrap();
-        assert_eq!(listed["plans"], serde_json::json!([]));
-
-        let fetched = client.get_plan_json("tkn", "plan-1").await.unwrap();
-        assert_eq!(fetched["version"], 7);
-
-        let exited = client
-            .post_plan_exit_mode_json(
-                "tkn",
-                "plan-1",
-                &serde_json::json!({"approved": true, "plan_md": "1. Ship auth"}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(exited["phase"], "refining");
-
-        Mock::given(method("POST"))
-            .and(path("/plans/plan-1/rewind"))
-            .and(header("authorization", "Bearer tkn"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "plan_id": "plan-1",
-                "reset_count": 2,
-                "version": 8,
-                "plan": { "subtasks": [] }
-            })))
-            .mount(&srv)
-            .await;
-
-        let rewound = client
-            .post_plan_rewind_json("tkn", "plan-1", &serde_json::json!({"anchor": "2"}))
-            .await
-            .unwrap();
-        assert_eq!(rewound["reset_count"], 2);
     }
 
     #[tokio::test]
@@ -2382,7 +2820,8 @@ mod tests {
                 "run_id": "run-1",
                 "intent_id": "intent-1",
                 "status": "accepted_remote",
-                "duplicate": false
+                "duplicate": false,
+                "event_index": 19
             })))
             .mount(&srv)
             .await;
@@ -2409,6 +2848,7 @@ mod tests {
             astra_turn_types::UserIntentStatus::AcceptedRemote
         );
         assert!(!response.duplicate);
+        assert_eq!(response.event_index, 19);
     }
 
     #[tokio::test]
@@ -2589,6 +3029,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/chat/runs/run-1/delegations/pause"))
             .and(header("authorization", "Bearer tok"))
+            .and(body_json(serde_json::json!({
+                "expected_session_id": "session-1"
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "parent_run_id": "run-1",
                 "affected": 2
@@ -2598,7 +3041,7 @@ mod tests {
 
         let client = ThinClient::new(&srv.uri(), None).unwrap();
         let v = client
-            .pause_run_delegations(Some("tok"), "run-1")
+            .pause_run_delegations(Some("tok"), "run-1", "session-1")
             .await
             .unwrap();
         assert_eq!(v["parent_run_id"], "run-1");
@@ -2611,6 +3054,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/chat/runs/run-1/delegations/resume"))
             .and(header("authorization", "Bearer tok"))
+            .and(body_json(serde_json::json!({
+                "expected_session_id": "session-1"
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "parent_run_id": "run-1",
                 "affected": 2
@@ -2620,7 +3066,7 @@ mod tests {
 
         let client = ThinClient::new(&srv.uri(), None).unwrap();
         let v = client
-            .resume_run_delegations(Some("tok"), "run-1")
+            .resume_run_delegations(Some("tok"), "run-1", "session-1")
             .await
             .unwrap();
         assert_eq!(v["parent_run_id"], "run-1");
@@ -2726,22 +3172,143 @@ mod tests {
             .post_tool_result(Some("tok"), Some("edge-abc"), &body)
             .await
             .unwrap();
-        assert_eq!(v["ok"], true);
+        assert!(v.is_null(), "callbacks acknowledge by successful status");
     }
 
     #[tokio::test]
-    async fn wiremock_agent_jobs_list() {
-        let srv = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/agent-jobs"))
-            .and(header("authorization", "Bearer t"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"jobs": []})))
-            .mount(&srv)
-            .await;
+    async fn approval_callback_timeout_is_bounded_and_retries_identical_request() {
+        use tokio::io::AsyncReadExt as _;
 
-        let client = ThinClient::new(&srv.uri(), None).unwrap();
-        let body = client.get_agent_jobs_query_text("t", &[]).await.unwrap();
-        assert!(body.contains("jobs"), "{body}");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request_tx = request_tx.clone();
+                tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    let mut chunk = [0_u8; 1024];
+                    loop {
+                        let read = stream.read(&mut chunk).await.unwrap();
+                        if read == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&chunk[..read]);
+                        let Some(headers_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n")
+                        else {
+                            continue;
+                        };
+                        let headers_end = headers_end + 4;
+                        let headers = String::from_utf8_lossy(&bytes[..headers_end]);
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if bytes.len() >= headers_end + content_length {
+                            let _ = request_tx
+                                .send(bytes[headers_end..headers_end + content_length].to_vec());
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let client = ThinClient::new(&format!("http://{address}"), None).unwrap();
+        let body = ApprovalRespondRequest {
+            request_id: "approval-1".into(),
+            decision: crate::protocol::ApprovalDecision::Allow,
+            reason: None,
+            session_id: "session-1".into(),
+            run_id: "run-1".into(),
+            tool_name: Some("bash".into()),
+            approval_kind: Some(crate::protocol::ApprovalKind::Standard),
+        };
+        let started = std::time::Instant::now();
+
+        let error = client
+            .post_approval_with_policy(Some("tok"), &body, Duration::from_millis(250), 2)
+            .await
+            .expect_err("both response-header waits should time out");
+
+        assert!(error.is_transport(), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let first = tokio::time::timeout(Duration::from_secs(1), request_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(1), request_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, second, "one bounded identical retry is required");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn approval_callback_success_does_not_wait_for_optional_response_body() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                bytes.extend_from_slice(&chunk[..read]);
+                let Some(headers_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers_end = headers_end + 4;
+                let headers = String::from_utf8_lossy(&bytes[..headers_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if bytes.len() >= headers_end + content_length {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    return;
+                }
+            }
+        });
+        let client = ThinClient::new(&format!("http://{address}"), None).unwrap();
+        let body = ApprovalRespondRequest {
+            request_id: "approval-2".into(),
+            decision: crate::protocol::ApprovalDecision::Allow,
+            reason: None,
+            session_id: "session-1".into(),
+            run_id: "run-1".into(),
+            tool_name: Some("bash".into()),
+            approval_kind: Some(crate::protocol::ApprovalKind::Standard),
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            client.post_approval_with_policy(Some("tok"), &body, Duration::from_secs(2), 2),
+        )
+        .await
+        .expect("successful callback status must not wait for a response body")
+        .unwrap();
+
+        assert!(result.is_null());
+        server.abort();
     }
 
     #[tokio::test]
@@ -2757,6 +3324,37 @@ mod tests {
         let url = format!("{}/mem/health", srv.uri().as_str().trim_end_matches('/'));
         let r = client.get_url(&url).await.unwrap();
         assert!(r.status().is_success());
+    }
+
+    #[tokio::test]
+    async fn wiremock_model_catalog_cursor_is_encoded_as_seek_query() {
+        let srv = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(query_param("after_provider", "bedrock/openai"))
+            .and(query_param("after_name", "model two"))
+            .and(query_param("after_offering_id", "offer/2"))
+            .and(header("authorization", "Bearer t"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [],
+                "next_cursor": null,
+                "limit": 1,
+                "total": 1,
+                "catalog_revision": "sha256:test"
+            })))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let response = client
+            .get_models_page_response_timeout(
+                "t",
+                Duration::from_secs(1),
+                Some(("bedrock/openai", "model two", "offer/2")),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
     }
 
     #[tokio::test]
@@ -2860,31 +3458,6 @@ mod tests {
             vec!["invocation-1".to_string()]
         );
         assert_eq!(response.ack_request_ids, vec!["invocation-2".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn wiremock_agent_job_lease_claim_sends_edge_header() {
-        let srv = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/agent-jobs/t1/lease/claim"))
-            .and(header("authorization", "Bearer t"))
-            .and(header("x-astra-edge-id", "edge-xyz"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"status":"granted"})),
-            )
-            .mount(&srv)
-            .await;
-
-        let client = ThinClient::new(&srv.uri(), None).unwrap();
-        let body = TaskLeaseMutationRequest {
-            edge_agent_id: "edge-xyz".into(),
-            ttl_sec: Some(120),
-        };
-        let v = client
-            .post_agent_job_lease_claim(Some("t"), Some("edge-xyz"), "t1", &body)
-            .await
-            .unwrap();
-        assert_eq!(v["status"], "granted");
     }
 
     // ── Constructor validation ──────────────────────────────────────────
@@ -3030,10 +3603,10 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/chat/stream"))
             .and(header("authorization", "Bearer override-tok"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string("data: {\"type\":\"text_delta\",\"content\":\"ok\"}\n\n"),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
+                "data: {\"type\":\"text_delta\",\"content\":\"ok\"}\n\n",
+                "data: {\"type\":\"turn_complete\"}\n\n"
+            )))
             .expect(1)
             .mount(&srv)
             .await;
@@ -3044,7 +3617,7 @@ mod tests {
             .chat_stream_collect(&req, Some("override-tok"))
             .await
             .unwrap();
-        assert_eq!(evs.len(), 1);
+        assert_eq!(evs.len(), 2);
     }
 
     #[tokio::test]
@@ -3053,10 +3626,10 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/chat/stream"))
             .and(header("authorization", "Bearer default-tok"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string("data: {\"type\":\"text_delta\",\"content\":\"ok\"}\n\n"),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
+                "data: {\"type\":\"text_delta\",\"content\":\"ok\"}\n\n",
+                "data: {\"type\":\"turn_complete\"}\n\n"
+            )))
             .expect(1)
             .mount(&srv)
             .await;
@@ -3064,7 +3637,27 @@ mod tests {
         let client = ThinClient::new(&srv.uri(), Some("default-tok".into())).unwrap();
         let req = ChatStreamRequest::new("hi", "test-model");
         let evs = client.chat_stream_collect(&req, None).await.unwrap();
-        assert_eq!(evs.len(), 1);
+        assert_eq!(evs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn chat_stream_eof_without_terminal_is_an_error() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/stream"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("data: {\"type\":\"text_delta\",\"content\":\"partial\"}\n\n"),
+            )
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let error = client
+            .chat_stream_collect(&ChatStreamRequest::new("hi", "test-model"), None)
+            .await
+            .expect_err("a partial stream must not look like a completed turn");
+        assert!(error.to_string().contains("terminal event"));
     }
 
     // ── 429 retry logic ─────────────────────────────────────────────────
@@ -3075,23 +3668,30 @@ mod tests {
         let srv = MockServer::start().await;
         // First call → 429, second call → 200
         Mock::given(method("POST"))
-            .and(path("/chat/turn"))
+            .and(path("/chat/stream"))
             .and(header("authorization", "Bearer t"))
             .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
             .up_to_n_times(1)
             .mount(&srv)
             .await;
         Mock::given(method("POST"))
-            .and(path("/chat/turn"))
+            .and(path("/chat/stream"))
             .and(header("authorization", "Bearer t"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER,
+                        astra_server_types::AGENT_INTERACTION_API_MAJOR,
+                    )
+                    .set_body_string("ok"),
+            )
             .mount(&srv)
             .await;
 
         let client = ThinClient::new(&srv.uri(), None).unwrap();
         let payload = serde_json::json!({"msg": "hello"});
         let resp = client
-            .post_chat_turn_retry_429("t", &payload, 3, true)
+            .post_developer_loop_retry_429("t", &payload, 3, true)
             .await
             .unwrap();
         assert_eq!(resp.status().as_u16(), 200);
@@ -3105,7 +3705,7 @@ mod tests {
         let srv = MockServer::start().await;
         // Always return 429
         Mock::given(method("POST"))
-            .and(path("/chat/turn"))
+            .and(path("/chat/stream"))
             .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
             .mount(&srv)
             .await;
@@ -3114,7 +3714,7 @@ mod tests {
         let payload = serde_json::json!({"msg": "hello"});
         // With max_attempts=1, there is no retry — the 429 response is returned as-is.
         let resp = client
-            .post_chat_turn_retry_429("t", &payload, 1, true)
+            .post_developer_loop_retry_429("t", &payload, 1, true)
             .await
             .unwrap();
         assert_eq!(resp.status().as_u16(), 429);
@@ -3124,8 +3724,15 @@ mod tests {
     async fn retry_429_returns_ok_on_non_429_immediately() {
         let srv = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/chat/turn"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .and(path("/chat/stream"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER,
+                        astra_server_types::AGENT_INTERACTION_API_MAJOR,
+                    )
+                    .set_body_string("ok"),
+            )
             .expect(1)
             .mount(&srv)
             .await;
@@ -3133,10 +3740,57 @@ mod tests {
         let client = ThinClient::new(&srv.uri(), None).unwrap();
         let payload = serde_json::json!({"msg": "hello"});
         let resp = client
-            .post_chat_turn_retry_429("t", &payload, 5, true)
+            .post_developer_loop_retry_429("t", &payload, 5, true)
             .await
             .unwrap();
         assert_eq!(resp.status().as_u16(), 200);
+    }
+
+    #[tokio::test]
+    async fn developer_loop_rejects_a_server_without_the_interaction_contract() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/stream"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("stale server"))
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let error = client
+            .post_developer_loop("t", &serde_json::json!({"msg": "hello"}))
+            .await
+            .expect_err("missing protocol header must fail before SSE consumption");
+
+        assert!(matches!(
+            error,
+            ThinClientError::IncompatibleRuntime { ref actual, .. } if actual == "missing"
+        ));
+        assert!(error.to_string().contains("restart or upgrade"));
+    }
+
+    #[tokio::test]
+    async fn developer_loop_rejects_a_stale_interaction_contract_before_sse() {
+        let srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/stream"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER, "1")
+                    .set_body_string("stale server"),
+            )
+            .mount(&srv)
+            .await;
+
+        let client = ThinClient::new(&srv.uri(), None).unwrap();
+        let error = client
+            .post_developer_loop("t", &serde_json::json!({"msg": "hello"}))
+            .await
+            .expect_err("stale protocol must fail before SSE consumption");
+        assert!(matches!(
+            error,
+            ThinClientError::IncompatibleRuntime { ref expected, ref actual }
+                if expected == "3" && actual == "1"
+        ));
     }
 
     // ── parse_retry_after tests ─────────────────────────────────────────
@@ -3192,7 +3846,7 @@ mod tests {
         let srv = MockServer::start().await;
         // First call → 429 with Retry-After: 1, second → 200
         Mock::given(method("POST"))
-            .and(path("/chat/turn"))
+            .and(path("/chat/stream"))
             .respond_with(
                 ResponseTemplate::new(429)
                     .insert_header("Retry-After", "1")
@@ -3202,15 +3856,22 @@ mod tests {
             .mount(&srv)
             .await;
         Mock::given(method("POST"))
-            .and(path("/chat/turn"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .and(path("/chat/stream"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER,
+                        astra_server_types::AGENT_INTERACTION_API_MAJOR,
+                    )
+                    .set_body_string("ok"),
+            )
             .mount(&srv)
             .await;
 
         let client = ThinClient::new(&srv.uri(), None).unwrap();
         let payload = serde_json::json!({"msg": "hello"});
         let resp = client
-            .post_chat_turn_retry_429("t", &payload, 3, true)
+            .post_developer_loop_retry_429("t", &payload, 3, true)
             .await
             .unwrap();
         assert_eq!(resp.status().as_u16(), 200);
@@ -3240,6 +3901,19 @@ mod tests {
         assert!(
             timeout >= Duration::from_secs(1),
             "authed text request timeout should not fail healthy calls immediately"
+        );
+    }
+
+    #[test]
+    fn health_request_timeout_policy_is_bounded() {
+        let timeout = Duration::from_secs(HEALTH_REQUEST_TIMEOUT_SECS);
+        assert!(
+            timeout <= Duration::from_secs(10),
+            "health probes must fail fast when the control plane is stuck"
+        );
+        assert!(
+            timeout >= Duration::from_secs(1),
+            "health probes should leave healthy local servers time to respond"
         );
     }
 

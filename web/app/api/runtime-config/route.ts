@@ -14,6 +14,19 @@ type RuntimeConfigBody = {
   demoMode?: boolean;
 };
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function hasOnlyExpectedFieldTypes(body: Record<string, unknown>): boolean {
+  return (
+    (body.apiUrl === undefined || typeof body.apiUrl === 'string') &&
+    (body.accessToken === undefined || typeof body.accessToken === 'string') &&
+    (body.refreshToken === undefined || typeof body.refreshToken === 'string') &&
+    (body.demoMode === undefined || typeof body.demoMode === 'boolean')
+  );
+}
+
 function applyCookie(
   response: NextResponse,
   name: string,
@@ -48,7 +61,28 @@ export async function GET() {
 }
 
 export async function POST(request: NextRequest) {
-  const body = (await request.json()) as RuntimeConfigBody;
+  let rawBody: unknown;
+  try {
+    rawBody = await request.json();
+  } catch {
+    return NextResponse.json({ error: 'invalid JSON body' }, { status: 400 });
+  }
+
+  if (!isRecord(rawBody)) {
+    return NextResponse.json(
+      { error: 'request body must be a JSON object' },
+      { status: 400 },
+    );
+  }
+
+  if (!hasOnlyExpectedFieldTypes(rawBody)) {
+    return NextResponse.json(
+      { error: 'runtime config fields have invalid types' },
+      { status: 400 },
+    );
+  }
+
+  const body = rawBody as RuntimeConfigBody;
   const response = NextResponse.json({ ok: true });
 
   applyCookie(response, API_URL_COOKIE, body.apiUrl?.trim(), true);

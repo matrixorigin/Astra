@@ -479,16 +479,26 @@ pub struct FeedbackDrainReport {
 
 struct RecallInvocationGuard {
     session_id: String,
+    user_id: Option<String>,
     producer_id: String,
     turn: u32,
     token: Option<String>,
 }
 
 impl RecallInvocationGuard {
-    fn begin(session_id: &str, producer_id: &str, turn: u32) -> Option<Self> {
+    fn begin(
+        session_id: &str,
+        user_id: Option<&str>,
+        producer_id: &str,
+        turn: u32,
+    ) -> Option<Self> {
         let token = MemoriaToolGateway::begin_recall(session_id)?;
         Some(Self {
             session_id: session_id.to_string(),
+            user_id: user_id
+                .map(str::trim)
+                .filter(|user_id| !user_id.is_empty())
+                .map(str::to_string),
             producer_id: producer_id.to_string(),
             turn,
             token: Some(token),
@@ -501,6 +511,7 @@ impl RecallInvocationGuard {
         };
         MemoriaToolGateway::complete_recall_for_producer(
             &self.session_id,
+            self.user_id.as_deref(),
             &self.producer_id,
             self.turn,
             &token,
@@ -704,6 +715,22 @@ fn validate_strict_recall_response(raw_text: &str, args: &Value) -> Result<(), S
     }
 }
 
+fn merge_strict_recall_working_memory(raw_text: &str, working_text: &str, args: &Value) -> String {
+    let Ok(mut original) = serde_json::from_str::<Value>(raw_text) else {
+        return raw_text.to_string();
+    };
+    let Ok(working) = serde_json::from_str::<Value>(working_text) else {
+        return raw_text.to_string();
+    };
+    let limit = args
+        .get("top_k")
+        .and_then(Value::as_u64)
+        .unwrap_or(10)
+        .clamp(1, 50) as usize;
+    astra_memoria::merge_strict_recall_working_memory(&mut original, &working, limit);
+    serde_json::to_string(&original).unwrap_or_else(|_| raw_text.to_string())
+}
+
 const MAX_FAILS: u32 = 2;
 const CIRCUIT_COOLDOWN: Duration = Duration::from_secs(30);
 
@@ -761,65 +788,6 @@ impl MemoriaToolGateway {
         projected
     }
 
-    /// Record a `focus` hint for the given session. Returns the synthetic
-    /// response the LLM sees (mirrors the v2 FocusResponse shape).
-    pub fn focus_set(&self, session_id: &str, args: &Value) -> String {
-        let focus_type = match args
-            .get("focus_type")
-            .or_else(|| args.get("type"))
-            .and_then(Value::as_str)
-        {
-            Some(t @ ("topic" | "tag" | "memory_id" | "session")) => t.to_string(),
-            _ => {
-                return json!({"error":
-                    "memory(action=focus) requires `focus_type` ∈ {topic,tag,memory_id,session}"})
-                .to_string();
-            }
-        };
-        let value = match args
-            .get("focus_value")
-            .or_else(|| args.get("value"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            Some(v) => v.to_string(),
-            None => {
-                return json!({"error": "memory(action=focus) requires non-empty `focus_value`"})
-                    .to_string();
-            }
-        };
-        let boost = args.get("boost").and_then(Value::as_f64).unwrap_or(1.5);
-        let ttl_secs = args
-            .get("ttl_secs")
-            .and_then(Value::as_i64)
-            .unwrap_or(3600)
-            .max(1) as u64;
-        if let Err(error) = astra_memoria::memoria_runtime_state().set_focus(
-            session_id,
-            &focus_type,
-            &value,
-            boost,
-            ttl_secs,
-        ) {
-            return json!({"error": error}).to_string();
-        }
-        json!({
-            "status": "completed",
-            "focus_type": focus_type,
-            "value": value,
-            "boost": boost,
-            "active_for_secs": ttl_secs,
-        })
-        .to_string()
-    }
-
-    /// Return active focus hints for a session. Expired entries are
-    /// evicted as a side effect.
-    fn focus_active(&self, session_id: &str) -> Vec<astra_memoria::FocusHint> {
-        astra_memoria::memoria_runtime_state().active_focus(session_id)
-    }
-
     /// Record memory_ids surfaced to the LLM in a given session
     /// (process-global store).
     ///
@@ -845,12 +813,6 @@ impl MemoriaToolGateway {
         astra_memoria::memoria_runtime_state().reset_seen(session_id);
     }
 
-    /// Clear focus hints for a session. Called at session-end cleanup so
-    /// long-lived processes do not carry stale attention boosts forever.
-    pub fn reset_focus(session_id: &str) {
-        astra_memoria::memoria_runtime_state().reset_focus(session_id);
-    }
-
     /// Record a recall snapshot for later outcome attribution.
     /// Pushed by `decorate_recall_response` when the LLM calls
     /// `memory(action=recall)` and receives memory_ids; drained by the
@@ -861,12 +823,14 @@ impl MemoriaToolGateway {
     /// doesn't leak memory.
     pub fn record_recall_for_producer(
         session_id: &str,
+        user_id: Option<&str>,
         producer_id: &str,
         turn: u32,
         memory_ids: Vec<String>,
     ) {
         astra_memoria::memoria_runtime_state().record_recall_for_producer(
             session_id,
+            user_id,
             producer_id,
             turn,
             memory_ids,
@@ -879,6 +843,7 @@ impl MemoriaToolGateway {
 
     pub fn complete_recall_for_producer(
         session_id: &str,
+        user_id: Option<&str>,
         producer_id: &str,
         turn: u32,
         invocation_token: &str,
@@ -886,6 +851,7 @@ impl MemoriaToolGateway {
     ) {
         astra_memoria::memoria_runtime_state().complete_recall_for_producer(
             session_id,
+            user_id,
             producer_id,
             turn,
             invocation_token,
@@ -997,8 +963,8 @@ impl MemoriaToolGateway {
 
     /// Clear all process-global memory state for a session. Long-lived CLI
     /// and server processes call this at the session boundary so surfaced
-    /// memory ids, focus hints, and pending recall feedback cannot bleed into
-    /// the next session.
+    /// memory ids and pending recall feedback cannot bleed into the next
+    /// session.
     pub fn reset_session_process_state(session_id: &str) {
         astra_memoria::memoria_runtime_state().reset_session(session_id);
     }
@@ -1027,16 +993,10 @@ impl MemoriaToolGateway {
                 } else {
                     format!("{context_prefix}: turn {} outcome", snap.turn)
                 };
+                let feedback =
+                    memory_feedback_payload(&id, signal, &context, snap.user_id.as_deref());
                 let output = self
-                    .call_with_timeout(
-                        "feedback",
-                        &json!({
-                            "memory_id": id,
-                            "signal": signal,
-                            "context": context,
-                        }),
-                        Duration::from_secs(3),
-                    )
+                    .call_with_timeout("feedback", &feedback, Duration::from_secs(3))
                     .await;
                 if memoria_output_is_error(&output) {
                     report.failed += 1;
@@ -1055,40 +1015,6 @@ impl MemoriaToolGateway {
             }
         }
         report
-    }
-
-    /// Inject focus hints into a `recall` payload. Called by the
-    /// `call_with_timeout` path right before the HTTP send when `op ==
-    /// "recall"`.
-    fn apply_focus_hints(&self, session_id: &str, payload: &mut Value) {
-        let hints = self.focus_active(session_id);
-        if hints.is_empty() {
-            return;
-        }
-        let Some(obj) = payload.as_object_mut() else {
-            return;
-        };
-        let mut topics: Vec<Value> = Vec::new();
-        let mut tags: Vec<Value> = Vec::new();
-        let mut memory_ids: Vec<Value> = Vec::new();
-        for h in hints {
-            let entry = json!({ "value": h.value, "boost": h.boost });
-            match h.focus_type.as_str() {
-                "topic" => topics.push(entry),
-                "tag" => tags.push(entry),
-                "memory_id" => memory_ids.push(entry),
-                _ => {}
-            }
-        }
-        if !topics.is_empty() {
-            obj.insert("boost_topics".into(), Value::Array(topics));
-        }
-        if !tags.is_empty() {
-            obj.insert("boost_tags".into(), Value::Array(tags));
-        }
-        if !memory_ids.is_empty() {
-            obj.insert("boost_memory_ids".into(), Value::Array(memory_ids));
-        }
     }
 
     /// Post-process a `recall` response so the LLM gets the same two
@@ -1262,64 +1188,6 @@ impl MemoriaToolGateway {
         }
     }
 
-    /// Minimum similarity score (Memoria `final_score`) that flags a
-    /// new `remember` call as a likely duplicate. Tuned empirically:
-    /// vector+keyword hybrid scores above ~0.85 on a short phrase
-    /// match are near-synonyms in practice.
-    pub const CONFLICT_SIMILARITY_FLOOR: f64 = 0.85;
-
-    /// Client-side conflict pre-check for `remember`. Issues a cheap
-    /// top-3 recall with a 2-second timeout; if any existing memory
-    /// crosses [`CONFLICT_SIMILARITY_FLOOR`], returns a structured
-    /// JSON string the LLM parses as a tool result — a "redirect" that
-    /// nudges the model toward `update(memory_id=...)` instead of
-    /// writing a duplicate. Returns `None` on no conflict / fetch
-    /// failure (degrade to the normal write path).
-    async fn detect_remember_conflict(
-        &self,
-        new_content: &str,
-        session_id: Option<&str>,
-        user_id: Option<&str>,
-    ) -> Option<String> {
-        // Do not switch transports behind an authenticated cloud gateway.
-        // The cloud/edge path owns tenant routing and backend deduplication.
-        if self.cloud_base.is_some() && self.cloud_token.is_some() {
-            return None;
-        }
-        // A narrow conflict query: use the new content as the query.
-        // We don't want to spend 5s on a full retrieval here — the
-        // write path must stay fast when there are no conflicts.
-        let mem = astra_core::MemoriaSettings::from_env();
-        let key = mem.master_key?;
-        let mut body = json!({"query": new_content, "top_k": 3});
-        if let Some(sid) = session_id {
-            body["session_id"] = json!(sid);
-        }
-        let client = astra_core::net::client_builder_for_target(&mem.base_url)
-            .timeout(Duration::from_secs(2))
-            .build()
-            .ok()?;
-        let request = client
-            .post(format!("{}/v1/memories/retrieve", mem.base_url))
-            .header("Authorization", format!("Bearer {key}"));
-        let request = match user_id.map(str::trim).filter(|user_id| !user_id.is_empty()) {
-            Some(user_id) => request.header("X-User-Id", user_id),
-            None => request,
-        };
-        let resp = request.json(&body).send().await.ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        let text = resp.text().await.ok()?;
-        let parsed: Value = serde_json::from_str(&text).ok()?;
-        let arr = parsed
-            .get("memories")
-            .and_then(Value::as_array)
-            .or_else(|| parsed.as_array())?;
-
-        format_remember_conflict(arr, Self::CONFLICT_SIMILARITY_FLOOR)
-    }
-
     /// Execute a memoria operation (store, retrieve, search, purge, correct, profile).
     pub async fn call(&self, op: &str, args: &Value) -> String {
         self.call_with_timeout(op, args, Duration::from_secs(10))
@@ -1328,12 +1196,6 @@ impl MemoriaToolGateway {
 
     /// Execute a memoria operation with custom timeout.
     pub async fn call_with_timeout(&self, op: &str, args: &Value, timeout: Duration) -> String {
-        // `focus` is handled entirely in-process; no HTTP call.
-        if op == "focus" {
-            let sid = args.get("session_id").and_then(Value::as_str).unwrap_or("");
-            return self.focus_set(sid, args);
-        }
-
         let resolved_args = match Self::resolve_selection_reference(op, args) {
             Ok(resolved) => resolved,
             Err(error) => return error.to_string(),
@@ -1361,36 +1223,18 @@ impl MemoriaToolGateway {
                 .unwrap_or("session")
                 .to_string();
             let turn = args.get("turn").and_then(Value::as_u64).unwrap_or(0) as u32;
-            RecallInvocationGuard::begin(&session_id, &producer_id, turn)
+            RecallInvocationGuard::begin(
+                &session_id,
+                args.get("user_id").and_then(Value::as_str),
+                &producer_id,
+                turn,
+            )
         } else {
             None
         };
 
         if self.is_circuit_open() {
             return json!({"error": "Memory service unavailable (circuit open)"}).to_string();
-        }
-
-        // `remember`: run a client-side conflict pre-check so the LLM
-        // can't silently create duplicates of near-identical memories.
-        // Opt-out via `skip_conflict_check: true` — the background
-        // extractor already manifests existing memories in its prompt
-        // and sets this flag to bypass the double-check.
-        if op == "remember"
-            && !args
-                .get("skip_conflict_check")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            && let Some(content) = args.get("content").and_then(Value::as_str)
-            && !content.trim().is_empty()
-        {
-            let session_id = args.get("session_id").and_then(Value::as_str);
-            let user_id = args.get("user_id").and_then(Value::as_str);
-            if let Some(conflict) = self
-                .detect_remember_conflict(content, session_id, user_id)
-                .await
-            {
-                return conflict;
-            }
         }
 
         // The v2→v1 translation — including business-category expansion
@@ -1436,15 +1280,7 @@ impl MemoriaToolGateway {
             }
         }
 
-        // For `recall`, layer in session-scoped focus boosts. The backend
-        // is free to ignore fields it doesn't understand; they become
-        // active once Memoria v2 lands.
-        if op == "recall" {
-            let sid = args.get("session_id").and_then(Value::as_str).unwrap_or("");
-            self.apply_focus_hints(sid, &mut payload);
-        }
-
-        let raw_text = match astra_core::net::client_builder_for_target(&endpoint)
+        let mut raw_text = match astra_core::net::client_builder_for_target(&endpoint)
             .timeout(timeout)
             .build()
         {
@@ -1503,6 +1339,40 @@ impl MemoriaToolGateway {
             Err(e) => json!({"error": format!("build client: {e}")}).to_string(),
         };
 
+        // A strict session recall must not lose a just-written `working`
+        // memory merely because the vector/index path is temporarily behind
+        // the authoritative owner/session list.  The server proxy performs
+        // the same reconciliation for edge callers; this direct path covers
+        // server-owned execution without introducing a local memory overlay.
+        if op == "recall"
+            && args.get("scope").and_then(Value::as_str) == Some("session")
+            && self.cloud_token.is_none()
+        {
+            match self.direct_session_working_list(args, timeout).await {
+                Some(working) => {
+                    tracing::debug!(
+                        target: "astra::memory::reconciliation",
+                        session_id = args
+                            .get("session_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(""),
+                        "strict session working list fetched"
+                    );
+                    raw_text = merge_strict_recall_working_memory(&raw_text, &working, args);
+                }
+                None => {
+                    tracing::warn!(
+                        target: "astra::memory::reconciliation",
+                        session_id = args
+                            .get("session_id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(""),
+                        "strict session working list unavailable"
+                    );
+                }
+            }
+        }
+
         // Post-process recall responses with requested view shaping,
         // freshness suffixes, and surface-once dedup so LLM-driven recalls
         // carry the same signals as the bridge-side prefetch path.
@@ -1560,6 +1430,45 @@ impl MemoriaToolGateway {
             }
         }
         raw_text
+    }
+
+    async fn direct_session_working_list(&self, args: &Value, timeout: Duration) -> Option<String> {
+        let session_id = args.get("session_id").and_then(Value::as_str)?;
+        let user_id = args.get("user_id").and_then(Value::as_str)?;
+        let mem = astra_core::MemoriaSettings::from_env();
+        let key = mem.master_key?;
+        let limit = args
+            .get("top_k")
+            .and_then(Value::as_u64)
+            .unwrap_or(10)
+            .clamp(1, 50);
+        let limit_text = limit.to_string();
+        let url = format!("{}/v1/memories", mem.base_url.trim_end_matches('/'));
+        let client = astra_core::net::client_builder_for_target(&url)
+            .timeout(timeout)
+            .build()
+            .ok()?;
+        let response = client
+            .get(url)
+            .header("Authorization", format!("Bearer {key}"))
+            .header("X-User-Id", user_id)
+            .query(&[
+                ("session_id", session_id),
+                ("memory_type", "working"),
+                ("limit", limit_text.as_str()),
+            ])
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let text = response.text().await.ok()?;
+        let validation = validate_strict_recall_response(&text, args);
+        if validation.is_err() {
+            return None;
+        }
+        Some(text)
     }
 
     fn build_request_transport(
@@ -1753,15 +1662,15 @@ impl MemoriaToolGateway {
     /// v1 HTTP request.
     ///
     /// The LLM only ever sees v2 verbs: `remember`, `recall`, `expand`,
-    /// `forget`, `update`, `focus`, `reflect`, `profile`, `feedback`.
+    /// `forget`, `update`, `reflect`, `profile`, `feedback`.
     /// Runtime translates each to the v1 endpoint with the appropriate
-    /// body shape. Some v2-only semantics (`focus`, `expand` detail
-    /// levels, `reflect` candidate synthesis) are synthesized client-side
-    /// on top of what v1 exposes — see per-verb comments.
+    /// body shape. Some richer semantics (`expand` detail levels and
+    /// `reflect` candidate synthesis) are synthesized client-side on top of
+    /// what v1 exposes — see per-verb comments.
     ///
     /// Returns `(endpoint, payload, method)`. An empty `endpoint` signals
     /// "client-side only, return `payload` verbatim as the tool output"
-    /// (used for validation errors and `focus`/synthetic responses).
+    /// (used for validation errors).
     pub fn build_direct_request(base: &str, op: &str, args: &Value) -> (String, Value, HttpMethod) {
         let inject_identity = |pl: &mut Value| {
             if let Some(obj) = pl.as_object_mut() {
@@ -2215,18 +2124,6 @@ impl MemoriaToolGateway {
                 inject_identity(&mut pl);
                 (format!("{base}/v1/profiles/me"), pl, HttpMethod::Get)
             }
-            // ── focus → client-side synthetic (no v1 endpoint) ───────────
-            //
-            // v1 doesn't expose an attention-boost primitive, so the
-            // dispatcher handles `focus` in-process: it stores a session-
-            // scoped boost hint that subsequent `recall` calls consult.
-            // Returning an empty endpoint tells the caller to short-circuit
-            // before the HTTP client runs.
-            "focus" => (
-                String::new(),
-                json!({"error": "memory(action=focus) is handled in-process; see dispatcher"}),
-                HttpMethod::Post,
-            ),
             _ => (
                 String::new(),
                 json!({"error": format!("Unknown memory action: {op}")}),
@@ -2312,55 +2209,21 @@ impl MemoriaToolGateway {
     }
 }
 
-/// Classification of a memoria write candidate against an existing
-/// corpus: either the content is truly new (→ `Store`) or it duplicates
-/// an existing memory whose id is known (→ `Update`). Used by the
-/// session-end extraction path so refinements route to `update` rather
-/// than creating duplicate rows.
-#[derive(Debug, Clone, PartialEq)]
-pub enum WriteDecision {
-    /// No near-duplicate found. POST /v1/memories to create a new row.
-    Store,
-    /// A near-duplicate exists at this memory_id; caller should
-    /// POST /v1/memories/{id}/correct to refine in place.
-    Update { memory_id: String, score: f64 },
-    /// Conflict check failed, so the safe choice is to skip rather than
-    /// fail-open into a duplicate write.
-    Skip { reason: String },
-}
-
-/// Given the `memories` array from a Memoria retrieve response, decide
-/// whether the write should become a new row (`Store`) or an in-place
-/// correction (`Update`) of the top hit.
-///
-/// Pure. Uses [`MemoriaToolGateway::CONFLICT_SIMILARITY_FLOOR`] as the
-/// threshold; entries missing `retrieval_score` or `memory_id` are
-/// ignored. Highest-score hit wins.
-pub fn classify_write(candidates: &[Value]) -> WriteDecision {
-    let mut best: Option<(f64, String)> = None;
-    for entry in candidates {
-        let Some(score) = entry.get("retrieval_score").and_then(Value::as_f64) else {
-            continue;
-        };
-        if score < MemoriaToolGateway::CONFLICT_SIMILARITY_FLOOR {
-            continue;
-        }
-        let Some(id) = entry.get("memory_id").and_then(Value::as_str) else {
-            continue;
-        };
-        if id.is_empty() {
-            continue;
-        }
-        match best {
-            None => best = Some((score, id.to_string())),
-            Some((s, _)) if score > s => best = Some((score, id.to_string())),
-            _ => {}
-        }
+fn memory_feedback_payload(
+    memory_id: &str,
+    signal: &str,
+    context: &str,
+    user_id: Option<&str>,
+) -> Value {
+    let mut feedback = json!({
+        "memory_id": memory_id,
+        "signal": signal,
+        "context": context,
+    });
+    if let Some(user_id) = user_id.map(str::trim).filter(|user_id| !user_id.is_empty()) {
+        feedback["user_id"] = Value::String(user_id.to_string());
     }
-    match best {
-        Some((score, memory_id)) => WriteDecision::Update { memory_id, score },
-        None => WriteDecision::Store,
-    }
+    feedback
 }
 
 /// Very small RFC3339-ish parser: returns "days since" for a timestamp
@@ -2396,59 +2259,6 @@ fn days_from_civil_now() -> Option<i64> {
         .ok()?
         .as_secs() as i64;
     Some(secs / 86_400)
-}
-
-/// Given the `memories` array from a Memoria retrieve response, return
-/// a conflict-redirect JSON blob if any entry crosses `floor`.
-/// Factored out so the LLM-facing shape is unit-testable without
-/// spinning up an HTTP server.
-fn format_remember_conflict(arr: &[Value], floor: f64) -> Option<String> {
-    let mut hits: Vec<(String, f64, String)> = Vec::new();
-    for entry in arr {
-        let Some(score) = entry.get("retrieval_score").and_then(Value::as_f64) else {
-            continue;
-        };
-        if score < floor {
-            continue;
-        }
-        let Some(id) = entry
-            .get("memory_id")
-            .and_then(Value::as_str)
-            .map(ToString::to_string)
-        else {
-            continue;
-        };
-        let abstract_text = entry
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .lines()
-            .next()
-            .unwrap_or("")
-            .chars()
-            .take(140)
-            .collect::<String>();
-        hits.push((id, score, abstract_text));
-    }
-    if hits.is_empty() {
-        return None;
-    }
-    Some(
-        json!({
-            "status": "conflict",
-            "action_required": "update",
-            "reason": "A similar memory already exists; update it instead of writing a duplicate.",
-            "candidates": hits.iter().map(|(id, score, abs_text)| json!({
-                "memory_id": id,
-                "similarity": score,
-                "abstract": abs_text,
-            })).collect::<Vec<_>>(),
-            "retry_hint": "Call memory(action=update, memory_id=<chosen_id>, content=<new_content>, reason=<why>) \
-                           to supersede, OR retry remember with skip_conflict_check=true if the \
-                           new memory is intentionally distinct.",
-        })
-        .to_string(),
-    )
 }
 
 /// Build a one-shot Memoria HTTP client + auth header.
@@ -2615,6 +2425,61 @@ pub async fn memoria_health() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    struct MemoriaEnvGuard {
+        base_url: Option<String>,
+        master_key: Option<String>,
+    }
+
+    impl MemoriaEnvGuard {
+        fn set(base_url: &str, master_key: &str) -> Self {
+            let guard = Self {
+                base_url: std::env::var("MEMORIA_BASE_URL").ok(),
+                master_key: std::env::var("MEMORIA_MASTER_KEY").ok(),
+            };
+            // SAFETY: this test is serialized with other environment-mutating
+            // tests; the guard restores both variables even on panic.
+            unsafe {
+                std::env::set_var("MEMORIA_BASE_URL", base_url);
+                std::env::set_var("MEMORIA_MASTER_KEY", master_key);
+            }
+            guard
+        }
+    }
+
+    impl Drop for MemoriaEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: see `MemoriaEnvGuard::set`.
+            unsafe {
+                match &self.base_url {
+                    Some(value) => std::env::set_var("MEMORIA_BASE_URL", value),
+                    None => std::env::remove_var("MEMORIA_BASE_URL"),
+                }
+                match &self.master_key {
+                    Some(value) => std::env::set_var("MEMORIA_MASTER_KEY", value),
+                    None => std::env::remove_var("MEMORIA_MASTER_KEY"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recall_feedback_preserves_the_recall_owner_scope() {
+        let payload = memory_feedback_payload(
+            "memory-1",
+            "useful",
+            "server-tool:read_file",
+            Some(" owner-1 "),
+        );
+
+        assert_eq!(payload["memory_id"], "memory-1");
+        assert_eq!(payload["user_id"], "owner-1");
+        let mut direct_payload = payload.clone();
+        let direct_scope = project_direct_memoria_scope(None, None, &payload, &mut direct_payload);
+        assert_eq!(direct_scope.as_deref(), Some("owner-1"));
+        assert!(direct_payload.get("user_id").is_none());
+    }
 
     #[test]
     fn client_errors_do_not_count_as_memory_service_outages() {
@@ -2703,72 +2568,6 @@ mod tests {
         );
     }
     use serde_json::json;
-
-    #[test]
-    fn conflict_returns_none_below_floor() {
-        let arr = vec![
-            json!({"memory_id": "a", "retrieval_score": 0.70, "content": "x"}),
-            json!({"memory_id": "b", "retrieval_score": 0.50, "content": "y"}),
-        ];
-        assert!(format_remember_conflict(&arr, 0.85).is_none());
-    }
-
-    #[test]
-    fn conflict_returns_none_on_empty() {
-        assert!(format_remember_conflict(&[], 0.85).is_none());
-    }
-
-    #[test]
-    fn conflict_surfaces_high_similarity_hit_as_update_redirect() {
-        let arr = vec![
-            json!({
-                "memory_id": "m-42",
-                "retrieval_score": 0.93,
-                "content": "Integration tests must hit a real database\nWhy: prior incident",
-            }),
-            json!({"memory_id": "low", "retrieval_score": 0.41, "content": "noise"}),
-        ];
-        let out = format_remember_conflict(&arr, 0.85).expect("conflict");
-        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(parsed["status"], "conflict");
-        assert_eq!(parsed["action_required"], "update");
-        let candidates = parsed["candidates"].as_array().unwrap();
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0]["memory_id"], "m-42");
-        assert_eq!(candidates[0]["similarity"].as_f64().unwrap(), 0.93);
-        // First-line abstract only.
-        assert_eq!(
-            candidates[0]["abstract"],
-            "Integration tests must hit a real database"
-        );
-    }
-
-    #[test]
-    fn conflict_skips_entries_missing_score_or_id() {
-        let arr = vec![
-            json!({"memory_id": "ok", "retrieval_score": 0.90, "content": "hit"}),
-            json!({"retrieval_score": 0.95, "content": "missing id"}),
-            json!({"memory_id": "no_score", "content": "missing score"}),
-        ];
-        let out = format_remember_conflict(&arr, 0.85).expect("conflict");
-        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(parsed["candidates"].as_array().unwrap().len(), 1);
-        assert_eq!(parsed["candidates"][0]["memory_id"], "ok");
-    }
-
-    #[test]
-    fn conflict_truncates_long_abstract() {
-        let long = "x".repeat(500);
-        let arr = vec![json!({
-            "memory_id": "m",
-            "retrieval_score": 0.95,
-            "content": long,
-        })];
-        let out = format_remember_conflict(&arr, 0.85).expect("conflict");
-        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
-        let abstract_text = parsed["candidates"][0]["abstract"].as_str().unwrap();
-        assert!(abstract_text.chars().count() <= 140);
-    }
 
     #[test]
     fn map_business_types_to_memoria_primitives() {
@@ -3050,6 +2849,44 @@ mod tests {
         assert_eq!(endpoint, "http://mem/v1/memories/retrieve");
         assert_eq!(pl["session_id"], "sess-abc");
         assert_eq!(pl["session_scope"], "only");
+    }
+
+    #[test]
+    fn strict_recall_working_reconciliation_is_bounded_and_deduplicated() {
+        let original = r#"{"items":[
+            {"memory_id":"episodic-1","memory_type":"episodic","user_id":"u","session_id":"s"},
+            {"memory_id":"working-1","memory_type":"working","user_id":"u","session_id":"s"}
+        ]}"#;
+        let working = r#"{"items":[
+            {"memory_id":"working-1","memory_type":"working","user_id":"u","session_id":"s"},
+            {"memory_id":"working-2","memory_type":"working","user_id":"u","session_id":"s"},
+            {"memory_id":"episodic-2","memory_type":"episodic","user_id":"u","session_id":"s"},
+            {"memory_id":"working-3","memory_type":"working","user_id":"u","session_id":"s"}
+        ]}"#;
+        let args = json!({"scope":"session", "session_id":"s", "user_id":"u", "top_k":3});
+
+        let merged = merge_strict_recall_working_memory(original, working, &args);
+        let merged: Value = serde_json::from_str(&merged).unwrap();
+        let items = merged["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["memory_id"], "working-2");
+        assert_eq!(items[1]["memory_id"], "working-3");
+        assert_eq!(items[2]["memory_id"], "episodic-1");
+        assert!(!items.iter().any(|item| item["memory_id"] == "episodic-2"));
+    }
+
+    #[test]
+    fn strict_recall_working_reconciliation_preserves_transport_for_caller_validation() {
+        let original = r#"{"memories":[{"memory_id":"m1","memory_type":"episodic","user_id":"u","session_id":"s"}]}"#;
+        let foreign = r#"{"memories":[{"memory_id":"m2","memory_type":"working","user_id":"other","session_id":"s"}]}"#;
+        let args = json!({"scope":"session", "session_id":"s", "user_id":"u"});
+        let merged = merge_strict_recall_working_memory(original, foreign, &args);
+        let merged: Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(merged["memories"].as_array().unwrap().len(), 2);
+        // The helper deliberately does not decide identity. The direct
+        // caller validates the fallback before invoking it; this test keeps
+        // that security boundary explicit rather than hiding validation here.
+        assert_eq!(merged["memories"][0]["user_id"], "other");
     }
 
     #[test]
@@ -3359,6 +3196,60 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn direct_remember_writes_once_without_retrieve_preflight() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // A high, intentionally unbounded ranking score must not redirect a
+        // write: retrieval is not a duplicate-probability oracle and should
+        // not be contacted by the direct remember path at all.
+        Mock::given(method("POST"))
+            .and(path("/v1/memories/retrieve"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "memories": [{
+                    "memory_id": "existing",
+                    "retrieval_score": 100.0,
+                    "content": "unrelated historical memory"
+                }]
+            })))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/memories"))
+            .and(header("authorization", "Bearer direct-test-key"))
+            .and(header("x-user-id", "user-direct"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": "completed",
+                "memory_id": "mem-new"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let _env = MemoriaEnvGuard::set(&server.uri(), "direct-test-key");
+        let gateway = MemoriaToolGateway::new(None, None);
+        let output = gateway
+            .call_with_timeout(
+                "remember",
+                &json!({
+                    "content": "A fresh, intentionally distinct fact",
+                    "memory_type": "semantic",
+                    "session_id": "session-direct",
+                    "user_id": "user-direct"
+                }),
+                Duration::from_secs(1),
+            )
+            .await;
+
+        let parsed: Value = serde_json::from_str(&output).expect("write response must be JSON");
+        assert_eq!(parsed["memory_id"], "mem-new");
+        server.verify().await;
+    }
+
     // ── P8: reason required on forget / update ────────────────────────
 
     #[test]
@@ -3623,6 +3514,7 @@ mod memoria_http_client_tests {
         MemoriaToolGateway::record_seen(session_id, ["m1".into(), "m2".into()]);
         MemoriaToolGateway::record_recall_for_producer(
             session_id,
+            None,
             "test",
             4,
             vec!["m1".into(), "m2".into()],
@@ -3687,6 +3579,7 @@ mod memoria_http_client_tests {
         MemoriaToolGateway::record_seen(session_id, ["m1".into(), "m2".into()]);
         MemoriaToolGateway::record_recall_for_producer(
             session_id,
+            None,
             "test",
             4,
             vec!["m1".into(), "m2".into()],
@@ -3738,6 +3631,7 @@ mod memoria_http_client_tests {
         MemoriaToolGateway::reset_session_process_state(session_id);
         MemoriaToolGateway::record_recall_for_producer(
             session_id,
+            None,
             "test",
             1,
             vec!["old-id".into()],
@@ -3769,11 +3663,23 @@ mod memoria_http_client_tests {
     fn stale_selection_receipt_cannot_target_a_newer_selection() {
         let session_id = "selection-stale-rejection";
         MemoriaToolGateway::reset_session_process_state(session_id);
-        MemoriaToolGateway::record_recall_for_producer(session_id, "test", 1, vec!["m1".into()]);
+        MemoriaToolGateway::record_recall_for_producer(
+            session_id,
+            None,
+            "test",
+            1,
+            vec!["m1".into()],
+        );
         let stale = MemoriaToolGateway::latest_recall(session_id)
             .unwrap()
             .selection_id();
-        MemoriaToolGateway::record_recall_for_producer(session_id, "test", 2, vec!["m2".into()]);
+        MemoriaToolGateway::record_recall_for_producer(
+            session_id,
+            None,
+            "test",
+            2,
+            vec!["m2".into()],
+        );
 
         let error = MemoriaToolGateway::resolve_selection_reference(
             "forget",
@@ -3821,7 +3727,7 @@ mod memoria_http_client_tests {
         let session_id = "cancelled-recall-guard";
         MemoriaToolGateway::reset_session_process_state(session_id);
 
-        let guard = RecallInvocationGuard::begin(session_id, "run-1", 1).unwrap();
+        let guard = RecallInvocationGuard::begin(session_id, None, "run-1", 1).unwrap();
         assert_eq!(
             astra_memoria::memoria_runtime_state().in_flight_recall_count(session_id),
             1
@@ -4016,73 +3922,6 @@ mod memoria_http_client_tests {
         assert!(newly.is_empty());
     }
 
-    // ── P4: classify_write (extraction conflict gate) ──────────────────
-
-    #[test]
-    fn classify_write_returns_store_when_no_hits_above_floor() {
-        use super::*;
-        let candidates = vec![
-            serde_json::json!({"memory_id": "m1", "retrieval_score": 0.70}),
-            serde_json::json!({"memory_id": "m2", "retrieval_score": 0.40}),
-        ];
-        assert_eq!(classify_write(&candidates), WriteDecision::Store);
-    }
-
-    #[test]
-    fn classify_write_returns_update_on_duplicate() {
-        use super::*;
-        let candidates = vec![
-            serde_json::json!({"memory_id": "m-dup", "retrieval_score": 0.92}),
-            serde_json::json!({"memory_id": "m-low", "retrieval_score": 0.50}),
-        ];
-        match classify_write(&candidates) {
-            WriteDecision::Update { memory_id, score } => {
-                assert_eq!(memory_id, "m-dup");
-                assert!((score - 0.92).abs() < 1e-6);
-            }
-            d => panic!("expected Update, got {d:?}"),
-        }
-    }
-
-    #[test]
-    fn classify_write_picks_highest_scoring_duplicate() {
-        use super::*;
-        let candidates = vec![
-            serde_json::json!({"memory_id": "m-a", "retrieval_score": 0.86}),
-            serde_json::json!({"memory_id": "m-b", "retrieval_score": 0.95}),
-            serde_json::json!({"memory_id": "m-c", "retrieval_score": 0.88}),
-        ];
-        match classify_write(&candidates) {
-            WriteDecision::Update { memory_id, .. } => assert_eq!(memory_id, "m-b"),
-            d => panic!("expected Update, got {d:?}"),
-        }
-    }
-
-    #[test]
-    fn classify_write_skips_entries_missing_id_or_score() {
-        use super::*;
-        let candidates = vec![
-            serde_json::json!({"retrieval_score": 0.99}), // no id
-            serde_json::json!({"memory_id": "m", "retrieval_score": 0.92}),
-            serde_json::json!({"memory_id": ""}), // no score + empty id
-        ];
-        match classify_write(&candidates) {
-            WriteDecision::Update { memory_id, .. } => assert_eq!(memory_id, "m"),
-            d => panic!("expected Update, got {d:?}"),
-        }
-    }
-
-    #[test]
-    fn classify_write_floor_is_exactly_0_85() {
-        use super::*;
-        // just below floor → Store
-        let below = vec![serde_json::json!({"memory_id": "m", "retrieval_score": 0.84})];
-        assert_eq!(classify_write(&below), WriteDecision::Store);
-        // exactly at floor → Update (tie-goes-to-dup)
-        let at = vec![serde_json::json!({"memory_id": "m", "retrieval_score": 0.85})];
-        assert!(matches!(classify_write(&at), WriteDecision::Update { .. }));
-    }
-
     #[test]
     fn seen_store_is_isolated_across_sessions() {
         use super::*;
@@ -4100,30 +3939,6 @@ mod memoria_http_client_tests {
         MemoriaToolGateway::record_seen("p6-reset-sess", ["m1".into(), "m2".into()]);
         MemoriaToolGateway::reset_seen("p6-reset-sess");
         assert!(MemoriaToolGateway::seen_snapshot("p6-reset-sess").is_empty());
-    }
-
-    #[test]
-    fn focus_hints_survive_new_client_instances() {
-        use super::*;
-        let session_id = "p6-focus-global";
-        MemoriaToolGateway::reset_focus(session_id);
-        let c1 = MemoriaToolGateway::new(None, None);
-        let c2 = MemoriaToolGateway::new(None, None);
-        let response = c1.focus_set(
-            session_id,
-            &json!({
-                "focus_type": "topic",
-                "focus_value": "memory-runtime",
-                "boost": 2.0,
-            }),
-        );
-        assert!(response.contains("\"status\":\"completed\""));
-
-        let mut payload = json!({"query": "review", "top_k": 5});
-        c2.apply_focus_hints(session_id, &mut payload);
-        assert_eq!(payload["boost_topics"][0]["value"], "memory-runtime");
-        assert_eq!(payload["boost_topics"][0]["boost"], 2.0);
-        MemoriaToolGateway::reset_focus(session_id);
     }
 
     #[test]
@@ -4170,6 +3985,7 @@ mod memoria_http_client_tests {
         MemoriaToolGateway::reset_session_process_state("r5-single");
         MemoriaToolGateway::record_recall_for_producer(
             "r5-single",
+            None,
             "test",
             3,
             vec!["m1".into(), "m2".into()],
@@ -4189,6 +4005,7 @@ mod memoria_http_client_tests {
         for i in 0..20 {
             MemoriaToolGateway::record_recall_for_producer(
                 "r5-cap",
+                None,
                 "test",
                 i,
                 vec![format!("m{i}")],
@@ -4202,9 +4019,21 @@ mod memoria_http_client_tests {
     fn drain_recalls_respects_max_age() {
         use super::*;
         MemoriaToolGateway::reset_session_process_state("r5-age");
-        MemoriaToolGateway::record_recall_for_producer("r5-age", "test", 1, vec!["stale".into()]);
+        MemoriaToolGateway::record_recall_for_producer(
+            "r5-age",
+            None,
+            "test",
+            1,
+            vec!["stale".into()],
+        );
         std::thread::sleep(Duration::from_millis(15));
-        MemoriaToolGateway::record_recall_for_producer("r5-age", "test", 2, vec!["fresh".into()]);
+        MemoriaToolGateway::record_recall_for_producer(
+            "r5-age",
+            None,
+            "test",
+            2,
+            vec!["fresh".into()],
+        );
         let drained = MemoriaToolGateway::drain_recalls_for_producer(
             "r5-age",
             "test",
@@ -4222,14 +4051,14 @@ mod memoria_http_client_tests {
     fn record_recall_empty_ids_is_noop() {
         use super::*;
         MemoriaToolGateway::reset_session_process_state("r5-empty");
-        MemoriaToolGateway::record_recall_for_producer("r5-empty", "test", 1, vec![]);
+        MemoriaToolGateway::record_recall_for_producer("r5-empty", None, "test", 1, vec![]);
         assert_eq!(MemoriaToolGateway::pending_recall_count("r5-empty"), 0);
     }
 
     #[test]
     fn record_recall_empty_session_is_noop() {
         use super::*;
-        MemoriaToolGateway::record_recall_for_producer("", "test", 1, vec!["m1".into()]);
+        MemoriaToolGateway::record_recall_for_producer("", None, "test", 1, vec!["m1".into()]);
         assert!(MemoriaToolGateway::drain_recalls_for_producer("", "test", None).is_empty());
     }
 
@@ -4237,9 +4066,27 @@ mod memoria_http_client_tests {
     fn drain_recalls_fifo_order_preserved() {
         use super::*;
         MemoriaToolGateway::reset_session_process_state("r5-fifo");
-        MemoriaToolGateway::record_recall_for_producer("r5-fifo", "test", 1, vec!["first".into()]);
-        MemoriaToolGateway::record_recall_for_producer("r5-fifo", "test", 2, vec!["second".into()]);
-        MemoriaToolGateway::record_recall_for_producer("r5-fifo", "test", 3, vec!["third".into()]);
+        MemoriaToolGateway::record_recall_for_producer(
+            "r5-fifo",
+            None,
+            "test",
+            1,
+            vec!["first".into()],
+        );
+        MemoriaToolGateway::record_recall_for_producer(
+            "r5-fifo",
+            None,
+            "test",
+            2,
+            vec!["second".into()],
+        );
+        MemoriaToolGateway::record_recall_for_producer(
+            "r5-fifo",
+            None,
+            "test",
+            3,
+            vec!["third".into()],
+        );
         let drained = MemoriaToolGateway::drain_recalls_for_producer("r5-fifo", "test", None);
         let turns: Vec<u32> = drained.iter().map(|s| s.turn).collect();
         assert_eq!(turns, vec![1, 2, 3]);
@@ -4248,26 +4095,25 @@ mod memoria_http_client_tests {
     #[test]
     fn reset_session_process_state_empties_recall_state() {
         use super::*;
-        MemoriaToolGateway::record_recall_for_producer("r5-reset", "test", 1, vec!["m1".into()]);
+        MemoriaToolGateway::record_recall_for_producer(
+            "r5-reset",
+            None,
+            "test",
+            1,
+            vec!["m1".into()],
+        );
         MemoriaToolGateway::reset_session_process_state("r5-reset");
         assert_eq!(MemoriaToolGateway::pending_recall_count("r5-reset"), 0);
     }
 
     #[test]
-    fn reset_session_process_state_clears_all_memory_globals() {
+    fn reset_session_process_state_clears_seen_and_recall_state() {
         use super::*;
         let session_id = "r5-reset-all";
-        let client = MemoriaToolGateway::new(None, None);
         MemoriaToolGateway::record_seen(session_id, ["seen-1".into()]);
-        client.focus_set(
-            session_id,
-            &json!({
-                "focus_type": "topic",
-                "focus_value": "cleanup",
-            }),
-        );
         MemoriaToolGateway::record_recall_for_producer(
             session_id,
+            None,
             "test",
             4,
             vec!["recall-1".into()],
@@ -4275,17 +4121,11 @@ mod memoria_http_client_tests {
 
         assert!(!MemoriaToolGateway::seen_snapshot(session_id).is_empty());
         assert_eq!(MemoriaToolGateway::pending_recall_count(session_id), 1);
-        let mut recall_payload = json!({"query": "cleanup"});
-        client.apply_focus_hints(session_id, &mut recall_payload);
-        assert!(recall_payload.get("boost_topics").is_some());
 
         MemoriaToolGateway::reset_session_process_state(session_id);
 
         assert!(MemoriaToolGateway::seen_snapshot(session_id).is_empty());
         assert_eq!(MemoriaToolGateway::pending_recall_count(session_id), 0);
-        let mut after_reset_payload = json!({"query": "cleanup"});
-        client.apply_focus_hints(session_id, &mut after_reset_payload);
-        assert!(after_reset_payload.get("boost_topics").is_none());
     }
 
     #[tokio::test]
@@ -4305,6 +4145,7 @@ mod memoria_http_client_tests {
         MemoriaToolGateway::reset_session_process_state(session_id);
         MemoriaToolGateway::record_recall_for_producer(
             session_id,
+            Some("owner-1"),
             "session",
             7,
             vec!["m1".into(), "m2".into()],

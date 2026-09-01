@@ -797,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_history_ignores_unpaired_or_keyword_search_results() {
+    fn canonical_history_ignores_unpaired_or_non_selection_search_results() {
         let selected = json!({
             "mode": "select",
             "query": "select:github",
@@ -806,8 +806,9 @@ mod tests {
             "missing": []
         })
         .to_string();
-        let keyword = json!({
-            "mode": "keyword",
+        let non_selection = json!({
+            "mode": "error",
+            "status": "failed",
             "query": "github",
             "matches": [{"name": "github"}]
         })
@@ -821,7 +822,7 @@ mod tests {
                     "function": {"name": "tool_search", "arguments": "{}"}
                 }]
             }),
-            json!({"role": "tool", "tool_call_id": "search-1", "content": keyword}),
+            json!({"role": "tool", "tool_call_id": "search-1", "content": non_selection}),
             json!({
                 "role": "tool",
                 "tool_call_id": "missing-call",
@@ -883,11 +884,12 @@ mod tests {
     }
 
     #[test]
-    fn keyword_result_does_not_activate_names() {
+    fn non_selection_result_does_not_activate_names() {
         let out = json!({
-            "mode": "keyword",
+            "mode": "error",
+            "status": "failed",
             "query": "agent",
-            "matches": [{"name": "agent_fanout", "description": "short", "score": 0.8}]
+            "matches": [{"name": "agent_fanout"}]
         })
         .to_string();
         assert!(activated_tool_names_from_tool_search_output(&out).is_empty());

@@ -128,32 +128,6 @@ pub async fn delete_credential_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub async fn publish_skill_handler(
-    State(state): State<AppState>,
-    Path(skill_name): Path<String>,
-    headers: HeaderMap,
-) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    let result = state
-        .marketplace_service
-        .publish_skill(user.user_id, skill_name)
-        .await?;
-    Ok(Json(result))
-}
-
-pub async fn deprecate_skill_handler(
-    State(state): State<AppState>,
-    Path(skill_name): Path<String>,
-    headers: HeaderMap,
-) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let user = state.auth_service.current_user(&headers).await?;
-    let result = state
-        .marketplace_service
-        .deprecate_skill(user.user_id, skill_name)
-        .await?;
-    Ok(Json(result))
-}
-
 // ── Marketplace stats handlers (Phase 3) ─────────────────────────────────────
 
 pub use astra_services::marketplace_stats::{

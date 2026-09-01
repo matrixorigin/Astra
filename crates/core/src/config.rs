@@ -1355,6 +1355,12 @@ impl MatrixOneSettings {
     /// - `min_connections` must be ≤ `max_connections`
     /// - acquire/idle/lifetime timeouts must be > 0
     pub fn validate(&self) -> Result<(), String> {
+        if self.database.is_empty() || self.database.len() > 64 {
+            return Err(format!(
+                "matrixone database identifier must be 1..=64 ASCII bytes (got {})",
+                self.database.len()
+            ));
+        }
         if self.db_pool_max_connections == 0 {
             return Err("db_pool_max_connections must be ≥ 1 (got 0)".into());
         }
@@ -1780,6 +1786,17 @@ mod tests {
             url_with_pw.contains(":111@"),
             "url_with_password should contain actual password: {url_with_pw}"
         );
+    }
+
+    #[test]
+    fn matrixone_settings_reject_database_identifiers_over_mysql_limit() {
+        let mut settings = MatrixOneSettings::default();
+        settings.database = "a".repeat(64);
+        assert!(settings.validate().is_ok());
+        settings.database = "select-db".into();
+        assert!(settings.validate().is_ok());
+        settings.database = "a".repeat(65);
+        assert!(settings.validate().is_err());
     }
 
     #[test]

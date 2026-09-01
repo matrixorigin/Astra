@@ -14,17 +14,20 @@
 //! ```
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex as TokioMutex;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::orchestration::{AgentProgressEvent, ProgressEventType};
+use crate::orchestration::{AgentProgressEvent, CancellationOrigin, ProgressEventType};
+use crate::server::run::lifecycle::run_state::TOOL_TERMINAL_DURABLY_FANNED_OUT_FIELD;
 use crate::server::tool_admission::{
     ToolAdmissionContext, has_explicit_runtime_executor_provider,
     resolve_tool_admission_for_binding_with_context,
@@ -40,30 +43,40 @@ use crate::server::tool_transport::{
     WorkspaceAuthority, WorkspaceBinding, WorkspaceBindingKind, binding_event_fields,
     capability_filter_edge_provided_tool_schemas_for_binding,
     capability_filter_edge_provided_tool_schemas_for_binding_with_context,
-    capability_filtered_server_tool_schemas, capability_filtered_server_tool_schemas_with_context,
-    projected_tool_end_event_fields, projected_tool_start_event_fields,
+    capability_filtered_server_tool_schemas_with_context, projected_tool_end_event_fields,
+    projected_tool_start_event_fields,
 };
 use crate::turn::agentic::headless_round::HeadlessStderrStyle;
-use crate::turn::agentic_loop::host::{
-    AgenticLoopHost, AgenticLoopOutcome, AgenticLoopState, HostTurnResult, SkillAutoRouteDecision,
-    SkillAutoRouteJudgeContext, TurnInteractionMode, TurnInteractionPolicy,
-    interaction_scoped_tool_restrictions,
+use crate::turn::agentic_loop::execution_phase::{
+    WorkValidationState, current_work_validation_state,
 };
-use crate::turn::agentic_loop::tool_support::edge_tool_status_exit_code;
-use crate::turn::bridge::llm_stream::rate_limit_cooldown;
+use crate::turn::agentic_loop::host::{
+    AdmittedToolCallControl, AdmittedToolCallOutcome, AgenticLoopHost, AgenticLoopOutcome,
+    AgenticLoopState, HostTurnResult, SkillAutoRouteDecision, SkillAutoRouteJudgeContext,
+    TurnInteractionMode, TurnInteractionPolicy, TurnPhaseKind, TurnPhaseOutcome, TurnPhaseReceipt,
+    complete_turn_phase, interaction_scoped_tool_restrictions,
+};
 use crate::turn::llm::client::{
     LlmCall, LlmCallResult, LlmCancel, LlmExecutionRoute, LlmStreamUpdate, OwnedLlmExecutionRoute,
-    call_llm_and_collect_with_stream_callback, sleep_ms_or_llm_cancel,
+    call_llm_and_collect_with_stream_callback,
+    call_llm_and_collect_with_stream_callback_and_budget,
+    call_llm_and_collect_with_stream_callback_and_budget_and_no_tool_choice,
+    call_llm_and_collect_with_stream_callback_and_no_tool_choice, provider_supports_no_tool_choice,
+    sleep_ms_or_llm_cancel,
 };
-use crate::turn::llm::summary_client::RuntimeSummaryClient;
+use crate::turn::llm::summary_client::{DurableSummaryAttemptAllocator, RuntimeSummaryClient};
+use crate::turn::model_cooldown::rate_limit_cooldown;
 use crate::turn::prompt_cache::PromptCacheConfig;
 use crate::{FernetTokenEncryptor, MatrixOneSettings};
+use astra_config::user_profile::WorkLifecycleIntent;
 use astra_core::SharedPool;
 use astra_services::AdmittedModelExecution;
 use astra_services::multi_agent::EdgeDispatchService;
 use astra_services::runs::{
-    RequestedTurnInteractionMode, SkillAutoRouteExecutionPolicy, TurnIntentExecutionPolicy,
+    ExecutionTimeBudget, RequestedTurnInteractionMode, SkillAutoRouteExecutionPolicy,
+    TurnIntentExecutionPolicy,
 };
+use astra_services::session_journal::{ToolCallDisposition, ToolCallRecord};
 use astra_services::{SkillAutoRouteCandidate, SkillAutoRouteJudge, SkillAutoRouteJudgeError};
 use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal, SharedAgentLiveEventSink,
@@ -78,12 +91,602 @@ use astra_turn_core::thinking_config::ThinkingConfig;
 use astra_turn_core::tool::schema::tool_schema_name;
 use astra_turn_core::tool_schema_prune::filter_tool_schemas_by_excluded_names;
 
+const PROVIDER_ACTION_CONVERGENCE_BUDGET: Duration = Duration::from_secs(30);
+
+/// Process-local monotonic authority for one run's wall-clock budget.
+///
+/// Wire snapshots are relative and may be replayed by transport retries. Once
+/// anchored, a later snapshot may only move the deadline earlier; it can never
+/// replenish time already spent by this host.
+#[derive(Clone, Copy, Debug)]
+struct RunExecutionTimeBudget {
+    deadline: tokio::time::Instant,
+}
+
+impl RunExecutionTimeBudget {
+    fn new(snapshot: ExecutionTimeBudget) -> Self {
+        Self::new_at(snapshot, tokio::time::Instant::now())
+    }
+
+    fn new_at(snapshot: ExecutionTimeBudget, now: tokio::time::Instant) -> Self {
+        Self {
+            deadline: now + Duration::from_secs(snapshot.remaining_seconds),
+        }
+    }
+
+    fn tighten_at(&mut self, snapshot: ExecutionTimeBudget, now: tokio::time::Instant) {
+        let proposed = now + Duration::from_secs(snapshot.remaining_seconds);
+        self.deadline = self.deadline.min(proposed);
+    }
+
+    fn remaining(self) -> Duration {
+        self.remaining_at(tokio::time::Instant::now())
+    }
+
+    fn remaining_at(self, now: tokio::time::Instant) -> Duration {
+        self.deadline.saturating_duration_since(now)
+    }
+
+    fn snapshot(self) -> ExecutionTimeBudget {
+        ExecutionTimeBudget {
+            remaining_seconds: self.remaining().as_secs(),
+        }
+    }
+
+    fn clamp_timeout(self, requested: Duration) -> Option<Duration> {
+        let remaining = self.remaining();
+        (!remaining.is_zero()).then_some(requested.min(remaining))
+    }
+}
+
+/// Execution-owned provider-work slice derived from the run's monotonic
+/// deadline. It is deliberately distinct from the admitted endpoint's
+/// response-start timeout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProviderWorkBudget(Duration);
+
+impl ProviderWorkBudget {
+    fn clamp(self, other: Duration) -> Duration {
+        self.0.min(other)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProviderAttemptBoundary {
+    convergence: bool,
+    no_tools: bool,
+}
+
+impl ProviderAttemptBoundary {
+    fn new(convergence: bool, no_tools: bool) -> Self {
+        Self {
+            convergence,
+            no_tools,
+        }
+    }
+
+    fn budget(self) -> Option<Duration> {
+        self.convergence
+            .then_some(PROVIDER_ACTION_CONVERGENCE_BUDGET)
+    }
+
+    fn provider_work_budget(self, execution: Option<ProviderWorkBudget>) -> Option<Duration> {
+        match (self.budget(), execution) {
+            (Some(boundary), Some(execution)) => Some(execution.clamp(boundary)),
+            (Some(boundary), None) => Some(boundary),
+            (None, Some(execution)) => Some(execution.0),
+            (None, None) => None,
+        }
+    }
+
+    fn forces_thinking_off(self) -> bool {
+        self.convergence
+    }
+
+    fn allows_host_continuation(self) -> bool {
+        !self.convergence
+    }
+}
+
+fn provider_result_has_actionable_output(
+    result: &LlmCallResult,
+    wire_authorized_tool_names: &HashSet<String>,
+) -> bool {
+    crate::turn::llm::client::text_has_actionable_content(&result.full_text)
+        || result.tool_calls.iter().any(|call| {
+            astra_turn_core::tool::args::shape::tool_call_name(call)
+                .and_then(crate::turn::llm::client::canonical_valid_tool_name)
+                .is_some_and(|name| wire_authorized_tool_names.contains(name))
+        })
+}
+
+/// Return whether a provider emitted a syntactically valid tool carrier.
+///
+/// The transport layer intentionally keeps malformed calls in the result so
+/// downstream guards and telemetry can report the original provider error.
+/// They must not, however, count as a selected tool at a convergence boundary:
+/// treating an invalid name as a real call turns recoverable provider
+/// misbehaviour into a fatal no-tools contract violation.
+fn provider_result_has_valid_tool_call(result: &LlmCallResult) -> bool {
+    result.tool_calls.iter().any(|call| {
+        astra_turn_core::tool::args::shape::tool_call_name(call)
+            .and_then(crate::turn::llm::client::canonical_valid_tool_name)
+            .is_some()
+    })
+}
+
+/// A provider can finish a well-formed stream after emitting only private
+/// reasoning.  That is not a settled assistant response: no text has become
+/// visible and no tool has been selected.  Preserve this distinction even on
+/// ordinary (non-convergence) calls so the loop can take its single safe
+/// thinking-off recovery rather than presenting an empty completion as
+/// success.
+///
+/// A selected tool deliberately does *not* qualify here, including one that
+/// will later be rejected by admission.  Replaying after a model selected a
+/// side-effect carrier would be unsafe; that path retains its normal typed
+/// tool-admission handling.
+pub(crate) fn reject_provider_completion_without_delivery(
+    result: &LlmCallResult,
+) -> Result<(), astra_core::ClassifiedError> {
+    reject_provider_completion_without_delivery_with_usage(result, None)
+}
+
+fn reject_provider_completion_without_delivery_with_usage(
+    result: &LlmCallResult,
+    aggregate_usage: Option<crate::turn::token_usage::TokenUsage>,
+) -> Result<(), astra_core::ClassifiedError> {
+    if crate::turn::llm::client::text_has_actionable_content(&result.full_text)
+        || !result.tool_calls.is_empty()
+    {
+        return Ok(());
+    }
+
+    Err(astra_core::ClassifiedError::new(
+        astra_core::ErrorKind::ProviderDeadline,
+        "provider completed without visible text or a selected tool",
+    )
+    .with_details_json(
+        json!({
+            "deadline": {
+                "scope": "provider_completion",
+                "phase": "actionable_output",
+                "actionable_output": false,
+                "retry_safety": "no_visible_text_or_selected_tool"
+            },
+            "partial_full_text": &result.full_text,
+            "partial_reasoning": &result.reasoning,
+            "tool_calls": &result.tool_calls,
+            "provider_response": {"transport_success": true},
+            "usage": aggregate_usage.map(|usage| json!({
+                "input_tokens": usage.input_tokens,
+                "cached_input_tokens": usage.cached_input_tokens,
+                "cache_creation_tokens": usage.cache_creation_tokens,
+                "output_tokens": usage.output_tokens,
+            })),
+        })
+        .to_string(),
+    ))
+}
+
+/// Preserve the authoritative provider result and usage when a host-level
+/// post-response contract rejects its delivery.  The transport succeeded, so
+/// this evidence must remain available to the error lane even though no
+/// `HostTurnResult` will be produced.
+fn attach_transport_success_usage(
+    error: astra_core::ClassifiedError,
+    result: &LlmCallResult,
+    aggregate_usage: Option<crate::turn::token_usage::TokenUsage>,
+) -> astra_core::ClassifiedError {
+    let mut details = error
+        .details_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    let object = details
+        .as_object_mut()
+        .expect("object fallback guarantees transport-success details");
+    object.insert("partial_full_text".to_string(), json!(&result.full_text));
+    object.insert("partial_reasoning".to_string(), json!(&result.reasoning));
+    object.insert("tool_calls".to_string(), json!(&result.tool_calls));
+    object.insert(
+        "provider_response".to_string(),
+        json!({"transport_success": true}),
+    );
+    object.insert(
+        "usage".to_string(),
+        json!(aggregate_usage.map(|usage| {
+            serde_json::json!({
+                "input_tokens": usage.input_tokens,
+                "cached_input_tokens": usage.cached_input_tokens,
+                "cache_creation_tokens": usage.cache_creation_tokens,
+                "output_tokens": usage.output_tokens,
+            })
+        })),
+    );
+    error.with_details_json(details.to_string())
+}
+
+fn provider_result_establishes_canonical_work(result: &LlmCallResult) -> bool {
+    result
+        .tool_calls
+        .iter()
+        .any(|call| astra_turn_core::tool::args::shape::tool_call_name(call) == Some("start_work"))
+}
+
+fn validate_provider_convergence_result(
+    boundary: ProviderAttemptBoundary,
+    canonical_work_pending: bool,
+    result: &LlmCallResult,
+    wire_authorized_tool_names: &HashSet<String>,
+) -> Result<(), astra_core::ClassifiedError> {
+    if boundary.allows_host_continuation() {
+        return Ok(());
+    }
+    if canonical_work_pending
+        && (!wire_authorized_tool_names.contains("start_work")
+            || !provider_result_establishes_canonical_work(result))
+    {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            "canonical Work was required but the bounded provider convergence did not establish it",
+        ));
+    }
+    if boundary.no_tools && provider_result_has_valid_tool_call(result) {
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ContractViolation,
+            "text-only provider convergence returned a tool call despite explicit no-tool authority",
+        ));
+    }
+    if !provider_result_has_actionable_output(result, wire_authorized_tool_names) {
+        if result.tool_calls.is_empty() {
+            return reject_provider_completion_without_delivery(result).map_err(|error| {
+                error.with_details_json(
+                    json!({
+                        "deadline": {
+                            "scope": "provider_convergence",
+                            "phase": "actionable_output",
+                            "limit_ms": PROVIDER_ACTION_CONVERGENCE_BUDGET.as_millis() as u64,
+                            "actionable_output": false,
+                            "retry_safety": "none"
+                        },
+                        "partial_full_text": &result.full_text,
+                        "partial_reasoning": &result.reasoning,
+                        "tool_calls": &result.tool_calls,
+                    })
+                    .to_string(),
+                )
+            });
+        }
+        return Err(astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::ProviderDeadline,
+            "bounded provider convergence selected no authorized output carrier",
+        ));
+    }
+    Ok(())
+}
+
 const MAX_STREAMED_TURN_EVENT_BUFFER: usize = 2_048;
 pub(crate) const HOST_EVENT_ROUTER_SOURCE: &str = "server_host_event_router";
 pub(crate) const HOST_EVENT_ROUTE_CONTRACT_ERROR_CODE: &str = "host_event_route_contract_violation";
 const AUX_LLM_POLICY_ENV: &str = "ASTRA_AUX_LLM_POLICY";
+/// The semantic classifier returns a closed lifecycle decision and, only when
+/// Work is required, a bounded initial graph. Keeping that contract small
+/// prevents admission from consuming primary-turn latency on prose.
+// Work admission may need to return an initial graph plus typed deferred
+// replacements. A smaller cap truncated otherwise-correct JSON and silently
+// degraded lifecycle requests into ordinary execution. Keep this bounded,
+// but large enough for the closed graph schema and one compact repair.
+const TURN_INTENT_JUDGE_MAX_OUTPUT_TOKENS: usize = 1_024;
+
+/// A deferred-tool manifest is part of the provider's control-plane prefix.
+/// It may be recomputed when the admitted wire surface changes, but a
+/// text-only settlement must not re-evaluate execution authority and silently
+/// rewrite the discovery contract at the end of an otherwise stable turn.
+#[derive(Debug, Clone)]
+struct DeferredToolsBlockCache {
+    session_turn: u32,
+    model_name: String,
+    context_window: Option<u32>,
+    text: String,
+}
+
+fn deferred_tools_wire_surface_hash(wire_tools: &[Value]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(wire_tools)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Read an explicit `start_work.activation` from a provider tool batch.
+///
+/// This is intentionally a structural decode of the typed tool envelope. It
+/// never searches model prose or the user's message. If a provider emits more
+/// than one lifecycle call, an explicit defer wins so the runtime cannot
+/// dispatch work merely because another call requested start in the same
+/// uncommitted response.
+fn primary_work_activation(
+    provider_tool_calls: &[Value],
+) -> Option<astra_services::WorkAdmissionActivation> {
+    let mut saw_start = false;
+    for call in provider_tool_calls {
+        let name = call
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str);
+        if name != Some("start_work") {
+            continue;
+        }
+        let Some(arguments) = call
+            .get("function")
+            .and_then(|function| function.get("arguments"))
+            .and_then(Value::as_str)
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        else {
+            continue;
+        };
+        let Some(activation) = arguments
+            .get("activation")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+        else {
+            continue;
+        };
+        match activation {
+            astra_services::WorkAdmissionActivation::Defer => {
+                return Some(astra_services::WorkAdmissionActivation::Defer);
+            }
+            astra_services::WorkAdmissionActivation::Start => saw_start = true,
+        }
+    }
+    saw_start.then_some(astra_services::WorkAdmissionActivation::Start)
+}
+
+/// Return whether the provider selected the explicit parallel fanout carrier.
+/// A mixed batch containing `start_work` is deliberately excluded: the
+/// canonical Work declaration remains the stronger lifecycle boundary there.
+fn primary_explicit_fanout_start(provider_tool_calls: &[Value]) -> bool {
+    let has_start_work = provider_tool_calls
+        .iter()
+        .any(|call| astra_turn_core::tool::args::shape::tool_call_name(call) == Some("start_work"));
+    !has_start_work
+        && provider_tool_calls.iter().any(|call| {
+            if astra_turn_core::tool::args::shape::tool_call_name(call) != Some("agent_fanout") {
+                return false;
+            }
+            let Ok(arguments) = astra_turn_core::tool::args::shape::parse_tool_call_arguments(call)
+            else {
+                return false;
+            };
+            arguments.get("action").and_then(Value::as_str) == Some("start")
+        })
+}
+
+/// Decide whether the first provider response has reached an executable
+/// boundary where semantic Work admission is worth spending an auxiliary
+/// call.  This is deliberately based on the typed tool registry/effects, not
+/// on prompt words or tool-name substrings. A plain answer does not wait for
+/// the sidecar, while a tool/control batch is the boundary at which its typed
+/// result must be settled. An independent multi-call batch, workspace
+/// mutation, network, process, external, or delegation effect gets one bounded
+/// Work-vs-topology decision before the batch is admitted.
+fn provider_batch_needs_work_admission(provider_tool_calls: &[Value]) -> bool {
+    // Skill interception is an exclusive semantic-context boundary: every
+    // companion call is deferred or surgically removed before execution.
+    // Judge the next concrete batch after the trusted workflow ledger is
+    // updated, otherwise a stale Primary result can permanently mask a newly
+    // loaded parallel topology.
+    if provider_tool_calls.iter().any(|call| {
+        astra_turn_core::tool::args::shape::tool_call_name(call)
+            .is_some_and(|name| matches!(name, "skill" | "discover_skills"))
+    }) {
+        return false;
+    }
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let mut has_effectful_call = false;
+    for call in provider_tool_calls {
+        let Some(name) = astra_turn_core::tool::args::shape::tool_call_name(call) else {
+            continue;
+        };
+        // Any canonical Work control call is an admission boundary while the
+        // session is unbound. In particular, inspect/propose must not execute
+        // first and fail merely because the primary model guessed that a
+        // graph already existed. The caller's bound-state guard keeps this
+        // classification out of ordinary Work maintenance rounds.
+        if matches!(
+            name,
+            "start_work"
+                | "inspect_work_plan"
+                | "propose_work_plan"
+                | "inspect_work_criteria"
+                | "propose_work_criteria"
+                | "run_next_work_item"
+                | "settle_work_item"
+        ) {
+            return true;
+        }
+        if matches!(name, "agent" | "agent_fanout") {
+            return true;
+        }
+        // Loading/discovering a workflow changes the semantic context used by
+        // topology admission; it is not itself an executable user outcome.
+        // Judging before the trusted skill result exists freezes a stale
+        // Primary decision and then blocks the workflow's later explicit
+        // fanout. Let the skill boundary complete and judge the subsequent
+        // concrete capability instead.
+        if matches!(name, "skill" | "discover_skills") {
+            continue;
+        }
+        // Capability discovery is the last cheap boundary before the model
+        // selects a newly exposed executor. Classify Work here instead of
+        // waiting for the following effectful call: otherwise a required
+        // graph discards an entire extra provider round (and its tokens) after
+        // discovery. This is a typed control-plane fact, not user-text intent
+        // matching; the semantic judge still owns the uncertain decision.
+        if name == "tool_search" {
+            return true;
+        }
+        let effectful = registry.get(name).is_none_or(|spec| {
+            let effect = spec.effect;
+            effect != astra_runtime_env::ToolEffect::none()
+                && (effect.reads_workspace
+                    || effect.writes_workspace
+                    || effect.spawns_process
+                    || effect.uses_network
+                    || effect.uses_credentials
+                    || effect.mutates_external_state)
+        });
+        if effectful {
+            has_effectful_call = true;
+        }
+    }
+    // The caller separately marks a batch with two or more such calls as an
+    // ambiguous topology. That catches automatic decomposition before the
+    // first batch runs, while policy can still skip a one-shot read.
+    has_effectful_call
+}
+
+/// Whether the default boundary-triggered semantic sidecar should run before
+/// this provider batch is admitted.
+///
+/// A standalone root `agent_fanout.start` is a topology boundary. It does not
+/// necessarily require a synthetic Work graph, but it still requires the
+/// semantic admission decision that says whether the requested user/workflow
+/// topology is primary or parallel. The provider's own tool choice cannot be
+/// the authority for that decision.
+fn provider_batch_starts_work_admission(provider_tool_calls: &[Value]) -> bool {
+    provider_batch_needs_work_admission(provider_tool_calls)
+}
+
+fn provider_batch_has_ambiguous_topology(provider_tool_calls: &[Value]) -> bool {
+    if provider_tool_calls.iter().any(|call| {
+        astra_turn_core::tool::args::shape::tool_call_name(call)
+            .is_some_and(|name| matches!(name, "skill" | "discover_skills"))
+    }) {
+        return false;
+    }
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let mut executable_count = 0_usize;
+    for call in provider_tool_calls {
+        let Some(name) = astra_turn_core::tool::args::shape::tool_call_name(call) else {
+            continue;
+        };
+        // A lifecycle carrier is an admission boundary even when it is not a
+        // parallel topology. The caller uses this bit to allow the one
+        // bounded Work judge under the default cost policy.
+        if name == "start_work" {
+            return true;
+        }
+        if matches!(name, "agent" | "agent_fanout") {
+            return true;
+        }
+        if matches!(name, "skill" | "discover_skills") {
+            continue;
+        }
+        let executable = registry
+            .get(name)
+            .is_none_or(|spec| spec.effect != astra_runtime_env::ToolEffect::none());
+        if executable {
+            executable_count = executable_count.saturating_add(1);
+        }
+    }
+    executable_count >= 2
+}
+
+fn work_admission_boundary_requires_wait(
+    provider_tool_calls: &[Value],
+    completed_decision: bool,
+    pending_judge: bool,
+) -> bool {
+    provider_batch_needs_work_admission(provider_tool_calls)
+        || !provider_tool_calls.is_empty()
+        || completed_decision
+        // Once the semantic preflight has actually started, a text-only
+        // provider response is still an executable completion boundary. Do
+        // not cancel the judge and report success before its typed lifecycle
+        // decision arrives; otherwise a Required Work request can disappear
+        // behind an otherwise innocuous prose response. Ordinary turns keep
+        // their fast path because they have no pending judge at all.
+        || pending_judge
+}
+
+/// Resolve the provider-visible schema surface at a settlement or immediate
+/// final-synthesis boundary. `Some` means the typed boundary owns the wire
+/// declaration; `None` leaves ordinary round projection in control.
+fn settlement_wire_tool_schemas(
+    text_only: bool,
+    work_settlement_only: bool,
+    preserve_wire_surface: bool,
+    preceding_wire_surface: &[Value],
+    fallback_wire_surface: &[Value],
+) -> Option<Vec<Value>> {
+    if !text_only && !work_settlement_only && !preserve_wire_surface {
+        return None;
+    }
+    // Settlement is an execution-authority transition, not a capability-
+    // discovery transition. Reuse the exact preceding declaration so the
+    // provider's cached prefix does not change merely because Work entered
+    // its typed settlement boundary. Runtime admission is narrowed
+    // independently by `sync_valid_tools_to_wire_surface_for_state` and
+    // `admit_terminal_tool_calls`.
+    if work_settlement_only {
+        let has_settlement_tool = |surface: &[Value]| {
+            surface
+                .iter()
+                .filter_map(tool_schema_name)
+                .any(|name| name == "settle_work_item")
+        };
+        return Some(if has_settlement_tool(preceding_wire_surface) {
+            preceding_wire_surface.to_vec()
+        } else {
+            // A stale or empty sticky snapshot cannot strand the only typed
+            // settlement capability. The current lifecycle-ready surface is
+            // the safe fallback; callers/tests verify it contains
+            // settle_work_item whenever this boundary is reachable.
+            fallback_wire_surface.to_vec()
+        });
+    }
+
+    Some(if preserve_wire_surface {
+        preceding_wire_surface.to_vec()
+    } else {
+        Vec::new()
+    })
+}
+
+/// Select the tool surface that versions both the provider's schemas and its
+/// cross-tool prompt contract. Runtime execution authority may be narrower at
+/// a settlement boundary, but the provider-visible pair must never disagree.
+fn provider_context_tool_surface<'a>(
+    settlement_wire_tools: &'a Option<Vec<Value>>,
+    authority_surface: &'a [Value],
+) -> &'a [Value] {
+    settlement_wire_tools
+        .as_deref()
+        .unwrap_or(authority_surface)
+}
+
+/// The semantic judge is auxiliary to the primary conversation. It runs in
+/// parallel with primary request preparation/inference, so this bound limits
+/// how long a slow provider can delay the first *executable* boundary without
+/// serially adding that time to every turn.
+const TURN_INTENT_JUDGE_DEADLINE: Duration = Duration::from_secs(12);
+/// A canonical Work item is deliberately narrow. After a few executed tools,
+/// the next model boundary must re-evaluate its exact expected result rather
+/// than silently turning one item into open-ended exploration.
+/// A semantic Work decision is authoritative, but provider tool selection is
+/// not. Give a provider that replies with text only one explicit, structured
+/// chance to establish the graph; never spin an unbounded corrective loop.
+const MAX_CANONICAL_WORK_ESTABLISHMENT_RETRIES: u32 = 1;
+const SKILL_AUTO_ROUTE_JUDGE_MAX_OUTPUT_TOKENS: usize = 64;
 const METRIC_LLM_MAIN_ATTEMPTS_TOTAL: &str = "astra_llm_main_attempts_total";
 const METRIC_LLM_MAIN_ATTEMPT_TOKENS_TOTAL: &str = "astra_llm_main_attempt_tokens_total";
+/// Immutable built-in authority contracts shared by schema construction and
+/// per-call admission. Keeping one instance avoids rebuilding the registry on
+/// every model tool batch while preserving one policy source of truth.
+static BUILTIN_TOOL_CONTRACTS: OnceLock<astra_runtime_env::ToolRegistry> = OnceLock::new();
 
 fn observed_ttft_ms(
     first_stream_update_ms: Option<u64>,
@@ -93,6 +696,71 @@ fn observed_ttft_ms(
     first_stream_update_ms
         .or(first_visible_text_ms)
         .unwrap_or(completed_ms)
+}
+
+/// Whether a root run that owns a canonical Work graph may perform this call
+/// itself.  Work control is intentionally permit-by-semantics: an unknown
+/// request-scoped/MCP tool is denied closed, and built-ins are admitted only
+/// when their declared effect is empty.  `run_next_work_item` is the one explicit
+/// execution handoff. Durable sub-runs are separately owned execution
+/// carriers, so an explicit isolation or parallelism boundary may use
+/// `agent` or `agent_fanout`; it does not let the root itself escape into
+/// untracked workspace or network execution.
+fn canonical_work_coordinator_tool_allowed(name: &str, _args: &Value) -> bool {
+    if name == "run_next_work_item" {
+        return true;
+    }
+    if matches!(name, "agent" | "agent_fanout") {
+        return true;
+    }
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let Some(spec) = registry.get(name) else {
+        return false;
+    };
+    let effect = spec.effect;
+    !effect.reads_workspace
+        && !effect.writes_workspace
+        && !effect.spawns_process
+        && !effect.uses_network
+        && !effect.uses_credentials
+        && !effect.mutates_external_state
+}
+
+/// Once the last primary Work attempt has settled, the coordinator still
+/// needs a narrow evidence boundary to inspect the resulting state before it
+/// answers the user. This is not task execution: argument-aware workspace
+/// mutation classification must prove the call read-only, and external or
+/// credential-bearing effects remain behind a newly declared Work item.
+fn canonical_work_post_completion_verification_tool_allowed(name: &str, args: &Value) -> bool {
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let Some(spec) = registry.get(name) else {
+        return false;
+    };
+    !spec.effect.uses_network
+        && !spec.effect.uses_credentials
+        && !spec.effect.mutates_external_state
+        && !crate::turn::tool_side_effects::tool_call_may_mutate_workspace(name, Some(args))
+}
+
+/// Build the one internal Work-dispatch call the root loop may synthesize.
+///
+/// This is intentionally represented in the same canonical tool-call shape
+/// as provider calls so it takes the identical admission, journal, event, and
+/// execution path.  Its identity is derived only from the durable turn and
+/// loop round; the model never supplies an item id, revision, or worker brief.
+fn system_next_work_item_call(session_turn: u32, round: u32) -> Value {
+    json!({
+        "id": format!("system-work-dispatch-{session_turn}-{round}"),
+        "type": "function",
+        "function": {
+            "name": "run_next_work_item",
+            "arguments": "{}"
+        },
+        "astra_internal": {
+            "source": "canonical_work_scheduler",
+            "contract_version": "v1"
+        }
+    })
 }
 
 fn apply_pre_turn_summary(
@@ -164,6 +832,9 @@ enum AuxiliaryLlmPolicy {
     CapacityAware,
     Always,
     Disabled,
+    /// Explicit low-latency opt-out: only typed effect/topology boundaries
+    /// trigger Work admission; ordinary text stays on the primary request.
+    BoundaryOnly,
 }
 
 impl AuxiliaryLlmPolicy {
@@ -180,6 +851,7 @@ impl AuxiliaryLlmPolicy {
             Self::CapacityAware => "capacity_aware",
             Self::Always => "always",
             Self::Disabled => "disabled",
+            Self::BoundaryOnly => "boundary_only",
         }
     }
 }
@@ -188,7 +860,12 @@ fn parse_auxiliary_llm_policy(raw: &str) -> AuxiliaryLlmPolicy {
     match raw.trim().to_ascii_lowercase().as_str() {
         "always" | "on" | "true" | "1" => AuxiliaryLlmPolicy::Always,
         "disabled" | "disable" | "off" | "false" | "0" => AuxiliaryLlmPolicy::Disabled,
-        "capacity_aware" | "capacity-aware" | "auto" | "" => AuxiliaryLlmPolicy::CapacityAware,
+        "capacity_aware" | "capacity-aware" | "auto" => AuxiliaryLlmPolicy::CapacityAware,
+        "boundary_only" | "boundary-only" => AuxiliaryLlmPolicy::BoundaryOnly,
+        // Empty and unknown values must not silently disable the semantic
+        // Work classifier. Fail safe to the adaptive product default so a
+        // typo cannot turn a durable user request into an untracked turn.
+        "" => AuxiliaryLlmPolicy::CapacityAware,
         _ => AuxiliaryLlmPolicy::CapacityAware,
     }
 }
@@ -197,6 +874,10 @@ fn should_skip_auxiliary_llm_for_capacity() -> Option<&'static str> {
     let policy = AuxiliaryLlmPolicy::from_env();
     match policy {
         AuxiliaryLlmPolicy::Disabled => Some("disabled"),
+        // Work admission is the product's lifecycle classifier and is
+        // intentionally handled by `should_skip_work_admission_judge`; this
+        // helper continues to gate unrelated optional auxiliaries.
+        AuxiliaryLlmPolicy::BoundaryOnly => Some("boundary_only"),
         AuxiliaryLlmPolicy::Always => None,
         AuxiliaryLlmPolicy::CapacityAware => {
             if crate::llm_provider_admission::ProviderAdmissionConfig::from_env().is_enabled() {
@@ -210,6 +891,30 @@ fn should_skip_auxiliary_llm_for_capacity() -> Option<&'static str> {
 
 fn auxiliary_llm_policy_label() -> &'static str {
     AuxiliaryLlmPolicy::from_env().as_label()
+}
+
+/// Work admission is the semantic lifecycle classifier. The default adaptive
+/// policy always starts its one bounded judge for an eligible primary turn.
+/// Provider admission still owns the shared quota claim for that request, but
+/// it cannot erase a product correctness boundary merely because quota
+/// accounting is enabled. Explicit
+/// `boundary_only` remains available for deployments that deliberately prefer
+/// the old single-request fast path.
+fn should_skip_work_admission_judge(
+    admission_boundary: bool,
+    _topology_boundary: bool,
+) -> Option<&'static str> {
+    match AuxiliaryLlmPolicy::from_env() {
+        AuxiliaryLlmPolicy::BoundaryOnly if admission_boundary => None,
+        AuxiliaryLlmPolicy::BoundaryOnly => Some("ordinary_primary_turn"),
+        AuxiliaryLlmPolicy::Disabled => Some("disabled"),
+        AuxiliaryLlmPolicy::Always => None,
+        // CapacityAware still gates optional auxiliary features through
+        // `should_skip_auxiliary_llm_for_capacity`. Work admission is not an
+        // optional enhancement: it decides whether user-visible execution
+        // must cross a durable lifecycle boundary before any effect runs.
+        AuxiliaryLlmPolicy::CapacityAware => None,
+    }
 }
 
 fn llm_main_attempt_metrics_slot() -> &'static RwLock<Option<Arc<MetricsRegistry>>> {
@@ -244,6 +949,32 @@ fn llm_main_attempt_label(attempt_in_round: u32) -> &'static str {
     } else {
         "retry"
     }
+}
+
+fn reconcile_durable_logical_attempt(
+    requested_attempt: u32,
+    admitted_attempt: u32,
+) -> Result<u32, astra_core::ClassifiedError> {
+    if admitted_attempt == requested_attempt
+        || requested_attempt.checked_add(1) == Some(admitted_attempt)
+    {
+        return Ok(admitted_attempt);
+    }
+    Err(astra_core::ClassifiedError::new(
+        astra_core::ErrorKind::ContractViolation,
+        format!(
+            "durable inference admission returned logical_attempt={admitted_attempt} for requested logical_attempt={requested_attempt}"
+        ),
+    )
+    .with_details_json(
+        json!({
+            "source": crate::turn::llm::durable::INFERENCE_LEDGER_ERROR_SOURCE,
+            "stage": "logical_invocation_admission_retry_identity",
+            "requested_logical_attempt": requested_attempt,
+            "admitted_logical_attempt": admitted_attempt,
+        })
+        .to_string(),
+    ))
 }
 
 /// Identity for the next logical provider request in this agent turn.
@@ -281,6 +1012,7 @@ fn llm_main_error_outcome(error: &astra_core::ClassifiedError) -> &'static str {
         astra_core::ErrorKind::StreamTransport => "error_stream_transport",
         astra_core::ErrorKind::ConnectionPoolExhausted => "error_connection_pool_exhausted",
         astra_core::ErrorKind::BudgetExhausted => "error_budget_exhausted",
+        astra_core::ErrorKind::ProviderDeadline => "error_provider_deadline",
         astra_core::ErrorKind::ToolRoundsExhausted => "error_tool_rounds_exhausted",
         astra_core::ErrorKind::Network => "error_network",
         astra_core::ErrorKind::ToolNotFound => "error_tool_not_found",
@@ -302,7 +1034,7 @@ fn llm_main_success_outcome(result: &LlmCallResult, will_retry_for_length: bool)
     if will_retry_for_length {
         return "length_retry";
     }
-    match result.finish_reason.as_deref() {
+    match result.lifecycle_finish_reason() {
         Some("stop") => "success_stop",
         Some("tool_calls") => "success_tool_calls",
         Some("length") => "success_length_cap",
@@ -310,6 +1042,189 @@ fn llm_main_success_outcome(result: &LlmCallResult, will_retry_for_length: bool)
         Some(_) => "success_other",
         None => "success_unknown_finish",
     }
+}
+
+/// Resolve the only output-cap retry that the host may add to a provider
+/// request.  A catalog completion limit is authoritative: the normal context
+/// policy has already chosen the request budget from that limit, so retrying
+/// above it is not a valid way to complete a task.  When the catalog has no
+/// completion limit, allow one conservative probe; repeated typed saturation
+/// is handled by `reconcile_repeated_provider_output_cap` instead of an
+/// arbitrary geometric retry ladder.
+fn output_cap_retry_limit(
+    initial_output_tokens: usize,
+    catalog_max_completion_tokens: Option<u32>,
+    context_output_limit: usize,
+) -> usize {
+    let candidate = if catalog_max_completion_tokens.is_some() {
+        initial_output_tokens
+    } else {
+        initial_output_tokens.saturating_mul(2)
+    };
+    candidate.min(context_output_limit)
+}
+
+/// Reconcile a compatible provider's raw terminal reason with a previously
+/// observed explicit output-cap boundary. The caller preserves the raw reason
+/// beside the effective lifecycle reason in provider-attempt capture; the
+/// returned result carries the latter for retry and finalization.
+fn reconcile_repeated_provider_output_cap(
+    result: &mut LlmCallResult,
+    prior_length_output_tokens: Option<u64>,
+) -> bool {
+    let usage = crate::turn::token_usage::TokenUsage::from_partial_json_map(&result.usage);
+    // An exact repeat is evidence about the provider boundary even when the
+    // provider reports `length` consistently.  A larger request cannot help
+    // if the usable response is still cut at the same output count; retaining
+    // the effective `length` reason lets the caller settle as incomplete
+    // without spending another full physical attempt.  Tool calls are
+    // excluded because a tool-bearing response may legitimately be retried
+    // through the normal tool-admission path.
+    let repeated_cap = result.tool_calls.is_empty()
+        && usage.output_tokens > 0
+        && prior_length_output_tokens == Some(usage.output_tokens)
+        // An explicit provider reason remains authoritative.  Only an
+        // omitted reason may be upgraded from repeated typed saturation;
+        // explicit `length` is already a cap, while `stop`/other reasons are
+        // legitimate terminal explanations even at the same token count.
+        && result
+            .finish_reason
+            .as_deref()
+            .is_none_or(|reason| reason == "length");
+    if repeated_cap && result.finish_reason.is_none() {
+        result.effective_finish_reason = Some("length".to_string());
+    }
+    repeated_cap
+}
+
+fn preserve_exhausted_output_cap_as_interruption(
+    state: &mut AgenticLoopState,
+    result: &LlmCallResult,
+) -> bool {
+    if result.lifecycle_finish_reason() != Some("length")
+        || !result.tool_calls.is_empty()
+        || state.interruption.is_some()
+    {
+        return false;
+    }
+
+    state.interruption = Some(astra_turn_core::interruption::InterruptionRecord::new(
+        astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete,
+        astra_turn_core::interruption::ResumeAction::ContinueImmediately,
+        crate::turn::agentic_loop::lifecycle::interruption_state_summary(
+            state,
+            Some(
+                "The provider exhausted the bounded output-cap retry without completing its response. The partial response is preserved and the session can continue."
+                    .to_string(),
+            ),
+        ),
+    ));
+    true
+}
+
+/// A provider output cap is a transport boundary, not proof that the model
+/// reached a semantic answer.  Give a text-only response one continuation
+/// opportunity before surfacing the resumable interruption.  The retry is
+/// deliberately bounded to one logical continuation and is only eligible when
+/// the provider reported a typed length boundary without tool calls; ordinary
+/// stops and tool-bearing responses retain their normal lifecycle.
+const MAX_OUTPUT_CAP_CONTINUATIONS: u8 = 1;
+
+fn output_cap_continuation_prompt() -> &'static str {
+    "The previous assistant response ended at the provider output limit before the task was complete. Continue from its last point without restarting or repeating the analysis. Make the next concrete tool call or give a concise final result; do not spend another response narrating the same derivation."
+}
+
+fn merge_output_cap_continuation(prefix: &str, continuation: &str) -> String {
+    if prefix.is_empty() {
+        return continuation.to_string();
+    }
+    if continuation.is_empty() || continuation.starts_with(prefix) {
+        return if continuation.is_empty() {
+            prefix.to_string()
+        } else {
+            continuation.to_string()
+        };
+    }
+    if continuation.chars().next().is_some_and(char::is_whitespace) {
+        return format!("{prefix}{continuation}");
+    }
+
+    // Providers normally return a suffix, but a small overlap can occur when
+    // they restate the final sentence after a continuation request.  Avoid
+    // duplicating that overlap while keeping the merge deterministic and
+    // independent of task/domain text.
+    let max_overlap = prefix.len().min(512).min(continuation.len());
+    for overlap in (1..=max_overlap).rev() {
+        if prefix.ends_with(&continuation[..overlap]) {
+            return format!("{}{}", prefix, &continuation[overlap..]);
+        }
+    }
+    format!("{prefix}\n{continuation}")
+}
+
+fn append_output_cap_continuation_context(messages: &mut Vec<Value>, partial_text: &str) {
+    if !partial_text.is_empty() {
+        messages.push(json!({
+            "role": "assistant",
+            "content": partial_text,
+        }));
+    }
+    messages.push(json!({
+        "role": "user",
+        "content": output_cap_continuation_prompt(),
+    }));
+}
+
+fn output_cap_action_first_context() -> Option<Value> {
+    crate::turn::wire_assembly::decision_feedback_preamble_message(
+        "The previous tool-producing response exhausted its provider output limit before acting. In this execution round, avoid another long derivation before action: if more execution is needed, make the next concrete tool call concisely; otherwise give a concise final answer. Do not skip required validation or claim completion without evidence.",
+    )
+}
+
+fn maybe_append_output_cap_action_first_context(
+    state: &mut AgenticLoopState,
+    volatile_preamble: &mut Vec<Value>,
+    tool_execution_available: bool,
+) -> bool {
+    if !tool_execution_available || !state.provider_adaptation.output_cap_action_first_pending {
+        return false;
+    }
+    state.provider_adaptation.output_cap_action_first_pending = false;
+    if let Some(context) = output_cap_action_first_context() {
+        volatile_preamble.push(context);
+        return true;
+    }
+    false
+}
+
+fn tool_execution_available_for_action_first(
+    final_answer_settlement_text_only: bool,
+    wire_tools: &[Value],
+    authority_tools: &[Value],
+) -> bool {
+    if final_answer_settlement_text_only {
+        return false;
+    }
+    let authority_names = authority_tools
+        .iter()
+        .filter_map(tool_schema_name)
+        .collect::<HashSet<_>>();
+    wire_tools
+        .iter()
+        .filter_map(tool_schema_name)
+        .any(|name| authority_names.contains(name))
+}
+
+fn remember_output_cap_action_first(
+    state: &mut AgenticLoopState,
+    output_cap_continuations: u8,
+    result: &LlmCallResult,
+) -> bool {
+    if output_cap_continuations == 0 || result.tool_calls.is_empty() {
+        return false;
+    }
+    state.provider_adaptation.output_cap_action_first_pending = true;
+    true
 }
 
 fn record_llm_main_attempt_metrics(
@@ -373,6 +1288,27 @@ fn llm_cancel_for_state(state: &AgenticLoopState) -> LlmCancel<'_> {
         (Some(f), None) => LlmCancel::Flag(f.as_ref()),
         (None, Some(t)) => LlmCancel::Token(t.as_ref()),
         (None, None) => LlmCancel::None,
+    }
+}
+
+fn estimate_tool_schema_tokens(tools: &[Value]) -> u64 {
+    let site = astra_core::history_work::HistoryWorkSite::ServerToolSchemaEstimationSerialization;
+    match serde_json::to_string(tools) {
+        Ok(value) => {
+            if astra_core::history_work::instrumentation_enabled() {
+                astra_core::history_work::record_operation(
+                    site,
+                    value.len().try_into().unwrap_or(u64::MAX),
+                    tools.len().try_into().unwrap_or(u64::MAX),
+                    0,
+                );
+            }
+            u64::from(astra_turn_core::section_types::estimate_text_tokens(&value))
+        }
+        Err(error) => {
+            astra_core::history_work::record_serialization_failure(site, &error);
+            0
+        }
     }
 }
 
@@ -623,6 +1559,9 @@ struct ResolvedTurnLlmConfig {
     base_url: String,
     provider: String,
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
+    /// Probe-derived fact used by bounded auxiliary calls. This is carried
+    /// from model admission rather than inferred from a provider/model name.
+    thinking_capability: Option<astra_services::models::ThinkingCapability>,
     fallback_chain: Vec<String>,
     header_overrides: HashMap<String, String>,
     request_body_overrides: Option<Map<String, Value>>,
@@ -644,6 +1583,7 @@ impl ResolvedTurnLlmConfig {
             api_key: self.api_key.clone(),
             base_url: self.base_url.clone(),
             provider: self.provider.clone(),
+            thinking_capability: self.thinking_capability,
             header_overrides: self.header_overrides.clone(),
             request_body_overrides: self.request_body_overrides.clone(),
             completions_url_override: self.completions_url_override.clone(),
@@ -690,9 +1630,12 @@ async fn try_resolve_same_owner_fallback(
 
 type PipelineTurnOutcome = crate::turn::llm::context::LlmContextAssemblyOutput;
 
-struct SummaryClientTurnIntentJudge {
+struct SummaryClientWorkAdmissionJudge {
     client: Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
 }
+
+type WorkAdmissionJudgeResult =
+    Result<astra_services::WorkAdmissionDecision, astra_services::TurnIntentJudgeError>;
 
 struct SummaryClientSkillAutoRouteJudge {
     client: Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>,
@@ -700,19 +1643,116 @@ struct SummaryClientSkillAutoRouteJudge {
 
 const RESOLVED_TURN_LLM_CONFIG_CACHE_TTL: Duration = Duration::from_secs(30);
 
-#[async_trait]
-impl astra_services::TurnIntentJudge for SummaryClientTurnIntentJudge {
+fn reconcile_trusted_workflow_topology(
+    ctx: &astra_services::TurnIntentJudgeContext,
+    mut decision: astra_services::WorkAdmissionDecision,
+) -> WorkAdmissionJudgeResult {
+    if ctx.loaded_workflow_execution_topology
+        != Some(astra_services::WorkExecutionTopology::ParallelSubruns)
+    {
+        return Ok(decision);
+    }
+    match &mut decision {
+        astra_services::WorkAdmissionDecision::NotRequired {
+            execution_topology,
+            required_capabilities,
+            ..
+        } => {
+            *execution_topology = astra_services::WorkExecutionTopology::ParallelSubruns;
+            if !required_capabilities
+                .contains(&astra_services::WorkAdmissionCapability::AgentSpawner)
+            {
+                required_capabilities.push(astra_services::WorkAdmissionCapability::AgentSpawner);
+            }
+            Ok(decision)
+        }
+        astra_services::WorkAdmissionDecision::Required { .. } => Err(
+            astra_services::TurnIntentJudgeError::UnsupportedCombination(
+                "durable Work and trusted workflow parallel sub-runs require a task-to-slot settlement protocol"
+                    .to_string(),
+            ),
+        ),
+    }
+}
+
+impl SummaryClientWorkAdmissionJudge {
     async fn judge(
         &self,
         ctx: &astra_services::TurnIntentJudgeContext,
-    ) -> Result<astra_config::user_profile::TurnIntent, astra_services::TurnIntentJudgeError> {
-        let messages = astra_services::turn_intent_judge_messages(ctx);
+    ) -> Result<astra_services::WorkAdmissionDecision, astra_services::TurnIntentJudgeError> {
+        let messages = astra_services::work_admission_judge_messages(ctx);
         let response = self
             .client
             .summarize(astra_turn_types::InferencePurpose::Introspection, &messages)
             .await
             .map_err(astra_services::TurnIntentJudgeError::Transport)?;
-        astra_services::parse_turn_intent_response(response.text.as_str())
+        tracing::debug!(
+            target: "astra::turn_intent",
+            response = %response.text,
+            "Work admission response received"
+        );
+        let parsed = astra_services::parse_work_admission_response(response.text.as_str());
+        let decision = match parsed {
+            Ok(decision) => reconcile_trusted_workflow_topology(ctx, decision),
+            Err(error) => Err(error),
+        };
+        let repair_allowed = match &decision {
+            Err(astra_services::TurnIntentJudgeError::Malformed { .. }) => true,
+            Err(astra_services::TurnIntentJudgeError::UnsupportedCombination(_)) => {
+                // A conflict introduced by a trusted loaded workflow remains a
+                // typed product limitation; it is not model ambiguity that a
+                // semantic repair may override.
+                ctx.loaded_workflow_execution_topology.is_none()
+            }
+            _ => false,
+        };
+        if repair_allowed {
+            // A malformed auxiliary response gets the existing bounded repair.
+            // A valid Required+Parallel response gets one semantic repair too:
+            // models commonly mistake intermediate fanout perspectives for
+            // independently accepted Work outcomes. This repair is deliberately
+            // limited to the model-authored response.
+            let semantic_conflict = matches!(
+                &decision,
+                Err(astra_services::TurnIntentJudgeError::UnsupportedCombination(_))
+            );
+            let repair_instruction = if semantic_conflict {
+                "The previous object chose an unsupported combination: durable Work plus parallel sub-runs. Re-evaluate the user-facing acceptance boundary. Intermediate agents, reviewers, perspectives, findings, and fanout slots that feed one synthesized final answer are not independently accepted outcomes. Return work_lifecycle=not_required with execution_topology=parallel_subruns, required_capabilities=[agent_spawner], and every user-facing result in acceptance_units unless the user explicitly requested durable task lifecycle control. Only retain required+parallel when both facts are explicit. Return one complete JSON object matching the original schema, with no prose."
+            } else {
+                "The previous object was malformed or truncated, or semantically inconsistent with the schema. Re-evaluate the acceptance boundary from the original user request; the previous lifecycle, basis, topology, and graph are not authoritative until they form one valid contract. Return one compact, complete JSON object matching the original schema. Every not_required object must include acceptance_unit_relationship and acceptance_units. Use independent_outcomes only when every unit has its own user-consumable payload/source and survives every peer failure; implementation, verification, and reporting of one change are single_outcome even if listed separately. Runtime, not the model, mechanically promotes 2+ independent primary units to Work. An explicit same-turn multi-agent request without tracked lifecycle is not durable Work. Preserve every atomic lifecycle mutation, but do not preserve an invalid classification. Use separate initial_tasks and mutations arrays. Add carries task only; cancel carries target_initial_task only; replace carries both. Cancel+add remain two mutations and must not become replace. Do not declare counts or final state; runtime derives them. Keep strings under 160 characters. No prose."
+            };
+            tracing::debug!(
+                target: "astra::turn_intent",
+                response = %response.text,
+                "Work admission response required one compact semantic repair"
+            );
+            let mut repair_messages = messages;
+            repair_messages.push(json!({
+                "role": "assistant",
+                "content": response.text,
+            }));
+            repair_messages.push(json!({
+                "role": "user",
+                "content": repair_instruction,
+            }));
+            let repaired = self
+                .client
+                .summarize(
+                    astra_turn_types::InferencePurpose::Introspection,
+                    &repair_messages,
+                )
+                .await
+                .map_err(astra_services::TurnIntentJudgeError::Transport)?;
+            tracing::debug!(
+                target: "astra::turn_intent",
+                response = %repaired.text,
+                "Work admission compact semantic repair completed"
+            );
+            astra_services::parse_work_admission_response(repaired.text.as_str())
+                .and_then(|decision| reconcile_trusted_workflow_topology(ctx, decision))
+        } else {
+            decision
+        }
     }
 }
 
@@ -777,6 +1817,7 @@ async fn resolve_llm_model_for_turn(
             cache_capability: crate::turn::llm::context::cache_capability_from_model_metadata(
                 execution.cache_capability,
             ),
+            thinking_capability: execution.thinking_capability,
             fallback_chain: Vec::new(),
             header_overrides: execution.header_overrides.clone(),
             request_body_overrides: execution.request_body_overrides.clone(),
@@ -798,6 +1839,7 @@ async fn resolve_llm_model_for_turn(
         cache_capability: crate::turn::llm::context::cache_capability_from_model_metadata(
             resolved.prompt_cache_capability,
         ),
+        thinking_capability: resolved.thinking_capability,
         fallback_chain: resolved.fallback_chain,
         header_overrides: HashMap::new(),
         request_body_overrides: resolved.request_body_overrides,
@@ -1130,12 +2172,19 @@ pub struct ServerAgenticLoopHost {
         Option<Arc<dyn crate::turn::llm::durable::InferenceLedgerPersistence>>,
     model_override: Option<String>,
     admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
+    inference_owner_pod_id: Option<String>,
     resolved_model_name: Option<String>,
     resolved_context_window: Option<u32>,
     /// Full resolved config from the last successful model resolution.
     /// Auxiliary inference must use this same admitted execution route.
     resolved_llm_config: Option<ResolvedTurnLlmConfig>,
     resolved_llm_config_at: Option<Instant>,
+    /// One monotonic auxiliary-inference identity namespace for this host.
+    /// Independently reconstructed summary clients must never restart at zero
+    /// for the same durable run scope.
+    summary_attempt_allocator: DurableSummaryAttemptAllocator,
+    /// Monotonic wall-clock authority for this process-local run host.
+    execution_time_budget: Option<RunExecutionTimeBudget>,
 
     // ── Context ──
     /// Final prompt-visible tool schemas after provider declaration, binding,
@@ -1148,11 +2197,30 @@ pub struct ServerAgenticLoopHost {
     /// readiness/policy so introspect can explain why they are unavailable
     /// without changing the LLM-visible `tools[]` payload.
     admission_tool_schemas: Vec<Value>,
+    /// Binding-admitted provider schemas that require explicit activation.
+    ///
+    /// They are kept out of the default `tools[]` payload, but remain available
+    /// to the typed deferred-discovery path. Activated entries are projected
+    /// into a later round's visible surface from this exact admitted pool.
+    deferred_tool_schemas: Vec<Value>,
     /// Tool names actually advertised by the selected runtime provider for
     /// this host. Empty means no explicit runtime provider schema inventory is
     /// constraining admission (for example server-only or server sandbox).
     runtime_declared_tool_names: HashSet<String>,
     capabilities: astra_turn_core::capability::CapabilitySet,
+    /// Whether the run began with a canonical Work binding. This is used only
+    /// by schema-only hosts; a production executor owns the mutable binding.
+    initial_work_planning_bound: bool,
+    canonical_work_context_binding:
+        Option<crate::server::work_context::CanonicalWorkContextBinding>,
+    /// Whether this exact run owns one admitted canonical WorkItem attempt.
+    ///
+    /// A run bound to the Work graph is normally its coordinator and must not
+    /// perform task side effects directly. An attempt-bound run is the inverse
+    /// role: it is the selected task executor. Keeping this role explicit
+    /// prevents the coordinator guard from recursively routing an executor
+    /// back through `run_next_work_item` for the task it already owns.
+    work_item_attempt_bound: bool,
     edge_profile: Map<String, Value>,
     valid_tools: HashSet<String>,
     /// Names the validator should admit beyond the current visible schemas.
@@ -1167,6 +2235,11 @@ pub struct ServerAgenticLoopHost {
     /// the raw edge-profile declaration so unavailable tools disappear rather
     /// than becoming "not yet activated" walls.
     current_deferred_tool_names: HashSet<String>,
+    /// Last control-plane discovery manifest for the current user turn. A
+    /// text-only settlement reuses it when the provider-visible schema surface
+    /// is unchanged; otherwise settlement-time policy projection could change
+    /// only the prompt prefix and destroy strict-history cache reuse.
+    deferred_tools_block_cache: Option<DeferredToolsBlockCache>,
     /// `true` when tools were auto-populated from astra-tools (no CLI connected).
     server_side_tools: bool,
     /// `true` when the visible wire surface was populated from the server catalog.
@@ -1183,6 +2256,77 @@ pub struct ServerAgenticLoopHost {
     turn_intent_policy: TurnIntentExecutionPolicy,
     /// Request-scoped policy for Astra's auxiliary skill auto-route LLM.
     skill_auto_route_policy: SkillAutoRouteExecutionPolicy,
+    /// A complete, typed Work admission for a Work-required user goal.
+    /// It is consumed exactly once at the post-response lifecycle boundary
+    /// when the primary model did not emit another durable execution carrier.
+    pending_work_admission: Option<astra_services::WorkAdmissionDecision>,
+    /// Typed graph changes explicitly requested for a later boundary in the
+    /// same Work turn. They remain obligations until a successful canonical
+    /// plan proposal is observed; natural-language goal text is not a
+    /// lifecycle authority.
+    pending_work_graph_mutations: Vec<astra_services::WorkAdmissionGraphMutation>,
+    /// Workspace side-effect authority from the same bounded semantic
+    /// admission. This remains available after the Work decision itself is
+    /// consumed to materialize a graph, so every later tool round in the user
+    /// turn keeps the same effect boundary.
+    admitted_workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent,
+    /// Tool-record boundary captured when the obligation was installed. This
+    /// prevents an unrelated proposal from an earlier round/turn satisfying a
+    /// newly admitted graph change.
+    pending_work_graph_mutation_record_floor: usize,
+    /// Built-in Work admission runs as a bounded preflight in parallel with
+    /// primary request preparation/inference. Its typed capabilities are
+    /// projected before the primary request when ready; the result is
+    /// reconciled before any provider tool side effect. A completed Required
+    /// decision is materialized through the same synthetic typed `start_work`
+    /// boundary only when the provider emitted no durable carrier.
+    pending_work_admission_judge: Option<JoinHandle<WorkAdmissionJudgeResult>>,
+    /// The optional semantic sidecar gets at most one attempt per user turn.
+    /// An unavailable classifier is not a reason to spend one auxiliary LLM
+    /// request at every subsequent tool boundary; typed primary execution is
+    /// the fail-open fallback for that turn.
+    work_admission_attempted: bool,
+    /// Number of trusted invoked-skill ledger entries visible to the current
+    /// semantic decision. A later skill load changes admission evidence and
+    /// deterministically invalidates the stale decision.
+    work_admission_skill_revision: usize,
+    pending_work_admission_started_at: Option<Instant>,
+    /// Round in which the post-response Work admission was started. The
+    /// generic turn-intent hook may have already emitted an `Unavailable`
+    /// placeholder before this boundary exists; retaining the round lets the
+    /// completed typed receipt be correlated without making it control state.
+    pending_work_admission_round: Option<u32>,
+    /// A completed post-response Work admission waiting to be projected
+    /// through the shared trace/Explain phase fan-out exactly once.
+    completed_work_admission_phase: Option<(Instant, u32, TurnPhaseOutcome)>,
+    /// One synthetic Work declaration may cross the common loop after the
+    /// primary response and before any tool side effect. It is ingested as a
+    /// real lifecycle event, but must not seed prompt-cache diagnostics or
+    /// provider manifests.
+    control_plane_turn_pending: bool,
+    /// User-turn number whose deferred Work declaration must keep the next
+    /// provider request on the exact pre-admission wire surface. A deferred
+    /// control-plane transition is not an execution-capability boundary; it
+    /// must not add agent/web schemas and create a same-turn cache miss. The
+    /// value naturally expires when the session advances to the next turn.
+    deferred_work_surface_turn: Option<u32>,
+    /// Per-turn semantic execution choice retained after the initial Work
+    /// declaration is consumed. This lets a typed parallel-subrun request
+    /// promote its capability without inferring it from prompt text or a
+    /// deferred-tool name.
+    work_admission_execution_topology: astra_services::WorkExecutionTopology,
+    /// True only when the topology came from a completed semantic admission
+    /// for this user turn. The enum default is not execution authority, and
+    /// this bit survives consumption of a Required decision into Work.
+    work_admission_topology_authoritative: bool,
+    /// Typed product limitation from semantic admission. Keeping this
+    /// separate from transport unavailability prevents silent fallback from
+    /// erasing one of two explicit user requirements.
+    work_admission_conflict: Option<String>,
+    /// Typed capability projections from the current Work admission. These
+    /// only affect early schema visibility; normal admission remains the
+    /// authority for execution.
+    work_admission_capabilities: Vec<astra_services::WorkAdmissionCapability>,
     /// `true` when this session explicitly requests full LLM request/response capture.
     full_llm_capture: bool,
     /// Whether tool-call validation should admit Astra's static tool catalog
@@ -1200,16 +2344,12 @@ pub struct ServerAgenticLoopHost {
     /// derived from `plan_resume_hint`, because normal session-resume text
     /// can be prompt-visible without meaning the session is in plan mode.
     plan_authoring_active: Arc<std::sync::RwLock<bool>>,
-    /// Bounded task-board digest loaded before the turn starts. This is a
-    /// scan hint, not an instruction to create or update tasks every turn.
-    task_board_resume_hint: Option<String>,
     /// Runtime-owned memory provider used consistently for prompt recall,
     /// current-session snapshots, compaction, and server-only/subrun paths.
     memoria_client: Option<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>>,
     /// Typed recall latched for one user turn so every tool round observes the
     /// same evidence and the dynamic prompt bytes do not churn mid-turn.
     prompt_memory_recall_cache: Option<PromptMemoryRecallCache>,
-
     // ── Tool execution ──
     edge_callback_ledger: Arc<TokioMutex<HashMap<String, Value>>>,
     edge_dispatch_service: Option<Arc<dyn EdgeDispatchService>>,
@@ -1231,10 +2371,6 @@ pub struct ServerAgenticLoopHost {
     pending_terminal_control_outcome: Option<crate::turn::terminal_control::TerminalControlOutcome>,
     pending_tool_call_admission: Option<crate::turn::agentic_loop::host::ToolCallAdmission>,
     admitted_tool_side_effects_enabled: bool,
-    /// Session-scoped cache for dedup of identical read-only tool invocations
-    /// within a short window. Gated by concurrency_safety classification.
-    tool_result_cache: astra_turn_core::tool_result_dedup::SharedResultCache,
-
     // ── Output collection ──
     /// SSE events emitted during the turn, streamed to the client.
     emitted_events: Vec<Value>,
@@ -1249,6 +2385,10 @@ pub struct ServerAgenticLoopHost {
     /// incremental streaming (web agent mode). The HTTP handler reads
     /// from the corresponding receiver to stream SSE to the client.
     event_tx: Option<ServerEventSender>,
+    /// Irreversible per-turn delivery mode. A disconnected observer removes
+    /// the sender but must not turn the remainder of a streaming run into an
+    /// unbounded non-streaming replay buffer.
+    streaming_turn_started: bool,
     /// Durable, bounded owner of human-input and executable-client
     /// boundaries. Unlike progress SSE, these events may never be dropped or
     /// exposed before their replay fact is committed.
@@ -1274,6 +2414,18 @@ pub struct ServerAgenticLoopHost {
     /// Tracks which plan hint was baked into the latched lifecycle summary so
     /// mid-turn plan enter/exit can refresh only the plan line.
     turn_start_plan_resume_hint: Option<String>,
+    /// Attempt identity that already received its one bounded-execution
+    /// convergence boundary. This is process-local pacing only; durable Work
+    /// facts remain the sole lifecycle authority.
+    /// Attempt identity that already received its one start-of-task contract.
+    /// This is a runtime reminder, not a second task state machine; the
+    /// durable assignment and settlement remain authoritative.
+    work_attempt_started_context: Option<String>,
+    /// Attempt identity that already received one server-owned assignment
+    /// replay after a text-only coordinator response. `run_next_work_item`
+    /// returns the same active attempt in this state; replaying it again is
+    /// not progress and can create an unbounded model/tool loop.
+    work_attempt_scheduler_replayed: Option<String>,
     /// Workspace/executor binding metadata attached to live tool-call events
     /// before transport execution begins.
     execution_metadata: Option<Value>,
@@ -1287,6 +2439,11 @@ pub struct ServerAgenticLoopHost {
     test_llm_rounds: std::collections::VecDeque<Value>,
     #[cfg(feature = "bridge-e2e-hooks")]
     test_llm_rounds_wired: bool,
+    /// One typed semantic-admission result for a mock-LLM HTTP E2E turn.
+    /// Production never accepts this value; it exists so the test path can
+    /// exercise both the primary model and the auxiliary topology authority.
+    #[cfg(feature = "bridge-e2e-hooks")]
+    test_work_admission: Option<astra_services::WorkAdmissionDecision>,
     /// Optional provider hint for the mock path, so cache_control annotations
     /// are exercised as if talking to anthropic/openai/etc. Default (None)
     /// leaves `PromptCacheConfig::default()` behavior (annotations off).
@@ -1343,72 +2500,15 @@ struct PromptMemoryRecallCache {
     session_turn: u32,
     user_content: String,
     entries: Vec<astra_turn_core::context_sources::MemoryEntry>,
+    outcome: astra_turn_types::MemoryRetrievalOutcome,
+    fetch_ms: u64,
 }
 
-async fn fetch_prompt_memory_entries(
-    memoria_client: Option<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>>,
-    user_id: String,
-    session_id: String,
-    session_turn: u32,
-    user_content: String,
-) -> Vec<astra_turn_core::context_sources::MemoryEntry> {
-    let Some(client) = memoria_client.as_deref() else {
-        return Vec::new();
-    };
-    let top_k = std::env::var("ASTRA_RETRIEVAL_TOP_K")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(5);
-    let (prefetched, session_start) = tokio::join!(
-        crate::turn::memory_prefetch::prefetch_memories_with_client(
-            client,
-            &user_content,
-            &user_id,
-            &session_id,
-            top_k,
-        ),
-        async {
-            if session_turn <= 1 {
-                crate::turn::memory_prefetch::prefetch_session_start_memories_with_client(
-                    client,
-                    &user_id,
-                    &session_id,
-                )
-                .await
-                .entries
-            } else {
-                Vec::new()
-            }
-        }
-    );
-    let mut entries = session_start;
-    entries.extend(prefetched.entries);
-    crate::turn::memory_prefetch::admit_prompt_memory_entries(&session_id, entries)
-}
-
-async fn load_initial_session_memory_entry(
-    memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
-    memoria_client: Option<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>>,
-    session_id: String,
-) -> Option<astra_turn_core::context_sources::MemoryEntry> {
-    if let Some(service) = memory_extraction_service.as_ref() {
-        return service
-            .current_session_memory_entry_for_pipeline(&session_id)
-            .await;
-    }
-    let client = memoria_client.as_deref()?;
-    let loaded =
-        crate::session_memory::runner::load_current_session_memory_preferring_local_with_freshness(
-            client,
-            &session_id,
-        )
-        .await;
-    loaded.as_ref().and_then(|loaded| {
-        crate::turn::wire_assembly::session_memory_entry_for_user_turn(
-            Some(&loaded.content),
-            loaded.updated_turn,
-        )
-    })
+struct PromptMemoryRecall {
+    entries: Vec<astra_turn_core::context_sources::MemoryEntry>,
+    outcome: astra_turn_types::MemoryRetrievalOutcome,
+    fetch_ms: u64,
+    fresh: bool,
 }
 
 #[derive(Clone)]
@@ -1446,7 +2546,139 @@ impl HostEventGapTracker {
 pub(crate) trait HostInteractionSink: Send + Sync {
     /// Commit durable replay truth before exposing an interaction. Success is
     /// the producer's permission to begin waiting for its callback.
+    #[cfg(test)]
     async fn commit_and_deliver(&self, event: Value) -> Result<(), String>;
+
+    /// Register every approval item in one canonical provider batch before
+    /// execution scheduling begins, then project the batch UI. Durable sinks
+    /// must persist per-item facts before returning.
+    #[cfg(not(test))]
+    async fn commit_approval_batch_and_deliver(
+        &self,
+        event: Value,
+        _expected_control_epoch: i64,
+        _expected_owner_generation: u64,
+    ) -> Result<(), String>;
+
+    #[cfg(test)]
+    async fn commit_approval_batch_and_deliver(
+        &self,
+        event: Value,
+        _expected_control_epoch: i64,
+        _expected_owner_generation: u64,
+    ) -> Result<(), String> {
+        self.commit_and_deliver(event).await
+    }
+
+    /// Open the exact execution frontier for one registered approval. A
+    /// callback for a later item may be durable already, but cannot resume a
+    /// different frontier.
+    async fn begin_edge_approval_wait(
+        &self,
+        _request_id: &str,
+        _expected_control_epoch: i64,
+        _expected_owner_generation: u64,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Atomically fence one not-yet-started Edge action against newer user
+    /// guidance and commit its exact `tool_request` outbox fact in the same
+    /// run transaction. This method commits durable truth only; the host
+    /// registers callback custody before asking the sink to project it.
+    async fn commit_guarded_tool_request(
+        &self,
+        _request: GuardedToolRequestCommit,
+    ) -> Result<GuardedToolRequestCommitOutcome, String> {
+        Err("interaction sink cannot atomically commit guarded tool requests".to_string())
+    }
+
+    /// Project a tool request already committed by
+    /// [`Self::commit_guarded_tool_request`]. This must never append a second
+    /// durable event.
+    async fn deliver_committed_tool_request(&self, _event: Value) -> Result<(), String> {
+        Err("interaction sink cannot project committed tool requests".to_string())
+    }
+
+    /// Durably settle a client approval callback and release the run wait
+    /// before a newly approved action may enter guarded admission.
+    async fn resolve_edge_approval(
+        &self,
+        _request_id: &str,
+        _tool_name: &str,
+        _approved: bool,
+        _reason: Option<&str>,
+    ) -> Result<(), String> {
+        Err("interaction sink cannot durably resolve Edge approvals".to_string())
+    }
+
+    /// Load the exact shared durable resolution for one pending Edge
+    /// approval. Local callback ledgers are only latency projections and may
+    /// live on a different pod from the run owner.
+    async fn load_edge_approval_resolution(
+        &self,
+        _request_id: &str,
+    ) -> Result<Option<Value>, String> {
+        Ok(None)
+    }
+
+    /// Whether this sink's resolution lookup is backed by the shared durable
+    /// run ledger rather than an in-process test/projection lane.
+    fn has_shared_edge_approval_authority(&self) -> bool {
+        false
+    }
+
+    /// Resolve a previously committed Edge approval when newer durable
+    /// guidance supersedes its not-yet-started action. Implementations must
+    /// return only after the durable resolution and run-resume facts commit;
+    /// callers keep execution denied on every error.
+    async fn resolve_superseded_approval(
+        &self,
+        _request_id: &str,
+        _tool_name: &str,
+    ) -> Result<(), String> {
+        Err("interaction sink cannot durably resolve superseded approvals".to_string())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct GuardedToolRequestCommit {
+    pub action_id: String,
+    pub expected_control_epoch: i64,
+    pub expected_owner_generation: u64,
+    pub event: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum GuardedToolRequestCommitOutcome {
+    Committed { event: Value },
+    AckRecoveredCommitted { event: Value },
+    AlreadyCommitted { event: Value },
+    Superseded { user_intent_event_index: i64 },
+    Inactive { status: String },
+    OwnerGenerationMismatch { actual_owner_generation: u64 },
+    OwnerMismatch { actual_owner_pod_id: Option<String> },
+    Missing,
+}
+
+#[derive(Clone)]
+struct EdgeActionAdmissionContext {
+    run_control: Arc<dyn crate::turn::run_control::RunControlProvider>,
+    user_id: String,
+    run_id: String,
+    control_cursor: usize,
+    expected_control_epoch: i64,
+    expected_owner_generation: u64,
+    session_turn: u32,
+    llm_round: u32,
+}
+
+enum EdgeApprovalWait {
+    Allowed,
+    Denied(astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery),
+    Superseded,
+    Cancelled,
+    FailedClosed(String),
 }
 
 struct ServerEventSender {
@@ -1463,6 +2695,8 @@ pub struct ServerAgenticLoopHostBuilder {
         Option<Arc<dyn crate::turn::llm::durable::InferenceLedgerPersistence>>,
     model_override: Option<String>,
     admitted_model_execution: Option<astra_services::AdmittedModelExecution>,
+    inference_owner_pod_id: Option<String>,
+    execution_time_budget: Option<RunExecutionTimeBudget>,
     edge_tools: Vec<Value>,
     edge_profile: Map<String, Value>,
     execution_bindings: Option<ExecutionBindingSnapshot>,
@@ -1480,7 +2714,6 @@ pub struct ServerAgenticLoopHostBuilder {
     static_tool_catalog_admissible: bool,
     plan_resume_hint: Option<String>,
     plan_authoring_active: bool,
-    task_board_resume_hint: Option<String>,
     memoria_client: Option<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>>,
     server_service_tool_catalog_enabled: bool,
     control_plane_tool_catalog_enabled: bool,
@@ -1489,10 +2722,18 @@ pub struct ServerAgenticLoopHostBuilder {
     #[cfg(feature = "bridge-e2e-hooks")]
     test_llm_rounds_wired: bool,
     #[cfg(feature = "bridge-e2e-hooks")]
+    test_work_admission: Option<astra_services::WorkAdmissionDecision>,
+    #[cfg(feature = "bridge-e2e-hooks")]
     mock_provider: Option<(String, String)>,
     #[cfg(feature = "bridge-e2e-hooks")]
     llm_request_capture: Option<Arc<std::sync::Mutex<Vec<CapturedLlmRequest>>>>,
     capabilities: astra_turn_core::capability::CapabilitySet,
+    work_planning_bound: bool,
+    canonical_work_context_binding:
+        Option<crate::server::work_context::CanonicalWorkContextBinding>,
+    /// Whether this exact durable run owns a canonical WorkItem attempt.
+    /// Session-level Work existence is insufficient authority to settle it.
+    work_item_attempt_bound: bool,
     /// Shared tool_call dedup state. When set (via `with_dedup_state`), the
     /// built host shares the same `emitted_tool_call_ids` Arc as the parent
     /// host, preventing duplicate `tool_call` events across host instances
@@ -1524,6 +2765,8 @@ impl ServerAgenticLoopHostBuilder {
             inference_ledger_persistence: None,
             model_override: None,
             admitted_model_execution: None,
+            inference_owner_pod_id: None,
+            execution_time_budget: None,
             edge_tools: Vec::new(),
             edge_profile: Map::new(),
             execution_bindings: None,
@@ -1541,7 +2784,6 @@ impl ServerAgenticLoopHostBuilder {
             static_tool_catalog_admissible: true,
             plan_resume_hint: None,
             plan_authoring_active: false,
-            task_board_resume_hint: None,
             memoria_client: crate::turn::cloud::memoria_compact::HttpMemoriaPort::from_env().map(
                 |client| {
                     let client = client.with_owner_user_id(memoria_owner_user_id.clone());
@@ -1555,10 +2797,15 @@ impl ServerAgenticLoopHostBuilder {
             #[cfg(feature = "bridge-e2e-hooks")]
             test_llm_rounds_wired: false,
             #[cfg(feature = "bridge-e2e-hooks")]
+            test_work_admission: None,
+            #[cfg(feature = "bridge-e2e-hooks")]
             mock_provider: None,
             #[cfg(feature = "bridge-e2e-hooks")]
             llm_request_capture: None,
             capabilities: crate::capabilities::full_server_capabilities_for_tests(),
+            work_planning_bound: false,
+            canonical_work_context_binding: None,
+            work_item_attempt_bound: false,
             #[cfg(feature = "bridge-e2e-hooks")]
             shared_dedup_state: None,
             prefix_store: None,
@@ -1605,6 +2852,7 @@ impl ServerAgenticLoopHostBuilder {
         persistence: crate::turn::llm::durable::TestInferenceLedgerPersistence,
     ) -> Self {
         self.inference_ledger_persistence = Some(Arc::new(persistence));
+        self.inference_owner_pod_id = Some("test-inference-owner".to_string());
         self
     }
 
@@ -1621,13 +2869,21 @@ impl ServerAgenticLoopHostBuilder {
         self
     }
 
-    pub fn with_task_board_resume_hint(mut self, hint: Option<String>) -> Self {
-        self.task_board_resume_hint = hint;
+    pub fn with_model(mut self, model: Option<String>) -> Self {
+        self.model_override = model;
         self
     }
 
-    pub fn with_model(mut self, model: Option<String>) -> Self {
-        self.model_override = model;
+    /// Anchor a relative wire snapshot to this host's monotonic clock.
+    /// Repeated application is tighten-only so retry cannot replenish time.
+    pub fn with_execution_time_budget(mut self, budget: Option<ExecutionTimeBudget>) -> Self {
+        if let Some(snapshot) = budget {
+            if let Some(current) = self.execution_time_budget.as_mut() {
+                current.tighten_at(snapshot, tokio::time::Instant::now());
+            } else {
+                self.execution_time_budget = Some(RunExecutionTimeBudget::new(snapshot));
+            }
+        }
         self
     }
 
@@ -1636,6 +2892,14 @@ impl ServerAgenticLoopHostBuilder {
         execution: Option<astra_services::AdmittedModelExecution>,
     ) -> Self {
         self.admitted_model_execution = execution;
+        self
+    }
+
+    /// Bind every run-scoped inference admission to the exact durable
+    /// executor pod. Generation/control coordinates remain request-local and
+    /// are attached from `AgenticLoopState` at each model boundary.
+    pub(crate) fn with_inference_owner_pod_id(mut self, owner_pod_id: Option<String>) -> Self {
+        self.inference_owner_pod_id = owner_pod_id;
         self
     }
 
@@ -1748,6 +3012,17 @@ impl ServerAgenticLoopHostBuilder {
         self
     }
 
+    /// **Test-only.** Supply the auxiliary semantic-admission decision that
+    /// authorizes the scripted primary mock response for this one user turn.
+    #[cfg(feature = "bridge-e2e-hooks")]
+    pub fn with_test_work_admission(
+        mut self,
+        decision: astra_services::WorkAdmissionDecision,
+    ) -> Self {
+        self.test_work_admission = Some(decision);
+        self
+    }
+
     /// **Test-only.** Override the provider/model seen by the mock LLM path so
     /// that `PromptCacheConfig::latch` produces the same annotations as real
     /// calls. Use e.g. `("anthropic", "claude-sonnet-4")` to exercise
@@ -1809,12 +3084,36 @@ impl ServerAgenticLoopHostBuilder {
         let schema_workspace = binding_snapshot.workspace.clone();
         let schema_executor = binding_snapshot.executor.clone();
         let schema_runtime = binding_snapshot.runtime.clone();
-        let runtime_declared_tool_names: HashSet<String> = self
+        let edge_profile_restricted_tool_names: HashSet<String> = self
+            .edge_profile
+            .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RESTRICTED_TOOL_NAMES)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect();
+        let mut runtime_declared_tool_names: HashSet<String> = self
             .edge_tools
             .iter()
             .filter_map(tool_schema_name)
             .map(str::to_string)
             .collect();
+        runtime_declared_tool_names.extend(
+            self.edge_profile
+                .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|name| {
+                    !name.is_empty() && !edge_profile_restricted_tool_names.contains(*name)
+                })
+                .map(str::to_string),
+        );
         let schema_admission_context = ToolAdmissionContext {
             server_service_provider_ready: self.server_service_tool_catalog_enabled,
             control_plane_provider_ready: self.control_plane_tool_catalog_enabled,
@@ -1829,9 +3128,15 @@ impl ServerAgenticLoopHostBuilder {
             provider_allowed_tools: snapshot_builder_policy_handle(&self.provider_allowed_tools),
             ..ToolAdmissionContext::default()
         };
-        let server_catalog_tools = if any_server_catalog_enabled {
+        // Keep the canonical Work control plane in the catalog as one stable
+        // service-backed surface. The durable binding is a typed handler
+        // precondition, not a reason to add/remove schemas mid-turn: that
+        // churn invalidates provider prompt-cache prefixes precisely when
+        // durable work begins.
+        let effective_capabilities = self.capabilities.clone();
+        let mut server_catalog_tools = if any_server_catalog_enabled {
             capability_filtered_server_tool_schemas_with_context(
-                &self.capabilities,
+                &effective_capabilities,
                 &schema_workspace,
                 &schema_executor,
                 schema_runtime.as_ref(),
@@ -1840,11 +3145,77 @@ impl ServerAgenticLoopHostBuilder {
         } else {
             Vec::new()
         };
+        // Work execution role is a per-round runtime fact: `start_work` can
+        // turn this host from coordinator into a primary attempt without
+        // rebuilding it. Keep every capability-admitted Work schema in the
+        // internal catalog and project the current typed role only when the
+        // wire surface is assembled. Filtering here from the builder's
+        // initial snapshot permanently hid settlement after same-run
+        // activation.
+        // An edge sub-run can advertise a deliberately narrow allowlist. The
+        // server owns additional control-plane schemas, so filter that catalog
+        // before building either the visible or deferred surface; otherwise a
+        // child restricted to `web_fetch` would still receive Work/memory/etc.
+        // from the server's default candidate set.
+        server_catalog_tools.retain(|schema| {
+            tool_schema_name(schema)
+                .is_none_or(|name| !edge_profile_restricted_tool_names.contains(name))
+        });
+        // The edge profile is the provider's authoritative load policy for
+        // this request. A server-owned schema may be `AlwaysLoad` in the
+        // process-wide catalog but still be explicitly deferred by the edge
+        // (for example, when the edge is carrying a smaller prompt surface).
+        // Keep that declaration out of the initial wire set and retain its
+        // admitted schema in the activation catalog. Otherwise the schema is
+        // visible and simultaneously absent from the deferred activation
+        // scope, so `tool_search` cannot ever select it.
+        let edge_profile_deferred_tool_names: HashSet<String> = self
+            .edge_profile
+            .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty() && !edge_profile_restricted_tool_names.contains(*name))
+            .map(str::to_string)
+            .collect();
+        let server_tool_surface = crate::tool_registry::surface::ToolSurface::build(
+            server_catalog_tools.clone(),
+            &astra_config::runtime_config::RuntimeConfig::cached().tool_surface,
+            &[],
+        );
+        let mut server_visible_tools = server_tool_surface.always_load_schemas();
+        server_visible_tools.retain(|schema| {
+            tool_schema_name(schema)
+                .is_none_or(|name| !edge_profile_deferred_tool_names.contains(name))
+        });
+        let server_always_load_tool_names: HashSet<String> = server_tool_surface
+            .always_load_names()
+            .into_iter()
+            .filter(|name| !edge_profile_deferred_tool_names.contains(name))
+            .collect();
+        let server_deferred_tool_names: HashSet<String> = server_tool_surface
+            .deferred()
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        let deferred_tool_schemas: Vec<Value> = server_catalog_tools
+            .iter()
+            .filter(|schema| {
+                tool_schema_name(schema).is_some_and(|name| {
+                    server_deferred_tool_names.contains(name)
+                        || edge_profile_deferred_tool_names.contains(name)
+                })
+            })
+            .cloned()
+            .collect();
+
         let mut admission_tool_schemas = Vec::new();
         if any_server_catalog_enabled {
             append_tool_schemas_unique(
                 &mut admission_tool_schemas,
-                crate::capabilities::server_builtin_tool_schemas(&self.capabilities),
+                crate::capabilities::server_builtin_tool_schemas(&effective_capabilities),
             );
             if has_explicit_runtime_executor_provider(
                 &schema_workspace,
@@ -1853,14 +3224,14 @@ impl ServerAgenticLoopHostBuilder {
             ) {
                 append_tool_schemas_unique(
                     &mut admission_tool_schemas,
-                    crate::capabilities::runtime_executor_tool_schemas(&self.capabilities),
+                    crate::capabilities::runtime_executor_tool_schemas(&effective_capabilities),
                 );
             }
         }
         append_tool_schemas_unique(&mut admission_tool_schemas, self.edge_tools.clone());
         let server_catalog_tool_surface = !server_catalog_tools.is_empty();
-        let tool_schemas = if self.edge_tools.is_empty() {
-            server_catalog_tools
+        let mut tool_schemas = if self.edge_tools.is_empty() {
+            server_visible_tools
         } else {
             let mut surface = capability_filter_edge_provided_tool_schemas_for_binding_with_context(
                 self.edge_tools,
@@ -1871,7 +3242,7 @@ impl ServerAgenticLoopHostBuilder {
             );
             append_server_owned_tool_schemas_unique(
                 &mut surface,
-                server_catalog_tools,
+                server_visible_tools,
                 &schema_workspace,
                 &schema_executor,
                 schema_runtime.as_ref(),
@@ -1880,6 +3251,17 @@ impl ServerAgenticLoopHostBuilder {
             );
             surface
         };
+        // The Edge payload may carry the shared local `agent` schema before
+        // the server-owned candidate is appended. Name-level deduplication
+        // must not let that earlier schema retain local-only actions on a
+        // server-routed tool. Project after the final route merge so the wire
+        // contract is derived from the selected execution owner, regardless
+        // of which provider supplied the first same-name declaration.
+        astra_tools::schemas::project_action_schemas_for_surface_using_declarations(
+            &mut tool_schemas,
+            &astra_tools::schemas::all_tool_schemas(),
+            "server",
+        );
 
         let mut valid_tools: HashSet<String> = tool_schemas
             .iter()
@@ -1893,7 +3275,7 @@ impl ServerAgenticLoopHostBuilder {
         let admissible_extras = Vec::new();
         valid_tools.extend(admissible_extras.iter().cloned());
 
-        let always_load_tool_names: HashSet<String> = self
+        let mut always_load_tool_names: HashSet<String> = self
             .edge_profile
             .get(astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_ALWAYS_LOAD_TOOL_NAMES)
             .and_then(Value::as_array)
@@ -1904,6 +3286,13 @@ impl ServerAgenticLoopHostBuilder {
                     .collect()
             })
             .unwrap_or_else(crate::turn::prompt_cache::runtime_always_load_tool_names);
+        always_load_tool_names.extend(server_always_load_tool_names);
+        // A request-level deferred declaration wins over either the process
+        // default or an accidentally stale always-load extension. Keeping the
+        // two sets disjoint is required for deterministic cache markers and
+        // for `tool_search` activation to remain authoritative.
+        always_load_tool_names.retain(|name| !edge_profile_deferred_tool_names.contains(name));
+        always_load_tool_names.retain(|name| !edge_profile_restricted_tool_names.contains(name));
 
         let progress_rx = self.progress_broadcaster.as_ref().map(|b| b.subscribe());
         let progress_filter = self
@@ -1917,18 +3306,26 @@ impl ServerAgenticLoopHostBuilder {
             inference_ledger_persistence: self.inference_ledger_persistence,
             model_override: self.model_override,
             admitted_model_execution: self.admitted_model_execution,
+            inference_owner_pod_id: self.inference_owner_pod_id,
             resolved_model_name: None,
             resolved_context_window: None,
             resolved_llm_config: None,
             resolved_llm_config_at: None,
+            summary_attempt_allocator: DurableSummaryAttemptAllocator::default(),
+            execution_time_budget: self.execution_time_budget,
             tool_schemas,
             admission_tool_schemas,
+            deferred_tool_schemas,
             runtime_declared_tool_names,
-            capabilities: self.capabilities,
+            capabilities: effective_capabilities,
+            initial_work_planning_bound: self.work_planning_bound,
+            canonical_work_context_binding: self.canonical_work_context_binding,
+            work_item_attempt_bound: self.work_item_attempt_bound,
             edge_profile: self.edge_profile,
             valid_tools,
             admissible_extras,
             current_deferred_tool_names: HashSet::new(),
+            deferred_tools_block_cache: None,
             server_side_tools,
             server_catalog_tool_surface,
             server_service_provider_catalog_enabled: self.server_service_tool_catalog_enabled,
@@ -1937,6 +3334,23 @@ impl ServerAgenticLoopHostBuilder {
             interaction_mode: self.interaction_mode,
             turn_intent_policy: self.turn_intent_policy,
             skill_auto_route_policy: self.skill_auto_route_policy,
+            pending_work_admission: None,
+            pending_work_graph_mutations: Vec::new(),
+            admitted_workspace_mutation:
+                astra_config::user_profile::WorkspaceMutationIntent::Unknown,
+            pending_work_graph_mutation_record_floor: 0,
+            pending_work_admission_judge: None,
+            work_admission_attempted: false,
+            work_admission_skill_revision: 0,
+            pending_work_admission_started_at: None,
+            pending_work_admission_round: None,
+            completed_work_admission_phase: None,
+            control_plane_turn_pending: false,
+            deferred_work_surface_turn: None,
+            work_admission_execution_topology: Default::default(),
+            work_admission_topology_authoritative: false,
+            work_admission_conflict: None,
+            work_admission_capabilities: Vec::new(),
             full_llm_capture: self.full_llm_capture,
             static_tool_catalog_admissible: self.static_tool_catalog_admissible,
             always_load_tool_names,
@@ -1955,13 +3369,10 @@ impl ServerAgenticLoopHostBuilder {
             pending_terminal_control_outcome: None,
             pending_tool_call_admission: None,
             admitted_tool_side_effects_enabled: true,
-            tool_result_cache: astra_turn_core::tool_result_dedup::new_shared_cache(
-                128,
-                Some(std::time::Duration::from_secs(30)),
-            ),
             emitted_events: Vec::new(),
             event_protocol_fault: None,
             event_tx: None,
+            streaming_turn_started: false,
             interaction_sink: None,
             prefer_client_tool_delivery: false,
             client_cancel_flag: None,
@@ -1970,6 +3381,8 @@ impl ServerAgenticLoopHostBuilder {
             progress_filter,
             turn_start_lifecycle_summary: None,
             turn_start_plan_resume_hint: None,
+            work_attempt_started_context: None,
+            work_attempt_scheduler_replayed: None,
             execution_metadata: self.execution_bindings.as_ref().map(|snapshot| {
                 Value::Object(binding_event_fields(
                     &snapshot.workspace,
@@ -1979,13 +3392,14 @@ impl ServerAgenticLoopHostBuilder {
             agent_live_mirror: None,
             plan_resume_hint: Arc::new(std::sync::RwLock::new(self.plan_resume_hint)),
             plan_authoring_active: Arc::new(std::sync::RwLock::new(self.plan_authoring_active)),
-            task_board_resume_hint: self.task_board_resume_hint,
             memoria_client: self.memoria_client,
             prompt_memory_recall_cache: None,
             #[cfg(feature = "bridge-e2e-hooks")]
             test_llm_rounds: std::collections::VecDeque::from(self.test_llm_rounds),
             #[cfg(feature = "bridge-e2e-hooks")]
             test_llm_rounds_wired: self.test_llm_rounds_wired,
+            #[cfg(feature = "bridge-e2e-hooks")]
+            test_work_admission: self.test_work_admission,
             #[cfg(feature = "bridge-e2e-hooks")]
             mock_provider: self.mock_provider,
             #[cfg(feature = "bridge-e2e-hooks")]
@@ -2015,6 +3429,24 @@ impl ServerAgenticLoopHostBuilder {
         capabilities: astra_turn_core::capability::CapabilitySet,
     ) -> Self {
         self.capabilities = capabilities;
+        self
+    }
+
+    pub fn with_work_planning_bound(mut self, bound: bool) -> Self {
+        self.work_planning_bound = bound;
+        self
+    }
+
+    pub(crate) fn with_canonical_work_context_binding(
+        mut self,
+        binding: crate::server::work_context::CanonicalWorkContextBinding,
+    ) -> Self {
+        self.canonical_work_context_binding = Some(binding);
+        self
+    }
+
+    pub fn with_work_item_attempt_bound(mut self, bound: bool) -> Self {
+        self.work_item_attempt_bound = bound;
         self
     }
 
@@ -2076,6 +3508,78 @@ fn append_tool_schemas_unique(surface: &mut Vec<Value>, candidates: Vec<Value>) 
             surface.push(schema);
         }
     }
+}
+
+/// Restore the server-owned Work continuation surface from the authoritative
+/// admission catalog after a coordinator becomes bound to Work.
+///
+/// The initial edge/tool-cache buckets describe the pre-Work request. They
+/// are not lifecycle authority: an edge may omit or defer a server-owned
+/// schema that only becomes executable after `start_work` installs an exact
+/// assignment. Rebuilding these few typed transitions from the admission
+/// catalog prevents a successful start from stranding the run without its
+/// only settlement operation. Runtime service readiness and the execution
+/// role projection below remain the independent fail-closed gates.
+fn append_bound_work_lifecycle_schemas(
+    surface: &mut Vec<Value>,
+    admission_catalog: &[Value],
+    deferred_catalog: &[Value],
+    restricted_tools: &HashSet<String>,
+    primary_attempt_active: bool,
+) {
+    let contracts = BUILTIN_TOOL_CONTRACTS.get_or_init(astra_runtime_env::ToolRegistry::builtins);
+    let candidates = admission_catalog
+        .iter()
+        .chain(deferred_catalog.iter())
+        .filter(|schema| {
+            tool_schema_name(schema).is_some_and(|name| {
+                !restricted_tools.contains(name)
+                    && contracts.get(name).is_some_and(|spec| {
+                        spec.load_policy == astra_runtime_env::ToolLoadPolicy::AlwaysLoad
+                            && (matches!(
+                                spec.required.work_execution_role,
+                                astra_runtime_env::WorkExecutionRole::CoordinatorOrPrimaryAttempt
+                            ) || (primary_attempt_active
+                                && matches!(
+                                    spec.required.work_execution_role,
+                                    astra_runtime_env::WorkExecutionRole::Attempt
+                                )))
+                    })
+            })
+        })
+        .cloned()
+        .collect();
+    append_tool_schemas_unique(surface, candidates);
+}
+
+/// Keep coordinator-exclusive Work transitions in a cache tail.
+///
+/// A selected Work attempt must not receive these schemas, but removing a
+/// coordinator transition from the middle of the provider tool array shifts
+/// every later schema and invalidates the entire prefix cache. Root planning
+/// tools intentionally survive the coordinator -> primary-attempt transition,
+/// so only truly coordinator-exclusive entries belong in this tail.
+fn stabilize_work_role_tool_order(tools: &mut Vec<Value>) {
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let mut stable = Vec::with_capacity(tools.len());
+    let mut coordinator_tail = Vec::new();
+    for schema in std::mem::take(tools) {
+        let is_transition_tool = tool_schema_name(&schema).is_some_and(|name| {
+            registry.get(name).is_some_and(|spec| {
+                matches!(
+                    spec.required.work_execution_role,
+                    astra_runtime_env::WorkExecutionRole::Coordinator
+                )
+            })
+        });
+        if is_transition_tool {
+            coordinator_tail.push(schema);
+        } else {
+            stable.push(schema);
+        }
+    }
+    stable.extend(coordinator_tail);
+    *tools = stable;
 }
 
 fn append_server_owned_tool_schemas_unique(
@@ -2181,17 +3685,1963 @@ fn executor_binding_summary(executor: &ExecutorBinding) -> String {
     parts.join(" · ")
 }
 
+fn call_requests_delivered_work_settlement(call: &Value) -> bool {
+    astra_turn_core::tool::args::shape::tool_call_name(call) == Some("settle_work_item")
+        && astra_turn_core::tool::args::shape::parse_tool_call_arguments(call)
+            .ok()
+            .and_then(|arguments| {
+                arguments
+                    .get("outcome")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .as_deref()
+            == Some("delivered")
+}
+
+/// A root run remains one provider/cache scope while it moves between
+/// coordinator and foreground-primary-attempt states. Runtime admission still
+/// applies `PrimaryAttempt` authority to calls, but the wire projection must
+/// not add/remove schemas at that transition. A delegated attempt is a
+/// separate run/cache scope and keeps its deliberately narrow surface.
+fn provider_work_execution_context(
+    delegated_attempt: bool,
+    _primary_attempt_active: bool,
+) -> Option<astra_runtime_env::WorkExecutionContext> {
+    delegated_attempt.then_some(astra_runtime_env::WorkExecutionContext::DelegatedAttempt)
+}
+
+fn call_is_pending_canonical_validation(call: &Value) -> bool {
+    let Some(name) = astra_turn_core::tool::args::shape::tool_call_name(call) else {
+        return false;
+    };
+    let raw_args = call
+        .get("function")
+        .and_then(|function| function.get("arguments"))
+        .map(|arguments| match arguments {
+            Value::String(arguments) => arguments.clone(),
+            other => other.to_string(),
+        });
+    raw_args.is_some_and(|args| {
+        astra_turn_core::evaluation::normalize_validation_prefix(name, &args).is_some()
+    })
+}
+
+fn is_turn_pipeline_tool(name: &str) -> bool {
+    matches!(
+        tool_execution_class(name, &astra_runtime_env::ToolRegistry::builtins()),
+        ToolExecutionClass::TurnPipelineIntercept
+    )
+}
+
+fn append_tool_calls_unique_by_id(target: &mut Vec<Value>, candidates: Vec<Value>) {
+    let mut seen = target
+        .iter()
+        .filter_map(|call| call.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    for call in candidates {
+        let Some(id) = call
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        if seen.insert(id.to_string()) {
+            target.push(call);
+        }
+    }
+}
+
+fn direct_parallel_agent_rejection(
+    topology_authoritative: bool,
+    execution_topology: astra_services::WorkExecutionTopology,
+) -> (&'static str, &'static str) {
+    if topology_authoritative
+        && execution_topology == astra_services::WorkExecutionTopology::ParallelSubruns
+    {
+        (
+            "parallel_topology_requires_fanout",
+            "The admitted execution topology requires one fixed child group. Use agent_fanout.start; independent agent.spawn calls cannot partially create that group.",
+        )
+    } else if topology_authoritative {
+        (
+            "parallel_topology_not_admitted",
+            "The authoritative execution topology for this turn is primary. Continue in the current agent; multiple direct child calls cannot change that decision.",
+        )
+    } else {
+        (
+            "parallel_topology_admission_unavailable",
+            "Parallel execution authority is unavailable. Continue in the current agent; switching between direct child calls and fanout cannot authorize parallel work.",
+        )
+    }
+}
+
+impl Drop for ServerAgenticLoopHost {
+    fn drop(&mut self) {
+        if let Some(handle) = self.pending_work_admission_judge.take() {
+            handle.abort();
+        }
+    }
+}
+
+fn remove_tool_action_branch(schema: &mut Value, denied_action: &str) -> bool {
+    if let Some(branches) = schema
+        .pointer_mut("/function/parameters/oneOf")
+        .and_then(Value::as_array_mut)
+    {
+        branches.retain(|branch| {
+            branch
+                .pointer("/properties/action/enum")
+                .and_then(Value::as_array)
+                .is_none_or(|actions| {
+                    !actions
+                        .iter()
+                        .any(|action| action.as_str() == Some(denied_action))
+                })
+        });
+        return !branches.is_empty();
+    }
+
+    let Some(parameters) = schema
+        .pointer_mut("/function/parameters")
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    let Some(actions) = parameters
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .and_then(|properties| properties.get_mut("action"))
+        .and_then(Value::as_object_mut)
+        .and_then(|action| action.get_mut("enum"))
+        .and_then(Value::as_array_mut)
+    else {
+        return false;
+    };
+    actions.retain(|action| action.as_str() != Some(denied_action));
+    let has_actions = !actions.is_empty();
+    for key in ["x-astra-per-action-required", "x-astra-per-action-allowed"] {
+        if let Some(map) = parameters.get_mut(key).and_then(Value::as_object_mut) {
+            map.remove(denied_action);
+        }
+    }
+    if schema.pointer("/function/description").is_some() {
+        schema["function"]["description"] = Value::String(
+            "Inspect or stop an existing fixed fanout group. New fanout starts are not admitted by the current primary execution topology. Use get_results with the returned group_id for bounded result windows; use stop_slot or stop_group only for that existing group."
+                .to_string(),
+        );
+    }
+    has_actions
+}
+
 impl ServerAgenticLoopHost {
+    fn execution_time_budget_error() -> astra_core::ClassifiedError {
+        astra_core::ClassifiedError::new(
+            astra_core::ErrorKind::BudgetExhausted,
+            "run execution wall-clock budget is exhausted",
+        )
+    }
+
+    fn execution_provider_work_budget(
+        execution_time_budget: Option<RunExecutionTimeBudget>,
+    ) -> Result<Option<ProviderWorkBudget>, astra_core::ClassifiedError> {
+        let Some(budget) = execution_time_budget else {
+            return Ok(None);
+        };
+        let remaining = budget.remaining();
+        if remaining.is_zero() {
+            return Err(Self::execution_time_budget_error());
+        }
+        Ok(Some(ProviderWorkBudget(remaining)))
+    }
+
+    fn provider_work_budget_at_client_boundary(
+        execution_time_budget: Option<RunExecutionTimeBudget>,
+        boundary: ProviderAttemptBoundary,
+    ) -> Result<Option<Duration>, astra_core::ClassifiedError> {
+        Ok(boundary
+            .provider_work_budget(Self::execution_provider_work_budget(execution_time_budget)?))
+    }
+
+    fn clamp_execution_timeout(&self, requested: Duration) -> Option<Duration> {
+        self.execution_time_budget
+            .map_or(Some(requested), |budget| budget.clamp_timeout(requested))
+    }
+
+    fn append_execution_time_budget_tail(
+        messages: &mut Vec<Value>,
+        snapshot: ExecutionTimeBudget,
+        round_index: u32,
+    ) {
+        let injection = astra_turn_core::chat_turn_edge_profile::RuntimeVolatileInjection {
+            kind: "execution_time_budget".to_string(),
+            delivery_class:
+                astra_turn_core::chat_turn_edge_profile::VolatileDeliveryClass::RequiredContext,
+            payload: json!({
+                "schema": "execution_time_budget.v1",
+                "remaining_seconds": snapshot.remaining_seconds,
+                "status": if snapshot.remaining_seconds == 0 { "exhausted" } else { "active" },
+                "instruction": "This is the current runtime-enforced wall-clock remainder. Finish or hand off within it; do not start work that cannot complete inside the remaining time.",
+            }),
+            round_index,
+        };
+        if let Some(content) = injection.render_for_prompt() {
+            // This synthetic current-request tail is never written back to
+            // state.messages and is appended after cache annotation.
+            messages.push(json!({
+                "role": "user",
+                "content": content,
+            }));
+        }
+    }
+
+    fn messages_with_current_execution_time_budget(
+        &self,
+        messages: &[Value],
+        round_index: u32,
+    ) -> Option<Vec<Value>> {
+        self.execution_time_budget.map(|budget| {
+            let mut messages = messages.to_vec();
+            Self::append_execution_time_budget_tail(&mut messages, budget.snapshot(), round_index);
+            messages
+        })
+    }
+
+    fn selected_edge_ledger_executor_id(&self) -> Result<&str, String> {
+        if self.executor_binding.kind != ExecutorBindingKind::EdgeAgent
+            || self.executor_binding.transport != ToolTransportKind::EdgeLedger
+        {
+            return Err(
+                "client-ledger delivery requires an explicitly selected Edge executor".to_string(),
+            );
+        }
+        let edge_agent_id = self.executor_binding.executor_id.as_str();
+        if edge_agent_id.is_empty()
+            || edge_agent_id.trim() != edge_agent_id
+            || edge_agent_id.len() > 256
+            || edge_agent_id.chars().any(char::is_control)
+        {
+            return Err("selected Edge executor id is invalid".to_string());
+        }
+        Ok(edge_agent_id)
+    }
+
+    fn model_request_topology(&self) -> astra_services::ModelRequestTopology {
+        if self.executor_binding.kind != ExecutorBindingKind::EdgeAgent {
+            return astra_services::ModelRequestTopology::ServerOnly;
+        }
+        match self.executor_binding.transport {
+            ToolTransportKind::EdgeLedger => astra_services::ModelRequestTopology::CliServer,
+            ToolTransportKind::EdgeWs => astra_services::ModelRequestTopology::EdgeServer,
+            _ => astra_services::ModelRequestTopology::ServerOnly,
+        }
+    }
+
+    fn model_request_context_seed(
+        &self,
+        trace: Option<&Value>,
+    ) -> astra_services::ModelRequestContextSeed {
+        crate::turn::llm::context::model_request_context_seed_from_manifest(
+            self.model_request_topology(),
+            trace,
+        )
+    }
+
     fn admit_terminal_tool_calls(
         &mut self,
+        state: &AgenticLoopState,
         tool_calls: &[Value],
         finish_reason: Option<&str>,
     ) -> Vec<Value> {
-        let admission =
-            crate::turn::agentic::tool_interception::admit_tool_calls(tool_calls, finish_reason);
+        let mut admission = if state.hooks.completion_settlement.text_only {
+            crate::turn::agentic::tool_interception::reject_tool_calls_at_text_only_boundary(
+                tool_calls,
+                finish_reason,
+            )
+        } else {
+            crate::turn::agentic::tool_interception::admit_tool_calls(tool_calls, finish_reason)
+        };
+
+        // `workspace_mutation` is an LLM-judged task semantic, not authority.
+        // Keep it available for instructions and completion accounting, but
+        // never turn an inferred ReadOnly value into a hidden capability or a
+        // pre-execution deny. Physical workspace authority, sandbox policy,
+        // and the permission engine are the executable safety contract.
+        // Once a typed graph-mutation boundary is crossed, only inspection
+        // and an exact proposal may execute. Reject a semantically different
+        // proposal before persistence; otherwise the graph can auto-dispatch
+        // invented work while the user's real obligation remains pending.
+        if !self.pending_work_graph_mutations.is_empty()
+            && self.pending_work_graph_mutation_boundary_crossed(state)
+        {
+            let mut retained = Vec::with_capacity(admission.admitted.len());
+            for call in admission.admitted.drain(..) {
+                let name = astra_turn_core::tool::args::shape::tool_call_name(&call)
+                    .unwrap_or("unknown")
+                    .to_string();
+                if name == "inspect_work_plan"
+                    || (name == "propose_work_plan"
+                        && self.proposal_satisfies_pending_work_graph_mutations(&call))
+                {
+                    retained.push(call);
+                    continue;
+                }
+                let id = call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                admission.rejected.push(
+                    crate::turn::agentic_loop::host::RejectedToolCall {
+                        id,
+                        name: name.clone(),
+                        canonical_call: call,
+                        result: json!({
+                            "status": "rejected",
+                            "error_kind": if name == "propose_work_plan" { "pending_work_graph_mutation_mismatch" } else { "pending_work_graph_mutation" },
+                            "retryable": true,
+                            "pending_mutation_count": self.pending_work_graph_mutations.len(),
+                            "error": "The current Work goal is at a graph-change boundary. Only inspect_work_plan and a proposal that exactly applies every typed cancel, add, and replace obligation may execute. Cancellation must remain cancelled, replacement must remain superseded, and no extra graph operation is allowed."
+                        })
+                        .to_string(),
+                    },
+                );
+            }
+            admission.admitted = retained;
+        }
+        if let Some(pagination) = state
+            .hooks
+            .completion_settlement
+            .foreground_fanout_pagination
+            .as_ref()
+        {
+            let mut retained = Vec::with_capacity(admission.admitted.len());
+            for call in admission.admitted.drain(..) {
+                let name =
+                    astra_turn_core::tool::args::shape::tool_call_name(&call).unwrap_or("unknown");
+                let args = astra_turn_core::tool::args::shape::tool_call_arguments_value(&call);
+                let is_exact_read = name == "agent_fanout"
+                    && args.get("action").and_then(Value::as_str) == Some("get_results")
+                    && args
+                        .get("group_id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|group| !group.is_empty())
+                        == Some(pagination.group_id.as_str())
+                    && args
+                        .get("slot_index")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|slot| {
+                            let offset = args
+                                .get("offset")
+                                .and_then(Value::as_u64)
+                                .unwrap_or_default();
+                            pagination.pending_slots.get(&slot).copied() == Some(offset)
+                        });
+                if is_exact_read {
+                    retained.push(call);
+                    continue;
+                }
+                let id = call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                admission.rejected.push(
+                    crate::turn::agentic_loop::host::RejectedToolCall {
+                        id,
+                        name: name.to_string(),
+                        canonical_call: call,
+                        result: json!({
+                            "status": "rejected",
+                            "error_kind": "fanout_result_pagination_pending",
+                            "retryable": true,
+                            "group_id": pagination.group_id,
+                            "pending_slots": pagination.pending_slots,
+                            "allowed_action": "agent_fanout.get_results",
+                            "error": "The foreground fanout is terminal, but its bounded result evidence is incomplete. Read only the next page for this exact group before parent synthesis; unrelated tools or groups cannot replace that evidence carrier."
+                        })
+                        .to_string(),
+                    },
+                );
+            }
+            admission.admitted = retained;
+        }
+        if state.hooks.completion_settlement.work_settlement_only {
+            let mut retained = Vec::with_capacity(admission.admitted.len());
+            for call in admission.admitted.drain(..) {
+                let name =
+                    astra_turn_core::tool::args::shape::tool_call_name(&call).unwrap_or("unknown");
+                if name == "settle_work_item" {
+                    retained.push(call);
+                    continue;
+                }
+                let id = call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                admission.rejected.push(
+                    crate::turn::agentic_loop::host::RejectedToolCall {
+                        id,
+                        name: name.to_string(),
+                        canonical_call: call,
+                        result: json!({
+                            "status": "rejected",
+                            "error_kind": "work_settlement_only",
+                            "retryable": true,
+                            "error": "The active WorkItem has reached its typed settlement boundary. Call settle_work_item with the truthful outcome; do not execute another tool.",
+                        })
+                        .to_string(),
+                    },
+                );
+            }
+            admission.admitted = retained;
+        }
+        let admission = self.enforce_canonical_delegation_lifecycle(state, admission);
         let admitted = admission.admitted.clone();
         self.pending_tool_call_admission = Some(admission);
         admitted
+    }
+
+    /// Server-side counterpart to the local completion-action admission.  The
+    /// ordinary admission method remains observational for graph/transport
+    /// callers and tests; execution paths use this wrapper so the one action
+    /// window is consumed only after all server restrictions have run.
+    fn admit_terminal_tool_calls_with_completion(
+        &mut self,
+        state: &mut AgenticLoopState,
+        tool_calls: &[Value],
+        finish_reason: Option<&str>,
+    ) -> Vec<Value> {
+        let _ = self.admit_terminal_tool_calls(state, tool_calls, finish_reason);
+        let Some(admission) = self.pending_tool_call_admission.take() else {
+            tracing::warn!(
+                target: "astra::tool_admission",
+                session_id = %self.session_id,
+                run_id = state.current_run_id.as_deref().unwrap_or_default(),
+                round = state.current_round_index,
+                "tool admission produced no pending result"
+            );
+            return Vec::new();
+        };
+        let mut admission = admission;
+        let validation_state = current_work_validation_state(state);
+        let validation_pending_in_batch = admission
+            .admitted
+            .iter()
+            .any(call_is_pending_canonical_validation);
+        let validation_blocks_delivery = matches!(
+            validation_state,
+            WorkValidationState::Failed | WorkValidationState::Stale
+        );
+        if validation_blocks_delivery || validation_pending_in_batch {
+            let mut retained = Vec::with_capacity(admission.admitted.len());
+            for call in admission.admitted.drain(..) {
+                if !call_requests_delivered_work_settlement(&call) {
+                    retained.push(call);
+                    continue;
+                }
+                let id = call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let retryable = !state.hooks.completion_settlement.work_settlement_only;
+                let error_kind = if validation_pending_in_batch {
+                    "work_validation_pending"
+                } else {
+                    "unresolved_work_validation"
+                };
+                admission.rejected.push(
+                    crate::turn::agentic_loop::host::RejectedToolCall {
+                        id,
+                        name: "settle_work_item".to_string(),
+                        canonical_call: call,
+                        result: json!({
+                            "status": "rejected",
+                            "error_kind": error_kind,
+                            "retryable": retryable,
+                            "unresolved_validation_operations": usize::from(validation_blocks_delivery),
+                            "validation_state": match validation_state {
+                                WorkValidationState::None => "none",
+                                WorkValidationState::Failed => "failed",
+                                WorkValidationState::Stale => "stale",
+                                WorkValidationState::Passed => "passed",
+                            },
+                            "error": if retryable {
+                                if validation_pending_in_batch {
+                                    "A canonical validation in this tool batch has not produced an outcome yet. The WorkItem cannot be recorded as delivered in the same batch; observe the validation result on the next boundary, then settle truthfully."
+                                } else {
+                                    "The current WorkItem's latest canonical validation failed. It cannot be recorded as delivered. Repair and rerun proportionate validation, or settle with the truthful failed/blocked outcome."
+                                }
+                            } else {
+                                "The current WorkItem has no successful current validation receipt and the bounded execution slice is closed. It cannot be recorded as delivered; settle with the truthful failed or blocked outcome."
+                            }
+                        })
+                        .to_string(),
+                    },
+                );
+            }
+            admission.admitted = retained;
+        }
+
+        let admission =
+            crate::turn::agentic_loop::execution_phase::apply_completion_action_admission(
+                state, admission, tool_calls,
+            );
+        let admitted = admission.admitted.clone();
+        let admitted_names = admitted
+            .iter()
+            .filter_map(astra_turn_core::tool::args::shape::tool_call_name)
+            .collect::<Vec<_>>();
+        let rejected_names = admission
+            .rejected
+            .iter()
+            .map(|call| call.name.as_str())
+            .collect::<Vec<_>>();
+        if !admission.rejected.is_empty() || (!tool_calls.is_empty() && admitted.is_empty()) {
+            let requested_names = tool_calls
+                .iter()
+                .filter_map(astra_turn_core::tool::args::shape::tool_call_name)
+                .collect::<Vec<_>>();
+            let rejected_error_kinds = admission
+                .rejected
+                .iter()
+                .filter_map(|call| {
+                    serde_json::from_str::<Value>(&call.result)
+                        .ok()
+                        .and_then(|result| {
+                            result
+                                .get("error_kind")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        })
+                })
+                .collect::<Vec<_>>();
+            tracing::warn!(
+                target: "astra::tool_admission",
+                session_id = %self.session_id,
+                run_id = state.current_run_id.as_deref().unwrap_or_default(),
+                round = state.current_round_index,
+                requested_names = ?requested_names,
+                admitted_names = ?admitted_names,
+                rejected_names = ?rejected_names,
+                rejected_error_kinds = ?rejected_error_kinds,
+                text_only = state.hooks.completion_settlement.text_only,
+                work_settlement_only = state.hooks.completion_settlement.work_settlement_only,
+                completion_action_window = ?state
+                    .hooks
+                    .completion_settlement
+                    .completion_action_window
+                    .as_ref()
+                    .map(|window| (window.consumed, window.matched)),
+                "provider tool batch was not fully admitted"
+            );
+        }
+        self.pending_tool_call_admission = Some(admission);
+        admitted
+    }
+
+    fn proposal_satisfies_pending_work_graph_mutations(&self, call: &Value) -> bool {
+        let Ok(arguments) = astra_turn_core::tool::args::shape::parse_tool_call_arguments(call)
+        else {
+            return false;
+        };
+        self.proposal_arguments_satisfy_pending_work_graph_mutations(&arguments)
+    }
+
+    fn proposal_arguments_satisfy_pending_work_graph_mutations(&self, arguments: &Value) -> bool {
+        if ["dependencies", "dependency_removals"]
+            .into_iter()
+            .any(|field| {
+                arguments
+                    .get(field)
+                    .and_then(Value::as_array)
+                    .is_none_or(|changes| !changes.is_empty())
+            })
+        {
+            return false;
+        }
+        let Some(mut actual_additions) = arguments
+            .get("additions")
+            .and_then(Value::as_array)
+            .and_then(|additions| {
+                additions
+                    .iter()
+                    .map(|addition| {
+                        Some((
+                            addition.get("objective")?.as_str()?.to_string(),
+                            addition.get("expected_result")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect::<Option<Vec<_>>>()
+            })
+        else {
+            return false;
+        };
+        let Some(mut actual_revisions) = arguments
+            .get("revisions")
+            .and_then(Value::as_array)
+            .and_then(|revisions| {
+                revisions
+                    .iter()
+                    .map(|revision| {
+                        Some((
+                            revision.get("item_id")?.as_str()?.to_string(),
+                            revision.get("declaration_state")?.as_str()?.to_string(),
+                            revision.get("objective")?.as_str()?.to_string(),
+                            revision.get("expected_result")?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect::<Option<Vec<_>>>()
+            })
+        else {
+            return false;
+        };
+
+        let mut expected_additions = self
+            .pending_work_graph_mutations
+            .iter()
+            .filter_map(|mutation| mutation.addition())
+            .map(|task| (task.objective.clone(), task.expected_result.clone()))
+            .collect::<Vec<_>>();
+        let mut expected_revisions = self
+            .pending_work_graph_mutations
+            .iter()
+            .filter_map(|mutation| {
+                Some((
+                    format!("task-{}", mutation.target_initial_candidate()?),
+                    mutation.required_declaration_state()?.to_string(),
+                    mutation.retirement()?.objective.clone(),
+                    mutation.retirement()?.expected_result.clone(),
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        actual_additions.sort();
+        expected_additions.sort();
+        actual_revisions.sort();
+        expected_revisions.sort();
+        actual_additions == expected_additions && actual_revisions == expected_revisions
+    }
+
+    /// Service-bound tools are control-plane routed, so route selection alone
+    /// cannot tell whether their backing service exists.
+    ///
+    /// Work lifecycle *service* readiness is deliberately stable for the
+    /// lifetime of a root run. Binding and active-attempt ownership are state
+    /// transition preconditions enforced by terminal admission and the typed
+    /// handlers; using those mutable facts to add/remove schemas would change
+    /// the provider prefix at exactly every `start -> settle -> next`
+    /// transition. Keep the operation family declared while its durable
+    /// service exists, and let runtime authority fail closed independently.
+    fn dynamic_service_binding_ready(&self, name: &str, state: &AgenticLoopState) -> Option<bool> {
+        use astra_turn_core::capability::Capability;
+
+        if is_turn_pipeline_tool(name) {
+            // A pipeline tool has exactly one execution owner. Server skills
+            // resolve inline; CLI-local skills are executed through the
+            // existing typed client-result lane only when that client
+            // explicitly advertised the schema. Never expose a virtual tool
+            // that neither side can execute.
+            return Some(
+                state.skills.resolver.is_some()
+                    || (self.runtime_declared_tool_names.contains(name)
+                        && self.has_client_tool_delivery_lane()),
+            );
+        }
+
+        let requires = astra_turn_core::tool::registry::meta::tool_meta(name)?.requires;
+        let needs_dynamic_binding = requires.iter().any(|capability| {
+            matches!(
+                capability,
+                Capability::ReflectService | Capability::WorkPlanning | Capability::WorkLifecycle
+            )
+        });
+        if !needs_dynamic_binding {
+            return None;
+        }
+
+        if requires.iter().any(|capability| {
+            matches!(
+                capability,
+                Capability::WorkPlanning | Capability::WorkLifecycle
+            )
+        }) {
+            // Provider capability and mutable service binding are independent
+            // requirements. A generic delegated child intentionally has no
+            // canonical Work capability even though its executor shares the
+            // parent's database pool.
+            if !requires
+                .iter()
+                .all(|capability| self.capabilities.has(*capability))
+            {
+                return Some(false);
+            }
+            if let Some(executor) = state.runtime_tool_executor.as_deref() {
+                return Some(executor.work_service_available());
+            }
+            return Some(
+                requires
+                    .iter()
+                    .all(|capability| self.capabilities.has(*capability)),
+            );
+        }
+
+        if let Some(executor) = state.runtime_tool_executor.as_deref() {
+            return Some(executor.tool_runtime_ready(name));
+        }
+
+        // A host without an executor cannot execute these tools. Preserve the
+        // initial Work fact only for schema-only test and diagnostic hosts;
+        // production runs always use executor readiness above, which changes
+        // immediately after start_work succeeds.
+        Some(false)
+    }
+
+    fn work_lifecycle_is_bound(&self, state: &AgenticLoopState) -> bool {
+        state
+            .runtime_tool_executor
+            .as_deref()
+            .map(crate::server::runtime_tool_executor::RuntimeToolExecutor::has_work_binding)
+            .unwrap_or(false)
+            || self.initial_work_planning_bound
+    }
+
+    /// A durable binding may outlive the graph that created it.  Only an
+    /// active attempt owns the current user turn strongly enough to suppress
+    /// fresh semantic admission; treating historical binding as activity
+    /// makes every later follow-up inherit stale Work semantics.
+    fn work_lifecycle_is_active(&self, state: &AgenticLoopState) -> bool {
+        self.work_item_attempt_bound
+            || state.runtime_tool_executor.as_deref().is_some_and(
+                crate::server::runtime_tool_executor::RuntimeToolExecutor::has_active_primary_work_attempt,
+            )
+    }
+
+    /// Advance a ready durable task when the root coordinator tried to end a
+    /// response without taking an action. The current turn must either have a
+    /// typed Work-required decision or have successfully executed start_work;
+    /// durable Work left by an earlier user turn is not consent to advance it.
+    /// We deliberately do not synthesize calls for a provider batch that
+    /// already contains a tool: the ordinary tool result is the
+    /// replan/recovery boundary for that batch.
+    fn canonical_work_scheduler_is_authorized(&self, state: &AgenticLoopState) -> bool {
+        !self.work_item_attempt_bound
+            && (self.work_lifecycle_is_required(state)
+                || state.telemetry.all_tools_used.contains("start_work"))
+    }
+
+    fn claim_work_attempt_scheduler_replay(&mut self, attempt_id: &str) -> bool {
+        if self.work_attempt_scheduler_replayed.as_deref() == Some(attempt_id) {
+            return false;
+        }
+        self.work_attempt_scheduler_replayed = Some(attempt_id.to_string());
+        true
+    }
+
+    async fn canonical_work_scheduler_call(
+        &mut self,
+        state: &AgenticLoopState,
+        provider_tool_calls: &[Value],
+    ) -> Option<Value> {
+        // An attempt-bound child already owns a task. Scheduling is a
+        // coordinator-only transition; doing it here would turn the child
+        // into a second coordinator and feed `InFlight` back to its own model
+        // loop instead of letting it use the admitted task capabilities.
+        if !self.canonical_work_scheduler_is_authorized(state) {
+            return None;
+        }
+        if !provider_tool_calls.is_empty() {
+            return None;
+        }
+        let executor = state.runtime_tool_executor.as_deref()?;
+        if !executor.has_work_binding() {
+            return None;
+        }
+        // Only an already-owned exact attempt may suppress premature final
+        // text. A merely Ready task can be intentionally deferred and must
+        // never be activated by a hidden scheduler transition.
+        let active = executor.active_primary_work_attempt()?;
+        if !self.claim_work_attempt_scheduler_replay(&active.attempt_id) {
+            return None;
+        }
+        Some(system_next_work_item_call(
+            state.session_turn,
+            state.current_round_index,
+        ))
+    }
+
+    /// Give every newly assigned primary attempt one stable, typed execution
+    /// contract before the model chooses its first tool batch. This is not a
+    /// hard call-count limit: a long task may still use as many focused tools
+    /// as its evidence requires. It simply makes the expected-result boundary
+    /// visible before broad exploration can start.
+    fn active_work_attempt_start_context(&mut self, state: &AgenticLoopState) -> Option<Value> {
+        let active = state
+            .runtime_tool_executor
+            .as_deref()?
+            .active_primary_work_attempt()?;
+        if self.work_attempt_started_context.as_deref() == Some(active.attempt_id.as_str()) {
+            return None;
+        }
+        self.work_attempt_started_context = Some(active.attempt_id.clone());
+        crate::turn::wire_assembly::required_runtime_preamble_message(
+            &json!({
+                "schema": "active_work_attempt_start.v1",
+                "item_id": active.item_id,
+                "item_revision": active.item_revision,
+                "expected_result": active.expected_result,
+                "instruction": "Execute only this assigned WorkItem. Use the smallest focused evidence path and keep the investigation inside the objective. Before outcome=delivered, compare direct evidence literally with every payload and verification field in expected_result: every field must be present in both the evidence and settlement summary. Every explicit conjunct, including a named behavior check, command, test, or observable workflow, needs direct successful evidence; an unrun or failed check remains a gap, and compilation, imports, or adjacent smoke checks do not substitute for it. Reachability, an index/home page, a category list, or a claim that an action ran never substitutes for a requested item, value, article, result, or source. If a field is missing, continue the focused evidence path; if it cannot be obtained, report the truthful blocked or failed outcome. Settle immediately once the exact boundary is satisfied. Do not create, delegate, or broaden the task."
+            })
+            .to_string(),
+        )
+    }
+
+    fn final_work_synthesis_context(state: &AgenticLoopState) -> Option<Value> {
+        if !state
+            .hooks
+            .completion_settlement
+            .preserve_final_synthesis_wire_surface
+        {
+            return None;
+        }
+        crate::turn::wire_assembly::required_runtime_preamble_message(
+            &json!({
+                "schema": "final_work_synthesis.v1",
+                "instruction": "Answer the user's outcome, not an internal execution transcript. Re-check every explicit requested payload against direct evidence, not settlement labels or summaries. A collection root, index/home page, category list, or reachability does not satisfy a requested member/item. If direct evidence is incomplete, do the smallest corrective work or truthfully disclose the gap; never call it delivered. Unless the user explicitly asks for debugging internals, omit tool names, revision numbers, rejected attempts, runtime gates, and instructions for operating Astra. State only the concise user-visible results and any material limitation."
+            })
+            .to_string(),
+        )
+    }
+
+    /// Resolve only from a successful typed graph proposal produced after the
+    /// obligation was installed. The proposal handler owns optimistic
+    /// concurrency and graph validation; this host observes its canonical
+    /// tool record instead of interpreting model prose.
+    fn reconcile_pending_work_graph_mutations(&mut self, state: &AgenticLoopState) {
+        if self.pending_work_graph_mutations.is_empty() {
+            return;
+        }
+        let accepted_proposals = state
+            .stall
+            .tool_call_records
+            .iter()
+            .skip(self.pending_work_graph_mutation_record_floor)
+            .enumerate()
+            .filter(|(_, record)| {
+                record.name == "propose_work_plan"
+                    && record.ok
+                    && matches!(
+                        record.effective_disposition(),
+                        astra_services::session_journal::ToolCallDisposition::Executed
+                            | astra_services::session_journal::ToolCallDisposition::Reused
+                    )
+                    && record
+                        .result_full
+                        .as_deref()
+                        .or(record.result_preview.as_deref())
+                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                        .and_then(|result| {
+                            result
+                                .get("status")
+                                .and_then(Value::as_str)
+                                .map(|status| status == "accepted")
+                        })
+                        .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        let resolved = accepted_proposals.iter().any(|(proposal_offset, record)| {
+            let Some(arguments) = record
+                .authoritative_args_full()
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            else {
+                return false;
+            };
+            // Reconciliation is deliberately as strict as pre-execution
+            // admission. This also protects recovery/replay paths where a
+            // historical accepted proposal did not pass through this host
+            // instance: satisfying the requested mutation plus unrelated
+            // additions is not the same user outcome.
+            if !self.proposal_arguments_satisfy_pending_work_graph_mutations(&arguments) {
+                return false;
+            }
+            self.pending_work_graph_mutations
+                .iter()
+                .filter_map(|mutation| mutation.target_initial_candidate())
+                .all(|position| {
+                    let item_id = format!("task-{position}");
+                    state
+                        .stall
+                        .tool_call_records
+                        .iter()
+                        .skip(self.pending_work_graph_mutation_record_floor)
+                        .take(*proposal_offset)
+                        .all(|prior| {
+                            prior.name != "settle_work_item"
+                                || !prior.ok
+                                || prior
+                                    .result_full
+                                    .as_deref()
+                                    .or(prior.result_preview.as_deref())
+                                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                                    .and_then(|result| {
+                                        result
+                                            .get("item_id")
+                                            .and_then(Value::as_str)
+                                            .map(|settled| settled == item_id)
+                                    })
+                                    != Some(true)
+                        })
+                })
+        });
+        if resolved {
+            self.pending_work_graph_mutations.clear();
+            self.pending_work_graph_mutation_record_floor = 0;
+        }
+    }
+
+    /// A staged graph mutation belongs at the scheduling boundary after the
+    /// currently assigned item has settled. Before that boundary, rejecting a
+    /// truthful settlement creates a needless failed tool round and reverses
+    /// user-requested chronology. After it, the next assigned revision must
+    /// not settle past the outstanding graph change.
+    fn pending_work_graph_mutation_boundary_crossed(&self, state: &AgenticLoopState) -> bool {
+        state
+            .stall
+            .tool_call_records
+            .iter()
+            .skip(self.pending_work_graph_mutation_record_floor)
+            .any(|record| {
+                record.name == "settle_work_item"
+                    && record.ok
+                    && matches!(
+                        record.effective_disposition(),
+                        astra_services::session_journal::ToolCallDisposition::Executed
+                            | astra_services::session_journal::ToolCallDisposition::Reused
+                    )
+            })
+    }
+
+    /// Keep late graph changes on the runtime-owned volatile lane until their
+    /// accepted typed proposal exists. This carries the semantic judge's
+    /// closed projection; it never reparses user text.
+    fn pending_work_graph_mutation_context(&self, state: &AgenticLoopState) -> Option<Value> {
+        if self.pending_work_graph_mutations.is_empty() {
+            return None;
+        }
+        let obligations = self
+            .pending_work_graph_mutations
+            .iter()
+            .map(|mutation| match mutation {
+                astra_services::WorkAdmissionGraphMutation::Add { task } => json!({
+                    "mutation_kind": "add",
+                    "objective": task.objective,
+                    "expected_result": task.expected_result,
+                }),
+                astra_services::WorkAdmissionGraphMutation::Cancel {
+                    target_initial_candidate,
+                    target,
+                } => json!({
+                    "mutation_kind": "cancel",
+                    "retire_item_id": format!("task-{target_initial_candidate}"),
+                    "required_declaration_state": "cancelled",
+                    "objective": target.objective,
+                    "expected_result": target.expected_result,
+                }),
+                astra_services::WorkAdmissionGraphMutation::Replace {
+                    target_initial_candidate,
+                    target,
+                    replacement,
+                } => json!({
+                    "mutation_kind": "replace",
+                    "retire_item_id": format!("task-{target_initial_candidate}"),
+                    "required_declaration_state": "superseded",
+                    "retired_objective": target.objective,
+                    "retired_expected_result": target.expected_result,
+                    "objective": replacement.objective,
+                    "expected_result": replacement.expected_result,
+                }),
+            })
+            .collect::<Vec<_>>();
+        let boundary_crossed = self.pending_work_graph_mutation_boundary_crossed(state);
+        let instruction = if boundary_crossed {
+            "The previous WorkItem is settled. Do not execute or settle the newly assigned item. Call inspect_work_plan, then propose every exact atomic mutation below: cancel uses declaration_state=cancelled and no addition; add creates only its stated addition; replace uses declaration_state=superseded plus its stated replacement. After acceptance, call run_next_work_item before doing newly added or replacement work; proposal acceptance does not assign an attempt. Never revise a delivered item or invent another domain."
+        } else {
+            "Finish and settle only the current WorkItem. Before executing the next assigned item, inspect the plan and propose every exact atomic mutation below: cancel uses declaration_state=cancelled and no addition; add creates only its stated addition; replace uses declaration_state=superseded plus its stated replacement. After acceptance, call run_next_work_item before doing newly added or replacement work; proposal acceptance does not assign an attempt. Never invent another domain."
+        };
+        crate::turn::wire_assembly::required_runtime_preamble_message(
+            &json!({
+                "schema": "pending_work_graph_mutations.v1",
+                "obligations": obligations,
+                "scheduling_boundary_crossed": boundary_crossed,
+                "instruction": instruction
+            })
+            .to_string(),
+        )
+    }
+
+    fn read_only_effect_context(&self) -> Option<Value> {
+        // Only the provider's physical workspace binding may impose this
+        // system-level prohibition. An auxiliary semantic judge is useful for
+        // completion planning, but a false-positive `read_only` classification
+        // must never override the user's requested end state.
+        (self.workspace_binding.authority == WorkspaceAuthority::ReadOnly).then(|| {
+                crate::turn::wire_assembly::required_runtime_preamble_message(
+                    &json!({
+                        "schema": "read_only_effect_boundary.v1",
+                        "workspace_effect": "read_only",
+                        "requirements": [
+                            "Do not modify workspace state.",
+                            "For a revision/ref-scoped claim, read every compared artifact from that immutable revision/ref; if evidence intentionally mixes snapshots, label each snapshot explicitly."
+                        ]
+                    })
+                    .to_string(),
+                )
+            })
+            .flatten()
+    }
+
+    /// The semantic classifier, rather than the root model's tool ordering,
+    /// decides whether this turn must establish canonical Work.  Once the
+    /// classifier has made that uncertain-language decision, admission is
+    /// entirely deterministic and uses only this typed value plus lifecycle
+    /// state.
+    fn work_lifecycle_is_required(&self, state: &AgenticLoopState) -> bool {
+        matches!(
+            state
+                .turn_intent
+                .as_ref()
+                .map(|intent| intent.work_lifecycle),
+            Some(WorkLifecycleIntent::Required)
+        )
+    }
+
+    /// Whether this root response must establish the durable graph before it
+    /// can be accepted. The decision is entirely typed: it never inspects the
+    /// user prompt, the model's prose, or a provider-specific tool name list.
+    fn canonical_work_establishment_pending(&self, state: &AgenticLoopState) -> bool {
+        // A semantic admission is unresolved or waiting for the primary
+        // provider response. It either has no typed decision yet or already
+        // carries the bounded graph/capability decision; in both cases do not
+        // turn it into a retry gate before the provider has had a chance to
+        // emit its own typed lifecycle carrier. The deterministic synthetic
+        // `start_work` boundary is selected after that response only when no
+        // carrier was emitted.
+        if self.pending_work_admission.is_some() || self.pending_work_admission_judge.is_some() {
+            return false;
+        }
+        !self.work_item_attempt_bound
+            && self.work_lifecycle_is_required(state)
+            && !self.work_lifecycle_is_bound(state)
+    }
+
+    fn apply_work_admission_decision(
+        &mut self,
+        decision: astra_services::WorkAdmissionDecision,
+    ) -> bool {
+        let required = matches!(
+            &decision,
+            astra_services::WorkAdmissionDecision::Required { .. }
+        );
+        self.work_admission_execution_topology = decision.execution_topology();
+        self.work_admission_topology_authoritative = true;
+        self.work_admission_conflict = None;
+        self.work_admission_capabilities = decision.required_capabilities().to_vec();
+        self.admitted_workspace_mutation = decision.workspace_mutation();
+        // Retain both decisions for the duration of this user turn. A
+        // `not_required` decision can still carry a typed execution topology
+        // (for example same-turn agent fan-out) that must shape the tool
+        // surface without establishing a durable Work graph.
+        self.pending_work_admission = Some(decision);
+        required
+    }
+
+    fn work_admission_terminal_error(&self) -> Option<astra_core::ClassifiedError> {
+        self.work_admission_conflict.as_ref().map(|detail| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                format!("Work admission cannot execute this request: {detail}"),
+            )
+            .with_details_json(
+                json!({
+                    "source": "work_admission",
+                    "error_kind": "work_lifecycle_topology_conflict",
+                    "retryable": false,
+                    "detail": detail,
+                })
+                .to_string(),
+            )
+        })
+    }
+
+    fn reconcile_work_admission_skill_revision(&mut self, state: &AgenticLoopState) -> usize {
+        let skill_revision = state.skills.invoked.len();
+        if self.work_admission_attempted && skill_revision > self.work_admission_skill_revision {
+            self.abort_pending_work_admission();
+            self.pending_work_admission = None;
+            self.work_admission_attempted = false;
+            self.work_admission_execution_topology = astra_services::WorkExecutionTopology::Primary;
+            self.work_admission_topology_authoritative = false;
+            self.work_admission_conflict = None;
+            self.work_admission_capabilities.clear();
+        }
+        skill_revision
+    }
+
+    /// Start the built-in Work classifier for a primary turn or for a typed
+    /// executable boundary. The adaptive default starts the primary-turn
+    /// decision when capacity permits; an explicit `boundary_only` policy
+    /// keeps ordinary text on the single-request path. The boundary call is
+    /// always the fallback before a tool/control effect is admitted. Both
+    /// paths share the same bounded typed decision and never inspect prompt
+    /// text.
+    async fn start_work_admission_preflight(
+        &mut self,
+        state: &AgenticLoopState,
+        admission_boundary: bool,
+        topology_boundary: bool,
+    ) -> bool {
+        let skill_revision = self.reconcile_work_admission_skill_revision(state);
+        if self.turn_intent_policy != TurnIntentExecutionPolicy::Auto
+            // Work genesis is a one-way lifecycle boundary. A durable
+            // binding can temporarily have no active attempt while an
+            // internal continuation is being scheduled; treating that gap
+            // as fresh admission replays the original user request and can
+            // synthesize a second start_work. Later graph changes remain
+            // explicit through inspect_work_plan/propose_work_plan.
+            || (self.work_lifecycle_is_bound(state) && !topology_boundary)
+            || self.pending_work_admission.is_some()
+            || self.pending_work_admission_judge.is_some()
+            || self.work_admission_attempted
+        {
+            return false;
+        }
+        if let Some(reason) =
+            should_skip_work_admission_judge(admission_boundary, topology_boundary)
+        {
+            tracing::debug!(
+                target: "astra::turn_intent",
+                operation = "turn_intent.judge",
+                source = "work_admission_judge",
+                status = "skipped",
+                policy = auxiliary_llm_policy_label(),
+                reason,
+                "Work admission preflight skipped by capacity policy"
+            );
+            return false;
+        }
+        self.work_admission_attempted = true;
+        self.work_admission_skill_revision = skill_revision;
+        let turn_count = state.llm_rounds_completed.saturating_add(1);
+        let user_intent = state.runtime_decision_user_intent();
+        let user_intent_chars = user_intent.chars().count();
+        let Some(client) = self
+            .turn_intent_summary_client(state, "turn_intent", TURN_INTENT_JUDGE_MAX_OUTPUT_TOKENS)
+            .await
+        else {
+            tracing::info!(
+                target: "astra::turn_intent",
+                operation = "turn_intent.judge",
+                source = "work_admission_judge",
+                status = "unavailable",
+                reason = "admission_material_unavailable",
+                "Work admission preflight could not be started"
+            );
+            return false;
+        };
+        let judge = SummaryClientWorkAdmissionJudge { client };
+        let context = crate::turn::agentic::turn_intent::build_turn_intent_judge_context(
+            &state.messages,
+            &user_intent,
+            turn_count,
+            &state.recent_tools,
+            &state.skills.invoked,
+        );
+        let has_prior_assistant_turn = context.has_prior_assistant_turn;
+        let started_at = Instant::now();
+        let handle = tokio::spawn(async move {
+            match tokio::time::timeout(TURN_INTENT_JUDGE_DEADLINE, judge.judge(&context)).await {
+                Ok(result) => result,
+                Err(_) => Err(astra_services::TurnIntentJudgeError::Transport(format!(
+                    "Work admission judge exceeded {}ms deadline",
+                    TURN_INTENT_JUDGE_DEADLINE.as_millis()
+                ))),
+            }
+        });
+        self.pending_work_admission_judge = Some(handle);
+        self.pending_work_admission_started_at = Some(started_at);
+        self.pending_work_admission_round = Some(state.current_round_index);
+        tracing::info!(
+            target: "astra::turn_intent",
+            operation = "turn_intent.judge",
+            source = "work_admission_judge",
+            status = "started",
+            round_index = state.current_round_index,
+            turn_count,
+            has_prior_assistant_turn,
+            user_intent_chars,
+            max_output_tokens = TURN_INTENT_JUDGE_MAX_OUTPUT_TOKENS,
+            deadline_ms = TURN_INTENT_JUDGE_DEADLINE.as_millis() as u64,
+            "Work admission preflight started"
+        );
+        true
+    }
+
+    /// Reconcile the built-in semantic Work preflight without adding another
+    /// model boundary to the happy path. A non-blocking poll is used before
+    /// primary provider I/O; the final reconciliation waits for the bounded
+    /// judge deadline and therefore cannot expose or execute a provider tool
+    /// before the typed Work decision is known.
+    async fn resolve_pending_work_admission(&mut self, wait: bool) -> bool {
+        let Some(handle) = self.pending_work_admission_judge.take() else {
+            return false;
+        };
+        let started_at = self
+            .pending_work_admission_started_at
+            .take()
+            .unwrap_or_else(Instant::now);
+        let round_index = self.pending_work_admission_round.take().unwrap_or_default();
+        if !wait && !handle.is_finished() {
+            self.pending_work_admission_judge = Some(handle);
+            self.pending_work_admission_started_at = Some(started_at);
+            self.pending_work_admission_round = Some(round_index);
+            return false;
+        }
+
+        let result = match handle.await {
+            Ok(result) => result,
+            Err(error) => Err(astra_services::TurnIntentJudgeError::Transport(format!(
+                "work admission judge task failed: {error}"
+            ))),
+        };
+        let duration_ms = started_at.elapsed().as_millis() as u64;
+        match result {
+            Ok(decision) => {
+                let initial_outcome_count = decision
+                    .initial_work_plan()
+                    .map_or(0, |(_, tasks)| tasks.len());
+                let deferred_mutation_count = decision.deferred_graph_mutations().len();
+                let activation = decision.activation();
+                let execution_topology = decision.execution_topology();
+                let required_capability_count = decision.required_capabilities().len();
+                let required = self.apply_work_admission_decision(decision);
+                self.completed_work_admission_phase =
+                    Some((started_at, round_index, TurnPhaseOutcome::Decided));
+                tracing::info!(
+                    target: "astra::turn_intent",
+                    operation = "turn_intent.judge",
+                    source = "work_admission_judge",
+                    status = "success",
+                    round_index,
+                    required,
+                    initial_outcome_count,
+                    deferred_mutation_count,
+                    activation = ?activation,
+                    execution_topology = ?execution_topology,
+                    required_capability_count,
+                    duration_ms,
+                    "Work admission reconciled before tool execution"
+                );
+                required
+            }
+            Err(error) => {
+                self.work_admission_conflict = match &error {
+                    astra_services::TurnIntentJudgeError::UnsupportedCombination(detail) => {
+                        Some(detail.clone())
+                    }
+                    _ => None,
+                };
+                self.pending_work_admission = None;
+                self.work_admission_execution_topology =
+                    astra_services::WorkExecutionTopology::Primary;
+                self.work_admission_topology_authoritative = false;
+                self.work_admission_capabilities.clear();
+                self.completed_work_admission_phase =
+                    Some((started_at, round_index, TurnPhaseOutcome::Unavailable));
+                tracing::warn!(
+                    target: "astra::turn_intent",
+                    operation = "turn_intent.judge",
+                    source = "work_admission_judge",
+                    status = "unavailable",
+                    round_index,
+                    duration_ms,
+                    error = %error,
+                    "Work admission unavailable; preserving typed primary fallback"
+                );
+                false
+            }
+        }
+    }
+
+    /// Project the completed post-response Work admission through the same
+    /// trace/Explain/SSE fan-out as the shared lifecycle. This is
+    /// observational only; admission state remains owned by the typed
+    /// decision above.
+    fn flush_completed_work_admission_phase(&mut self, state: &mut AgenticLoopState) {
+        let Some((started_at, round_index, outcome)) = self.completed_work_admission_phase.take()
+        else {
+            return;
+        };
+        if let Some(decision) = self.pending_work_admission.as_ref() {
+            // The boundary classifier is the single semantic owner for both
+            // Work and workspace effects. Keep its minimal typed projection
+            // on loop state so delegation and completion policy inherit the
+            // same authority instead of running disconnected classifiers.
+            let boundary_intent = decision.turn_intent();
+            let mut intent = state.turn_intent.take().unwrap_or_default();
+            intent.work_lifecycle = boundary_intent.work_lifecycle;
+            if boundary_intent.workspace_mutation
+                != astra_config::user_profile::WorkspaceMutationIntent::Unknown
+            {
+                intent.workspace_mutation = boundary_intent.workspace_mutation;
+            }
+            match intent.workspace_mutation {
+                astra_config::user_profile::WorkspaceMutationIntent::MustMutate => {
+                    // The typed Work judge has now supplied the semantic fact
+                    // that the fallback profile intentionally refused to
+                    // infer from user text. Correct only the untouched initial
+                    // review slice; explicit limits, hard ceiling, and later
+                    // evidence-based renewals remain unchanged.
+                    crate::turn::agentic_loop::lifecycle::promote_fallback_budget_for_authoritative_mutation(
+                        state,
+                    );
+                    state.task_profile.mutates_workspace = true;
+                    state.task_profile.verification_required = true;
+                }
+                astra_config::user_profile::WorkspaceMutationIntent::ReadOnly => {
+                    state.task_profile.mutates_workspace = false;
+                    state.task_profile.verification_required = false;
+                }
+                astra_config::user_profile::WorkspaceMutationIntent::MayMutate
+                | astra_config::user_profile::WorkspaceMutationIntent::Unknown => {}
+            }
+            state.turn_guard.set_task_profile(state.task_profile);
+            state.turn_intent = Some(intent.clone());
+            if let Some(executor) = state.runtime_tool_executor.as_deref() {
+                executor.set_workspace_mutation_intent(intent.workspace_mutation);
+            }
+        }
+        complete_turn_phase(
+            self,
+            state,
+            started_at,
+            TurnPhaseKind::SemanticAdmission,
+            round_index,
+            1,
+            outcome,
+            format!("work_admission_{round_index}"),
+        );
+    }
+
+    fn abort_pending_work_admission(&mut self) {
+        if let Some(handle) = self.pending_work_admission_judge.take() {
+            handle.abort();
+        }
+        self.pending_work_admission_started_at = None;
+        self.pending_work_admission_round = None;
+    }
+
+    /// Materialize an already-admitted Work graph without asking the primary
+    /// model to rediscover it after a response that carried no durable
+    /// execution carrier. The semantic judge owns the uncertain-language
+    /// decision and decomposition; this synthetic call only crosses the
+    /// deterministic durable lifecycle boundary with an exact call identity.
+    fn take_admitted_work_establishment_call(&mut self, state: &AgenticLoopState) -> Option<Value> {
+        let admission_requires_establishment = (!self.work_lifecycle_is_bound(state)
+            && self
+                .pending_work_admission
+                .as_ref()
+                .is_some_and(|decision| {
+                    matches!(
+                        decision,
+                        astra_services::WorkAdmissionDecision::Required { .. }
+                    )
+                }))
+            || self.canonical_work_establishment_pending(state);
+        if !admission_requires_establishment {
+            return None;
+        }
+        let admission = self.pending_work_admission.as_ref()?;
+        let activation = match admission.activation() {
+            astra_services::WorkAdmissionActivation::Start => "start",
+            astra_services::WorkAdmissionActivation::Defer => "defer",
+        };
+        let (goal, tasks) = admission.initial_work_plan()?;
+        let deferred_graph_mutations = admission.deferred_graph_mutations().to_vec();
+        let tasks = tasks
+            .iter()
+            .map(|task| {
+                json!({
+                    "objective": task.objective,
+                    "expected_result": task.expected_result,
+                })
+            })
+            .collect::<Vec<_>>();
+        let arguments = json!({
+            "activation": activation,
+            "goal": goal,
+            "tasks": tasks,
+        });
+        self.deferred_work_surface_turn = (activation == "defer").then_some(state.session_turn);
+        self.pending_work_graph_mutations = deferred_graph_mutations;
+        self.pending_work_graph_mutation_record_floor = state.stall.tool_call_records.len();
+        // Consume only after the full typed payload has been constructed. If
+        // an invariant is ever violated, leaving the decision intact is safer
+        // than silently degrading a required lifecycle into an ungated turn.
+        self.pending_work_admission = None;
+        Some(json!({
+            "id": format!(
+                "server-work-admission-t{}-r{}",
+                state.session_turn,
+                state.current_round_index,
+            ),
+            "type": "function",
+            "function": {
+                "name": "start_work",
+                "arguments": arguments.to_string(),
+            },
+        }))
+    }
+
+    fn should_retry_canonical_work_establishment(
+        &self,
+        state: &AgenticLoopState,
+        provider_tool_calls: &[Value],
+        retry_count: u32,
+    ) -> bool {
+        self.canonical_work_establishment_pending(state)
+            && provider_tool_calls.is_empty()
+            && retry_count < MAX_CANONICAL_WORK_ESTABLISHMENT_RETRIES
+    }
+
+    /// Reconcile the admission judge's execution mode with an explicit typed
+    /// activation emitted by the primary model.
+    ///
+    /// The sidecar judge remains authoritative for whether Work is needed and
+    /// for the bounded task graph. The primary model sees the complete user
+    /// request and may also express `start_work.activation`; that is a
+    /// structured product signal, not prose to be pattern-matched. A
+    /// conflicting `defer` is fail-closed: dispatching an outcome the user
+    /// explicitly kept pending is a larger product failure than requiring a
+    /// later continuation. No provider tool side effect has run yet because
+    /// this reconciliation happens before the canonical synthetic call is
+    /// admitted.
+    fn reconcile_work_activation_from_primary(&mut self, provider_tool_calls: &[Value]) {
+        // A provider-visible fanout start is a typed execution carrier, but it
+        // is not proof that the user or loaded workflow requested parallel
+        // topology. Preserve any semantic admission decision already made.
+        // An unavailable admission is not semantic authority. Fail closed at
+        // the execution boundary instead of allowing the provider tool call
+        // to self-authorize the topology it is asking to create.
+        if primary_explicit_fanout_start(provider_tool_calls) {
+            if let Some(decision) = self.pending_work_admission.as_ref() {
+                let topology = decision.execution_topology();
+                tracing::info!(
+                    target: "astra::work",
+                    ?topology,
+                    "semantic execution-topology admission retained over provider fanout choice"
+                );
+                return;
+            }
+            tracing::warn!(
+                target: "astra::work",
+                "provider fanout has no semantic topology admission; execution will fail closed"
+            );
+            return;
+        }
+        let Some(decision) = self.pending_work_admission.take() else {
+            return;
+        };
+        if !matches!(
+            &decision,
+            astra_services::WorkAdmissionDecision::Required { .. }
+        ) {
+            self.pending_work_admission = Some(decision);
+            return;
+        }
+
+        let judge_activation = decision.activation();
+        let primary_activation = primary_work_activation(provider_tool_calls);
+        let reconciled = match (judge_activation, primary_activation) {
+            (astra_services::WorkAdmissionActivation::Defer, _)
+            | (_, Some(astra_services::WorkAdmissionActivation::Defer)) => {
+                astra_services::WorkAdmissionActivation::Defer
+            }
+            (activation, _) => activation,
+        };
+        if reconciled != judge_activation {
+            tracing::info!(
+                target: "astra::work",
+                judge_activation = ?judge_activation,
+                primary_activation = ?primary_activation,
+                reconciled_activation = ?reconciled,
+                "reconciled typed Work activation before durable dispatch"
+            );
+        }
+        self.pending_work_admission = Some(decision.with_activation(reconciled));
+    }
+
+    fn canonical_work_establishment_retry_preamble(retry_count: u32) -> Value {
+        crate::turn::wire_assembly::required_runtime_preamble_message(
+            &json!({
+                "schema": "canonical_work_establishment_retry.v1",
+                "retry": retry_count,
+                "required_state": "unbound",
+                "instruction": "The previous response did not establish canonical Work. Do not answer the user or call another tool yet. Call start_work now with the bounded task graph that realizes the user goal. After it succeeds, wait for the runtime-owned task assignment."
+            })
+            .to_string(),
+        )
+        .expect("non-empty canonical Work retry contract")
+    }
+
+    /// Enforce the canonical lifecycle for every delegated execution at the
+    /// side-effect admission boundary.
+    ///
+    /// Delegation creates independently executing work. That is a durable
+    /// fact, not a linguistic interpretation of the user's message, so it
+    /// must not depend on an optional semantic sidecar. The only accepted
+    /// representation is a bound Work graph plus an exact WorkItem revision.
+    /// Titles, prompts, and other free text never participate in the decision.
+    fn enforce_canonical_delegation_lifecycle(
+        &self,
+        state: &AgenticLoopState,
+        mut admission: crate::turn::agentic_loop::host::ToolCallAdmission,
+    ) -> crate::turn::agentic_loop::host::ToolCallAdmission {
+        // An explicit lifecycle/topology combination that the runtime cannot
+        // faithfully settle is a turn-wide executable conflict, not merely a
+        // fanout-shaped error.  Reject every carrier before any side effect so
+        // a provider cannot silently choose one half by switching from
+        // `agent_fanout` to `start_work`, a direct child, or an ordinary tool.
+        // The conflict came from the typed semantic judge; no tool name or
+        // user-text heuristic participates in this boundary.
+        if let Some(conflict) = self.work_admission_conflict.as_deref() {
+            for call in admission.admitted.drain(..) {
+                let name = astra_turn_core::tool::args::shape::tool_call_name(&call)
+                    .unwrap_or("unknown")
+                    .to_string();
+                admission
+                    .rejected
+                    .push(crate::turn::agentic_loop::host::RejectedToolCall {
+                        id: call
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        name,
+                        canonical_call: call,
+                        result: json!({
+                            "status": "rejected",
+                            "error_kind": "work_lifecycle_topology_conflict",
+                            "retryable": false,
+                            "error": conflict,
+                        })
+                        .to_string(),
+                    });
+            }
+            return admission;
+        }
+        // A selected WorkItem may recursively decompose through agent
+        // execution topologies, but it cannot author or dispatch a second
+        // Work graph. The shared tool contract, not a caller-maintained
+        // tool-name list, defines that role boundary across every topology.
+        let primary_attempt_active = state.runtime_tool_executor.as_deref().is_some_and(
+            crate::server::runtime_tool_executor::RuntimeToolExecutor::has_active_primary_work_attempt,
+        );
+        if self.work_item_attempt_bound || primary_attempt_active {
+            let tool_contracts =
+                BUILTIN_TOOL_CONTRACTS.get_or_init(astra_runtime_env::ToolRegistry::builtins);
+            let direct_agent_batch_count = admission
+                .admitted
+                .iter()
+                .filter(|call| {
+                    astra_turn_core::tool::args::shape::tool_call_name(call) == Some("agent")
+                        && astra_turn_core::tool::args::shape::parse_tool_call_arguments(call)
+                            .ok()
+                            .and_then(|arguments| {
+                                arguments
+                                    .get("action")
+                                    .and_then(Value::as_str)
+                                    .map(|action| matches!(action, "spawn" | "run_chain"))
+                            })
+                            .unwrap_or(false)
+                })
+                .count();
+            let parallel_fanout_admitted = self.work_admission_topology_authoritative
+                && self.work_admission_execution_topology
+                    == astra_services::WorkExecutionTopology::ParallelSubruns;
+            let direct_parallel_rejection = direct_parallel_agent_rejection(
+                self.work_admission_topology_authoritative,
+                self.work_admission_execution_topology,
+            );
+            let mut retained = Vec::with_capacity(admission.admitted.len());
+            for call in admission.admitted.drain(..) {
+                let name = astra_turn_core::tool::args::shape::tool_call_name(&call);
+                let arguments =
+                    astra_turn_core::tool::args::shape::parse_tool_call_arguments(&call)
+                        .unwrap_or(Value::Null);
+                if name == Some("agent")
+                    && arguments
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .is_some_and(|action| matches!(action, "spawn" | "run_chain"))
+                    && direct_agent_batch_count > 1
+                {
+                    let (error_kind, error) = direct_parallel_rejection;
+                    let retryable = error_kind == "parallel_topology_requires_fanout";
+                    admission
+                        .rejected
+                        .push(crate::turn::agentic_loop::host::RejectedToolCall {
+                            id: call
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            name: "agent".to_string(),
+                            canonical_call: call,
+                            result: json!({
+                                "status": "rejected",
+                                "error_kind": error_kind,
+                                "retryable": retryable,
+                                "error": error,
+                            })
+                            .to_string(),
+                        });
+                    continue;
+                }
+                if name == Some("agent_fanout")
+                    && arguments.get("action").and_then(Value::as_str) == Some("start")
+                    && !parallel_fanout_admitted
+                {
+                    admission.rejected.push(crate::turn::agentic_loop::host::RejectedToolCall {
+                        id: call
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        name: "agent_fanout".to_string(),
+                        canonical_call: call,
+                        result: json!({
+                            "status": "rejected",
+                            "error_kind": "parallel_topology_not_admitted",
+                            "retryable": false,
+                            "error": "This Work attempt has no authoritative parallel-subrun topology. Continue in the current attempt; a provider fanout call cannot authorize itself."
+                        })
+                        .to_string(),
+                    });
+                    continue;
+                }
+                let context = if self.work_item_attempt_bound {
+                    astra_runtime_env::WorkExecutionContext::DelegatedAttempt
+                } else {
+                    astra_runtime_env::WorkExecutionContext::PrimaryAttempt
+                };
+                if name
+                    .is_none_or(|name| tool_contracts.permits_work_execution_context(name, context))
+                {
+                    retained.push(call);
+                    continue;
+                }
+                let name = name.unwrap_or("unknown");
+                admission.rejected.push(crate::turn::agentic_loop::host::RejectedToolCall {
+                    id: call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    name: name.to_string(),
+                    canonical_call: call,
+                    result: json!({
+                        "status": "rejected",
+                        "error_kind": "canonical_work_attempt_may_not_author_work",
+                        "retryable": false,
+                        "error": "This run owns one canonical WorkItem. It may use agent execution topology, but it cannot author or dispatch another Work graph."
+                    })
+                    .to_string(),
+                });
+            }
+            admission.admitted = retained;
+            return admission;
+        }
+        let work_is_required = self.work_lifecycle_is_required(state);
+        let parallel_subruns_requested = matches!(
+            self.work_admission_execution_topology,
+            astra_services::WorkExecutionTopology::ParallelSubruns
+        );
+        let parallel_topology_admitted = self.work_admission_topology_authoritative
+            && self.work_admission_execution_topology
+                == astra_services::WorkExecutionTopology::ParallelSubruns;
+        let direct_parallel_rejection = direct_parallel_agent_rejection(
+            self.work_admission_topology_authoritative,
+            self.work_admission_execution_topology,
+        );
+        // A model may return start_work and a task-executing tool in one
+        // parallel tool-call batch. The latter cannot be allowed to race the
+        // graph establishment merely because admission observed the binding
+        // before the first handler committed it.
+        let work_is_established_in_batch = admission.admitted.iter().any(|call| {
+            astra_turn_core::tool::args::shape::tool_call_name(call) == Some("start_work")
+        });
+        // A provider may return the lifecycle declaration and the first
+        // concrete capability in one tool-call batch. `start_work` with
+        // activation=start is a typed execution barrier: the headless
+        // pipeline serializes that non-read-only call before the following
+        // capability batch. Keep the dependency structural so a model does
+        // not need to rediscover `run_next_work_item`; the executor boundary
+        // still rejects the capability if the start itself failed.
+        let start_work_start_index =
+            admission
+                .admitted
+                .iter()
+                .enumerate()
+                .find_map(|(index, call)| {
+                    let name = astra_turn_core::tool::args::shape::tool_call_name(call)?;
+                    if name != "start_work" {
+                        return None;
+                    }
+                    let arguments =
+                        astra_turn_core::tool::args::shape::parse_tool_call_arguments(call).ok()?;
+                    (arguments.get("activation").and_then(Value::as_str) == Some("start"))
+                        .then_some(index)
+                });
+        // A durable binding is session history; it is not proof that Work is
+        // still executing in this user turn. Keep coordinator admission only
+        // while this turn established Work, an exact primary attempt remains
+        // active, or start_work is present in the current batch. In
+        // particular, `initial_work_planning_bound` must not participate here:
+        // it is true for every later turn in a session that has ever owned
+        // Work, including a completed graph. Treating that historical bit as
+        // execution authority traps follow-up calls behind run_next_work_item
+        // after the scheduler has already returned complete/no item.
+        let coordinator_has_active_work =
+            primary_attempt_active || state.telemetry.all_tools_used.contains("start_work");
+        let work_established_this_turn = state
+            .stall
+            .tool_call_records
+            .iter()
+            .any(|record| record.name == "start_work" && record.was_executed() && record.ok);
+        let work_dispatch_in_batch = admission.admitted.iter().any(|call| {
+            astra_turn_core::tool::args::shape::tool_call_name(call) == Some("run_next_work_item")
+        });
+        let coordinator_has_work =
+            coordinator_has_active_work || work_is_established_in_batch || work_dispatch_in_batch;
+        // A provider batch is executed concurrently by definition. Multiple
+        // direct agent lifecycle calls in one batch therefore express the
+        // same topology as `agent_fanout`, even when the optional semantic
+        // admission sidecar was skipped for a bound Work continuation. Keep
+        // this invariant structural: it is derived from typed call shapes,
+        // never from prompt text or an inferred keyword.
+        let direct_agent_batch_count = admission
+            .admitted
+            .iter()
+            .filter(|call| {
+                let Some(name) = astra_turn_core::tool::args::shape::tool_call_name(call) else {
+                    return false;
+                };
+                if name != "agent" {
+                    return false;
+                }
+                astra_turn_core::tool::args::shape::parse_tool_call_arguments(call)
+                    .ok()
+                    .and_then(|arguments| {
+                        arguments
+                            .get("action")
+                            .and_then(Value::as_str)
+                            .map(|action| matches!(action, "spawn" | "run_chain"))
+                    })
+                    .unwrap_or(false)
+            })
+            .count();
+        let direct_parallel_batch = direct_agent_batch_count > 1;
+        let fanout_start_in_batch = admission.admitted.iter().any(|call| {
+            if astra_turn_core::tool::args::shape::tool_call_name(call) != Some("agent_fanout") {
+                return false;
+            }
+            astra_turn_core::tool::args::shape::parse_tool_call_arguments(call)
+                .ok()
+                .and_then(|arguments| {
+                    arguments
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .map(|action| action == "start")
+                })
+                .unwrap_or(false)
+        });
+        // An unavailable optional semantic sidecar must preserve the normal
+        // typed tool surface. It is not evidence that an arbitrary multi-tool
+        // batch is a Work violation: a broad call-count gate made valid
+        // exploration pay an extra model round and leaked an internal policy
+        // error into the user transcript. The one count invariant above is
+        // narrower and structural: two direct child lifecycles in one batch
+        // are intrinsically a parallel topology. Work remains LLM-driven
+        // through the visible `start_work` contract, while an authoritative
+        // typed `work_is_required` decision still enforces its boundary below.
+        let mut retained = Vec::with_capacity(admission.admitted.len());
+        let mut work_item_runner_admitted = false;
+        for (index, call) in admission.admitted.drain(..).enumerate() {
+            let Some(name) = astra_turn_core::tool::args::shape::tool_call_name(&call) else {
+                // The structural admission has already rejected this shape;
+                // retain defensively if an alternate implementation changes.
+                retained.push(call);
+                continue;
+            };
+            let arguments = astra_turn_core::tool::args::shape::parse_tool_call_arguments(&call)
+                .unwrap_or(Value::Null);
+            let action = arguments.get("action").and_then(Value::as_str);
+            let batch_primary_attempt_allowed = start_work_start_index
+                .is_some_and(|start_index| index > start_index)
+                && astra_runtime_env::ToolRegistry::builtins().permits_work_execution_context(
+                    name,
+                    astra_runtime_env::WorkExecutionContext::PrimaryAttempt,
+                );
+            let rejection = match name {
+                // `start_work` may extend a historical Work branch on a later
+                // user turn, but it is not a second graph-authoring endpoint
+                // inside the same turn. Same-turn changes use the explicit
+                // inspect/propose boundary so genesis cannot be replayed as
+                // extra active outcomes after a mutation already succeeded.
+                "start_work" if work_established_this_turn => Some((
+                    "canonical_work_already_established_this_turn",
+                    "Canonical Work was already established in this user turn. Continue the assigned item, or inspect_work_plan and propose_work_plan for an intentional graph change; do not call start_work again.",
+                )),
+                // A fixed-size fanout already has one server-owned durable
+                // group lifecycle (stable group/slot identity, target-count
+                // settlement, and journaled child termination). Requiring a
+                // second Work graph after the model discovered the fanout
+                // tool creates an impossible cycle: start_work(start) binds a
+                // primary attempt, and primary attempts correctly cannot
+                // delegate. Keep ordinary multi-step execution behind Work,
+                // but admit this independently durable execution carrier.
+                "run_next_work_item" if work_item_runner_admitted => Some((
+                    "canonical_work_parallel_execution_not_allowed",
+                    "Canonical Work runs one foreground task at a time. Wait for the current run_next_work_item result before starting the next task.",
+                )),
+                "agent"
+                    if matches!(action, Some("spawn" | "run_chain"))
+                        && parallel_topology_admitted =>
+                {
+                    Some(direct_parallel_rejection)
+                }
+                "agent"
+                    if matches!(action, Some("spawn" | "run_chain"))
+                        && (parallel_subruns_requested
+                            || direct_parallel_batch
+                            || fanout_start_in_batch) =>
+                {
+                    Some(direct_parallel_rejection)
+                }
+                "agent"
+                    if matches!(action, Some("spawn" | "run_chain"))
+                        && !coordinator_has_active_work
+                        && work_is_required =>
+                {
+                    Some((
+                        "work_lifecycle_required",
+                        "Delegated execution must use canonical Work tracking. Establish it with start_work, then call run_next_work_item; the server owns task selection and worker identity.",
+                    ))
+                }
+                "agent_fanout" if action == Some("start") && !parallel_topology_admitted => {
+                    if self.pending_work_admission.is_some() {
+                        Some((
+                            "parallel_topology_not_admitted",
+                            "The authoritative execution topology for this turn is primary. Continue in the current agent; do not add parallel sub-runs unless the user or loaded workflow explicitly changes that topology.",
+                        ))
+                    } else {
+                        Some((
+                            "parallel_topology_admission_unavailable",
+                            "Parallel execution was not admitted because semantic topology authority is unavailable. Do not create sub-runs from the provider call itself; retry the turn when admission is available.",
+                        ))
+                    }
+                }
+                // `Required` comes from the LLM turn-intent policy, not from
+                // a text heuristic.  It makes Work establishment a hard
+                // admission boundary: the root cannot explore first and add a
+                // decorative task list after doing the task itself.
+                _ if work_is_required
+                    && !coordinator_has_work
+                    && !fanout_start_in_batch
+                    && name != "start_work" =>
+                {
+                    Some((
+                        "canonical_work_establishment_required",
+                        "This turn requires canonical Work. Establish its task list with start_work before root exploration or task execution; the server will then route task execution through run_next_work_item.",
+                    ))
+                }
+                // A bound Work makes the root a coordinator. Task execution
+                // is allowed only through the exact Work-specific endpoint.
+                // Independently durable agents are an explicit exception;
+                // workspace/network/external tools in the coordinator are
+                // otherwise an untracked escape hatch. This decision is made
+                // from typed tool contracts, never task wording.
+                _ if coordinator_has_work
+                    && work_established_this_turn
+                    && !primary_attempt_active
+                    && !canonical_work_post_completion_verification_tool_allowed(
+                        name, &arguments,
+                    ) =>
+                {
+                    Some((
+                        "canonical_work_post_completion_execution_not_allowed",
+                        "The current Work graph is complete. Read-only inspection and verification remain available, but additional workspace, network, or external mutation requires extending canonical Work with a new outcome.",
+                    ))
+                }
+                _ if coordinator_has_work
+                    && !batch_primary_attempt_allowed
+                    && !(work_established_this_turn
+                        && !primary_attempt_active
+                        && canonical_work_post_completion_verification_tool_allowed(
+                            name, &arguments,
+                        ))
+                    && !canonical_work_coordinator_tool_allowed(name, &arguments) =>
+                {
+                    Some((
+                        "canonical_work_task_execution_required",
+                        "Canonical Work is active. The root coordinator may inspect or update Work, but task workspace, network, external, and generic-agent execution must use run_next_work_item so durable Work selects the task.",
+                    ))
+                }
+                _ => None,
+            };
+
+            if let Some((error_kind, error)) = rejection {
+                let retryable = !matches!(
+                    error_kind,
+                    "canonical_work_task_execution_required"
+                        | "canonical_work_parallel_execution_not_allowed"
+                        | "canonical_work_already_established_this_turn"
+                        | "canonical_work_post_completion_execution_not_allowed"
+                        | "parallel_topology_not_admitted"
+                        | "parallel_topology_admission_unavailable"
+                );
+                admission
+                    .rejected
+                    .push(crate::turn::agentic_loop::host::RejectedToolCall {
+                        id: call
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        name: name.to_string(),
+                        canonical_call: call,
+                        result: json!({
+                            "status": "rejected",
+                            "error_kind": error_kind,
+                            "retryable": retryable,
+                            "error": error,
+                        })
+                        .to_string(),
+                    });
+            } else {
+                if name == "run_next_work_item" {
+                    work_item_runner_admitted = true;
+                }
+                retained.push(call);
+            }
+        }
+        admission.admitted = retained;
+        admission
     }
 
     fn update_latched_plan_resume_line(summary: &str, plan_hint: Option<&str>) -> String {
@@ -2333,13 +5783,14 @@ impl ServerAgenticLoopHost {
         &mut self,
         state: &AgenticLoopState,
         operation_id: &'static str,
+        max_output_tokens: usize,
     ) -> Option<Box<dyn astra_turn_core::cloud_summary::SummaryLlmClient>> {
         if self.resolved_llm_config.is_some() && !self.cached_llm_config_matches_state(state) {
             self.clear_resolved_llm_config();
         }
         if let Some(config) = self.resolved_llm_config.as_ref() {
             return self
-                .durable_summary_client(config, 256, state, operation_id)
+                .durable_summary_client(config, max_output_tokens, state, operation_id)
                 .map(|client| Box::new(client) as Box<_>);
         }
 
@@ -2355,7 +5806,7 @@ impl ServerAgenticLoopHost {
             }
         };
         self.remember_resolved_llm_config(&llm_cfg);
-        self.durable_summary_client(&llm_cfg, 256, state, operation_id)
+        self.durable_summary_client(&llm_cfg, max_output_tokens, state, operation_id)
             .map(|client| Box::new(client) as Box<_>)
     }
 
@@ -2366,7 +5817,19 @@ impl ServerAgenticLoopHost {
         state: &AgenticLoopState,
         operation_id: &'static str,
     ) -> Option<RuntimeSummaryClient> {
-        let ledger = match self.required_inference_ledger() {
+        let authority = match self.inference_run_authority(state) {
+            Ok(authority) => authority,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra::inference",
+                    operation_id,
+                    error = %error,
+                    "auxiliary inference skipped because durable run authority is unavailable"
+                );
+                return None;
+            }
+        };
+        let ledger = match self.required_inference_ledger(authority) {
             Ok(ledger) => ledger,
             Err(error) => {
                 tracing::warn!(
@@ -2378,25 +5841,50 @@ impl ServerAgenticLoopHost {
                 return None;
             }
         };
-        Some(RuntimeSummaryClient::new(
-            config.execution_route(),
-            max_output_tokens,
-            ledger,
-            astra_turn_types::InferenceInvocationScope::Session {
+        // Auxiliary inference is causal to one durable run whenever the
+        // lifecycle has established that identity.  A session-only scope
+        // makes every retry of the same visible turn collide with the first
+        // judge invocation (the idempotency key intentionally includes the
+        // scope), which turns a successful prior judge into a misleading
+        // `already exists with status succeeded` transport failure.  Keep the
+        // session scope only for isolated/unit callers that have no run yet.
+        let scope = match state
+            .current_run_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|run_id| !run_id.is_empty())
+        {
+            Some(run_id) => astra_turn_types::InferenceInvocationScope::Run {
+                session_id: self.session_id.clone(),
+                run_id: run_id.to_string(),
+                turn: state.session_turn,
+                round: state.llm_rounds_completed,
+                operation_id: operation_id.to_string(),
+                logical_attempt: 0,
+            },
+            None => astra_turn_types::InferenceInvocationScope::Session {
                 session_id: self.session_id.clone(),
                 turn: state.session_turn,
                 round: state.llm_rounds_completed,
                 operation_id: operation_id.to_string(),
                 logical_attempt: 0,
             },
+        };
+        Some(RuntimeSummaryClient::new_with_attempt_allocator(
+            config.execution_route(),
+            max_output_tokens,
+            ledger,
+            scope,
+            self.summary_attempt_allocator.clone(),
         ))
     }
 
     fn required_inference_ledger(
         &self,
+        run_authority: Option<crate::turn::llm::durable::DurableInferenceRunAuthority>,
     ) -> Result<crate::turn::llm::durable::DurableInferenceLedger, astra_core::ClassifiedError>
     {
-        match self.inference_ledger_persistence.as_ref() {
+        let ledger = match self.inference_ledger_persistence.as_ref() {
             Some(persistence) => {
                 crate::turn::llm::durable::DurableInferenceLedger::required_with_persistence(
                     self.shared_pool.as_ref(),
@@ -2410,7 +5898,91 @@ impl ServerAgenticLoopHost {
                 self.admitted_model_execution.as_ref(),
                 &self.user_id,
             ),
+        }?;
+        Ok(match run_authority {
+            Some(authority) => ledger.with_run_authority(authority),
+            None => ledger,
+        })
+    }
+
+    fn inference_run_authority(
+        &self,
+        state: &AgenticLoopState,
+    ) -> Result<
+        Option<crate::turn::llm::durable::DurableInferenceRunAuthority>,
+        astra_core::ClassifiedError,
+    > {
+        if state
+            .current_run_id
+            .as_deref()
+            .is_none_or(|run_id| run_id.trim().is_empty())
+        {
+            return Ok(None);
         }
+        let expected_owner_generation = state.current_run_owner_generation.ok_or_else(|| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                "durable run inference has no execution-owner generation",
+            )
+        })?;
+        let expected_owner_pod_id = self
+            .inference_owner_pod_id
+            .as_deref()
+            .filter(|owner| !owner.trim().is_empty())
+            .ok_or_else(|| {
+                astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    "durable run inference has no execution-owner pod capability",
+                )
+            })?;
+        let expected_control_epoch = i64::try_from(state.user_intents.user_intent_cursor())
+            .map_err(|_| {
+                astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    "durable inference control epoch exceeds the database range",
+                )
+            })?;
+        Ok(Some(
+            crate::turn::llm::durable::DurableInferenceRunAuthority::new(
+                expected_owner_generation,
+                expected_owner_pod_id,
+                expected_control_epoch,
+                state.cancellation.flag.clone(),
+                state.cancellation.token.clone(),
+                state.cancellation.execution_lease_lost.clone(),
+            ),
+        ))
+    }
+
+    /// Publish one pre-provider boundary per physical request attempt.
+    /// Failures before a stream begins are otherwise invisible to a
+    /// phase-oriented explain view, even though they can account for all of a
+    /// user's wait. Retried provider calls retain distinct receipts rather
+    /// than being mistaken for duplicate delivery.
+    fn complete_request_preparation_phase(
+        &mut self,
+        state: &mut AgenticLoopState,
+        started_at: Instant,
+        attempt_index: u32,
+        recorded_attempts: &mut HashSet<u32>,
+        outcome: TurnPhaseOutcome,
+    ) {
+        if !recorded_attempts.insert(attempt_index) {
+            return;
+        }
+        complete_turn_phase(
+            self,
+            state,
+            started_at,
+            TurnPhaseKind::RequestPreparation,
+            state.current_round_index,
+            attempt_index,
+            outcome,
+            format!(
+                "request_preparation_{}_{}",
+                state.current_round_index, attempt_index
+            ),
+        );
     }
 
     /// Install runtime MCP tool schemas into the LLM tool surface.
@@ -2553,8 +6125,8 @@ impl ServerAgenticLoopHost {
             );
             return;
         }
-        let candidates = capability_filtered_server_tool_schemas(
-            &self.capabilities,
+        let candidates = capability_filter_edge_provided_tool_schemas_for_binding(
+            astra_tools::schemas::all_tool_schemas(),
             &self.workspace_binding,
             &self.executor_binding,
             self.runtime_binding.as_ref(),
@@ -2584,6 +6156,20 @@ impl ServerAgenticLoopHost {
             merged_count
         );
         for schema in merged {
+            if let Some(name) = tool_schema_name(&schema) {
+                // Admission route selection needs the same provider fact as
+                // schema visibility. Without updating this set, a schema
+                // appended after builder construction is present in
+                // `tool_schemas` but is resolved as ServerLocal/unsupported
+                // and disappears again at runtime-readiness filtering.
+                self.runtime_declared_tool_names.insert(name.to_string());
+            }
+            // Keep the complete admitted candidate in the deferred catalog as
+            // well as the immediate surface. The prompt pipeline may
+            // cache-prune a non-core child capability and leave only
+            // tool_search visible; without this catalog entry the activation
+            // manifest says the exact allowlisted tool does not exist.
+            append_tool_schemas_unique(&mut self.deferred_tool_schemas, vec![schema.clone()]);
             self.install_admissible_tool_schema(schema, true);
         }
         // MOI runner chat sends `allow_tools` + executor_binding.transport=edge_ws.
@@ -2697,14 +6283,6 @@ impl ServerAgenticLoopHost {
             format!("- Session: {session_id} · run: {run_id} · model: {model}"),
             format!("- Resume context: {plan_line}"),
             format!(
-                "- Task board: {}",
-                self.task_board_resume_hint
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|hint| !hint.is_empty())
-                    .unwrap_or("no open tasks")
-            ),
-            format!(
                 "- Delegation: engine={} · this_turn={} · progress_stream={}",
                 if state.delegation_engine.is_some() {
                     "enabled"
@@ -2811,6 +6389,20 @@ impl ServerAgenticLoopHost {
     }
 
     fn retain_emitted_event(&mut self, event: Value, streaming_turn: bool) {
+        // Streaming deltas are already delivered on the live lane. Retaining
+        // every tiny text/reasoning fragment in the bounded settlement buffer
+        // lets a verbose provider evict tool and lifecycle evidence before
+        // terminal projection. Non-streaming turns still need their deltas to
+        // construct the response, so only the streaming replay buffer filters
+        // these transient event kinds.
+        if streaming_turn
+            && matches!(
+                event.get("type").and_then(Value::as_str),
+                Some("text_delta" | "reasoning_delta" | "thinking_delta")
+            )
+        {
+            return;
+        }
         self.emitted_events.push(event);
         if streaming_turn && self.emitted_events.len() > MAX_STREAMED_TURN_EVENT_BUFFER {
             let overflow = self
@@ -2824,7 +6416,7 @@ impl ServerAgenticLoopHost {
     /// Push ordinary progress to both the bounded live lane and terminal
     /// buffer. Progress may be coalesced behind an explicit repair boundary;
     /// interactions that can block execution must use
-    /// [`Self::emit_committed_interaction`] instead.
+    /// [`Self::emit_committed_approval_batch`] instead.
     fn emit_progress_event(&mut self, event: Value) {
         if self.validate_progress_event_lane(&event).is_err() {
             return;
@@ -2841,12 +6433,22 @@ impl ServerAgenticLoopHost {
     }
 
     fn emit_validated_progress_event(&mut self, mut event: Value) {
+        if let Some(object) = event.as_object_mut() {
+            // Settlement authority is lifecycle-owned. Never trust or expose
+            // a producer-supplied copy of its private durable watermark.
+            object.remove(TOOL_TERMINAL_DURABLY_FANNED_OUT_FIELD);
+        }
         self.attach_execution_metadata_to_tool_event(&mut event);
         self.mirror_agent_live_event(&event);
-        let streaming_turn = self.event_tx.is_some();
-        if !self.prefer_client_tool_delivery
-            && let Some(sender) = &self.event_tx
-        {
+        let streaming_turn = self.streaming_turn_started;
+        // Edge-owned tool calls have a committed callback lane and must not
+        // be duplicated onto the lossy progress stream.  Server/MCP-owned
+        // tools still need the live lane: `prefer_client_tool_delivery` is a
+        // routing preference, not a blanket suppression of introspect,
+        // reflect, Work, or other server feedback visible to the user.
+        let client_owned_tool_event =
+            self.prefer_client_tool_delivery && Self::progress_event_is_client_owned_tool(&event);
+        if !client_owned_tool_event && let Some(sender) = &self.event_tx {
             let disconnected = match sender.tx.try_send(event.clone()) {
                 Ok(()) => false,
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => true,
@@ -2864,9 +6466,78 @@ impl ServerAgenticLoopHost {
         self.retain_emitted_event(event, streaming_turn);
     }
 
+    fn progress_event_is_client_owned_tool(event: &Value) -> bool {
+        let event_type = event.get("type").and_then(Value::as_str);
+        if !matches!(
+            event_type,
+            Some(
+                "tool_call"
+                    | "tool_call_start"
+                    | "tool_call_end"
+                    | "tool_transport_started"
+                    | "tool_transport_completed"
+                    | "tool_transport_failed"
+            )
+        ) {
+            return false;
+        }
+        event
+            .get("transport")
+            .and_then(Value::as_str)
+            .is_some_and(|transport| matches!(transport, "edge_ws" | "edge_ledger"))
+            || event.pointer("/executor/kind").and_then(Value::as_str) == Some("edge_agent")
+    }
+
+    /// Deliver a committed lifecycle projection without allowing Edge tool
+    /// delivery preference to suppress it. Tool cards may be owned by the
+    /// client in Edge mode, but canonical session state is owned by the
+    /// server and must reach the durable live lane in every topology.
+    async fn emit_committed_lifecycle_projection(&mut self, mut event: Value) {
+        if self.validate_progress_event_lane(&event).is_err() {
+            return;
+        }
+        self.attach_execution_metadata_to_tool_event(&mut event);
+        let sender = self.event_tx.as_ref().map(|sender| sender.tx.clone());
+        let streaming_turn = self.streaming_turn_started;
+        if let Some(sender) = sender {
+            match tokio::time::timeout(Duration::from_secs(1), sender.send(event.clone())).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    tracing::debug!(target: "sse_channel", "stream fanout disconnected; retaining committed lifecycle projection for turn settlement");
+                    self.event_tx = None;
+                }
+                Err(_) => {
+                    tracing::warn!(target: "sse_channel", event_type = ?event.get("type"), "stream fanout remained backpressured; retaining committed lifecycle projection without blocking run execution");
+                }
+            }
+        }
+        self.mirror_agent_live_event(&event);
+        self.retain_emitted_event(event, streaming_turn);
+    }
+
+    fn emit_committed_control_projection(&mut self, mut event: Value) {
+        if self.validate_progress_event_lane(&event).is_err() {
+            return;
+        }
+        self.attach_execution_metadata_to_tool_event(&mut event);
+        let streaming_turn = self.streaming_turn_started;
+        if let Some(sender) = self.event_tx.as_ref().map(|sender| sender.tx.clone()) {
+            match sender.try_send(event.clone()) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => self.event_tx = None,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(target: "sse_channel", event_type = ?event.get("type"), "control projection retained for replay without blocking run execution");
+                }
+            }
+        }
+        self.mirror_agent_live_event(&event);
+        self.retain_emitted_event(event, streaming_turn);
+    }
+
     /// Commit and deliver an interaction before allowing the executor to wait
     /// for its callback. Production installs a durable sink; direct host tests
     /// fall back to bounded channel send, which is still lossless.
+    #[cfg(test)]
     async fn emit_committed_interaction(&mut self, mut event: Value) -> Result<(), String> {
         if !Self::interaction_event_requires_commit(&event) {
             let fault = Self::event_route_contract_error(
@@ -2879,7 +6550,7 @@ impl ServerAgenticLoopHost {
             return Err(message);
         }
         self.attach_execution_metadata_to_tool_event(&mut event);
-        let streaming_turn = self.event_tx.is_some() || self.interaction_sink.is_some();
+        let streaming_turn = self.streaming_turn_started || self.interaction_sink.is_some();
 
         if let Some(sink) = self.interaction_sink.clone() {
             sink.commit_and_deliver(event.clone()).await?;
@@ -2894,6 +6565,54 @@ impl ServerAgenticLoopHost {
 
         self.mirror_agent_live_event(&event);
         self.retain_emitted_event(event, streaming_turn);
+        Ok(())
+    }
+
+    async fn emit_committed_approval_batch(
+        &mut self,
+        mut event: Value,
+        expected_control_epoch: i64,
+        expected_owner_generation: u64,
+    ) -> Result<(), String> {
+        if !Self::interaction_event_requires_commit(&event) {
+            let fault = Self::event_route_contract_error(
+                &event,
+                "committed interaction lane",
+                "emit_progress_event",
+            );
+            let message = fault.message.clone();
+            self.record_event_protocol_fault(fault);
+            return Err(message);
+        }
+        self.attach_execution_metadata_to_tool_event(&mut event);
+        let streaming_turn = self.streaming_turn_started || self.interaction_sink.is_some();
+        if let Some(sink) = self.interaction_sink.clone() {
+            sink.commit_approval_batch_and_deliver(
+                event.clone(),
+                expected_control_epoch,
+                expected_owner_generation,
+            )
+            .await?;
+        } else if let Some(sender) = self.event_tx.as_ref().map(|sender| sender.tx.clone()) {
+            sender
+                .send(event.clone())
+                .await
+                .map_err(|_| "interaction delivery lane is closed".to_string())?;
+        } else {
+            return Err("interactive event has no durable delivery owner".to_string());
+        }
+        self.mirror_agent_live_event(&event);
+        self.retain_emitted_event(event, streaming_turn);
+        Ok(())
+    }
+
+    async fn project_committed_tool_request(&mut self, event: Value) -> Result<(), String> {
+        let Some(sink) = self.interaction_sink.clone() else {
+            return Err("committed tool request has no durable projection owner".to_string());
+        };
+        sink.deliver_committed_tool_request(event.clone()).await?;
+        self.mirror_agent_live_event(&event);
+        self.retain_emitted_event(event, true);
         Ok(())
     }
 
@@ -2961,44 +6680,53 @@ impl ServerAgenticLoopHost {
         }
     }
 
-    fn push_reasoning_events(&mut self, reasoning: &str) {
-        if reasoning.is_empty() {
-            return;
-        }
-        self.emit_progress_event(json!({
-            "type": "reasoning_delta",
-            "content": reasoning,
-        }));
-        self.emit_progress_event(json!({
-            "type": "reasoning_done",
-        }));
-    }
-
     fn replay_action_window_updates(
         &mut self,
         updates: Vec<LlmStreamUpdate>,
         streamed_text: &mut String,
         streamed_reasoning: &mut String,
     ) {
+        const REPLAY_CHUNK_BYTES: usize = 8 * 1024;
+        let mut pending_kind: Option<&'static str> = None;
+        let mut pending = String::new();
         for update in updates {
-            match update {
-                LlmStreamUpdate::Text(content) if !content.is_empty() => {
-                    self.emit_progress_event(json!({
-                        "type": "text_delta",
-                        "content": content,
-                    }));
-                    streamed_text.push_str(&content);
-                }
+            let (kind, content) = match update {
+                LlmStreamUpdate::Text(content) if !content.is_empty() => ("text_delta", content),
                 LlmStreamUpdate::Reasoning(content) if !content.is_empty() => {
-                    self.emit_progress_event(json!({
-                        "type": "reasoning_delta",
-                        "content": content,
-                    }));
-                    streamed_reasoning.push_str(&content);
+                    ("reasoning_delta", content)
                 }
                 LlmStreamUpdate::Text(_)
                 | LlmStreamUpdate::Reasoning(_)
-                | LlmStreamUpdate::ToolCall { .. } => {}
+                | LlmStreamUpdate::ToolCall { .. } => continue,
+            };
+            if pending_kind.is_some_and(|pending_kind| pending_kind != kind)
+                || pending.len().saturating_add(content.len()) > REPLAY_CHUNK_BYTES
+            {
+                let emitted = std::mem::take(&mut pending);
+                if pending_kind == Some("text_delta") {
+                    self.emit_progress_event(json!({
+                        "type": "text_delta",
+                        "content": &emitted,
+                    }));
+                    streamed_text.push_str(&emitted);
+                } else if pending_kind == Some("reasoning_delta") {
+                    self.emit_progress_event(json!({
+                        "type": "reasoning_delta",
+                        "content": &emitted,
+                    }));
+                    streamed_reasoning.push_str(&emitted);
+                }
+            }
+            pending_kind = Some(kind);
+            pending.push_str(&content);
+        }
+        if !pending.is_empty() {
+            if pending_kind == Some("text_delta") {
+                self.emit_progress_event(json!({"type": "text_delta", "content": &pending}));
+                streamed_text.push_str(&pending);
+            } else if pending_kind == Some("reasoning_delta") {
+                self.emit_progress_event(json!({"type": "reasoning_delta", "content": &pending}));
+                streamed_reasoning.push_str(&pending);
             }
         }
     }
@@ -3114,6 +6842,7 @@ impl ServerAgenticLoopHost {
     ) {
         self.progress_rx = None;
         self.progress_filter = None;
+        self.streaming_turn_started = true;
         self.event_tx = Some(ServerEventSender { tx, gap });
     }
 
@@ -3233,6 +6962,10 @@ impl ServerAgenticLoopHost {
         round: &Value,
         turn_started: Instant,
     ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
+        if let Some(decision) = self.test_work_admission.take() {
+            self.work_admission_attempted = true;
+            self.apply_work_admission_decision(decision);
+        }
         // Latch a cache config from the (optional) mock provider so that
         // annotations exercised here mirror the real pipeline at the server
         // loop host level — including Anthropic cache_control blocks and the
@@ -3277,6 +7010,9 @@ impl ServerAgenticLoopHost {
             &cache_cfg,
             &self.always_load_tool_names,
         );
+        if let Some(pipeline_session) = state.pipeline_session.as_mut() {
+            pipeline_session.replace_pending_wire_tool_schemas(&annotated_tools);
+        }
         self.sync_valid_tools_to_wire_surface_for_state(&annotated_tools, state);
         self.last_turn_tool_schemas = clone_server_fork_tool_schemas(&annotated_tools);
         let (provider, model) = self
@@ -3291,6 +7027,7 @@ impl ServerAgenticLoopHost {
             base_url: String::new(),
             fallback_chain: Vec::new(),
             cache_capability: None,
+            thinking_capability: None,
             header_overrides: HashMap::new(),
             request_body_overrides: None,
             completions_url_override: None,
@@ -3305,6 +7042,7 @@ impl ServerAgenticLoopHost {
             state,
             &mock_llm_cfg,
             &cache_cfg,
+            false,
         );
         if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
             crate::turn::llm::context::augment_manifest_trace_with_wire_detail(
@@ -3318,10 +7056,23 @@ impl ServerAgenticLoopHost {
                 },
             );
         }
+        if let Some(buffer) = state.turn_event_buffer.as_mut() {
+            buffer.set_visible_tool_actions(
+                crate::turn::llm::context::visible_tool_action_surface(&annotated_tools),
+            );
+            buffer.set_visible_tool_names(
+                annotated_tools
+                    .iter()
+                    .filter_map(tool_schema_name)
+                    .map(str::to_string)
+                    .collect(),
+            );
+        }
         self.emit_context_meta(
             &mock_pipeline.breakdown,
             state.last_llm_context_manifest_trace.as_ref(),
             &[],
+            &annotated_tools,
         );
         // `assemble_llm_messages` produces `[system(s), …, compacted msgs,
         // post-compact attachments]`. For the capture's downstream
@@ -3412,13 +7163,26 @@ impl ServerAgenticLoopHost {
             return Err(error);
         }
 
-        let (full_text, reasoning, tool_calls, usage, delay_ms) =
+        let (full_text, reasoning, provider_tool_calls, usage, delay_ms) =
             astra_turn_core::bridge_e2e_hooks::parse_llm_round(round);
         if delay_ms > 0 {
             sleep_ms_or_llm_cancel(delay_ms, llm_cancel_for_state(state)).await?;
         }
 
-        let admitted_terminal_tool_calls = self.admit_terminal_tool_calls(
+        // A provider response is evidence about what the model said, not
+        // authority to strand a ready durable task.  Keep that raw evidence
+        // separate for capture, then add the scheduler-owned call to the
+        // canonical execution batch when needed.
+        let mut tool_calls = provider_tool_calls.clone();
+        let scheduler_dispatched = self
+            .canonical_work_scheduler_call(state, &provider_tool_calls)
+            .await;
+        if let Some(call) = scheduler_dispatched.as_ref() {
+            tool_calls.push(call.clone());
+        }
+
+        let admitted_terminal_tool_calls = self.admit_terminal_tool_calls_with_completion(
+            state,
             &tool_calls,
             if tool_calls.is_empty() {
                 Some("stop")
@@ -3438,8 +7202,9 @@ impl ServerAgenticLoopHost {
             crate::turn::terminal_control::TerminalControlOutcome::Requested(_)
         );
         let hold_action_window_projection = self.terminal_handoff_window.is_open();
-        let suppress_source_projection =
-            terminal_handoff_requested || hold_action_window_projection;
+        let suppress_source_projection = terminal_handoff_requested
+            || hold_action_window_projection
+            || scheduler_dispatched.is_some();
         let suppress_tool_execution = !matches!(
             terminal_control_outcome,
             crate::turn::terminal_control::TerminalControlOutcome::Passthrough
@@ -3448,7 +7213,11 @@ impl ServerAgenticLoopHost {
         self.record_terminal_control_outcome(&terminal_control_outcome);
 
         if !suppress_source_projection && !reasoning.is_empty() {
-            self.push_reasoning_events(&reasoning);
+            self.emit_progress_event(json!({
+                "type": "reasoning_delta",
+                "content": reasoning,
+            }));
+            self.emit_progress_event(json!({ "type": "reasoning_done" }));
         }
         if !suppress_source_projection && !full_text.is_empty() {
             self.emit_progress_event(json!({ "type": "text_delta", "content": &full_text }));
@@ -3518,10 +7287,10 @@ impl ServerAgenticLoopHost {
                 None,
                 "success",
                 json!({
-                    "finish_reason": if tool_calls.is_empty() { "stop" } else { "tool_calls" },
+                    "finish_reason": if provider_tool_calls.is_empty() { "stop" } else { "tool_calls" },
                     "full_text": full_text.clone(),
                     "reasoning": accum.reasoning_content.clone(),
-                    "tool_calls": tool_calls.clone(),
+                    "tool_calls": provider_tool_calls,
                     "usage": {
                         "input_tokens": u.input_tokens,
                         "cached_input_tokens": u.cached_input_tokens,
@@ -3539,13 +7308,8 @@ impl ServerAgenticLoopHost {
             .await;
         }
 
-        state.final_text_streamed = !full_text.is_empty();
+        state.final_text_streamed = !suppress_source_projection && !full_text.is_empty();
         state.final_text = full_text;
-        state.total_prompt += u.input_tokens;
-        state.total_cache_read += u.cached_input_tokens;
-        state.total_cache_creation += u.cache_creation_tokens;
-        state.total_completion += u.output_tokens;
-        state.has_any_usage = true;
 
         Ok(HostTurnResult {
             accum,
@@ -3609,7 +7373,7 @@ impl ServerAgenticLoopHost {
             args: args.clone(),
             output,
             tool_result_fields: Some(fields),
-            status: "error".to_string(),
+            status: "failed".to_string(),
             duration_ms: 0,
         }
     }
@@ -3617,15 +7381,17 @@ impl ServerAgenticLoopHost {
     fn offline_edge_results_for_tool_calls(
         &mut self,
         tool_calls: &[Value],
-    ) -> Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult> {
+    ) -> Result<
+        Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult>,
+        astra_turn_core::headless_tool_assembly::ProviderToolBatchError,
+    > {
         if tool_calls.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         use astra_turn_core::headless_tool_assembly::parse_flat_tool_call_event;
 
-        let ordered_tool_calls =
-            self.object_tool_calls_with_ids("offline_edge_results_for_tool_calls", tool_calls);
+        let ordered_tool_calls = self.canonical_provider_tool_calls(tool_calls)?;
         let mut results = Vec::new();
         for tc in ordered_tool_calls.iter() {
             let (request_id, tool_name, args) = parse_flat_tool_call_event(tc);
@@ -3635,24 +7401,15 @@ impl ServerAgenticLoopHost {
             self.valid_tools.insert(tool_name.clone());
             results.push(self.edge_executor_offline_result(&request_id, &tool_name, &args));
         }
-        results
+        Ok(results)
     }
 
-    fn object_tool_calls_with_ids(&self, route: &'static str, tool_calls: &[Value]) -> Vec<Value> {
-        use astra_turn_core::headless_tool_assembly::ensure_tool_call_ids;
-
-        let object_tool_calls = tool_calls
-            .iter()
-            .filter_map(|tool_call| {
-                if tool_call.is_object() {
-                    Some(tool_call.clone())
-                } else {
-                    self.warn_non_object_tool_call(route, tool_call);
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        ensure_tool_call_ids(&object_tool_calls).into_owned()
+    fn canonical_provider_tool_calls(
+        &self,
+        tool_calls: &[Value],
+    ) -> Result<Vec<Value>, astra_turn_core::headless_tool_assembly::ProviderToolBatchError> {
+        astra_turn_core::headless_tool_assembly::canonicalize_provider_tool_batch(tool_calls)
+            .map(std::borrow::Cow::into_owned)
     }
 
     fn emit_admitted_tool_call_events(&mut self, tool_calls: &[Value]) {
@@ -3767,38 +7524,17 @@ impl ServerAgenticLoopHost {
         self.emit_progress_event(Value::Object(waiting));
     }
 
-    /// Deliver edge tool calls via the ledger protocol.
-    ///
-    /// For each tool call:
-    /// 1. If approval required: emit `approval_required` SSE → wait on approval ledger
-    /// 2. Emit `tool_request` SSE (so client can execute the tool)
-    /// 3. Wait on tool result ledger (populated by client's `POST /tools/result`)
-    /// 4. Convert result to `EdgeToolExecResult`
-    ///
-    /// Events are streamed incrementally through `event_tx`.
-    ///
-    /// **P0-3**: When the in-memory ledger times out and an edge dispatch
-    /// service is wired (cross-pod deployment), falls back to DB-polling
-    /// for results delivered by another pod.
-    async fn deliver_edge_bound_tools_via_ledger(
-        &mut self,
-        run_id: &str,
-        turn_chain_id: &str,
-        tool_calls: &[Value],
-    ) -> Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult> {
-        if self.event_tx.is_none() || tool_calls.is_empty() {
-            return Vec::new();
-        }
-        let edge_bound_tool_calls = self.edge_ledger_tool_calls_for_delivery(tool_calls);
-        if edge_bound_tool_calls.is_empty() {
-            return Vec::new();
-        }
-        self.deliver_edge_tools_via_ledger(run_id, turn_chain_id, &edge_bound_tool_calls)
-            .await
+    fn has_client_tool_delivery_lane(&self) -> bool {
+        self.event_tx.is_some() || self.interaction_sink.is_some()
     }
 
     fn should_deliver_edge_bound_tools_via_client_ledger(&self, state: &AgenticLoopState) -> bool {
-        if self.prefer_client_tool_delivery && self.event_tx.is_some() {
+        // Dynamic children do not own the root SSE sender. They inherit a
+        // durable interaction sink that commits tool requests under the child
+        // run and projects them onto the parent's live lane. Treat that sink
+        // as executable delivery authority instead of falling through to the
+        // server-local runtime executor merely because `event_tx` is absent.
+        if self.prefer_client_tool_delivery && self.has_client_tool_delivery_lane() {
             return true;
         }
         should_deliver_edge_bound_tools_via_client_ledger_for_binding(
@@ -3814,10 +7550,32 @@ impl ServerAgenticLoopHost {
         &mut self,
         state: &AgenticLoopState,
         tool_calls: &[Value],
-    ) -> Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult> {
-        let mut results = self.offline_edge_results_for_tool_calls(tool_calls);
+    ) -> AdmittedToolCallOutcome {
+        let mut results = match self.offline_edge_results_for_tool_calls(tool_calls) {
+            Ok(results) => results,
+            Err(error) => {
+                tracing::error!(
+                    target: "astra::tool_admission",
+                    session_id = %self.session_id,
+                    user_id = %self.user_id,
+                    error = %error,
+                    "refusing malformed admitted provider tool batch before edge delivery"
+                );
+                return AdmittedToolCallOutcome {
+                    results: Vec::new(),
+                    control: AdmittedToolCallControl::FailedClosed,
+                };
+            }
+        };
+        let client_pipeline_calls = self.client_pipeline_tool_calls(state, tool_calls);
+        let client_pipeline_call_ids = client_pipeline_calls
+            .iter()
+            .filter_map(|call| call.get("id").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+        let deliver_edge_runtime = self.should_deliver_edge_bound_tools_via_client_ledger(state);
 
-        if !self.should_deliver_edge_bound_tools_via_client_ledger(state) {
+        if !deliver_edge_runtime && client_pipeline_calls.is_empty() {
             if self.event_tx.is_some()
                 && state.runtime_tool_executor.is_some()
                 && !tool_calls.is_empty()
@@ -3829,10 +7587,15 @@ impl ServerAgenticLoopHost {
                     "skip browser edge-tool ledger because runtime tool executor is available"
                 );
             }
-            return results;
+            return results.into();
         }
-        let ledger_tool_calls = self
-            .edge_ledger_tool_calls_for_delivery(tool_calls)
+        let mut ledger_tool_calls = if deliver_edge_runtime {
+            self.edge_ledger_tool_calls_for_delivery(tool_calls)
+        } else {
+            Vec::new()
+        };
+        append_tool_calls_unique_by_id(&mut ledger_tool_calls, client_pipeline_calls);
+        let ledger_tool_calls = ledger_tool_calls
             .into_iter()
             .filter(|tool_call| {
                 if !tool_call.is_object() {
@@ -3843,6 +7606,9 @@ impl ServerAgenticLoopHost {
                 !self.edge_executor_offline_blocks_tool(&tool_name)
             })
             .collect::<Vec<_>>();
+        if ledger_tool_calls.is_empty() {
+            return results.into();
+        }
         let Some(run_id) = state
             .current_run_id
             .as_deref()
@@ -3854,18 +7620,128 @@ impl ServerAgenticLoopHost {
                 tool_call_count = ledger_tool_calls.len(),
                 "skip browser edge-tool ledger because current run id is missing"
             );
-            return results;
+            return results.into();
         };
         let turn_chain_id = state
-            .bridge_turn_chain_id
+            .canonical_turn_chain_id
             .as_deref()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or(run_id);
-        results.extend(
-            self.deliver_edge_bound_tools_via_ledger(run_id, turn_chain_id, &ledger_tool_calls)
-                .await,
-        );
-        results
+        let Some(run_control) = state.run_control.as_ref() else {
+            let mut blocked = self.edge_action_blocked_results(
+                &ledger_tool_calls,
+                "action_admission_unavailable",
+                "Durable action authority is unavailable; the tool was not executed.",
+            );
+            results.append(&mut blocked);
+            return AdmittedToolCallOutcome {
+                results,
+                control: AdmittedToolCallControl::FailedClosed,
+            };
+        };
+        let Some(expected_owner_generation) = state.current_run_owner_generation else {
+            let mut blocked = self.edge_action_blocked_results(
+                &ledger_tool_calls,
+                "action_admission_unavailable",
+                "Durable run owner generation is unavailable; the tool was not executed.",
+            );
+            results.append(&mut blocked);
+            return AdmittedToolCallOutcome {
+                results,
+                control: AdmittedToolCallControl::FailedClosed,
+            };
+        };
+        let action_context = EdgeActionAdmissionContext {
+            run_control: run_control.clone(),
+            user_id: state
+                .context_manifest_user_id
+                .clone()
+                .unwrap_or_else(|| self.user_id.clone()),
+            run_id: run_id.to_string(),
+            control_cursor: state.user_intents.user_intent_cursor(),
+            expected_control_epoch: i64::try_from(state.user_intents.user_intent_cursor())
+                .unwrap_or(i64::MAX),
+            expected_owner_generation,
+            session_turn: state.session_turn,
+            llm_round: state
+                .turn_event_buffer
+                .as_ref()
+                .map(|buffer| buffer.current_round())
+                .unwrap_or_default(),
+        };
+        let mut delivered =
+            // Selection already happened above and includes both ordinary
+            // EdgeBound calls and client-owned pipeline calls. Re-running the
+            // EdgeBound-only selector here would silently discard the latter.
+            self.deliver_edge_tools_via_ledger(
+                run_id,
+                turn_chain_id,
+                &ledger_tool_calls,
+                &action_context,
+            )
+                .await;
+        for result in &mut delivered.results {
+            let fields = result.tool_result_fields.get_or_insert_with(Map::new);
+            // The client cannot self-assert this route. It is derived from the
+            // exact call set selected above, after callback identity has been
+            // admitted by the ledger.
+            fields.remove(crate::turn::headless_tool_pipeline::EDGE_RESULT_EXECUTION_ROUTE_FIELD);
+            if client_pipeline_call_ids.contains(&result.request_id) {
+                fields.insert(
+                    crate::turn::headless_tool_pipeline::EDGE_RESULT_EXECUTION_ROUTE_FIELD
+                        .to_string(),
+                    Value::String(
+                        crate::turn::headless_tool_pipeline::EDGE_RESULT_CLIENT_PIPELINE_ROUTE
+                            .to_string(),
+                    ),
+                );
+            }
+        }
+        results.append(&mut delivered.results);
+        AdmittedToolCallOutcome {
+            results,
+            control: delivered.control,
+        }
+    }
+
+    fn client_pipeline_tool_calls(
+        &self,
+        state: &AgenticLoopState,
+        tool_calls: &[Value],
+    ) -> Vec<Value> {
+        if !self.has_client_tool_delivery_lane() {
+            return Vec::new();
+        }
+        tool_calls
+            .iter()
+            .filter(|tool_call| {
+                let Some(name) = astra_turn_core::tool::args::shape::tool_call_name(tool_call)
+                else {
+                    return false;
+                };
+                if !is_turn_pipeline_tool(name) || !self.runtime_declared_tool_names.contains(name)
+                {
+                    return false;
+                }
+                // With no server resolver, the connected client is the only
+                // possible pipeline owner (legacy clients included). When both
+                // catalogs exist, route only calls whose exact target the
+                // client advertised; do not choose by prompt text.
+                if state.skills.resolver.is_none() {
+                    return true;
+                }
+                if name.eq_ignore_ascii_case(crate::turn::skill_tool::DISCOVER_SKILLS_TOOL_NAME) {
+                    return !state.skills.client_pipeline_skill_names.is_empty();
+                }
+                crate::turn::skill_tool::extract_skill_name(tool_call).is_some_and(|target| {
+                    state
+                        .skills
+                        .client_pipeline_skill_names
+                        .contains(&target.trim().to_ascii_lowercase())
+                })
+            })
+            .cloned()
+            .collect()
     }
 
     fn edge_ledger_tool_calls_for_delivery(&self, tool_calls: &[Value]) -> Vec<Value> {
@@ -3896,16 +7772,448 @@ impl ServerAgenticLoopHost {
             .collect()
     }
 
+    fn edge_action_id(
+        context: &EdgeActionAdmissionContext,
+        tool_call: &Value,
+    ) -> Result<String, String> {
+        use sha2::{Digest, Sha256};
+
+        let call_id = tool_call
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| "edge action admission requires a non-empty call id".to_string())?;
+        let identity = astra_core::canonical_json_string(&json!({
+            "session_turn": context.session_turn,
+            "round": context.llm_round,
+            "call_id": call_id,
+        }));
+        Ok(format!(
+            "turn:{}:round:{}:edge:{:x}",
+            context.session_turn,
+            context.llm_round,
+            Sha256::digest(identity.as_bytes())
+        ))
+    }
+
+    async fn wait_for_edge_guidance(context: &EdgeActionAdmissionContext) -> Result<(), String> {
+        loop {
+            let poll = context
+                .run_control
+                .poll_user_intents(&context.user_id, &context.run_id, context.control_cursor)
+                .await;
+            if let Some(error) = poll.error {
+                return Err(format!(
+                    "durable guidance lookup failed while approval was pending: {error}"
+                ));
+            }
+            if !poll.inputs.is_empty() || !poll.issues.is_empty() {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    async fn load_shared_edge_approval(&self, tool_call: &Value) -> Result<Option<Value>, String> {
+        let Some(sink) = self.interaction_sink.as_ref() else {
+            return Ok(None);
+        };
+        let Some(context) = self.approval_audit_context.as_ref() else {
+            return Err("shared approval polling requires durable run identity".to_string());
+        };
+        let (request_id, tool_name, _) =
+            astra_turn_core::headless_tool_assembly::parse_flat_tool_call_event(tool_call);
+        if request_id.trim().is_empty() || tool_name.trim().is_empty() {
+            return Err("shared approval polling requires exact tool identity".to_string());
+        }
+        let Some(event) = sink.load_edge_approval_resolution(&request_id).await? else {
+            return Ok(None);
+        };
+        let data = event.get("data").unwrap_or(&event);
+        if data.get("request_id").and_then(Value::as_str) != Some(request_id.as_str())
+            || data.get("tool").and_then(Value::as_str) != Some(tool_name.as_str())
+        {
+            return Err(format!(
+                "shared approval resolution did not match request {request_id} tool {tool_name}"
+            ));
+        }
+        let decision = data
+            .get("decision")
+            .and_then(Value::as_str)
+            .filter(|decision| matches!(*decision, "allow" | "allow_session" | "deny"))
+            .ok_or_else(|| {
+                format!("shared approval resolution {request_id} has invalid decision")
+            })?;
+        if data
+            .pointer("/_durable_resolution/disposition")
+            .and_then(Value::as_str)
+            != Some("resumed")
+        {
+            return Err(format!(
+                "shared approval resolution {request_id} was recorded without durable resume authority"
+            ));
+        }
+        let approval_kind = data
+            .get("approval_kind")
+            .and_then(Value::as_str)
+            .filter(|kind| matches!(*kind, "standard" | "explicit"))
+            .ok_or_else(|| {
+                format!("shared approval resolution {request_id} has invalid approval kind")
+            })?;
+        Ok(Some(json!({
+            "kind": "approval_respond",
+            "body": {
+                "request_id": request_id,
+                "decision": decision,
+                "reason": data.get("reason").cloned().unwrap_or(Value::Null),
+                "session_id": context.session_id,
+                "run_id": context.run_id,
+                "tool_name": tool_name,
+                "approval_kind": approval_kind,
+            }
+        })))
+    }
+
+    async fn wait_for_shared_edge_approval(&self, tool_call: &Value) -> Result<Value, String> {
+        if !self
+            .interaction_sink
+            .as_ref()
+            .is_some_and(|sink| sink.has_shared_edge_approval_authority())
+        {
+            return std::future::pending::<Result<Value, String>>().await;
+        }
+        let mut poll_interval = Duration::from_millis(100);
+        let max_poll_interval = Duration::from_secs(1);
+        loop {
+            if let Some(entry) = self.load_shared_edge_approval(tool_call).await? {
+                return Ok(entry);
+            }
+            tokio::time::sleep(poll_interval).await;
+            poll_interval = poll_interval.saturating_mul(2).min(max_poll_interval);
+        }
+    }
+
+    async fn classify_shared_edge_approval(
+        &self,
+        tool_call: &Value,
+        entry: Value,
+    ) -> EdgeApprovalWait {
+        use astra_turn_core::cloud_tool_delivery::wait_approval_ledger_for_tool;
+
+        let context = self.approval_audit_context.as_ref();
+        let key = context
+            .map(|context| {
+                astra_turn_core::edge_ledger::approval_callback_key(
+                    &self.user_id,
+                    &context.session_id,
+                    &context.run_id,
+                    tool_call.get("id").and_then(Value::as_str).unwrap_or(""),
+                )
+            })
+            .unwrap_or_default();
+        let replay_ledger = Arc::new(tokio::sync::Mutex::new(HashMap::from([(key, entry)])));
+        match wait_approval_ledger_for_tool(
+            &replay_ledger,
+            &self.user_id,
+            tool_call,
+            Duration::ZERO,
+            context,
+        )
+        .await
+        {
+            Ok(()) => EdgeApprovalWait::Allowed,
+            Err(denied) => EdgeApprovalWait::Denied(denied),
+        }
+    }
+
+    async fn wait_edge_approval_or_guidance(
+        &self,
+        context: &EdgeActionAdmissionContext,
+        tool_call: &Value,
+        ledger_wait: Duration,
+    ) -> EdgeApprovalWait {
+        use astra_turn_core::cloud_tool_delivery::wait_approval_ledger_for_tool;
+
+        let approval = wait_approval_ledger_for_tool(
+            &self.edge_callback_ledger,
+            &self.user_id,
+            tool_call,
+            ledger_wait,
+            self.approval_audit_context.as_ref(),
+        );
+        tokio::pin!(approval);
+        let approval_deadline = tokio::time::sleep(ledger_wait);
+        tokio::pin!(approval_deadline);
+        let shared_approval = self.wait_for_shared_edge_approval(tool_call);
+        tokio::pin!(shared_approval);
+        let guidance = Self::wait_for_edge_guidance(context);
+        tokio::pin!(guidance);
+        let client_cancel = self.client_cancel_token.clone();
+        let cancelled = async move {
+            match client_cancel {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(cancelled);
+        tokio::select! {
+            biased;
+            () = &mut cancelled => EdgeApprovalWait::Cancelled,
+            guidance = &mut guidance => match guidance {
+                Ok(()) => EdgeApprovalWait::Superseded,
+                Err(error) => EdgeApprovalWait::FailedClosed(error),
+            },
+            shared = &mut shared_approval => match shared {
+                Ok(entry) => self.classify_shared_edge_approval(tool_call, entry).await,
+                Err(error) => EdgeApprovalWait::FailedClosed(error),
+            },
+            approval = &mut approval => match approval {
+                local => {
+                    if !self
+                        .interaction_sink
+                        .as_ref()
+                        .is_some_and(|sink| sink.has_shared_edge_approval_authority())
+                    {
+                        match local {
+                            Ok(()) => EdgeApprovalWait::Allowed,
+                            Err(denied) => EdgeApprovalWait::Denied(denied),
+                        }
+                    } else {
+                        // A local callback is only a latency hint. Its final
+                        // shared-authority read must remain inside the same
+                        // cancellation/deadline fence as the original wait;
+                        // a half-open database connection must not make Ctrl+C
+                        // or the bounded approval timeout ineffective.
+                        // A local receipt is only proof that this process saw a
+                        // callback.  It is not proof that a fresh database read
+                        // can already observe the callback's committed durable
+                        // decision: a replica/read-after-write delay must not
+                        // turn an accepted approval into a terminal failure.
+                        // Keep polling the shared authority, under the original
+                        // cancellation and deadline fence, exactly as we do
+                        // when no local receipt arrives.
+                        tokio::select! {
+                            biased;
+                            () = &mut cancelled => EdgeApprovalWait::Cancelled,
+                            guidance = &mut guidance => match guidance {
+                                Ok(()) => EdgeApprovalWait::Superseded,
+                                Err(error) => EdgeApprovalWait::FailedClosed(error),
+                            },
+                            () = &mut approval_deadline => match local {
+                                Err(denied) if edge_tool_delivery_timed_out(&denied) => {
+                                    EdgeApprovalWait::Denied(denied)
+                                }
+                                _ => EdgeApprovalWait::FailedClosed(
+                                    "shared durable approval resolution did not arrive before the approval deadline"
+                                        .to_string(),
+                                ),
+                            },
+                            shared = &mut shared_approval => match shared {
+                                Ok(entry) => self.classify_shared_edge_approval(tool_call, entry).await,
+                                Err(error) => EdgeApprovalWait::FailedClosed(error),
+                            },
+                        }
+                    }
+                }
+            },
+        }
+    }
+
+    async fn close_edge_approvals_superseded_by_guidance(
+        &self,
+        tool_calls: &[&Value],
+    ) -> Result<(), String> {
+        let Some(sink) = self.interaction_sink.as_ref() else {
+            // Direct host tests can use an in-process event channel without a
+            // durable interaction. There is nothing durable to close there.
+            return Ok(());
+        };
+        let mut failures = Vec::new();
+        for tool_call in tool_calls {
+            if !astra_turn_core::cloud_tool_delivery::cloud_tool_requires_approval_for_delivery(
+                tool_call,
+            ) {
+                continue;
+            }
+            let (request_id, tool_name, _) =
+                astra_turn_core::headless_tool_assembly::parse_flat_tool_call_event(tool_call);
+            if let Err(error) = sink
+                .resolve_superseded_approval(&request_id, &tool_name)
+                .await
+            {
+                failures.push(format!("{request_id}: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "superseded approval could not be closed durably: {}",
+                failures.join("; ")
+            ))
+        }
+    }
+
+    async fn close_unstarted_edge_approvals(
+        &self,
+        tool_calls: &[Value],
+        started_call_ids: &HashSet<String>,
+        reason: &str,
+    ) -> Result<(), String> {
+        let Some(sink) = self.interaction_sink.as_ref() else {
+            return Ok(());
+        };
+        let mut failures = Vec::new();
+        for tool_call in tool_calls {
+            if !astra_turn_core::cloud_tool_delivery::cloud_tool_requires_approval_for_delivery(
+                tool_call,
+            ) {
+                continue;
+            }
+            let (request_id, tool_name, _) =
+                astra_turn_core::headless_tool_assembly::parse_flat_tool_call_event(tool_call);
+            if started_call_ids.contains(&request_id) {
+                continue;
+            }
+            match sink.load_edge_approval_resolution(&request_id).await {
+                Ok(Some(_)) => continue,
+                Ok(None) => {}
+                Err(error) => {
+                    failures.push(format!("{request_id}: resolution lookup failed: {error}"));
+                    continue;
+                }
+            }
+            if let Err(error) = sink
+                .resolve_edge_approval(&request_id, &tool_name, false, Some(reason))
+                .await
+            {
+                failures.push(format!("{request_id}: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "unstarted approvals could not be closed durably: {}",
+                failures.join("; ")
+            ))
+        }
+    }
+
+    async fn resolve_completed_edge_approval(
+        &self,
+        request_id: &str,
+        tool_name: &str,
+        approved: bool,
+        reason: Option<&str>,
+    ) -> Result<(), String> {
+        let Some(sink) = self.interaction_sink.as_ref() else {
+            // Direct in-process hosts have no durable run wait to release.
+            return Ok(());
+        };
+        sink.resolve_edge_approval(request_id, tool_name, approved, reason)
+            .await
+    }
+
+    fn edge_action_blocked_results(
+        &mut self,
+        tool_calls: &[Value],
+        error_kind: &str,
+        reason: &str,
+    ) -> Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult> {
+        use astra_turn_core::headless_tool_assembly::parse_flat_tool_call_event;
+        use astra_turn_core::sse_stream_host::EdgeToolExecResult;
+        use astra_turn_core::stream_events::build_tool_call_end_event;
+
+        tool_calls
+            .iter()
+            .map(|tool_call| {
+                let (request_id, tool_name, args) = parse_flat_tool_call_event(tool_call);
+                let retryable = !matches!(
+                    error_kind,
+                    "action_superseded" | "execution_time_budget_exhausted"
+                );
+                let result = json!({
+                    "status": "blocked",
+                    "error_kind": error_kind,
+                    "retryable": retryable,
+                    "advisory": {"executed": false},
+                    "output": reason,
+                });
+                self.emit_progress_event(Value::Object(build_tool_call_end_event(
+                    &request_id,
+                    result,
+                )));
+                let mut fields =
+                    self.edge_result_fields_with_runtime(&request_id, &tool_name, &args, None);
+                fields.insert(
+                    "error_kind".to_string(),
+                    Value::String(error_kind.to_string()),
+                );
+                fields.insert("retryable".to_string(), Value::Bool(retryable));
+                fields.insert("executed".to_string(), Value::Bool(false));
+                EdgeToolExecResult {
+                    request_id,
+                    tool: tool_name,
+                    args,
+                    output: reason.to_string(),
+                    tool_result_fields: Some(fields),
+                    status: "blocked".to_string(),
+                    duration_ms: 0,
+                }
+            })
+            .collect()
+    }
+
+    fn edge_action_outcome_unknown_result(
+        &mut self,
+        tool_call: &Value,
+    ) -> astra_turn_core::sse_stream_host::EdgeToolExecResult {
+        use astra_turn_core::headless_tool_assembly::parse_flat_tool_call_event;
+        use astra_turn_core::sse_stream_host::EdgeToolExecResult;
+        use astra_turn_core::stream_events::build_tool_call_end_event;
+
+        let (request_id, tool_name, args) = parse_flat_tool_call_event(tool_call);
+        let output = "This tool request was durably committed before recovery, but no result or active callback custody could be proven. It was not dispatched again because doing so could repeat a side effect.";
+        self.emit_progress_event(Value::Object(build_tool_call_end_event(
+            &request_id,
+            json!({
+                "status": "unknown",
+                "error_kind": "action_outcome_unknown",
+                "retryable": false,
+                "advisory": {"executed": Value::Null},
+                "output": output,
+            }),
+        )));
+        let mut fields = self.edge_result_fields_with_runtime(&request_id, &tool_name, &args, None);
+        fields.insert(
+            "error_kind".to_string(),
+            Value::String("action_outcome_unknown".to_string()),
+        );
+        fields.insert("retryable".to_string(), Value::Bool(false));
+        fields.insert("executed".to_string(), Value::Null);
+        EdgeToolExecResult {
+            request_id,
+            tool: tool_name,
+            args,
+            output: output.to_string(),
+            tool_result_fields: Some(fields),
+            status: "unknown".to_string(),
+            duration_ms: 0,
+        }
+    }
+
     async fn deliver_edge_tools_via_ledger(
         &mut self,
         run_id: &str,
         turn_chain_id: &str,
         tool_calls: &[Value],
-    ) -> Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult> {
+        action_context: &EdgeActionAdmissionContext,
+    ) -> AdmittedToolCallOutcome {
         use astra_turn_core::cloud_tool_delivery::{
             cloud_tool_requires_approval_for_delivery, collect_approval_batches,
-            local_tool_execution_delivery, sse_maps_through_tool_request,
-            wait_approval_ledger_for_tool,
+            sse_maps_through_tool_request,
         };
         use astra_turn_core::edge_ledger::{expect_ledger_entry, tool_callback_key};
         use astra_turn_core::headless_tool_assembly::parse_flat_tool_call_event;
@@ -3916,12 +8224,55 @@ impl ServerAgenticLoopHost {
         };
         use std::collections::HashMap;
 
-        // 5-minute timeout: web clients may execute long-running tools.
-        let ledger_wait = std::time::Duration::from_secs(300);
+        // Approval is a distinct user-interaction wait. Tool execution
+        // deadlines are derived per invocation below.
+        let approval_wait = Duration::from_secs(300);
         let mut results_by_id: HashMap<String, EdgeToolExecResult> = HashMap::new();
-        let ordered_tool_calls =
-            self.object_tool_calls_with_ids("deliver_edge_bound_tools_via_ledger", tool_calls);
+        let ordered_tool_calls = match self.canonical_provider_tool_calls(tool_calls) {
+            Ok(tool_calls) => tool_calls,
+            Err(error) => {
+                tracing::error!(
+                    target: "astra::tool_admission",
+                    session_id = %self.session_id,
+                    user_id = %self.user_id,
+                    error = %error,
+                    "refusing malformed admitted provider tool batch before ledger mutation"
+                );
+                return AdmittedToolCallOutcome {
+                    results: Vec::new(),
+                    control: AdmittedToolCallControl::FailedClosed,
+                };
+            }
+        };
+        let selected_edge_agent_id = match self.selected_edge_ledger_executor_id() {
+            Ok(edge_agent_id) => edge_agent_id.to_string(),
+            Err(error) => {
+                let results = self.edge_action_blocked_results(
+                    &ordered_tool_calls,
+                    "edge_executor_custody_missing",
+                    &error,
+                );
+                return AdmittedToolCallOutcome {
+                    results,
+                    control: AdmittedToolCallControl::FailedClosed,
+                };
+            }
+        };
         let mut tool_calls = Vec::with_capacity(ordered_tool_calls.len());
+        // An explicit request-level Auto mode is the non-interactive approval
+        // policy used by CLI `-y`/bypass runs.  Dynamic children inherit this
+        // mode from the parent (see the server lifecycle wiring), so edge
+        // mutations must not enter a user approval wait that has no UI owner.
+        // Keep the guarded tool-request/callback protocol below intact; only
+        // the optional human approval phase is elided.
+        let effective_interaction_mode = self.turn_interaction_mode();
+        let auto_approve_edge_actions = effective_interaction_mode == TurnInteractionMode::Auto;
+        let deny_edge_actions = matches!(
+            effective_interaction_mode,
+            TurnInteractionMode::Deny
+                | TurnInteractionMode::NonInteractive
+                | TurnInteractionMode::Headless
+        );
 
         for tc in ordered_tool_calls.iter() {
             let (request_id, tool_name, args) = parse_flat_tool_call_event(tc);
@@ -3970,9 +8321,51 @@ impl ServerAgenticLoopHost {
             );
         }
 
-        for batch in collect_approval_batches(&tool_calls) {
-            let event = if batch.items.len() == 1 {
-                let item = &batch.items[0];
+        if deny_edge_actions {
+            let denied_calls = tool_calls
+                .iter()
+                .filter(|call| cloud_tool_requires_approval_for_delivery(call))
+                .cloned()
+                .collect::<Vec<_>>();
+            for result in self.edge_action_blocked_results(
+                &denied_calls,
+                "permission_denied",
+                "The tool was not executed because this run does not allow interactive approval.",
+            ) {
+                results_by_id.insert(result.request_id.clone(), result);
+            }
+            tool_calls.retain(|call| !cloud_tool_requires_approval_for_delivery(call));
+        }
+
+        let indices = (0..tool_calls.len())
+            .map(astra_turn_core::headless_tool_assembly::HeadlessRoundToolIdx::ServerToolCall)
+            .collect::<Vec<_>>();
+        let batches = crate::turn::agentic::headless_round::
+            partition_tool_batches_with_provider_policy_and_serial_gate(
+                &indices,
+                &tool_calls,
+                |_| None,
+                cloud_tool_requires_approval_for_delivery,
+            );
+        let mut control = AdmittedToolCallControl::Continue;
+        let mut started_call_ids = HashSet::new();
+
+        // Registration is a durable truth phase, not an execution phase.
+        // Persist and expose every approval item from the canonical provider
+        // batch before waiting for any sibling result. This lets an earlier
+        // read-only segment dispatch immediately while later writes are
+        // already actionable in the UI.
+        let approval_items = if auto_approve_edge_actions {
+            Vec::new()
+        } else {
+            collect_approval_batches(&tool_calls)
+                .into_iter()
+                .flat_map(|batch| batch.items)
+                .collect::<Vec<_>>()
+        };
+        if !approval_items.is_empty() {
+            let event = if approval_items.len() == 1 {
+                let item = &approval_items[0];
                 Value::Object(build_approval_required_event(
                     &item.request_id,
                     &item.tool_name,
@@ -3982,8 +8375,7 @@ impl ServerAgenticLoopHost {
                     item.display_label.as_deref(),
                 ))
             } else {
-                let requests = batch
-                    .items
+                let requests = approval_items
                     .iter()
                     .map(|item| ApprovalBatchRequestEvent {
                         request_id: &item.request_id,
@@ -3996,71 +8388,183 @@ impl ServerAgenticLoopHost {
                     .collect::<Vec<_>>();
                 Value::Object(build_approval_batch_required_event(&requests))
             };
-            if let Err(error) = self.emit_committed_interaction(event).await {
-                tracing::error!(
-                    target: "astra_runtime::server_loop_host",
-                    run_id,
-                    error = %error,
-                    "approval interaction could not be committed and delivered"
+            if let Err(error) = self
+                .emit_committed_approval_batch(
+                    event,
+                    action_context.expected_control_epoch,
+                    action_context.expected_owner_generation,
+                )
+                .await
+            {
+                let cleanup_error = self
+                    .close_unstarted_edge_approvals(
+                        &tool_calls,
+                        &started_call_ids,
+                        "approval batch registration did not return authoritative success",
+                    )
+                    .await
+                    .err();
+                let failure = cleanup_error.map_or_else(
+                    || format!("Approval request delivery failed: {error}"),
+                    |cleanup_error| {
+                        format!(
+                            "Approval request delivery failed: {error}; durable cleanup needs recovery: {cleanup_error}"
+                        )
+                    },
                 );
-                for item in &batch.items {
-                    let (_, _, args) = parse_flat_tool_call_event(&item.tool_call);
-                    results_by_id.insert(
-                        item.request_id.clone(),
-                        EdgeToolExecResult {
-                            request_id: item.request_id.clone(),
-                            tool: item.tool_name.clone(),
-                            args: args.clone(),
-                            output: format!("Approval request delivery failed: {error}"),
-                            tool_result_fields: Some(self.edge_result_fields_with_runtime(
-                                &item.request_id,
-                                &item.tool_name,
-                                &args,
-                                None,
-                            )),
-                            status: "error".to_string(),
-                            duration_ms: 0,
-                        },
-                    );
+                for result in self.edge_action_blocked_results(
+                    &tool_calls,
+                    "approval_delivery_failed",
+                    &failure,
+                ) {
+                    results_by_id.insert(result.request_id.clone(), result);
                 }
+                return AdmittedToolCallOutcome {
+                    results: ordered_tool_calls
+                        .iter()
+                        .filter_map(|call| {
+                            let (id, _, _) = parse_flat_tool_call_event(call);
+                            results_by_id.remove(&id)
+                        })
+                        .collect(),
+                    control: AdmittedToolCallControl::FailedClosed,
+                };
             }
         }
 
-        let mut block_start = 0;
-        while block_start < tool_calls.len() {
-            let approval_required =
-                cloud_tool_requires_approval_for_delivery(&tool_calls[block_start]);
-            let mut block_end = block_start + 1;
-            while block_end < tool_calls.len()
-                && cloud_tool_requires_approval_for_delivery(&tool_calls[block_end])
-                    == approval_required
-            {
-                block_end += 1;
+        'batches: for batch in batches {
+            let batch_indices = match batch {
+                crate::turn::agentic::headless_round::ToolBatch::Concurrent(indices) => indices,
+                crate::turn::agentic::headless_round::ToolBatch::Serial(index) => vec![index],
+            };
+            let batch_calls = batch_indices
+                .iter()
+                .filter_map(|index| {
+                    match index {
+                    astra_turn_core::headless_tool_assembly::HeadlessRoundToolIdx::ServerToolCall(
+                        index,
+                    ) => tool_calls.get(*index),
+                    astra_turn_core::headless_tool_assembly::HeadlessRoundToolIdx::SyntheticEdge(
+                        _,
+                    ) => None,
+                }
+                })
+                .collect::<Vec<_>>();
+            if batch_calls.is_empty() {
+                continue;
             }
 
-            let block = &tool_calls[block_start..block_end];
-            let mut executable_calls = Vec::new();
-            if approval_required {
-                for tc in block {
-                    if !tc.is_object() {
-                        continue;
+            let mut executable_calls = Vec::with_capacity(batch_calls.len());
+            for tc in &batch_calls {
+                let (request_id, tool_name, args) = parse_flat_tool_call_event(tc);
+                if results_by_id.contains_key(&request_id) {
+                    continue;
+                }
+                if auto_approve_edge_actions || !cloud_tool_requires_approval_for_delivery(tc) {
+                    executable_calls.push(*tc);
+                    continue;
+                }
+                let Some(effective_approval_wait) = self.clamp_execution_timeout(approval_wait)
+                else {
+                    let remaining = tool_calls
+                        .iter()
+                        .filter(|call| {
+                            let (id, _, _) = parse_flat_tool_call_event(call);
+                            !results_by_id.contains_key(&id)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for result in self.edge_action_blocked_results(
+                        &remaining,
+                        "execution_time_budget_exhausted",
+                        "The run wall-clock budget expired before approval; the tool was not executed.",
+                    ) {
+                        results_by_id.insert(result.request_id.clone(), result);
                     }
-                    let (request_id, tool_name, args) = parse_flat_tool_call_event(tc);
-                    if results_by_id.contains_key(&request_id) {
-                        continue;
+                    control = AdmittedToolCallControl::FailedClosed;
+                    break 'batches;
+                };
+                if let Some(sink) = self.interaction_sink.as_ref()
+                    && let Err(error) = sink
+                        .begin_edge_approval_wait(
+                            &request_id,
+                            action_context.expected_control_epoch,
+                            action_context.expected_owner_generation,
+                        )
+                        .await
+                {
+                    let remaining = tool_calls
+                        .iter()
+                        .filter(|call| {
+                            let (id, _, _) = parse_flat_tool_call_event(call);
+                            !results_by_id.contains_key(&id)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for result in self.edge_action_blocked_results(
+                        &remaining,
+                        "approval_frontier_failed",
+                        &format!("Approval execution frontier could not be opened: {error}"),
+                    ) {
+                        results_by_id.insert(result.request_id.clone(), result);
                     }
-                    if let Err(denied) = wait_approval_ledger_for_tool(
-                        &self.edge_callback_ledger,
-                        &self.user_id,
-                        tc,
-                        ledger_wait,
-                        self.approval_audit_context.as_ref(),
-                    )
+                    control = AdmittedToolCallControl::FailedClosed;
+                    break 'batches;
+                }
+                match self
+                    .wait_edge_approval_or_guidance(action_context, tc, effective_approval_wait)
                     .await
-                    {
-                        for m in denied.sse_maps {
-                            self.emit_progress_event(Value::Object(m));
+                {
+                    EdgeApprovalWait::Allowed => {
+                        if let Err(error) = self
+                            .resolve_completed_edge_approval(&request_id, &tool_name, true, None)
+                            .await
+                        {
+                            let remaining = tool_calls
+                                .iter()
+                                .filter(|call| {
+                                    let (id, _, _) = parse_flat_tool_call_event(call);
+                                    !results_by_id.contains_key(&id)
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            for result in self.edge_action_blocked_results(
+                                &remaining,
+                                "approval_resolution_failed",
+                                &format!(
+                                    "Approval was received but its durable run wait could not be released: {error}"
+                                ),
+                            ) {
+                                results_by_id.insert(result.request_id.clone(), result);
+                            }
+                            control = AdmittedToolCallControl::FailedClosed;
+                            break 'batches;
                         }
+                        executable_calls.push(*tc)
+                    }
+                    EdgeApprovalWait::Denied(denied) => {
+                        for map in &denied.sse_maps {
+                            self.emit_progress_event(Value::Object(map.clone()));
+                        }
+                        let structured = denied.tool_results.first();
+                        let output = denied
+                            .raw_tool_output(0)
+                            .unwrap_or("approval request did not produce a terminal result")
+                            .to_string();
+                        let resolution_error = self
+                            .resolve_completed_edge_approval(
+                                &request_id,
+                                &tool_name,
+                                false,
+                                Some(&output),
+                            )
+                            .await
+                            .err();
+                        let status = structured
+                            .map(|result| result.status.clone())
+                            .unwrap_or_else(|| "error".to_string());
+                        let fields =
+                            structured.and_then(|result| result.tool_result_fields.clone());
                         results_by_id.insert(
                             request_id.clone(),
                             EdgeToolExecResult {
@@ -4068,143 +8572,484 @@ impl ServerAgenticLoopHost {
                                     &request_id,
                                     &tool_name,
                                     &args,
-                                    None,
+                                    fields,
                                 )),
                                 request_id,
                                 tool: tool_name,
                                 args,
-                                output: "Tool execution denied or timed out".to_string(),
-                                status: "error".to_string(),
+                                output,
+                                status,
                                 duration_ms: 0,
                             },
                         );
-                        continue;
+                        if let Some(error) = resolution_error {
+                            let remaining = tool_calls
+                                .iter()
+                                .filter(|call| {
+                                    let (id, _, _) = parse_flat_tool_call_event(call);
+                                    !results_by_id.contains_key(&id)
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            for result in self.edge_action_blocked_results(
+                                &remaining,
+                                "approval_resolution_failed",
+                                &format!(
+                                    "Approval was denied, but its durable run wait could not be released: {error}"
+                                ),
+                            ) {
+                                results_by_id.insert(result.request_id.clone(), result);
+                            }
+                            control = AdmittedToolCallControl::FailedClosed;
+                            break 'batches;
+                        }
                     }
-                    executable_calls.push(tc);
+                    EdgeApprovalWait::Superseded => {
+                        let close_error = self
+                            .close_edge_approvals_superseded_by_guidance(&batch_calls)
+                            .await
+                            .err();
+                        let reason = close_error.map_or_else(
+                            || {
+                                "Newer user guidance superseded this pending action; the tool was not executed."
+                                    .to_string()
+                            },
+                            |error| {
+                                format!(
+                                    "Newer user guidance superseded this pending action; execution was denied, but the approval close needs recovery: {error}"
+                                )
+                            },
+                        );
+                        let remaining = tool_calls
+                            .iter()
+                            .filter(|call| {
+                                let (id, _, _) = parse_flat_tool_call_event(call);
+                                !results_by_id.contains_key(&id)
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for result in self.edge_action_blocked_results(
+                            &remaining,
+                            "action_superseded",
+                            &reason,
+                        ) {
+                            results_by_id.insert(result.request_id.clone(), result);
+                        }
+                        control = AdmittedToolCallControl::Superseded;
+                        break 'batches;
+                    }
+                    EdgeApprovalWait::Cancelled => {
+                        let remaining = tool_calls
+                            .iter()
+                            .filter(|call| {
+                                let (id, _, _) = parse_flat_tool_call_event(call);
+                                !results_by_id.contains_key(&id)
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let mut resolution_failures = Vec::new();
+                        for call in &batch_calls {
+                            if !cloud_tool_requires_approval_for_delivery(call) {
+                                continue;
+                            }
+                            let (id, name, _) = parse_flat_tool_call_event(call);
+                            if let Err(error) = self
+                                .resolve_completed_edge_approval(
+                                    &id,
+                                    &name,
+                                    false,
+                                    Some("run cancellation superseded the pending approval"),
+                                )
+                                .await
+                            {
+                                resolution_failures.push(format!("{id}: {error}"));
+                            }
+                        }
+                        let reason = if resolution_failures.is_empty() {
+                            "Run cancellation superseded this pending approval; the tool was not executed."
+                                .to_string()
+                        } else {
+                            format!(
+                                "Run cancellation denied execution, but durable approval closure needs recovery: {}",
+                                resolution_failures.join("; ")
+                            )
+                        };
+                        for result in self.edge_action_blocked_results(
+                            &remaining,
+                            "action_cancelled",
+                            &reason,
+                        ) {
+                            results_by_id.insert(result.request_id.clone(), result);
+                        }
+                        control = AdmittedToolCallControl::FailedClosed;
+                        break 'batches;
+                    }
+                    EdgeApprovalWait::FailedClosed(error) => {
+                        let remaining = tool_calls
+                            .iter()
+                            .filter(|call| {
+                                let (id, _, _) = parse_flat_tool_call_event(call);
+                                !results_by_id.contains_key(&id)
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for result in self.edge_action_blocked_results(
+                            &remaining,
+                            "action_admission_failed",
+                            &format!("Action authority could not be established: {error}"),
+                        ) {
+                            results_by_id.insert(result.request_id.clone(), result);
+                        }
+                        control = AdmittedToolCallControl::FailedClosed;
+                        break 'batches;
+                    }
                 }
-            } else {
-                executable_calls.extend(block.iter());
             }
 
-            // Resolve read-only cache hits before exposing tool requests. A
-            // cached result has no callback consumer; sending it to the edge
-            // would trigger duplicate work and create an unowned result.
-            let mut pending_calls = Vec::with_capacity(executable_calls.len());
+            if executable_calls.is_empty() {
+                continue;
+            }
+
+            // Each call owns its own durable linearization point. Concurrency
+            // is only a scheduling optimization: guidance may commit after A
+            // but before B, in which case A remains started and B plus every
+            // later not-yet-started call is superseded.
+            // Edge owns filesystem freshness. The server must not replay
+            // dynamic read results without an Edge-provided version token;
+            // the headless context cache and the Edge's validated local cache
+            // already provide dedup at boundaries that can prove freshness.
+            let mut delivered_calls = Vec::with_capacity(executable_calls.len());
+            let mut stop_after_started_calls = false;
             for tc in executable_calls {
-                if !tc.is_object() {
-                    continue;
-                }
-                let (id, tool_name, args) = parse_flat_tool_call_event(tc);
-                let is_cacheable = astra_turn_core::parallel_tool_exec::is_read_only_tool_with_args(
-                    &tool_name,
-                    Some(&args),
-                );
-                let sig = if is_cacheable {
-                    Some(
-                        astra_turn_core::tool_result_dedup::CallSignature::from_args(
-                            &tool_name, &args,
-                        ),
-                    )
-                } else {
-                    None
-                };
-                let cached = sig.as_ref().and_then(|s| {
-                    self.tool_result_cache
-                        .lock()
-                        .ok()
-                        .and_then(|mut g| g.lookup(s))
-                });
-                if let Some(output) = cached {
-                    results_by_id.insert(
-                        id.clone(),
-                        EdgeToolExecResult {
-                            request_id: id.clone(),
-                            tool: tool_name.clone(),
-                            args: args.clone(),
-                            output,
-                            tool_result_fields: Some(
-                                self.edge_result_fields_with_runtime(&id, &tool_name, &args, None),
-                            ),
-                            status: "ok".to_string(),
-                            duration_ms: 0,
-                        },
-                    );
-                } else {
-                    pending_calls.push((tc, sig));
-                }
-            }
-
-            // Register every callback before its SSE request is visible. This
-            // makes the exact emitted identity—not session ownership alone—
-            // the authorization boundary for same-process delivery.
-            let mut delivered_calls = Vec::with_capacity(pending_calls.len());
-            for (tc, sig) in pending_calls {
-                let request_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                let (request_id, tool_name, args) = parse_flat_tool_call_event(tc);
                 let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
                     &self.user_id,
                     &self.session_id,
                     run_id,
                     turn_chain_id,
-                    request_id,
+                    &request_id,
                 );
-                let callback_key = tool_callback_key(&identity);
-                expect_ledger_entry(&self.edge_callback_ledger, &callback_key);
-                let mut delivery_error = None;
-                for m in sse_maps_through_tool_request(tc, &identity) {
-                    // L1094 (execute_mock_turn mock-LLM-response path) is the
-                    // SINGLE owner of `tool_call` events per skill invocation.
-                    // `sse_maps_through_tool_request` re-wraps the same tc as
-                    // a `tool_call` map for the tool-dispatch stream, but that
-                    // would produce a duplicate event (same id) downstream.
-                    // Skip any `tool_call` map here — other map types
-                    // (tool_request, etc.) still flow through normally.
-                    // Contract locked by:
-                    //   `skill_invocation_costs_exactly_two_llm_rounds_today`
-                    #[cfg(feature = "bridge-e2e-hooks")]
-                    {
-                        if m.get("type").and_then(|v| v.as_str()) == Some("tool_call") {
-                            continue;
-                        }
+                let command_timeout_cap_ms = self.edge_execution_timeout_ms(&tool_name, &args);
+                let Some(execution_timeout_ms) =
+                    self.clamped_edge_execution_timeout_ms(&tool_name, &args)
+                else {
+                    let remaining = tool_calls
+                        .iter()
+                        .filter(|call| {
+                            let (id, _, _) = parse_flat_tool_call_event(call);
+                            !results_by_id.contains_key(&id) && !started_call_ids.contains(&id)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for result in self.edge_action_blocked_results(
+                        &remaining,
+                        "execution_time_budget_exhausted",
+                        "The run wall-clock budget expired before this tool could start; it was not executed.",
+                    ) {
+                        results_by_id.insert(result.request_id.clone(), result);
                     }
-                    let event = Value::Object(m);
-                    if Self::interaction_event_requires_commit(&event) {
-                        if let Err(error) = self.emit_committed_interaction(event).await {
-                            delivery_error = Some(error);
-                            break;
-                        }
+                    control = AdmittedToolCallControl::FailedClosed;
+                    stop_after_started_calls = true;
+                    break;
+                };
+                let execution_deadline =
+                    Instant::now() + Duration::from_millis(execution_timeout_ms);
+                let execution_deadline_unix_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+                    .saturating_add(u128::from(execution_timeout_ms))
+                    .min(u128::from(u64::MAX))
+                    as u64;
+                let mut progress_events = Vec::new();
+                let mut tool_request_event = None;
+                for event in sse_maps_through_tool_request(
+                    tc,
+                    &identity,
+                    execution_timeout_ms,
+                    execution_deadline_unix_ms,
+                ) {
+                    let event = Value::Object(event);
+                    if event.get("type").and_then(Value::as_str) == Some("tool_request") {
+                        tool_request_event = Some(event);
                     } else {
-                        if let Err(error) = self.try_emit_progress_event(event) {
-                            delivery_error = Some(error);
+                        progress_events.push(event);
+                    }
+                }
+                let Some(tool_request_event) = tool_request_event else {
+                    let remaining = tool_calls
+                        .iter()
+                        .filter(|call| {
+                            let (id, _, _) = parse_flat_tool_call_event(call);
+                            !results_by_id.contains_key(&id) && !started_call_ids.contains(&id)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for result in self.edge_action_blocked_results(
+                        &remaining,
+                        "action_admission_failed",
+                        "Action authority could not be established: tool request projection was missing.",
+                    ) {
+                        results_by_id.insert(result.request_id.clone(), result);
+                    }
+                    control = AdmittedToolCallControl::FailedClosed;
+                    stop_after_started_calls = true;
+                    break;
+                };
+                let mut tool_request_event = tool_request_event;
+                // `execution_timeout_ms` is the Edge delivery deadline and
+                // intentionally includes the settlement grace. Keep the
+                // executor's command cap in a server-authored field, not
+                // the model's `timeout` argument: rewriting that argument
+                // changes explicitness-sensitive tool semantics.
+                if let Some(event) = tool_request_event.as_object_mut() {
+                    event.insert(
+                        "args".to_string(),
+                        Self::with_authoritative_command_timeout_cap(
+                            &tool_name,
+                            &args,
+                            command_timeout_cap_ms,
+                        ),
+                    );
+                }
+                let Some(interaction_sink) = self.interaction_sink.clone() else {
+                    let remaining = tool_calls
+                        .iter()
+                        .filter(|call| {
+                            let (id, _, _) = parse_flat_tool_call_event(call);
+                            !results_by_id.contains_key(&id) && !started_call_ids.contains(&id)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for result in self.edge_action_blocked_results(
+                        &remaining,
+                        "action_admission_failed",
+                        "Action authority could not be established: no durable interaction owner.",
+                    ) {
+                        results_by_id.insert(result.request_id.clone(), result);
+                    }
+                    control = AdmittedToolCallControl::FailedClosed;
+                    stop_after_started_calls = true;
+                    break;
+                };
+                let action_id = match Self::edge_action_id(action_context, tc) {
+                    Ok(action_id) => action_id,
+                    Err(error) => {
+                        let remaining = tool_calls
+                            .iter()
+                            .filter(|call| {
+                                let (id, _, _) = parse_flat_tool_call_event(call);
+                                !results_by_id.contains_key(&id) && !started_call_ids.contains(&id)
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for result in self.edge_action_blocked_results(
+                            &remaining,
+                            "action_admission_failed",
+                            &format!("Action authority could not be established: {error}"),
+                        ) {
+                            results_by_id.insert(result.request_id.clone(), result);
+                        }
+                        control = AdmittedToolCallControl::FailedClosed;
+                        stop_after_started_calls = true;
+                        break;
+                    }
+                };
+                let callback_key = tool_callback_key(&identity);
+                let admission = interaction_sink
+                    .commit_guarded_tool_request(GuardedToolRequestCommit {
+                        action_id,
+                        expected_control_epoch: action_context.expected_control_epoch,
+                        expected_owner_generation: action_context.expected_owner_generation,
+                        event: tool_request_event,
+                    })
+                    .await;
+                let committed_event = match admission {
+                    Ok(
+                        GuardedToolRequestCommitOutcome::Committed { event }
+                        | GuardedToolRequestCommitOutcome::AckRecoveredCommitted { event },
+                    ) => Some(event),
+                    Ok(GuardedToolRequestCommitOutcome::AlreadyCommitted { .. }) => {
+                        // A durable request is not proof that Edge received it.
+                        // Re-projecting without client-side durable dedupe can
+                        // repeat writes or shell commands. Only reattach when
+                        // this process can prove an existing callback waiter or
+                        // result; otherwise close with an explicit unknown
+                        // outcome and leave later calls unstarted.
+                        if self.edge_request_has_custody_or_result(&identity).await {
+                            None
+                        } else {
+                            let unknown = self.edge_action_outcome_unknown_result(tc);
+                            results_by_id.insert(unknown.request_id.clone(), unknown);
+                            let remaining = tool_calls
+                                .iter()
+                                .filter(|call| {
+                                    let (id, _, _) = parse_flat_tool_call_event(call);
+                                    id != request_id
+                                        && !results_by_id.contains_key(&id)
+                                        && !started_call_ids.contains(&id)
+                                })
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            for result in self.edge_action_blocked_results(
+                                &remaining,
+                                "action_admission_failed",
+                                "A preceding tool request has an unknown execution outcome; later actions were not started.",
+                            ) {
+                                results_by_id.insert(result.request_id.clone(), result);
+                            }
+                            control = AdmittedToolCallControl::FailedClosed;
+                            stop_after_started_calls = true;
                             break;
                         }
                     }
-                }
-                if let Some(error) = delivery_error {
-                    astra_turn_core::edge_ledger::cancel_expected_ledger_entry(
-                        &self.edge_callback_ledger,
-                        &callback_key,
-                    );
-                    let (id, tool_name, args) = parse_flat_tool_call_event(tc);
-                    results_by_id.insert(
-                        id.clone(),
-                        EdgeToolExecResult {
-                            request_id: id.clone(),
-                            tool: tool_name.clone(),
-                            args: args.clone(),
-                            output: format!("Tool request delivery failed: {error}"),
-                            tool_result_fields: Some(
-                                self.edge_result_fields_with_runtime(&id, &tool_name, &args, None),
+                    Ok(GuardedToolRequestCommitOutcome::Superseded {
+                        user_intent_event_index,
+                    }) => {
+                        let remaining = tool_calls
+                            .iter()
+                            .filter(|call| {
+                                let (id, _, _) = parse_flat_tool_call_event(call);
+                                !results_by_id.contains_key(&id) && !started_call_ids.contains(&id)
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for result in self.edge_action_blocked_results(
+                            &remaining,
+                            "action_superseded",
+                            &format!(
+                                "Newer user guidance at durable event {user_intent_event_index} superseded this action; the tool was not executed."
                             ),
-                            status: "error".to_string(),
-                            duration_ms: 0,
-                        },
-                    );
-                } else {
-                    delivered_calls.push((tc, sig));
+                        ) {
+                            results_by_id.insert(result.request_id.clone(), result);
+                        }
+                        control = AdmittedToolCallControl::Superseded;
+                        stop_after_started_calls = true;
+                        break;
+                    }
+                    Ok(outcome) => {
+                        let reason = match outcome {
+                            GuardedToolRequestCommitOutcome::Inactive { status } => {
+                                format!("run is {status}; tool request {request_id} cannot start")
+                            }
+                            GuardedToolRequestCommitOutcome::OwnerGenerationMismatch {
+                                actual_owner_generation,
+                            } => format!(
+                                "run ownership moved to generation {actual_owner_generation}; stale tool request {request_id} cannot start"
+                            ),
+                            GuardedToolRequestCommitOutcome::OwnerMismatch {
+                                actual_owner_pod_id,
+                            } => format!(
+                                "run ownership moved to another executor ({actual_owner_pod_id:?}); stale tool request {request_id} cannot start"
+                            ),
+                            GuardedToolRequestCommitOutcome::Missing => {
+                                format!("run is missing; tool request {request_id} cannot start")
+                            }
+                            GuardedToolRequestCommitOutcome::Committed { .. }
+                            | GuardedToolRequestCommitOutcome::AckRecoveredCommitted { .. }
+                            | GuardedToolRequestCommitOutcome::AlreadyCommitted { .. }
+                            | GuardedToolRequestCommitOutcome::Superseded { .. } => unreachable!(),
+                        };
+                        let remaining = tool_calls
+                            .iter()
+                            .filter(|call| {
+                                let (id, _, _) = parse_flat_tool_call_event(call);
+                                !results_by_id.contains_key(&id) && !started_call_ids.contains(&id)
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for result in self.edge_action_blocked_results(
+                            &remaining,
+                            "action_admission_failed",
+                            &format!("Action authority could not be established: {reason}"),
+                        ) {
+                            results_by_id.insert(result.request_id.clone(), result);
+                        }
+                        control = AdmittedToolCallControl::FailedClosed;
+                        stop_after_started_calls = true;
+                        break;
+                    }
+                    Err(error) => {
+                        let remaining = tool_calls
+                            .iter()
+                            .filter(|call| {
+                                let (id, _, _) = parse_flat_tool_call_event(call);
+                                !results_by_id.contains_key(&id) && !started_call_ids.contains(&id)
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for result in self.edge_action_blocked_results(
+                            &remaining,
+                            "action_admission_failed",
+                            &format!("Action authority could not be established: {error}"),
+                        ) {
+                            results_by_id.insert(result.request_id.clone(), result);
+                        }
+                        control = AdmittedToolCallControl::FailedClosed;
+                        stop_after_started_calls = true;
+                        break;
+                    }
+                };
+                if let Err(error) = expect_ledger_entry(
+                    &self.edge_callback_ledger,
+                    &callback_key,
+                    &selected_edge_agent_id,
+                ) {
+                    let remaining = tool_calls
+                        .iter()
+                        .filter(|call| {
+                            let (id, _, _) = parse_flat_tool_call_event(call);
+                            !results_by_id.contains_key(&id) && !started_call_ids.contains(&id)
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for result in self.edge_action_blocked_results(
+                        &remaining,
+                        "edge_executor_custody_conflict",
+                        &format!("Edge callback custody could not be established: {error}"),
+                    ) {
+                        results_by_id.insert(result.request_id.clone(), result);
+                    }
+                    control = AdmittedToolCallControl::FailedClosed;
+                    stop_after_started_calls = true;
+                    break;
                 }
+                started_call_ids.insert(request_id.to_string());
+                if committed_event.is_some() {
+                    for event in progress_events {
+                        // L1094 (execute_mock_turn mock-LLM-response path) is the
+                        // SINGLE owner of `tool_call` events per skill invocation.
+                        // `sse_maps_through_tool_request` re-wraps the same tc as
+                        // a `tool_call` map for the tool-dispatch stream, but that
+                        // would produce a duplicate event (same id) downstream.
+                        // Skip any `tool_call` map here — other map types
+                        // (tool_request, etc.) still flow through normally.
+                        // Contract locked by:
+                        //   `skill_invocation_costs_exactly_two_llm_rounds_today`
+                        #[cfg(feature = "bridge-e2e-hooks")]
+                        {
+                            if event.get("type").and_then(|v| v.as_str()) == Some("tool_call") {
+                                continue;
+                            }
+                        }
+                        let _ = self.try_emit_progress_event(event);
+                    }
+                }
+                if let Some(committed_event) = committed_event
+                    && let Err(error) = self.project_committed_tool_request(committed_event).await
+                {
+                    tracing::warn!(
+                        target: "astra_runtime::server_loop_host",
+                        run_id,
+                        request_id,
+                        error = %error,
+                        "durable tool request projection failed; callback remains recoverable from committed run truth"
+                    );
+                }
+                delivered_calls.push((tc, execution_deadline));
             }
 
-            for (tc, sig) in delivered_calls {
+            for (tc, execution_deadline) in delivered_calls {
                 let (id, tool_name, args) = parse_flat_tool_call_event(tc);
                 let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
                     &self.user_id,
@@ -4215,16 +9060,32 @@ impl ServerAgenticLoopHost {
                 );
                 let started = std::time::Instant::now();
                 let delivery = self
-                    .wait_tool_result_with_dispatch_fallback(tc, &identity, ledger_wait)
+                    .wait_tool_result_with_dispatch_fallback(
+                        tc,
+                        &identity,
+                        &selected_edge_agent_id,
+                        execution_deadline
+                            .saturating_duration_since(Instant::now())
+                            .saturating_add(Duration::from_secs(10)),
+                    )
                     .await;
 
                 let duration_ms = started.elapsed().as_millis() as u64;
                 let delivery_sse_maps = delivery.sse_maps.clone();
+                // Preserve the raw edge observation until the canonical
+                // headless record/model boundary. `tool_messages` is already
+                // a bounded presentation for direct cloud-delivery callers;
+                // ingesting it here would compress twice and discard the only
+                // source from which a session artifact can be created.
                 let output = delivery
-                    .tool_messages
-                    .first()
-                    .and_then(|m| m.get("content"))
-                    .and_then(Value::as_str)
+                    .raw_tool_output(0)
+                    .or_else(|| {
+                        delivery
+                            .tool_messages
+                            .first()
+                            .and_then(|message| message.get("content"))
+                            .and_then(Value::as_str)
+                    })
                     .unwrap_or("")
                     .to_string();
                 let tool_result = delivery.tool_results.first().cloned();
@@ -4232,15 +9093,6 @@ impl ServerAgenticLoopHost {
                     .as_ref()
                     .map(|result| result.status.clone())
                     .unwrap_or_else(|| "unknown".to_string());
-                if let Some(sig_ref) = sig.as_ref() {
-                    let is_err = tool_result
-                        .as_ref()
-                        .and_then(|result| edge_tool_status_exit_code(&result.status))
-                        .is_some_and(|exit_code| exit_code != 0);
-                    if !is_err && let Ok(mut guard) = self.tool_result_cache.lock() {
-                        guard.record(sig_ref.clone(), output.clone());
-                    }
-                }
                 let tool_result_fields = self.edge_result_fields_with_runtime(
                     &id,
                     &tool_name,
@@ -4273,8 +9125,32 @@ impl ServerAgenticLoopHost {
                     },
                 );
             }
+            if stop_after_started_calls {
+                break 'batches;
+            }
+        }
 
-            block_start = block_end;
+        if !matches!(control, AdmittedToolCallControl::Continue) {
+            let reason = match &control {
+                AdmittedToolCallControl::Superseded => {
+                    "newer user guidance superseded the unstarted approval"
+                }
+                AdmittedToolCallControl::FailedClosed => {
+                    "the provider batch stopped before this approved action could start"
+                }
+                AdmittedToolCallControl::Continue => unreachable!(),
+            };
+            if let Err(error) = self
+                .close_unstarted_edge_approvals(&tool_calls, &started_call_ids, reason)
+                .await
+            {
+                tracing::warn!(
+                    target: "astra::tool_admission",
+                    run_id,
+                    error = %error,
+                    "provider batch stopped with unresolved durable approval cleanup debt"
+                );
+            }
         }
 
         let mut results = Vec::with_capacity(ordered_tool_calls.len());
@@ -4292,13 +9168,107 @@ impl ServerAgenticLoopHost {
             }
         }
 
-        results
+        AdmittedToolCallOutcome { results, control }
+    }
+
+    /// Freeze an upper bound for the command execution budget at server
+    /// admission. The command budget is deliberately distinct from the edge callback deadline: a
+    /// timed-out executor still needs a bounded interval to terminate its
+    /// process group, reap descendants, collect partial output, and publish
+    /// the terminal receipt. Reusing this value for the callback deadline
+    /// races the executor's own timeout and turns a command timeout into an
+    /// opaque transport cancellation.
+    fn edge_execution_timeout_ms(&self, tool_name: &str, args: &Value) -> u64 {
+        // A resource policy is a ceiling, not a default duration. Treating a
+        // large deployment ceiling (for example 1800s) as the default made a
+        // normal timeout-omitting Bash/write_file call impossible to admit in
+        // a 900s Terminal-Bench run: there was no way to reserve another 30s
+        // for its receipt. Keep the server's default bounded. Bash refines it
+        // further using its local command-class default behind this cap.
+        const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let request = ToolExecutionRequest {
+            user_id: self.user_id.clone(),
+            run_id: String::new(),
+            turn_chain_id: String::new(),
+            session_id: self.session_id.clone(),
+            tool_call_id: String::new(),
+            tool_name: tool_name.to_string(),
+            args: args.clone(),
+            workspace: self.workspace_binding.clone(),
+            workspace_record: None,
+            executor: self.executor_binding.clone(),
+            runtime: self.runtime_binding.clone(),
+            selected_offer: None,
+            policy: ToolPolicySnapshot::default(),
+            runtime_process_authorization: None,
+            runtime_process_authorization_required: false,
+            runtime_edge_dispatch_authorization: None,
+            runtime_edge_dispatch_authorization_required: false,
+        };
+        let policy_cap_ms = request
+            .runtime_environment_binding(&registry)
+            .policy
+            .resources
+            .max_execution_secs
+            .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+            .map(|seconds| (seconds * 1_000.0).ceil().min(u64::MAX as f64) as u64)
+            .unwrap_or(DEFAULT_TIMEOUT_MS);
+        let requested_ms = args
+            .get("timeout")
+            .and_then(Value::as_f64)
+            .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+            .map(|seconds| (seconds * 1_000.0).ceil().min(u64::MAX as f64) as u64);
+        requested_ms
+            .unwrap_or(DEFAULT_TIMEOUT_MS)
+            .min(policy_cap_ms)
+    }
+
+    fn clamped_edge_execution_timeout_ms(&self, tool_name: &str, args: &Value) -> Option<u64> {
+        const SETTLEMENT_GRACE: Duration = Duration::from_secs(30);
+        let command_timeout =
+            Duration::from_millis(self.edge_execution_timeout_ms(tool_name, args));
+        let deadline = command_timeout.saturating_add(SETTLEMENT_GRACE);
+        let clamped = self.clamp_execution_timeout(deadline)?;
+        // Do not silently shorten the inner command budget when a run is
+        // nearly out of wall time. That reintroduces the timeout-vs-callback
+        // race and can interrupt a side-effecting process mid-transaction.
+        // Refuse admission before execution instead; the caller receives the
+        // existing typed `execution_time_budget_exhausted` result.
+        if clamped < deadline {
+            return None;
+        }
+        u64::try_from(deadline.as_millis())
+            .ok()
+            .filter(|milliseconds| *milliseconds > 0)
+    }
+
+    /// Bash has adaptive local defaults, so it receives a server-authored
+    /// upper bound rather than a fabricated model timeout. Keeping it
+    /// separate preserves explicitness-sensitive tool semantics while letting
+    /// the Edge choose the shorter local default for timeout-omitting calls.
+    fn with_authoritative_command_timeout_cap(
+        tool_name: &str,
+        args: &Value,
+        timeout_cap_ms: u64,
+    ) -> Value {
+        let mut effective = args.clone();
+        if let Some(map) = effective.as_object_mut()
+            && tool_name == "bash"
+        {
+            map.insert(
+                "_astra_command_timeout_cap_ms".to_string(),
+                Value::from(timeout_cap_ms),
+            );
+        }
+        effective
     }
 
     async fn wait_tool_result_with_dispatch_fallback(
         &self,
         tc: &Value,
         identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+        edge_agent_id: &str,
         ledger_wait: Duration,
     ) -> astra_turn_core::cloud_tool_delivery::EdgeToolRoundDelivery {
         use astra_turn_core::cloud_tool_delivery::wait_tool_result_ledger_for_tool_with_cancel;
@@ -4306,6 +9276,7 @@ impl ServerAgenticLoopHost {
 
         let delivery = wait_tool_result_ledger_for_tool_with_cancel(
             &self.edge_callback_ledger,
+            edge_agent_id,
             identity,
             tc,
             ledger_wait,
@@ -4340,8 +9311,22 @@ impl ServerAgenticLoopHost {
             }
         };
 
-        let body =
-            serde_json::from_str::<Value>(&result_json).unwrap_or(Value::String(result_json));
+        let body = match canonical_edge_dispatch_result(identity, edge_agent_id, &result_json) {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::server_loop_host",
+                    user_id = %self.user_id,
+                    session_id = %self.session_id,
+                    run_id = %identity.run_id,
+                    turn_chain_id = %identity.turn_chain_id,
+                    request_id = %identity.request_id,
+                    error = %error,
+                    "edge dispatch fallback rejected a non-canonical durable result"
+                );
+                return delivery;
+            }
+        };
         let key = tool_callback_key(identity);
         {
             let mut ledger = self.edge_callback_ledger.lock().await;
@@ -4359,12 +9344,97 @@ impl ServerAgenticLoopHost {
 
         wait_tool_result_ledger_for_tool_with_cancel(
             &self.edge_callback_ledger,
+            edge_agent_id,
             identity,
             tc,
             Duration::from_millis(0),
             self.client_cancel_token.as_deref(),
         )
         .await
+    }
+
+    /// Prove that an already-committed Edge request still has process-local
+    /// callback custody or a recoverable result. Durable request existence by
+    /// itself is deliberately insufficient: the client does not yet provide
+    /// an exactly-once execution key for arbitrary effectful tools.
+    async fn edge_request_has_custody_or_result(
+        &self,
+        identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+    ) -> bool {
+        use astra_turn_core::edge_ledger::{ledger_entry_is_expected, tool_callback_key};
+
+        let key = tool_callback_key(identity);
+        let Ok(edge_agent_id) = self.selected_edge_ledger_executor_id() else {
+            return false;
+        };
+        let exact_local_result = self
+            .edge_callback_ledger
+            .lock()
+            .await
+            .get(&key)
+            .and_then(|entry| entry.pointer("/body/edge_agent_id"))
+            .and_then(Value::as_str)
+            == Some(edge_agent_id);
+        if exact_local_result
+            || ledger_entry_is_expected(&self.edge_callback_ledger, &key, edge_agent_id)
+        {
+            return true;
+        }
+        let Some(dispatch_service) = &self.edge_dispatch_service else {
+            return false;
+        };
+        match dispatch_service
+            .wait_result(identity, Duration::from_millis(0))
+            .await
+        {
+            Ok(Some(result_json)) => {
+                let body = match canonical_edge_dispatch_result(
+                    identity,
+                    edge_agent_id,
+                    &result_json,
+                ) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "astra_runtime::server_loop_host",
+                            user_id = %self.user_id,
+                            session_id = %self.session_id,
+                            run_id = %identity.run_id,
+                            turn_chain_id = %identity.turn_chain_id,
+                            request_id = %identity.request_id,
+                            error = %error,
+                            "durable Edge result cannot prove custody because its protocol is invalid"
+                        );
+                        return false;
+                    }
+                };
+                self.edge_callback_ledger.lock().await.insert(
+                    key,
+                    json!({
+                        "kind": "tool_result",
+                        "user_id": self.user_id.as_str(),
+                        "session_id": self.session_id.as_str(),
+                        "run_id": identity.run_id.as_str(),
+                        "turn_chain_id": identity.turn_chain_id.as_str(),
+                        "body": body,
+                    }),
+                );
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                tracing::warn!(
+                    target: "astra_runtime::server_loop_host",
+                    user_id = %self.user_id,
+                    session_id = %self.session_id,
+                    run_id = %identity.run_id,
+                    request_id = %identity.request_id,
+                    error = %error,
+                    "could not prove custody or a durable result for an already-committed Edge request"
+                );
+                false
+            }
+        }
     }
 
     fn edge_result_fields_with_runtime(
@@ -4375,6 +9445,9 @@ impl ServerAgenticLoopHost {
         fields: Option<Map<String, Value>>,
     ) -> Map<String, Value> {
         let mut fields = fields.unwrap_or_default();
+        // Execution ownership is server-derived after exact ledger delivery;
+        // never preserve a client-authored assertion of that authority.
+        fields.remove(crate::turn::headless_tool_pipeline::EDGE_RESULT_EXECUTION_ROUTE_FIELD);
         if !fields.contains_key("runtime_environment_advertisement") {
             let registry = astra_runtime_env::ToolRegistry::builtins();
             let request = ToolExecutionRequest {
@@ -4424,13 +9497,15 @@ impl ServerAgenticLoopHost {
         breakdown: &astra_turn_core::context_assembly_trace::SystemPromptBreakdown,
         manifest_trace: Option<&Value>,
         compactions: &[astra_turn_core::chat_turn_sse_dispatch::ContextCompactionObservation],
+        visible_tools: &[Value],
     ) {
         record_server_context_trace_clone(manifest_trace);
         self.emit_progress_event(
-            crate::turn::llm::context::context_meta_event_with_compactions(
+            crate::turn::llm::context::context_meta_event_with_tool_surface(
                 breakdown,
                 manifest_trace,
                 compactions,
+                visible_tools,
             ),
         );
     }
@@ -4516,6 +9591,15 @@ impl ServerAgenticLoopHost {
             &self.tool_schemas,
         );
         append_tool_schemas_unique(&mut snapshot_schemas, self.tool_schemas.clone());
+        append_tool_schemas_unique(
+            &mut snapshot_schemas,
+            clone_server_fork_tool_schemas(&self.last_turn_tool_schemas),
+        );
+        let provider_visible_names = self
+            .last_turn_tool_schemas
+            .iter()
+            .filter_map(tool_schema_name)
+            .collect::<HashSet<_>>();
         let tool_names = snapshot_schemas
             .iter()
             .filter_map(tool_schema_name)
@@ -4527,6 +9611,8 @@ impl ServerAgenticLoopHost {
                 let decision = self.admission_for_current_binding(&name, &registry);
                 astra_turn_core::introspect::ToolAdmissionSnapshotEntry {
                     tool_name: decision.tool_name.clone(),
+                    provider_visible: (!self.last_turn_tool_schemas.is_empty())
+                        .then(|| provider_visible_names.contains(name.as_str())),
                     visible: decision.visible,
                     selected_offer_id: decision.selected_offer_id().map(str::to_string),
                     selected_route: format!("{:?}", decision.selected_route()),
@@ -4557,9 +9643,7 @@ impl ServerAgenticLoopHost {
     }
 
     fn runtime_ready_turn_tools(&self, tools: Vec<Value>, state: &AgenticLoopState) -> Vec<Value> {
-        let Some(executor) = state.runtime_tool_executor.as_deref() else {
-            return tools;
-        };
+        let executor = state.runtime_tool_executor.as_deref();
         let registry = astra_runtime_env::ToolRegistry::builtins();
         tools
             .into_iter()
@@ -4571,6 +9655,9 @@ impl ServerAgenticLoopHost {
                 if !admission.visible {
                     return false;
                 }
+                if let Some(ready) = self.dynamic_service_binding_ready(name, state) {
+                    return ready;
+                }
                 if matches!(
                     tool_execution_class(name, &registry),
                     ToolExecutionClass::TurnPipelineIntercept
@@ -4578,13 +9665,20 @@ impl ServerAgenticLoopHost {
                     return true;
                 }
                 match admission.selected_route() {
-                    ToolExecutionRouteKind::EdgeBound
-                    | ToolExecutionRouteKind::GatewayRelay
-                    | ToolExecutionRouteKind::SandboxResidentAgent
-                    | ToolExecutionRouteKind::ServerControlPlane
+                    ToolExecutionRouteKind::EdgeBound => {
+                        !self.edge_executor_offline_blocks_tool(name)
+                    }
+                    ToolExecutionRouteKind::GatewayRelay
+                    | ToolExecutionRouteKind::SandboxResidentAgent => matches!(
+                        self.executor_binding.status,
+                        crate::server::tool_transport::ExecutorStatus::Online
+                    ),
+                    ToolExecutionRouteKind::ServerControlPlane
                     | ToolExecutionRouteKind::ServerRuntime => true,
                     ToolExecutionRouteKind::ServerLocal
-                    | ToolExecutionRouteKind::RequestScopedMcp => executor.tool_runtime_ready(name),
+                    | ToolExecutionRouteKind::RequestScopedMcp => {
+                        executor.is_some_and(|executor| executor.tool_runtime_ready(name))
+                    }
                     ToolExecutionRouteKind::Unsupported => false,
                 }
             })
@@ -4596,13 +9690,192 @@ impl ServerAgenticLoopHost {
         restricted_tools: &HashSet<String>,
         state: &AgenticLoopState,
     ) -> Vec<Value> {
-        self.runtime_ready_turn_tools(self.filtered_turn_tools(restricted_tools), state)
+        let mut tools = self.filtered_turn_tools(restricted_tools);
+        // Build the candidate Work surface in a stable order, then let typed
+        // runtime readiness remove transitions that cannot execute in the
+        // current role. Work-role tools live in a cache tail, so removing an
+        // unbound settlement operation preserves the stable prefix without
+        // making a false executable promise to the model.
+        let work_lifecycle_bound = self.work_lifecycle_is_bound(state);
+        let work_lifecycle_required = self.work_lifecycle_is_required(state);
+        let deferred_control_plane_surface =
+            self.deferred_work_surface_turn == Some(state.session_turn);
+        let primary_attempt_active = state.runtime_tool_executor.as_deref().is_some_and(
+            crate::server::runtime_tool_executor::RuntimeToolExecutor::has_active_primary_work_attempt,
+        );
+        // Web access is a normal primary-turn capability. A historical Work
+        // binding must not hide it forever after that graph completes: later
+        // one-shot follow-ups are ordinary root turns, while an active primary
+        // attempt is already authorized to use it. Admission still enforces a
+        // newly required/established Work boundary before execution.
+        let stable_primary_web_surface =
+            state.inference_purpose == astra_turn_types::InferencePurpose::PrimaryAgent;
+        let parallel_subruns_requested = !deferred_control_plane_surface
+            && !primary_attempt_active
+            && matches!(
+                self.work_admission_execution_topology,
+                astra_services::WorkExecutionTopology::ParallelSubruns
+            );
+        let parallel_direct_delegation = !primary_attempt_active
+            && matches!(
+                self.pending_work_admission.as_ref(),
+                Some(astra_services::WorkAdmissionDecision::NotRequired {
+                    execution_topology: astra_services::WorkExecutionTopology::ParallelSubruns,
+                    ..
+                })
+            );
+        // A deferred declaration is a durable planning transition only. Do
+        // not promote optional execution capabilities on the follow-up model
+        // request: doing so changes `tools[]` after the synthetic control
+        // plane boundary and needlessly breaks strict provider cache history.
+        let agent_spawner_admitted = !deferred_control_plane_surface
+            && self
+                .work_admission_capabilities
+                .contains(&astra_services::WorkAdmissionCapability::AgentSpawner);
+        let web_admitted = !deferred_control_plane_surface
+            && self
+                .work_admission_capabilities
+                .contains(&astra_services::WorkAdmissionCapability::Web);
+        // A resumed root with canonical Work must not depend on the edge's
+        // generic deferred-tool discovery policy to recover its task board.
+        // The server owns this control plane and has already resolved the
+        // owner/session/branch binding. Promote only typed core continuation
+        // tools here; runtime readiness and the execution-role projection
+        // below still fail closed for an unavailable repository or a
+        // delegated WorkItem attempt.
+        if work_lifecycle_bound {
+            append_bound_work_lifecycle_schemas(
+                &mut tools,
+                &self.admission_tool_schemas,
+                &self.deferred_tool_schemas,
+                restricted_tools,
+                primary_attempt_active,
+            );
+        }
+        // The semantic Work decision may be available before the synthetic
+        // start_work boundary. It controls the admitted web/agent additions;
+        // graph/criteria authoring is already on the stable candidate surface
+        // and is still capability-filtered by the typed role below.
+        if work_lifecycle_bound
+            || work_lifecycle_required
+            || parallel_direct_delegation
+            || agent_spawner_admitted
+        {
+            append_tool_schemas_unique(
+                &mut tools,
+                self.deferred_tool_schemas
+                    .iter()
+                    .filter(|schema| {
+                        tool_schema_name(schema).is_some_and(|name| {
+                            !restricted_tools.contains(name)
+                                && astra_turn_core::tool::registry::meta::tool_meta(name)
+                                    .is_some_and(|meta| {
+                                        (parallel_subruns_requested
+                                            && meta.requires.contains(
+                                                &astra_turn_core::capability::Capability::AgentSpawner,
+                                            ))
+                                        || (web_admitted
+                                            && matches!(name, "web_fetch" | "web_search"))
+                                        || (stable_primary_web_surface
+                                            && matches!(name, "web_fetch" | "web_search"))
+                                        || (agent_spawner_admitted
+                                            && matches!(name, "agent" | "agent_fanout"))
+                                    })
+                        })
+                    })
+                    .cloned()
+                    .collect(),
+            );
+        } else {
+            // Admission is an optimization, not a prerequisite for the
+            // primary model to choose durable Work. Keep the single typed
+            // lifecycle entrypoint visible on every unbound interactive turn;
+            // otherwise the model has no way to recover from a missing or
+            // ignored semantic projection. Core Work planning remains
+            // available from the stable candidate surface; capability and
+            // execution-role filters still decide whether a caller may use it.
+            append_tool_schemas_unique(
+                &mut tools,
+                self.deferred_tool_schemas
+                    .iter()
+                    .filter(|schema| {
+                        tool_schema_name(schema).is_some_and(|name| {
+                            (name == "start_work"
+                                || (stable_primary_web_surface
+                                    && matches!(name, "web_fetch" | "web_search")))
+                                && !restricted_tools.contains(name)
+                        })
+                    })
+                    .cloned()
+                    .collect(),
+            );
+        }
+        // Delegation carriers are stable execution capabilities, not
+        // workspace task escape hatches. Their schemas remain available on a
+        // bound coordinator surface so both a single child and an explicit
+        // fanout can be selected without a discovery round or cache-prefix
+        // change. Typed role/capability admission below remains authoritative.
+        if let Some(executor) = state.runtime_tool_executor.as_deref() {
+            let activated: HashSet<String> = executor
+                .activated_deferred_tool_names()
+                .into_iter()
+                .collect();
+            append_tool_schemas_unique(
+                &mut tools,
+                self.deferred_tool_schemas
+                    .iter()
+                    .filter(|schema| {
+                        tool_schema_name(schema).is_some_and(|name| {
+                            activated.contains(name) && !restricted_tools.contains(name)
+                        })
+                    })
+                    .cloned()
+                    .collect(),
+            );
+        }
+        // A root primary attempt remains the coordinator for its Work. It may
+        // inspect and revision-pin the graph when user guidance changes scope,
+        // while a delegated child remains confined to its assigned item.
+        // Apply the typed role projection after dynamic additions so wire
+        // visibility and terminal admission use the same authority contract.
+        let execution_context =
+            provider_work_execution_context(self.work_item_attempt_bound, primary_attempt_active);
+        if let Some(execution_context) = execution_context {
+            let contracts =
+                BUILTIN_TOOL_CONTRACTS.get_or_init(astra_runtime_env::ToolRegistry::builtins);
+            tools.retain(|schema| {
+                tool_schema_name(schema).is_none_or(|name| {
+                    contracts.permits_work_execution_context(name, execution_context)
+                })
+            });
+        }
+        let mut tools = self.runtime_ready_turn_tools(tools, state);
+        // A provider-visible action is an executable promise.  Expose a new
+        // fanout start only after semantic admission has authoritatively
+        // selected parallel subruns; an unresolved/unavailable judge must not
+        // advertise an action that the terminal gate will reject. Historical
+        // or recovered groups still need their read/cancel carrier, so narrow
+        // the action union instead of deleting the entire tool. Runtime
+        // admission remains the independent forged/stale-call fence.
+        let parallel_fanout_start_admitted = self.work_admission_topology_authoritative
+            && self.work_admission_execution_topology
+                == astra_services::WorkExecutionTopology::ParallelSubruns;
+        if !parallel_fanout_start_admitted {
+            tools.retain_mut(|schema| {
+                tool_schema_name(schema) != Some("agent_fanout")
+                    || remove_tool_action_branch(schema, "start")
+            });
+        }
+        stabilize_work_role_tool_order(&mut tools);
+        tools
     }
 
     fn runtime_allowlist_restrictions(&self, state: &AgenticLoopState) -> HashSet<String> {
         let registry = astra_runtime_env::ToolRegistry::builtins();
         self.tool_schemas
             .iter()
+            .chain(self.deferred_tool_schemas.iter())
+            .chain(self.admission_tool_schemas.iter())
             .filter_map(|tool| {
                 tool.get("function")
                     .and_then(|f| f.get("name"))
@@ -4643,10 +9916,28 @@ impl ServerAgenticLoopHost {
             wire_tools,
             self.resolved_model_name.as_deref(),
             self.resolved_context_window,
-            state.runtime_tool_executor.as_deref(),
+            state,
         );
         if let Some(executor) = state.runtime_tool_executor.as_deref() {
-            executor.set_current_activatable_tool_names(activatable_deferred_tool_names.clone());
+            // Activation is turn-sticky while the selected schema remains on
+            // the admitted wire surface. The deferred manifest correctly
+            // excludes visible tools, but using that manifest itself as the
+            // activation scope made a selected tool visible for exactly one
+            // round: on the following sync it disappeared, then reappeared as
+            // deferred, causing schema oscillation and tool-surface cache
+            // churn.
+            // Retaining only activated names that are still wire-visible also
+            // fails closed when policy, topology, or readiness removes them.
+            let wire_tool_names =
+                astra_turn_core::tool::schema::tool_names_from_schemas(wire_tools);
+            let activated_visible_names = executor
+                .activated_deferred_tool_names()
+                .into_iter()
+                .filter(|name| wire_tool_names.contains(name))
+                .collect::<HashSet<_>>();
+            let mut activation_scope = activatable_deferred_tool_names.clone();
+            activation_scope.extend(activated_visible_names);
+            executor.set_current_activatable_tool_names(activation_scope);
             executor.set_current_searchable_tool_schemas(wire_tools);
             let registry = astra_runtime_env::ToolRegistry::builtins();
             let selected_offers = wire_tools
@@ -4671,6 +9962,19 @@ impl ServerAgenticLoopHost {
         }
         self.current_deferred_tool_names = activatable_deferred_tool_names;
         self.valid_tools = self.admissible_tool_names_for_surface(wire_tools, &extras);
+        if state.hooks.completion_settlement.work_settlement_only {
+            // Work settlement keeps the provider declaration stable for
+            // strict-history caches, but execution authority is narrower
+            // than that declaration. Do not let deferred activation or an
+            // edge callback bypass the typed settlement boundary.
+            if let Some(executor) = state.runtime_tool_executor.as_deref() {
+                executor.set_current_activatable_tool_names(HashSet::new());
+                executor.set_current_searchable_tool_schemas(&[]);
+                executor.set_current_selected_tool_offers(HashMap::new());
+            }
+            self.current_deferred_tool_names.clear();
+            self.valid_tools.retain(|name| name == "settle_work_item");
+        }
     }
 
     fn admissible_tool_names_for_surface(
@@ -4687,6 +9991,12 @@ impl ServerAgenticLoopHost {
                 wire_tools, extras,
             )
         }
+    }
+
+    fn retain_valid_tools_for_authority_surface(&mut self, authority_tools: &[Value]) {
+        let authority =
+            self.admissible_tool_names_for_surface(authority_tools, &self.admissible_extras);
+        self.valid_tools.retain(|name| authority.contains(name));
     }
 
     fn deferred_tool_names_from_edge_profile_for_model(
@@ -4706,114 +10016,131 @@ impl ServerAgenticLoopHost {
         wire_tools: &[Value],
         resolved_model_name: Option<&str>,
         resolved_context_window: Option<u32>,
-        executor: Option<&crate::server::runtime_tool_executor::RuntimeToolExecutor>,
+        state: &AgenticLoopState,
     ) -> HashSet<String> {
-        let deferred_tool_names = self.prompt_deferred_tool_names_for_wire_tools(
+        self.deferred_manifest_for_wire_tools(
             wire_tools,
             resolved_model_name,
             resolved_context_window,
-        );
-        if deferred_tool_names.is_empty() {
-            return HashSet::new();
-        }
-
-        let deferred_tool_names = if let Some(executor) = executor {
-            let runtime_bound = executor.runtime_bound_tool_names(deferred_tool_names.clone());
-            if runtime_bound != deferred_tool_names {
-                let removed: Vec<&str> = deferred_tool_names
-                    .difference(&runtime_bound)
-                    .map(String::as_str)
-                    .collect();
-                tracing::warn!(
-                    target: "astra.deferred_tools",
-                    removed = ?removed,
-                    removed_count = removed.len(),
-                    declared_count = deferred_tool_names.len(),
-                    kept_count = runtime_bound.len(),
-                    "deferred manifest filtered: runtime binding removed {} of {} tool(s); \
-                     prompt block will be rendered with the runtime-bound subset",
-                    removed.len(),
-                    deferred_tool_names.len()
-                );
-                runtime_bound
-            } else {
-                deferred_tool_names
-            }
-        } else {
-            deferred_tool_names
-        };
-        let registry = astra_runtime_env::ToolRegistry::builtins();
-        deferred_tool_names
-            .into_iter()
-            .filter(|name| self.admission_for_current_binding(name, &registry).visible)
-            .collect()
+            state,
+        )
+        .map(|manifest| manifest.names.into_iter().collect())
+        .unwrap_or_default()
     }
 
-    fn prompt_deferred_tool_names_for_wire_tools(
+    fn deferred_manifest_for_wire_tools(
         &self,
         wire_tools: &[Value],
         resolved_model_name: Option<&str>,
         resolved_context_window: Option<u32>,
-    ) -> HashSet<String> {
-        let deferred_tool_names = self.deferred_tool_names_from_edge_profile_for_model(
+        state: &AgenticLoopState,
+    ) -> Option<crate::prompts::DeferredToolsPromptBlock> {
+        let visible_tool_names = astra_turn_core::tool::schema::tool_names_from_schemas(wire_tools);
+        if !visible_tool_names.contains("tool_search") {
+            return None;
+        }
+
+        let mut deferred_tool_names = self.deferred_tool_names_from_edge_profile_for_model(
             resolved_model_name,
             resolved_context_window,
         );
-        if deferred_tool_names.is_empty() {
-            return HashSet::new();
-        }
+        let mut restricted = state.restricted_tools.clone();
+        restricted.extend(self.runtime_allowlist_restrictions(state));
+        restricted.extend(interaction_scoped_tool_restrictions(
+            self.turn_interaction_mode(),
+        ));
+        let server_candidates: Vec<Value> = self
+            .deferred_tool_schemas
+            .iter()
+            .filter(|schema| {
+                tool_schema_name(schema).is_some_and(|name| {
+                    !restricted.contains(name) && !visible_tool_names.contains(name)
+                })
+            })
+            .cloned()
+            .collect();
+        deferred_tool_names.extend(
+            self.runtime_ready_turn_tools(server_candidates, state)
+                .iter()
+                .filter_map(tool_schema_name)
+                .map(str::to_string),
+        );
+        deferred_tool_names.retain(|name| !visible_tool_names.contains(name));
 
-        let visible_tool_names = astra_turn_core::tool::schema::tool_names_from_schemas(wire_tools);
-        if !deferred_tool_names.is_disjoint(&visible_tool_names) {
-            let overlap: Vec<&str> = deferred_tool_names
-                .intersection(&visible_tool_names)
-                .map(String::as_str)
-                .collect();
-            let retained: HashSet<String> = deferred_tool_names
-                .difference(&visible_tool_names)
-                .cloned()
-                .collect();
-            tracing::warn!(
-                target: "astra.deferred_tools",
-                overlap = ?overlap,
-                deferred_count = deferred_tool_names.len(),
-                visible_count = visible_tool_names.len(),
-                kept_count = retained.len(),
-                "deferred manifest filtered: deferred tool(s) already appear in visible surface; \
-                 prompt block will keep only names that still require activation"
-            );
-            return retained;
+        if let Some(executor) = state.runtime_tool_executor.as_deref() {
+            deferred_tool_names = executor.runtime_bound_tool_names(deferred_tool_names);
         }
-
+        let registry = astra_runtime_env::ToolRegistry::builtins();
         deferred_tool_names
+            .retain(|name| self.admission_for_current_binding(name, &registry).visible);
+
+        crate::prompts::build_deferred_tool_names_prompt_block_with_budget(
+            deferred_tool_names.iter().map(String::as_str),
+            resolved_context_window,
+        )
     }
 
     fn deferred_tools_block_for_wire_surface(
-        &self,
+        &mut self,
         wire_tools: &[Value],
         state: &AgenticLoopState,
         model_name: &str,
         model_context_window: Option<u32>,
     ) -> String {
-        if state.hooks.completion_settlement.text_only {
-            return String::new();
-        }
-        let manifest_names = self.deferred_tool_names_for_wire_tools(
-            wire_tools,
-            Some(model_name),
-            model_context_window,
-            state.runtime_tool_executor.as_deref(),
+        let wire_surface_hash = deferred_tools_wire_surface_hash(wire_tools);
+        let preserve_work_wire_surface = state.runtime_tool_executor.as_deref().is_some_and(
+            crate::server::runtime_tool_executor::RuntimeToolExecutor::has_work_binding,
         );
-        if manifest_names.is_empty() {
-            return String::new();
+        let preserve_control_plane_manifest = state.hooks.completion_settlement.text_only
+            || state.hooks.completion_settlement.work_settlement_only
+            || preserve_work_wire_surface;
+        tracing::debug!(
+            target: "astra::prompt_cache",
+            session_id = %self.session_id,
+            session_turn = state.session_turn,
+            preserve_control_plane_manifest,
+            wire_surface_hash,
+            cached = self.deferred_tools_block_cache.is_some(),
+            "deferred tool manifest resolution"
+        );
+        if preserve_control_plane_manifest
+            && let Some(cache) = self.deferred_tools_block_cache.as_ref()
+            && cache.session_turn == state.session_turn
+            && cache.model_name == model_name
+            && cache.context_window == model_context_window
+        {
+            // `wire_tools` is the pre-settlement projection.  The final
+            // provider request is assembled from the sticky/admitted surface
+            // after this hook, so its raw hash can legitimately differ even
+            // though the control-plane contract must remain identical.  The
+            // turn/model/context identity is the authoritative snapshot
+            // boundary; comparing this intermediate hash would recreate the
+            // cache miss we are preventing.
+            return cache.text.clone();
         }
-        crate::turn::deferred_tools_edge_profile::block_for_model_filtered(
-            &self.edge_profile,
-            model_name,
-            model_context_window,
-            &manifest_names,
-        )
-        .unwrap_or_default()
+
+        let text = self
+            .deferred_manifest_for_wire_tools(
+                wire_tools,
+                Some(model_name),
+                model_context_window,
+                state,
+            )
+            .map(|manifest| manifest.section.text)
+            .unwrap_or_default();
+
+        // Ordinary rounds publish the latest admitted discovery contract.
+        // Settlement reuses that snapshot instead of publishing a new
+        // policy-filtered variant that would invalidate strict-history caches.
+        if !preserve_control_plane_manifest {
+            self.deferred_tools_block_cache = Some(DeferredToolsBlockCache {
+                session_turn: state.session_turn,
+                model_name: model_name.to_string(),
+                context_window: model_context_window,
+                text: text.clone(),
+            });
+        }
+        text
     }
 
     /// Set the extras list (runtime-injected names + plugin names) so
@@ -4844,6 +10171,7 @@ impl ServerAgenticLoopHost {
         &self,
         state: &mut AgenticLoopState,
         consume_widen: bool,
+        retain_text_only_wire_surface: bool,
     ) -> HashSet<String> {
         // 1. Consume or peek the widen flag. Soft health diagnostics are not
         // promoted into the hard restricted-tool set.
@@ -4858,12 +10186,25 @@ impl ServerAgenticLoopHost {
         effective.extend(interaction_scoped_tool_restrictions(
             self.turn_interaction_mode(),
         ));
-        if state.hooks.completion_settlement.text_only {
+        if state.hooks.completion_settlement.text_only && !retain_text_only_wire_surface {
             effective.extend(
                 self.tool_schemas
                     .iter()
                     .chain(self.admission_tool_schemas.iter())
                     .filter_map(tool_schema_name)
+                    .map(str::to_string),
+            );
+        }
+        if state.hooks.completion_settlement.work_settlement_only
+            && !state.hooks.completion_settlement.text_only
+        {
+            effective.extend(
+                self.tool_schemas
+                    .iter()
+                    .chain(self.admission_tool_schemas.iter())
+                    .chain(self.deferred_tool_schemas.iter())
+                    .filter_map(tool_schema_name)
+                    .filter(|name| *name != "settle_work_item")
                     .map(str::to_string),
             );
         }
@@ -4874,7 +10215,7 @@ impl ServerAgenticLoopHost {
     /// hard runtime restrictions.
     #[cfg(test)]
     fn visible_turn_tools(&mut self, state: &mut AgenticLoopState) -> Vec<Value> {
-        let effective_restricted = self.compute_effective_restricted(state, true);
+        let effective_restricted = self.compute_effective_restricted(state, true, false);
         let visible = self.filtered_runtime_ready_turn_tools(&effective_restricted, state);
         self.sync_valid_tools_to_wire_surface_for_state(&visible, state);
         visible
@@ -4893,32 +10234,138 @@ impl ServerAgenticLoopHost {
     /// tracing, the breakdown, the selected compaction tier, and the tier-pruned
     /// tool schemas. Callers that only want the system text can discard the
     /// extra fields.
-    #[cfg(test)]
     async fn prompt_memory_entries_for_turn(
         &mut self,
         session_turn: u32,
         user_content: &str,
-    ) -> Vec<astra_turn_core::context_sources::MemoryEntry> {
+    ) -> PromptMemoryRecall {
         if let Some(cached) = self.prompt_memory_recall_cache.as_ref().filter(|cached| {
             cached.session_turn == session_turn && cached.user_content == user_content
         }) {
-            return cached.entries.clone();
+            return PromptMemoryRecall {
+                entries: cached.entries.clone(),
+                outcome: cached.outcome,
+                fetch_ms: cached.fetch_ms,
+                fresh: false,
+            };
         }
 
-        let entries = fetch_prompt_memory_entries(
-            self.memoria_client.clone(),
-            self.user_id.clone(),
-            self.session_id.clone(),
-            session_turn,
-            user_content.to_string(),
-        )
-        .await;
+        let started = Instant::now();
+        let (entries, outcome) = if let Some(client) = self.memoria_client.as_deref() {
+            let top_k = std::env::var("ASTRA_RETRIEVAL_TOP_K")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(5);
+            let (prefetched, session_start) = tokio::join!(
+                crate::turn::memory_prefetch::prefetch_memories_with_client(
+                    client,
+                    user_content,
+                    &self.user_id,
+                    &self.session_id,
+                    top_k,
+                ),
+                async {
+                    if session_turn <= 1 {
+                        crate::turn::memory_prefetch::prefetch_session_start_memories_with_client(
+                            client,
+                            &self.user_id,
+                            &self.session_id,
+                        )
+                        .await
+                    } else {
+                        crate::turn::memory_prefetch::SessionStartPrefetchResult::default()
+                    }
+                }
+            );
+            let outcome = prefetched.outcome.combine(session_start.outcome);
+            let mut entries = session_start.entries;
+            entries.extend(prefetched.entries);
+            (
+                crate::turn::memory_prefetch::admit_prompt_memory_entries(
+                    &self.session_id,
+                    entries,
+                ),
+                outcome,
+            )
+        } else {
+            (
+                Vec::new(),
+                astra_turn_types::MemoryRetrievalOutcome::NotAttempted,
+            )
+        };
+        let fetch_ms = started.elapsed().as_millis() as u64;
         self.prompt_memory_recall_cache = Some(PromptMemoryRecallCache {
             session_turn,
             user_content: user_content.to_string(),
             entries: entries.clone(),
+            outcome,
+            fetch_ms,
         });
-        entries
+        PromptMemoryRecall {
+            entries,
+            outcome,
+            fetch_ms,
+            fresh: true,
+        }
+    }
+
+    /// Resolve the two independent memory inputs consumed by the context
+    /// pipeline without making their latencies additive. Both futures remain
+    /// scoped to this provider request (no detached work), and the existing
+    /// owner/session-bound Memoria port remains the only retrieval authority.
+    async fn memory_context_for_turn(
+        &mut self,
+        session_turn: u32,
+        user_content: &str,
+        memory_extraction_service: Option<Arc<crate::session_memory::MemoryExtractionService>>,
+    ) -> (
+        PromptMemoryRecall,
+        Option<astra_turn_core::context_sources::MemoryEntry>,
+    ) {
+        let memoria_client = self.memoria_client.clone();
+        let session_id = self.session_id.clone();
+        let prompt_recall = self.prompt_memory_entries_for_turn(session_turn, user_content);
+        let session_memory = async move {
+            if let Some(service) = memory_extraction_service {
+                service
+                    .current_session_memory_entry_for_pipeline_with_deadline(
+                        &session_id,
+                        crate::turn::memory_prefetch::INTERACTIVE_MEMORY_READ_DEADLINE,
+                    )
+                    .await
+            } else if let Some(client) = memoria_client.as_deref() {
+                let loaded = crate::session_memory::runner::load_current_session_memory_preferring_local_with_deadline(
+                    client,
+                    &session_id,
+                    crate::turn::memory_prefetch::INTERACTIVE_MEMORY_READ_DEADLINE,
+                )
+                .await;
+                loaded.as_ref().and_then(|loaded| {
+                    crate::turn::wire_assembly::session_memory_entry_for_user_turn(
+                        Some(&loaded.content),
+                        loaded.updated_turn,
+                    )
+                })
+            } else {
+                None
+            }
+        };
+
+        tokio::join!(prompt_recall, session_memory)
+    }
+
+    fn record_prompt_memory_trace(state: &AgenticLoopState, recall: &PromptMemoryRecall) {
+        if !recall.fresh || !recall.outcome.was_attempted() {
+            return;
+        }
+        if let Some(collector) = state.telemetry.turn_trace_collector.as_ref() {
+            collector.record_prompt_memory_retrieval(
+                "prompt_memory_recall",
+                recall.outcome,
+                &recall.entries,
+                recall.fetch_ms,
+            );
+        }
     }
 
     fn run_turn_pipeline(
@@ -4983,9 +10430,7 @@ impl ServerAgenticLoopHost {
         user_content: &str,
     ) -> Result<PipelineTurnOutcome, astra_core::ClassifiedError> {
         let plan_hint = self.read_plan_resume_hint();
-        // Keep the turn-start snapshot latched for introspection and diagnostics,
-        // but do not project lifecycle telemetry into the model prompt.
-        let _lifecycle_summary = if let Some(existing) = &self.turn_start_lifecycle_summary {
+        let lifecycle_summary = if let Some(existing) = &self.turn_start_lifecycle_summary {
             if self.turn_start_plan_resume_hint.as_deref() != plan_hint.as_deref() {
                 let updated = Self::update_latched_plan_resume_line(existing, plan_hint.as_deref());
                 self.turn_start_lifecycle_summary = Some(updated.clone());
@@ -5000,7 +10445,39 @@ impl ServerAgenticLoopHost {
             self.turn_start_plan_resume_hint = plan_hint.clone();
             summary
         };
+        let lifecycle_sections = vec![crate::prompts::PromptSection::dynamic(
+            lifecycle_summary,
+            crate::prompts::PromptTokenBucket::Environment,
+        )];
         let restricted_snapshot = state.restricted_tools.clone();
+        // A delegated/request-scoped allowlist is an executable contract, not
+        // a relevance hint. Preserve its admitted schemas through adaptive
+        // context pruning; otherwise a narrow child can lose its only useful
+        // capability and be left with generic fallback tools. Filtering has
+        // already applied binding readiness and hard restrictions above.
+        let required_tool_schemas = state
+            .skills
+            .request_constraints
+            .allowed_tools
+            .as_ref()
+            .map(|allowed| {
+                visible_tools
+                    .iter()
+                    .filter(|schema| {
+                        tool_schema_name(schema).is_some_and(|name| allowed.contains(name))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        tracing::debug!(
+            target: "astra::tool_surface",
+            run_id = state.current_run_id.as_deref().unwrap_or_default(),
+            allowed_tools = ?state.skills.request_constraints.allowed_tools,
+            visible_tools = ?visible_tools.iter().filter_map(tool_schema_name).collect::<Vec<_>>(),
+            required_tools = ?required_tool_schemas.iter().filter_map(tool_schema_name).collect::<Vec<_>>(),
+            "resolved executable request tool contract before context optimization"
+        );
         let deferred_tools_block = self.deferred_tools_block_for_wire_surface(
             visible_tools,
             state,
@@ -5017,11 +10494,13 @@ impl ServerAgenticLoopHost {
                     visible_tools,
                     &restricted_snapshot,
                 )
+                .with_required_tools(&required_tool_schemas)
                 .with_deferred_tools_block(&deferred_tools_block),
                 runtime_signals: crate::turn::llm::context::RuntimeSignals::new(
                     &self.edge_profile,
                     plan_hint,
                 )
+                .with_extra_sections(&[], &lifecycle_sections)
                 .with_memory_entries(memory_entries)
                 .with_memory_provider_source(
                     self.memoria_client.is_some().then_some("server_config"),
@@ -5075,7 +10554,7 @@ impl ServerAgenticLoopHost {
 
     /// Thin wrapper around [`wire_assembly::assemble_llm_messages_with_cache_capability`] that
     /// extracts the server-path-specific attachments from `AgenticLoopState`
-    /// (invoked skills + recently-read files) and delegates the rest. The
+    /// (invoked skills) and delegates the rest. The
     /// shared module handles `strip_stale_reasoning_with_policy`, continuation-prompt
     /// insertion, attachment ordering, and cache annotations.
     fn assemble_llm_messages(
@@ -5086,6 +10565,7 @@ impl ServerAgenticLoopHost {
         state: &mut AgenticLoopState,
         llm_cfg: &ResolvedTurnLlmConfig,
         cache_cfg: &PromptCacheConfig,
+        compaction_boundary_hit: bool,
     ) -> Vec<Value> {
         // Per-turn skill listing (ranked shortlist) now flows through the
         // pipeline as an `extra_dynamic_sections` entry (RuntimeVolatile,
@@ -5098,8 +10578,8 @@ impl ServerAgenticLoopHost {
                 volatile_preamble,
                 compacted_messages,
                 state,
+                compaction_boundary_hit,
                 thinking: &thinking,
-                edge_profile: &self.edge_profile,
                 session_id: &self.session_id,
                 provider: &llm_cfg.provider,
                 model_name: &llm_cfg.model_name,
@@ -5109,13 +10589,24 @@ impl ServerAgenticLoopHost {
         )
     }
 
-    /// Convert an [`LlmCallResult`] into a [`ChatTurnSseAccum`].
-    fn result_to_accum(result: &LlmCallResult) -> ChatTurnSseAccum {
+    /// Convert an [`LlmCallResult`] into a [`ChatTurnSseAccum`], optionally
+    /// replacing its per-request usage with the aggregate physical usage of a
+    /// bounded retry sequence.
+    fn result_to_accum_with_usage(
+        result: &LlmCallResult,
+        aggregate_usage: Option<crate::turn::token_usage::TokenUsage>,
+    ) -> ChatTurnSseAccum {
         let u = crate::turn::token_usage::TokenUsage::from_partial_json_map(&result.usage);
-        let prompt_tokens = u.input_tokens;
-        let completion_tokens = u.output_tokens;
-        let cache_read_tokens = u.cached_input_tokens;
-        let cache_creation_tokens = u.cache_creation_tokens;
+        let aggregate = aggregate_usage.unwrap_or(u);
+        // A bounded provider retry contributes to the logical response's
+        // accounting, but it is not the context usage of the final request.
+        // Reuse the existing aggregate marker so downstream accounting does
+        // not feed the retry sum back into context-window pressure.
+        let usage_is_aggregate = aggregate_usage.is_some_and(|usage| usage != u);
+        let prompt_tokens = aggregate.input_tokens;
+        let completion_tokens = aggregate.output_tokens;
+        let cache_read_tokens = aggregate.cached_input_tokens;
+        let cache_creation_tokens = aggregate.cache_creation_tokens;
 
         ChatTurnSseAccum {
             full_text: result.full_text.clone(),
@@ -5127,7 +10618,18 @@ impl ServerAgenticLoopHost {
             completion_tokens,
             cache_read_tokens,
             cache_creation_tokens,
-            has_usage: !result.usage.is_empty(),
+            has_usage: !result.usage.is_empty()
+                || aggregate_usage.is_some_and(|usage| !usage.is_empty()),
+            usage_is_run_total: usage_is_aggregate,
+            current_request_usage: (!result.usage.is_empty()).then_some(
+                astra_turn_types::RequestTokenUsage {
+                    fresh_input_tokens: u.input_tokens,
+                    cache_read_tokens: u.cached_input_tokens,
+                    cache_creation_tokens: u.cache_creation_tokens,
+                    output_tokens: u.output_tokens,
+                },
+            ),
+            finish_reason: result.lifecycle_finish_reason().map(str::to_string),
             session_id: None,
             run_id: None,
             explain_turns: Vec::new(),
@@ -5139,27 +10641,257 @@ impl ServerAgenticLoopHost {
     }
 }
 
+impl ServerAgenticLoopHost {
+    fn admitted_work_turn_result(
+        &mut self,
+        state: &mut AgenticLoopState,
+        turn_started: Instant,
+        provider_result: &LlmCallResult,
+        aggregate_usage: Option<crate::turn::token_usage::TokenUsage>,
+    ) -> Result<Option<HostTurnResult>, astra_core::ClassifiedError> {
+        let Some(start_work) = self.take_admitted_work_establishment_call(state) else {
+            return Ok(None);
+        };
+        let mut admitted = self.admit_terminal_tool_calls_with_completion(
+            state,
+            std::slice::from_ref(&start_work),
+            Some("tool_calls"),
+        );
+        if admitted.len() != 1 {
+            return Err(astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                "server-admitted Work declaration was rejected before lifecycle execution",
+            ));
+        }
+        tracing::info!(
+            target: "astra::work",
+            session_id = %self.session_id,
+            turn = state.session_turn,
+            "materializing semantic Work admission at the lifecycle boundary"
+        );
+        self.control_plane_turn_pending = true;
+        let start_work = admitted
+            .pop()
+            .expect("the length check above guarantees one canonical Work call");
+        // The provider request already happened even though semantic
+        // admission replaces its provisional response with the canonical
+        // lifecycle carrier. Preserve that physical request's usage in the
+        // run total: dropping it makes cost, cache rate, and token telemetry
+        // disagree with the invocation ledger and under-reports production
+        // load. Provisional prose/reasoning and tool calls remain suppressed.
+        let mut accum = Self::result_to_accum_with_usage(provider_result, aggregate_usage);
+        accum.full_text.clear();
+        accum.reasoning_content.clear();
+        accum.reasoning_signature.clear();
+        accum.tool_calls = vec![start_work];
+        accum.has_tool_calls = true;
+        Ok(Some(HostTurnResult {
+            accum,
+            ttft_ms: Some(turn_started.elapsed().as_millis() as u64),
+            edge_tool_round: Vec::new(),
+            error_kind: None,
+        }))
+    }
+}
+
 #[async_trait]
 impl AgenticLoopHost for ServerAgenticLoopHost {
+    fn runtime_feedback_topology(&self) -> astra_services::ModelRequestTopology {
+        self.model_request_topology()
+    }
+
+    fn publish_runtime_feedback(
+        &mut self,
+        frame: &astra_turn_core::context_feedback::RuntimeFeedbackFrame,
+    ) {
+        self.emit_progress_event(json!({
+            "type": "runtime_feedback",
+            "runtime_feedback": frame,
+        }));
+    }
+
+    fn runtime_policy_subject(
+        &self,
+        state: &AgenticLoopState,
+    ) -> astra_turn_core::context_feedback::RuntimePolicySubject {
+        state
+            .runtime_tool_executor
+            .as_deref()
+            .and_then(
+                crate::server::runtime_tool_executor::RuntimeToolExecutor::active_primary_work_attempt,
+            )
+            .map_or(
+                astra_turn_core::context_feedback::RuntimePolicySubject::Run,
+                |active| astra_turn_core::context_feedback::RuntimePolicySubject::WorkItem {
+                    attempt_id: active.attempt_id,
+                    item_id: active.item_id,
+                    item_revision: active.item_revision,
+                    objective: active.objective,
+                    expected_result: active.expected_result,
+                },
+            )
+    }
+
+    async fn committed_work_synthesis_authorized(
+        &mut self,
+        state: &AgenticLoopState,
+    ) -> Result<bool, String> {
+        let (Some(executor), Some(user_id), Some(session_id), Some(run_id), Some(generation)) = (
+            state.runtime_tool_executor.as_deref(),
+            state.context_manifest_user_id.as_deref(),
+            state.current_session_id.as_deref(),
+            state.current_run_id.as_deref(),
+            state.current_run_owner_generation,
+        ) else {
+            return Ok(false);
+        };
+        executor
+            .committed_work_synthesis_authorized(user_id, session_id, run_id, generation)
+            .await
+    }
+
     fn admit_tool_calls(
         &mut self,
         tool_calls: &[Value],
         finish_reason: Option<&str>,
     ) -> crate::turn::agentic_loop::host::ToolCallAdmission {
-        self.pending_tool_call_admission.take().unwrap_or_else(|| {
+        let mut admission = self.pending_tool_call_admission.take().unwrap_or_else(|| {
             crate::turn::agentic::tool_interception::admit_tool_calls(tool_calls, finish_reason)
-        })
+        });
+        if self
+            .execution_time_budget
+            .is_some_and(|budget| budget.remaining().is_zero())
+        {
+            admission.rejected.extend(admission.admitted.drain(..).map(|canonical_call| {
+                let id = canonical_call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let name = astra_turn_core::tool::args::shape::tool_call_name(&canonical_call)
+                    .unwrap_or("unknown")
+                    .to_string();
+                crate::turn::agentic_loop::host::RejectedToolCall {
+                    id,
+                    name,
+                    canonical_call,
+                    result: json!({
+                        "status": "rejected",
+                        "error_kind": "execution_time_budget_exhausted",
+                        "retryable": false,
+                        "error": "The run wall-clock budget expired before this tool could be admitted; it was not executed.",
+                    })
+                    .to_string(),
+                }
+            }));
+        }
+        admission
     }
 
     fn injects_round_guidance(&self) -> bool {
         true // Server injects guidance into the system prompt in execute_turn.
     }
 
+    fn requires_turn_intent_decision(&self) -> bool {
+        // The built-in auxiliary admission judge is an optimization and a
+        // typed Work projection, not the only authority capable of starting
+        // a safe turn.  If it times out or is unavailable, the primary model
+        // still receives the normal Work contract and can establish Work
+        // through `start_work`; returning an empty turn here makes the CLI
+        // retry the same user request and is materially worse than that
+        // bounded fallback.  Hosts with a genuinely mandatory sidecar may
+        // still opt in through the trait method (the lifecycle keeps that
+        // fail-closed path for them).
+        false
+    }
+
+    fn on_turn_phase(&mut self, receipt: TurnPhaseReceipt) {
+        let phase = match receipt.phase {
+            TurnPhaseKind::SemanticAdmission => {
+                astra_server_types::TurnPhaseKindV1::TurnIntentAdmission
+            }
+            TurnPhaseKind::RequestPreparation => {
+                astra_server_types::TurnPhaseKindV1::RequestPreparation
+            }
+            TurnPhaseKind::ModelInference => astra_server_types::TurnPhaseKindV1::ModelInference,
+            TurnPhaseKind::ToolExecution => astra_server_types::TurnPhaseKindV1::ToolExecution,
+        };
+        let outcome = match receipt.outcome {
+            TurnPhaseOutcome::Decided => astra_server_types::TurnPhaseOutcomeV1::Decided,
+            TurnPhaseOutcome::FixedDefault => astra_server_types::TurnPhaseOutcomeV1::FixedDefault,
+            TurnPhaseOutcome::Delegated => astra_server_types::TurnPhaseOutcomeV1::Delegated,
+            TurnPhaseOutcome::Unavailable => astra_server_types::TurnPhaseOutcomeV1::Unavailable,
+            TurnPhaseOutcome::Succeeded => astra_server_types::TurnPhaseOutcomeV1::Succeeded,
+            TurnPhaseOutcome::Failed => astra_server_types::TurnPhaseOutcomeV1::Failed,
+        };
+        let phase = astra_server_types::TurnPhaseReceiptV1 {
+            schema_version: astra_server_types::TURN_PHASE_SCHEMA_VERSION,
+            phase,
+            round_index: receipt.round_index,
+            attempt_index: receipt.attempt_index,
+            outcome,
+            duration_ms: receipt.duration_ms,
+        };
+        debug_assert!(phase.is_valid());
+        // A phase receipt is a small observational event. It cannot affect
+        // lifecycle control and is safe to coalesce on the normal progress
+        // lane; the lifecycle trace remains the durable timing authority.
+        self.emit_progress_event(json!({
+            "type": astra_server_types::TURN_PHASE_EVENT_TYPE,
+            "schema_version": phase.schema_version,
+            "phase": phase.phase,
+            "round_index": phase.round_index,
+            "attempt_index": phase.attempt_index,
+            "outcome": phase.outcome,
+            "duration_ms": phase.duration_ms,
+        }));
+    }
+
+    fn owns_model_inference_timing(&self) -> bool {
+        true
+    }
+
+    fn consume_control_plane_turn(
+        &mut self,
+        _result: &crate::turn::agentic_loop::host::HostTurnResult,
+    ) -> crate::turn::agentic_loop::host::ControlPlaneTurnBoundary {
+        if std::mem::take(&mut self.control_plane_turn_pending) {
+            // Work admission replaces provisional provider prose with a
+            // canonical lifecycle carrier, but the provider request and its
+            // usage already happened and must remain in round accounting.
+            crate::turn::agentic_loop::host::ControlPlaneTurnBoundary::ProviderBacked
+        } else {
+            crate::turn::agentic_loop::host::ControlPlaneTurnBoundary::Ordinary
+        }
+    }
+
     async fn judge_turn_intent(
         &mut self,
         state: &AgenticLoopState,
     ) -> crate::turn::agentic_loop::host::TurnIntentJudgeOutcome {
+        if self.turn_intent_policy == TurnIntentExecutionPolicy::Auto
+            && self.work_lifecycle_is_active(state)
+        {
+            // The durable Work binding and current assignment remain the
+            // authority for ordinary continuation. The stable coordinator
+            // surface keeps `agent_fanout` available for an explicit
+            // same-turn parallel boundary, so a completed graph does not
+            // require another auxiliary judge request merely to expose it.
+            tracing::debug!(
+                target: "astra::turn_intent",
+                operation = "turn_intent.phase",
+                status = "skipped",
+                policy = "auto",
+                reason = "work_already_bound",
+                "turn intent judge skipped for an already-bound Work"
+            );
+            return crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::FixedDefault;
+        }
         if self.turn_intent_policy == TurnIntentExecutionPolicy::FixedDefault {
+            // FixedDefault is used by delegated sub-runs because their parent
+            // admission is already authoritative. Only a primary user turn
+            // may fall back to model-established Work when the auxiliary
+            // semantic projection is intentionally skipped.
             tracing::info!(
                 target: "astra::turn_intent",
                 operation = "turn_intent.phase",
@@ -5171,92 +10903,38 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             );
             return crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::FixedDefault;
         }
-        let has_prior_assistant_turn = state
-            .messages
-            .iter()
-            .rev()
-            .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"));
-        // Use 1-based turn count: llm_rounds_completed counts *prior* rounds,
-        // so the current user turn is +1.
-        let turn_count = state.llm_rounds_completed.saturating_add(1);
-        let user_intent = state.runtime_decision_user_intent();
-
         if let Some(judge) = self.turn_intent_judge.as_ref() {
-            return crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::from_optional_intent(
-                crate::turn::agentic::turn_intent::judge_turn_intent_with_llm(
-                    judge.as_ref(),
-                    &user_intent,
-                    turn_count,
-                    &state.recent_tools,
-                    has_prior_assistant_turn,
-                )
-                .await,
+            // Use 1-based turn count: llm_rounds_completed counts *prior*
+            // rounds, so the current user turn is +1.
+            let turn_count = state.llm_rounds_completed.saturating_add(1);
+            let user_intent = state.runtime_decision_user_intent();
+            let context = crate::turn::agentic::turn_intent::build_turn_intent_judge_context(
+                &state.messages,
+                &user_intent,
+                turn_count,
+                &state.recent_tools,
+                &state.skills.invoked,
             );
+            let outcome =
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::from_optional_intent(
+                    crate::turn::agentic::turn_intent::judge_turn_intent_with_llm_deadline(
+                        judge.as_ref(),
+                        &context,
+                        TURN_INTENT_JUDGE_DEADLINE,
+                    )
+                    .await,
+                );
+            return outcome;
         }
 
-        if let Some(reason) = should_skip_auxiliary_llm_for_capacity() {
-            tracing::info!(
-                target: "astra::turn_intent",
-                operation = "turn_intent.phase",
-                status = "skipped",
-                policy = auxiliary_llm_policy_label(),
-                reason,
-                duration_ms = 0_u64,
-                "turn intent judge skipped by capacity policy"
-            );
-            return crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable;
-        }
-
-        let phase_started_at = Instant::now();
-        let model_resolution_started_at = Instant::now();
-        let Some(client) = self.turn_intent_summary_client(state, "turn_intent").await else {
-            let duration_ms = phase_started_at.elapsed().as_millis() as u64;
-            tracing::info!(
-                target: "astra::turn_intent",
-                operation = "turn_intent.phase",
-                status = "skipped",
-                reason = "model_resolution_unavailable",
-                model_resolution_ms = model_resolution_started_at.elapsed().as_millis() as u64,
-                duration_ms,
-                "turn intent phase completed"
-            );
-            return crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable;
-        };
-        let model_resolution_ms = model_resolution_started_at.elapsed().as_millis() as u64;
-        let (model_name, provider) = self
-            .resolved_llm_config
-            .as_ref()
-            .map(|config| (config.model_name.clone(), config.provider.clone()))
-            .unwrap_or_default();
-        let judge = SummaryClientTurnIntentJudge { client };
-        let result = crate::turn::agentic::turn_intent::judge_turn_intent_with_llm(
-            &judge,
-            &user_intent,
-            turn_count,
-            &state.recent_tools,
-            has_prior_assistant_turn,
-        )
-        .await;
-        let outcome =
-            crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::from_optional_intent(result);
-        let duration_ms = phase_started_at.elapsed().as_millis() as u64;
-        let judge_ms = duration_ms.saturating_sub(model_resolution_ms);
-        tracing::info!(
-            target: "astra::turn_intent",
-            operation = "turn_intent.phase",
-            status = match &outcome {
-                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Intent(_) => "success",
-                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::FixedDefault => "skipped",
-                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable => "no_intent",
-            },
-            model = %model_name,
-            provider = %provider,
-            model_resolution_ms,
-            judge_ms,
-            duration_ms,
-            "turn intent phase completed"
-        );
-        outcome
+        // Start the bounded semantic admission in parallel with the primary
+        // request when adaptive capacity permits it. If no durable inference
+        // material is available, the typed primary Work contract remains the
+        // safe fallback; a provider tool/control response can still start the
+        // boundary judge below before any effect is admitted.
+        self.start_work_admission_preflight(state, false, false)
+            .await;
+        crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable
     }
 
     async fn judge_skill_auto_route(
@@ -5268,11 +10946,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             tracing::info!(
                 target: "astra::skill_auto_route_judge",
                 operation = "skill_auto_route.phase",
-                status = "skipped",
-                policy = "disabled",
-                reason = "request_execution_policy",
-                duration_ms = 0_u64,
-                "skill auto-route judge skipped by request execution policy"
+                status = "disabled",
+                "skill auto-route skipped by request policy"
             );
             return None;
         }
@@ -5294,7 +10969,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 return None;
             }
             let client = self
-                .turn_intent_summary_client(state, "skill_auto_route")
+                .turn_intent_summary_client(
+                    state,
+                    "skill_auto_route",
+                    SKILL_AUTO_ROUTE_JUDGE_MAX_OUTPUT_TOKENS,
+                )
                 .await?;
             let judge = SummaryClientSkillAutoRouteJudge { client };
             judge.judge(&service_ctx).await
@@ -5355,6 +11034,36 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
     }
 
+    async fn on_pre_resolved_tool_call_terminal(
+        &mut self,
+        run_id: Option<&str>,
+        record: &ToolCallRecord,
+    ) {
+        if let Some(event) = server_tool_terminal_event(run_id, record) {
+            // A terminal receipt is lifecycle authority, not coalescible
+            // progress. Backpressure may delay it but must never drop it and
+            // leave clients with a permanent start-only projection.
+            self.emit_committed_lifecycle_projection(event).await;
+        }
+    }
+
+    async fn on_pre_resolved_tool_calls_terminal(
+        &mut self,
+        run_id: Option<&str>,
+        records: &[ToolCallRecord],
+    ) {
+        // The retained event set is the replay authority. Project each exact
+        // terminal fact to the live lane opportunistically, but never grant
+        // every item an independent timeout: a full client/bridge channel
+        // must not turn a bounded provider batch into O(N seconds) of run
+        // occupancy.
+        for record in records {
+            if let Some(event) = server_tool_terminal_event(run_id, record) {
+                self.emit_committed_control_projection(event);
+            }
+        }
+    }
+
     async fn on_final_output_ready(&mut self, _state: &AgenticLoopState) {
         self.emit_progress_event(json!({ "type": "assistant_output_settled" }));
     }
@@ -5372,6 +11081,69 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             Value::String("agent_communication".to_string()),
         );
         self.emit_progress_event(Value::Object(payload));
+    }
+
+    async fn on_committed_work_task_board_update(
+        &mut self,
+        state: &AgenticLoopState,
+        event: Value,
+    ) {
+        let typed_update = event.get("task_board_update").cloned().and_then(|value| {
+            serde_json::from_value::<astra_server_types::WorkTaskBoardUpdateV1>(value).ok()
+        });
+        if let (Some(executor), Some(event)) = (
+            state.runtime_tool_executor.as_deref(),
+            event.as_object().cloned(),
+        ) {
+            executor.emit_committed_work_task_board_update(event).await;
+        } else {
+            // Embedded/test hosts can legitimately omit a runtime executor. They
+            // still retain the committed lifecycle fact, but production server
+            // runs always use the shared Work-surface lane above.
+            self.emit_committed_lifecycle_projection(event).await;
+        }
+
+        let (Some(update), Some(binding), Some(pool)) = (
+            typed_update,
+            self.canonical_work_context_binding.clone(),
+            self.shared_pool.clone(),
+        ) else {
+            return;
+        };
+        if update.work_id != binding.work_id.as_str()
+            || update.branch_id != binding.branch_id.as_str()
+        {
+            tracing::error!(
+                expected_work_id = %binding.work_id.as_str(),
+                expected_branch_id = %binding.branch_id.as_str(),
+                actual_work_id = %update.work_id,
+                actual_branch_id = %update.branch_id,
+                "committed Work board update crossed its validated runtime binding"
+            );
+            crate::server::work_context::install_canonical_work_context(
+                &mut self.edge_profile,
+                crate::server::work_context::unavailable_canonical_work_context(&binding),
+            );
+            return;
+        }
+        match crate::server::work_context::load_canonical_work_context(pool, &binding, None).await {
+            Ok(payload) => crate::server::work_context::install_canonical_work_context(
+                &mut self.edge_profile,
+                payload,
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    work_id = %binding.work_id.as_str(),
+                    branch_id = %binding.branch_id.as_str(),
+                    error = %error,
+                    "failed to refresh canonical Work context after durable mutation"
+                );
+                crate::server::work_context::install_canonical_work_context(
+                    &mut self.edge_profile,
+                    crate::server::work_context::unavailable_canonical_work_context(&binding),
+                );
+            }
+        }
     }
 
     fn apply_user_intent_context(&mut self, event: &crate::turn::run_control::QueuedUserIntent) {
@@ -5395,13 +11167,46 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         }
     }
 
-    fn on_user_intent_applied(&mut self, event: &crate::turn::run_control::QueuedUserIntent) {
+    async fn on_user_intent_applied(&mut self, event: &crate::turn::run_control::QueuedUserIntent) {
+        // A queued user intent starts a new semantic turn.
+        self.abort_pending_work_admission();
+        self.pending_work_admission = None;
+        self.work_admission_attempted = false;
+        self.work_admission_skill_revision = 0;
+        self.pending_work_graph_mutations.clear();
+        self.pending_work_graph_mutation_record_floor = 0;
+        self.admitted_workspace_mutation =
+            astra_config::user_profile::WorkspaceMutationIntent::Unknown;
+        self.completed_work_admission_phase = None;
+        self.work_admission_execution_topology = astra_services::WorkExecutionTopology::Primary;
+        self.work_admission_topology_authoritative = false;
+        self.work_admission_conflict = None;
+        self.work_admission_capabilities.clear();
+        self.work_attempt_started_context = None;
+        self.deferred_work_surface_turn = None;
+        self.deferred_tools_block_cache = None;
         if let Some(content) = crate::turn::run_control::user_intent_content(&event.input) {
-            self.emit_progress_event(json!({
+            self.emit_committed_control_projection(json!({
                 "type": "user_intent_applied",
                 "intent_id": event.intent_id,
                 "delivery": event.delivery,
                 "status": astra_turn_types::UserIntentStatus::Applied,
+                "event_index": event.event_index,
+                "content": content,
+            }));
+        }
+    }
+
+    async fn on_user_intent_returned(
+        &mut self,
+        event: &crate::turn::run_control::QueuedUserIntent,
+    ) {
+        if let Some(content) = crate::turn::run_control::user_intent_content(&event.input) {
+            self.emit_committed_control_projection(json!({
+                "type": "user_intent_returned",
+                "intent_id": event.intent_id,
+                "delivery": event.delivery,
+                "status": astra_turn_types::UserIntentStatus::Returned,
                 "event_index": event.event_index,
                 "content": content,
             }));
@@ -5413,6 +11218,19 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         state: &mut AgenticLoopState,
     ) -> Result<HostTurnResult, astra_core::ClassifiedError> {
         let turn_started = Instant::now();
+        self.reconcile_pending_work_graph_mutations(state);
+        if !self.pending_work_graph_mutations.is_empty() {
+            // Graph authoring is the earlier lifecycle boundary. A generic
+            // "settle now" latch must not hide inspect/propose and create an
+            // impossible gate where settlement is both required and rejected.
+            state.hooks.completion_settlement.work_settlement_only = false;
+        }
+        // This begins after semantic admission has completed in the shared
+        // lifecycle. It therefore measures actual pre-provider work (model
+        // resolution, cooldown, prompt/context construction, and durable
+        // request admission) without attributing auxiliary semantic latency
+        // to request preparation.
+        let mut request_preparation_recorded_attempts = HashSet::new();
 
         // ── Test hook: mock LLM rounds ──────────────────────────────────
         #[cfg(feature = "bridge-e2e-hooks")]
@@ -5449,79 +11267,45 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             }
         }
 
-        let user_content = state
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-            .and_then(|m| m.get("content").and_then(Value::as_str))
-            .unwrap_or("")
-            .to_string();
-
-        // Model revalidation, query-relevant recall, and the current-session
-        // snapshot are independent remote reads. Start them together so a
-        // healthy turn pays the slowest boundary once instead of serially.
-        let cached_prompt_memory = self
-            .prompt_memory_recall_cache
-            .as_ref()
-            .filter(|cached| {
-                cached.session_turn == state.session_turn && cached.user_content == user_content
-            })
-            .map(|cached| cached.entries.clone());
-        let prompt_memoria_client = self.memoria_client.clone();
-        let prompt_memory_user_id = self.user_id.clone();
-        let prompt_memory_session_id = self.session_id.clone();
-        let prompt_memory_user_content = user_content.clone();
-        let prompt_memory_turn = state.session_turn;
-        let session_memory_service = state.memory_extraction_service.clone();
-        let session_memoria_client = self.memoria_client.clone();
-        let session_memory_session_id = self.session_id.clone();
-        let (
-            llm_cfg_result,
-            (memoria_prefetch_entries, fetched_prompt_memory),
-            initial_session_memory_entry,
-        ) = tokio::join!(
-            self.resolve_llm_config_for_state(state),
-            async move {
-                if let Some(entries) = cached_prompt_memory {
-                    (entries, false)
-                } else {
-                    (
-                        fetch_prompt_memory_entries(
-                            prompt_memoria_client,
-                            prompt_memory_user_id,
-                            prompt_memory_session_id,
-                            prompt_memory_turn,
-                            prompt_memory_user_content,
-                        )
-                        .await,
-                        true,
-                    )
-                }
-            },
-            load_initial_session_memory_entry(
-                session_memory_service,
-                session_memoria_client,
-                session_memory_session_id,
-            ),
-        );
-        if fetched_prompt_memory {
-            self.prompt_memory_recall_cache = Some(PromptMemoryRecallCache {
-                session_turn: state.session_turn,
-                user_content: user_content.clone(),
-                entries: memoria_prefetch_entries.clone(),
-            });
+        // Reconcile a fast semantic preflight before the primary request so
+        // its typed optional capabilities (for example `agent_fanout`) are
+        // projected onto the provider surface. Do not materialize Required
+        // Work here: the provider may emit a complete typed execution
+        // carrier, and preempting it would rewrite the requested topology.
+        // If no carrier is emitted, the post-response boundary below creates
+        // the server-owned synthetic `start_work` exactly once.
+        self.resolve_pending_work_admission(false).await;
+        self.flush_completed_work_admission_phase(state);
+        if let Some(error) = self.work_admission_terminal_error() {
+            tracing::error!(
+                target: "astra::turn_intent",
+                operation = "turn_intent.judge",
+                source = "work_admission_judge",
+                status = "terminal",
+                round_index = state.current_round_index,
+                error = %error,
+                "unsupported Work admission contract stopped the run before another provider request"
+            );
+            return Err(error);
         }
 
         // ── 1. Resolve LLM model ────────────────────────────────────────
-        let mut llm_cfg = match llm_cfg_result {
+        let mut llm_cfg = match self.resolve_llm_config_for_state(state).await {
             Ok(m) => m,
             Err(e) => {
                 let message = format!("Model resolution failed: {e}");
-                return Err(astra_core::ClassifiedError::new(
+                let error = astra_core::ClassifiedError::new(
                     astra_core::classify_model_resolution_error_message(&message),
                     message,
-                ));
+                );
+                self.complete_request_preparation_phase(
+                    state,
+                    turn_started,
+                    0,
+                    &mut request_preparation_recorded_attempts,
+                    TurnPhaseOutcome::Failed,
+                );
+                return Err(error);
             }
         };
         let fallback_chain = llm_cfg.fallback_chain.clone();
@@ -5537,7 +11321,18 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     "llm",
                     "rate-limit cooldown: waiting {delay_ms}ms before request"
                 );
-                sleep_ms_or_llm_cancel(delay_ms, llm_cancel_for_state(state)).await?;
+                if let Err(error) =
+                    sleep_ms_or_llm_cancel(delay_ms, llm_cancel_for_state(state)).await
+                {
+                    self.complete_request_preparation_phase(
+                        state,
+                        turn_started,
+                        0,
+                        &mut request_preparation_recorded_attempts,
+                        TurnPhaseOutcome::Failed,
+                    );
+                    return Err(error);
+                }
             }
             RateLimitAction::UseFallback { reason } => {
                 let mx = &self.matrixone;
@@ -5565,13 +11360,21 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         );
                     }
                     FallbackOutcome::AllExhausted { chain_len } => {
-                        return Err(astra_core::ClassifiedError::new(
+                        let error = astra_core::ClassifiedError::new(
                             astra_core::ErrorKind::RateLimit,
                             format!(
                                 "Rate limit cooldown requires a same-owner fallback, but all {chain_len} configured candidates are unavailable ({})",
                                 reason.as_str()
                             ),
-                        ));
+                        );
+                        self.complete_request_preparation_phase(
+                            state,
+                            turn_started,
+                            0,
+                            &mut request_preparation_recorded_attempts,
+                            TurnPhaseOutcome::Failed,
+                        );
+                        return Err(error);
                     }
                 }
             }
@@ -5579,21 +11382,99 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 reason,
                 reset_in_ms,
             } => {
-                return Err(astra_core::ClassifiedError::new(
+                let error = astra_core::ClassifiedError::new(
                     astra_core::ErrorKind::RateLimit,
                     format!(
                         "Rate limit cooldown active ({}). Resets in {}s. Try again later.",
                         reason.as_str(),
                         reset_in_ms / 1000
                     ),
-                ));
+                );
+                self.complete_request_preparation_phase(
+                    state,
+                    turn_started,
+                    0,
+                    &mut request_preparation_recorded_attempts,
+                    TurnPhaseOutcome::Failed,
+                );
+                return Err(error);
             }
         }
 
         // ── 2. Build messages ───────────────────────────────────────────
+        let user_content = state
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            .and_then(|m| m.get("content").and_then(Value::as_str))
+            .unwrap_or("")
+            .to_string();
+
         let final_answer_settlement_text_only = state.hooks.completion_settlement.text_only;
-        let effective_restricted = self.compute_effective_restricted(state, true);
+        let work_settlement_only = state.hooks.completion_settlement.work_settlement_only;
+        let cache_cap =
+            astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider_model(
+                llm_cfg.cache_capability,
+                &llm_cfg.provider,
+                &llm_cfg.model_name,
+            );
+        // A Work-bound run keeps one stable declaration surface for strict-
+        // history providers. This is presentation/cache state only; the
+        // current-round synthesis hint below remains the scope gate for the
+        // final durable Work authorization read.
+        let preserve_final_synthesis_wire_surface =
+            matches!(
+                cache_cap.protocol,
+                astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch
+            ) && state.runtime_tool_executor.as_deref().is_some_and(
+                crate::server::runtime_tool_executor::RuntimeToolExecutor::has_work_binding,
+            );
+        let preserve_text_only_tool_surface = final_answer_settlement_text_only
+            && provider_supports_no_tool_choice(&llm_cfg.provider);
+        let preserve_settlement_wire_surface = work_settlement_only
+            || preserve_text_only_tool_surface
+            || preserve_final_synthesis_wire_surface;
+        let effective_restricted =
+            self.compute_effective_restricted(state, true, preserve_text_only_tool_surface);
+        tracing::debug!(
+            target: "astra::tool_surface",
+            run_id = state.current_run_id.as_deref().unwrap_or_default(),
+            request_allowed_tools = ?state.skills.request_constraints.allowed_tools,
+            request_enabled_tools = ?state.skills.request_constraints.enabled_tools,
+            hard_restricted_tools = ?state.restricted_tools,
+            effective_restricted_tools = ?effective_restricted,
+            provider_allowed_tools = ?self.provider_allowed_tools_snapshot(),
+            "resolved effective request tool restrictions"
+        );
         let visible_tools = self.filtered_runtime_ready_turn_tools(&effective_restricted, state);
+        // The context contract and tool declarations must describe the same
+        // provider-visible surface. At settlement/final-synthesis boundaries
+        // strict-history providers intentionally reuse the preceding schema
+        // bytes even though runtime execution authority has already narrowed.
+        // Feeding the new authority surface into the prompt pipeline while
+        // sending the old schemas creates a mismatched Work protocol and a
+        // false SystemPromptChanged cache break on the final answer round.
+        let settlement_wire_tools = settlement_wire_tool_schemas(
+            final_answer_settlement_text_only,
+            work_settlement_only,
+            preserve_settlement_wire_surface,
+            &state.sticky_tool_schemas,
+            &visible_tools,
+        );
+        let context_tool_surface =
+            provider_context_tool_surface(&settlement_wire_tools, &visible_tools);
+        tracing::debug!(
+            target: "astra::tool_surface",
+            run_id = state.current_run_id.as_deref().unwrap_or_default(),
+            work_planning_bound = self.initial_work_planning_bound,
+            runtime_work_binding = state
+                .runtime_tool_executor
+                .as_deref()
+                .is_some_and(crate::server::runtime_tool_executor::RuntimeToolExecutor::has_work_binding),
+            visible_tools = ?astra_turn_core::tool::schema::tool_names_from_schemas(&visible_tools),
+            "resolved authoritative server tool surface"
+        );
 
         // Latch prompt cache config from provider info (once per turn is fine;
         // provider doesn't change within a turn).
@@ -5610,6 +11491,15 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         //   * compaction tier selection
         //   * tier-pruned tool schemas
         // Runtime no longer re-derives any of these.
+        let (prompt_memory_recall, initial_session_memory_entry) = self
+            .memory_context_for_turn(
+                state.session_turn,
+                &user_content,
+                state.memory_extraction_service.clone(),
+            )
+            .await;
+        Self::record_prompt_memory_trace(state, &prompt_memory_recall);
+        let memoria_prefetch_entries = prompt_memory_recall.entries;
         tracing::debug!(
             target: "astra_runtime::server_loop",
             session_id = %self.session_id,
@@ -5617,9 +11507,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             has_session_memory = initial_session_memory_entry.is_some(),
             "turn pipeline: session memory loaded"
         );
-        let turn_pipeline = self.run_turn_pipeline_with_model_limits_and_session_memory(
+        let turn_pipeline = match self.run_turn_pipeline_with_model_limits_and_session_memory(
             state,
-            &visible_tools,
+            context_tool_surface,
             &llm_cfg.provider,
             &llm_cfg.model_name,
             llm_cfg.context_window,
@@ -5628,7 +11518,19 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             initial_session_memory_entry.clone(),
             &memoria_prefetch_entries,
             &user_content,
-        )?;
+        ) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.complete_request_preparation_phase(
+                    state,
+                    turn_started,
+                    0,
+                    &mut request_preparation_recorded_attempts,
+                    TurnPhaseOutcome::Failed,
+                );
+                return Err(error);
+            }
+        };
         let PipelineTurnOutcome {
             system_messages,
             volatile_preamble,
@@ -5670,7 +11572,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 state,
                 &pipeline_messages,
                 &compaction_fixed_context,
-                &visible_tools,
+                context_tool_surface,
                 tier,
                 &llm_cfg,
             )
@@ -5683,7 +11585,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             &pipeline_messages,
             &compact_result,
             &compaction_fixed_context,
-            &visible_tools,
+            context_tool_surface,
             Some(
                 crate::prompts::budget_for_model_with_metadata(
                     Some(&llm_cfg.model_name),
@@ -5700,7 +11602,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             state,
             &context_compactions,
         );
-        if let Some(rerun) = crate::turn::wire_assembly::rerun_with_compaction_memory_for_user_turn(
+        let rerun = match crate::turn::wire_assembly::rerun_with_compaction_memory_for_user_turn(
             compact_result.session_memory_context.as_deref(),
             initial_session_memory_entry.as_ref(),
             None,
@@ -5709,7 +11611,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             |session_memory_entry, memory_entries| {
                 self.run_turn_pipeline_with_model_limits_and_session_memory(
                     state,
-                    &visible_tools,
+                    context_tool_surface,
                     &llm_cfg.provider,
                     &llm_cfg.model_name,
                     llm_cfg.context_window,
@@ -5721,8 +11623,21 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 )
             },
         )
-        .transpose()?
+        .transpose()
         {
+            Ok(rerun) => rerun,
+            Err(error) => {
+                self.complete_request_preparation_phase(
+                    state,
+                    turn_started,
+                    0,
+                    &mut request_preparation_recorded_attempts,
+                    TurnPhaseOutcome::Failed,
+                );
+                return Err(error);
+            }
+        };
+        if let Some(rerun) = rerun {
             debug_assert_eq!(rerun.tier, tier);
             final_system_messages = rerun.system_messages;
             final_volatile_preamble = rerun.volatile_preamble;
@@ -5734,21 +11649,70 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         final_volatile_preamble.extend(compact_result.runtime_contexts.iter().filter_map(
             |context| crate::turn::wire_assembly::required_runtime_preamble_message(context),
         ));
+        self.reconcile_pending_work_graph_mutations(state);
+        if let Some(context) = self.active_work_attempt_start_context(state) {
+            final_volatile_preamble.push(context);
+        }
+        // The mutation obligation is the later scheduling boundary and must
+        // follow the generic active-attempt instruction when both are present.
+        if let Some(context) = self.pending_work_graph_mutation_context(state) {
+            final_volatile_preamble.push(context);
+        }
+        if let Some(context) = self.read_only_effect_context() {
+            final_volatile_preamble.push(context);
+        }
+        if let Some(context) = Self::final_work_synthesis_context(state) {
+            final_volatile_preamble.push(context);
+        }
+        let cache_candidate_tools = final_pipeline_tool_schemas.clone();
+        let mut final_tools = if let Some(settlement_tools) = settlement_wire_tools {
+            settlement_tools
+        } else {
+            crate::turn::llm::context::stabilize_tool_schemas_for_cache(
+                &cache_candidate_tools,
+                &state.sticky_tool_schemas,
+                &visible_tools,
+                cache_cap,
+                state.llm_rounds_completed,
+            )
+        };
+        let tool_execution_available = tool_execution_available_for_action_first(
+            final_answer_settlement_text_only,
+            &final_tools,
+            &visible_tools,
+        );
+        maybe_append_output_cap_action_first_context(
+            state,
+            &mut final_volatile_preamble,
+            tool_execution_available,
+        );
         // Parity with the bridge path: when Memoria returned a boundary, the
         // conversation was trimmed mid-task, so nudge the model to resume
         // instead of asking the user a follow-up question.
         let mut compacted_messages = compact_result.messages;
+        // Re-inject exact file contents only when this preparation pass
+        // actually crossed a compaction boundary. Ordinary tool rounds retain
+        // the stable prompt path; a later real boundary gets a fresh bounded
+        // attachment because its rewritten history may no longer contain the
+        // prior file result.
+        // Every stateless request produced from a real compaction boundary
+        // needs the current-turn frame again. The wire assembler naturally
+        // emits no file attachment when the bounded recent-read set is empty.
+        // Do not latch this by user turn: a later boundary can remove the
+        // frame and prior tool result from the next request's history.
+        let compaction_boundary_hit = compact_result.boundary.is_some();
         crate::turn::wire_assembly::maybe_append_continuation_prompt(
             &mut compacted_messages,
             compact_result.boundary.is_some(),
         );
-        let llm_messages = self.assemble_llm_messages(
+        let mut llm_messages = self.assemble_llm_messages(
             final_system_messages,
             final_volatile_preamble,
             compacted_messages,
             state,
             &llm_cfg,
             &cache_cfg,
+            compaction_boundary_hit,
         );
 
         // ── 3. Call LLM ─────────────────────────────────────────────────
@@ -5759,39 +11723,25 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         );
         let max_output_tokens = crate::prompts::capped_output_tokens(&budget);
 
-        let cache_cap =
-            astra_turn_core::cache_placement::CacheCapability::from_explicit_or_provider_model(
-                llm_cfg.cache_capability,
-                &llm_cfg.provider,
-                &llm_cfg.model_name,
-            );
-        let mut final_tools = if final_answer_settlement_text_only {
-            Vec::new()
-        } else {
-            crate::turn::llm::context::stabilize_tool_schemas_for_cache(
-                &final_pipeline_tool_schemas,
-                &state.sticky_tool_schemas,
-                &visible_tools,
-                cache_cap,
-                state.llm_rounds_completed,
-            )
-        };
-        if !final_answer_settlement_text_only {
-            state.sticky_tool_schemas = final_tools.clone();
-        }
+        // A text-only settlement changes execution authority, not the
+        // provider-visible schema prefix. Keep the schemas stable for cache
+        // reuse, but use the protocol's explicit no-tool choice whenever the
+        // provider supports it. The local admission gate remains a defense in
+        // depth for providers that ignore the wire choice or return malformed
+        // tool calls.
+        let use_no_tool_choice = preserve_text_only_tool_surface;
+        tracing::debug!(
+            target: "astra::tool_surface",
+            run_id = state.current_run_id.as_deref().unwrap_or_default(),
+            final_tools = ?final_tools.iter().filter_map(tool_schema_name).collect::<Vec<_>>(),
+            "resolved final wire tool surface"
+        );
         // Annotate tool schemas with cache_control for Anthropic.
         crate::turn::llm::context::annotate_tool_schemas_for_cache(
             &mut final_tools,
             &cache_cfg,
             &self.always_load_tool_names,
         );
-        // Runtime admission must mirror the exact tool schemas sent on the
-        // wire. Pipeline pruning, sticky schema stabilization, and cache
-        // annotation all happen after the broad edge-tool candidate set is
-        // built, so syncing earlier can admit or reject tools the model did
-        // not actually see this turn.
-        self.sync_valid_tools_to_wire_surface_for_state(&final_tools, state);
-        self.last_turn_tool_schemas = clone_server_fork_tool_schemas(&final_tools);
         let final_wire_budget_status =
             if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
                 crate::turn::llm::context::augment_manifest_trace_with_wire_detail(
@@ -5831,27 +11781,137 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 "final wire estimate exceeds the model limit; provider tokenizer remains authoritative"
             );
         }
-        state.pinned_tool_schema_tokens =
-            u64::try_from(final_wire_budget_status.estimated_tool_schema_tokens)
-                .unwrap_or(u64::MAX);
+        // A synthetic Work admission is a durable control-plane transition,
+        // not a provider request. Do not publish its pre-admission tool
+        // surface as sticky/cache state: the next round is the first real
+        // provider boundary and must commit only the exact surface it sends.
+        // Otherwise binding Work can look like a cache break (for example,
+        // removing an optional coordinator tool) even though no request used
+        // the stale surface.
+        if !final_answer_settlement_text_only {
+            state.sticky_tool_schemas = final_tools.clone();
+        }
+        if let Some(pipeline_session) = state.pipeline_session.as_mut() {
+            pipeline_session.replace_pending_wire_tool_schemas(&final_tools);
+        }
+        // Runtime admission must mirror the exact tool schemas sent on the
+        // wire. Pipeline pruning, sticky schema stabilization, and cache
+        // annotation all happen after the broad edge-tool candidate set is
+        // built, so syncing earlier can admit or reject tools the model did
+        // not actually see this turn.
+        self.sync_valid_tools_to_wire_surface_for_state(&final_tools, state);
+        if preserve_final_synthesis_wire_surface {
+            // The provider sees the preceding declaration for strict-history
+            // cache continuity, but schemas are not execution authority. A
+            // tool that disappeared with the completed attempt must remain
+            // inadmissible even when its old declaration stays on the wire.
+            self.retain_valid_tools_for_authority_surface(&visible_tools);
+        }
+        self.last_turn_tool_schemas = clone_server_fork_tool_schemas(&final_tools);
+        let wire_authorized_tool_names: HashSet<String> = final_tools
+            .iter()
+            .filter_map(|schema| tool_schema_name(schema).map(str::to_string))
+            .collect();
+        state.pinned_tool_schema_tokens = estimate_tool_schema_tokens(&final_tools);
         state.last_turn_policy =
             TurnInteractionPolicy::from_tool_schemas(self.turn_interaction_mode(), &final_tools);
+        // Establishing a durable graph is a small structured transition, not
+        // task execution.  Keep the provider's first response concise and
+        // prompt so the user gets a live task board before expensive task
+        // reasoning starts. The semantic decision remains LLM-driven; this
+        // only selects deterministic execution behavior after that decision.
+        let canonical_work_establishment_pending =
+            !final_answer_settlement_text_only && self.canonical_work_establishment_pending(state);
+        let force_provider_convergence =
+            std::mem::take(&mut state.provider_adaptation.force_next_thinking_off);
+        let provider_attempt_boundary =
+            ProviderAttemptBoundary::new(force_provider_convergence, use_no_tool_choice);
+        let primary_thinking = if canonical_work_establishment_pending
+            || preserve_text_only_tool_surface
+            || provider_attempt_boundary.forces_thinking_off()
+        {
+            ThinkingConfig::Off
+        } else {
+            state.thinking.clone()
+        };
 
-        // Output token escalation: if finish_reason is "length", retry once
-        // with a higher max_output_tokens (up to 4× the initial budget).
+        // Output token recovery: if finish_reason is "length", make at most
+        // one catalog/context-valid probe. Never turn an already authoritative
+        // provider budget into an arbitrary 4× request; a repeated typed cap
+        // settles as an incomplete, resumable result below.
         let mut effective_max_output = max_output_tokens;
+        let context_output_limit = final_wire_budget_status
+            .model_limit
+            .saturating_sub(final_wire_budget_status.estimated_input_tokens)
+            .saturating_sub(final_wire_budget_status.reserved_protocol_tokens);
+        let output_cap_retry_limit = output_cap_retry_limit(
+            max_output_tokens,
+            llm_cfg.max_completion_tokens,
+            context_output_limit,
+        );
         let mut attempt_in_round = 0_u32;
+        let mut last_length_output_tokens: Option<u64> = None;
+        let mut output_cap_continuations = 0_u8;
+        let mut output_cap_partial_text = String::new();
+        let mut output_cap_partial_reasoning = String::new();
+        // A logical host turn may contain a bounded provider retry.  Keep
+        // accounting for every physical request while `result` below remains
+        // the authoritative final response payload.
+        let mut physical_attempt_usage = crate::turn::token_usage::TokenUsage::default();
+        let mut physical_attempt_usage_reported = false;
         let mut streamed_text = String::new();
         let mut streamed_reasoning = String::new();
         let mut first_stream_update_turn_ms: Option<u64> = None;
         let mut first_visible_text_turn_ms: Option<u64> = None;
+        // A coordinator's streamed answer prose is provisional while canonical Work
+        // has a live binding.  Buffer it until the server has inspected the
+        // durable queue below: otherwise a model can visibly claim success,
+        // then the scheduler discovers and starts work that was never done.
+        // Tool and task-progress events remain live, so this does not turn a
+        // long Work execution into a silent UI.
+        // An explicitly enabled semantic Work preflight may run beside the
+        // primary provider request. Keep that response provisional until the
+        // typed decision is reconciled: if the judge requires a graph, no
+        // provider prose/tool call may leak before the server-owned
+        // `start_work` boundary; if it does not, the buffered response is
+        // projected normally. The default boundary-only policy leaves this
+        // pending handle empty for ordinary text turns.
+        let semantic_admission_pending = self.pending_work_admission_judge.is_some();
+        let buffer_root_text_for_active_work = state.runtime_tool_executor.as_deref().is_some_and(
+            crate::server::runtime_tool_executor::RuntimeToolExecutor::has_work_binding,
+        ) || canonical_work_establishment_pending
+            || semantic_admission_pending;
         let started_with_action_window = self.terminal_handoff_window.is_open();
         let mut action_window_updates = Vec::new();
-        let result = loop {
+        let mut canonical_work_establishment_retries = 0_u32;
+        let mut result = loop {
+            let repeated_provider_output_cap;
+            // A retry begins a new physical provider attempt.  Its preparation
+            // receipt must not inherit the elapsed inference time of the
+            // preceding attempt; the first attempt intentionally starts at
+            // turn admission so it also accounts for initial request setup.
+            let request_attempt_started_at = if attempt_in_round == 0 {
+                turn_started
+            } else {
+                Instant::now()
+            };
             let attempt_label = llm_main_attempt_label(attempt_in_round);
-            let admission_estimated_tokens = final_wire_budget_status
-                .admission_estimated_input_tokens
-                .saturating_add(effective_max_output);
+            // Admission still accounts for the volatile tail's tokens, but
+            // this early estimate is never reused as provider wire context.
+            let admission_budgeted_llm_messages = self.messages_with_current_execution_time_budget(
+                &llm_messages,
+                state.current_round_index,
+            );
+            let admission_llm_messages = admission_budgeted_llm_messages
+                .as_deref()
+                .unwrap_or(llm_messages.as_slice());
+            let admission_estimated_tokens = crate::prompts::estimate_tokens(
+                admission_llm_messages,
+                state.pinned_tool_schema_tokens as usize,
+                0,
+            )
+            .saturating_add(effective_max_output);
+            drop(admission_budgeted_llm_messages);
             match crate::llm_provider_admission::admit_llm_provider_request(
                 self.shared_pool.as_ref(),
                 &llm_cfg.provider,
@@ -5873,6 +11933,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         llm_main_error_outcome(&error),
                         admission_estimated_tokens as u64,
                     );
+                    self.complete_request_preparation_phase(
+                        state,
+                        request_attempt_started_at,
+                        attempt_in_round,
+                        &mut request_preparation_recorded_attempts,
+                        TurnPhaseOutcome::Failed,
+                    );
                     return Err(error);
                 }
             }
@@ -5885,15 +11952,170 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     attempt_wire_budget_status,
                 );
             }
+            if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
+                crate::turn::llm::context::clear_manifest_provider_request(trace);
+            }
+            if let Some(buffer) = state.turn_event_buffer.as_mut() {
+                buffer.set_visible_tool_actions(
+                    crate::turn::llm::context::visible_tool_action_surface(&final_tools),
+                );
+                buffer.set_visible_tool_names(
+                    final_tools
+                        .iter()
+                        .filter_map(tool_schema_name)
+                        .map(str::to_string)
+                        .collect(),
+                );
+            }
+            self.emit_context_meta(
+                &final_system_prompt_breakdown,
+                state.last_llm_context_manifest_trace.as_ref(),
+                &context_compactions,
+                &final_tools,
+            );
+            let run_authority = match self.inference_run_authority(state) {
+                Ok(Some(authority)) => authority,
+                Ok(None) => {
+                    let error = astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ContractViolation,
+                        "durable inference admission failed: Server execution has no durable run authority",
+                    );
+                    self.complete_request_preparation_phase(
+                        state,
+                        request_attempt_started_at,
+                        attempt_in_round,
+                        &mut request_preparation_recorded_attempts,
+                        TurnPhaseOutcome::Failed,
+                    );
+                    return Err(error);
+                }
+                Err(error) => {
+                    self.complete_request_preparation_phase(
+                        state,
+                        request_attempt_started_at,
+                        attempt_in_round,
+                        &mut request_preparation_recorded_attempts,
+                        TurnPhaseOutcome::Failed,
+                    );
+                    return Err(error);
+                }
+            };
+            let durable_ledger = match self.required_inference_ledger(Some(run_authority)) {
+                Ok(ledger) => ledger,
+                Err(error) => {
+                    self.complete_request_preparation_phase(
+                        state,
+                        request_attempt_started_at,
+                        attempt_in_round,
+                        &mut request_preparation_recorded_attempts,
+                        TurnPhaseOutcome::Failed,
+                    );
+                    return Err(error);
+                }
+            };
+            let run_id = match state.current_run_id.clone() {
+                Some(run_id) => run_id,
+                None => {
+                    let error = astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ContractViolation,
+                        "durable inference admission failed: Server execution has no durable run identity",
+                    );
+                    self.complete_request_preparation_phase(
+                        state,
+                        request_attempt_started_at,
+                        attempt_in_round,
+                        &mut request_preparation_recorded_attempts,
+                        TurnPhaseOutcome::Failed,
+                    );
+                    return Err(error);
+                }
+            };
+            let request_context =
+                self.model_request_context_seed(state.last_llm_context_manifest_trace.as_ref());
+            let requested_logical_attempt = attempt_in_round;
+            let durable_invocation = match durable_ledger
+                .admit_with_request_context(
+                    astra_turn_types::InferenceInvocationScope::Run {
+                        session_id: self.session_id.clone(),
+                        run_id,
+                        turn: state.session_turn,
+                        round: prompt_round,
+                        operation_id: "agent_turn".to_string(),
+                        logical_attempt: attempt_in_round,
+                    },
+                    state.inference_purpose,
+                    &llm_cfg.model_name,
+                    llm_cfg
+                        .wire_model_name
+                        .as_deref()
+                        .unwrap_or(&llm_cfg.model_name),
+                    &llm_cfg.provider,
+                    request_context,
+                )
+                .await
+            {
+                Ok(invocation) => invocation,
+                Err(failure) => {
+                    attempt_in_round = failure.logical_attempt;
+                    self.complete_request_preparation_phase(
+                        state,
+                        request_attempt_started_at,
+                        attempt_in_round,
+                        &mut request_preparation_recorded_attempts,
+                        TurnPhaseOutcome::Failed,
+                    );
+                    return Err(failure.error);
+                }
+            };
+            attempt_in_round = match reconcile_durable_logical_attempt(
+                requested_logical_attempt,
+                durable_invocation.logical_attempt(),
+            ) {
+                Ok(admitted_attempt) => admitted_attempt,
+                Err(error) => {
+                    self.complete_request_preparation_phase(
+                        state,
+                        request_attempt_started_at,
+                        requested_logical_attempt,
+                        &mut request_preparation_recorded_attempts,
+                        TurnPhaseOutcome::Failed,
+                    );
+                    durable_invocation.finish_error(&error).await?;
+                    return Err(error);
+                }
+            };
+            if attempt_in_round != requested_logical_attempt {
+                tracing::info!(
+                    stage = "logical_invocation_admission_retry_identity",
+                    requested_logical_attempt,
+                    admitted_logical_attempt = attempt_in_round,
+                    "host advanced to the authoritative recovered inference identity"
+                );
+            }
+            // This tail is volatile request context. Sample it only after the
+            // provider and durable-invocation admission waits above, then use
+            // that exact snapshot for both prompt truth and the wire request.
+            // The hard client budget is sampled again at the later call edge.
+            let budgeted_llm_messages = self.messages_with_current_execution_time_budget(
+                &llm_messages,
+                state.current_round_index,
+            );
+            let attempt_llm_messages = budgeted_llm_messages
+                .as_deref()
+                .unwrap_or(llm_messages.as_slice());
+            // Attempt-keyed prompt truth is created only after durable
+            // admission chooses the authoritative logical identity. The
+            // cancelled N recovery fact must never own the request artifact
+            // that is physically sent as N+1.
             let prompt_request_plan =
-                astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
+                match astra_services::plan_prompt_request(astra_services::PromptRequestPlanInput {
                     user_id: &self.user_id,
                     session_id: &self.session_id,
                     turn: state.session_turn,
                     round: prompt_round,
                     attempt: attempt_in_round,
                     source: "server_loop_host",
-                    messages: &llm_messages,
+                    messages: attempt_llm_messages,
                     tools: &final_tools,
                     max_output_tokens: Some(effective_max_output),
                 })
@@ -5902,15 +12124,24 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         astra_core::ErrorKind::ContractViolation,
                         format!("failed to plan prompt delta projection: {error}"),
                     )
-                })?;
-            if let Some(trace) = state.last_llm_context_manifest_trace.as_mut() {
-                crate::turn::llm::context::clear_manifest_provider_request(trace);
-            }
-            self.emit_context_meta(
-                &final_system_prompt_breakdown,
-                state.last_llm_context_manifest_trace.as_ref(),
-                &context_compactions,
-            );
+                }) {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        self.complete_request_preparation_phase(
+                            state,
+                            request_attempt_started_at,
+                            attempt_in_round,
+                            &mut request_preparation_recorded_attempts,
+                            TurnPhaseOutcome::Failed,
+                        );
+                        // Durable admission already owns this authoritative
+                        // attempt. If attempt-keyed artifact planning fails
+                        // before provider I/O, terminalize that exact identity
+                        // instead of leaving an admitted orphan.
+                        durable_invocation.finish_error(&error).await?;
+                        return Err(error);
+                    }
+                };
             record_full_llm_request_event(
                 state,
                 self.full_llm_capture,
@@ -5920,7 +12151,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 &llm_cfg.model_name,
                 &llm_cfg.provider,
                 attempt_in_round,
-                &llm_messages,
+                attempt_llm_messages,
                 &final_tools,
                 Some(effective_max_output),
             );
@@ -5941,52 +12172,45 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 prompt_request_plan,
             )
             .await;
-            let durable_ledger = self.required_inference_ledger()?;
-            let run_id = state.current_run_id.clone().ok_or_else(|| {
-                astra_core::ClassifiedError::new(
-                    astra_core::ErrorKind::ContractViolation,
-                    "durable inference admission failed: Server execution has no durable run identity",
-                )
-            })?;
-            let request_context =
-                crate::turn::llm::context::model_request_context_seed_from_manifest(
-                    astra_services::ModelRequestTopology::ServerOnly,
-                    state.last_llm_context_manifest_trace.as_ref(),
-                );
-            let durable_invocation = durable_ledger
-                .admit_with_request_context(
-                    astra_turn_types::InferenceInvocationScope::Run {
-                        session_id: self.session_id.clone(),
-                        run_id,
-                        turn: state.session_turn,
-                        round: prompt_round,
-                        operation_id: "agent_turn".to_string(),
-                        logical_attempt: attempt_in_round,
-                    },
-                    state.inference_purpose,
-                    &llm_cfg.model_name,
-                    llm_cfg
-                        .wire_model_name
-                        .as_deref()
-                        .unwrap_or(&llm_cfg.model_name),
-                    &llm_cfg.provider,
-                    request_context,
-                )
-                .await?;
+            let attempt_label = llm_main_attempt_label(attempt_in_round);
             state
                 .step_recorder
                 .begin_llm_round(&llm_cfg.model_name, state.inference_purpose);
             let llm_round_start = std::time::Instant::now();
+            self.complete_request_preparation_phase(
+                state,
+                request_attempt_started_at,
+                attempt_in_round,
+                &mut request_preparation_recorded_attempts,
+                TurnPhaseOutcome::Succeeded,
+            );
             let llm_cancel = llm_cancel_for_state(state);
             let mut attempt_first_stream_update_ms: Option<u64> = None;
             let mut attempt_first_visible_text_ms: Option<u64> = None;
+            // Carry the absolute monotonic deadline across callback construction;
+            // conversion to a relative client budget happens only immediately
+            // before the call below.
+            let execution_time_budget = self.execution_time_budget;
             let r = {
                 let mut attempt_text = String::new();
                 let mut attempt_reasoning = String::new();
+                let mut pending_live_reasoning = String::new();
+                let mut last_live_reasoning_flush = Instant::now();
                 let mut first_streamed_tool_index = None;
                 let mut on_stream_update = |update: LlmStreamUpdate| match update {
                     LlmStreamUpdate::Text(content) => {
-                        if !content.is_empty() {
+                        if !pending_live_reasoning.is_empty() {
+                            let pending = std::mem::take(&mut pending_live_reasoning);
+                            self.emit_progress_event(json!({
+                                "type": "reasoning_delta",
+                                "content": &pending,
+                            }));
+                            streamed_reasoning.push_str(&pending);
+                            last_live_reasoning_flush = Instant::now();
+                        }
+                        let has_visible_text =
+                            crate::turn::llm::client::text_has_actionable_content(&content);
+                        if has_visible_text {
                             attempt_first_stream_update_ms.get_or_insert_with(|| {
                                 llm_round_start.elapsed().as_millis() as u64
                             });
@@ -5994,9 +12218,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                                 .get_or_insert_with(|| turn_started.elapsed().as_millis() as u64);
                         }
                         attempt_text.push_str(&content);
+                        if buffer_root_text_for_active_work {
+                            return;
+                        }
                         if self.terminal_handoff_window.is_open() {
                             action_window_updates.push(LlmStreamUpdate::Text(content.clone()));
-                            if !content.is_empty() {
+                            if has_visible_text {
                                 self.terminal_handoff_window.close();
                                 attempt_first_visible_text_ms.get_or_insert_with(|| {
                                     llm_round_start.elapsed().as_millis() as u64
@@ -6012,7 +12239,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                             }
                             return;
                         }
-                        if !content.is_empty() {
+                        if has_visible_text {
                             attempt_first_visible_text_ms.get_or_insert_with(|| {
                                 llm_round_start.elapsed().as_millis() as u64
                             });
@@ -6047,6 +12274,12 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                                 .get_or_insert_with(|| turn_started.elapsed().as_millis() as u64);
                         }
                         attempt_reasoning.push_str(&content);
+                        // Reasoning is an explicitly provisional preview, not
+                        // a durable success claim. Keep it live while Work
+                        // admission or execution is pending; only answer text
+                        // needs the settlement gate. Buffering both made the
+                        // UI silent for the whole inference and then emitted a
+                        // misleading sub-second Thought after completion.
                         if self.terminal_handoff_window.is_open() {
                             action_window_updates.push(LlmStreamUpdate::Reasoning(content));
                             return;
@@ -6057,11 +12290,20 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         if let Some(suffix) = attempt_reasoning.strip_prefix(&streamed_reasoning)
                             && !suffix.is_empty()
                         {
-                            self.emit_progress_event(json!({
-                                "type": "reasoning_delta",
-                                "content": suffix,
-                            }));
-                            streamed_reasoning.push_str(suffix);
+                            pending_live_reasoning.clear();
+                            pending_live_reasoning.push_str(suffix);
+                            if streamed_reasoning.is_empty()
+                                || pending_live_reasoning.len() >= 8 * 1024
+                                || last_live_reasoning_flush.elapsed() >= Duration::from_millis(250)
+                            {
+                                let pending = std::mem::take(&mut pending_live_reasoning);
+                                self.emit_progress_event(json!({
+                                    "type": "reasoning_delta",
+                                    "content": &pending,
+                                }));
+                                streamed_reasoning.push_str(&pending);
+                                last_live_reasoning_flush = Instant::now();
+                            }
                         } else if streamed_reasoning.is_empty() {
                             self.emit_progress_event(json!({
                                 "type": "reasoning_delta",
@@ -6071,6 +12313,15 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         }
                     }
                     LlmStreamUpdate::ToolCall { index, tool_call } => {
+                        if !pending_live_reasoning.is_empty() {
+                            let pending = std::mem::take(&mut pending_live_reasoning);
+                            self.emit_progress_event(json!({
+                                "type": "reasoning_delta",
+                                "content": &pending,
+                            }));
+                            streamed_reasoning.push_str(&pending);
+                            last_live_reasoning_flush = Instant::now();
+                        }
                         if !self.terminal_handoff_window.is_open() {
                             return;
                         }
@@ -6094,35 +12345,114 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         }
                     }
                 };
-                call_llm_and_collect_with_stream_callback(
-                    LlmCall {
-                        purpose: state.inference_purpose,
-                        messages: &llm_messages,
-                        tools: &final_tools,
-                        cache_capability: llm_cfg.cache_capability,
-                        route: LlmExecutionRoute {
-                            model_name: &llm_cfg.model_name,
-                            wire_model_name: llm_cfg.wire_model_name.as_deref(),
-                            api_key: &llm_cfg.api_key,
-                            base_url: &llm_cfg.base_url,
-                            provider: &llm_cfg.provider,
-                            header_overrides: (!llm_cfg.header_overrides.is_empty())
-                                .then_some(&llm_cfg.header_overrides),
-                            request_body_overrides: llm_cfg.request_body_overrides.as_ref(),
-                            completions_url_override: llm_cfg.completions_url_override.as_deref(),
-                            request_timeout: llm_cfg.request_timeout,
-                        },
-                        max_output_tokens: Some(effective_max_output),
-                        temperature: None,
-                        has_fallback,
-                        thinking: &state.thinking,
+                let call = LlmCall {
+                    purpose: state.inference_purpose,
+                    messages: attempt_llm_messages,
+                    tools: &final_tools,
+                    cache_capability: llm_cfg.cache_capability,
+                    route: LlmExecutionRoute {
+                        model_name: &llm_cfg.model_name,
+                        wire_model_name: llm_cfg.wire_model_name.as_deref(),
+                        api_key: &llm_cfg.api_key,
+                        base_url: &llm_cfg.base_url,
+                        provider: &llm_cfg.provider,
+                        header_overrides: (!llm_cfg.header_overrides.is_empty())
+                            .then_some(&llm_cfg.header_overrides),
+                        request_body_overrides: llm_cfg.request_body_overrides.as_ref(),
+                        completions_url_override: llm_cfg.completions_url_override.as_deref(),
+                        request_timeout: llm_cfg.request_timeout,
                     },
-                    llm_cancel,
-                    Some(&mut on_stream_update),
-                    Some(durable_invocation.attempt_observer()),
-                )
-                .await
+                    max_output_tokens: Some(effective_max_output),
+                    temperature: None,
+                    has_fallback,
+                    thinking: &primary_thinking,
+                };
+                // Take the relative duration at the last common boundary before
+                // invoking the provider. Prompt preparation and durable-attempt
+                // admission above may await; sampling earlier would replenish
+                // that elapsed time even though the run deadline is monotonic.
+                let provider_work_budget = match Self::provider_work_budget_at_client_boundary(
+                    execution_time_budget,
+                    provider_attempt_boundary,
+                ) {
+                    Ok(budget) => budget,
+                    Err(error) => {
+                        // Durable admission already owns this invocation. If
+                        // the run expired during preparation, terminalize that
+                        // exact identity without sending a provider request.
+                        durable_invocation.finish_error(&error).await?;
+                        return Err(error);
+                    }
+                };
+                let provider_result = match (provider_work_budget, use_no_tool_choice) {
+                    (Some(budget), true) => {
+                        call_llm_and_collect_with_stream_callback_and_budget_and_no_tool_choice(
+                            call,
+                            llm_cancel,
+                            Some(&mut on_stream_update),
+                            Some(durable_invocation.attempt_observer()),
+                            budget,
+                        )
+                        .await
+                    }
+                    (Some(budget), false) => {
+                        call_llm_and_collect_with_stream_callback_and_budget(
+                            call,
+                            llm_cancel,
+                            Some(&mut on_stream_update),
+                            Some(durable_invocation.attempt_observer()),
+                            budget,
+                        )
+                        .await
+                    }
+                    (None, true) => {
+                        call_llm_and_collect_with_stream_callback_and_no_tool_choice(
+                            call,
+                            llm_cancel,
+                            Some(&mut on_stream_update),
+                            Some(durable_invocation.attempt_observer()),
+                        )
+                        .await
+                    }
+                    (None, false) => {
+                        // The schema remains on the wire so the provider can
+                        // reuse the prior prefix. The explicit wire-level choice
+                        // asks for text, while the host-owned admission gate
+                        // still prevents a terminal response from executing a
+                        // tool if a provider violates that contract.
+                        call_llm_and_collect_with_stream_callback(
+                            call,
+                            llm_cancel,
+                            Some(&mut on_stream_update),
+                            Some(durable_invocation.attempt_observer()),
+                        )
+                        .await
+                    }
+                };
+                if !pending_live_reasoning.is_empty() {
+                    let pending = std::mem::take(&mut pending_live_reasoning);
+                    self.emit_progress_event(json!({
+                        "type": "reasoning_delta",
+                        "content": &pending,
+                    }));
+                    streamed_reasoning.push_str(&pending);
+                }
+                provider_result
             };
+            complete_turn_phase(
+                self,
+                state,
+                llm_round_start,
+                TurnPhaseKind::ModelInference,
+                state.current_round_index,
+                attempt_in_round,
+                if r.is_ok() {
+                    TurnPhaseOutcome::Succeeded
+                } else {
+                    TurnPhaseOutcome::Failed
+                },
+                format!("model_inference_{prompt_round}_{attempt_in_round}"),
+            );
 
             let provider_attempts = durable_invocation.provider_attempt_facts().await;
             if !provider_attempts.is_empty() {
@@ -6133,20 +12463,33 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         prompt_round,
                     );
                 }
+                if let Some(buffer) = state.turn_event_buffer.as_mut() {
+                    buffer.set_visible_tool_actions(
+                        crate::turn::llm::context::visible_tool_action_surface(&final_tools),
+                    );
+                    buffer.set_visible_tool_names(
+                        final_tools
+                            .iter()
+                            .filter_map(tool_schema_name)
+                            .map(str::to_string)
+                            .collect(),
+                    );
+                }
                 self.emit_context_meta(
                     &final_system_prompt_breakdown,
                     state.last_llm_context_manifest_trace.as_ref(),
                     &context_compactions,
+                    &final_tools,
                 );
             }
 
             // Context-window errors flow through the accum so the agentic loop's
             // Fatal handler can trigger auto-compaction + retry.
-            let r = match r {
+            let mut r = match r {
                 Ok(r) => r,
                 Err(e)
                     if let Some(reason) =
-                        crate::turn::bridge::llm_stream::fallback_required_reason(&e) =>
+                        crate::turn::model_cooldown::fallback_required_reason(&e) =>
                 {
                     record_llm_main_attempt_metrics(
                         "call",
@@ -6174,7 +12517,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     ));
                 }
                 Err(ref e) if e.kind == astra_core::ErrorKind::ContextWindow => {
-                    durable_invocation.finish_error(e).await?;
                     record_llm_main_attempt_metrics(
                         "call",
                         attempt_label,
@@ -6192,6 +12534,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         "context_window_error",
                         llm_capture_error_response(e),
                     );
+                    durable_invocation.finish_error(e).await?;
                     if !self.session_id.is_empty() {
                         let mut artifact_store = astra_services::DatabaseSessionArtifactStore::new(
                             self.matrixone.clone(),
@@ -6205,7 +12548,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                             &llm_cfg.model_name,
                             &llm_cfg.provider,
                             &e.message,
-                            &llm_messages,
+                            attempt_llm_messages,
                             &final_tools,
                             i64::from(state.llm_rounds_completed),
                             Some(effective_max_output),
@@ -6230,7 +12573,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                             "server_loop_host",
                             &llm_cfg.model_name,
                             &llm_cfg.provider,
-                            &llm_messages,
+                            attempt_llm_messages,
                             &final_tools,
                             Some(effective_max_output),
                             "context_window_error",
@@ -6264,7 +12607,6 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     });
                 }
                 Err(e) => {
-                    durable_invocation.finish_error(&e).await?;
                     record_llm_main_attempt_metrics(
                         "call",
                         attempt_label,
@@ -6282,6 +12624,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         "error",
                         llm_capture_error_response(&e),
                     );
+                    durable_invocation.finish_error(&e).await?;
                     if !self.session_id.is_empty() {
                         let mut artifact_store = astra_services::DatabaseSessionArtifactStore::new(
                             self.matrixone.clone(),
@@ -6295,7 +12638,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                             &llm_cfg.model_name,
                             &llm_cfg.provider,
                             &e.message,
-                            &llm_messages,
+                            attempt_llm_messages,
                             &final_tools,
                             i64::from(state.llm_rounds_completed),
                             Some(effective_max_output),
@@ -6320,7 +12663,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                             "server_loop_host",
                             &llm_cfg.model_name,
                             &llm_cfg.provider,
-                            &llm_messages,
+                            attempt_llm_messages,
                             &final_tools,
                             Some(effective_max_output),
                             "error",
@@ -6337,8 +12680,77 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 }
             };
 
+            let raw_provider_finish_reason = r.finish_reason.clone();
+            let will_retry_for_length;
             {
                 let u = crate::turn::token_usage::TokenUsage::from_partial_json_map(&r.usage);
+                physical_attempt_usage_reported |= !r.usage.is_empty();
+                physical_attempt_usage.input_tokens = physical_attempt_usage
+                    .input_tokens
+                    .saturating_add(u.input_tokens);
+                physical_attempt_usage.cached_input_tokens = physical_attempt_usage
+                    .cached_input_tokens
+                    .saturating_add(u.cached_input_tokens);
+                physical_attempt_usage.cache_creation_tokens = physical_attempt_usage
+                    .cache_creation_tokens
+                    .saturating_add(u.cache_creation_tokens);
+                physical_attempt_usage.output_tokens = physical_attempt_usage
+                    .output_tokens
+                    .saturating_add(u.output_tokens);
+                // Preserve the provider's raw SSE reason in durable capture,
+                // but reconcile lifecycle semantics from typed saturation
+                // evidence. Some compatible endpoints acknowledge a larger
+                // retry cap while repeatedly enforcing the earlier ceiling,
+                // then report `stop` (or no reason) on the regenerated text.
+                // The same non-zero output count after an explicit length
+                // boundary proves that the retry did not gain capacity.
+                repeated_provider_output_cap =
+                    reconcile_repeated_provider_output_cap(&mut r, last_length_output_tokens);
+                if repeated_provider_output_cap {
+                    tracing::warn!(
+                        output_tokens = u.output_tokens,
+                        requested_output_tokens = effective_max_output,
+                        raw_finish_reason = ?raw_provider_finish_reason,
+                        "provider repeated a known truncated output ceiling"
+                    );
+                }
+                if r.lifecycle_finish_reason() == Some("length") && r.tool_calls.is_empty() {
+                    last_length_output_tokens = Some(u.output_tokens);
+                }
+                will_retry_for_length = !repeated_provider_output_cap
+                    && r.lifecycle_finish_reason() == Some("length")
+                    && !r.tool_calls.is_empty()
+                    && effective_max_output < output_cap_retry_limit;
+                let llm_attempt_outcome = llm_main_success_outcome(&r, will_retry_for_length);
+                // Provider evidence and attempt metrics describe the call itself,
+                // so publish them before durable inference settlement. A ledger
+                // write/transfer failure must not turn a valid provider response
+                // into an apparently missing or partial exchange capture.
+                record_llm_main_attempt_metrics(
+                    "call",
+                    attempt_label,
+                    llm_attempt_outcome,
+                    admission_estimated_tokens as u64,
+                );
+                record_full_llm_response_event(
+                    state,
+                    self.full_llm_capture,
+                    &self.session_id,
+                    "server_loop_host",
+                    &llm_cfg.model_name,
+                    &llm_cfg.provider,
+                    attempt_in_round,
+                    llm_attempt_outcome,
+                    json!({
+                        "finish_reason": raw_provider_finish_reason,
+                        "effective_finish_reason": r.lifecycle_finish_reason(),
+                        "provider_finish_reason": r.finish_reason.clone(),
+                        "full_text": r.full_text.clone(),
+                        "reasoning": r.reasoning.clone(),
+                        "tool_calls": r.tool_calls.clone(),
+                        "usage": r.usage.clone(),
+                    }),
+                );
                 durable_invocation.finish_result(&r).await?;
                 crate::llm_provider_admission::record_llm_provider_admission_calibration(
                     admission_estimated_tokens as u64,
@@ -6355,40 +12767,83 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 );
             }
 
-            let will_retry_for_length = r.finish_reason.as_deref() == Some("length")
-                && effective_max_output < max_output_tokens * 4;
-            let llm_attempt_outcome = llm_main_success_outcome(&r, will_retry_for_length);
-            record_llm_main_attempt_metrics(
-                "call",
-                attempt_label,
-                llm_attempt_outcome,
-                admission_estimated_tokens as u64,
-            );
-            record_full_llm_response_event(
+            // A convergence attempt is one logical provider request, not a
+            // new retry budget. Its durable attempt is already settled above;
+            // do not let host-level work-establishment, output-cap, or length
+            // continuations silently turn the 30s slice into 60s or more.
+            // The returned response still follows the ordinary admission and
+            // tool-execution path after this provider loop.
+            if !provider_attempt_boundary.allows_host_continuation() {
+                break r;
+            }
+
+            if self.should_retry_canonical_work_establishment(
                 state,
-                self.full_llm_capture,
-                &self.session_id,
-                "server_loop_host",
-                &llm_cfg.model_name,
-                &llm_cfg.provider,
-                attempt_in_round,
-                llm_attempt_outcome,
-                json!({
-                    "finish_reason": r.finish_reason.clone(),
-                    "full_text": r.full_text.clone(),
-                    "reasoning": r.reasoning.clone(),
-                    "tool_calls": r.tool_calls.clone(),
-                    "usage": r.usage.clone(),
-                }),
-            );
+                &r.tool_calls,
+                canonical_work_establishment_retries,
+            ) {
+                canonical_work_establishment_retries += 1;
+                llm_messages.insert(
+                    0,
+                    Self::canonical_work_establishment_retry_preamble(
+                        canonical_work_establishment_retries,
+                    ),
+                );
+                attempt_in_round = attempt_in_round.checked_add(1).ok_or_else(|| {
+                    astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ContractViolation,
+                        "durable host logical attempt space is exhausted",
+                    )
+                })?;
+                astra_core::agent_warn!(
+                    "work",
+                    "required canonical Work was not established; retrying once with runtime contract (retry={})",
+                    canonical_work_establishment_retries,
+                );
+                continue;
+            }
+            if self.canonical_work_establishment_pending(state) && r.tool_calls.is_empty() {
+                return Err(astra_core::ClassifiedError::new(
+                    astra_core::ErrorKind::ContractViolation,
+                    "canonical Work was required but the provider did not establish it after the bounded retry",
+                ));
+            }
+
+            if r.lifecycle_finish_reason() == Some("length")
+                && r.tool_calls.is_empty()
+                && output_cap_continuations < MAX_OUTPUT_CAP_CONTINUATIONS
+            {
+                output_cap_partial_text = r.full_text.clone();
+                output_cap_partial_reasoning = r.reasoning.clone();
+                append_output_cap_continuation_context(&mut llm_messages, &r.full_text);
+                output_cap_continuations = output_cap_continuations.saturating_add(1);
+                attempt_in_round = attempt_in_round.checked_add(1).ok_or_else(|| {
+                    astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ContractViolation,
+                        "durable host logical attempt space is exhausted",
+                    )
+                })?;
+                astra_core::agent_warn!(
+                    "llm",
+                    "output cap reached; requesting one bounded continuation before settling"
+                );
+                continue;
+            }
 
             if will_retry_for_length {
                 if started_with_action_window {
                     action_window_updates.clear();
                 }
                 let prev = effective_max_output;
-                effective_max_output = (effective_max_output * 2).min(max_output_tokens * 4);
-                attempt_in_round = attempt_in_round.saturating_add(1);
+                effective_max_output = effective_max_output
+                    .saturating_mul(2)
+                    .min(output_cap_retry_limit);
+                attempt_in_round = attempt_in_round.checked_add(1).ok_or_else(|| {
+                    astra_core::ClassifiedError::new(
+                        astra_core::ErrorKind::ContractViolation,
+                        "durable host logical attempt space is exhausted",
+                    )
+                })?;
                 astra_core::agent_warn!(
                     "llm",
                     "output truncated (finish_reason=length), escalating max_output_tokens {} → {}",
@@ -6399,6 +12854,72 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             }
             break r;
         };
+
+        // The continuation request carries only the suffix returned by the
+        // provider. Reconstruct one logical response for the accumulator and
+        // finalization while keeping raw provider-attempt capture unchanged.
+        if !output_cap_partial_text.is_empty() {
+            result.full_text =
+                merge_output_cap_continuation(&output_cap_partial_text, &result.full_text);
+            if !output_cap_partial_reasoning.is_empty() {
+                result.reasoning =
+                    merge_output_cap_continuation(&output_cap_partial_reasoning, &result.reasoning);
+            }
+        }
+
+        if !provider_attempt_boundary.allows_host_continuation()
+            && let Err(error) = validate_provider_convergence_result(
+                provider_attempt_boundary,
+                self.canonical_work_establishment_pending(state),
+                &result,
+                &wire_authorized_tool_names,
+            )
+        {
+            if physical_attempt_usage_reported {
+                let usage = physical_attempt_usage;
+                self.emit_progress_event(json!({
+                    "type": "usage",
+                    "input_tokens": usage.input_tokens,
+                    "cached_input_tokens": usage.cached_input_tokens,
+                    "cache_creation_tokens": usage.cache_creation_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "total_tokens": usage.total_tokens(),
+                }));
+            }
+            return Err(attach_transport_success_usage(
+                error,
+                &result,
+                physical_attempt_usage_reported.then_some(physical_attempt_usage),
+            ));
+        }
+
+        // A transport success is not an assistant success.  Judge delivery
+        // only after any bounded output-cap continuation has been merged:
+        // a visible first segment is already externally observable and must
+        // never be replayed merely because its suffix was empty.  Conversely,
+        // a logical response with no text and no selected tool is safe for
+        // exactly one thinking-off convergence recovery.
+        if let Err(error) = reject_provider_completion_without_delivery_with_usage(
+            &result,
+            physical_attempt_usage_reported.then_some(physical_attempt_usage),
+        ) {
+            if physical_attempt_usage_reported {
+                let usage = physical_attempt_usage;
+                self.emit_progress_event(json!({
+                    "type": "usage",
+                    "input_tokens": usage.input_tokens,
+                    "cached_input_tokens": usage.cached_input_tokens,
+                    "cache_creation_tokens": usage.cache_creation_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "total_tokens": usage.total_tokens(),
+                }));
+            }
+            return Err(error);
+        }
+
+        remember_output_cap_action_first(state, output_cap_continuations, &result);
+
+        preserve_exhausted_output_cap_as_interruption(state, &result);
 
         if !self.session_id.is_empty() {
             let mut artifact_store =
@@ -6424,6 +12945,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 "success",
                 json!({
                     "finish_reason": result.finish_reason.clone(),
+                    "effective_finish_reason": result.lifecycle_finish_reason(),
                     "full_text": result.full_text.clone(),
                     "reasoning": result.reasoning.clone(),
                     "tool_calls": result.tool_calls.clone(),
@@ -6438,8 +12960,100 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .await;
         }
 
-        let admitted_terminal_tool_calls =
-            self.admit_terminal_tool_calls(&result.tool_calls, result.finish_reason.as_deref());
+        // The primary response is the final typed checkpoint before any
+        // provider tool can run. A speculative Work judge may already be
+        // running; if capacity policy deferred it, start it now only for this
+        // structural batch. The result is awaited before admission, so a
+        // required durable graph cannot race a workspace/network/delegation
+        // side effect. `start_work` is also routed through the bounded judge:
+        // its typed activation is the only place where a response can
+        // accidentally turn a requested plan-only transition into execution.
+        let provider_crosses_work_boundary =
+            provider_batch_starts_work_admission(&result.tool_calls);
+        if provider_crosses_work_boundary {
+            let topology_boundary = provider_batch_has_ambiguous_topology(&result.tool_calls);
+            self.start_work_admission_preflight(state, true, topology_boundary)
+                .await;
+        }
+
+        // The primary request was allowed to overlap the semantic preflight,
+        // but its provider response is not yet an executable boundary. Once
+        // the bounded judge settles, materialize the authoritative graph
+        // before any model-requested tool can enter the tool phase. The
+        // primary response was already durably observed/captured above; the
+        // next loop iteration will use the newly bound, stable Work surface.
+        //
+        // A typed fanout response is an explicit execution carrier. A
+        // completed semantic Work decision is still authoritative for the
+        // user's requested lifecycle; only an unavailable/not-required
+        // decision preserves direct fanout. This prevents the primary model's
+        // first topology guess from silently bypassing durable tracking.
+        // A plain text response stays on the fast path only when no semantic
+        // preflight was started. Once a judge is pending, text is an
+        // executable completion boundary too: waiting is required so a
+        // Required Work decision cannot be discarded by the fast path. Any
+        // provider tool/control batch is an executable boundary and therefore
+        // waits for the typed decision before admission. A decision that has
+        // already completed is also retained even when the provider emitted
+        // no carrier, so Required Work can cross the synthetic boundary.
+        let admission_must_settle = work_admission_boundary_requires_wait(
+            &result.tool_calls,
+            self.pending_work_admission.is_some(),
+            self.pending_work_admission_judge.is_some(),
+        );
+        if admission_must_settle {
+            self.resolve_pending_work_admission(true).await;
+            self.flush_completed_work_admission_phase(state);
+            if let Some(error) = self.work_admission_terminal_error() {
+                tracing::error!(
+                    target: "astra::turn_intent",
+                    operation = "turn_intent.judge",
+                    source = "work_admission_judge",
+                    status = "terminal",
+                    round_index = state.current_round_index,
+                    error = %error,
+                    "unsupported Work admission contract stopped the run before tool dispatch"
+                );
+                return Err(error);
+            }
+        } else {
+            self.resolve_pending_work_admission(false).await;
+            self.flush_completed_work_admission_phase(state);
+            if self.pending_work_admission_judge.is_some() {
+                self.abort_pending_work_admission();
+            }
+        }
+        self.reconcile_work_activation_from_primary(&result.tool_calls);
+        if let Some(admitted_work) = self.admitted_work_turn_result(
+            state,
+            turn_started,
+            &result,
+            Some(physical_attempt_usage),
+        )? {
+            return Ok(admitted_work);
+        }
+
+        // Preserve the provider response as audit evidence, then extend only
+        // the canonical execution batch with a server-owned dispatch when a
+        // durable Work task is ready.  A root model's empty tool batch is not
+        // a lifecycle completion signal.
+        let mut canonical_tool_calls = result.tool_calls.clone();
+        let scheduler_dispatched = self
+            .canonical_work_scheduler_call(state, &result.tool_calls)
+            .await;
+        if let Some(call) = scheduler_dispatched.as_ref() {
+            canonical_tool_calls.push(call.clone());
+        }
+
+        let admitted_terminal_tool_calls = self.admit_terminal_tool_calls_with_completion(
+            state,
+            &canonical_tool_calls,
+            if canonical_tool_calls.is_empty() {
+                result.lifecycle_finish_reason()
+            } else {
+                Some("tool_calls")
+            },
+        );
         let terminal_control_outcome =
             crate::turn::terminal_control::evaluate_terminal_control_actions(
                 &mut self.terminal_handoff_window,
@@ -6452,8 +13066,13 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             crate::turn::terminal_control::TerminalControlOutcome::Requested(_)
         );
         let hold_action_window_projection = self.terminal_handoff_window.is_open();
-        let suppress_source_projection =
-            terminal_handoff_requested || hold_action_window_projection;
+        let suppress_source_projection = terminal_handoff_requested
+            || hold_action_window_projection
+            || scheduler_dispatched.is_some()
+            // A typed Work-required root response is provisional until the
+            // graph has been durably established. Never project a model's
+            // optimistic prose before the lifecycle boundary accepts it.
+            || canonical_work_establishment_pending;
         self.admitted_tool_side_effects_enabled = matches!(
             terminal_control_outcome,
             crate::turn::terminal_control::TerminalControlOutcome::Passthrough
@@ -6497,7 +13116,11 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 self.emit_progress_event(json!({ "type": "reasoning_done" }));
             }
         } else if streamed_reasoning.is_empty() {
-            self.push_reasoning_events(&result.reasoning);
+            // A provider may expose reasoning only in its terminal response.
+            // Replaying that payload after inference is not streaming: it
+            // creates a post-hoc Thought with a fabricated sub-second
+            // duration. Keep the full reasoning in trace/capture, but project
+            // a Thought only when at least one live reasoning update existed.
         } else {
             if let Some(suffix) = result.reasoning.strip_prefix(&streamed_reasoning)
                 && !suffix.is_empty()
@@ -6516,8 +13139,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         {
             state.final_text_streamed = true;
         }
-        if !result.usage.is_empty() {
-            let u = crate::turn::token_usage::TokenUsage::from_partial_json_map(&result.usage);
+        if !physical_attempt_usage.is_empty() {
+            let u = physical_attempt_usage;
             self.emit_progress_event(json!({
                 "type": "usage",
                 "input_tokens": u.input_tokens,
@@ -6534,7 +13157,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             first_visible_text_turn_ms,
             turn_started.elapsed().as_millis() as u64,
         ));
-        let mut accum = Self::result_to_accum(&result);
+        let mut accum = Self::result_to_accum_with_usage(&result, Some(physical_attempt_usage));
+        accum.tool_calls = canonical_tool_calls;
+        accum.has_tool_calls = !accum.tool_calls.is_empty();
         accum.system_prompt_tokens = Some(final_system_prompt_breakdown.total_tokens);
         accum.system_prompt_breakdown = serde_json::to_value(&final_system_prompt_breakdown).ok();
         accum.context_manifest_trace =
@@ -6552,12 +13177,50 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         &mut self,
         state: &AgenticLoopState,
         tool_calls: &[Value],
-    ) -> Vec<astra_turn_core::sse_stream_host::EdgeToolExecResult> {
+    ) -> AdmittedToolCallOutcome {
         if !self.admitted_tool_side_effects_enabled {
-            return Vec::new();
+            tracing::warn!(
+                target: "astra::tool_admission",
+                session_id = %self.session_id,
+                run_id = state.current_run_id.as_deref().unwrap_or_default(),
+                round = state.current_round_index,
+                tool_names = ?tool_calls
+                    .iter()
+                    .filter_map(astra_turn_core::tool::args::shape::tool_call_name)
+                    .collect::<Vec<_>>(),
+                "admitted provider tools were suppressed by terminal control outcome"
+            );
+            return AdmittedToolCallOutcome::default();
+        }
+        if self
+            .execution_time_budget
+            .is_some_and(|budget| budget.remaining().is_zero())
+        {
+            let results = self.edge_action_blocked_results(
+                tool_calls,
+                "execution_time_budget_exhausted",
+                "The run wall-clock budget expired before tool execution; the tool was not executed.",
+            );
+            return AdmittedToolCallOutcome {
+                results,
+                control: AdmittedToolCallControl::FailedClosed,
+            };
         }
         self.emit_admitted_tool_call_events(tool_calls);
-        self.maybe_deliver_edge_bound_tools_via_ledger(state, tool_calls)
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let externally_dispatchable = tool_calls
+            .iter()
+            .filter(|tool_call| {
+                astra_turn_core::tool::args::shape::tool_call_name(tool_call).is_none_or(|name| {
+                    !matches!(
+                        tool_execution_class(name, &registry),
+                        ToolExecutionClass::TurnPipelineIntercept
+                    ) || state.skills.resolver.is_none()
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        self.maybe_deliver_edge_bound_tools_via_ledger(state, &externally_dispatchable)
             .await
     }
 
@@ -6619,7 +13282,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             .unwrap_or("")
             .to_string();
 
-        let effective_restricted = self.compute_effective_restricted(state, false);
+        let effective_restricted = self.compute_effective_restricted(state, false, false);
         let visible_tools = self.filtered_runtime_ready_turn_tools(&effective_restricted, state);
         // We only need the system messages here — the inline summary call
         // reuses the main turn's system prefix, not its tools.
@@ -6815,6 +13478,58 @@ fn tool_name_from_tool_end_event(event_obj: &Map<String, Value>) -> Option<&str>
         .and_then(Value::as_str)
 }
 
+fn server_tool_terminal_event(run_id: Option<&str>, record: &ToolCallRecord) -> Option<Value> {
+    let call_id = record
+        .tool_call_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|call_id| !call_id.is_empty())?;
+    let disposition = record.effective_disposition();
+    let status = match disposition {
+        ToolCallDisposition::Executed if record.ok => "completed",
+        ToolCallDisposition::Executed => "failed",
+        ToolCallDisposition::Rejected => "rejected",
+        ToolCallDisposition::Reused => "completed",
+        ToolCallDisposition::Suppressed | ToolCallDisposition::Deferred => "skipped",
+    };
+    let output = record
+        .result_full
+        .as_deref()
+        .or(record.result_preview.as_deref())
+        .or(record.error.as_deref())
+        .unwrap_or_default();
+    let arguments = record
+        .args_full
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .unwrap_or_else(|| {
+            record
+                .args_preview
+                .as_deref()
+                .map(|preview| Value::String(preview.to_string()))
+                .unwrap_or_else(|| Value::Object(Map::new()))
+        });
+    let mut event = json!({
+        "type": "tool_call_end",
+        "call_id": call_id,
+        "tool": record.name,
+        "status": status,
+        "success": matches!(disposition, ToolCallDisposition::Executed | ToolCallDisposition::Reused) && record.ok,
+        "duration_ms": record.ms,
+        "arguments": arguments,
+        "output": output,
+        "output_summary": record.result_preview,
+        "error": record.error,
+        "error_kind": record.error_kind,
+        "disposition": disposition,
+        "terminal_event_type": record.canonical_terminal_event_type(),
+    });
+    if let Some(run_id) = run_id.map(str::trim).filter(|run_id| !run_id.is_empty()) {
+        event["run_id"] = Value::String(run_id.to_string());
+    }
+    Some(event)
+}
+
 fn json_value_type(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
@@ -6868,6 +13583,15 @@ pub(crate) fn agent_live_event_kind_from_server_sse(event: &Value) -> Option<Age
         }
         "user_intent_applied" => Some(AgentLiveEventKind::Signal(
             AgentLiveSignal::UserIntentApplied {
+                intent_id: event.get("intent_id")?.as_str()?.to_string(),
+                delivery: serde_json::from_value(event.get("delivery")?.clone()).ok()?,
+                status: serde_json::from_value(event.get("status")?.clone()).ok()?,
+                event_index: usize::try_from(event.get("event_index")?.as_u64()?).ok()?,
+                content: event.get("content")?.as_str()?.to_string(),
+            },
+        )),
+        "user_intent_returned" => Some(AgentLiveEventKind::Signal(
+            AgentLiveSignal::UserIntentReturned {
                 intent_id: event.get("intent_id")?.as_str()?.to_string(),
                 delivery: serde_json::from_value(event.get("delivery")?.clone()).ok()?,
                 status: serde_json::from_value(event.get("status")?.clone()).ok()?,
@@ -7153,11 +13877,12 @@ pub(crate) fn progress_event_to_sse(
             "reason": reason,
             "timestamp": ts,
         }),
-        ProgressEventType::Cancelled { reason } => json!({
+        ProgressEventType::Cancelled { reason, origin } => json!({
             "type": "agent_cancelled",
             "agent_id": agent_id,
             "status": "cancelled",
             "reason": reason,
+            "cancellation_origin": origin,
             "timestamp": ts,
         }),
         ProgressEventType::ToolExecuting { tool_name, turn } => json!({
@@ -7334,6 +14059,43 @@ fn edge_tool_delivery_timed_out(
         .any(|result| result.status == "timed_out")
 }
 
+fn canonical_edge_dispatch_result(
+    identity: &astra_services::multi_agent::EdgeDispatchIdentity,
+    expected_edge_agent_id: &str,
+    result_json: &str,
+) -> Result<Value, String> {
+    let result = serde_json::from_str::<astra_thin_client::ToolResultRequest>(result_json)
+        .map_err(|error| format!("invalid ToolResultRequest JSON: {error}"))?;
+    if result.session_id != identity.session_id
+        || result.run_id != identity.run_id
+        || result.turn_chain_id != identity.turn_chain_id
+        || result.request_id != identity.request_id
+    {
+        return Err("durable tool result identity does not match its dispatch".to_string());
+    }
+    if result.edge_agent_id != expected_edge_agent_id {
+        return Err("durable tool result executor custody does not match its dispatch".to_string());
+    }
+    astra_thin_client::tool_result_status_is_error(&result.status)
+        .ok_or_else(|| "durable tool result status is not canonical".to_string())?;
+    let expected_hash = astra_thin_client::ToolResultRequest::compute_result_hash(
+        &result.session_id,
+        &result.run_id,
+        &result.turn_chain_id,
+        &result.request_id,
+        &result.edge_agent_id,
+        &result.status,
+        &result.output,
+        result.duration_ms,
+        result.tool_result_fields.as_ref(),
+    );
+    if result.result_hash != expected_hash {
+        return Err("durable tool result hash does not match its payload".to_string());
+    }
+    serde_json::to_value(result)
+        .map_err(|error| format!("could not project canonical durable tool result: {error}"))
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -7347,6 +14109,915 @@ mod tests {
     use astra_turn_core::edge_ledger::approval_callback_key;
     use astra_turn_core::sse_stream_host::EdgeToolExecResult;
     use std::ffi::OsString;
+
+    #[test]
+    fn execution_time_budget_retry_can_only_tighten_deadline() {
+        let start = tokio::time::Instant::now();
+        let mut budget = RunExecutionTimeBudget::new_at(
+            ExecutionTimeBudget {
+                remaining_seconds: 10,
+            },
+            start,
+        );
+
+        budget.tighten_at(
+            ExecutionTimeBudget {
+                remaining_seconds: 20,
+            },
+            start + Duration::from_secs(2),
+        );
+        assert_eq!(
+            budget.remaining_at(start + Duration::from_secs(2)),
+            Duration::from_secs(8),
+            "a replayed larger relative snapshot must not extend the original deadline"
+        );
+
+        budget.tighten_at(
+            ExecutionTimeBudget {
+                remaining_seconds: 2,
+            },
+            start + Duration::from_secs(3),
+        );
+        assert_eq!(
+            budget.remaining_at(start + Duration::from_secs(3)),
+            Duration::from_secs(2),
+            "a smaller snapshot must tighten the deadline"
+        );
+    }
+
+    #[test]
+    fn execution_time_budget_zero_rejects_new_timeout() {
+        let now = tokio::time::Instant::now();
+        let budget = RunExecutionTimeBudget::new_at(
+            ExecutionTimeBudget {
+                remaining_seconds: 0,
+            },
+            now,
+        );
+        assert_eq!(budget.remaining_at(now), Duration::ZERO);
+        assert_eq!(budget.clamp_timeout(Duration::from_secs(30)), None);
+    }
+
+    #[test]
+    fn missing_execution_time_budget_preserves_unbounded_provider_work() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-unbounded-time".to_string(),
+            "s-unbounded-time".to_string(),
+        )
+        .build();
+
+        assert_eq!(
+            ServerAgenticLoopHost::provider_work_budget_at_client_boundary(
+                host.execution_time_budget,
+                ProviderAttemptBoundary::new(false, false),
+            )
+            .expect("unbounded behavior"),
+            None
+        );
+        assert_eq!(
+            ProviderAttemptBoundary::new(false, false).provider_work_budget(None),
+            None
+        );
+    }
+
+    #[test]
+    fn execution_provider_work_budget_and_convergence_choose_the_smaller_slice() {
+        let convergence = ProviderAttemptBoundary::new(true, false);
+        assert_eq!(
+            convergence.provider_work_budget(Some(ProviderWorkBudget(Duration::from_secs(5)))),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            convergence.provider_work_budget(Some(ProviderWorkBudget(Duration::from_secs(60)))),
+            Some(PROVIDER_ACTION_CONVERGENCE_BUDGET)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_work_budget_is_sampled_after_admission_delay() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-delayed-provider".to_string(),
+            "s-delayed-provider".to_string(),
+        )
+        .build();
+        host.execution_time_budget = Some(RunExecutionTimeBudget::new(ExecutionTimeBudget {
+            remaining_seconds: 10,
+        }));
+        let ordinary = ProviderAttemptBoundary::new(false, false);
+
+        assert_eq!(
+            ServerAgenticLoopHost::provider_work_budget_at_client_boundary(
+                host.execution_time_budget,
+                ordinary,
+            )
+            .expect("initial provider budget"),
+            Some(Duration::from_secs(10))
+        );
+
+        // Model prompt construction, durable admission, and ledger work can
+        // all await before the provider call. Their elapsed time belongs to
+        // the original run deadline and must not be restored by a stale
+        // relative-duration snapshot.
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert_eq!(
+            ServerAgenticLoopHost::provider_work_budget_at_client_boundary(
+                host.execution_time_budget,
+                ordinary,
+            )
+            .expect("post-admission provider budget"),
+            Some(Duration::from_secs(6))
+        );
+
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let error = ServerAgenticLoopHost::provider_work_budget_at_client_boundary(
+            host.execution_time_budget,
+            ordinary,
+        )
+        .expect_err("an exhausted deadline must reject before client invocation");
+        assert_eq!(error.kind, astra_core::ErrorKind::BudgetExhausted);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn volatile_budget_tail_is_resampled_after_durable_admission_delay() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-delayed-tail".to_string(),
+            "s-delayed-tail".to_string(),
+        )
+        .build();
+        host.execution_time_budget = Some(RunExecutionTimeBudget::new(ExecutionTimeBudget {
+            remaining_seconds: 10,
+        }));
+        let stable = vec![json!({"role": "system", "content": "stable prefix"})];
+
+        let admission_estimate = host
+            .messages_with_current_execution_time_budget(&stable, 1)
+            .expect("admission estimate tail");
+        assert!(admission_estimate.last().is_some_and(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains("\"remaining_seconds\":10"))
+        }));
+
+        tokio::time::advance(Duration::from_secs(4)).await;
+        let post_admission_wire = host
+            .messages_with_current_execution_time_budget(&stable, 1)
+            .expect("post-admission wire tail");
+        assert!(post_admission_wire.last().is_some_and(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains("\"remaining_seconds\":6"))
+        }));
+        assert_eq!(post_admission_wire[0], stable[0]);
+    }
+
+    #[test]
+    fn execution_time_budget_is_a_fresh_volatile_wire_tail() {
+        let base = vec![json!({"role": "system", "content": "stable prefix"})];
+        let mut first = base.clone();
+        let mut second = base.clone();
+        ServerAgenticLoopHost::append_execution_time_budget_tail(
+            &mut first,
+            ExecutionTimeBudget {
+                remaining_seconds: 9,
+            },
+            1,
+        );
+        ServerAgenticLoopHost::append_execution_time_budget_tail(
+            &mut second,
+            ExecutionTimeBudget {
+                remaining_seconds: 4,
+            },
+            1,
+        );
+
+        assert_eq!(first[0], base[0]);
+        assert_eq!(second[0], base[0]);
+        assert!(first.last().is_some_and(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| {
+                    content.contains("runtime-required-context")
+                        && content.contains("\"remaining_seconds\":9")
+                })
+        }));
+        assert!(second.last().is_some_and(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| {
+                    content.contains("runtime-required-context")
+                        && content.contains("\"remaining_seconds\":4")
+                })
+        }));
+    }
+
+    #[test]
+    fn exhausted_execution_time_budget_rejects_new_tool_admission() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-expired-tool".to_string(),
+            "s-expired-tool".to_string(),
+        )
+        .with_execution_time_budget(Some(ExecutionTimeBudget {
+            remaining_seconds: 0,
+        }))
+        .build();
+        let calls = vec![json!({
+            "id": "call-expired",
+            "type": "function",
+            "function": {"name": "shell", "arguments": "{}"},
+        })];
+
+        let admission = AgenticLoopHost::admit_tool_calls(&mut host, &calls, Some("tool_calls"));
+        assert!(admission.admitted.is_empty());
+        assert_eq!(admission.rejected.len(), 1);
+        assert!(
+            admission.rejected[0]
+                .result
+                .contains("execution_time_budget_exhausted")
+        );
+        assert!(admission.rejected[0].result.contains("\"retryable\":false"));
+    }
+
+    #[test]
+    fn edge_deadline_reserves_settlement_grace_after_bash_timeout() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-settlement-grace".to_string(),
+            "s-settlement-grace".to_string(),
+        )
+        .build();
+        let args = json!({"command": "sleep 90", "timeout": 90.0});
+
+        // This test runtime caps Bash at 30 seconds. The Edge deadline must
+        // nevertheless leave the executor a further 30 seconds to report its
+        // timeout receipt rather than cancelling it at the same instant.
+        assert_eq!(
+            host.clamped_edge_execution_timeout_ms("bash", &args),
+            Some(60_000)
+        );
+        assert_eq!(
+            ServerAgenticLoopHost::with_authoritative_command_timeout_cap("bash", &args, 30_000)
+                .get("_astra_command_timeout_cap_ms")
+                .and_then(Value::as_u64),
+            Some(30_000),
+            "the executor receives a server-authored command cap, not the delivery deadline"
+        );
+        let omitted = json!({"command": "cargo test"});
+        assert_eq!(
+            ServerAgenticLoopHost::with_authoritative_command_timeout_cap("bash", &omitted, 30_000)
+                .get("_astra_command_timeout_cap_ms")
+                .and_then(Value::as_u64),
+            Some(30_000),
+            "Bash must not exceed the server cap when using its Edge-local adaptive default"
+        );
+        assert!(
+            ServerAgenticLoopHost::with_authoritative_command_timeout_cap("bash", &omitted, 30_000)
+                .get("timeout")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn edge_long_session_default_timeout_admits_with_terminal_bench_budget() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-long-session-default-timeout".to_string(),
+            "s-long-session-default-timeout".to_string(),
+        )
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_execution_time_budget(Some(ExecutionTimeBudget {
+            remaining_seconds: 900,
+        }))
+        .build();
+        let bash = json!({"command": "echo test && pwd && which git"});
+        let write_file = json!({"path": "README.md", "content": "test"});
+
+        // A host-process Edge runtime has the production long-session policy
+        // (1800 seconds). That is a ceiling, not the default for an omitted
+        // timeout: ordinary Edge calls must still fit within a 900-second
+        // Terminal-Bench trial while retaining time to publish their receipt.
+        assert_eq!(host.edge_execution_timeout_ms("bash", &bash), 120_000);
+        assert_eq!(
+            host.clamped_edge_execution_timeout_ms("bash", &bash),
+            Some(150_000)
+        );
+        assert_eq!(
+            host.clamped_edge_execution_timeout_ms("write_file", &write_file),
+            Some(150_000)
+        );
+        assert_eq!(
+            ServerAgenticLoopHost::with_authoritative_command_timeout_cap("bash", &bash, 120_000)
+                .get("_astra_command_timeout_cap_ms")
+                .and_then(Value::as_u64),
+            Some(120_000),
+            "the Edge receives a bounded cap and retains its adaptive default"
+        );
+    }
+
+    #[test]
+    fn edge_admission_rejects_when_run_cannot_cover_command_and_settlement() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-insufficient-settlement-budget".to_string(),
+            "s-insufficient-settlement-budget".to_string(),
+        )
+        .with_execution_time_budget(Some(ExecutionTimeBudget {
+            remaining_seconds: 59,
+        }))
+        .build();
+        let args = json!({"command": "sleep 90", "timeout": 90.0});
+
+        // The effective command allowance is 30 seconds under this test
+        // policy, plus 30 seconds of settlement. Starting it with only 59
+        // seconds left would recreate the cancellation race.
+        assert_eq!(host.clamped_edge_execution_timeout_ms("bash", &args), None);
+    }
+
+    #[test]
+    fn durable_admission_retry_identity_advances_host_attempt_monotonically() {
+        assert_eq!(
+            reconcile_durable_logical_attempt(0, 0).expect("ordinary admission"),
+            0
+        );
+        assert_eq!(
+            reconcile_durable_logical_attempt(0, 1).expect("one recovered admission"),
+            1
+        );
+        assert_eq!(
+            reconcile_durable_logical_attempt(1, 2).expect("retry after recovered admission"),
+            2
+        );
+    }
+
+    #[test]
+    fn durable_admission_retry_identity_rejects_reuse_or_unbounded_jump() {
+        for (requested, admitted) in [(1, 0), (0, 2), (u32::MAX, 0)] {
+            let error = reconcile_durable_logical_attempt(requested, admitted)
+                .expect_err("authority must advance by at most one exact identity");
+            assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+            assert!(error.details_json.as_deref().is_some_and(|details| {
+                details.contains("logical_invocation_admission_retry_identity")
+            }));
+        }
+    }
+
+    async fn test_edge_action_context(user_id: &str, run_id: &str) -> EdgeActionAdmissionContext {
+        let engine = crate::server::run::engine::RunEngine::new(Arc::new(
+            astra_services::runs::InMemoryRunStateStore::new(),
+        ));
+        engine
+            .start_run(run_id, user_id, "edge-action-session")
+            .await
+            .expect("test durable run");
+        EdgeActionAdmissionContext {
+            run_control: Arc::new(engine),
+            user_id: user_id.to_string(),
+            run_id: run_id.to_string(),
+            control_cursor: 0,
+            expected_control_epoch: -1,
+            expected_owner_generation: 0,
+            session_turn: 0,
+            llm_round: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_edge_approval_is_cancel_responsive() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-cancel-approval".to_string(),
+            "s-cancel-approval".to_string(),
+        )
+        .build();
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_token = Arc::new(CancellationToken::new());
+        host.set_client_cancel(cancel_flag, cancel_token.clone());
+        let context = test_edge_action_context("u-cancel-approval", "run-cancel-approval").await;
+        let tool_call = json!({
+            "id": "write-after-cancel",
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "arguments": r#"{"content":"no","path":"blocked.txt"}"#,
+            }
+        });
+
+        cancel_token.cancel();
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(100),
+            host.wait_edge_approval_or_guidance(&context, &tool_call, Duration::from_secs(300)),
+        )
+        .await
+        .expect("client cancellation must interrupt a pending approval wait");
+
+        assert!(matches!(outcome, EdgeApprovalWait::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn local_approval_hint_cannot_make_half_open_shared_lookup_uncancellable() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-half-open-approval".to_string(),
+            "s-half-open-approval".to_string(),
+        )
+        .build();
+        host.set_approval_audit_context(test_approval_audit_context(
+            "u-half-open-approval",
+            "s-half-open-approval",
+        ));
+        host.set_interaction_sink(Arc::new(PendingApprovalInteractionSink));
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let cancel_token = Arc::new(CancellationToken::new());
+        host.set_client_cancel(cancel_flag, cancel_token.clone());
+        let context =
+            test_edge_action_context("u-half-open-approval", "run-half-open-approval").await;
+        let tool_call = json!({
+            "id": "write-after-local-hint",
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "arguments": r#"{"content":"no","path":"blocked.txt"}"#,
+            }
+        });
+        host.edge_callback_ledger.lock().await.insert(
+            test_approval_key(
+                "u-half-open-approval",
+                "s-half-open-approval",
+                "write-after-local-hint",
+            ),
+            approval_allow_entry("s-half-open-approval", "write-after-local-hint"),
+        );
+
+        let wait = tokio::spawn(async move {
+            host.wait_edge_approval_or_guidance(&context, &tool_call, Duration::from_secs(300))
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!wait.is_finished());
+        cancel_token.cancel();
+        let outcome = tokio::time::timeout(Duration::from_millis(100), wait)
+            .await
+            .expect("client cancellation must interrupt the final shared lookup")
+            .expect("approval wait task");
+
+        assert!(matches!(outcome, EdgeApprovalWait::Cancelled));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_approval_receipt_retries_shared_authority_until_resolution_is_visible() {
+        let journal_dir = tempfile::tempdir().expect("journal tempdir");
+        let _journal_guard =
+            astra_services::session_journal::JournalDirGuard::new(journal_dir.path());
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-shared-approval".to_string(),
+            "s-shared-approval".to_string(),
+        )
+        .build();
+        host.set_approval_audit_context(test_approval_audit_context(
+            "u-shared-approval",
+            "s-shared-approval",
+        ));
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        host.set_interaction_sink(Arc::new(PolledApprovalInteractionSink {
+            polls: polls.clone(),
+            resolve_after_poll: 6,
+            resolution: json!({
+                "event_type": "approval_resolved",
+                "data": {
+                    "request_id": "write-after-shared-resolution",
+                    "outcome": "approved",
+                    "decision": "allow",
+                    "reason": null,
+                    "tool": "write_file",
+                    "approval_kind": "standard",
+                    "_durable_resolution": {"disposition": "resumed"},
+                }
+            }),
+        }));
+        let context = test_edge_action_context("u-shared-approval", "test-run").await;
+        let tool_call = json!({
+            "id": "write-after-shared-resolution",
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "arguments": r#"{"content":"ok","path":"shared.txt"}"#,
+            }
+        });
+        // The callback receipt can be visible to this process before a fresh
+        // shared-store read observes the committed decision.  It must speed up
+        // the wait without converting that ordinary visibility window into a
+        // terminal failure.
+        host.edge_callback_ledger.lock().await.insert(
+            test_approval_key(
+                "u-shared-approval",
+                "s-shared-approval",
+                "write-after-shared-resolution",
+            ),
+            approval_allow_entry("s-shared-approval", "write-after-shared-resolution"),
+        );
+
+        let wait = tokio::spawn(async move {
+            host.wait_edge_approval_or_guidance(&context, &tool_call, Duration::from_secs(300))
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+
+        for millis in [100, 200, 400, 800] {
+            tokio::time::advance(Duration::from_millis(millis)).await;
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(polls.load(Ordering::SeqCst), 5);
+        assert!(!wait.is_finished());
+
+        tokio::time::advance(Duration::from_millis(999)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(polls.load(Ordering::SeqCst), 5);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let outcome = wait.await.expect("shared approval poll task");
+        assert!(matches!(outcome, EdgeApprovalWait::Allowed));
+        assert_eq!(polls.load(Ordering::SeqCst), 6);
+    }
+
+    #[tokio::test]
+    async fn shared_edge_approval_poll_rejects_authority_lost_denial() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-stale-shared-deny".to_string(),
+            "s-stale-shared-deny".to_string(),
+        )
+        .build();
+        host.set_approval_audit_context(test_approval_audit_context(
+            "u-stale-shared-deny",
+            "s-stale-shared-deny",
+        ));
+        host.set_interaction_sink(Arc::new(PolledApprovalInteractionSink {
+            polls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            resolve_after_poll: 1,
+            resolution: json!({
+                "event_type": "approval_resolved",
+                "data": {
+                    "request_id": "write-after-stale-deny",
+                    "outcome": "denied",
+                    "decision": "deny",
+                    "reason": "stale denial",
+                    "tool": "write_file",
+                    "approval_kind": "standard",
+                    "_durable_resolution": {"disposition": "authority_lost"},
+                }
+            }),
+        }));
+        let context = test_edge_action_context("u-stale-shared-deny", "run-stale-deny").await;
+        let tool_call = json!({
+            "id": "write-after-stale-deny",
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "arguments": r#"{"content":"no","path":"blocked.txt"}"#,
+            }
+        });
+
+        let outcome = host
+            .wait_edge_approval_or_guidance(&context, &tool_call, Duration::from_secs(1))
+            .await;
+        match outcome {
+            EdgeApprovalWait::FailedClosed(error) => assert!(
+                error.contains("without durable resume authority"),
+                "unexpected fail-closed reason: {error}"
+            ),
+            EdgeApprovalWait::Allowed => panic!("authority-lost denial was allowed"),
+            EdgeApprovalWait::Denied(_) => {
+                panic!("authority-lost denial was consumed as an ordinary user denial")
+            }
+            EdgeApprovalWait::Superseded => panic!("authority-lost denial became superseded"),
+            EdgeApprovalWait::Cancelled => panic!("authority-lost denial became cancellation"),
+        }
+    }
+
+    struct SequencedSummaryClient {
+        responses: std::sync::Mutex<std::collections::VecDeque<String>>,
+        requests: Arc<std::sync::Mutex<Vec<Vec<Value>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SummaryLlmClient for SequencedSummaryClient {
+        async fn summarize(
+            &self,
+            _purpose: astra_turn_types::InferencePurpose,
+            messages: &[Value],
+        ) -> Result<astra_turn_core::cloud_summary::SummaryResponse, String> {
+            self.requests
+                .lock()
+                .expect("requests")
+                .push(messages.to_vec());
+            let text = self
+                .responses
+                .lock()
+                .expect("responses")
+                .pop_front()
+                .ok_or_else(|| "no response".to_string())?;
+            Ok(astra_turn_core::cloud_summary::SummaryResponse {
+                text,
+                is_ptl_error: false,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_work_admission_is_repaired_once_without_erasing_mutation() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let repaired = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","basis":"explicit_lifecycle_control","goal":"Run A and B, cancel one, then add one","initial_tasks":[{"objective":"A","expected_result":"Evidence A"},{"objective":"B","expected_result":"Evidence B"}],"mutations":[{"kind":"cancel"},{"kind":"add","task":{"objective":"B","expected_result":"Evidence B"}}],"execution_topology":"primary"}"#;
+        let judge = SummaryClientWorkAdmissionJudge {
+            client: Box::new(SequencedSummaryClient {
+                responses: std::sync::Mutex::new(std::collections::VecDeque::from([
+                    "{\"work_lifecycle\":\"required\"".to_string(),
+                    repaired.to_string(),
+                ])),
+                requests: requests.clone(),
+            }),
+        };
+        let decision = judge
+            .judge(&astra_services::TurnIntentJudgeContext {
+                message: "run A and B, cancel one, add one".to_string(),
+                turn_count: 1,
+                recent_tools: Vec::new(),
+                has_prior_assistant_turn: false,
+                ..Default::default()
+            })
+            .await
+            .expect("repair returns a closed decision");
+        let astra_services::WorkAdmissionDecision::Required {
+            deferred_graph_mutations,
+            ..
+        } = decision
+        else {
+            panic!("expected required Work");
+        };
+        assert!(matches!(
+            deferred_graph_mutations.as_slice(),
+            [
+                astra_services::WorkAdmissionGraphMutation::Cancel { .. },
+                astra_services::WorkAdmissionGraphMutation::Add { .. }
+            ]
+        ));
+        let requests = requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].iter().any(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|text| {
+                    text.contains("malformed or truncated") && text.contains("No prose")
+                })
+        }));
+        assert!(requests[1].iter().any(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|text| {
+                    text.contains("runtime derives them")
+                        && text.contains("Cancel+add remain two mutations")
+                })
+        }));
+    }
+
+    #[tokio::test]
+    async fn non_durable_work_admission_with_descriptive_goal_is_accepted_without_repair() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let judge = SummaryClientWorkAdmissionJudge {
+            client: Box::new(SequencedSummaryClient {
+                responses: std::sync::Mutex::new(std::collections::VecDeque::from([
+                    "```json\n{\"work_lifecycle\":\"not_required\",\"workspace_mutation\":\"must_mutate\",\"mutation_completion_scope\":\"workspace\",\"execution_topology\":\"primary\",\"goal\":\"Create the requested workspace artifact.\",\"acceptance_unit_relationship\":\"single_outcome\",\"acceptance_units\":[{\"objective\":\"Create the artifact\",\"expected_result\":\"One workspace artifact\"}]}\n```".to_string(),
+                ])),
+                requests: requests.clone(),
+            }),
+        };
+
+        let decision = judge
+            .judge(&astra_services::TurnIntentJudgeContext {
+                message: "create the requested workspace artifact".to_string(),
+                turn_count: 1,
+                ..Default::default()
+            })
+            .await
+            .expect("an inert descriptive goal must not trigger semantic repair");
+
+        assert_eq!(
+            decision.turn_intent().workspace_mutation,
+            astra_config::user_profile::WorkspaceMutationIntent::MustMutate
+        );
+        assert_eq!(
+            requests.lock().expect("requests").len(),
+            1,
+            "valid semantic content must cost exactly one auxiliary inference"
+        );
+    }
+
+    #[tokio::test]
+    async fn semantic_parallel_conflict_is_repaired_to_one_combined_deliverable() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let initially_conflicting = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","basis":"durable_continuation","goal":"Review three dimensions and synthesize the findings","initial_tasks":[{"objective":"Correctness","expected_result":"Evidence"},{"objective":"Concurrency","expected_result":"Evidence"}],"execution_topology":"parallel_subruns","required_capabilities":["agent_spawner"]}"#;
+        let repaired = r#"{"work_lifecycle":"not_required","workspace_mutation":"read_only","execution_topology":"parallel_subruns","required_capabilities":["agent_spawner"],"acceptance_unit_relationship":"independent_outcomes","acceptance_units":[{"objective":"Review correctness","expected_result":"Correctness finding"},{"objective":"Review concurrency","expected_result":"Concurrency finding"}]}"#;
+        let judge = SummaryClientWorkAdmissionJudge {
+            client: Box::new(SequencedSummaryClient {
+                responses: std::sync::Mutex::new(std::collections::VecDeque::from([
+                    initially_conflicting.to_string(),
+                    repaired.to_string(),
+                ])),
+                requests: requests.clone(),
+            }),
+        };
+
+        let decision = judge
+            .judge(&astra_services::TurnIntentJudgeContext {
+                message: "Use multiple perspectives, then provide one synthesized report"
+                    .to_string(),
+                turn_count: 1,
+                ..Default::default()
+            })
+            .await
+            .expect("intermediate fanout perspectives are not durable Work");
+        assert_eq!(
+            decision.execution_topology(),
+            astra_services::WorkExecutionTopology::ParallelSubruns
+        );
+        assert!(matches!(
+            &decision,
+            astra_services::WorkAdmissionDecision::NotRequired { .. }
+        ));
+
+        let requests = requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].iter().any(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|text| {
+                    text.contains("user-facing acceptance boundary")
+                        && text.contains("one synthesized final answer")
+                        && text.contains("every user-facing result in acceptance_units")
+                        && text.contains("durable task lifecycle control")
+                })
+        }));
+    }
+
+    #[tokio::test]
+    async fn malformed_work_admission_re_evaluates_instead_of_preserving_invalid_basis() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let invalid = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","basis":"explicit_lifecycle_control","goal":"Return two same-turn agent results","initial_tasks":[{"objective":"Result A","expected_result":"Payload A"},{"objective":"Result B","expected_result":"Payload B"}],"execution_topology":"primary"}"#;
+        let repaired = r#"{"work_lifecycle":"not_required","workspace_mutation":"read_only","execution_topology":"parallel_subruns","required_capabilities":["agent_spawner"],"acceptance_unit_relationship":"independent_outcomes","acceptance_units":[{"objective":"Return result A","expected_result":"Payload A"},{"objective":"Return result B","expected_result":"Payload B"}]}"#;
+        let judge = SummaryClientWorkAdmissionJudge {
+            client: Box::new(SequencedSummaryClient {
+                responses: std::sync::Mutex::new(std::collections::VecDeque::from([
+                    invalid.to_string(),
+                    repaired.to_string(),
+                ])),
+                requests: requests.clone(),
+            }),
+        };
+
+        let decision = judge
+            .judge(&astra_services::TurnIntentJudgeContext {
+                message: "Use two agents now and return their results".to_string(),
+                turn_count: 1,
+                ..Default::default()
+            })
+            .await
+            .expect("the bounded repair must replace a self-inconsistent lifecycle basis");
+
+        assert!(matches!(
+            &decision,
+            astra_services::WorkAdmissionDecision::NotRequired { .. }
+        ));
+        assert_eq!(
+            decision.execution_topology(),
+            astra_services::WorkExecutionTopology::ParallelSubruns
+        );
+        let requests = requests.lock().expect("requests");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].iter().any(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|text| {
+                    text.contains(
+                        "previous lifecycle, basis, topology, and graph are not authoritative",
+                    ) && text.contains("do not preserve an invalid classification")
+                        && text.contains("same-turn multi-agent request")
+                })
+        }));
+    }
+
+    #[tokio::test]
+    async fn trusted_parallel_conflict_is_not_repaired_or_downgraded() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let conflicting = r#"{"work_lifecycle":"required","workspace_mutation":"read_only","basis":"durable_continuation","goal":"Persist separate outcomes","initial_tasks":[{"objective":"A","expected_result":"A"},{"objective":"B","expected_result":"B"}],"execution_topology":"parallel_subruns","required_capabilities":["agent_spawner"]}"#;
+        let judge = SummaryClientWorkAdmissionJudge {
+            client: Box::new(SequencedSummaryClient {
+                responses: std::sync::Mutex::new(std::collections::VecDeque::from([
+                    conflicting.to_string()
+                ])),
+                requests: requests.clone(),
+            }),
+        };
+
+        let error = judge
+            .judge(&astra_services::TurnIntentJudgeContext {
+                message: "Use the loaded workflow".to_string(),
+                turn_count: 1,
+                loaded_workflow_execution_topology: Some(
+                    astra_services::WorkExecutionTopology::ParallelSubruns,
+                ),
+                ..Default::default()
+            })
+            .await
+            .expect_err("trusted durable-plus-parallel topology remains unsupported");
+        assert!(matches!(
+            error,
+            astra_services::TurnIntentJudgeError::UnsupportedCombination(_)
+        ));
+        assert_eq!(requests.lock().expect("requests").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn trusted_parallel_workflow_cannot_be_downgraded_by_judge_response() {
+        let judge = SummaryClientWorkAdmissionJudge {
+            client: Box::new(SequencedSummaryClient {
+                responses: std::sync::Mutex::new(std::collections::VecDeque::from([
+                    r#"{"work_lifecycle":"not_required","workspace_mutation":"read_only","execution_topology":"primary","required_capabilities":[],"acceptance_unit_relationship":"single_outcome","acceptance_units":[{"objective":"Use the workflow","expected_result":"One workflow result"}]}"#.to_string(),
+                ])),
+                requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }),
+        };
+        let decision = judge
+            .judge(&astra_services::TurnIntentJudgeContext {
+                message: "Follow the loaded workflow".to_string(),
+                turn_count: 1,
+                loaded_workflow_execution_topology: Some(
+                    astra_services::WorkExecutionTopology::ParallelSubruns,
+                ),
+                ..Default::default()
+            })
+            .await
+            .expect("trusted manifest topology must reconcile after parsing");
+        assert_eq!(
+            decision.execution_topology(),
+            astra_services::WorkExecutionTopology::ParallelSubruns
+        );
+        assert!(
+            decision
+                .required_capabilities()
+                .contains(&astra_services::WorkAdmissionCapability::AgentSpawner)
+        );
+
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-trusted-workflow".to_string(),
+            "s-trusted-workflow".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .build();
+        host.apply_work_admission_decision(decision);
+        let call = json!({
+            "id": "trusted-workflow-fanout",
+            "function": {
+                "name": "agent_fanout",
+                "arguments": "{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"description\":\"A\",\"prompt\":\"A\"},{\"description\":\"B\",\"prompt\":\"B\"}]}"
+            }
+        });
+        let admission = host.enforce_canonical_delegation_lifecycle(
+            &create_test_state(),
+            crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: vec![call],
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+        );
+        assert_eq!(admission.admitted.len(), 1);
+        assert!(admission.rejected.is_empty());
+    }
 
     #[cfg(feature = "bridge-e2e-hooks")]
     #[test]
@@ -7370,6 +15041,245 @@ mod tests {
         assert_eq!(observed_ttft_ms(Some(240), Some(900), 1_600), 240);
         assert_eq!(observed_ttft_ms(None, Some(900), 1_600), 900);
         assert_eq!(observed_ttft_ms(None, None, 1_600), 1_600);
+    }
+
+    #[test]
+    fn canonical_tool_record_projects_one_typed_live_terminal() {
+        let completed = server_tool_terminal_event(
+            Some("run-1"),
+            &ToolCallRecord {
+                tool_call_id: Some("call-introspect".into()),
+                name: "introspect".into(),
+                ok: true,
+                ms: 17,
+                result_preview: Some("runtime snapshot".into()),
+                result_full: Some("{\"status\":\"ok\"}".into()),
+                disposition: Some(ToolCallDisposition::Executed),
+                ..Default::default()
+            },
+        )
+        .expect("terminal event");
+        assert_eq!(completed["type"], "tool_call_end");
+        assert_eq!(completed["call_id"], "call-introspect");
+        assert_eq!(completed["run_id"], "run-1");
+        assert_eq!(completed["tool"], "introspect");
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["success"], true);
+        assert_eq!(completed["output"], "{\"status\":\"ok\"}");
+        assert_eq!(completed["terminal_event_type"], "tool_call_completed");
+
+        let rejected = server_tool_terminal_event(
+            None,
+            &ToolCallRecord {
+                tool_call_id: Some("call-denied".into()),
+                name: "settle_work_item".into(),
+                ok: false,
+                error: Some("policy denied".into()),
+                disposition: Some(ToolCallDisposition::Rejected),
+                ..Default::default()
+            },
+        )
+        .expect("terminal event");
+        assert_eq!(rejected["status"], "rejected");
+        assert_eq!(rejected["success"], false);
+        assert_eq!(rejected["output"], "policy denied");
+        assert_eq!(rejected["terminal_event_type"], "tool_call_rejected");
+        assert!(rejected.get("run_id").is_none());
+
+        assert!(server_tool_terminal_event(None, &ToolCallRecord::default()).is_none());
+    }
+
+    #[test]
+    fn system_work_dispatch_cannot_carry_model_selected_task_identity() {
+        let call = system_next_work_item_call(7, 3);
+        assert_eq!(call["id"].as_str(), Some("system-work-dispatch-7-3"));
+        assert_eq!(
+            call["function"]["name"].as_str(),
+            Some("run_next_work_item")
+        );
+        assert_eq!(call["function"]["arguments"].as_str(), Some("{}"));
+        assert_eq!(
+            call["astra_internal"]["source"].as_str(),
+            Some("canonical_work_scheduler")
+        );
+        assert!(
+            call.get("work_item").is_none() && call["function"].get("prompt").is_none(),
+            "scheduler selection must contain neither task identity nor a free-form worker prompt"
+        );
+    }
+
+    #[test]
+    fn scheduler_requires_current_turn_work_authorization_and_never_runs_inside_attempt() {
+        let mut state = create_test_state();
+        let coordinator = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-scheduler".to_string(),
+            "s-scheduler".to_string(),
+        )
+        .build();
+        assert!(
+            !coordinator.canonical_work_scheduler_is_authorized(&state),
+            "an existing Work graph cannot autonomously advance after an unrelated or stop turn"
+        );
+
+        state.turn_intent = Some(
+            astra_config::user_profile::TurnIntent::default()
+                .with_work_lifecycle(astra_config::user_profile::WorkLifecycleIntent::Required),
+        );
+        assert!(coordinator.canonical_work_scheduler_is_authorized(&state));
+
+        let attempt = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-scheduler".to_string(),
+            "s-attempt".to_string(),
+        )
+        .with_work_item_attempt_bound(true)
+        .build();
+        assert!(
+            !attempt.canonical_work_scheduler_is_authorized(&state),
+            "the selected task executor may never dispatch a second task"
+        );
+    }
+
+    #[test]
+    fn scheduler_replays_each_active_attempt_at_most_once() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-scheduler-replay".to_string(),
+            "s-scheduler-replay".to_string(),
+        )
+        .build();
+
+        assert!(host.claim_work_attempt_scheduler_replay("attempt-1"));
+        assert!(
+            !host.claim_work_attempt_scheduler_replay("attempt-1"),
+            "an idempotent active-attempt result is not progress"
+        );
+        assert!(
+            host.claim_work_attempt_scheduler_replay("attempt-2"),
+            "a successor attempt receives its own single convergence boundary"
+        );
+        assert!(
+            !host.claim_work_attempt_scheduler_replay("attempt-2"),
+            "the successor must not reintroduce the same replay loop"
+        );
+    }
+
+    #[test]
+    fn active_work_attempt_start_contract_is_once_per_attempt() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-pacing".to_string(),
+            "s-pacing".to_string(),
+        )
+        .build();
+        let dir = tempfile::TempDir::new().expect("workspace");
+        let executor = runtime_tool_executor_with_agent_context(dir.path());
+        executor
+            .install_active_primary_work_attempt(
+                crate::server::runtime_tool_executor::ActivePrimaryWorkAttempt {
+                    attempt_id: "attempt-pacing".to_string(),
+                    executor_run_id: "run-pacing".to_string(),
+                    item_id: "task-pacing".to_string(),
+                    item_revision: 1,
+                    objective: "Inspect the bounded subject".to_string(),
+                    expected_result: "One direct evidence result".to_string(),
+                },
+            )
+            .expect("install attempt");
+        let mut state = create_test_state();
+        state.runtime_tool_executor = Some(Arc::new(executor));
+        assert_eq!(
+            host.runtime_policy_subject(&state),
+            astra_turn_core::context_feedback::RuntimePolicySubject::WorkItem {
+                attempt_id: "attempt-pacing".to_string(),
+                item_id: "task-pacing".to_string(),
+                item_revision: 1,
+                objective: "Inspect the bounded subject".to_string(),
+                expected_result: "One direct evidence result".to_string(),
+            },
+            "pure Server policy must bind to the authoritative active Work attempt"
+        );
+        let start_context = host
+            .active_work_attempt_start_context(&state)
+            .expect("a new assignment gets one start contract");
+        let start_payload: Value = serde_json::from_str(
+            start_context["content"]
+                .as_str()
+                .expect("structured start context"),
+        )
+        .expect("start context JSON");
+        assert_eq!(start_payload["schema"], "active_work_attempt_start.v1");
+        assert!(
+            start_payload["instruction"].as_str().is_some_and(
+                |instruction| instruction.contains("every payload and verification field")
+            )
+        );
+        assert!(
+            start_payload["instruction"]
+                .as_str()
+                .is_some_and(|instruction| instruction.contains("index/home page"))
+        );
+        assert!(
+            start_payload["instruction"]
+                .as_str()
+                .is_some_and(|instruction| instruction
+                    .contains("named behavior check, command, test, or observable workflow"))
+        );
+        assert!(
+            host.active_work_attempt_start_context(&state).is_none(),
+            "the start contract is emitted once per attempt"
+        );
+        state.hooks.completion_settlement.work_settlement_only = true;
+        let restricted = host.compute_effective_restricted(&mut state, true, false);
+        assert!(
+            host.tool_schemas
+                .iter()
+                .chain(host.admission_tool_schemas.iter())
+                .chain(host.deferred_tool_schemas.iter())
+                .filter_map(tool_schema_name)
+                .any(|name| name == "settle_work_item"),
+            "fixture must include the typed Work settlement capability"
+        );
+        assert!(
+            host.tool_schemas
+                .iter()
+                .chain(host.admission_tool_schemas.iter())
+                .chain(host.deferred_tool_schemas.iter())
+                .filter_map(tool_schema_name)
+                .filter(|name| *name != "settle_work_item")
+                .all(|name| restricted.contains(name)),
+            "stall recovery for an owned WorkItem must not reopen exploration"
+        );
+        assert!(!restricted.contains("settle_work_item"));
+    }
+
+    #[test]
+    fn final_work_synthesis_contract_is_user_facing_and_evidence_backed() {
+        let mut state = create_test_state();
+        assert!(ServerAgenticLoopHost::final_work_synthesis_context(&state).is_none());
+        state
+            .hooks
+            .completion_settlement
+            .preserve_final_synthesis_wire_surface = true;
+        let message = ServerAgenticLoopHost::final_work_synthesis_context(&state)
+            .expect("completed Work gets a synthesis contract");
+        let payload: Value = serde_json::from_str(
+            message["content"]
+                .as_str()
+                .expect("structured synthesis context"),
+        )
+        .expect("valid synthesis JSON");
+        assert_eq!(payload["schema"], "final_work_synthesis.v1");
+        let instruction = payload["instruction"].as_str().expect("instruction");
+        assert!(instruction.contains("direct evidence"));
+        assert!(instruction.contains("index/home page"));
+        assert!(instruction.contains("omit tool names"));
+        assert!(instruction.contains("rejected attempts"));
     }
 
     #[test]
@@ -7517,6 +15427,7 @@ mod tests {
             url.into(),
             "Bearer forwarded-token".to_string(),
             timeout_ms,
+            128_000,
         )
     }
 
@@ -7528,6 +15439,7 @@ mod tests {
             base_url,
             provider: "openai".to_string(),
             cache_capability: None,
+            thinking_capability: None,
             fallback_chain: Vec::new(),
             header_overrides: HashMap::new(),
             request_body_overrides: None,
@@ -7549,6 +15461,191 @@ mod tests {
             self.committed.lock().expect("interaction sink").push(event);
             Ok(())
         }
+
+        async fn commit_guarded_tool_request(
+            &self,
+            request: GuardedToolRequestCommit,
+        ) -> Result<GuardedToolRequestCommitOutcome, String> {
+            Ok(GuardedToolRequestCommitOutcome::Committed {
+                event: request.event,
+            })
+        }
+
+        async fn deliver_committed_tool_request(&self, event: Value) -> Result<(), String> {
+            self.committed.lock().expect("interaction sink").push(event);
+            Ok(())
+        }
+
+        async fn resolve_edge_approval(
+            &self,
+            _request_id: &str,
+            _tool_name: &str,
+            _approved: bool,
+            _reason: Option<&str>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct PolledApprovalInteractionSink {
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+        resolve_after_poll: usize,
+        resolution: Value,
+    }
+
+    #[derive(Default)]
+    struct ImmediatelyResolvedApprovalDeliverySink {
+        projected_tool_requests: std::sync::atomic::AtomicUsize,
+        approval_releases: std::sync::atomic::AtomicUsize,
+    }
+
+    struct PendingApprovalInteractionSink;
+
+    #[derive(Default)]
+    struct RecordingApprovalCleanupSink {
+        resolved: std::sync::Mutex<HashSet<String>>,
+        denials: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl HostInteractionSink for RecordingApprovalCleanupSink {
+        async fn commit_and_deliver(&self, _event: Value) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn load_edge_approval_resolution(
+            &self,
+            request_id: &str,
+        ) -> Result<Option<Value>, String> {
+            Ok(self
+                .resolved
+                .lock()
+                .expect("resolved approvals")
+                .contains(request_id)
+                .then(|| json!({"request_id": request_id, "decision": "deny"})))
+        }
+
+        async fn resolve_edge_approval(
+            &self,
+            request_id: &str,
+            tool_name: &str,
+            approved: bool,
+            reason: Option<&str>,
+        ) -> Result<(), String> {
+            assert!(!approved, "batch cleanup can only deny unstarted approvals");
+            self.resolved
+                .lock()
+                .expect("resolved approvals")
+                .insert(request_id.to_string());
+            self.denials.lock().expect("approval denials").push((
+                request_id.to_string(),
+                tool_name.to_string(),
+                reason.map(ToString::to_string),
+            ));
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HostInteractionSink for PendingApprovalInteractionSink {
+        async fn commit_and_deliver(&self, _event: Value) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn load_edge_approval_resolution(
+            &self,
+            _request_id: &str,
+        ) -> Result<Option<Value>, String> {
+            std::future::pending().await
+        }
+
+        fn has_shared_edge_approval_authority(&self) -> bool {
+            true
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HostInteractionSink for PolledApprovalInteractionSink {
+        async fn commit_and_deliver(&self, _event: Value) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn load_edge_approval_resolution(
+            &self,
+            _request_id: &str,
+        ) -> Result<Option<Value>, String> {
+            let poll = self.polls.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok((poll >= self.resolve_after_poll).then(|| self.resolution.clone()))
+        }
+
+        fn has_shared_edge_approval_authority(&self) -> bool {
+            true
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HostInteractionSink for ImmediatelyResolvedApprovalDeliverySink {
+        async fn commit_and_deliver(&self, _event: Value) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn begin_edge_approval_wait(
+            &self,
+            _request_id: &str,
+            _expected_control_epoch: i64,
+            _expected_owner_generation: u64,
+        ) -> Result<(), String> {
+            // The HTTP callback already committed the exact durable resume.
+            Ok(())
+        }
+
+        async fn commit_guarded_tool_request(
+            &self,
+            request: GuardedToolRequestCommit,
+        ) -> Result<GuardedToolRequestCommitOutcome, String> {
+            Ok(GuardedToolRequestCommitOutcome::Committed {
+                event: request.event,
+            })
+        }
+
+        async fn deliver_committed_tool_request(&self, _event: Value) -> Result<(), String> {
+            self.projected_tool_requests.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn resolve_edge_approval(
+            &self,
+            _request_id: &str,
+            _tool_name: &str,
+            approved: bool,
+            _reason: Option<&str>,
+        ) -> Result<(), String> {
+            assert!(approved, "the recorded durable decision is allow");
+            self.approval_releases.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn load_edge_approval_resolution(
+            &self,
+            request_id: &str,
+        ) -> Result<Option<Value>, String> {
+            Ok(Some(json!({
+                "event_type": "approval_resolved",
+                "data": {
+                    "request_id": request_id,
+                    "outcome": "approved",
+                    "decision": "allow",
+                    "reason": null,
+                    "tool": "write_file",
+                    "approval_kind": "standard",
+                    "_durable_resolution": {"disposition": "resumed"},
+                }
+            })))
+        }
+
+        fn has_shared_edge_approval_authority(&self) -> bool {
+            true
+        }
     }
 
     fn install_in_memory_interaction_sink(
@@ -7557,6 +15654,98 @@ mod tests {
         let sink = Arc::new(InMemoryInteractionSink::default());
         host.set_interaction_sink(sink.clone());
         sink
+    }
+
+    #[derive(Default)]
+    struct AlreadyCommittedInteractionSink {
+        projected_tool_requests: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl HostInteractionSink for AlreadyCommittedInteractionSink {
+        async fn commit_and_deliver(&self, _event: Value) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn commit_guarded_tool_request(
+            &self,
+            request: GuardedToolRequestCommit,
+        ) -> Result<GuardedToolRequestCommitOutcome, String> {
+            Ok(GuardedToolRequestCommitOutcome::AlreadyCommitted {
+                event: request.event,
+            })
+        }
+
+        async fn deliver_committed_tool_request(&self, _event: Value) -> Result<(), String> {
+            self.projected_tool_requests.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FailingGuardedInteractionSink {
+        projected_tool_requests: std::sync::atomic::AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct PartiallySupersedingInteractionSink {
+        commit_attempts: std::sync::atomic::AtomicUsize,
+        projected_request_ids: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl HostInteractionSink for PartiallySupersedingInteractionSink {
+        async fn commit_and_deliver(&self, _event: Value) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn commit_guarded_tool_request(
+            &self,
+            request: GuardedToolRequestCommit,
+        ) -> Result<GuardedToolRequestCommitOutcome, String> {
+            if self.commit_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(GuardedToolRequestCommitOutcome::Committed {
+                    event: request.event,
+                })
+            } else {
+                Ok(GuardedToolRequestCommitOutcome::Superseded {
+                    user_intent_event_index: 42,
+                })
+            }
+        }
+
+        async fn deliver_committed_tool_request(&self, event: Value) -> Result<(), String> {
+            self.projected_request_ids
+                .lock()
+                .expect("projected request ids")
+                .push(
+                    event
+                        .get("request_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HostInteractionSink for FailingGuardedInteractionSink {
+        async fn commit_and_deliver(&self, _event: Value) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn commit_guarded_tool_request(
+            &self,
+            _request: GuardedToolRequestCommit,
+        ) -> Result<GuardedToolRequestCommitOutcome, String> {
+            Err("simulated run-store transaction failure".to_string())
+        }
+
+        async fn deliver_committed_tool_request(&self, _event: Value) -> Result<(), String> {
+            self.projected_tool_requests.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
     }
 
     #[derive(Default)]
@@ -7618,6 +15807,105 @@ mod tests {
         }
     }
 
+    struct CoordinatedMemoryReads {
+        started: std::sync::atomic::AtomicUsize,
+        prompt_calls: std::sync::atomic::AtomicUsize,
+        session_calls: std::sync::atomic::AtomicUsize,
+        started_changed: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl Default for CoordinatedMemoryReads {
+        fn default() -> Self {
+            Self {
+                started: std::sync::atomic::AtomicUsize::new(0),
+                prompt_calls: std::sync::atomic::AtomicUsize::new(0),
+                session_calls: std::sync::atomic::AtomicUsize::new(0),
+                started_changed: tokio::sync::Notify::new(),
+                release: tokio::sync::Semaphore::new(0),
+            }
+        }
+    }
+
+    impl CoordinatedMemoryReads {
+        async fn wait_for_release(&self) {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            self.started_changed.notify_waiters();
+            self.release
+                .acquire()
+                .await
+                .expect("test semaphore remains open")
+                .forget();
+        }
+
+        async fn wait_until_started(&self, expected: usize) {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let changed = self.started_changed.notified();
+                    if self.started.load(Ordering::SeqCst) >= expected {
+                        break;
+                    }
+                    changed.await;
+                }
+            })
+            .await
+            .expect("independent memory reads should start concurrently");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::turn::cloud::memoria_compact::MemoriaPort for CoordinatedMemoryReads {
+        async fn retrieve_for_prompt(
+            &self,
+            _query: &str,
+            _user_id: &str,
+            session_id: &str,
+            _top_k: usize,
+        ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String> {
+            self.prompt_calls.fetch_add(1, Ordering::SeqCst);
+            self.wait_for_release().await;
+            Ok(vec![crate::turn::cloud::memoria_compact::MemoriaMemory {
+                memory_id: "parallel-recall".into(),
+                content: astra_prompts::memory_proto::MemoryEntry::new(
+                    astra_prompts::memory_proto::NS_KNOWLEDGE,
+                    astra_prompts::memory_proto::ST_ACTIVE,
+                    "Independent memory inputs are prepared concurrently",
+                )
+                .encode(),
+                memory_type: "semantic".into(),
+                retrieval_score: Some(0.9),
+                session_id: Some(session_id.to_string()),
+                ..Default::default()
+            }])
+        }
+
+        async fn retrieve_ext(
+            &self,
+            _query: &str,
+            _session_id: Option<&str>,
+            _top_k: usize,
+            _filter_session: bool,
+        ) -> Result<Vec<crate::turn::cloud::memoria_compact::MemoriaMemory>, String> {
+            self.session_calls.fetch_add(1, Ordering::SeqCst);
+            self.wait_for_release().await;
+            Ok(Vec::new())
+        }
+
+        async fn store(
+            &self,
+            _content: &str,
+            _memory_type: &str,
+            _session_id: Option<&str>,
+            _trust_tier: Option<&str>,
+        ) -> Result<String, String> {
+            Ok(String::new())
+        }
+
+        async fn purge_working(&self, _session_id: &str) -> Result<u64, String> {
+            Ok(0)
+        }
+    }
+
     #[tokio::test]
     async fn server_only_prompt_recall_needs_no_edge_profile_and_is_latched_per_turn() {
         let provider = Arc::new(ServerOnlyPromptMemory::default());
@@ -7639,16 +15927,29 @@ mod tests {
         let same_turn = host
             .prompt_memory_entries_for_turn(2, "review astra memory #42")
             .await;
-        assert_eq!(first, same_turn);
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].memory_id.as_deref(), Some("server-memory-1"));
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(first.entries, same_turn.entries);
+        assert!(first.fresh);
+        assert!(!same_turn.fresh);
+        assert_eq!(
+            first.outcome,
+            astra_turn_types::MemoryRetrievalOutcome::Complete
+        );
+        assert_eq!(first.entries.len(), 1);
+        assert_eq!(
+            first.entries[0].memory_id.as_deref(),
+            Some("server-memory-1")
+        );
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            1,
+            "one complete semantic query owns per-turn prompt recall"
+        );
 
         let next_turn = host
             .prompt_memory_entries_for_turn(3, "review astra memory #42")
             .await;
-        assert_eq!(next_turn.len(), 1);
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
+        assert_eq!(next_turn.entries.len(), 1);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
         assert!(
             provider
                 .scopes
@@ -7656,6 +15957,93 @@ mod tests {
                 .expect("scopes")
                 .iter()
                 .all(|(user, session)| user == "server-user" && session == "server-session")
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_recall_and_session_memory_are_prepared_concurrently() {
+        let provider = Arc::new(CoordinatedMemoryReads::default());
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "parallel-user".into(),
+            "parallel-session".into(),
+        )
+        .with_memoria_client(Some(
+            Arc::clone(&provider) as Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>
+        ))
+        .build();
+
+        let task = tokio::spawn(async move {
+            let mut host = host;
+            let context = host
+                .memory_context_for_turn(2, "review astra memory #42", None)
+                .await;
+            (host, context)
+        });
+
+        // The prompt path issues one full-message semantic query. The session
+        // snapshot is a second, independent query. Seeing both blocked at the
+        // same release boundary proves neither lane waits for the other; the
+        // removed ASCII keyword-query lane must not return as hidden load.
+        provider.wait_until_started(2).await;
+        assert_eq!(provider.prompt_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.session_calls.load(Ordering::SeqCst), 1);
+        provider.release.add_permits(2);
+
+        let (_host, (prompt_recall, session_entry)) = task.await.expect("memory context task");
+        assert_eq!(prompt_recall.entries.len(), 1);
+        assert_eq!(
+            prompt_recall.outcome,
+            astra_turn_types::MemoryRetrievalOutcome::Complete
+        );
+        assert_eq!(
+            prompt_recall.entries[0].memory_id.as_deref(),
+            Some("parallel-recall")
+        );
+        assert!(session_entry.is_none());
+    }
+
+    #[test]
+    fn server_prompt_recall_projects_typed_outcome_and_backend_identity() {
+        let mut state = create_test_state();
+        state.telemetry.turn_trace_collector =
+            Some(crate::turn::turn_trace_collector::TurnTraceCollector::new(
+                "turn-memory-trace",
+                "session-memory-trace",
+            ));
+        let recall = PromptMemoryRecall {
+            entries: vec![
+                astra_turn_core::context_sources::MemoryEntry::scored(
+                    "typed memory evidence",
+                    0.91,
+                )
+                .with_memory_identity("backend-memory-42", "semantic")
+                .with_source("memoria.prefetch"),
+            ],
+            outcome: astra_turn_types::MemoryRetrievalOutcome::Partial,
+            fetch_ms: 37,
+            fresh: true,
+        };
+
+        ServerAgenticLoopHost::record_prompt_memory_trace(&state, &recall);
+
+        let trace = state
+            .telemetry
+            .turn_trace_collector
+            .as_ref()
+            .expect("collector")
+            .finalize();
+        assert_eq!(
+            trace.memory.outcome,
+            astra_turn_types::MemoryRetrievalOutcome::Partial
+        );
+        assert_eq!(trace.memory.retrieval_latency_ms, 37);
+        assert_eq!(trace.memory.query, "prompt_memory_recall");
+        assert_eq!(trace.memory.memories_selected.len(), 1);
+        assert_eq!(
+            trace.memory.memories_selected[0].memory_id,
+            "backend-memory-42"
         );
     }
 
@@ -7677,18 +16065,6 @@ mod tests {
         astra_turn_core::edge_ledger::tool_callback_key(&test_dispatch_identity(
             user_id, session_id, request_id,
         ))
-    }
-
-    struct NoopAuxiliaryEventWriter;
-
-    #[async_trait::async_trait]
-    impl astra_turn_core::contracts::TurnAuxiliaryEventWriter for NoopAuxiliaryEventWriter {
-        async fn persist_events(
-            &self,
-            _events: Vec<astra_turn_core::contracts::TurnAuxiliaryEventRecord>,
-        ) -> Result<(), String> {
-            Ok(())
-        }
     }
 
     fn approval_allow_entry(session_id: &str, request_id: &str) -> Value {
@@ -7719,11 +16095,6 @@ mod tests {
             session_id: session_id.to_string(),
             run_id: "test-run".to_string(),
             turn: 1,
-            agent_id: None,
-            parent_event_id: None,
-            parent_event_ids: Vec::new(),
-            causal_chain_id: "test-approval-chain".to_string(),
-            auxiliary_event_writer: Arc::new(NoopAuxiliaryEventWriter),
         }
     }
 
@@ -7802,6 +16173,29 @@ mod tests {
         ]
     }
 
+    fn sample_edge_tools_with_skill() -> Vec<Value> {
+        let mut tools = sample_edge_tools();
+        tools.push(crate::turn::skill_tool::skill_tool_schema_v2());
+        tools
+    }
+
+    struct ServerSkillResolver;
+
+    impl crate::turn::skill_tool::SkillResolver for ServerSkillResolver {
+        fn resolve(
+            &self,
+            name: &str,
+        ) -> Result<crate::turn::skill_tool::ResolvedSkill, crate::skills::SkillError> {
+            Err(crate::skills::SkillError::NotFound(format!(
+                "unknown test skill: {name}"
+            )))
+        }
+
+        fn available_skills(&self) -> Vec<crate::turn::skill_tool::SkillToolInfo> {
+            Vec::new()
+        }
+    }
+
     fn server_public_network_capabilities() -> Arc<HashMap<String, HashSet<String>>> {
         Arc::new(HashMap::from([(
             "server-builtin".to_string(),
@@ -7864,6 +16258,23 @@ mod tests {
                 crate::server::tool_transport::ExecutorStatus::Online,
             ),
             astra_runtime_env::RuntimeBinding::host_process("edge-host").with_platform(platform),
+        )
+    }
+
+    fn edge_ledger_runtime_snapshot() -> ExecutionBindingSnapshot {
+        ExecutionBindingSnapshot::new(
+            WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-1",
+                "MacBook Pro",
+                crate::server::tool_transport::ToolTransportKind::EdgeLedger,
+                crate::server::tool_transport::ExecutorStatus::Online,
+            ),
+            astra_runtime_env::RuntimeBinding::host_process("edge-host"),
         )
     }
 
@@ -7959,6 +16370,150 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn server_catalog_deferred_tools_activate_into_a_later_wire_surface() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-deferred".to_string(),
+            "s-deferred".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            false, true,
+        ))
+        .build();
+        host.resolved_model_name = Some("gpt-4o".to_string());
+        host.resolved_context_window = Some(200_000);
+
+        let dir = tempfile::TempDir::new().expect("temporary agent workspace");
+        let executor = Arc::new(runtime_tool_executor_with_agent_context(dir.path()));
+        let mut state = create_test_state();
+        state.runtime_tool_executor = Some(Arc::clone(&executor));
+
+        let initial = host.visible_turn_tools(&mut state);
+        let initial_names = schema_names(&initial);
+        assert!(initial_names.contains("tool_search"));
+        assert!(initial_names.contains("introspect"));
+        assert!(
+            initial_names.contains("agent"),
+            "single-child execution must be selectable on the first provider request"
+        );
+        assert!(
+            host.current_deferred_tool_names.contains("get_agent_info"),
+            "optional control-plane tools must remain discoverable: {:?}",
+            host.current_deferred_tool_names
+        );
+
+        let result = executor
+            .execute_with_metadata("tool_search", &json!({"query": "select:get_agent_info"}))
+            .await;
+        assert!(
+            !result.is_error,
+            "typed deferred selection failed: {result:?}"
+        );
+
+        let activated = host.visible_turn_tools(&mut state);
+        let activated_names = schema_names(&activated);
+        assert!(
+            activated_names.contains("get_agent_info"),
+            "a selected schema must enter the next provider request"
+        );
+        assert!(
+            !host.current_deferred_tool_names.contains("get_agent_info"),
+            "visible and deferred surfaces must remain disjoint"
+        );
+
+        let following_round_names = schema_names(&host.visible_turn_tools(&mut state));
+        assert!(
+            following_round_names.contains("get_agent_info"),
+            "activation must stay visible for subsequent tool rounds instead of oscillating back to deferred"
+        );
+        assert!(
+            !host.current_deferred_tool_names.contains("get_agent_info"),
+            "a turn-sticky activated schema must not re-enter the deferred manifest"
+        );
+
+        let initial_bytes = serde_json::to_vec(&initial)
+            .expect("serialize initial surface")
+            .len();
+        let mut full_catalog = initial;
+        append_tool_schemas_unique(&mut full_catalog, host.deferred_tool_schemas.clone());
+        let full_bytes = serde_json::to_vec(&full_catalog)
+            .expect("serialize full server catalog")
+            .len();
+        let saved_bytes = full_bytes.saturating_sub(initial_bytes);
+        assert!(
+            initial_bytes.saturating_mul(5) <= full_bytes.saturating_mul(4)
+                && saved_bytes >= 4 * 1024,
+            "default provider payload must remove material schema overhead (at least 20% and 4 KiB): initial={initial_bytes} full={full_bytes} saved={saved_bytes}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edge_declared_deferred_runtime_tool_activates_without_widening_provider_inventory() {
+        let mut edge_profile = Map::new();
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES
+                .to_string(),
+            json!(["symbols"]),
+        );
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_TEXT
+                .to_string(),
+            json!("<deferred-tools>\nsymbols\n</deferred-tools>"),
+        );
+        edge_profile.insert(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOLS_CONTEXT_WINDOW
+                .to_string(),
+            json!(200_000),
+        );
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-edge-deferred".to_string(),
+            "s-edge-deferred".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_edge_profile(edge_profile)
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        host.resolved_model_name = Some("gpt-4o".to_string());
+        host.resolved_context_window = Some(200_000);
+
+        let dir = tempfile::TempDir::new().expect("temporary edge workspace");
+        let mut runtime_executor = runtime_tool_executor_with_agent_context(dir.path());
+        runtime_executor.set_execution_binding_snapshot(edge_runtime_snapshot());
+        let executor = Arc::new(runtime_executor);
+        let mut state = create_test_state();
+        state.runtime_tool_executor = Some(Arc::clone(&executor));
+
+        let initial_names = schema_names(&host.visible_turn_tools(&mut state));
+        assert!(!initial_names.contains("symbols"));
+        assert!(host.current_deferred_tool_names.contains("symbols"));
+        assert!(
+            !host.current_deferred_tool_names.contains("powershell"),
+            "the edge provider inventory must not widen beyond its visible and deferred declarations"
+        );
+
+        let selection = executor
+            .execute_with_metadata("tool_search", &json!({"query": "select:symbols"}))
+            .await;
+        assert!(
+            !selection.is_error,
+            "deferred edge selection failed: {selection:?}"
+        );
+        let activated_names = schema_names(&host.visible_turn_tools(&mut state));
+        assert!(activated_names.contains("symbols"));
+        assert!(!activated_names.contains("powershell"));
+
+        let request = executor.tool_execution_request("symbols", &json!({"path": "src/lib.rs"}));
+        let selected = request
+            .selected_offer
+            .expect("activated edge tool must retain its selected offer");
+        assert_eq!(selected.provider_id, "edge-1");
+        assert_eq!(selected.route, ToolExecutionRouteKind::EdgeBound);
+    }
+
     #[test]
     fn builder_can_disable_server_service_catalog_without_losing_control_plane() {
         let host = ServerAgenticLoopHostBuilder::new(
@@ -7974,7 +16529,7 @@ mod tests {
         .build();
 
         let names = schema_names(&host.tool_schemas);
-        for expected in ["ask_user", "task_board", "tool_search", "introspect"] {
+        for expected in ["ask_user", "notify", "tool_search", "introspect"] {
             assert!(
                 names.contains(expected),
                 "control-plane backbone tool {expected} must remain visible when server-service capacity is disabled: {names:?}"
@@ -7989,6 +16544,1253 @@ mod tests {
         assert!(
             host.valid_tool_names().contains("tool_search"),
             "tool_search must remain callable as the deferred activation backbone"
+        );
+    }
+
+    #[test]
+    fn work_tool_surface_separates_coordinator_and_attempt_roles() {
+        let capabilities = crate::capabilities::lifecycle_server_capabilities(true, false);
+        let unbound = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work".to_string(),
+            "s-unbound".to_string(),
+        )
+        .with_capabilities(capabilities.clone())
+        .build();
+        let bound = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work".to_string(),
+            "s-bound".to_string(),
+        )
+        .with_capabilities(capabilities)
+        .with_work_planning_bound(true)
+        .build();
+        let mut parallel_bound = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work".to_string(),
+            "s-parallel".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .with_work_planning_bound(true)
+        .with_provider_capabilities(server_public_network_capabilities())
+        .build();
+        parallel_bound.apply_work_admission_decision(
+            astra_services::WorkAdmissionDecision::NotRequired {
+                workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::Unknown,
+                mutation_completion_scope:
+                    astra_config::user_profile::MutationCompletionScope::Unknown,
+                execution_topology: astra_services::WorkExecutionTopology::ParallelSubruns,
+                required_capabilities: vec![astra_services::WorkAdmissionCapability::AgentSpawner],
+            },
+        );
+        let mut direct_parallel_bound = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work".to_string(),
+            "s-direct-parallel".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .with_work_planning_bound(true)
+        .with_provider_capabilities(server_public_network_capabilities())
+        .build();
+        direct_parallel_bound.apply_work_admission_decision(
+            astra_services::WorkAdmissionDecision::NotRequired {
+                workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::Unknown,
+                mutation_completion_scope:
+                    astra_config::user_profile::MutationCompletionScope::Unknown,
+                execution_topology: astra_services::WorkExecutionTopology::ParallelSubruns,
+                required_capabilities: vec![astra_services::WorkAdmissionCapability::AgentSpawner],
+            },
+        );
+        let mut assigned_attempt = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work".to_string(),
+            "s-attempt".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .with_work_item_attempt_bound(true)
+        .build();
+        let detached_subrun = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work".to_string(),
+            "s-detached-child".to_string(),
+        )
+        .with_capabilities(crate::capabilities::delegated_subrun_capabilities(
+            true, false, false,
+        ))
+        .build();
+        let deferred_work_profile = serde_json::Map::from_iter([(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES
+                .to_string(),
+            json!([
+                "run_next_work_item",
+                "inspect_work_plan",
+                "propose_work_plan",
+                "inspect_work_criteria",
+                "propose_work_criteria"
+            ]),
+        )]);
+        let resumed_edge_bound = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work".to_string(),
+            "s-resumed-edge".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .with_work_planning_bound(true)
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_edge_profile(deferred_work_profile)
+        .build();
+
+        let unbound_visible = schema_names(
+            &unbound.runtime_ready_turn_tools(unbound.tool_schemas.clone(), &create_test_state()),
+        );
+        let bound_visible = schema_names(&bound.filtered_runtime_ready_turn_tools(
+            &std::collections::HashSet::new(),
+            &create_test_state(),
+        ));
+        let parallel_bound_visible =
+            schema_names(&parallel_bound.filtered_runtime_ready_turn_tools(
+                &std::collections::HashSet::new(),
+                &create_test_state(),
+            ));
+        let direct_parallel_bound_visible =
+            schema_names(&direct_parallel_bound.filtered_runtime_ready_turn_tools(
+                &std::collections::HashSet::new(),
+                &create_test_state(),
+            ));
+        let dir = tempfile::TempDir::new().expect("workspace");
+        let executor = Arc::new(runtime_tool_executor_with_agent_context(dir.path()));
+        executor
+            .install_active_primary_work_attempt(
+                crate::server::runtime_tool_executor::ActivePrimaryWorkAttempt {
+                    attempt_id: "attempt-surface".to_string(),
+                    executor_run_id: "run-surface".to_string(),
+                    item_id: "task-surface".to_string(),
+                    item_revision: 1,
+                    objective: "Inspect the exact surface".to_string(),
+                    expected_result: "One bounded result".to_string(),
+                },
+            )
+            .expect("install active primary attempt");
+        let mut active_primary_state = create_test_state();
+        active_primary_state.runtime_tool_executor = Some(executor);
+        let active_primary_surface = parallel_bound.filtered_runtime_ready_turn_tools(
+            &std::collections::HashSet::new(),
+            &active_primary_state,
+        );
+        let active_primary_visible = schema_names(&active_primary_surface);
+        let mut recovered_bound_surface = Vec::new();
+        append_bound_work_lifecycle_schemas(
+            &mut recovered_bound_surface,
+            &parallel_bound.admission_tool_schemas,
+            &parallel_bound.deferred_tool_schemas,
+            &std::collections::HashSet::new(),
+            true,
+        );
+        let recovered_bound_names = schema_names(&recovered_bound_surface);
+        let mut recovered_coordinator_surface = Vec::new();
+        append_bound_work_lifecycle_schemas(
+            &mut recovered_coordinator_surface,
+            &parallel_bound.admission_tool_schemas,
+            &parallel_bound.deferred_tool_schemas,
+            &std::collections::HashSet::new(),
+            false,
+        );
+        let recovered_coordinator_names = schema_names(&recovered_coordinator_surface);
+        let assigned_visible = schema_names(&assigned_attempt.filtered_runtime_ready_turn_tools(
+            &std::collections::HashSet::new(),
+            &create_test_state(),
+        ));
+        let detached_visible = schema_names(&detached_subrun.filtered_runtime_ready_turn_tools(
+            &std::collections::HashSet::new(),
+            &create_test_state(),
+        ));
+        let resumed_edge_visible =
+            schema_names(&resumed_edge_bound.filtered_runtime_ready_turn_tools(
+                &std::collections::HashSet::new(),
+                &create_test_state(),
+            ));
+
+        assert!(
+            unbound_visible.contains("start_work"),
+            "the initial Work lifecycle surface is missing its entrypoint: {unbound_visible:?}"
+        );
+        for tool in [
+            "inspect_work_plan",
+            "propose_work_plan",
+            "inspect_work_criteria",
+            "propose_work_criteria",
+        ] {
+            assert!(
+                bound_visible.contains(tool),
+                "bound Work authoring must remain immediately callable without a discovery round: {tool}"
+            );
+        }
+        for tool in [
+            "run_next_work_item",
+            "inspect_work_plan",
+            "propose_work_plan",
+            "inspect_work_criteria",
+            "propose_work_criteria",
+        ] {
+            assert!(
+                resumed_edge_visible.contains(tool),
+                "a resumed root must receive server-owned Work continuation directly even when the edge generically deferred it: {tool}; surface={resumed_edge_visible:?}"
+            );
+        }
+        assert!(
+            bound_visible.contains("start_work"),
+            "the core Work lifecycle surface must remain cache-stable after binding"
+        );
+        assert!(
+            bound_visible.contains("agent_fanout"),
+            "a bound coordinator must keep the stable fanout entrypoint visible for explicit same-turn parallel work"
+        );
+        for agent_tool in ["agent", "agent_fanout"] {
+            assert!(
+                bound_visible.contains(agent_tool),
+                "bound coordinators must keep both execution topologies directly selectable: {agent_tool}"
+            );
+            assert!(
+                parallel_bound_visible.contains(agent_tool),
+                "semantic parallel-subrun admission must expose {agent_tool} without a discovery round"
+            );
+        }
+        assert!(
+            active_primary_visible.contains("agent_fanout"),
+            "an active WorkItem keeps the always-loaded recursive fanout topology: {active_primary_visible:?}"
+        );
+        assert!(
+            active_primary_visible.contains("agent"),
+            "an active WorkItem keeps the always-loaded recursive single-child topology: {active_primary_visible:?}"
+        );
+        for lifecycle_tool in ["run_next_work_item", "settle_work_item"] {
+            assert!(
+                recovered_bound_names.contains(lifecycle_tool),
+                "a bound primary assignment must recover its server-owned lifecycle transition from the authoritative admission catalog: {lifecycle_tool}; surface={recovered_bound_names:?}"
+            );
+        }
+        assert!(
+            !recovered_coordinator_names.contains("settle_work_item"),
+            "a merely bound coordinator must not receive attempt settlement authority"
+        );
+        assert!(
+            direct_parallel_bound_visible.contains("agent_fanout")
+                && direct_parallel_bound_visible.contains("agent"),
+            "semantic admission may recommend fanout, but the visible typed surface must preserve a single-child carrier: {direct_parallel_bound_visible:?}"
+        );
+        let direct_agent_call = json!({
+            "id": "direct-agent",
+            "type": "function",
+            "function": {
+                "name": "agent",
+                "arguments": r#"{"action":"spawn","description":"one child","prompt":"Review one concern"}"#
+            }
+        });
+        let fanout_call = json!({
+            "id": "typed-fanout",
+            "type": "function",
+            "function": {
+                "name": "agent_fanout",
+                "arguments": r#"{"action":"start","target_count":2,"slots":[{"description":"A","prompt":"Review A"},{"description":"B","prompt":"Review B"}]}"#
+            }
+        });
+        let direct_parallel_calls = [direct_agent_call, fanout_call];
+
+        let single_child_admission = AgenticLoopHost::admit_tool_calls(
+            &mut direct_parallel_bound,
+            &direct_parallel_calls[..1],
+            Some("tool_calls"),
+        );
+        assert_eq!(single_child_admission.admitted.len(), 1);
+        assert!(single_child_admission.rejected.is_empty());
+        assert_eq!(
+            single_child_admission.admitted[0]["function"]["name"], "agent",
+            "a fallible semantic topology prediction must not replace an explicit typed single-child carrier"
+        );
+
+        let direct_parallel_terminal = direct_parallel_bound.admit_terminal_tool_calls(
+            &create_test_state(),
+            &direct_parallel_calls,
+            Some("tool_calls"),
+        );
+        assert_eq!(
+            direct_parallel_terminal.len(),
+            1,
+            "terminal projection must remove the single-agent substitution"
+        );
+        let direct_parallel_admission = AgenticLoopHost::admit_tool_calls(
+            &mut direct_parallel_bound,
+            &direct_parallel_calls,
+            Some("tool_calls"),
+        );
+        assert_eq!(direct_parallel_admission.admitted.len(), 1);
+        assert_eq!(
+            direct_parallel_admission.admitted[0]["function"]["name"],
+            "agent_fanout"
+        );
+        let rejected = direct_parallel_admission
+            .rejected
+            .first()
+            .expect("single-agent substitution must be rejected");
+        assert_eq!(
+            serde_json::from_str::<Value>(&rejected.result)
+                .expect("typed fanout topology rejection")["error_kind"],
+            "parallel_topology_requires_fanout"
+        );
+
+        // The same structural boundary must hold when a bound continuation
+        // skipped the optional semantic admission judge. A provider batch
+        // containing two direct child lifecycles is already concurrent; it
+        // must be redirected to the atomic fanout carrier rather than
+        // starting an untracked sibling pair.
+        let mut bound_without_pending_topology = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work".to_string(),
+            "s-direct-batch".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .with_work_planning_bound(true)
+        .with_provider_capabilities(server_public_network_capabilities())
+        .build();
+        let direct_agent_batch = vec![
+            json!({
+                "id": "direct-a",
+                "type": "function",
+                "function": {
+                    "name": "agent",
+                    "arguments": r#"{"action":"spawn","description":"A","prompt":"Review A"}"#
+                }
+            }),
+            json!({
+                "id": "direct-b",
+                "type": "function",
+                "function": {
+                    "name": "agent",
+                    "arguments": r#"{"action":"spawn","description":"B","prompt":"Review B"}"#
+                }
+            }),
+        ];
+        let _ = bound_without_pending_topology.admit_terminal_tool_calls(
+            &create_test_state(),
+            &direct_agent_batch,
+            Some("tool_calls"),
+        );
+        let direct_agent_admission = AgenticLoopHost::admit_tool_calls(
+            &mut bound_without_pending_topology,
+            &direct_agent_batch,
+            Some("tool_calls"),
+        );
+        assert!(
+            direct_agent_admission.admitted.is_empty(),
+            "a concurrent direct-agent batch must not bypass the fanout carrier"
+        );
+        assert_eq!(direct_agent_admission.rejected.len(), 2);
+        for rejection in direct_agent_admission.rejected {
+            let result = serde_json::from_str::<Value>(&rejection.result)
+                .expect("typed batch topology rejection");
+            assert_eq!(
+                result["error_kind"],
+                "parallel_topology_admission_unavailable"
+            );
+            assert_eq!(result["retryable"], false);
+        }
+        assert!(
+            active_primary_visible.contains("web_fetch"),
+            "an active primary Work attempt keeps an admitted browser capability on the wire without a discovery round: {active_primary_visible:?}"
+        );
+        // This fixture has no durable Work service, so it cannot exercise the
+        // service-backed lifecycle schemas. The pure role-projection test
+        // below and the live harness cover the root state transition itself.
+        let plan_revision_call = json!({
+            "id": "revise-bound-work",
+            "type": "function",
+            "function": {
+                "name": "propose_work_plan",
+                "arguments": r#"{"context_id":"ctx","reason":"User changed the requested outcomes","additions":[],"revisions":[],"dependencies":[],"dependency_removals":[]}"#
+            }
+        });
+        let root_revision_admission = parallel_bound.enforce_canonical_delegation_lifecycle(
+            &active_primary_state,
+            crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: vec![plan_revision_call.clone()],
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+        );
+        assert_eq!(root_revision_admission.admitted.len(), 1);
+        assert!(root_revision_admission.rejected.is_empty());
+
+        let delegated_revision_admission = assigned_attempt.enforce_canonical_delegation_lifecycle(
+            &create_test_state(),
+            crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: vec![plan_revision_call],
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+        );
+        assert!(delegated_revision_admission.admitted.is_empty());
+        assert_eq!(delegated_revision_admission.rejected.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&delegated_revision_admission.rejected[0].result)
+                .expect("typed delegated Work rejection")["error_kind"],
+            "canonical_work_attempt_may_not_author_work"
+        );
+        assert!(
+            schema_names(&detached_subrun.admission_tool_schemas).contains("agent"),
+            "a generic child remains independently capable through the stable execution surface"
+        );
+        assert!(
+            detached_visible.iter().all(|name| {
+                astra_turn_core::tool::registry::meta::tool_meta(name).is_none_or(|meta| {
+                    !meta
+                        .requires
+                        .contains(&astra_turn_core::capability::Capability::WorkPlanning)
+                        && !meta
+                            .requires
+                            .contains(&astra_turn_core::capability::Capability::WorkLifecycle)
+                })
+            }),
+            "a generic child must not receive any canonical Work control or settlement tool: {detached_visible:?}"
+        );
+        assert!(
+            assigned_visible.contains("settle_work_item"),
+            "an exact WorkItem attempt must expose its typed settlement tool"
+        );
+        assert!(
+            assigned_visible.contains("agent_fanout"),
+            "an exact WorkItem attempt may recursively decompose through the stable fanout topology"
+        );
+        for coordinator_tool in [
+            "start_work",
+            "inspect_work_plan",
+            "propose_work_plan",
+            "inspect_work_criteria",
+            "propose_work_criteria",
+        ] {
+            assert!(
+                !assigned_visible.contains(coordinator_tool),
+                "an assigned WorkItem must not receive coordinator tool {coordinator_tool}"
+            );
+        }
+        assert!(
+            assigned_visible.contains("agent"),
+            "an exact WorkItem attempt may recursively decompose through the stable single-child topology"
+        );
+        let delegated_recursive_calls = vec![
+            json!({
+                "id": "delegated-agent",
+                "type": "function",
+                "function": {"name": "agent", "arguments": r#"{"action":"spawn","description":"nested","prompt":"nested"}"#}
+            }),
+            json!({
+                "id": "delegated-fanout",
+                "type": "function",
+                "function": {"name": "agent_fanout", "arguments": r#"{"action":"start","target_count":1,"slots":[{"description":"nested","prompt":"nested"}]}"#}
+            }),
+            json!({
+                "id": "delegated-work",
+                "type": "function",
+                "function": {"name": "start_work", "arguments": r#"{"activation":"start","goal":"nested","tasks":[{"objective":"nested","expected_result":"nested"}]}"#}
+            }),
+        ];
+        let _ = assigned_attempt.admit_terminal_tool_calls(
+            &create_test_state(),
+            &delegated_recursive_calls,
+            Some("tool_calls"),
+        );
+        let delegated_admission = AgenticLoopHost::admit_tool_calls(
+            &mut assigned_attempt,
+            &delegated_recursive_calls,
+            Some("tool_calls"),
+        );
+        assert_eq!(
+            delegated_admission
+                .admitted
+                .iter()
+                .filter_map(astra_turn_core::tool::args::shape::tool_call_name)
+                .collect::<Vec<_>>(),
+            vec!["agent"],
+            "a delegated WorkItem may use one child but cannot self-authorize parallel topology"
+        );
+        assert_eq!(delegated_admission.rejected.len(), 2);
+        let rejected_by_id = delegated_admission
+            .rejected
+            .iter()
+            .map(|rejected| {
+                (
+                    rejected.id.as_str(),
+                    serde_json::from_str::<Value>(&rejected.result)
+                        .expect("typed delegated rejection")["error_kind"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            rejected_by_id.get("delegated-fanout").map(String::as_str),
+            Some("parallel_topology_not_admitted")
+        );
+        assert_eq!(
+            rejected_by_id.get("delegated-work").map(String::as_str),
+            Some("canonical_work_attempt_may_not_author_work")
+        );
+    }
+
+    #[test]
+    fn root_primary_assignment_does_not_change_provider_work_role_projection() {
+        assert_eq!(provider_work_execution_context(false, false), None);
+        assert_eq!(
+            provider_work_execution_context(false, true),
+            None,
+            "a foreground primary assignment changes runtime authority, not the root provider/cache scope"
+        );
+        assert_eq!(
+            provider_work_execution_context(true, true),
+            Some(astra_runtime_env::WorkExecutionContext::DelegatedAttempt),
+            "a delegated attempt remains a separate narrow provider/cache scope"
+        );
+    }
+
+    #[test]
+    fn work_role_transition_tools_form_a_cache_tail() {
+        let schemas = astra_tools::schemas::all_tool_schemas();
+        let by_name = |name: &str| {
+            schemas
+                .iter()
+                .find(|schema| tool_schema_name(schema) == Some(name))
+                .cloned()
+                .unwrap_or_else(|| panic!("missing schema {name}"))
+        };
+        let mut before = vec![
+            by_name("agent_fanout"),
+            by_name("bash"),
+            by_name("inspect_work_plan"),
+            by_name("start_work"),
+            by_name("read_file"),
+            by_name("propose_work_criteria"),
+        ];
+        stabilize_work_role_tool_order(&mut before);
+        let before_names: Vec<String> = before
+            .iter()
+            .filter_map(tool_schema_name)
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            before_names,
+            vec![
+                "agent_fanout",
+                "bash",
+                "inspect_work_plan",
+                "read_file",
+                "propose_work_criteria",
+                "start_work"
+            ]
+        );
+
+        let after_names: Vec<_> = before_names
+            .iter()
+            .filter(|name| name.as_str() != "start_work")
+            .cloned()
+            .collect();
+        assert_eq!(
+            after_names,
+            before_names[..5],
+            "removing a coordinator-exclusive transition must preserve the complete root prefix"
+        );
+    }
+
+    #[test]
+    fn unbound_surface_keeps_start_work_when_admission_is_unavailable() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-fallback".to_string(),
+            "s-work-fallback".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .build();
+        let mut state = create_test_state();
+        state.turn_intent = None;
+
+        let names = schema_names(
+            &host.filtered_runtime_ready_turn_tools(&std::collections::HashSet::new(), &state),
+        );
+        assert!(
+            names.contains("start_work"),
+            "an unavailable admission judge must not remove the model's typed Work entrypoint: {names:?}"
+        );
+    }
+
+    #[test]
+    fn unavailable_work_admission_preserves_structural_calls_but_rejects_self_authorized_fanout() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-admission-unavailable".to_string(),
+            "s-work-admission-unavailable".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .build();
+        let mut state = create_test_state();
+        let single = json!({
+            "id": "read-single",
+            "type": "function",
+            "function": {"name":"read_file","arguments":"{\"path\":\"a\"}"}
+        });
+        let admission = host.enforce_canonical_delegation_lifecycle(
+            &state,
+            crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: vec![single.clone()],
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+        );
+        assert_eq!(admission.admitted.len(), 1);
+        assert!(
+            admission.rejected.is_empty(),
+            "one direct observation remains compatible with a one-shot turn"
+        );
+
+        state.total_tool_calls = 1;
+        let fanout = json!({
+            "id": "fanout-after-discovery",
+            "type": "function",
+            "function": {
+                "name": "agent_fanout",
+                "arguments": r#"{"action":"start","target_count":2,"slots":[{"description":"Inspect A","prompt":"Inspect A"},{"description":"Inspect B","prompt":"Inspect B"}]}"#
+            }
+        });
+        let admission = host.enforce_canonical_delegation_lifecycle(
+            &state,
+            crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: vec![fanout],
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+        );
+        assert!(admission.admitted.is_empty());
+        assert_eq!(admission.rejected.len(), 1);
+        assert!(
+            admission.rejected[0]
+                .result
+                .contains("parallel_topology_admission_unavailable")
+        );
+
+        let admission = host.enforce_canonical_delegation_lifecycle(
+            &state,
+            crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: vec![single],
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+        );
+        assert_eq!(admission.admitted.len(), 1);
+        assert!(
+            admission.rejected.is_empty(),
+            "a later direct observation must not be rejected solely because the sidecar was unavailable"
+        );
+
+        state.total_tool_calls = 0;
+        let calls = vec![
+            json!({
+                "id": "read-a",
+                "type": "function",
+                "function": {"name":"read_file","arguments":"{\"path\":\"a\"}"}
+            }),
+            json!({
+                "id": "read-b",
+                "type": "function",
+                "function": {"name":"read_file","arguments":"{\"path\":\"b\"}"}
+            }),
+        ];
+        let admission = host.enforce_canonical_delegation_lifecycle(
+            &state,
+            crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: calls,
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+        );
+        assert_eq!(admission.admitted.len(), 2);
+        assert!(
+            admission.rejected.is_empty(),
+            "independent observations in one provider batch remain valid without semantic admission"
+        );
+
+        state.inference_purpose = astra_turn_types::InferencePurpose::SubAgent;
+        state.total_tool_calls = 1;
+        let delegated_follow_up = json!({
+            "id": "delegated-follow-up",
+            "type": "function",
+            "function": {"name":"read_file","arguments":"{\"path\":\"a\"}"}
+        });
+        let delegated_admission = host.enforce_canonical_delegation_lifecycle(
+            &state,
+            crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: vec![delegated_follow_up],
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+        );
+        assert_eq!(delegated_admission.admitted.len(), 1);
+        assert!(
+            delegated_admission.rejected.is_empty(),
+            "a typed delegated run must not be forced through root Work establishment"
+        );
+        state.inference_purpose = astra_turn_types::InferencePurpose::PrimaryAgent;
+        state.total_tool_calls = 0;
+
+        let start = json!({
+            "id": "start",
+            "type": "function",
+            "function": {"name":"start_work","arguments":"{\"activation\":\"start\",\"goal\":\"g\",\"tasks\":[{\"objective\":\"a\",\"expected_result\":\"b\"},{\"objective\":\"c\",\"expected_result\":\"d\"}]}"}
+        });
+        let admission = host.enforce_canonical_delegation_lifecycle(
+            &state,
+            crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: vec![start],
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+        );
+        assert_eq!(
+            admission.admitted.len(),
+            1,
+            "the typed Work entrypoint remains usable"
+        );
+        assert!(admission.rejected.is_empty());
+    }
+
+    #[test]
+    fn admitted_fixed_subruns_reject_partial_single_agent_execution() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-fixed-subruns".to_string(),
+            "s-fixed-subruns".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .build();
+        host.work_admission_execution_topology =
+            astra_services::WorkExecutionTopology::ParallelSubruns;
+        host.work_admission_topology_authoritative = true;
+        let state = create_test_state();
+        let single_spawn = json!({
+            "id": "partial-spawn",
+            "type": "function",
+            "function": {
+                "name": "agent",
+                "arguments": r#"{"action":"spawn","prompt":"inspect one half"}"#
+            }
+        });
+
+        let admission = host.enforce_canonical_delegation_lifecycle(
+            &state,
+            crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: vec![single_spawn],
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+        );
+
+        assert!(admission.admitted.is_empty());
+        assert_eq!(admission.rejected.len(), 1);
+        assert!(
+            admission.rejected[0]
+                .result
+                .contains("parallel_topology_requires_fanout")
+        );
+    }
+
+    #[test]
+    fn canonical_work_admission_binds_then_executes_in_the_primary_session() {
+        let mut unbound = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-policy".to_string(),
+            "s-work-policy".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .build();
+        let state = create_test_state();
+        // No semantic turn-intent is installed. Explicit agent delegation is
+        // allowed as an ordinary capability; Work becomes a hard boundary
+        // only when the typed admission decision says it is required. The
+        // separate fanout contract is exercised by the topology tests below.
+        let calls = vec![
+            json!({
+                "id": "start",
+                "type": "function",
+                "function": {"name": "start_work", "arguments": r#"{"goal":"Deliver the change","activation":"start","tasks":[{"objective":"Implement","expected_result":"Verified change"}]}"#}
+            }),
+            json!({
+                "id": "spawn",
+                "type": "function",
+                "function": {"name": "agent", "arguments": r#"{"action":"spawn","description":"Implement","prompt":"Implement the change"}"#}
+            }),
+        ];
+
+        let admitted = unbound.admit_terminal_tool_calls(&state, &calls, Some("tool_calls"));
+        assert_eq!(admitted.len(), 2);
+        assert_eq!(
+            admitted[0]["function"]["name"].as_str(),
+            Some("start_work"),
+            "the lifecycle-establishing call remains executable"
+        );
+        assert_eq!(admitted[1]["function"]["name"].as_str(), Some("agent"));
+        let admission = AgenticLoopHost::admit_tool_calls(&mut unbound, &calls, Some("tool_calls"));
+        assert!(
+            admission.rejected.is_empty(),
+            "without a typed Required decision, explicit delegation must not be blocked by a text/name heuristic"
+        );
+
+        // Absent a typed `Required` decision, ordinary root exploration keeps
+        // its normal capability surface. This guards against turning a
+        // lifecycle policy into an over-broad tool-name or text heuristic.
+        let ordinary_exploration = vec![json!({
+            "id": "ordinary-read",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": r#"{"path":"Cargo.toml"}"#}
+        })];
+        let admitted =
+            unbound.admit_terminal_tool_calls(&state, &ordinary_exploration, Some("tool_calls"));
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0]["id"].as_str(), Some("ordinary-read"));
+        assert!(
+            AgenticLoopHost::admit_tool_calls(
+                &mut unbound,
+                &ordinary_exploration,
+                Some("tool_calls"),
+            )
+            .rejected
+            .is_empty()
+        );
+
+        // A policy-required Work turn must establish its graph before even
+        // read-only root exploration. This is intentionally driven by the
+        // typed LLM decision, not words in a task title or prompt.
+        let mut required = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-policy".to_string(),
+            "s-work-policy".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .build();
+        let mut required_state = create_test_state();
+        required_state.turn_intent = Some(
+            astra_config::user_profile::TurnIntent::default()
+                .with_work_lifecycle(astra_config::user_profile::WorkLifecycleIntent::Required),
+        );
+        let direct_exploration = vec![json!({
+            "id": "direct-read",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": r#"{"path":"Cargo.toml"}"#}
+        })];
+        assert!(
+            required
+                .admit_terminal_tool_calls(&required_state, &direct_exploration, Some("tool_calls"))
+                .is_empty(),
+            "a policy-required Work turn cannot explore before it owns a graph"
+        );
+        let admission = AgenticLoopHost::admit_tool_calls(
+            &mut required,
+            &direct_exploration,
+            Some("tool_calls"),
+        );
+        assert_eq!(admission.rejected.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&admission.rejected[0].result)
+                .expect("structured Work-establishment rejection")["error_kind"]
+                .as_str(),
+            Some("canonical_work_establishment_required")
+        );
+
+        let mut bound = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-policy".to_string(),
+            "s-work-policy".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .with_work_planning_bound(true)
+        .build();
+        let bound_calls = vec![
+            calls[1].clone(),
+            json!({
+                "id": "run-item",
+                "type": "function",
+                "function": {"name": "run_next_work_item", "arguments": r#"{}"#}
+            }),
+            json!({
+                "id": "direct-network",
+                "type": "function",
+                "function": {"name": "web_fetch", "arguments": r#"{"url":"https://example.test"}"#}
+            }),
+        ];
+        let admitted = bound.admit_terminal_tool_calls(&state, &bound_calls, Some("tool_calls"));
+        assert_eq!(admitted.len(), 2);
+        for id in ["spawn", "run-item"] {
+            assert!(
+                admitted.iter().any(|call| call["id"].as_str() == Some(id)),
+                "a canonical Work coordinator must admit explicit durable delegation {id}"
+            );
+        }
+        let admission =
+            AgenticLoopHost::admit_tool_calls(&mut bound, &bound_calls, Some("tool_calls"));
+        assert_eq!(admission.rejected.len(), 1);
+        assert_eq!(
+            admission.rejected[0].id, "direct-network",
+            "a task capability must not race a same-batch Work dispatch"
+        );
+        assert_eq!(admission.admitted.len(), 2);
+
+        let ordinary_follow_up = vec![bound_calls[2].clone()];
+        let admitted =
+            bound.admit_terminal_tool_calls(&state, &ordinary_follow_up, Some("tool_calls"));
+        assert_eq!(admitted.len(), 1);
+        let admission =
+            AgenticLoopHost::admit_tool_calls(&mut bound, &ordinary_follow_up, Some("tool_calls"));
+        assert!(
+            admission.rejected.is_empty(),
+            "a completed historical Work binding must not capture a later ordinary turn"
+        );
+        assert_eq!(admission.admitted.len(), 1);
+
+        let duplicate_start = vec![json!({
+            "id": "duplicate-start",
+            "type": "function",
+            "function": {
+                "name": "start_work",
+                "arguments": r#"{"activation":"start","goal":"same","tasks":[{"objective":"a","expected_result":"b"}]}"#
+            }
+        })];
+        let duplicate_terminal =
+            bound.admit_terminal_tool_calls(&state, &duplicate_start, Some("tool_calls"));
+        assert_eq!(duplicate_terminal.len(), 1);
+        assert_eq!(
+            duplicate_terminal[0]["function"]["name"].as_str(),
+            Some("start_work"),
+            "the typed start_work handler must return an idempotent/extension receipt instead of admission dropping the call"
+        );
+        let duplicate_admission =
+            AgenticLoopHost::admit_tool_calls(&mut bound, &duplicate_start, Some("tool_calls"));
+        assert!(
+            duplicate_admission.rejected.is_empty(),
+            "a bound Work must let the typed handler explain idempotency or graph extension"
+        );
+        assert_eq!(duplicate_admission.admitted.len(), 1);
+        assert_eq!(
+            duplicate_admission.admitted[0]["function"]["name"].as_str(),
+            Some("start_work")
+        );
+
+        let mut same_turn_state = create_test_state();
+        same_turn_state.stall.tool_call_records.push(
+            astra_services::session_journal::ToolCallRecord {
+                name: "start_work".to_string(),
+                ok: true,
+                disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+                ..Default::default()
+            },
+        );
+        assert!(
+            bound
+                .admit_terminal_tool_calls(&same_turn_state, &duplicate_start, Some("tool_calls"))
+                .is_empty(),
+            "one user turn may establish canonical Work only once"
+        );
+        let same_turn_duplicate =
+            AgenticLoopHost::admit_tool_calls(&mut bound, &duplicate_start, Some("tool_calls"));
+        assert_eq!(same_turn_duplicate.rejected.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&same_turn_duplicate.rejected[0].result)
+                .expect("same-turn start_work rejection")["error_kind"],
+            "canonical_work_already_established_this_turn"
+        );
+
+        let start_and_direct_network = vec![
+            calls[0].clone(),
+            json!({
+                "id": "network-after-start",
+                "type": "function",
+                "function": {"name": "web_fetch", "arguments": r#"{"url":"https://example.test"}"#}
+            }),
+        ];
+        let admitted = unbound.admit_terminal_tool_calls(
+            &state,
+            &start_and_direct_network,
+            Some("tool_calls"),
+        );
+        assert_eq!(admitted.len(), 2);
+        assert_eq!(admitted[0]["id"].as_str(), Some("start"));
+        assert_eq!(admitted[1]["id"].as_str(), Some("network-after-start"));
+        let admission = AgenticLoopHost::admit_tool_calls(
+            &mut unbound,
+            &start_and_direct_network,
+            Some("tool_calls"),
+        );
+        assert!(
+            admission.rejected.is_empty(),
+            "activation=start establishes a typed execution barrier for the following capability"
+        );
+
+        let reversed_batch = vec![
+            start_and_direct_network[1].clone(),
+            start_and_direct_network[0].clone(),
+        ];
+        let admitted =
+            unbound.admit_terminal_tool_calls(&state, &reversed_batch, Some("tool_calls"));
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0]["id"].as_str(), Some("start"));
+        let admission =
+            AgenticLoopHost::admit_tool_calls(&mut unbound, &reversed_batch, Some("tool_calls"));
+        let rejected = admission
+            .rejected
+            .iter()
+            .find(|call| call.id == "network-after-start")
+            .expect("a capability before the lifecycle barrier must be rejected");
+        assert_eq!(
+            serde_json::from_str::<Value>(&rejected.result)
+                .expect("structured reversed-batch Work rejection")["error_kind"]
+                .as_str(),
+            Some("canonical_work_task_execution_required")
+        );
+
+        let duplicate_runner = vec![
+            bound_calls[1].clone(),
+            json!({
+                "id": "run-item-again",
+                "type": "function",
+                "function": {"name": "run_next_work_item", "arguments": r#"{}"#}
+            }),
+        ];
+        let admitted =
+            bound.admit_terminal_tool_calls(&state, &duplicate_runner, Some("tool_calls"));
+        assert_eq!(admitted.len(), 1);
+        let admission =
+            AgenticLoopHost::admit_tool_calls(&mut bound, &duplicate_runner, Some("tool_calls"));
+        assert_eq!(admission.rejected.len(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&admission.rejected[0].result)
+                .expect("parallel Work runner rejection")["error_kind"]
+                .as_str(),
+            Some("canonical_work_parallel_execution_not_allowed")
+        );
+
+        // A primary-session attempt gets the same execution boundary as an
+        // explicitly delegated attempt, without constructing another model
+        // loop. The transition is driven by trusted runtime state.
+        let mut primary = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-policy".to_string(),
+            "s-primary-attempt".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .build();
+        let dir = tempfile::TempDir::new().expect("workspace");
+        let executor = runtime_tool_executor_with_agent_context(dir.path());
+        executor
+            .install_active_primary_work_attempt(
+                crate::server::runtime_tool_executor::ActivePrimaryWorkAttempt {
+                    attempt_id: "attempt-1".to_string(),
+                    executor_run_id: "run-1".to_string(),
+                    item_id: "task-1".to_string(),
+                    item_revision: 1,
+                    objective: "Execute task 1".to_string(),
+                    expected_result: "Task 1 is verified".to_string(),
+                },
+            )
+            .expect("install primary attempt");
+        let mut primary_state = create_test_state();
+        primary_state.runtime_tool_executor = Some(Arc::new(executor));
+        let attempt_calls = vec![
+            json!({
+                "id": "task-network",
+                "type": "function",
+                "function": {"name": "web_fetch", "arguments": r#"{"url":"https://example.test"}"#}
+            }),
+            json!({
+                "id": "task-settle",
+                "type": "function",
+                "function": {"name": "settle_work_item", "arguments": r#"{}"#}
+            }),
+            json!({
+                "id": "task-recursive-dispatch",
+                "type": "function",
+                "function": {"name": "run_next_work_item", "arguments": r#"{}"#}
+            }),
+            json!({
+                "id": "task-recursive-agent",
+                "type": "function",
+                "function": {"name": "agent", "arguments": r#"{"action":"spawn","description":"nested","prompt":"nested"}"#}
+            }),
+            json!({
+                "id": "task-recursive-fanout",
+                "type": "function",
+                "function": {"name": "agent_fanout", "arguments": r#"{"action":"start","target_count":1,"slots":[{"description":"nested","prompt":"nested"}]}"#}
+            }),
+            json!({
+                "id": "task-recursive-work",
+                "type": "function",
+                "function": {"name": "start_work", "arguments": r#"{"activation":"start","goal":"nested graph","tasks":[{"objective":"nested","expected_result":"nested"}]}"#}
+            }),
+        ];
+        let admitted =
+            primary.admit_terminal_tool_calls(&primary_state, &attempt_calls, Some("tool_calls"));
+        assert_eq!(
+            admitted
+                .iter()
+                .filter_map(astra_turn_core::tool::args::shape::tool_call_name)
+                .collect::<Vec<_>>(),
+            vec![
+                "web_fetch",
+                "settle_work_item",
+                "run_next_work_item",
+                "agent"
+            ],
+            "a primary WorkItem may execute, settle, or delegate one child; parallel decomposition still requires typed topology authority"
+        );
+        let admission =
+            AgenticLoopHost::admit_tool_calls(&mut primary, &attempt_calls, Some("tool_calls"));
+        assert_eq!(admission.rejected.len(), 2);
+        let rejection_kinds = admission
+            .rejected
+            .iter()
+            .map(|rejected| {
+                (
+                    rejected.id.as_str(),
+                    serde_json::from_str::<Value>(&rejected.result)
+                        .expect("structured attempt boundary rejection")["error_kind"]
+                        .as_str()
+                        .unwrap()
+                        .to_string(),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            rejection_kinds
+                .get("task-recursive-fanout")
+                .map(String::as_str),
+            Some("parallel_topology_not_admitted")
+        );
+        assert_eq!(
+            rejection_kinds
+                .get("task-recursive-work")
+                .map(String::as_str),
+            Some("canonical_work_attempt_may_not_author_work")
+        );
+    }
+
+    #[test]
+    fn completed_same_turn_work_allows_read_only_verification_but_not_more_execution() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-completed-work".to_string(),
+            "s-completed-work".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .with_work_planning_bound(true)
+        .build();
+        let mut state = create_test_state();
+        state.telemetry.all_tools_used.insert("start_work".into());
+        state
+            .stall
+            .tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "start_work".into(),
+                ok: true,
+                disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+                ..Default::default()
+            });
+
+        let diff = json!({
+            "id": "verify-diff",
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": r#"{"command":"git diff --stat && git status --short"}"#
+            }
+        });
+        let admitted =
+            host.admit_terminal_tool_calls(&state, std::slice::from_ref(&diff), Some("tool_calls"));
+        assert_eq!(admitted, vec![diff.clone()]);
+        let admission = AgenticLoopHost::admit_tool_calls(
+            &mut host,
+            std::slice::from_ref(&diff),
+            Some("tool_calls"),
+        );
+        assert_eq!(admission.admitted, vec![diff]);
+        assert!(admission.rejected.is_empty());
+
+        let mutation = json!({
+            "id": "late-mutation",
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "arguments": r#"{"path":"src/lib.rs","content":"late change"}"#
+            }
+        });
+        assert!(
+            host.admit_terminal_tool_calls(
+                &state,
+                std::slice::from_ref(&mutation),
+                Some("tool_calls"),
+            )
+            .is_empty()
+        );
+        let admission =
+            AgenticLoopHost::admit_tool_calls(&mut host, &[mutation], Some("tool_calls"));
+        assert!(admission.admitted.is_empty());
+        assert_eq!(admission.rejected.len(), 1);
+        let result: Value = serde_json::from_str(&admission.rejected[0].result)
+            .expect("structured post-completion rejection");
+        assert_eq!(
+            result["error_kind"],
+            "canonical_work_post_completion_execution_not_allowed"
+        );
+        assert!(
+            result["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("Read-only inspection"))
         );
     }
 
@@ -8285,9 +18087,9 @@ mod tests {
                 "function": {"name": "mcp__docs__query", "arguments": r#"{"query":"astra"}"#}
             }),
             json!({
-                "id": "task-1",
+                "id": "notify-1",
                 "type": "function",
-                "function": {"name": "task_board", "arguments": r#"{"action":"create","title":"server task"}"#}
+                "function": {"name": "notify", "arguments": r#"{"message":"server status"}"#}
             }),
             json!({
                 "id": "unknown-1",
@@ -8401,8 +18203,6 @@ mod tests {
         )
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
-        let (tx, _rx) = tokio::sync::mpsc::channel(4);
-        host.set_event_tx(tx);
         host.prefer_client_tool_delivery();
 
         let dir = tempfile::TempDir::new().unwrap();
@@ -8412,13 +18212,18 @@ mod tests {
         state.runtime_tool_executor = Some(Arc::new(runtime_executor));
 
         assert!(
+            !host.should_deliver_edge_bound_tools_via_client_ledger(&state),
+            "binding metadata alone must never invent an executable child delivery lane"
+        );
+        install_in_memory_interaction_sink(&mut host);
+        assert!(
             host.should_deliver_edge_bound_tools_via_client_ledger(&state),
-            "a child with an inherited executable client lane must not fall through to an unavailable server edge transport"
+            "a child with an inherited durable interaction lane must not fall through to an unavailable server edge transport"
         );
     }
 
     #[tokio::test]
-    async fn thin_client_ledger_does_not_emit_server_owned_task_request() {
+    async fn thin_client_ledger_does_not_emit_server_owned_control_plane_request() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -8431,23 +18236,23 @@ mod tests {
         host.set_event_tx(tx);
         let state = create_test_state();
 
-        let task_call = json!({
-            "id": "task-1",
+        let control_plane_call = json!({
+            "id": "notify-1",
             "type": "function",
-            "function": {"name": "task_board", "arguments": r#"{"action":"create","title":"server task"}"#}
+            "function": {"name": "notify", "arguments": r#"{"message":"server status"}"#}
         });
 
         let results = host
-            .maybe_deliver_edge_bound_tools_via_ledger(&state, &[task_call])
+            .maybe_deliver_edge_bound_tools_via_ledger(&state, &[control_plane_call])
             .await;
 
         assert!(
-            results.is_empty(),
-            "server-owned task must not be converted into edge/client results"
+            results.results.is_empty(),
+            "server-owned control-plane calls must not become edge/client results"
         );
         assert!(
             rx.try_recv().is_err(),
-            "server-owned task must not emit a tool_request to thin clients"
+            "server-owned control-plane calls must not emit tool_request to thin clients"
         );
     }
 
@@ -8468,15 +18273,7 @@ mod tests {
         .build();
 
         let names = schema_names(&host.tool_schemas);
-        for expected in [
-            "bash",
-            "read_file",
-            "task_board",
-            "session",
-            "tool_search",
-            "web_search",
-            "memory",
-        ] {
+        for expected in ["bash", "read_file", "notify", "tool_search", "memory"] {
             assert!(
                 names.contains(expected),
                 "{expected} should be visible in the composed server+edge surface: {names:?}"
@@ -8484,6 +18281,17 @@ mod tests {
             assert!(
                 host.valid_tool_names().contains(expected),
                 "{expected} should be admitted in the composed server+edge surface"
+            );
+        }
+        let deferred = schema_names(&host.deferred_tool_schemas);
+        for expected in ["session", "web_search"] {
+            assert!(
+                deferred.contains(expected),
+                "{expected} should remain available through deferred discovery: {deferred:?}"
+            );
+            assert!(
+                !names.contains(expected),
+                "deferred tool {expected} must not inflate the default wire surface"
             );
         }
         assert!(
@@ -8524,18 +18332,66 @@ mod tests {
             names.contains("bash"),
             "edge-declared runtime tools should remain visible"
         );
-        for expected in ["task_board", "session", "tool_search", "introspect"] {
+        for expected in ["notify", "tool_search", "introspect"] {
             assert!(
                 names.contains(expected),
                 "control-plane backbone tool {expected} must remain visible with edge tools: {names:?}"
             );
         }
+        assert!(schema_names(&host.deferred_tool_schemas).contains("session"));
+        assert!(!names.contains("session"));
         for hidden in ["web_search", "memory"] {
             assert!(
                 !names.contains(hidden),
                 "server-service tool {hidden} must not leak when server-service capacity is disabled: {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn final_server_wire_projects_an_edge_supplied_action_schema_to_its_route_owner() {
+        let mut edge_schemas = astra_tools::schemas::all_tool_schemas();
+        astra_tools::schemas::project_action_schemas_for_surface(&mut edge_schemas, "local");
+        let edge_agent = edge_schemas
+            .into_iter()
+            .find(|schema| tool_schema_name(schema) == Some("agent"))
+            .expect("locally projected edge agent schema");
+        assert!(
+            edge_agent
+                .pointer("/function/parameters/x-astra-action-surfaces")
+                .is_none(),
+            "production Edge payload must not rely on internal owner metadata"
+        );
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-action-owner".to_string(),
+            "s-action-owner".to_string(),
+        )
+        .with_edge_tools(vec![edge_agent])
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+
+        let agent = host
+            .tool_schemas
+            .iter()
+            .find(|schema| tool_schema_name(schema) == Some("agent"))
+            .expect("final server agent schema");
+        assert_eq!(
+            agent.pointer("/function/parameters/properties/action/enum"),
+            Some(&json!(["spawn", "get_result", "send_message"]))
+        );
+        assert!(
+            agent
+                .pointer("/function/parameters/properties/steps")
+                .is_none()
+        );
+        assert!(
+            agent
+                .pointer("/function/parameters/x-astra-action-surfaces")
+                .is_none(),
+            "projection metadata must not leak into the provider schema"
+        );
     }
 
     #[test]
@@ -8566,7 +18422,11 @@ mod tests {
             Default::default(),
         );
 
-        host.merge_allowlisted_edge_tool_schemas(&["bash".to_string(), "read_file".to_string()]);
+        host.merge_allowlisted_edge_tool_schemas(&[
+            "bash".to_string(),
+            "read_file".to_string(),
+            "web_fetch".to_string(),
+        ]);
 
         assert!(
             host.valid_tool_names()
@@ -8574,6 +18434,7 @@ mod tests {
         );
         assert!(host.valid_tool_names().contains("bash"));
         assert!(host.valid_tool_names().contains("read_file"));
+        assert!(host.valid_tool_names().contains("web_fetch"));
         assert!(
             host.server_side_tools,
             "edge_ws allow_tools must route through ServerToolExecutor, not edge ledger"
@@ -8607,6 +18468,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn edge_owned_github_schema_does_not_require_server_github_authority() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u1".to_string(),
+            "s1".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            false, false,
+        ))
+        .with_server_service_tool_catalog_enabled(false)
+        .with_static_tool_catalog_admissible(false)
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+
+        assert!(
+            !host
+                .capabilities
+                .has(astra_turn_core::capability::Capability::GitHubAuth)
+        );
+        host.merge_allowlisted_edge_tool_schemas(&["github".to_string()]);
+
+        assert!(
+            host.valid_tool_names().contains("github"),
+            "the Edge declaration owns both its schema and credential binding"
+        );
+    }
+
     fn schema_names(tools: &[Value]) -> HashSet<String> {
         tools
             .iter()
@@ -8630,6 +18520,122 @@ mod tests {
             ),
             astra_runtime_env::RuntimeBinding::host_process("edge-host"),
         )
+    }
+
+    fn cli_edge_ledger_snapshot() -> ExecutionBindingSnapshot {
+        ExecutionBindingSnapshot::new(
+            WorkspaceBinding::edge_workspace(
+                "CLI workspace",
+                "/home/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-process-42",
+                "CLI workspace",
+                crate::server::tool_transport::ToolTransportKind::EdgeLedger,
+                crate::server::tool_transport::ExecutorStatus::Online,
+            ),
+            astra_runtime_env::RuntimeBinding::host_process("edge-process-42"),
+        )
+    }
+
+    #[test]
+    fn model_request_topology_follows_the_authoritative_execution_binding() {
+        let server = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-server-topology".to_string(),
+            "s-server-topology".to_string(),
+        )
+        .with_server_sandbox_workspace("/tmp/astra-server-topology")
+        .build();
+        assert_eq!(
+            server.model_request_topology(),
+            astra_services::ModelRequestTopology::ServerOnly
+        );
+        let server_context = server.model_request_context_seed(None);
+        assert_eq!(server_context.topology, server.model_request_topology());
+        assert_eq!(server_context.interaction_owner, "server");
+        assert_eq!(server_context.loop_owner, "server");
+
+        let edge = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-edge-topology".to_string(),
+            "s-edge-topology".to_string(),
+        )
+        .with_execution_binding_snapshot(cli_edge_ledger_snapshot())
+        .build();
+        assert_eq!(
+            edge.model_request_topology(),
+            astra_services::ModelRequestTopology::CliServer
+        );
+        let cli_context = edge.model_request_context_seed(None);
+        assert_eq!(cli_context.topology, edge.model_request_topology());
+        assert_eq!(cli_context.interaction_owner, "cli");
+        assert_eq!(cli_context.loop_owner, "server");
+
+        let external_edge = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-external-edge-topology".to_string(),
+            "s-external-edge-topology".to_string(),
+        )
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        assert_eq!(
+            external_edge.model_request_topology(),
+            astra_services::ModelRequestTopology::EdgeServer
+        );
+        let edge_context = external_edge.model_request_context_seed(None);
+        assert_eq!(
+            edge_context.topology,
+            external_edge.model_request_topology()
+        );
+        assert_eq!(edge_context.interaction_owner, "edge");
+        assert_eq!(edge_context.loop_owner, "server");
+    }
+
+    #[test]
+    fn connected_cli_and_inherited_child_share_an_executable_workspace_surface() {
+        let root = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-cli-root".to_string(),
+            "s-cli-root".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(cli_edge_ledger_snapshot())
+        .build();
+        let child = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-cli-child".to_string(),
+            "s-cli-child".to_string(),
+        )
+        .with_execution_binding_snapshot(cli_edge_ledger_snapshot())
+        .build();
+
+        for (label, host) in [("root", root), ("child", child)] {
+            let names = schema_names(&host.tool_schemas);
+            assert!(names.contains("bash"), "{label} lost process execution");
+            assert!(
+                names.contains("read_file"),
+                "{label} lost repository read execution"
+            );
+            let read_admission = host
+                .tool_admission_snapshot_entries()
+                .into_iter()
+                .find(|entry| entry.tool_name == "read_file")
+                .expect("read_file admission");
+            assert!(read_admission.visible, "{label}: {read_admission:?}");
+            assert_eq!(read_admission.selected_route, "EdgeBound");
+            assert!(read_admission.candidates.iter().any(|candidate| {
+                candidate.selected
+                    && candidate.executor_id == "edge-process-42"
+                    && candidate.readiness == "ready"
+            }));
+        }
     }
 
     fn runtime_tool_executor_with_agent_context(
@@ -8656,11 +18662,13 @@ mod tests {
             working_dir: work_dir.to_path_buf(),
             spawner,
             inherited_permissions: crate::orchestration::InheritedPermissions::auto_approve(),
+            enabled_tools: None,
             active_skills: Vec::new(),
             live_event_sink: None,
             client_tool_delivery_tx: None,
             trace_context: None,
             execution_metadata: None,
+            workspace_mutation: crate::orchestration::WorkspaceMutationAuthority::default(),
             transcript_location: crate::orchestration::AgentTranscriptLocation::DurableServer,
         });
         executor
@@ -8928,13 +18936,15 @@ mod tests {
 
         assert!(host.valid_tool_names().contains("bash"));
         assert!(host.valid_tool_names().contains("read_file"));
-        for expected in ["task_board", "session", "tool_search", "introspect"] {
+        for expected in ["notify", "tool_search", "introspect"] {
             assert!(
                 host.valid_tool_names().contains(expected),
                 "control-plane backbone tool {expected} must remain valid with server-service capacity disabled: {:?}",
                 host.valid_tool_names()
             );
         }
+        assert!(schema_names(&host.deferred_tool_schemas).contains("session"));
+        assert!(!host.valid_tool_names().contains("session"));
         for hidden in ["memory", "web_fetch", "web_search", "github"] {
             assert!(
                 !host.valid_tool_names().contains(hidden),
@@ -8975,12 +18985,45 @@ mod tests {
             !names.contains("bash"),
             "prompt-visible edge runtime tools must mirror the advertised offer set"
         );
-        for expected in ["task_board", "session", "tool_search", "introspect"] {
+        for expected in ["notify", "tool_search", "introspect"] {
             assert!(
                 host.valid_tool_names().contains(expected),
                 "control-plane backbone tool {expected} must remain valid while runtime tools are provider-scoped"
             );
         }
+        assert!(schema_names(&host.deferred_tool_schemas).contains("session"));
+    }
+
+    #[test]
+    fn builder_applies_edge_restricted_tool_names_to_server_owned_surface() {
+        let profile = serde_json::Map::from_iter([(
+            astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RESTRICTED_TOOL_NAMES
+                .to_string(),
+            json!(["memory", "propose_work_plan", "tool_search"]),
+        )]);
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_edge_profile(profile)
+        .build();
+
+        let names = schema_names(&host.tool_schemas);
+        assert!(names.contains("bash"));
+        for restricted in ["memory", "propose_work_plan", "tool_search"] {
+            assert!(
+                !names.contains(restricted),
+                "edge-owned child restriction must prevent the server from re-adding {restricted}: {names:?}"
+            );
+        }
+        assert!(
+            !host.always_load_tool_names.contains("propose_work_plan"),
+            "restricted server tools must not remain in cache-boundary metadata"
+        );
     }
 
     #[test]
@@ -9022,8 +19065,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sync_wire_surface_carries_selected_server_offer_for_shared_tool() {
+    #[tokio::test]
+    async fn stable_server_web_tool_carries_selected_offer_into_execution() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -9046,7 +19089,7 @@ mod tests {
         let visible_names = schema_names(&visible);
         assert!(
             visible_names.contains("web_search"),
-            "server-owned web_search should be visible when the selected edge did not advertise it"
+            "primary server turns keep browser access on the stable wire surface"
         );
 
         let request = executor.tool_execution_request("web_search", &json!({"query": "astra"}));
@@ -9102,19 +19145,19 @@ mod tests {
         let _visible = host.visible_turn_tools(&mut state);
 
         assert!(
-            !executor
+            executor
                 .current_activatable_tool_names_snapshot()
                 .contains("agent_fanout"),
-            "already-visible backbone tools must not be duplicated into deferred activation"
+            "the composed manifest must make an admitted deferred tool activatable"
         );
         assert!(
-            !<ServerAgenticLoopHost as AgenticLoopHost>::deferred_tool_names(&host)
+            <ServerAgenticLoopHost as AgenticLoopHost>::deferred_tool_names(&host)
                 .contains("agent_fanout"),
-            "validator must see the final deferred set after visible-tool overlap is removed"
+            "validator must see the same deferred set as tool_search"
         );
 
         let result = executor
-            .execute_with_metadata("tool_search", &json!({"query": "Select:agent_fanout"}))
+            .execute_with_metadata("tool_search", &json!({"query": "select:agent_fanout"}))
             .await;
         let parsed: Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(
@@ -9123,6 +19166,7 @@ mod tests {
             "server tool_search must resolve names advertised in the deferred manifest: {}",
             result.output
         );
+        assert!(schema_names(&host.visible_turn_tools(&mut state)).contains("agent_fanout"));
     }
 
     #[tokio::test]
@@ -9388,12 +19432,16 @@ mod tests {
         .build();
 
         let names = schema_names(&host.tool_schemas);
-        for visible in ["agent", "tool_search", "memory"] {
+        for visible in ["tool_search", "memory"] {
             assert!(
                 names.contains(visible),
                 "{visible} should remain visible because it runs on the server"
             );
         }
+        assert!(
+            names.contains("agent") && names.contains("agent_fanout"),
+            "server-owned execution topologies must remain selectable while the workspace is offline"
+        );
         for hidden in [
             "bash",
             "read_file",
@@ -9413,6 +19461,49 @@ mod tests {
                 "{hidden} must not be admitted while hidden; unavailable tools should disappear from the model surface"
             );
         }
+    }
+
+    #[test]
+    fn runtime_surface_rejects_activated_background_controls_when_edge_is_offline() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_execution_bindings(
+            WorkspaceBinding::edge_workspace(
+                "MacBook Pro",
+                "/Users/test/project",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-1",
+                "MacBook Pro",
+                crate::server::tool_transport::ToolTransportKind::EdgeWs,
+                crate::server::tool_transport::ExecutorStatus::Offline,
+            ),
+        )
+        .build();
+
+        let schema = |name: &str| {
+            serde_json::json!({
+                "type": "function",
+                "function": {"name": name, "description": name, "parameters": {"type": "object"}}
+            })
+        };
+        let visible = schema_names(&host.runtime_ready_turn_tools(
+            vec![
+                schema("task_list"),
+                schema("task_output"),
+                schema("introspect"),
+            ],
+            &create_test_state(),
+        ));
+
+        assert!(visible.contains("introspect"));
+        assert!(!visible.contains("task_list"));
+        assert!(!visible.contains("task_output"));
     }
 
     #[tokio::test]
@@ -9470,11 +19561,14 @@ mod tests {
             .maybe_deliver_edge_bound_tools_via_ledger(&state, &tool_calls)
             .await;
 
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].request_id, "call-offline-headless-bash");
-        assert_eq!(results[0].tool, "bash");
-        assert_eq!(results[0].status, "error");
-        let fields = results[0]
+        assert_eq!(results.results.len(), 1);
+        assert_eq!(results.results[0].request_id, "call-offline-headless-bash");
+        assert_eq!(results.results[0].tool, "bash");
+        assert_eq!(
+            results.results[0].status, "failed",
+            "the tool result uses the terminal outcome vocabulary; error_kind carries the transport cause"
+        );
+        let fields = results.results[0]
             .tool_result_fields
             .as_ref()
             .expect("offline result must carry structured metadata");
@@ -9488,6 +19582,11 @@ mod tests {
             }),
             "headless offline blocking must still be observable through buffered host events"
         );
+        assert!(host.emitted_events.iter().any(|event| {
+            event["type"] == "tool_transport_failed"
+                && event["status"] == "error"
+                && event["reason"] == "executor_offline"
+        }));
     }
 
     #[test]
@@ -9517,7 +19616,6 @@ mod tests {
         for visible in [
             "ask_user",
             "tool_search",
-            "web_fetch",
             "bash",
             "read_file",
             "write_file",
@@ -9530,6 +19628,57 @@ mod tests {
             assert!(
                 host.valid_tool_names().contains(visible),
                 "{visible} should be admitted for an online edge workspace binding"
+            );
+        }
+        assert!(
+            schema_names(&host.deferred_tool_schemas).contains("web_fetch"),
+            "network tools remain discoverable without becoming permanent schema overhead"
+        );
+        assert!(!names.contains("web_fetch"));
+    }
+
+    #[test]
+    fn semantic_work_admission_projects_web_and_work_schemas_before_establishment() {
+        let mut edge_tools = sample_edge_tools();
+        for name in ["web_fetch", "web_search"] {
+            edge_tools.push(json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": name,
+                    "parameters": {"type": "object"}
+                }
+            }));
+        }
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-semantic-surface".to_string(),
+            "session-semantic-surface".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .with_edge_tools(edge_tools)
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        host.work_admission_capabilities = vec![astra_services::WorkAdmissionCapability::Web];
+
+        let mut state = create_test_state();
+        state.turn_intent = Some(
+            astra_config::user_profile::TurnIntent::default()
+                .with_work_lifecycle(astra_config::user_profile::WorkLifecycleIntent::Required),
+        );
+        let names = schema_names(&host.visible_turn_tools(&mut state));
+
+        assert!(
+            names.contains("web_fetch") && names.contains("web_search"),
+            "semantic web admission must project network schemas before the model spends a tool_search round: {names:?}"
+        );
+        for name in ["run_next_work_item", "settle_work_item"] {
+            assert!(
+                names.contains(name),
+                "semantic Work admission must keep lifecycle maintenance visible before start_work: {name}"
             );
         }
     }
@@ -9561,7 +19710,7 @@ mod tests {
         .build();
 
         let names = schema_names(&host.tool_schemas);
-        for visible in ["read_file", "grep", "glob", "git"] {
+        for visible in ["read_file", "grep", "glob", "git", "bash"] {
             assert!(
                 names.contains(visible),
                 "{visible} should be advertised for an online read-only orchestrator-managed executor"
@@ -9579,8 +19728,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn durable_user_intent_event_follows_local_context_application() {
+    #[tokio::test]
+    async fn durable_user_intent_event_follows_local_context_application() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -9605,7 +19754,7 @@ mod tests {
             Some(&json!(["release-manager", "deploy-auditor"]))
         );
 
-        host.on_user_intent_applied(&first);
+        host.on_user_intent_applied(&first).await;
         assert_eq!(
             host.emitted_events.last(),
             Some(&json!({
@@ -9696,9 +19845,10 @@ mod tests {
             model_used: "gpt-4".to_string(),
             duration_ms: 500,
             finish_reason: Some("stop".to_string()),
+            effective_finish_reason: None,
         };
 
-        let accum = ServerAgenticLoopHost::result_to_accum(&result);
+        let accum = ServerAgenticLoopHost::result_to_accum_with_usage(&result, None);
         assert_eq!(accum.full_text, "Hello world");
         assert_eq!(accum.reasoning_content, "thinking...");
         assert!(accum.has_tool_calls);
@@ -9706,16 +19856,530 @@ mod tests {
         assert_eq!(accum.prompt_tokens, 100);
         assert_eq!(accum.completion_tokens, 50);
         assert!(accum.has_usage);
+        assert_eq!(accum.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(
+            accum.current_request_usage,
+            Some(astra_turn_types::RequestTokenUsage {
+                fresh_input_tokens: 100,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                output_tokens: 50,
+            })
+        );
+    }
+
+    #[test]
+    fn provider_convergence_boundary_is_one_shot_text_only_and_bounded() {
+        let no_tools = HashSet::new();
+        let work_tools = HashSet::from(["start_work".to_string()]);
+        let text_only = ProviderAttemptBoundary::new(true, true);
+        assert_eq!(text_only.budget(), Some(Duration::from_secs(30)));
+        assert!(text_only.forces_thinking_off());
+        assert!(text_only.no_tools);
+        assert!(
+            !text_only.allows_host_continuation(),
+            "length and canonical-work results must not create another provider request"
+        );
+
+        let ordinary = ProviderAttemptBoundary::new(false, false);
+        assert_eq!(ordinary.budget(), None);
+        assert!(!ordinary.forces_thinking_off());
+        assert!(!ordinary.no_tools);
+        assert!(ordinary.allows_host_continuation());
+
+        let empty = LlmCallResult::default();
+        assert!(!provider_result_has_actionable_output(&empty, &no_tools));
+        assert!(!provider_result_establishes_canonical_work(&empty));
+        let reasoning_only = LlmCallResult {
+            reasoning: "private derivation only".into(),
+            ..Default::default()
+        };
+        let reasoning_only_error = reject_provider_completion_without_delivery(&reasoning_only)
+            .expect_err("reasoning-only protocol terminal must not settle successfully");
+        assert_eq!(
+            reasoning_only_error.kind,
+            astra_core::ErrorKind::ProviderDeadline
+        );
+        let details: serde_json::Value = serde_json::from_str(
+            reasoning_only_error
+                .details_json
+                .as_deref()
+                .expect("typed delivery evidence"),
+        )
+        .expect("valid typed delivery evidence");
+        assert_eq!(
+            details
+                .pointer("/deadline/scope")
+                .and_then(serde_json::Value::as_str),
+            Some("provider_completion")
+        );
+        let empty_error = validate_provider_convergence_result(text_only, false, &empty, &no_tools)
+            .expect_err("empty convergence must not reach textless retry");
+        assert_eq!(empty_error.kind, astra_core::ErrorKind::ProviderDeadline);
+
+        let text = LlmCallResult {
+            full_text: "final answer".into(),
+            ..Default::default()
+        };
+        assert!(provider_result_has_actionable_output(&text, &no_tools));
+        assert!(validate_provider_convergence_result(text_only, false, &text, &no_tools).is_ok());
+        let work_error = validate_provider_convergence_result(text_only, true, &text, &work_tools)
+            .expect_err("required Work must not be bypassed by convergence text");
+        assert_eq!(work_error.kind, astra_core::ErrorKind::ContractViolation);
+
+        let work = LlmCallResult {
+            tool_calls: vec![json!({
+                "id": "work-1",
+                "type": "function",
+                "function": {"name": "start_work", "arguments": "{}"}
+            })],
+            ..Default::default()
+        };
+        assert!(
+            reject_provider_completion_without_delivery(&work).is_ok(),
+            "a selected tool remains a side-effect boundary, not a safe replay"
+        );
+        let merged_visible_prefix = LlmCallResult {
+            full_text: "already visible output from the capped first segment".into(),
+            reasoning: "an empty continuation may still have private reasoning".into(),
+            ..Default::default()
+        };
+        assert!(
+            reject_provider_completion_without_delivery(&merged_visible_prefix).is_ok(),
+            "a visible output-cap prefix is a delivery boundary even when its continuation is empty"
+        );
+        assert!(!provider_result_has_actionable_output(&work, &no_tools));
+        assert!(provider_result_has_actionable_output(&work, &work_tools));
+        assert!(provider_result_establishes_canonical_work(&work));
+        let no_tool_error =
+            validate_provider_convergence_result(text_only, true, &work, &work_tools)
+                .expect_err("text-only convergence must reject provider tool calls");
+        assert_eq!(no_tool_error.kind, astra_core::ErrorKind::ContractViolation);
+        assert!(
+            validate_provider_convergence_result(
+                ProviderAttemptBoundary::new(true, false),
+                true,
+                &work,
+                &work_tools,
+            )
+            .is_ok()
+        );
+
+        let unknown_tool = LlmCallResult {
+            tool_calls: vec![json!({
+                "id": "unknown-1",
+                "type": "function",
+                "function": {"name": "not_on_this_wire", "arguments": "{}"}
+            })],
+            ..Default::default()
+        };
+        let unknown_error = validate_provider_convergence_result(
+            ProviderAttemptBoundary::new(true, false),
+            false,
+            &unknown_tool,
+            &work_tools,
+        )
+        .expect_err("a syntactically valid but unauthorized tool is not convergence");
+        assert_eq!(unknown_error.kind, astra_core::ErrorKind::ProviderDeadline);
+
+        let malformed_tool = LlmCallResult {
+            tool_calls: vec![json!({
+                "id": "malformed-1",
+                "type": "function",
+                "function": {
+                    "name": "str_replace\nfile_path: /app/vm.js",
+                    "arguments": "{}"
+                }
+            })],
+            ..Default::default()
+        };
+        assert!(
+            !provider_result_has_valid_tool_call(&malformed_tool),
+            "malformed provider names remain evidence but are not selected tools"
+        );
+        let malformed_error =
+            validate_provider_convergence_result(text_only, false, &malformed_tool, &no_tools)
+                .expect_err("malformed tool calls must take the recoverable provider-error lane");
+        assert_eq!(
+            malformed_error.kind,
+            astra_core::ErrorKind::ProviderDeadline
+        );
+    }
+
+    #[test]
+    fn streaming_settlement_buffer_drops_transient_deltas_before_terminal_evidence() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .build();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        host.set_event_tx(tx);
+
+        for sequence in 0..(MAX_STREAMED_TURN_EVENT_BUFFER + 512) {
+            host.retain_emitted_event(
+                json!({"type": "reasoning_delta", "sequence": sequence}),
+                true,
+            );
+        }
+        host.retain_emitted_event(
+            json!({"type": "tool_call_end", "call_id": "call-1", "status": "completed"}),
+            true,
+        );
+        for sequence in 0..(MAX_STREAMED_TURN_EVENT_BUFFER + 512) {
+            host.retain_emitted_event(json!({"type": "text_delta", "sequence": sequence}), true);
+        }
+
+        assert_eq!(host.emitted_events.len(), 1);
+        assert_eq!(host.emitted_events[0]["type"], "tool_call_end");
+        assert_eq!(host.emitted_events[0]["call_id"], "call-1");
+    }
+
+    #[test]
+    fn buffered_action_window_replay_coalesces_dense_reasoning_without_reordering() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .build();
+        let updates = (0..3_000)
+            .map(|_| LlmStreamUpdate::Reasoning("reasoning ".to_string()))
+            .chain(std::iter::once(LlmStreamUpdate::Text(
+                "final answer".to_string(),
+            )))
+            .collect();
+        let mut text = String::new();
+        let mut reasoning = String::new();
+
+        host.replay_action_window_updates(updates, &mut text, &mut reasoning);
+
+        assert_eq!(reasoning, "reasoning ".repeat(3_000));
+        assert_eq!(text, "final answer");
+        assert!(
+            host.emitted_events.len() < 10,
+            "dense provider chunks must be bounded before entering the live event lane"
+        );
+        assert_eq!(host.emitted_events.last().unwrap()["type"], "text_delta");
+    }
+
+    #[test]
+    fn aggregate_retry_usage_keeps_final_request_usage_separate() {
+        let result = LlmCallResult {
+            usage: Map::from_iter([
+                ("input_tokens".to_string(), json!(20)),
+                ("output_tokens".to_string(), json!(5)),
+            ]),
+            ..Default::default()
+        };
+        let accum = ServerAgenticLoopHost::result_to_accum_with_usage(
+            &result,
+            Some(crate::turn::token_usage::TokenUsage {
+                input_tokens: 120,
+                cached_input_tokens: 300,
+                cache_creation_tokens: 4,
+                output_tokens: 25,
+            }),
+        );
+        assert_eq!(accum.prompt_tokens, 120);
+        assert_eq!(accum.cache_read_tokens, 300);
+        assert_eq!(accum.cache_creation_tokens, 4);
+        assert_eq!(accum.completion_tokens, 25);
+        assert!(accum.usage_is_run_total);
+        assert_eq!(
+            accum.current_request_usage,
+            Some(astra_turn_types::RequestTokenUsage {
+                fresh_input_tokens: 20,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                output_tokens: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn repeated_known_output_cap_does_not_override_explicit_stop() {
+        let mut result = LlmCallResult {
+            finish_reason: Some("stop".to_string()),
+            usage: Map::from_iter([("output_tokens".to_string(), json!(8192))]),
+            full_text: "partial sentence".to_string(),
+            ..Default::default()
+        };
+
+        assert!(!reconcile_repeated_provider_output_cap(
+            &mut result,
+            Some(8192)
+        ));
+        assert_eq!(result.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(result.effective_finish_reason, None);
+    }
+
+    #[test]
+    fn repeated_missing_output_cap_reason_becomes_effective_length() {
+        let mut result = LlmCallResult {
+            finish_reason: None,
+            usage: Map::from_iter([("output_tokens".to_string(), json!(8192))]),
+            ..Default::default()
+        };
+        assert!(reconcile_repeated_provider_output_cap(
+            &mut result,
+            Some(8192)
+        ));
+        assert_eq!(result.finish_reason, None);
+        assert_eq!(result.lifecycle_finish_reason(), Some("length"));
+    }
+
+    #[test]
+    fn output_cap_retry_never_exceeds_authoritative_catalog_budget() {
+        assert_eq!(
+            output_cap_retry_limit(384_000, Some(384_000), 500_000),
+            384_000
+        );
+        assert_eq!(output_cap_retry_limit(8_192, Some(384_000), 500_000), 8_192);
+    }
+
+    #[test]
+    fn output_cap_retry_without_catalog_allows_one_conservative_probe() {
+        assert_eq!(output_cap_retry_limit(8_192, None, 32_768), 16_384);
+        assert_eq!(output_cap_retry_limit(8_192, None, 12_000), 12_000);
+        assert_eq!(
+            output_cap_retry_limit(usize::MAX, None, usize::MAX),
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn repeated_explicit_length_cap_stops_retry_without_tools() {
+        let mut result = LlmCallResult {
+            finish_reason: Some("length".to_string()),
+            usage: Map::from_iter([("output_tokens".to_string(), json!(8192))]),
+            ..Default::default()
+        };
+
+        assert!(reconcile_repeated_provider_output_cap(
+            &mut result,
+            Some(8192)
+        ));
+        assert_eq!(result.finish_reason.as_deref(), Some("length"));
+    }
+
+    #[test]
+    fn output_cap_reconciliation_requires_prior_exact_typed_evidence() {
+        for (prior, output_tokens, has_tool_call) in [
+            (None, 4096, false),
+            (Some(8192), 4096, false),
+            (Some(4096), 4096, true),
+        ] {
+            let mut result = LlmCallResult {
+                finish_reason: Some("stop".to_string()),
+                usage: Map::from_iter([("output_tokens".to_string(), json!(output_tokens))]),
+                tool_calls: has_tool_call
+                    .then(|| json!({"id":"call-1"}))
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            };
+            assert!(!reconcile_repeated_provider_output_cap(&mut result, prior));
+            assert_eq!(result.finish_reason.as_deref(), Some("stop"));
+        }
+    }
+
+    #[test]
+    fn exhausted_output_cap_is_execution_incomplete_not_completed() {
+        let mut state = create_test_state();
+        let result = LlmCallResult {
+            finish_reason: Some("length".to_string()),
+            full_text: "partial sentence".to_string(),
+            ..Default::default()
+        };
+
+        assert!(preserve_exhausted_output_cap_as_interruption(
+            &mut state, &result
+        ));
+        let interruption = state.interruption.expect("interruption");
+        assert_eq!(
+            interruption.kind,
+            astra_turn_core::interruption::InterruptionKind::ExecutionIncomplete
+        );
+        assert_eq!(
+            interruption.resume_action,
+            astra_turn_core::interruption::ResumeAction::ContinueImmediately
+        );
+    }
+
+    #[test]
+    fn output_cap_interruption_requires_text_only_length_terminal() {
+        let cases = [
+            LlmCallResult {
+                finish_reason: Some("stop".to_string()),
+                ..Default::default()
+            },
+            LlmCallResult {
+                finish_reason: Some("length".to_string()),
+                tool_calls: vec![json!({"id":"call-1"})],
+                ..Default::default()
+            },
+        ];
+
+        for result in cases {
+            let mut state = create_test_state();
+            assert!(!preserve_exhausted_output_cap_as_interruption(
+                &mut state, &result
+            ));
+            assert!(state.interruption.is_none());
+        }
+    }
+
+    #[test]
+    fn output_cap_continuation_merges_suffix_without_duplication() {
+        assert_eq!(
+            merge_output_cap_continuation("partial answer", " and the rest"),
+            "partial answer and the rest"
+        );
+        assert_eq!(
+            merge_output_cap_continuation("partial answer", "partial answer and the rest"),
+            "partial answer and the rest"
+        );
+        assert_eq!(
+            merge_output_cap_continuation("prefix: result", "result is verified"),
+            "prefix: result is verified"
+        );
+    }
+
+    #[test]
+    fn output_cap_continuation_context_is_provider_only_and_typed() {
+        let mut messages = vec![json!({"role":"user", "content":"finish the task"})];
+        append_output_cap_continuation_context(&mut messages, "partial result");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"], "partial result");
+        assert_eq!(messages[2]["role"], "user");
+        assert!(
+            messages[2]["content"]
+                .as_str()
+                .expect("continuation prompt")
+                .contains("next concrete tool call or give a concise final result")
+        );
+    }
+
+    #[test]
+    fn output_cap_action_first_advisory_is_one_shot_on_the_next_tool_round() {
+        let mut state = create_test_state();
+        state.provider_adaptation.output_cap_action_first_pending = true;
+        let mut preamble = Vec::new();
+
+        assert!(maybe_append_output_cap_action_first_context(
+            &mut state,
+            &mut preamble,
+            true,
+        ));
+        assert!(!state.provider_adaptation.output_cap_action_first_pending);
+        assert_eq!(preamble.len(), 1);
+        assert!(
+            preamble[0]["content"]
+                .as_str()
+                .expect("action-first advisory")
+                .contains("if more execution is needed")
+        );
+
+        assert!(!maybe_append_output_cap_action_first_context(
+            &mut state,
+            &mut preamble,
+            true,
+        ));
+        assert_eq!(preamble.len(), 1);
+    }
+
+    #[test]
+    fn output_cap_action_first_advisory_waits_through_text_only_settlement() {
+        let mut state = create_test_state();
+        state.provider_adaptation.output_cap_action_first_pending = true;
+        let mut preamble = Vec::new();
+
+        assert!(!maybe_append_output_cap_action_first_context(
+            &mut state,
+            &mut preamble,
+            false,
+        ));
+        assert!(state.provider_adaptation.output_cap_action_first_pending);
+        assert!(preamble.is_empty());
+    }
+
+    #[test]
+    fn output_cap_action_first_requires_a_continuation_that_produced_a_tool() {
+        for (continuations, tool_calls, expected) in [
+            (0, vec![json!({"id":"call-1"})], false),
+            (1, Vec::new(), false),
+            (1, vec![json!({"id":"call-1"})], true),
+        ] {
+            let mut state = create_test_state();
+            let result = LlmCallResult {
+                tool_calls,
+                ..Default::default()
+            };
+            assert_eq!(
+                remember_output_cap_action_first(&mut state, continuations, &result),
+                expected
+            );
+            assert_eq!(
+                state.provider_adaptation.output_cap_action_first_pending,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn output_cap_action_first_requires_wire_and_runtime_authority_overlap() {
+        let bash = json!({"type":"function", "function":{"name":"bash"}});
+        let settle = json!({"type":"function", "function":{"name":"settle_work_item"}});
+
+        assert!(!tool_execution_available_for_action_first(
+            false,
+            std::slice::from_ref(&bash),
+            &[],
+        ));
+        assert!(!tool_execution_available_for_action_first(
+            true,
+            std::slice::from_ref(&bash),
+            std::slice::from_ref(&bash),
+        ));
+        assert!(tool_execution_available_for_action_first(
+            false,
+            &[bash.clone(), settle.clone()],
+            std::slice::from_ref(&settle),
+        ));
+        assert!(tool_execution_available_for_action_first(
+            false,
+            std::slice::from_ref(&bash),
+            std::slice::from_ref(&bash),
+        ));
+        assert!(!tool_execution_available_for_action_first(
+            false,
+            std::slice::from_ref(&bash),
+            std::slice::from_ref(&settle),
+        ));
     }
 
     #[test]
     fn result_to_accum_empty_result() {
         let result = LlmCallResult::default();
-        let accum = ServerAgenticLoopHost::result_to_accum(&result);
+        let accum = ServerAgenticLoopHost::result_to_accum_with_usage(&result, None);
         assert!(accum.full_text.is_empty());
         assert!(!accum.has_tool_calls);
         assert!(!accum.has_usage);
         assert_eq!(accum.prompt_tokens, 0);
+
+        let zero_retry_usage = ServerAgenticLoopHost::result_to_accum_with_usage(
+            &result,
+            Some(crate::turn::token_usage::TokenUsage::default()),
+        );
+        assert!(
+            !zero_retry_usage.has_usage,
+            "an absent provider usage must not become a fabricated zero-usage observation"
+        );
     }
 
     #[test]
@@ -9763,7 +20427,7 @@ mod tests {
                     agent_id: "reviewer".into(),
                 },
             },
-            payload_kind: "text".into(),
+            payload_kind: astra_turn_types::AgentCommunicationPayloadKind::Text,
             summary: Some("review this".into()),
             response_accepted: None,
             related_message_id: None,
@@ -9798,6 +20462,165 @@ mod tests {
         assert_eq!(host.emitted_events.len(), 1);
         assert_eq!(host.emitted_events[0]["type"], "headless_line");
         assert_eq!(host.emitted_events[0]["content"], "test line");
+    }
+
+    #[test]
+    fn runtime_feedback_is_projected_without_recomputing_the_frame() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .build();
+        let frame: astra_turn_core::context_feedback::RuntimeFeedbackFrame =
+            serde_json::from_value(serde_json::json!({
+                "schema_version": 4,
+                "identity": {
+                    "session_id": "s",
+                    "run_id": "run-live",
+                    "agent_id": "orchestrator",
+                    "model_id": "deepseek-v4-flash",
+                    "topology": "server_only"
+                },
+                "progress": {
+                    "session_turn": 1,
+                    "agentic_round_index": 1,
+                    "llm_rounds_completed": 2,
+                    "slice_round_limit": 60,
+                    "slice_rounds_remaining": 58
+                },
+                "context": {"compaction_tier": "normal"},
+                "was_truncated": false,
+                "policy_feedback": {"state": "not_evaluated"}
+            }))
+            .unwrap();
+
+        host.publish_runtime_feedback(&frame);
+
+        assert_eq!(host.emitted_events.len(), 1);
+        assert_eq!(host.emitted_events[0]["type"], "runtime_feedback");
+        assert_eq!(
+            host.emitted_events[0]["runtime_feedback"],
+            serde_json::json!(frame)
+        );
+    }
+
+    #[test]
+    fn semantic_admission_receipt_has_one_versioned_public_event_shape() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .build();
+
+        host.on_turn_phase(crate::turn::agentic_loop::host::TurnPhaseReceipt {
+            phase: crate::turn::agentic_loop::host::TurnPhaseKind::SemanticAdmission,
+            round_index: 0,
+            attempt_index: 0,
+            duration_ms: 5_021,
+            outcome: crate::turn::agentic_loop::host::TurnPhaseOutcome::Decided,
+        });
+
+        assert_eq!(
+            host.take_emitted_events(),
+            vec![json!({
+                "type": astra_server_types::TURN_PHASE_EVENT_TYPE,
+                "schema_version": astra_server_types::TURN_PHASE_SCHEMA_VERSION,
+                "phase": "turn_intent_admission",
+                "round_index": 0,
+                "attempt_index": 0,
+                "outcome": "decided",
+                "duration_ms": 5_021,
+            })]
+        );
+    }
+
+    #[test]
+    fn post_response_work_admission_receipt_is_projected_with_distinct_attempt() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-phase".to_string(),
+            "s-work-phase".to_string(),
+        )
+        .build();
+        let mut state = create_test_state();
+        state.turn_event_buffer =
+            Some(astra_services::session_journal::TurnEventBuffer::begin_turn(None, 3));
+        host.completed_work_admission_phase = Some((
+            Instant::now(),
+            3,
+            crate::turn::agentic_loop::host::TurnPhaseOutcome::Decided,
+        ));
+
+        host.flush_completed_work_admission_phase(&mut state);
+        host.flush_completed_work_admission_phase(&mut state);
+
+        let events = host.take_emitted_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0],
+            json!({
+                "type": astra_server_types::TURN_PHASE_EVENT_TYPE,
+                "schema_version": astra_server_types::TURN_PHASE_SCHEMA_VERSION,
+                "phase": "turn_intent_admission",
+                "round_index": 3,
+                "attempt_index": 1,
+                "outcome": "decided",
+                "duration_ms": events[0]["duration_ms"],
+            })
+        );
+        let trace_events = state
+            .turn_event_buffer
+            .as_mut()
+            .expect("flush creates a trace buffer")
+            .drain()
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(trace_events.len(), 1);
+        let metadata = trace_events[0].metadata.as_ref().expect("trace metadata");
+        assert_eq!(metadata["name"], "turn_intent_admission");
+        assert_eq!(metadata["attrs"]["round_index"], "3");
+        assert_eq!(metadata["attrs"]["attempt_index"], "1");
+    }
+
+    #[tokio::test]
+    async fn model_resolution_failure_is_visible_as_failed_request_preparation() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-phase-resolution".to_string(),
+            "session-phase-resolution".to_string(),
+        )
+        // Admission binds the executable offering. A different request
+        // override is a deterministic pre-provider failure, so no upstream
+        // gateway or timing sleep is needed for this unhappy-path test.
+        .with_model(Some("not-the-admitted-model".to_string()))
+        .with_admitted_model_execution(Some(test_gateway_execution(
+            "http://example.invalid/v1/chat/completions",
+            Some(1_000),
+        )))
+        .build();
+        let mut state = create_test_state();
+
+        assert!(
+            host.execute_turn(&mut state).await.is_err(),
+            "an override outside the admitted model contract must fail before provider I/O"
+        );
+        let phases: Vec<_> = host
+            .take_emitted_events()
+            .into_iter()
+            .filter(|event| {
+                event.get("type").and_then(Value::as_str)
+                    == Some(astra_server_types::TURN_PHASE_EVENT_TYPE)
+            })
+            .collect();
+        assert_eq!(phases.len(), 1);
+        assert_eq!(phases[0]["phase"], "request_preparation");
+        assert_eq!(phases[0]["outcome"], "failed");
     }
 
     #[test]
@@ -9896,36 +20719,6 @@ mod tests {
         assert!(!packs.is_empty());
     }
 
-    #[test]
-    fn push_reasoning_events_emits_done_marker() {
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u".to_string(),
-            "s".to_string(),
-        )
-        .build();
-        host.push_reasoning_events("thinking...");
-
-        assert_eq!(host.emitted_events.len(), 2);
-        assert_eq!(host.emitted_events[0]["type"], "reasoning_delta");
-        assert_eq!(host.emitted_events[0]["content"], "thinking...");
-        assert_eq!(host.emitted_events[1]["type"], "reasoning_done");
-    }
-
-    #[test]
-    fn push_reasoning_events_skips_empty_reasoning() {
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u".to_string(),
-            "s".to_string(),
-        )
-        .build();
-        host.push_reasoning_events("");
-        assert!(host.emitted_events.is_empty());
-    }
-
     #[tokio::test]
     async fn assemble_llm_messages_includes_system_and_user() {
         let host = ServerAgenticLoopHostBuilder::new(
@@ -9955,6 +20748,7 @@ mod tests {
             provider: "openai".into(),
             fallback_chain: Vec::new(),
             cache_capability: None,
+            thinking_capability: None,
             header_overrides: HashMap::new(),
             request_body_overrides: None,
             completions_url_override: None,
@@ -9969,6 +20763,7 @@ mod tests {
             &mut state,
             &llm_cfg,
             &PromptCacheConfig::latch("openai", "gpt-4"),
+            false,
         );
         assert!(msgs.len() >= 2, "should have system + user messages");
         assert_eq!(msgs[0]["role"], "system");
@@ -10035,7 +20830,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_turn_pipeline_keeps_lifecycle_summary_out_of_model_prompt() {
+    async fn run_turn_pipeline_includes_turn_start_lifecycle_summary_for_web_agent() {
         let mut edge_profile = Map::new();
         edge_profile.insert(
             "session_lineage".to_string(),
@@ -10071,79 +20866,34 @@ mod tests {
         let text = pipeline_outcome_text(&outcome);
 
         assert!(
-            !text.contains("Turn-start session execution state"),
-            "lifecycle telemetry must not be injected into model prompt context: {text}"
-        );
-        assert!(!text.contains("Workspace binding:"));
-        assert!(!text.contains("Executor binding:"));
-        assert!(!text.contains("Session lineage:"));
-
-        let summary = host.turn_start_lifecycle_summary(&state);
-        assert!(
-            summary.contains("Runtime surface: mode=server-side · interaction=headless · providers=server_service:ready, control_plane:ready, sandbox:unbound (workspace executor not bound)"),
-            "runtime provider coverage must remain available to diagnostics: {summary}"
+            text.contains("Turn-start session execution state"),
+            "turn-start lifecycle summary must be injected into prompt context: {text}"
         );
         assert!(
-            summary.contains(
+            text.contains("Runtime surface: mode=server-side · interaction=headless · providers=server_service:ready, control_plane:ready, sandbox:unbound (workspace executor not bound)"),
+            "runtime provider coverage must be explicit: {text}"
+        );
+        assert!(
+            text.contains(
                 "Workspace binding: kind=none · authority=none · name=No file environment"
             ),
-            "workspace binding must come from execution binding state, not topology shorthand: {summary}"
+            "workspace binding must come from execution binding state, not topology shorthand: {text}"
         );
         assert!(
-            summary.contains("Executor binding: kind=server_local · transport=server_local · status=online · id=server-control-plane · name=Server control plane"),
-            "executor binding must remain available to diagnostics: {summary}"
+            text.contains("Executor binding: kind=server_local · transport=server_local · status=online · id=server-control-plane · name=Server control plane"),
+            "executor binding must be explicit: {text}"
         );
         assert!(
-            summary.contains("Resume context: [plan-resume] goal=\"stabilize\""),
-            "plan resume digest must remain available to diagnostics: {summary}"
+            text.contains("Resume context: [plan-resume] goal=\"stabilize\""),
+            "plan resume digest must be visible in lifecycle summary: {text}"
         );
         assert!(
-            summary.contains("Task board: no open tasks"),
-            "task-board state should remain explicit even when empty: {summary}"
+            text.contains("Session lineage: parent=parent-session-1 · forked_after_turn=7"),
+            "fork lineage must be surfaced when available: {text}"
         );
         assert!(
-            summary.contains("Session lineage: parent=parent-session-1 · forked_after_turn=7"),
-            "fork lineage must remain available to diagnostics: {summary}"
-        );
-        assert!(
-            summary.contains("Delegation: engine=disabled · this_turn=2 · progress_stream=none"),
-            "delegation state must remain available to diagnostics: {summary}"
-        );
-    }
-
-    #[tokio::test]
-    async fn run_turn_pipeline_includes_bounded_task_board_hint_for_web_agent() {
-        let mut host = ServerAgenticLoopHostBuilder::new(
-            mock_matrixone(),
-            mock_encryptor(),
-            "u-task-board".to_string(),
-            "s-task-board".to_string(),
-        )
-        .with_task_board_resume_hint(Some(
-            "open=2 · next=[in_progress] task-1: Ship task UX".to_string(),
-        ))
-        .build();
-
-        let mut state = create_test_state();
-        state.current_session_id = Some("s-task-board".into());
-        state.current_run_id = Some("run-task-board".into());
-        state.max_turn_input_tokens = 200_000;
-        state.pipeline_session = Some(astra_turn_core::pipeline_session::PipelineSession::new(
-            astra_turn_core::pipeline_config::PipelineConfig::default(),
-        ));
-        let tools = host.tool_schemas.clone();
-
-        let outcome = host
-            .run_turn_pipeline(&mut state, &tools, "openai", "gpt-4o", "continue")
-            .expect("pipeline should succeed");
-        let text = pipeline_outcome_text(&outcome);
-
-        assert!(!text.contains("Task board:"));
-        let summary = host.turn_start_lifecycle_summary(&state);
-        assert!(summary.contains("Task board: open=2 · next=[in_progress] task-1: Ship task UX"));
-        assert!(
-            !summary.contains("The task tools haven't been used recently."),
-            "task-board diagnostics must stay a bounded state hint: {summary}"
+            text.contains("Delegation: engine=disabled · this_turn=2 · progress_stream=none"),
+            "delegation state must be visible: {text}"
         );
     }
 
@@ -10186,17 +20936,15 @@ mod tests {
 
         assert!(
             !text.contains("Session lineage:"),
-            "lifecycle summary must not enter the model prompt: {text}"
-        );
-        assert!(!text.contains("Delegation context:"));
-        let summary = host.turn_start_lifecycle_summary(&state);
-        assert!(
-            !summary.contains("parent-ignored") && !summary.contains("forked_after_turn=11"),
-            "top-level fork aliases must not leak into lifecycle diagnostics: {summary}"
+            "turn-start lifecycle summary must require canonical session_lineage object: {text}"
         );
         assert!(
-            summary.contains("Delegation context: recursion_depth=2 · agent_id=reviewer-1"),
-            "sub-agent delegation context should remain available to diagnostics: {summary}"
+            !text.contains("parent-ignored") && !text.contains("forked_after_turn=11"),
+            "top-level fork aliases must not leak into lifecycle summary: {text}"
+        );
+        assert!(
+            text.contains("Delegation context: recursion_depth=2 · agent_id=reviewer-1"),
+            "sub-agent delegation context should be visible in lifecycle summary: {text}"
         );
     }
 
@@ -10265,11 +21013,8 @@ mod tests {
             .run_turn_pipeline(&mut state, &tools, "openai", "gpt-4o", "continue")
             .expect("round 0 pipeline should succeed");
         let round0_text = pipeline_outcome_text(&round0);
-        assert!(!round0_text.contains("Resume context:"));
-        assert!(!round0_text.contains("this_turn=0"));
-        let round0_summary = host.turn_start_lifecycle_summary(&state);
-        assert!(round0_summary.contains("Resume context: [plan-resume] goal=\"initial\""));
-        assert!(round0_summary.contains("this_turn=0"));
+        assert!(round0_text.contains("Resume context: [plan-resume] goal=\"initial\""));
+        assert!(round0_text.contains("this_turn=0"));
 
         state.current_round_index = 3;
         state.delegations_this_turn = 5;
@@ -10283,15 +21028,13 @@ mod tests {
             .run_turn_pipeline(&mut state, &tools, "openai", "gpt-4o", "continue")
             .expect("round 3 pipeline should succeed");
         let round3_text = pipeline_outcome_text(&round3);
-        assert!(!round3_text.contains("Resume context:"));
-        let round3_summary = host.turn_start_lifecycle_summary(&state);
         assert!(
-            round3_summary.contains("Resume context: [plan-resume] goal=\"mutated\""),
-            "plan line must refresh when the shared plan hint changes: {round3_summary}"
+            round3_text.contains("Resume context: [plan-resume] goal=\"mutated\""),
+            "plan line must refresh when the shared plan hint changes: {round3_text}"
         );
         assert!(
-            round3_summary.contains("this_turn=0"),
-            "delegation counters should remain turn-start snapshot values: {round3_summary}"
+            round3_text.contains("this_turn=0"),
+            "delegation counters should remain turn-start snapshot values: {round3_text}"
         );
     }
 
@@ -10597,6 +21340,357 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guidance_between_per_call_claims_completes_started_call_and_closes_remaining_tools() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-edge-partial".to_string(),
+            "s-edge-partial".to_string(),
+        )
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        host.install_runtime_tool_schemas(
+            vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            })],
+            Default::default(),
+        );
+        let sink = Arc::new(PartiallySupersedingInteractionSink::default());
+        host.set_interaction_sink(sink.clone());
+        let calls = vec![
+            json!({
+                "id": "read-a",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": r#"{"path":"a.txt"}"#}
+            }),
+            json!({
+                "id": "read-b",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": r#"{"path":"b.txt"}"#}
+            }),
+        ];
+        let callback_key = astra_turn_core::edge_ledger::tool_callback_key(
+            &astra_services::multi_agent::EdgeDispatchIdentity::new(
+                "u-edge-partial",
+                "s-edge-partial",
+                "run-edge-partial",
+                "chain-edge-partial",
+                "read-a",
+            ),
+        );
+        let ledger = host.edge_callback_ledger.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ledger.lock().await.insert(
+                callback_key,
+                json!({"body": {"request_id": "read-a", "status": "ok", "output": "a"}}),
+            );
+        });
+        let context = test_edge_action_context("u-edge-partial", "run-edge-partial").await;
+
+        let outcome = host
+            .deliver_edge_tools_via_ledger(
+                "run-edge-partial",
+                "chain-edge-partial",
+                &calls,
+                &context,
+            )
+            .await;
+
+        assert_eq!(outcome.control, AdmittedToolCallControl::Superseded);
+        assert_eq!(outcome.results.len(), 2, "every tool call must be closed");
+        assert_eq!(outcome.results[0].request_id, "read-a");
+        assert_eq!(outcome.results[0].status, "ok");
+        assert_eq!(outcome.results[1].request_id, "read-b");
+        assert_eq!(outcome.results[1].status, "blocked");
+        assert_eq!(
+            outcome.results[1]
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("error_kind"))
+                .and_then(Value::as_str),
+            Some("action_superseded")
+        );
+        assert_eq!(
+            sink.projected_request_ids
+                .lock()
+                .expect("projected request ids")
+                .as_slice(),
+            ["read-a"],
+            "the superseded call must have neither a request projection nor callback custody"
+        );
+        let second_key = astra_turn_core::edge_ledger::tool_callback_key(
+            &astra_services::multi_agent::EdgeDispatchIdentity::new(
+                "u-edge-partial",
+                "s-edge-partial",
+                "run-edge-partial",
+                "chain-edge-partial",
+                "read-b",
+            ),
+        );
+        assert!(!astra_turn_core::edge_ledger::ledger_entry_is_expected(
+            &host.edge_callback_ledger,
+            &second_key,
+            "edge-process-42",
+        ));
+    }
+
+    #[tokio::test]
+    async fn guarded_tool_request_store_failure_is_typed_failed_closed_without_projection() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-edge-db-fail".to_string(),
+            "s-edge-db-fail".to_string(),
+        )
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        host.install_runtime_tool_schemas(
+            vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            })],
+            Default::default(),
+        );
+        let sink = Arc::new(FailingGuardedInteractionSink::default());
+        host.set_interaction_sink(sink.clone());
+        let calls = vec![json!({
+            "id": "read-db-fail",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": r#"{"path":"a.txt"}"#
+            }
+        })];
+        let context = test_edge_action_context("u-edge-db-fail", "run-edge-db-fail").await;
+
+        let outcome = host
+            .deliver_edge_tools_via_ledger(
+                "run-edge-db-fail",
+                "chain-edge-db-fail",
+                &calls,
+                &context,
+            )
+            .await;
+
+        assert_eq!(outcome.control, AdmittedToolCallControl::FailedClosed);
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].status, "blocked");
+        assert_eq!(
+            outcome.results[0]
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("error_kind"))
+                .and_then(Value::as_str),
+            Some("action_admission_failed")
+        );
+        assert_eq!(
+            sink.projected_tool_requests.load(Ordering::SeqCst),
+            0,
+            "a failed durable transaction must not expose a tool request"
+        );
+    }
+
+    #[tokio::test]
+    async fn already_committed_edge_request_without_custody_fails_closed_without_redelivery() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-edge-recovery".to_string(),
+            "s-edge-recovery".to_string(),
+        )
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        host.install_runtime_tool_schemas(
+            vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            })],
+            Default::default(),
+        );
+        let sink = Arc::new(AlreadyCommittedInteractionSink::default());
+        host.set_interaction_sink(sink.clone());
+        let calls = vec![json!({
+            "id": "read-before-crash",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": r#"{"path":"a.txt"}"#
+            }
+        })];
+        let context = test_edge_action_context("u-edge-recovery", "run-edge-recovery").await;
+
+        let outcome = host
+            .deliver_edge_tools_via_ledger(
+                "run-edge-recovery",
+                "chain-edge-recovery",
+                &calls,
+                &context,
+            )
+            .await;
+
+        assert_eq!(outcome.control, AdmittedToolCallControl::FailedClosed);
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].status, "unknown");
+        assert_eq!(
+            outcome.results[0]
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields.get("error_kind"))
+                .and_then(Value::as_str),
+            Some("action_outcome_unknown")
+        );
+        assert_eq!(
+            sink.projected_tool_requests.load(Ordering::SeqCst),
+            0,
+            "an already-committed request without exactly-once client custody must not be sent again"
+        );
+    }
+
+    #[tokio::test]
+    async fn already_committed_edge_request_with_pending_callback_reattaches_without_redelivery() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-edge-reattach".to_string(),
+            "s-edge-reattach".to_string(),
+        )
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        host.install_runtime_tool_schemas(
+            vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            })],
+            Default::default(),
+        );
+        let sink = Arc::new(AlreadyCommittedInteractionSink::default());
+        host.set_interaction_sink(sink.clone());
+        let calls = vec![json!({
+            "id": "read-in-flight",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": r#"{"path":"a.txt"}"#
+            }
+        })];
+        let callback_key = astra_turn_core::edge_ledger::tool_callback_key(
+            &astra_services::multi_agent::EdgeDispatchIdentity::new(
+                "u-edge-reattach",
+                "s-edge-reattach",
+                "run-edge-reattach",
+                "chain-edge-reattach",
+                "read-in-flight",
+            ),
+        );
+        astra_turn_core::edge_ledger::expect_ledger_entry(
+            &host.edge_callback_ledger,
+            &callback_key,
+            "edge-process-42",
+        )
+        .unwrap();
+        let ledger = host.edge_callback_ledger.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ledger.lock().await.insert(
+                callback_key,
+                json!({
+                    "body": {
+                        "request_id": "read-in-flight",
+                        "status": "ok",
+                        "output": "existing result"
+                    }
+                }),
+            );
+        });
+        let context = test_edge_action_context("u-edge-reattach", "run-edge-reattach").await;
+
+        let outcome = host
+            .deliver_edge_tools_via_ledger(
+                "run-edge-reattach",
+                "chain-edge-reattach",
+                &calls,
+                &context,
+            )
+            .await;
+
+        assert_eq!(outcome.control, AdmittedToolCallControl::Continue);
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].status, "ok");
+        assert!(outcome.results[0].output.contains("existing result"));
+        assert_eq!(
+            sink.projected_tool_requests.load(Ordering::SeqCst),
+            0,
+            "reattachment must not project an already delivered request a second time"
+        );
+    }
+
+    #[tokio::test]
+    async fn aborted_provider_batch_closes_every_unstarted_preregistered_approval_idempotently() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-approval-abort".to_string(),
+            "s-approval-abort".to_string(),
+        )
+        .build();
+        let sink = Arc::new(RecordingApprovalCleanupSink::default());
+        sink.resolved
+            .lock()
+            .expect("resolved approvals")
+            .insert("approval-c".to_string());
+        host.set_interaction_sink(sink.clone());
+        let calls = ["approval-a", "approval-b", "approval-c"]
+            .into_iter()
+            .map(|request_id| {
+                json!({
+                    "id": request_id,
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": format!(r#"{{"path":"{request_id}.txt","content":"x"}}"#)
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let started = HashSet::from(["approval-b".to_string()]);
+
+        host.close_unstarted_edge_approvals(&calls, &started, "provider batch aborted")
+            .await
+            .expect("all unresolved unstarted approvals close durably");
+        host.close_unstarted_edge_approvals(&calls, &started, "provider batch aborted")
+            .await
+            .expect("cleanup replay remains idempotent");
+
+        assert_eq!(
+            sink.denials.lock().expect("approval denials").as_slice(),
+            [(
+                "approval-a".to_string(),
+                "write_file".to_string(),
+                Some("provider batch aborted".to_string())
+            )],
+            "the started item and the already-resolved sibling must remain untouched"
+        );
+    }
+
+    #[tokio::test]
     async fn deliver_edge_tools_batches_multiple_approval_prompts() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
@@ -10604,35 +21698,49 @@ mod tests {
             "u-batch".to_string(),
             "s-batch".to_string(),
         )
-        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_interaction_mode(Some(RequestedTurnInteractionMode::Prompt))
+        .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
         .build();
         let interaction_sink = install_in_memory_interaction_sink(&mut host);
         host.set_approval_audit_context(test_approval_audit_context("u-batch", "s-batch"));
-        // Register write_file as a valid tool so the edge ledger delivery path admits it.
+        // Register bash as a valid tool so the edge ledger delivery path admits it.
         host.install_runtime_tool_schemas(
             vec![json!({
                 "type": "function",
                 "function": {
-                    "name": "write_file",
-                    "description": "Write file contents",
+                    "name": "bash",
+                    "description": "Run a shell command",
                     "parameters": {"type": "object", "properties": {}}
                 }
             })],
             Default::default(),
         );
+        assert!(host.valid_tools.contains("bash"), "bash schema is admitted");
         let ledger = host.edge_callback_ledger.clone();
         let tool_calls = vec![
             json!({
                 "id": "w1",
                 "type": "function",
-                "function": {"name": "write_file", "arguments": r#"{"path":"a.rs","content":"1"}"#}
+                "function": {"name": "bash", "arguments": r#"{"command":"cargo build"}"#}
             }),
             json!({
                 "id": "w2",
                 "type": "function",
-                "function": {"name": "write_file", "arguments": r#"{"path":"b.rs","content":"2"}"#}
+                "function": {"name": "bash", "arguments": r#"{"command":"git push origin main"}"#}
             }),
         ];
+        assert!(
+            astra_turn_core::cloud_tool_delivery::cloud_tool_requires_approval_for_delivery(
+                &tool_calls[0]
+            ),
+            "the first mutating command must enter the approval protocol"
+        );
+        assert!(
+            astra_turn_core::cloud_tool_delivery::cloud_tool_requires_approval_for_delivery(
+                &tool_calls[1]
+            ),
+            "the second mutating command must enter the approval protocol"
+        );
 
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -10659,39 +21767,41 @@ mod tests {
             );
         });
 
+        let action_context = test_edge_action_context("u-batch", "test-run").await;
         let results = host
-            .deliver_edge_tools_via_ledger("test-run", "test-chain", &tool_calls)
+            .deliver_edge_tools_via_ledger("test-run", "test-chain", &tool_calls, &action_context)
             .await;
-
-        assert!(
-            host.emitted_events
-                .iter()
-                .all(|event| event.get("type").and_then(Value::as_str) != Some("approval_required"))
-        );
-        let batch = host
-            .emitted_events
+        let committed = interaction_sink
+            .committed
+            .lock()
+            .expect("committed interactions");
+        let approval_batch = committed
             .iter()
             .find(|event| {
                 event.get("type").and_then(Value::as_str) == Some("approval_batch_required")
             })
-            .expect("approval batch event");
-        assert_eq!(batch["requests"].as_array().unwrap().len(), 2);
+            .expect("both approvals are delivered as one committed UI batch");
         assert_eq!(
-            interaction_sink
-                .committed
-                .lock()
-                .expect("committed interactions")
+            approval_batch["requests"]
+                .as_array()
+                .expect("approval batch requests")
+                .iter()
+                .filter_map(|request| request.get("request_id").and_then(Value::as_str))
+                .collect::<Vec<_>>(),
+            ["w1", "w2"],
+            "the complete approval set is visible before either action starts"
+        );
+        assert_eq!(
+            committed
                 .iter()
                 .filter(|event| {
-                    matches!(
-                        event.get("type").and_then(Value::as_str),
-                        Some("approval_batch_required" | "tool_request")
-                    )
+                    event.get("type").and_then(Value::as_str) == Some("tool_request")
                 })
                 .count(),
-            3,
-            "the approval batch and both executable requests must cross the commit boundary"
+            2,
+            "each approved serial action crosses its own guarded tool-request boundary"
         );
+        drop(committed);
 
         let tool_request_positions: Vec<_> = host
             .emitted_events
@@ -10707,13 +21817,266 @@ mod tests {
             .iter()
             .position(|event| event.get("type").and_then(Value::as_str) == Some("tool_call_end"))
             .expect("tool_call_end");
-        assert!(tool_request_positions.iter().all(|idx| *idx < first_end));
+        assert!(tool_request_positions[0] < first_end);
+        assert!(
+            tool_request_positions[1] > first_end,
+            "the second serial side effect cannot start before the first settles"
+        );
 
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].request_id, "w1");
-        assert_eq!(results[1].request_id, "w2");
-        assert_eq!(results[0].status, "ok");
-        assert_eq!(results[1].status, "ok");
+        assert_eq!(results.results.len(), 2);
+        assert_eq!(results.results[0].request_id, "w1");
+        assert_eq!(results.results[1].request_id, "w2");
+        assert_eq!(results.results[0].status, "ok");
+        assert_eq!(results.results[1].status, "ok");
+    }
+
+    #[tokio::test]
+    async fn immediate_durable_approval_still_commits_and_projects_the_tool_request() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-immediate-approval".to_string(),
+            "s-immediate-approval".to_string(),
+        )
+        .with_interaction_mode(Some(RequestedTurnInteractionMode::Prompt))
+        .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
+        .build();
+        host.set_approval_audit_context(test_approval_audit_context(
+            "u-immediate-approval",
+            "s-immediate-approval",
+        ));
+        host.install_runtime_tool_schemas(
+            vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "Write file contents",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            })],
+            Default::default(),
+        );
+        let sink = Arc::new(ImmediatelyResolvedApprovalDeliverySink::default());
+        host.set_interaction_sink(sink.clone());
+        let call = json!({
+            "id": "write-after-immediate-approval",
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "arguments": r#"{"path":"immediate.txt","content":"ok"}"#,
+            }
+        });
+        let callback_key = astra_turn_core::edge_ledger::tool_callback_key(
+            &astra_services::multi_agent::EdgeDispatchIdentity::new(
+                "u-immediate-approval",
+                "s-immediate-approval",
+                "run-immediate",
+                "chain-immediate",
+                "write-after-immediate-approval",
+            ),
+        );
+        let ledger = host.edge_callback_ledger.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ledger.lock().await.insert(
+                callback_key,
+                json!({
+                    "body": {
+                        "request_id": "write-after-immediate-approval",
+                        "edge_agent_id": "edge-1",
+                        "status": "ok",
+                        "output": "wrote-immediate"
+                    }
+                }),
+            );
+        });
+        let context = test_edge_action_context("u-immediate-approval", "run-immediate").await;
+
+        let outcome = host
+            .deliver_edge_tools_via_ledger("run-immediate", "chain-immediate", &[call], &context)
+            .await;
+
+        assert_eq!(
+            outcome.control,
+            AdmittedToolCallControl::Continue,
+            "immediate durable approval must not block guarded delivery: {outcome:?}"
+        );
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].status, "ok");
+        assert_eq!(sink.approval_releases.load(Ordering::SeqCst), 1);
+        assert_eq!(sink.projected_tool_requests.load(Ordering::SeqCst), 1);
+        assert!(
+            host.emitted_events
+                .iter()
+                .any(|event| { event.get("type").and_then(Value::as_str) == Some("tool_request") })
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_interaction_mode_delivers_edge_mutation_without_approval_wait() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-auto-edge".to_string(),
+            "s-auto-edge".to_string(),
+        )
+        .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
+        .with_interaction_mode(Some(RequestedTurnInteractionMode::Auto))
+        .build();
+        let sink = install_in_memory_interaction_sink(&mut host);
+        host.install_runtime_tool_schemas(
+            vec![json!({
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "Write file contents",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            })],
+            Default::default(),
+        );
+        let call = json!({
+            "id": "auto-write",
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "arguments": r#"{"path":"auto.txt","content":"ok"}"#,
+            }
+        });
+        let callback_key = astra_turn_core::edge_ledger::tool_callback_key(
+            &astra_services::multi_agent::EdgeDispatchIdentity::new(
+                "u-auto-edge",
+                "s-auto-edge",
+                "run-auto-edge",
+                "chain-auto-edge",
+                "auto-write",
+            ),
+        );
+        let ledger = host.edge_callback_ledger.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            ledger.lock().await.insert(
+                callback_key,
+                json!({
+                    "body": {
+                        "request_id": "auto-write",
+                        "edge_agent_id": "edge-1",
+                        "status": "ok",
+                        "output": "wrote-auto"
+                    }
+                }),
+            );
+        });
+
+        let context = test_edge_action_context("u-auto-edge", "run-auto-edge").await;
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            host.deliver_edge_tools_via_ledger(
+                "run-auto-edge",
+                "chain-auto-edge",
+                &[call],
+                &context,
+            ),
+        )
+        .await
+        .expect("auto mode must not wait for a human approval");
+
+        assert_eq!(outcome.control, AdmittedToolCallControl::Continue);
+        assert_eq!(outcome.results.len(), 1);
+        assert_eq!(outcome.results[0].status, "ok");
+        let committed = sink.committed.lock().expect("committed interactions");
+        assert!(
+            committed.iter().all(|event| {
+                !matches!(
+                    event.get("type").and_then(Value::as_str),
+                    Some("approval_required" | "approval_batch_required")
+                )
+            }),
+            "auto mode must not publish an unresolved approval request"
+        );
+        assert_eq!(
+            committed
+                .iter()
+                .filter(|event| event.get("type").and_then(Value::as_str) == Some("tool_request"))
+                .count(),
+            1,
+            "auto mode still uses the guarded tool-request boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_approval_modes_block_edge_mutation_without_waiting() {
+        for (label, requested_mode) in [
+            ("implicit-headless", None),
+            (
+                "explicit-headless",
+                Some(RequestedTurnInteractionMode::Headless),
+            ),
+            ("deny", Some(RequestedTurnInteractionMode::Deny)),
+            (
+                "non-interactive",
+                Some(RequestedTurnInteractionMode::NonInteractive),
+            ),
+        ] {
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                format!("u-{label}"),
+                format!("s-{label}"),
+            )
+            .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
+            .with_interaction_mode(requested_mode)
+            .build();
+            host.install_runtime_tool_schemas(
+                vec![json!({
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "description": "Write file contents",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                })],
+                Default::default(),
+            );
+            let call = json!({
+                "id": format!("{label}-write"),
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "arguments": r#"{"path":"denied.txt","content":"no"}"#,
+                }
+            });
+            let run_id = format!("run-{label}");
+            let context = test_edge_action_context(&format!("u-{label}"), &run_id).await;
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(1),
+                host.deliver_edge_tools_via_ledger(
+                    &run_id,
+                    &format!("chain-{label}"),
+                    &[call],
+                    &context,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{label} mode must not wait for approval"));
+
+            assert_eq!(
+                outcome.control,
+                AdmittedToolCallControl::Continue,
+                "{label}"
+            );
+            assert_eq!(outcome.results.len(), 1, "{label}");
+            assert_eq!(outcome.results[0].status, "blocked", "{label}");
+            assert_eq!(
+                outcome.results[0]
+                    .tool_result_fields
+                    .as_ref()
+                    .and_then(|fields| fields.get("error_kind"))
+                    .and_then(Value::as_str),
+                Some("permission_denied"),
+                "{label}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -10759,6 +22122,7 @@ mod tests {
             .wait_tool_result_with_dispatch_fallback(
                 &tool_call,
                 &identity,
+                "edge-1",
                 Duration::from_millis(1),
             )
             .await;
@@ -10784,6 +22148,1812 @@ mod tests {
             host.edge_callback_ledger.lock().await.is_empty(),
             "dispatch fallback should consume the synthesized ledger entry"
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_fallback_and_custody_reject_noncanonical_durable_results() {
+        let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
+            "u-invalid-dispatch",
+            "s-invalid-dispatch",
+            "run-invalid-dispatch",
+            "chain-invalid-dispatch",
+            "request-invalid-dispatch",
+        );
+        let mut invalid_results = vec!["plain tool output".to_string()];
+        for status in ["success", "ok", "skipped"] {
+            invalid_results.push(
+                serde_json::to_string(&astra_thin_client::ToolResultRequest::new_with_hash(
+                    astra_thin_client::ToolResultRequestParts {
+                        session_id: identity.session_id.clone(),
+                        run_id: identity.run_id.clone(),
+                        turn_chain_id: identity.turn_chain_id.clone(),
+                        request_id: identity.request_id.clone(),
+                        edge_agent_id: "edge-invalid".to_string(),
+                        status: status.to_string(),
+                        output: "ambiguous outcome".to_string(),
+                        duration_ms: 1,
+                        tool_result_fields: None,
+                    },
+                ))
+                .expect("serialize invalid canonical-status fixture"),
+            );
+        }
+
+        let tool_call = json!({
+            "id": identity.request_id.clone(),
+            "type": "function",
+            "function": {"name": "read_file", "arguments": r#"{"path":"a.rs"}"#}
+        });
+        for result_json in invalid_results {
+            let host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                identity.user_id.clone(),
+                identity.session_id.clone(),
+            )
+            .with_edge_dispatch_service(Arc::new(StaticWaitResultEdgeDispatch {
+                result_json: Some(result_json),
+            }))
+            .build();
+
+            assert!(
+                !host.edge_request_has_custody_or_result(&identity).await,
+                "invalid durable result must not prove callback custody"
+            );
+            let delivery = host
+                .wait_tool_result_with_dispatch_fallback(
+                    &tool_call,
+                    &identity,
+                    "edge-1",
+                    Duration::from_millis(1),
+                )
+                .await;
+            assert!(
+                edge_tool_delivery_timed_out(&delivery),
+                "invalid durable result must not be delivered to the model"
+            );
+            assert!(host.edge_callback_ledger.lock().await.is_empty());
+        }
+    }
+
+    #[test]
+    fn typed_required_work_uses_a_bounded_provider_neutral_establishment_gate() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-choice".to_string(),
+            "s-work-choice".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .build();
+        let mut state = create_test_state();
+        state.turn_intent = Some(
+            astra_config::user_profile::TurnIntent::default()
+                .with_work_lifecycle(astra_config::user_profile::WorkLifecycleIntent::Required),
+        );
+
+        assert!(
+            host.canonical_work_establishment_pending(&state),
+            "only the typed semantic decision and unbound lifecycle state authorize the gate"
+        );
+        assert!(
+            host.should_retry_canonical_work_establishment(&state, &[], 0),
+            "a text-only provider response gets exactly one structured recovery boundary"
+        );
+        assert!(
+            !host.should_retry_canonical_work_establishment(
+                &state,
+                &[],
+                MAX_CANONICAL_WORK_ESTABLISHMENT_RETRIES,
+            ),
+            "the recovery is bounded independently of provider behavior"
+        );
+        assert!(
+            !host.should_retry_canonical_work_establishment(
+                &state,
+                &[json!({"function": {"name": "read_file"}})],
+                0,
+            ),
+            "ordinary tool batches retain the existing deterministic admission path"
+        );
+
+        state.turn_intent = None;
+        assert!(
+            !host.canonical_work_establishment_pending(&state),
+            "ordinary turns never enter a Work gate from prompt text or tool names"
+        );
+
+        let retry = ServerAgenticLoopHost::canonical_work_establishment_retry_preamble(1);
+        assert_eq!(retry["role"].as_str(), Some("system"));
+        let payload: Value = serde_json::from_str(
+            retry["content"]
+                .as_str()
+                .expect("structured retry preamble content"),
+        )
+        .expect("retry preamble JSON");
+        assert_eq!(
+            payload["schema"].as_str(),
+            Some("canonical_work_establishment_retry.v1")
+        );
+        assert_eq!(payload["retry"].as_u64(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn unresolved_work_admission_does_not_create_a_retry_gate() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-pending-judge".to_string(),
+            "s-work-pending-judge".to_string(),
+        )
+        .build();
+        let mut state = create_test_state();
+        state.turn_intent = Some(
+            astra_config::user_profile::TurnIntent::default()
+                .with_work_lifecycle(astra_config::user_profile::WorkLifecycleIntent::Required),
+        );
+        host.pending_work_admission_judge = Some(tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Err(astra_services::TurnIntentJudgeError::Transport(
+                "test timeout".to_string(),
+            ))
+        }));
+
+        assert!(!host.canonical_work_establishment_pending(&state));
+        assert!(!host.should_retry_canonical_work_establishment(&state, &[], 0));
+        host.abort_pending_work_admission();
+    }
+
+    #[tokio::test]
+    async fn required_work_admission_wins_over_explicit_primary_fanout() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-fanout-race".to_string(),
+            "s-work-fanout-race".to_string(),
+        )
+        .build();
+        host.pending_work_admission_judge = Some(tokio::spawn(async {
+            Ok(astra_services::WorkAdmissionDecision::Required {
+                workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+                mutation_completion_scope:
+                    astra_config::user_profile::MutationCompletionScope::Unknown,
+                goal: "Collect two independent outcomes".to_string(),
+                tasks: vec![
+                    astra_services::WorkAdmissionTask {
+                        objective: "Collect outcome A".to_string(),
+                        expected_result: "Outcome A is returned".to_string(),
+                    },
+                    astra_services::WorkAdmissionTask {
+                        objective: "Collect outcome B".to_string(),
+                        expected_result: "Outcome B is returned".to_string(),
+                    },
+                ],
+                deferred_graph_mutations: Vec::new(),
+                activation: astra_services::WorkAdmissionActivation::Start,
+                execution_topology: astra_services::WorkExecutionTopology::Primary,
+                required_capabilities: Vec::new(),
+            })
+        }));
+
+        assert!(host.resolve_pending_work_admission(true).await);
+        host.reconcile_work_activation_from_primary(&[json!({
+            "function": {
+                "name": "agent_fanout",
+                "arguments": "{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"description\":\"A\",\"prompt\":\"A\"},{\"description\":\"B\",\"prompt\":\"B\"}]}"
+            }
+        })]);
+        assert!(
+            host.pending_work_admission
+                .as_ref()
+                .is_some_and(|decision| {
+                    matches!(
+                        decision,
+                        astra_services::WorkAdmissionDecision::Required { .. }
+                    )
+                })
+        );
+        assert_eq!(
+            host.work_admission_execution_topology,
+            astra_services::WorkExecutionTopology::Primary
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_lifecycle_and_parallel_combination_is_not_silently_serialized() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-parallel-conflict".to_string(),
+            "s-work-parallel-conflict".to_string(),
+        )
+        .build();
+        host.pending_work_admission_judge =
+            Some(tokio::spawn(async {
+                Err(astra_services::TurnIntentJudgeError::UnsupportedCombination(
+                "durable Work and parallel sub-runs require a task-to-slot settlement protocol"
+                    .to_string(),
+            ))
+            }));
+
+        assert!(!host.resolve_pending_work_admission(true).await);
+        assert!(host.work_admission_conflict.is_some());
+        let calls = vec![
+            json!({
+                "id": "conflicting-fanout",
+                "function": {
+                    "name": "agent_fanout",
+                    "arguments": "{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"description\":\"A\",\"prompt\":\"A\"},{\"description\":\"B\",\"prompt\":\"B\"}]}"
+                }
+            }),
+            json!({
+                "id": "conflicting-work",
+                "function": {
+                    "name": "start_work",
+                    "arguments": "{\"activation\":\"start\",\"goal\":\"do both\",\"tasks\":[{\"objective\":\"A\",\"expected_result\":\"A\"}]}"
+                }
+            }),
+            json!({
+                "id": "conflicting-tool",
+                "function": {
+                    "name": "read_file",
+                    "arguments": "{\"path\":\"README.md\"}"
+                }
+            }),
+        ];
+        let admission = host.enforce_canonical_delegation_lifecycle(
+            &create_test_state(),
+            crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: calls,
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+        );
+
+        assert!(admission.admitted.is_empty());
+        assert_eq!(admission.rejected.len(), 3);
+        assert!(admission.rejected.iter().all(|rejected| {
+            rejected.result.contains("work_lifecycle_topology_conflict")
+                && rejected.result.contains("\"retryable\":false")
+        }));
+    }
+
+    #[test]
+    fn unsupported_work_admission_is_a_terminal_typed_error() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-terminal-conflict".to_string(),
+            "s-work-terminal-conflict".to_string(),
+        )
+        .build();
+        host.work_admission_conflict =
+            Some("durable Work and parallel sub-runs require a settlement protocol".to_string());
+
+        let error = host
+            .work_admission_terminal_error()
+            .expect("an unsupported admission contract must stop the run");
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+        let details: Value = serde_json::from_str(
+            error
+                .details_json
+                .as_deref()
+                .expect("terminal error includes machine-readable disposition"),
+        )
+        .expect("terminal details are JSON");
+        assert_eq!(details["source"], "work_admission");
+        assert_eq!(details["retryable"], false);
+        assert_eq!(details["error_kind"], "work_lifecycle_topology_conflict");
+    }
+
+    #[test]
+    fn semantic_work_admission_materializes_one_typed_initial_graph_at_lifecycle_boundary() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-admission".to_string(),
+            "s-work-admission".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .build();
+        let mut state = create_test_state();
+        state.session_turn = 7;
+        state.current_round_index = 3;
+        state.turn_intent = Some(
+            astra_config::user_profile::TurnIntent::default()
+                .with_work_lifecycle(astra_config::user_profile::WorkLifecycleIntent::Required),
+        );
+
+        assert!(
+            host.take_admitted_work_establishment_call(&state).is_none(),
+            "a required lifecycle without a semantic graph must not invent tasks from prompt text"
+        );
+
+        host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::Required {
+            workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+            mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
+            goal: "Produce two independent evidence-backed findings".to_string(),
+            tasks: vec![
+                astra_services::WorkAdmissionTask {
+                    objective: "Inspect the first source".to_string(),
+                    expected_result: "One cited finding from the first source".to_string(),
+                },
+                astra_services::WorkAdmissionTask {
+                    objective: "Inspect the second source".to_string(),
+                    expected_result: "One cited finding from the second source".to_string(),
+                },
+            ],
+            deferred_graph_mutations: vec![astra_services::WorkAdmissionGraphMutation::Replace {
+                target_initial_candidate: 2,
+                target: astra_services::WorkAdmissionTask {
+                    objective: "Inspect the second source".to_string(),
+                    expected_result: "One cited finding from the second source".to_string(),
+                },
+                replacement: astra_services::WorkAdmissionTask {
+                    objective: "Replace the second outcome after the first is evidenced"
+                        .to_string(),
+                    expected_result: "One accepted cancellation and one replacement task"
+                        .to_string(),
+                },
+            }],
+            activation: astra_services::WorkAdmissionActivation::Start,
+            execution_topology: astra_services::WorkExecutionTopology::Primary,
+            required_capabilities: Vec::new(),
+        });
+
+        let call = host.take_admitted_work_establishment_call(&state).expect(
+            "a typed required graph must cross the canonical lifecycle without another judge turn",
+        );
+        assert_eq!(
+            call["id"].as_str(),
+            Some("server-work-admission-t7-r3"),
+            "the server, not the model, owns the lifecycle call identity"
+        );
+        assert_eq!(call["function"]["name"].as_str(), Some("start_work"));
+        let arguments: Value = serde_json::from_str(
+            call["function"]["arguments"]
+                .as_str()
+                .expect("synthetic tool arguments"),
+        )
+        .expect("valid synthetic tool arguments");
+        assert_eq!(
+            arguments["goal"].as_str(),
+            Some("Produce two independent evidence-backed findings")
+        );
+        assert_eq!(arguments["activation"].as_str(), Some("start"));
+        assert_eq!(arguments["tasks"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            arguments["tasks"][0]["objective"].as_str(),
+            Some("Inspect the first source")
+        );
+        assert_eq!(host.pending_work_graph_mutations.len(), 1);
+        assert!(
+            host.pending_work_graph_mutation_context(&state)
+                .is_some_and(|message| message
+                    .to_string()
+                    .contains("pending_work_graph_mutations.v1"))
+        );
+
+        host.pending_work_admission = Some(astra_services::WorkAdmissionDecision::Required {
+            workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+            mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
+            goal: "Prepare two independent evidence-backed findings".to_string(),
+            tasks: vec![
+                astra_services::WorkAdmissionTask {
+                    objective: "Inspect the first source".to_string(),
+                    expected_result: "One cited finding from the first source".to_string(),
+                },
+                astra_services::WorkAdmissionTask {
+                    objective: "Inspect the second source".to_string(),
+                    expected_result: "One cited finding from the second source".to_string(),
+                },
+            ],
+            deferred_graph_mutations: Vec::new(),
+            activation: astra_services::WorkAdmissionActivation::Defer,
+            execution_topology: astra_services::WorkExecutionTopology::Primary,
+            required_capabilities: Vec::new(),
+        });
+        let deferred_call = host
+            .take_admitted_work_establishment_call(&state)
+            .expect("deferred typed graph must still cross the canonical lifecycle");
+        let deferred_arguments: Value = serde_json::from_str(
+            deferred_call["function"]["arguments"]
+                .as_str()
+                .expect("deferred synthetic tool arguments"),
+        )
+        .expect("valid deferred synthetic arguments");
+        assert_eq!(deferred_arguments["activation"].as_str(), Some("defer"));
+        assert!(
+            host.take_admitted_work_establishment_call(&state).is_none(),
+            "an admitted graph is materialized exactly once even if the host is re-entered"
+        );
+    }
+
+    #[test]
+    fn deferred_cancel_and_add_remain_distinct_after_current_item_settlement() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-mutation-gate".to_string(),
+            "s-work-mutation-gate".to_string(),
+        )
+        .build();
+        host.pending_work_graph_mutations = vec![
+            astra_services::WorkAdmissionGraphMutation::Cancel {
+                target_initial_candidate: 2,
+                target: astra_services::WorkAdmissionTask {
+                    objective: "Original declared outcome".to_string(),
+                    expected_result: "Original outcome evidence".to_string(),
+                },
+            },
+            astra_services::WorkAdmissionGraphMutation::Add {
+                task: astra_services::WorkAdmissionTask {
+                    objective: "Added declared outcome".to_string(),
+                    expected_result: "Added outcome evidence".to_string(),
+                },
+            },
+        ];
+        host.pending_work_graph_mutation_record_floor = 0;
+        let settle = json!({
+            "id": "settle-before-mutation",
+            "type": "function",
+            "function": {
+                "name": "settle_work_item",
+                "arguments": r#"{"outcome":"delivered","summary":"evidence"}"#
+            }
+        });
+        let mut state = create_test_state();
+        let admitted = host.admit_terminal_tool_calls(
+            &state,
+            std::slice::from_ref(&settle),
+            Some("tool_calls"),
+        );
+        assert_eq!(admitted, vec![settle.clone()]);
+        assert!(
+            host.pending_tool_call_admission
+                .as_ref()
+                .is_none_or(|admission| admission.rejected.is_empty()),
+            "the current item must settle before its staged mutation boundary"
+        );
+
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "settle_work_item".to_string(),
+            ok: true,
+            result_full: Some(r#"{"status":"recorded","item_id":"task-1"}"#.to_string()),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+        assert!(host.pending_work_graph_mutation_boundary_crossed(&state));
+        let context = host
+            .pending_work_graph_mutation_context(&state)
+            .expect("post-settlement mutation context")
+            .to_string();
+        assert!(context.contains("scheduling_boundary_crossed"));
+        assert!(context.contains("Do not execute or settle"));
+        assert!(context.contains("task-2"));
+
+        let admitted = host.admit_terminal_tool_calls(&state, &[settle], Some("tool_calls"));
+        assert!(admitted.is_empty());
+        let rejected = host
+            .pending_tool_call_admission
+            .as_ref()
+            .and_then(|admission| admission.rejected.first())
+            .expect("the next settlement must remain behind the graph mutation");
+        assert_eq!(
+            serde_json::from_str::<Value>(&rejected.result).expect("typed rejection")["error_kind"],
+            "pending_work_graph_mutation"
+        );
+
+        let wrong_patch = json!({
+            "id": "wrong-patch",
+            "type": "function",
+            "function": {
+                "name": "propose_work_plan",
+                "arguments": json!({
+                    "additions": [
+                        {
+                            "objective": "Added declared outcome",
+                            "expected_result": "Added outcome evidence"
+                        },
+                        {"objective": "Invented domain", "expected_result": "Invented evidence"}
+                    ],
+                    "revisions": [{
+                        "item_id": "task-2",
+                        "declaration_state": "cancelled",
+                        "objective": "Original declared outcome",
+                        "expected_result": "Original outcome evidence"
+                    }],
+                    "dependencies": [],
+                    "dependency_removals": []
+                }).to_string()
+            }
+        });
+        assert!(
+            host.admit_terminal_tool_calls(&state, &[wrong_patch], Some("tool_calls"))
+                .is_empty(),
+            "an unrelated patch must be rejected before graph persistence"
+        );
+        assert!(
+            host.pending_tool_call_admission
+                .as_ref()
+                .and_then(|admission| admission.rejected.first())
+                .is_some_and(|rejected| rejected
+                    .result
+                    .contains("pending_work_graph_mutation_mismatch"))
+        );
+
+        let rewritten_retirement = json!({
+            "id": "rewritten-retirement",
+            "type": "function",
+            "function": {
+                "name": "propose_work_plan",
+                "arguments": json!({
+                    "additions": [{
+                        "objective": "Added declared outcome",
+                        "expected_result": "Added outcome evidence"
+                    }],
+                    "revisions": [{
+                        "item_id": "task-2",
+                        "declaration_state": "cancelled",
+                        "objective": "A subtly rewritten outcome",
+                        "expected_result": "Original outcome evidence"
+                    }],
+                    "dependencies": [],
+                    "dependency_removals": []
+                }).to_string()
+            }
+        });
+        assert!(
+            host.admit_terminal_tool_calls(&state, &[rewritten_retirement], Some("tool_calls"))
+                .is_empty(),
+            "retirement must not smuggle a semantic rewrite into an exact cancellation"
+        );
+
+        let superseded_is_not_cancelled = json!({
+            "id": "wrong-retirement-state",
+            "type": "function",
+            "function": {
+                "name": "propose_work_plan",
+                "arguments": json!({
+                    "additions": [{
+                        "objective": "Added declared outcome",
+                        "expected_result": "Added outcome evidence"
+                    }],
+                    "revisions": [{
+                        "item_id": "task-2",
+                        "declaration_state": "superseded",
+                        "objective": "Original declared outcome",
+                        "expected_result": "Original outcome evidence"
+                    }],
+                    "dependencies": [],
+                    "dependency_removals": []
+                }).to_string()
+            }
+        });
+        assert!(
+            host.admit_terminal_tool_calls(
+                &state,
+                &[superseded_is_not_cancelled],
+                Some("tool_calls")
+            )
+            .is_empty(),
+            "superseded must never satisfy an explicit cancellation obligation"
+        );
+
+        let exact_patch = json!({
+            "id": "exact-patch",
+            "type": "function",
+            "function": {
+                "name": "propose_work_plan",
+                "arguments": json!({
+                    "additions": [{
+                        "objective": "Added declared outcome",
+                        "expected_result": "Added outcome evidence"
+                    }],
+                    "revisions": [{
+                        "item_id": "task-2",
+                        "declaration_state": "cancelled",
+                        "objective": "Original declared outcome",
+                        "expected_result": "Original outcome evidence"
+                    }],
+                    "dependencies": [],
+                    "dependency_removals": []
+                }).to_string()
+            }
+        });
+        assert_eq!(
+            host.admit_terminal_tool_calls(
+                &state,
+                std::slice::from_ref(&exact_patch),
+                Some("tool_calls")
+            ),
+            vec![exact_patch]
+        );
+
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "propose_work_plan".to_string(),
+            ok: true,
+            result_full: Some(r#"{"status":"pending"}"#.to_string()),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+        host.reconcile_pending_work_graph_mutations(&state);
+        assert_eq!(host.pending_work_graph_mutations.len(), 2);
+
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "propose_work_plan".to_string(),
+            ok: true,
+            args_full: Some(
+                r#"{"additions":[{"objective":"Invented third domain","expected_result":"Unrequested result"}],"revisions":[{"item_id":"task-2","declaration_state":"cancelled"}],"dependencies":[],"dependency_removals":[]}"#
+                    .to_string(),
+            ),
+            result_full: Some(r#"{"status":"accepted"}"#.to_string()),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+        host.reconcile_pending_work_graph_mutations(&state);
+        assert_eq!(
+            host.pending_work_graph_mutations.len(),
+            2,
+            "an accepted but semantically different patch must not discharge the typed obligation"
+        );
+
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "propose_work_plan".to_string(),
+            ok: true,
+            args_full: Some(
+                r#"{"additions":[{"objective":"Added declared outcome","expected_result":"Added outcome evidence"}],"revisions":[{"item_id":"task-2","declaration_state":"cancelled","objective":"Original declared outcome","expected_result":"Original outcome evidence"}],"dependencies":[],"dependency_removals":[]}"#
+                    .to_string(),
+            ),
+            result_full: Some(r#"{"status":"accepted"}"#.to_string()),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+        host.reconcile_pending_work_graph_mutations(&state);
+        assert!(host.pending_work_graph_mutations.is_empty());
+    }
+
+    #[test]
+    fn graph_mutation_admission_compares_exact_multisets() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-multiset".to_string(),
+            "s-work-multiset".to_string(),
+        )
+        .build();
+        let repeated = astra_services::WorkAdmissionTask {
+            objective: "Repeat the admitted outcome".into(),
+            expected_result: "Independent evidence for the repeated outcome".into(),
+        };
+        host.pending_work_graph_mutations = vec![
+            astra_services::WorkAdmissionGraphMutation::Add {
+                task: repeated.clone(),
+            },
+            astra_services::WorkAdmissionGraphMutation::Add {
+                task: repeated.clone(),
+            },
+        ];
+
+        let smuggled = json!({
+            "additions": [
+                {"objective": repeated.objective, "expected_result": repeated.expected_result},
+                {"objective": "Unrequested outcome", "expected_result": "Unrequested evidence"}
+            ],
+            "revisions": [],
+            "dependencies": [],
+            "dependency_removals": []
+        });
+        assert!(
+            !host.proposal_arguments_satisfy_pending_work_graph_mutations(&smuggled),
+            "one matching row must not satisfy two identical obligations while hiding an unrelated row"
+        );
+
+        let exact = json!({
+            "additions": [
+                {"objective": repeated.objective, "expected_result": repeated.expected_result},
+                {"objective": repeated.objective, "expected_result": repeated.expected_result}
+            ],
+            "revisions": [],
+            "dependencies": [],
+            "dependency_removals": []
+        });
+        assert!(host.proposal_arguments_satisfy_pending_work_graph_mutations(&exact));
+
+        let with_unrequested_dependency = json!({
+            "additions": [
+                {"objective": repeated.objective, "expected_result": repeated.expected_result},
+                {"objective": repeated.objective, "expected_result": repeated.expected_result}
+            ],
+            "revisions": [],
+            "dependencies": [{"predecessor_item_id": "task-1", "successor_item_id": "task-2"}],
+            "dependency_removals": []
+        });
+        assert!(
+            !host.proposal_arguments_satisfy_pending_work_graph_mutations(
+                &with_unrequested_dependency
+            ),
+            "an exact task mutation must not carry an unrequested dependency change"
+        );
+    }
+
+    #[test]
+    fn read_only_semantic_intent_does_not_override_runtime_authority() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-read-only-boundary".to_string(),
+            "s-read-only-boundary".to_string(),
+        )
+        .build();
+        host.admitted_workspace_mutation =
+            astra_config::user_profile::WorkspaceMutationIntent::ReadOnly;
+        let state = create_test_state();
+        let read = json!({
+            "id": "read-status",
+            "type": "function",
+            "function": {"name": "bash", "arguments": r#"{"command":"git status --short"}"#}
+        });
+        let checkout = json!({
+            "id": "mutate-checkout",
+            "type": "function",
+            "function": {"name": "bash", "arguments": r#"{"command":"git checkout review-ref -- ."}"#}
+        });
+        let admitted = host.admit_terminal_tool_calls(
+            &state,
+            &[read.clone(), checkout.clone()],
+            Some("tool_calls"),
+        );
+        assert_eq!(admitted, vec![read, checkout]);
+        let admission = host
+            .pending_tool_call_admission
+            .as_ref()
+            .expect("typed admission result");
+        assert!(
+            admission.rejected.is_empty(),
+            "an inferred task semantic must not become an authorization deny"
+        );
+    }
+
+    #[test]
+    fn work_boundary_projection_preserves_other_typed_turn_semantics() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-semantic-merge".to_string(),
+            "s-semantic-merge".to_string(),
+        )
+        .build();
+        host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+            mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
+            execution_topology: astra_services::WorkExecutionTopology::Primary,
+            required_capabilities: Vec::new(),
+        });
+        host.completed_work_admission_phase = Some((Instant::now(), 0, TurnPhaseOutcome::Decided));
+        let mut state = create_test_state();
+        state.turn_intent = Some(
+            astra_config::user_profile::TurnIntent::default()
+                .with_requested_scenario(astra_config::user_profile::Scenario::CodeReview)
+                .with_workspace_mutation(
+                    astra_config::user_profile::WorkspaceMutationIntent::MustMutate,
+                ),
+        );
+
+        host.flush_completed_work_admission_phase(&mut state);
+        let intent = state.turn_intent.as_ref().expect("merged typed intent");
+        assert_eq!(
+            intent.requested_scenario,
+            Some(astra_config::user_profile::Scenario::CodeReview)
+        );
+        assert_eq!(
+            intent.work_lifecycle,
+            astra_config::user_profile::WorkLifecycleIntent::NotRequired
+        );
+        assert_eq!(
+            intent.workspace_mutation,
+            astra_config::user_profile::WorkspaceMutationIntent::ReadOnly
+        );
+        assert!(
+            host.read_only_effect_context().is_none(),
+            "semantic read-only intent must not create a system-level write prohibition"
+        );
+
+        let physical_read_only_host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-physical-read-only".to_string(),
+            "s-physical-read-only".to_string(),
+        )
+        .with_execution_binding_snapshot(ExecutionBindingSnapshot::new(
+            WorkspaceBinding {
+                kind: WorkspaceBindingKind::CloudWorkspace,
+                display_name: "Snapshot".to_string(),
+                cwd: Some("/snapshot".to_string()),
+                authority: WorkspaceAuthority::ReadOnly,
+            },
+            ExecutorBinding::orchestrator_managed(
+                "snapshot-runtime",
+                "Snapshot runtime",
+                crate::server::tool_transport::ExecutorStatus::Online,
+            ),
+            astra_runtime_env::RuntimeBinding::oci_container("snapshot-runtime"),
+        ))
+        .build();
+        let context = physical_read_only_host
+            .read_only_effect_context()
+            .expect("physical read-only runtime context")
+            .to_string();
+        assert!(context.contains("immutable revision/ref"));
+        assert!(context.contains("label each snapshot explicitly"));
+    }
+
+    #[test]
+    fn work_mutation_admission_reconciles_only_the_untouched_fallback_initial_slice() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-budget".to_string(),
+            "s-work-budget".to_string(),
+        )
+        .build();
+        host.pending_work_admission = Some(astra_services::WorkAdmissionDecision::Required {
+            workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::MustMutate,
+            mutation_completion_scope:
+                astra_config::user_profile::MutationCompletionScope::Workspace,
+            goal: "Deliver one verified workspace change".to_string(),
+            tasks: vec![astra_services::WorkAdmissionTask {
+                objective: "Implement the declared change".to_string(),
+                expected_result: "The changed behavior passes its acceptance check".to_string(),
+            }],
+            deferred_graph_mutations: Vec::new(),
+            activation: astra_services::WorkAdmissionActivation::Start,
+            execution_topology: astra_services::WorkExecutionTopology::Primary,
+            required_capabilities: Vec::new(),
+        });
+        host.completed_work_admission_phase = Some((Instant::now(), 0, TurnPhaseOutcome::Decided));
+        let mut state = create_test_state();
+        let fallback = astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default();
+        state.task_profile = fallback;
+        state.agentic_turn_budget = fallback.agentic_turn_budget;
+        state.max_turns = fallback.agentic_turn_budget.initial_turns;
+        state.remaining_turns = 19;
+        let hard_limit = state.agentic_turn_budget.hard_turn_limit;
+
+        host.flush_completed_work_admission_phase(&mut state);
+
+        assert_eq!(state.max_turns, 32);
+        assert_eq!(state.remaining_turns, 27);
+        assert_eq!(state.agentic_turn_budget.hard_turn_limit, hard_limit);
+        assert!(state.task_profile.mutates_workspace);
+        assert!(state.task_profile.verification_required);
+
+        let mut explicit = create_test_state();
+        explicit.task_profile = fallback;
+        explicit.agentic_turn_budget = fallback.agentic_turn_budget;
+        explicit.max_turns = fallback.agentic_turn_budget.initial_turns;
+        explicit.remaining_turns = 19;
+        explicit.budget_is_explicit = true;
+        host.completed_work_admission_phase = Some((Instant::now(), 1, TurnPhaseOutcome::Decided));
+        host.flush_completed_work_admission_phase(&mut explicit);
+        assert_eq!(
+            explicit.max_turns,
+            fallback.agentic_turn_budget.initial_turns
+        );
+        assert!(explicit.task_profile.mutates_workspace);
+
+        host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+            mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
+            execution_topology: astra_services::WorkExecutionTopology::Primary,
+            required_capabilities: Vec::new(),
+        });
+        host.completed_work_admission_phase = Some((Instant::now(), 2, TurnPhaseOutcome::Decided));
+        let mut read_only = create_test_state();
+        read_only.task_profile = fallback;
+        read_only.agentic_turn_budget = fallback.agentic_turn_budget;
+        read_only.max_turns = fallback.agentic_turn_budget.initial_turns;
+        read_only.remaining_turns = 19;
+        host.flush_completed_work_admission_phase(&mut read_only);
+        assert_eq!(
+            read_only.max_turns,
+            fallback.agentic_turn_budget.initial_turns
+        );
+        assert!(!read_only.task_profile.mutates_workspace);
+    }
+
+    #[test]
+    fn semantic_work_replacement_preserves_physical_provider_usage() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-usage".to_string(),
+            "s-work-usage".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .build();
+        let mut state = create_test_state();
+        state.session_turn = 2;
+        host.pending_work_admission = Some(astra_services::WorkAdmissionDecision::Required {
+            workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+            mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
+            goal: "Deliver one tracked outcome".to_string(),
+            tasks: vec![astra_services::WorkAdmissionTask {
+                objective: "Produce the outcome".to_string(),
+                expected_result: "The outcome has evidence".to_string(),
+            }],
+            deferred_graph_mutations: Vec::new(),
+            activation: astra_services::WorkAdmissionActivation::Start,
+            execution_topology: astra_services::WorkExecutionTopology::Primary,
+            required_capabilities: Vec::new(),
+        });
+        let provider_result = LlmCallResult {
+            full_text: "provisional answer must not escape".to_string(),
+            reasoning: "provisional reasoning".to_string(),
+            tool_calls: vec![json!({
+                "id": "discarded-provider-call",
+                "function": {"name": "web_fetch", "arguments": "{}"}
+            })],
+            usage: Map::from_iter([
+                ("input_tokens".to_string(), json!(40123)),
+                ("output_tokens".to_string(), json!(157)),
+                ("cached_input_tokens".to_string(), json!(2048)),
+            ]),
+            ..Default::default()
+        };
+
+        let replacement = host
+            .admitted_work_turn_result(&mut state, Instant::now(), &provider_result, None)
+            .expect("typed Work replacement")
+            .expect("admitted Work result");
+
+        assert!(replacement.accum.full_text.is_empty());
+        assert!(replacement.accum.reasoning_content.is_empty());
+        assert_eq!(replacement.accum.tool_calls.len(), 1);
+        assert_eq!(
+            replacement.accum.tool_calls[0]["function"]["name"],
+            "start_work"
+        );
+        assert_eq!(replacement.accum.prompt_tokens, 40123);
+        assert_eq!(replacement.accum.completion_tokens, 157);
+        assert_eq!(replacement.accum.cache_read_tokens, 2048);
+        assert!(replacement.accum.has_usage);
+        assert_eq!(
+            crate::turn::agentic_loop::host::AgenticLoopHost::consume_control_plane_turn(
+                &mut host,
+                &replacement,
+            ),
+            crate::turn::agentic_loop::host::ControlPlaneTurnBoundary::ProviderBacked
+        );
+    }
+
+    #[test]
+    fn primary_typed_defer_wins_before_server_work_dispatch() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-activation".to_string(),
+            "s-work-activation".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .build();
+        host.pending_work_admission = Some(astra_services::WorkAdmissionDecision::Required {
+            workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::MustMutate,
+            mutation_completion_scope:
+                astra_config::user_profile::MutationCompletionScope::Workspace,
+            goal: "Prepare two independently verifiable outcomes".to_string(),
+            tasks: vec![
+                astra_services::WorkAdmissionTask {
+                    objective: "Implement outcome A".to_string(),
+                    expected_result: "A is implemented".to_string(),
+                },
+                astra_services::WorkAdmissionTask {
+                    objective: "Verify outcome B".to_string(),
+                    expected_result: "B has evidence".to_string(),
+                },
+            ],
+            deferred_graph_mutations: Vec::new(),
+            activation: astra_services::WorkAdmissionActivation::Start,
+            execution_topology: astra_services::WorkExecutionTopology::Primary,
+            required_capabilities: Vec::new(),
+        });
+
+        let provider_calls = vec![
+            json!({
+                "function": {
+                    "name": "start_work",
+                    "arguments": "{\"activation\":\"defer\",\"goal\":\"provider proposal\",\"tasks\":[]}"
+                }
+            }),
+            json!({
+                "function": {
+                    "name": "list_dir",
+                    "arguments": "{}"
+                }
+            }),
+        ];
+        host.reconcile_work_activation_from_primary(&provider_calls);
+        let mut state = create_test_state();
+        state.session_turn = 4;
+        let call = host
+            .take_admitted_work_establishment_call(&state)
+            .expect("required Work must still be materialized");
+        let arguments: Value = serde_json::from_str(
+            call["function"]["arguments"]
+                .as_str()
+                .expect("synthetic Work arguments"),
+        )
+        .expect("valid synthetic Work arguments");
+        assert_eq!(
+            arguments["activation"].as_str(),
+            Some("defer"),
+            "an explicit typed defer must not be replaced by the judge default start"
+        );
+    }
+
+    #[test]
+    fn primary_work_activation_is_structurally_decoded_and_defer_is_conservative() {
+        let calls = vec![
+            json!({
+                "function": {
+                    "name": "start_work",
+                    "arguments": "{\"activation\":\"start\"}"
+                }
+            }),
+            json!({
+                "function": {
+                    "name": "start_work",
+                    "arguments": "{\"activation\":\"defer\"}"
+                }
+            }),
+        ];
+        assert_eq!(
+            primary_work_activation(&calls),
+            Some(astra_services::WorkAdmissionActivation::Defer)
+        );
+        assert_eq!(
+            primary_work_activation(&[json!({"content": "defer"})]),
+            None
+        );
+        let fanout = json!({
+            "function": {
+                "name": "agent_fanout",
+                "arguments": "{\"action\":\"start\",\"target_count\":2,\"slots\":[]}"
+            }
+        });
+        assert!(primary_explicit_fanout_start(std::slice::from_ref(&fanout)));
+        assert!(!primary_explicit_fanout_start(&[
+            fanout,
+            json!({"function": {"name": "start_work", "arguments": "{}"}}),
+        ]));
+        assert!(!primary_explicit_fanout_start(&[json!({
+            "content": "please fan out"
+        })]));
+    }
+
+    #[test]
+    fn work_admission_boundary_uses_typed_effects_and_control_boundaries() {
+        let call = |name: &str| {
+            json!({
+                "type": "function",
+                "function": {"name": name, "arguments": "{}"}
+            })
+        };
+
+        assert!(!provider_batch_needs_work_admission(&[]));
+        assert!(!provider_batch_needs_work_admission(&[json!({
+            "content": "run the task system"
+        })]));
+        assert!(
+            provider_batch_needs_work_admission(&[call("read_file")]),
+            "a read-only batch is a candidate; the default capacity policy decides whether to spend the judge"
+        );
+        assert!(provider_batch_needs_work_admission(&[
+            call("read_file"),
+            call("read_file")
+        ]));
+        assert!(
+            !provider_batch_needs_work_admission(&[call("task_list")]),
+            "control-plane observation keeps the fast path"
+        );
+        assert!(provider_batch_has_ambiguous_topology(&[
+            call("read_file"),
+            call("read_file")
+        ]));
+        assert!(!provider_batch_has_ambiguous_topology(&[call("read_file")]));
+        assert!(provider_batch_needs_work_admission(&[call("web_search")]));
+        assert!(provider_batch_needs_work_admission(&[call("bash")]));
+        assert!(provider_batch_needs_work_admission(&[call("agent_fanout")]));
+        assert!(
+            !provider_batch_needs_work_admission(&[call("skill")]),
+            "workflow loading must complete before topology admission observes its trusted directive"
+        );
+        assert!(!provider_batch_has_ambiguous_topology(&[call("skill")]));
+        assert!(
+            !provider_batch_needs_work_admission(&[call("skill"), call("bash")]),
+            "skill interception defers the mixed effect; admission must observe the loaded workflow on the next batch"
+        );
+        assert!(!provider_batch_has_ambiguous_topology(&[
+            call("skill"),
+            call("bash")
+        ]));
+        assert!(
+            provider_batch_starts_work_admission(&[json!({
+                "type": "function",
+                "function": {
+                    "name": "agent_fanout",
+                    "arguments": "{\"action\":\"start\",\"target_count\":2,\"slots\":[]}"
+                }
+            })]),
+            "a fixed fanout still needs an authoritative semantic topology decision"
+        );
+        assert!(
+            provider_batch_starts_work_admission(&[call("agent_fanout")]),
+            "an ambiguous or malformed fanout call remains conservative"
+        );
+        assert!(
+            provider_batch_starts_work_admission(&[
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": "agent_fanout",
+                        "arguments": "{\"action\":\"start\",\"target_count\":2,\"slots\":[]}"
+                    }
+                }),
+                call("bash"),
+            ]),
+            "fanout lifecycle ownership must not exempt a mixed side-effect batch"
+        );
+        assert!(provider_batch_needs_work_admission(&[call("start_work")]));
+        for lifecycle_control in [
+            "inspect_work_plan",
+            "propose_work_plan",
+            "inspect_work_criteria",
+            "propose_work_criteria",
+            "run_next_work_item",
+            "settle_work_item",
+        ] {
+            assert!(
+                provider_batch_needs_work_admission(&[call(lifecycle_control)]),
+                "an unbound lifecycle guess must settle semantic admission before execution: {lifecycle_control}"
+            );
+        }
+        assert!(
+            provider_batch_needs_work_admission(&[call("tool_search")]),
+            "deferred capability discovery must settle semantic admission before another provider round"
+        );
+        assert!(
+            provider_batch_has_ambiguous_topology(&[call("start_work")]),
+            "a lifecycle carrier must be eligible for one activation decision"
+        );
+        assert!(
+            provider_batch_needs_work_admission(&[call("mcp__browser__navigate")]),
+            "unknown request-scoped tools remain conservative without matching their names"
+        );
+        assert!(
+            !work_admission_boundary_requires_wait(&[], false, false),
+            "an ordinary turn with no semantic preflight keeps the fast path"
+        );
+        assert!(work_admission_boundary_requires_wait(
+            &[call("task_list")],
+            false,
+            false
+        ));
+        assert!(work_admission_boundary_requires_wait(&[], true, false));
+        assert!(
+            work_admission_boundary_requires_wait(&[], false, true),
+            "a pending semantic preflight must settle before text-only completion"
+        );
+    }
+
+    #[test]
+    fn required_typed_work_precedence_is_structural_and_keeps_fanout_unexecuted() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-fanout-precedence".to_string(),
+            "s-fanout-precedence".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .build();
+        host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::Required {
+            workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+            mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
+            goal: "Collect independent evidence concurrently".to_string(),
+            tasks: vec![
+                astra_services::WorkAdmissionTask {
+                    objective: "Collect evidence A".to_string(),
+                    expected_result: "Evidence A is returned".to_string(),
+                },
+                astra_services::WorkAdmissionTask {
+                    objective: "Collect evidence B".to_string(),
+                    expected_result: "Evidence B is returned".to_string(),
+                },
+            ],
+            deferred_graph_mutations: Vec::new(),
+            activation: astra_services::WorkAdmissionActivation::Start,
+            execution_topology: astra_services::WorkExecutionTopology::Primary,
+            required_capabilities: Vec::new(),
+        });
+        let mut state = create_test_state();
+        state.turn_intent = Some(
+            astra_config::user_profile::TurnIntent::default()
+                .with_work_lifecycle(astra_config::user_profile::WorkLifecycleIntent::Required),
+        );
+
+        host.reconcile_work_activation_from_primary(&[json!({
+            "function": {
+                "name": "agent_fanout",
+                "arguments": "{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"description\":\"A\",\"prompt\":\"A\"},{\"description\":\"B\",\"prompt\":\"B\"}]}"
+            }
+        })]);
+
+        assert_eq!(
+            host.work_admission_execution_topology,
+            astra_services::WorkExecutionTopology::Primary
+        );
+        assert!(
+            host.pending_work_admission
+                .as_ref()
+                .is_some_and(|decision| {
+                    matches!(
+                        decision,
+                        astra_services::WorkAdmissionDecision::Required { .. }
+                    )
+                })
+        );
+        assert!(
+            host.take_admitted_work_establishment_call(&state).is_some(),
+            "required Work must synthesize the canonical lifecycle before fanout"
+        );
+    }
+
+    #[test]
+    fn primary_semantic_topology_is_not_overwritten_by_provider_fanout() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-fanout-direct".to_string(),
+            "s-fanout-direct".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .build();
+        host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+            mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
+            execution_topology: astra_services::WorkExecutionTopology::Primary,
+            required_capabilities: Vec::new(),
+        });
+
+        host.reconcile_work_activation_from_primary(&[json!({
+            "function": {
+                "name": "agent_fanout",
+                "arguments": "{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"description\":\"A\",\"prompt\":\"A\"},{\"description\":\"B\",\"prompt\":\"B\"}]}"
+            }
+        })]);
+
+        assert_eq!(
+            host.work_admission_execution_topology,
+            astra_services::WorkExecutionTopology::Primary
+        );
+        assert!(
+            host.pending_work_admission
+                .as_ref()
+                .is_some_and(|decision| {
+                    matches!(
+                        decision,
+                        astra_services::WorkAdmissionDecision::NotRequired {
+                            execution_topology: astra_services::WorkExecutionTopology::Primary,
+                            required_capabilities: capabilities,
+                            ..
+                        } if capabilities.is_empty()
+                    )
+                })
+        );
+        let state = create_test_state();
+        assert!(
+            host.take_admitted_work_establishment_call(&state).is_none(),
+            "not-required primary execution must not synthesize a durable Work graph"
+        );
+        let admission = host.enforce_canonical_delegation_lifecycle(
+            &state,
+            crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: vec![json!({
+                    "id": "fanout-unadmitted",
+                    "function": {
+                        "name": "agent_fanout",
+                        "arguments": "{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"description\":\"A\",\"prompt\":\"A\"},{\"description\":\"B\",\"prompt\":\"B\"}]}"
+                    }
+                })],
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+        );
+        assert!(admission.admitted.is_empty());
+        assert_eq!(admission.rejected.len(), 1);
+        assert!(
+            admission.rejected[0]
+                .result
+                .contains("parallel_topology_not_admitted")
+        );
+    }
+
+    #[test]
+    fn primary_topology_never_redirects_a_direct_parallel_batch_to_hidden_fanout() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-primary-direct-batch".to_string(),
+            "s-primary-direct-batch".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .build();
+        host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+            mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
+            execution_topology: astra_services::WorkExecutionTopology::Primary,
+            required_capabilities: vec![astra_services::WorkAdmissionCapability::AgentSpawner],
+        });
+        let calls = ["a", "b"].map(|id| {
+            json!({
+                "id": id,
+                "function": {
+                    "name": "agent",
+                    "arguments": format!(r#"{{"action":"spawn","description":"{id}","prompt":"review {id}"}}"#)
+                }
+            })
+        });
+
+        let admission = host.enforce_canonical_delegation_lifecycle(
+            &create_test_state(),
+            crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: calls.into_iter().collect(),
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+        );
+
+        assert!(admission.admitted.is_empty());
+        assert_eq!(admission.rejected.len(), 2);
+        for rejected in admission.rejected {
+            let result: Value = serde_json::from_str(&rejected.result).unwrap();
+            assert_eq!(result["error_kind"], "parallel_topology_not_admitted");
+            assert_eq!(result["retryable"], false);
+            assert!(
+                !result["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Use agent_fanout"),
+                "a rejection must not recommend an action absent from the authoritative surface"
+            );
+        }
+    }
+
+    #[test]
+    fn unavailable_semantic_topology_does_not_let_provider_self_authorize_fanout() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-fanout-unavailable".to_string(),
+            "s-fanout-unavailable".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .build();
+        let call = json!({
+            "id": "fanout-without-authority",
+            "function": {
+                "name": "agent_fanout",
+                "arguments": "{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"description\":\"A\",\"prompt\":\"A\"},{\"description\":\"B\",\"prompt\":\"B\"}]}"
+            }
+        });
+
+        host.reconcile_work_activation_from_primary(std::slice::from_ref(&call));
+
+        assert!(host.pending_work_admission.is_none());
+        assert_eq!(
+            host.work_admission_execution_topology,
+            astra_services::WorkExecutionTopology::Primary
+        );
+        let admission = host.enforce_canonical_delegation_lifecycle(
+            &create_test_state(),
+            crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: vec![call],
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+        );
+
+        assert!(admission.admitted.is_empty());
+        assert_eq!(admission.rejected.len(), 1);
+        assert!(
+            admission.rejected[0]
+                .result
+                .contains("parallel_topology_admission_unavailable")
+        );
+    }
+
+    #[test]
+    fn explicit_parallel_semantic_topology_admits_provider_fanout() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-fanout-authorized".to_string(),
+            "s-fanout-authorized".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .build();
+        host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+            mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
+            execution_topology: astra_services::WorkExecutionTopology::ParallelSubruns,
+            required_capabilities: vec![astra_services::WorkAdmissionCapability::AgentSpawner],
+        });
+        let call = json!({
+            "id": "fanout-authorized",
+            "function": {
+                "name": "agent_fanout",
+                "arguments": "{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"description\":\"A\",\"prompt\":\"A\"},{\"description\":\"B\",\"prompt\":\"B\"}]}"
+            }
+        });
+
+        host.reconcile_work_activation_from_primary(std::slice::from_ref(&call));
+        let admission = host.enforce_canonical_delegation_lifecycle(
+            &create_test_state(),
+            crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: vec![call],
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+        );
+
+        assert_eq!(admission.admitted.len(), 1);
+        assert!(admission.rejected.is_empty());
+    }
+
+    #[tokio::test]
+    async fn authoritative_primary_topology_hides_fanout_until_new_intent_reopens_admission() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-primary-surface".to_string(),
+            "s-primary-surface".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .with_provider_capabilities(server_public_network_capabilities())
+        .build();
+        let state = create_test_state();
+
+        let unresolved_tools =
+            host.filtered_runtime_ready_turn_tools(&std::collections::HashSet::new(), &state);
+        let unresolved = schema_names(&unresolved_tools);
+        assert!(
+            unresolved.contains("agent_fanout"),
+            "an unresolved semantic decision must retain historical fanout inspection: {unresolved:?}"
+        );
+        let unresolved_fanout = unresolved_tools
+            .iter()
+            .find(|schema| tool_schema_name(schema) == Some("agent_fanout"))
+            .expect("historical fanout carrier");
+        let unresolved_actions =
+            unresolved_fanout["function"]["parameters"]["properties"]["action"]["enum"]
+                .as_array()
+                .expect("action enum");
+        assert!(
+            !unresolved_actions.iter().any(|action| action == "start"),
+            "an unresolved admission decision must not advertise an unusable fanout start"
+        );
+
+        host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+            mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
+            execution_topology: astra_services::WorkExecutionTopology::Primary,
+            required_capabilities: vec![astra_services::WorkAdmissionCapability::AgentSpawner],
+        });
+        let primary_tools =
+            host.filtered_runtime_ready_turn_tools(&std::collections::HashSet::new(), &state);
+        let primary = schema_names(&primary_tools);
+        assert!(
+            primary.contains("agent_fanout"),
+            "historical fanout results remain readable under primary topology: {primary:?}"
+        );
+        let fanout = primary_tools
+            .iter()
+            .find(|schema| tool_schema_name(schema) == Some("agent_fanout"))
+            .expect("read-only fanout carrier");
+        let actions = fanout["function"]["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum");
+        assert!(!actions.iter().any(|action| action == "start"));
+        assert!(actions.iter().any(|action| action == "get_results"));
+        assert!(
+            fanout["function"]["parameters"]["x-astra-per-action-required"]
+                .get("start")
+                .is_none()
+        );
+        let stabilized = crate::turn::llm::context::stabilize_tool_schemas_for_cache(
+            &primary_tools,
+            &unresolved_tools,
+            &primary_tools,
+            astra_turn_core::cache_placement::CacheCapability {
+                protocol: astra_turn_core::cache_placement::CacheProtocol::StrictHistoryMatch,
+                volatile_placement:
+                    astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly,
+                reuse_scope: Some(
+                    astra_turn_core::cache_placement::CacheReuseScope::ConversationTurns,
+                ),
+            },
+            1,
+        );
+        let stabilized_fanout = stabilized
+            .iter()
+            .find(|schema| tool_schema_name(schema) == Some("agent_fanout"))
+            .expect("stabilized historical fanout carrier");
+        assert!(
+            !stabilized_fanout["function"]["parameters"]["properties"]["action"]["enum"]
+                .as_array()
+                .expect("stabilized action enum")
+                .iter()
+                .any(|action| action == "start"),
+            "strict-history cache ordering must not restore a currently forbidden action"
+        );
+        assert!(
+            primary.contains("agent"),
+            "primary topology may retain one typed child carrier: {primary:?}"
+        );
+
+        host.on_user_intent_applied(&crate::turn::run_control::QueuedUserIntent {
+            intent_id: "intent-new-topology".to_string(),
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+            event_index: 1,
+            input: json!({"content":"Use two independent agents now."}),
+        })
+        .await;
+        let invalidated = schema_names(
+            &host.filtered_runtime_ready_turn_tools(&std::collections::HashSet::new(), &state),
+        );
+        assert!(
+            invalidated.contains("agent_fanout"),
+            "new user evidence must retain historical fanout inspection while admission is unresolved: {invalidated:?}"
+        );
+    }
+
+    #[test]
+    fn newly_loaded_workflow_invalidates_stale_primary_topology_decision() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-skill-topology-refresh".to_string(),
+            "s-skill-topology-refresh".to_string(),
+        )
+        .build();
+        host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::NotRequired {
+            workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+            mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
+            execution_topology: astra_services::WorkExecutionTopology::Primary,
+            required_capabilities: Vec::new(),
+        });
+        host.work_admission_attempted = true;
+        host.work_admission_skill_revision = 0;
+        let mut state = create_test_state();
+        state.skills.invoked.insert(
+            "parallel-review".to_string(),
+            crate::turn::skill_tool::InvokedSkill {
+                name: "parallel-review".to_string(),
+                content: "Use independent reviewers.".to_string(),
+                invoked_at_turn: 1,
+                reentry_count: 0,
+                execution_topology: Some(astra_services::WorkExecutionTopology::ParallelSubruns),
+            },
+        );
+
+        assert_eq!(host.reconcile_work_admission_skill_revision(&state), 1);
+        assert!(host.pending_work_admission.is_none());
+        assert!(!host.work_admission_attempted);
+        assert!(!host.work_admission_topology_authoritative);
+    }
+
+    #[test]
+    fn delegated_work_attempt_cannot_self_authorize_provider_fanout() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-attempt-fanout".to_string(),
+            "s-work-attempt-fanout".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .with_work_item_attempt_bound(true)
+        .build();
+        let call = json!({
+            "id":"attempt-fanout",
+            "function":{
+                "name":"agent_fanout",
+                "arguments":"{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"description\":\"A\",\"prompt\":\"A\"},{\"description\":\"B\",\"prompt\":\"B\"}]}"
+            }
+        });
+
+        let admission = host.enforce_canonical_delegation_lifecycle(
+            &create_test_state(),
+            crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: vec![call],
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+        );
+
+        assert!(admission.admitted.is_empty());
+        assert!(
+            admission.rejected[0]
+                .result
+                .contains("parallel_topology_not_admitted")
+        );
+    }
+
+    #[test]
+    fn required_work_materialization_does_not_authorize_nested_fanout() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-required-parallel".to_string(),
+            "s-required-parallel".to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .with_work_item_attempt_bound(true)
+        .build();
+        host.apply_work_admission_decision(astra_services::WorkAdmissionDecision::Required {
+            workspace_mutation: astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+            mutation_completion_scope: astra_config::user_profile::MutationCompletionScope::Unknown,
+            goal: "Collect two admitted outcomes".into(),
+            tasks: vec![
+                astra_services::WorkAdmissionTask {
+                    objective: "Outcome A".into(),
+                    expected_result: "Evidence A".into(),
+                },
+                astra_services::WorkAdmissionTask {
+                    objective: "Outcome B".into(),
+                    expected_result: "Evidence B".into(),
+                },
+            ],
+            deferred_graph_mutations: Vec::new(),
+            activation: astra_services::WorkAdmissionActivation::Start,
+            execution_topology: astra_services::WorkExecutionTopology::Primary,
+            required_capabilities: Vec::new(),
+        });
+        let state = create_test_state();
+        assert!(host.take_admitted_work_establishment_call(&state).is_some());
+        assert!(host.pending_work_admission.is_none());
+        assert!(host.work_admission_topology_authoritative);
+        let call = json!({
+            "id":"admitted-attempt-fanout",
+            "function":{
+                "name":"agent_fanout",
+                "arguments":"{\"action\":\"start\",\"target_count\":2,\"slots\":[{\"description\":\"A\",\"prompt\":\"A\"},{\"description\":\"B\",\"prompt\":\"B\"}]}"
+            }
+        });
+
+        let admission = host.enforce_canonical_delegation_lifecycle(
+            &state,
+            crate::turn::agentic_loop::host::ToolCallAdmission {
+                admitted: vec![call],
+                rejected: Vec::new(),
+                completion_action_applied: false,
+            },
+        );
+
+        assert!(admission.admitted.is_empty());
+        assert_eq!(admission.rejected.len(), 1);
+        assert!(
+            admission.rejected[0]
+                .result
+                .contains("parallel_topology_not_admitted")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    async fn required_unbound_work_retries_text_only_provider_once_without_named_tool_choice() {
+        let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+        let session_id = "session-work-establishment-retry";
+        let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+        let (gateway_url, requests, server) = spawn_gateway(
+            axum::http::StatusCode::OK,
+            json!({
+                "choices": [{
+                    "message": {"content": "I will answer without creating Work."},
+                    "finish_reason": "stop"
+                }],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 4}
+            }),
+        )
+        .await;
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-work-establishment-retry".to_string(),
+            session_id.to_string(),
+        )
+        .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+            true, false,
+        ))
+        .with_test_inference_ledger(inference_ledger.clone())
+        .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
+        .build();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        host.set_event_tx(tx);
+        let mut state = create_durable_execution_test_state(session_id);
+        state.message = "complete several independently verifiable outcomes".to_string();
+        state.user_intent = state.message.clone();
+        state.turn_intent = Some(
+            astra_config::user_profile::TurnIntent::default()
+                .with_work_lifecycle(astra_config::user_profile::WorkLifecycleIntent::Required),
+        );
+
+        let error = match host.execute_turn(&mut state).await {
+            Ok(_) => panic!("a text-only provider cannot bypass required canonical Work"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind, astra_core::ErrorKind::ContractViolation);
+        assert!(error.message.contains("canonical Work was required"));
+
+        let requests = requests.lock().await.clone();
+        assert_eq!(requests.len(), 2, "the corrective boundary is exactly once");
+        for request in &requests {
+            assert_eq!(
+                request["tool_choice"], "auto",
+                "the generic OpenAI-compatible request must not assume named tool forcing support"
+            );
+            assert!(
+                request["tools"].as_array().is_some_and(|tools| tools
+                    .iter()
+                    .any(|tool| { tool_schema_name(tool) == Some("start_work") })),
+                "the normal provider surface still advertises the canonical entrypoint"
+            );
+        }
+        assert!(
+            requests[1]
+                .to_string()
+                .contains("canonical_work_establishment_retry.v1"),
+            "only the retry request receives the structured runtime correction"
+        );
+        let mut emitted = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            emitted.push(event);
+        }
+        assert!(
+            emitted.iter().all(|event| {
+                !matches!(
+                    event.get("type").and_then(Value::as_str),
+                    Some("text_delta" | "reasoning_delta" | "reasoning_done")
+                )
+            }),
+            "unaccepted provider prose must not leak before the Work lifecycle exists: {emitted:?}"
+        );
+        inference_ledger.assert_quiescent();
+        server.abort();
     }
 
     #[tokio::test]
@@ -10835,12 +24005,13 @@ mod tests {
             "function": {"name": "read_file", "arguments": r#"{"path":"a.rs"}"#}
         })];
 
+        let action_context = test_edge_action_context("u-edge-meta", "test-run").await;
         let results = host
-            .deliver_edge_tools_via_ledger("test-run", "test-chain", &tool_calls)
+            .deliver_edge_tools_via_ledger("test-run", "test-chain", &tool_calls, &action_context)
             .await;
 
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].status, "ok");
+        assert_eq!(results.results.len(), 1);
+        assert_eq!(results.results[0].status, "ok");
         let end = host
             .emitted_events
             .iter()
@@ -10857,7 +24028,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cached_edge_tool_result_does_not_emit_an_unowned_request() {
+    async fn server_delegates_edge_read_freshness_to_client() {
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
             mock_encryptor(),
@@ -10866,6 +24037,7 @@ mod tests {
         )
         .with_execution_binding_snapshot(edge_runtime_snapshot())
         .build();
+        install_in_memory_interaction_sink(&mut host);
         host.install_runtime_tool_schemas(
             vec![json!({
                 "type": "function",
@@ -10878,37 +24050,157 @@ mod tests {
             Default::default(),
         );
         let args = json!({"path": "cached.rs"});
-        host.tool_result_cache
-            .lock()
-            .expect("tool result cache")
-            .record(
-                astra_turn_core::tool_result_dedup::CallSignature::from_args("read_file", &args),
-                "cached contents".to_string(),
-            );
+        host.edge_callback_ledger.lock().await.insert(
+            tool_callback_key("u-edge-cache", "s-edge-cache", "read-current"),
+            json!({"body": {
+                "request_id": "read-current",
+                "status": "completed",
+                "output": "current contents"
+            }}),
+        );
         let tool_calls = vec![json!({
-            "id": "cached-read",
+            "id": "read-current",
             "type": "function",
             "function": {"name": "read_file", "arguments": args.to_string()}
         })];
 
+        let action_context = test_edge_action_context("u-edge-cache", "test-run").await;
         let results = host
-            .deliver_edge_tools_via_ledger("test-run", "test-chain", &tool_calls)
+            .deliver_edge_tools_via_ledger("test-run", "test-chain", &tool_calls, &action_context)
             .await;
 
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].output, "cached contents");
+        assert_eq!(results.results.len(), 1);
+        assert_eq!(results.results[0].output, "current contents");
         assert!(
             host.emitted_events
                 .iter()
-                .all(|event| { event.get("type").and_then(Value::as_str) != Some("tool_request") })
+                .any(|event| event.get("type").and_then(Value::as_str) == Some("tool_request")),
+            "the resource owner must receive the read so it can validate freshness"
         );
-        assert!(
-            !astra_turn_core::edge_ledger::ledger_entry_is_expected(
-                &host.edge_callback_ledger,
-                &tool_callback_key("u-edge-cache", "s-edge-cache", "cached-read"),
+    }
+
+    #[tokio::test]
+    async fn edge_read_after_successful_mutation_observes_resource_owner_result() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-edge-mutation-cache".to_string(),
+            "s-edge-mutation-cache".to_string(),
+        )
+        .with_interaction_mode(Some(RequestedTurnInteractionMode::Prompt))
+        .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
+        .build();
+        install_in_memory_interaction_sink(&mut host);
+        host.approval_audit_context = Some(test_approval_audit_context(
+            "u-edge-mutation-cache",
+            "s-edge-mutation-cache",
+        ));
+        host.install_runtime_tool_schemas(
+            vec![
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read file contents",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                }),
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": "apply_patch",
+                        "description": "Apply a workspace patch",
+                        "parameters": {"type": "object", "properties": {}}
+                    }
+                }),
+            ],
+            Default::default(),
+        );
+        host.valid_tools.insert("apply_patch".to_string());
+
+        let read_args = json!({"path": "cached.rs"});
+        host.edge_callback_ledger.lock().await.insert(
+            tool_callback_key("u-edge-mutation-cache", "s-edge-mutation-cache", "read-old"),
+            json!({"body": {
+                "request_id": "read-old",
+                "status": "completed",
+                "output": "old contents"
+            }}),
+        );
+        let old_read = json!({
+            "id": "read-old",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": read_args.to_string()
+            }
+        });
+        let action_context = test_edge_action_context("u-edge-mutation-cache", "test-run").await;
+        let old_result = host
+            .deliver_edge_tools_via_ledger("test-run", "test-chain", &[old_read], &action_context)
+            .await;
+        assert_eq!(old_result.results[0].output, "old contents");
+
+        let mutation = json!({
+            "id": "mutate-1",
+            "type": "function",
+            "function": {
+                "name": "apply_patch",
+                "arguments": json!({
+                    "patch": "*** Begin Patch\n*** End Patch"
+                }).to_string()
+            }
+        });
+        host.edge_callback_ledger.lock().await.insert(
+            test_approval_key("u-edge-mutation-cache", "s-edge-mutation-cache", "mutate-1"),
+            approval_allow_entry("s-edge-mutation-cache", "mutate-1"),
+        );
+        host.edge_callback_ledger.lock().await.insert(
+            tool_callback_key("u-edge-mutation-cache", "s-edge-mutation-cache", "mutate-1"),
+            json!({"body": {
+                "request_id": "mutate-1",
+                "status": "completed",
+                "output": "patch applied"
+            }}),
+        );
+
+        let mutation_result = host
+            .deliver_edge_tools_via_ledger("test-run", "test-chain", &[mutation], &action_context)
+            .await;
+        assert_eq!(
+            mutation_result.results[0].status, "completed",
+            "{}",
+            mutation_result.results[0].output
+        );
+
+        host.edge_callback_ledger.lock().await.insert(
+            tool_callback_key(
+                "u-edge-mutation-cache",
+                "s-edge-mutation-cache",
+                "read-fresh",
             ),
-            "a cache hit must not authorize a callback nobody will consume"
+            json!({"body": {
+                "request_id": "read-fresh",
+                "status": "completed",
+                "output": "new contents"
+            }}),
         );
+        let fresh_read = json!({
+            "id": "read-fresh",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": read_args.to_string()
+            }
+        });
+        let read_result = host
+            .deliver_edge_tools_via_ledger("test-run", "test-chain", &[fresh_read], &action_context)
+            .await;
+        assert_eq!(read_result.results[0].output, "new contents");
+        assert!(host.emitted_events.iter().any(|event| {
+            event.get("type").and_then(Value::as_str) == Some("tool_request")
+                && event.get("request_id").and_then(Value::as_str) == Some("read-fresh")
+        }));
     }
 
     #[tokio::test]
@@ -10919,7 +24211,8 @@ mod tests {
             "u-mixed".to_string(),
             "s-mixed".to_string(),
         )
-        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_interaction_mode(Some(RequestedTurnInteractionMode::Prompt))
+        .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
         .build();
         install_in_memory_interaction_sink(&mut host);
         // Register read_file and write_file as valid tools so the edge ledger delivery path admits them.
@@ -11002,8 +24295,9 @@ mod tests {
             );
         });
 
+        let action_context = test_edge_action_context("u-mixed", "test-run").await;
         let results = host
-            .deliver_edge_tools_via_ledger("test-run", "test-chain", &tool_calls)
+            .deliver_edge_tools_via_ledger("test-run", "test-chain", &tool_calls, &action_context)
             .await;
 
         let request_ids: Vec<_> = host
@@ -11041,11 +24335,11 @@ mod tests {
         assert!(r2_request > w1_end);
         assert!(r2_request < w2_request);
 
-        assert_eq!(results.len(), 4);
-        assert_eq!(results[0].request_id, "r1");
-        assert_eq!(results[1].request_id, "w1");
-        assert_eq!(results[2].request_id, "r2");
-        assert_eq!(results[3].request_id, "w2");
+        assert_eq!(results.results.len(), 4);
+        assert_eq!(results.results[0].request_id, "r1");
+        assert_eq!(results.results[1].request_id, "w1");
+        assert_eq!(results.results[2].request_id, "r2");
+        assert_eq!(results.results[3].request_id, "w2");
     }
 
     // ── Mock host tests for agentic loop integration ───────────────────────
@@ -11056,6 +24350,17 @@ mod tests {
         turns: Vec<HostTurnResult>,
         valid_tools: HashSet<String>,
         emitted: Vec<String>,
+    }
+
+    fn edge_runtime_environment_fields() -> serde_json::Map<String, Value> {
+        let registry = astra_runtime_env::ToolRegistry::builtins();
+        let advertisement = astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+            astra_runtime_env::RunBinding::edge_developer("/workspace/project", &registry),
+        );
+        serde_json::Map::from_iter([(
+            "runtime_environment_advertisement".to_string(),
+            serde_json::to_value(advertisement).expect("serialize advertisement"),
+        )])
     }
 
     impl MockServerHost {
@@ -11083,19 +24388,45 @@ mod tests {
             prompt: u64,
             completion: u64,
         ) -> Self {
+            let tool_calls = tools
+                .iter()
+                .map(|tool| {
+                    json!({
+                        "id": tool.request_id,
+                        "type": "function",
+                        "function": {
+                            "name": tool.tool,
+                            "arguments": tool.args.to_string(),
+                        }
+                    })
+                })
+                .collect();
             Self {
-                turns: vec![HostTurnResult {
-                    accum: ChatTurnSseAccum {
-                        has_tool_calls: false,
-                        has_usage: true,
-                        prompt_tokens: prompt,
-                        completion_tokens: completion,
-                        ..ChatTurnSseAccum::default()
+                turns: vec![
+                    HostTurnResult {
+                        accum: ChatTurnSseAccum {
+                            has_tool_calls: !tools.is_empty(),
+                            has_usage: true,
+                            prompt_tokens: prompt,
+                            completion_tokens: completion,
+                            tool_calls,
+                            ..ChatTurnSseAccum::default()
+                        },
+                        ttft_ms: Some(30),
+                        edge_tool_round: tools,
+                        error_kind: None,
                     },
-                    ttft_ms: Some(30),
-                    edge_tool_round: tools,
-                    error_kind: None,
-                }],
+                    HostTurnResult {
+                        accum: ChatTurnSseAccum {
+                            full_text: "Tool response acknowledged.".to_string(),
+                            has_usage: true,
+                            ..ChatTurnSseAccum::default()
+                        },
+                        ttft_ms: Some(30),
+                        edge_tool_round: Vec::new(),
+                        error_kind: None,
+                    },
+                ],
                 valid_tools: HashSet::from(["bash".to_string(), "read_file".to_string()]),
                 emitted: Vec::new(),
             }
@@ -11145,6 +24476,7 @@ mod tests {
             tool_results: Vec::new(),
             current_session_id: None,
             current_run_id: None,
+            current_run_owner_generation: None,
             inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
             context_manifest_pool: None,
             context_manifest_user_id: None,
@@ -11160,14 +24492,13 @@ mod tests {
             total_cache_creation: 0,
             total_tool_calls: 0,
             total_observation_tool_calls: 0,
+            tool_ledger_receipt: Default::default(),
             has_any_usage: false,
             max_turns: 10,
             remaining_turns: 10,
             last_finish_reason: None,
-            turn_budget_hint_emitted_90: false,
-            turn_budget_hint_emitted_50: false,
-            turn_budget_hint_emitted_20: false,
             agentic_turn_budget: TaskExecutionProfile::default().agentic_turn_budget,
+            budget_is_explicit: false,
             budget_policy: None,
             current_round_index: 0,
             llm_rounds_completed: 0,
@@ -11180,7 +24511,6 @@ mod tests {
             idempotency_cache: InMemoryIdempotencyCache::new(),
             semantic_dedup: SemanticDedup::new(0.75),
             observation_journal: Default::default(),
-            observation_store: None,
             call_counts: HashMap::new(),
             max_identical_tool_calls: astra_config::runtime_config::RuntimeConfig::load()
                 .tool_selection
@@ -11196,6 +24526,7 @@ mod tests {
             messaging: Default::default(),
             user_intents: Default::default(),
             error_recovery: Default::default(),
+            provider_adaptation: Default::default(),
             run_control: None,
             pipeline_session: Some(astra_turn_core::pipeline_session::PipelineSession::new(
                 astra_turn_core::pipeline_config::PipelineConfig::default(),
@@ -11213,7 +24544,7 @@ mod tests {
             delegation_engine: None,
             delegations_this_turn: 0,
             delegation_chain: Vec::new(),
-            self_agent_id: "orchestrator".to_string(),
+            self_agent_id: "main".to_string(),
             project_context: None,
             checkpoint_gate: None,
             last_llm_context_manifest_trace: None,
@@ -11232,9 +24563,7 @@ mod tests {
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: CompactionTier::Normal,
             skill_produced_output: false,
-            max_cumulative_tokens: 0,
             thinking: astra_turn_core::thinking_config::ThinkingConfig::Off,
-            recent_file_reads: Vec::new(),
             permission_context: None,
             permission_handler: None,
             tactical_adapter: None,
@@ -11251,8 +24580,8 @@ mod tests {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
-            bridge_turn_chain_id: None,
-            bridge_user_query_event_id: None,
+            canonical_turn_chain_id: None,
+            root_user_query_event_id: None,
             turn_event_buffer: None,
             harness: crate::turn::harness_adapter::HarnessSlot::empty(),
         }
@@ -11262,6 +24591,7 @@ mod tests {
         let mut state = create_test_state();
         state.current_session_id = Some(session_id.to_string());
         state.current_run_id = Some(format!("test-run-{session_id}"));
+        state.current_run_owner_generation = Some(0);
         state
     }
 
@@ -11509,6 +24839,975 @@ mod tests {
     }
 
     #[test]
+    fn supported_text_only_wire_keeps_schema_prefix_but_clears_execution_authority() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        let mut state = create_test_state();
+        state.hooks.completion_settlement.text_only = true;
+
+        let restricted = host.compute_effective_restricted(&mut state, true, true);
+        let wire_tools = host.filtered_runtime_ready_turn_tools(&restricted, &state);
+        assert!(
+            !wire_tools.is_empty(),
+            "a provider-level no-tool choice must not destroy the stable schema prefix"
+        );
+        assert!(
+            host.deferred_manifest_for_wire_tools(&wire_tools, None, None, &state)
+                .is_some(),
+            "text-only settlement must retain the stable deferred manifest prefix"
+        );
+
+        host.sync_valid_tools_to_wire_surface_for_state(&wire_tools, &state);
+        assert!(
+            host.valid_tools.is_empty(),
+            "text-only settlement must retain zero runtime execution authority"
+        );
+        assert!(
+            host.current_deferred_tool_names.is_empty(),
+            "text-only settlement cannot activate a deferred capability"
+        );
+    }
+
+    #[test]
+    fn text_only_settlement_reuses_exact_preceding_schema_surface() {
+        let preceding = vec![
+            json!({"type": "function", "function": {"name": "web_fetch"}}),
+            json!({"type": "function", "function": {"name": "settle_work_item"}}),
+        ];
+        let selected = settlement_wire_tool_schemas(true, false, true, &preceding, &[])
+            .expect("text-only settlement owns wire schema selection");
+
+        assert_eq!(selected, preceding);
+        assert_eq!(
+            provider_context_tool_surface(&Some(selected.clone()), &[]),
+            preceding,
+            "the prompt contract must be derived from the preserved wire surface"
+        );
+        assert_eq!(
+            provider_context_tool_surface(&None, &preceding),
+            preceding,
+            "ordinary rounds derive prompt context from runtime-ready tools"
+        );
+        assert_eq!(
+            settlement_wire_tool_schemas(true, false, false, &preceding, &[]),
+            Some(Vec::new()),
+            "providers without a typed no-tool choice must fail closed"
+        );
+        assert_eq!(
+            settlement_wire_tool_schemas(false, false, true, &preceding, &[]),
+            Some(preceding.clone()),
+            "the immediate final-synthesis boundary must preserve strict-history wire bytes"
+        );
+        assert_eq!(
+            settlement_wire_tool_schemas(false, false, false, &preceding, &[]),
+            None,
+            "ordinary rounds retain lifecycle-aware schema projection"
+        );
+    }
+
+    #[test]
+    fn preserved_final_synthesis_wire_surface_does_not_widen_runtime_authority() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .build();
+        let preceding = vec![
+            json!({"type": "function", "function": {"name": "read_file"}}),
+            json!({"type": "function", "function": {"name": "settle_work_item"}}),
+        ];
+        let current = vec![json!({
+            "type": "function",
+            "function": {"name": "read_file"}
+        })];
+
+        host.sync_valid_tools_to_visible(&preceding);
+        host.retain_valid_tools_for_authority_surface(&current);
+
+        assert!(host.valid_tools.contains("read_file"));
+        assert!(!host.valid_tools.contains("settle_work_item"));
+    }
+
+    #[test]
+    fn work_settlement_reuses_exact_preceding_wire_surface() {
+        let preceding = vec![
+            json!({"type": "function", "function": {"name": "bash"}}),
+            json!({"type": "function", "function": {"name": "settle_work_item"}}),
+        ];
+        let fallback = vec![json!({"type": "function", "function": {"name": "settle_work_item"}})];
+
+        let selected = settlement_wire_tool_schemas(false, true, true, &preceding, &fallback)
+            .expect("Work settlement owns wire schema selection");
+
+        assert_eq!(selected, preceding);
+        assert_eq!(
+            selected
+                .iter()
+                .filter_map(tool_schema_name)
+                .collect::<Vec<_>>(),
+            vec!["bash", "settle_work_item"],
+            "provider declaration stays stable even though execution authority narrows"
+        );
+    }
+
+    #[test]
+    fn work_settlement_without_sticky_uses_current_ready_surface() {
+        let preceding = Vec::new();
+        let fallback = vec![json!({"type": "function", "function": {"name": "settle_work_item"}})];
+
+        let selected = settlement_wire_tool_schemas(false, true, true, &preceding, &fallback)
+            .expect("Work settlement fallback must remain executable");
+
+        assert_eq!(selected, fallback);
+        assert!(
+            selected
+                .iter()
+                .any(|schema| { tool_schema_name(schema) == Some("settle_work_item") })
+        );
+    }
+
+    #[test]
+    fn work_settlement_admission_executes_only_settle_work_item() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-settlement".to_string(),
+            "s-work-settlement".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        let mut state = create_test_state();
+        state.hooks.completion_settlement.work_settlement_only = true;
+
+        let calls = vec![
+            json!({
+                "id": "call-bash",
+                "type": "function",
+                "function": {"name": "bash", "arguments": "{}"}
+            }),
+            json!({
+                "id": "call-settle",
+                "type": "function",
+                "function": {"name": "settle_work_item", "arguments": "{}"}
+            }),
+        ];
+        let admitted = host.admit_terminal_tool_calls(&state, &calls, Some("tool_calls"));
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(
+            astra_turn_core::tool::args::shape::tool_call_name(&admitted[0]),
+            Some("settle_work_item")
+        );
+
+        let admission = AgenticLoopHost::admit_tool_calls(&mut host, &calls, Some("tool_calls"));
+        assert_eq!(admission.admitted.len(), 1);
+        let rejected = admission
+            .rejected
+            .iter()
+            .find(|call| call.id == "call-bash")
+            .expect("non-settlement call must be rejected before execution");
+        let result: Value = serde_json::from_str(&rejected.result).expect("structured rejection");
+        assert_eq!(result["error_kind"], "work_settlement_only");
+        assert_eq!(result["retryable"], true);
+
+        let wire_tools = vec![
+            json!({"type": "function", "function": {"name": "bash"}}),
+            json!({"type": "function", "function": {"name": "settle_work_item"}}),
+        ];
+        host.sync_valid_tools_to_wire_surface_for_state(&wire_tools, &state);
+        assert_eq!(
+            host.valid_tools,
+            HashSet::from(["settle_work_item".to_string()]),
+            "runtime execution authority must be narrower than the stable provider surface"
+        );
+        assert!(host.current_deferred_tool_names.is_empty());
+    }
+
+    #[test]
+    fn fanout_pagination_admission_is_bound_to_exact_foreground_group() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-fanout-page".to_string(),
+            "s-fanout-page".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        let mut state = create_test_state();
+        state
+            .hooks
+            .completion_settlement
+            .foreground_fanout_pagination = Some(
+            crate::turn::agentic_loop::host::ForegroundFanoutPagination {
+                group_id: "group-current".into(),
+                target_count: 2,
+                pending_slots: std::collections::BTreeMap::from([(0, 4096), (1, 2048)]),
+            },
+        );
+        let calls = vec![
+            json!({
+                "id":"read-stale","type":"function",
+                "function":{"name":"read_file","arguments":"{}"}
+            }),
+            json!({
+                "id":"other-group","type":"function",
+                "function":{"name":"agent_fanout","arguments":"{\"action\":\"get_results\",\"group_id\":\"group-old\"}"}
+            }),
+            json!({
+                "id":"current-page","type":"function",
+                "function":{"name":"agent_fanout","arguments":"{\"action\":\"get_results\",\"group_id\":\" group-current \",\"slot_index\":0,\"offset\":4096}"}
+            }),
+            json!({
+                "id":"wrong-offset","type":"function",
+                "function":{"name":"agent_fanout","arguments":"{\"action\":\"get_results\",\"group_id\":\"group-current\",\"slot_index\":1,\"offset\":4096}"}
+            }),
+        ];
+
+        let admitted = host.admit_terminal_tool_calls(&state, &calls, Some("tool_calls"));
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0]["id"], "current-page");
+        let admission = AgenticLoopHost::admit_tool_calls(&mut host, &calls, Some("tool_calls"));
+        assert_eq!(admission.rejected.len(), 3);
+        assert!(admission.rejected.iter().all(|rejection| {
+            serde_json::from_str::<Value>(&rejection.result)
+                .is_ok_and(|value| value["error_kind"] == "fanout_result_pagination_pending")
+        }));
+    }
+
+    fn validation_record(command: &str, ok: bool) -> ToolCallRecord {
+        ToolCallRecord {
+            name: "bash".to_string(),
+            ok,
+            args_full: Some(json!({"command": command}).to_string()),
+            result_class: Some(if ok { "success" } else { "test_failure" }.to_string()),
+            exit_semantics: Some(if ok { "success" } else { "domain_negative" }.to_string()),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        }
+    }
+
+    fn write_record(path: &str) -> ToolCallRecord {
+        ToolCallRecord {
+            name: "write_file".to_string(),
+            ok: true,
+            args_full: Some(json!({"path": path, "content": "fixed"}).to_string()),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn delivered_work_cannot_override_an_unresolved_exact_validation_failure() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-validation".to_string(),
+            "s-work-validation".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        let mut state = create_test_state();
+        state.hooks.completion_settlement.work_settlement_only = true;
+        state
+            .stall
+            .tool_call_records
+            .push(validation_record("python3 -m pytest tests", false));
+        let delivered = json!({
+            "id": "call-delivered",
+            "type": "function",
+            "function": {
+                "name": "settle_work_item",
+                "arguments": r#"{"outcome":"delivered","summary":"done"}"#
+            }
+        });
+
+        assert!(
+            host.admit_terminal_tool_calls_with_completion(
+                &mut state,
+                std::slice::from_ref(&delivered),
+                Some("tool_calls"),
+            )
+            .is_empty()
+        );
+        let admission = AgenticLoopHost::admit_tool_calls(
+            &mut host,
+            std::slice::from_ref(&delivered),
+            Some("tool_calls"),
+        );
+        let rejected = admission.rejected.first().expect("delivered is rejected");
+        let result: Value = serde_json::from_str(&rejected.result).expect("typed rejection");
+        assert_eq!(result["error_kind"], "unresolved_work_validation");
+        assert_eq!(result["retryable"], false);
+        assert_eq!(result["unresolved_validation_operations"], 1);
+        assert!(state.hooks.completion_settlement.work_settlement_only);
+
+        let failed = json!({
+            "id": "call-failed",
+            "type": "function",
+            "function": {
+                "name": "settle_work_item",
+                "arguments": r#"{"outcome":"failed","summary":"validation failed"}"#
+            }
+        });
+        assert_eq!(
+            host.admit_terminal_tool_calls_with_completion(
+                &mut state,
+                std::slice::from_ref(&failed),
+                Some("tool_calls"),
+            ),
+            vec![failed]
+        );
+    }
+
+    #[test]
+    fn delivered_work_requires_positive_validation_not_a_completed_empty_result() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-validation-domain-result".to_string(),
+            "s-work-validation-domain-result".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        let mut state = create_test_state();
+        let mut validation = validation_record("python -m pytest tests", true);
+        validation.result_class = Some("empty_result".to_string());
+        validation.exit_semantics = Some("empty_result".to_string());
+        state.stall.tool_call_records.push(validation);
+        let delivered = json!({
+            "id": "call-delivered-domain-result",
+            "type": "function",
+            "function": {
+                "name": "settle_work_item",
+                "arguments": r#"{"outcome":"delivered","summary":"done"}"#
+            }
+        });
+
+        assert!(
+            host.admit_terminal_tool_calls_with_completion(
+                &mut state,
+                std::slice::from_ref(&delivered),
+                Some("tool_calls"),
+            )
+            .is_empty(),
+            "a completed shell invocation is not positive proof that its validator passed"
+        );
+        let admission = host
+            .pending_tool_call_admission
+            .as_ref()
+            .expect("rejected delivery admission");
+        assert_eq!(admission.rejected.len(), 1);
+        assert!(
+            admission.rejected[0]
+                .result
+                .contains("unresolved_work_validation")
+        );
+    }
+
+    #[test]
+    fn exact_validation_recovery_or_a_new_work_attempt_allows_delivery() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-validation-recovery".to_string(),
+            "s-work-validation-recovery".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        let delivered = json!({
+            "id": "call-delivered",
+            "type": "function",
+            "function": {
+                "name": "settle_work_item",
+                "arguments": r#"{"outcome":"delivered","summary":"verified"}"#
+            }
+        });
+
+        let mut ordinary_failure = create_test_state();
+        ordinary_failure
+            .stall
+            .tool_call_records
+            .push(ToolCallRecord {
+                name: "read_file".to_string(),
+                ok: false,
+                args_full: Some(json!({"path": "missing.txt"}).to_string()),
+                result_class: Some("execution_error".to_string()),
+                disposition: Some(ToolCallDisposition::Executed),
+                ..Default::default()
+            });
+        assert_eq!(
+            host.admit_terminal_tool_calls_with_completion(
+                &mut ordinary_failure,
+                std::slice::from_ref(&delivered),
+                Some("tool_calls"),
+            ),
+            vec![delivered.clone()],
+            "ordinary tool failures are not validation authority"
+        );
+
+        let mut repaired_with_broader_validation = create_test_state();
+        repaired_with_broader_validation
+            .stall
+            .tool_call_records
+            .push(validation_record("cargo test -p focused", false));
+        repaired_with_broader_validation
+            .stall
+            .tool_call_records
+            .push(write_record("src/lib.rs"));
+        repaired_with_broader_validation
+            .stall
+            .tool_call_records
+            .push(validation_record("cargo test --workspace", true));
+        assert!(
+            host.admit_terminal_tool_calls_with_completion(
+                &mut repaired_with_broader_validation,
+                std::slice::from_ref(&delivered),
+                Some("tool_calls"),
+            )
+            .is_empty(),
+            "a different validation may add evidence after a repair, but cannot waive the failed operation"
+        );
+
+        let mut recovered = create_test_state();
+        recovered
+            .stall
+            .tool_call_records
+            .push(validation_record("cargo test --workspace", false));
+        recovered
+            .stall
+            .tool_call_records
+            .push(validation_record("cargo test --workspace", true));
+        assert_eq!(
+            host.admit_terminal_tool_calls_with_completion(
+                &mut recovered,
+                std::slice::from_ref(&delivered),
+                Some("tool_calls"),
+            ),
+            vec![delivered.clone()]
+        );
+
+        let mut next_attempt = create_test_state();
+        next_attempt
+            .stall
+            .tool_call_records
+            .push(validation_record("cargo test --workspace", false));
+        next_attempt.stall.tool_call_records.push(ToolCallRecord {
+            name: "settle_work_item".to_string(),
+            ok: true,
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+        assert_eq!(
+            host.admit_terminal_tool_calls_with_completion(
+                &mut next_attempt,
+                std::slice::from_ref(&delivered),
+                Some("tool_calls"),
+            ),
+            vec![delivered]
+        );
+
+        let delivered = json!({
+            "id": "call-delivered-after-start",
+            "type": "function",
+            "function": {
+                "name": "settle_work_item",
+                "arguments": r#"{"outcome":"delivered","summary":"verified"}"#
+            }
+        });
+        let mut pre_start_failure = create_test_state();
+        pre_start_failure
+            .stall
+            .tool_call_records
+            .push(validation_record("cargo test --workspace", false));
+        pre_start_failure
+            .stall
+            .tool_call_records
+            .push(ToolCallRecord {
+                name: "start_work".to_string(),
+                ok: true,
+                result_full: Some(
+                    json!({
+                        "status": "started",
+                        "initial_task": {
+                            "status": "assigned",
+                            "attempt_id": "fresh-initial-attempt",
+                            "execution": "primary_session"
+                        }
+                    })
+                    .to_string(),
+                ),
+                disposition: Some(ToolCallDisposition::Executed),
+                ..Default::default()
+            });
+        assert_eq!(
+            host.admit_terminal_tool_calls_with_completion(
+                &mut pre_start_failure,
+                std::slice::from_ref(&delivered),
+                Some("tool_calls"),
+            ),
+            vec![delivered],
+            "validation before Work acquisition is outside the attempt"
+        );
+    }
+
+    #[test]
+    fn delivered_work_waits_for_a_same_batch_validation_outcome() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-validation-batch".to_string(),
+            "s-work-validation-batch".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        let mut state = create_test_state();
+        let validation = json!({
+            "id": "call-validation",
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": r#"{"command":"cargo test --workspace"}"#
+            }
+        });
+        let delivered = json!({
+            "id": "call-delivered",
+            "type": "function",
+            "function": {
+                "name": "settle_work_item",
+                "arguments": r#"{"outcome":"delivered","summary":"verified"}"#
+            }
+        });
+
+        assert_eq!(
+            host.admit_terminal_tool_calls_with_completion(
+                &mut state,
+                &[validation.clone(), delivered.clone()],
+                Some("tool_calls"),
+            ),
+            vec![validation]
+        );
+        let admission =
+            AgenticLoopHost::admit_tool_calls(&mut host, &[delivered], Some("tool_calls"));
+        let rejected = admission.rejected.first().expect("settlement is deferred");
+        let result: Value = serde_json::from_str(&rejected.result).expect("typed rejection");
+        assert_eq!(result["error_kind"], "work_validation_pending");
+        assert_eq!(result["retryable"], true);
+    }
+
+    #[test]
+    fn latest_failed_validation_blocks_even_after_an_earlier_success() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-validation-latest".to_string(),
+            "s-work-validation-latest".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        let mut state = create_test_state();
+        state
+            .stall
+            .tool_call_records
+            .push(validation_record("cargo test --workspace", true));
+        state
+            .stall
+            .tool_call_records
+            .push(validation_record("cargo test -p focused", false));
+        let delivered = json!({
+            "id": "call-delivered",
+            "type": "function",
+            "function": {
+                "name": "settle_work_item",
+                "arguments": r#"{"outcome":"delivered","summary":"verified"}"#
+            }
+        });
+
+        assert!(
+            host.admit_terminal_tool_calls_with_completion(
+                &mut state,
+                std::slice::from_ref(&delivered),
+                Some("tool_calls"),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn scheduler_resume_does_not_clear_the_same_attempt_validation_failure() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-validation-resume".to_string(),
+            "s-work-validation-resume".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        let mut state = create_test_state();
+        state
+            .stall
+            .tool_call_records
+            .push(validation_record("cargo test --workspace", false));
+        state.stall.tool_call_records.push(ToolCallRecord {
+            name: "run_next_work_item".to_string(),
+            ok: true,
+            result_full: Some(
+                json!({
+                    "status": "assigned",
+                    "attempt_id": "same-attempt",
+                    "execution": "primary_session_resumed"
+                })
+                .to_string(),
+            ),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        });
+        let delivered = json!({
+            "id": "call-delivered",
+            "type": "function",
+            "function": {
+                "name": "settle_work_item",
+                "arguments": r#"{"outcome":"delivered","summary":"verified"}"#
+            }
+        });
+
+        assert!(
+            host.admit_terminal_tool_calls_with_completion(
+                &mut state,
+                std::slice::from_ref(&delivered),
+                Some("tool_calls"),
+            )
+            .is_empty()
+        );
+
+        let mut fresh_assignment = create_test_state();
+        fresh_assignment
+            .stall
+            .tool_call_records
+            .push(validation_record("cargo test --workspace", false));
+        fresh_assignment
+            .stall
+            .tool_call_records
+            .push(ToolCallRecord {
+                name: "run_next_work_item".to_string(),
+                ok: true,
+                result_full: Some(
+                    json!({
+                        "status": "assigned",
+                        "attempt_id": "fresh-attempt",
+                        "execution": "primary_session"
+                    })
+                    .to_string(),
+                ),
+                disposition: Some(ToolCallDisposition::Executed),
+                ..Default::default()
+            });
+        assert_eq!(
+            host.admit_terminal_tool_calls_with_completion(
+                &mut fresh_assignment,
+                std::slice::from_ref(&delivered),
+                Some("tool_calls"),
+            ),
+            vec![delivered],
+            "a server-owned fresh assignment starts a new validation epoch"
+        );
+    }
+
+    #[test]
+    fn mutation_after_validation_requires_a_new_validation_receipt() {
+        let mut state = create_test_state();
+        state
+            .stall
+            .tool_call_records
+            .push(validation_record("cargo test --workspace", false));
+        state
+            .stall
+            .tool_call_records
+            .push(write_record("src/lib.rs"));
+        assert_eq!(
+            current_work_validation_state(&state),
+            WorkValidationState::Stale
+        );
+
+        let mut failed_writer = create_test_state();
+        failed_writer
+            .stall
+            .tool_call_records
+            .push(validation_record("cargo test --workspace", false));
+        let mut partial = write_record("src/lib.rs");
+        partial.ok = false;
+        partial.result_class = Some("execution_error".to_string());
+        failed_writer.stall.tool_call_records.push(partial);
+        assert_eq!(
+            current_work_validation_state(&failed_writer),
+            WorkValidationState::Stale,
+            "a partial bound writer cannot turn failed validation into no obligation"
+        );
+
+        let mut scratch = create_test_state();
+        scratch.hooks.workspace_root_hint = Some("/workspace".to_string());
+        scratch
+            .stall
+            .tool_call_records
+            .push(validation_record("cargo test --workspace", false));
+        scratch
+            .stall
+            .tool_call_records
+            .push(write_record("/tmp/diagnostic.txt"));
+        assert_eq!(
+            current_work_validation_state(&scratch),
+            WorkValidationState::Failed,
+            "external scratch is not a bound-workspace validation epoch"
+        );
+    }
+
+    #[test]
+    fn rejected_same_batch_validation_does_not_block_existing_work_settlement() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-work-validation-rejected-batch".to_string(),
+            "s-work-validation-rejected-batch".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        let mut state = create_test_state();
+        state.hooks.completion_settlement.work_settlement_only = true;
+        let validation = json!({
+            "id": "call-validation",
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": r#"{"command":"cargo test --workspace"}"#
+            }
+        });
+        let delivered = json!({
+            "id": "call-delivered",
+            "type": "function",
+            "function": {
+                "name": "settle_work_item",
+                "arguments": r#"{"outcome":"delivered","summary":"already verified"}"#
+            }
+        });
+
+        assert_eq!(
+            host.admit_terminal_tool_calls_with_completion(
+                &mut state,
+                &[validation, delivered.clone()],
+                Some("tool_calls"),
+            ),
+            vec![delivered]
+        );
+    }
+
+    #[test]
+    fn completion_action_admission_keeps_the_current_server_tool_boundary_executable() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-completion-action".to_string(),
+            "s-completion-action".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        let mut state = create_test_state();
+        state.hooks.completion_settlement.completion_action_window =
+            Some(crate::turn::agentic_loop::host::CompletionActionWindow {
+                action: crate::turn::agentic_loop::host::CompletionAction::PostMutationObservation,
+                attempts_remaining: 1,
+                mismatch_corrections_remaining: 1,
+                consumed: false,
+                matched: false,
+            });
+        let call = json!({
+            "id": "call-observe",
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": r#"{"command":"git diff --stat","mode":"verify"}"#
+            }
+        });
+
+        let admitted = host.admit_terminal_tool_calls_with_completion(
+            &mut state,
+            std::slice::from_ref(&call),
+            Some("tool_calls"),
+        );
+
+        assert_eq!(admitted, vec![call]);
+        assert!(
+            state
+                .hooks
+                .completion_settlement
+                .completion_action_window
+                .as_ref()
+                .is_some_and(|window| window.consumed && window.matched)
+        );
+        assert!(
+            !state.hooks.completion_settlement.text_only,
+            "server pre-admission must not cause the common tool phase to discard the same legal action"
+        );
+        assert!(!state.budget_wrapup_injected);
+    }
+
+    #[test]
+    fn server_completion_mismatch_is_correctable_and_pre_admission_is_idempotent() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-completion-correction".to_string(),
+            "s-completion-correction".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        let mut state = create_test_state();
+        state.hooks.completion_settlement.completion_action_window =
+            Some(crate::turn::agentic_loop::host::CompletionActionWindow {
+                action: crate::turn::agentic_loop::host::CompletionAction::PostMutationObservation,
+                attempts_remaining: 1,
+                mismatch_corrections_remaining: 1,
+                consumed: false,
+                matched: false,
+            });
+        let wrong = json!({
+            "id": "call-write-too-late",
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "arguments": r#"{"file_path":"src/out","content":"late"}"#
+            }
+        });
+        let max_before = state.max_turns;
+
+        assert!(
+            host.admit_terminal_tool_calls_with_completion(
+                &mut state,
+                std::slice::from_ref(&wrong),
+                Some("tool_calls"),
+            )
+            .is_empty()
+        );
+        let preprocessed = AgenticLoopHost::admit_tool_calls(
+            &mut host,
+            std::slice::from_ref(&wrong),
+            Some("tool_calls"),
+        );
+        let common = crate::turn::agentic_loop::execution_phase::apply_completion_action_admission(
+            &mut state,
+            preprocessed,
+            std::slice::from_ref(&wrong),
+        );
+        assert!(common.completion_action_applied);
+        assert_eq!(state.max_turns, max_before + 1);
+        let window = state
+            .hooks
+            .completion_settlement
+            .completion_action_window
+            .as_ref()
+            .expect("the correction keeps the action window open");
+        assert!(!window.consumed);
+        assert_eq!(window.mismatch_corrections_remaining, 0);
+
+        let corrected = json!({
+            "id": "call-observe-after-correction",
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": r#"{"command":"git diff --stat","mode":"verify"}"#
+            }
+        });
+        assert_eq!(
+            host.admit_terminal_tool_calls_with_completion(
+                &mut state,
+                std::slice::from_ref(&corrected),
+                Some("tool_calls"),
+            ),
+            vec![corrected.clone()]
+        );
+        let preprocessed = AgenticLoopHost::admit_tool_calls(
+            &mut host,
+            std::slice::from_ref(&corrected),
+            Some("tool_calls"),
+        );
+        let common = crate::turn::agentic_loop::execution_phase::apply_completion_action_admission(
+            &mut state,
+            preprocessed,
+            std::slice::from_ref(&corrected),
+        );
+        assert_eq!(common.admitted, vec![corrected]);
+        assert!(
+            state
+                .hooks
+                .completion_settlement
+                .completion_action_window
+                .as_ref()
+                .is_some_and(|window| window.consumed && window.matched)
+        );
+        assert_eq!(state.max_turns, max_before + 1);
+    }
+
+    #[test]
+    fn deferred_manifest_cache_is_scoped_to_turn_and_settlement_reuses_snapshot() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-deferred-cache".to_string(),
+            "s-deferred-cache".to_string(),
+        )
+        .build();
+        host.deferred_tools_block_cache = Some(DeferredToolsBlockCache {
+            session_turn: 4,
+            model_name: "deepseek-v4-flash".to_string(),
+            context_window: Some(800_000),
+            text: "<deferred-tools>cache-snapshot-sentinel</deferred-tools>".to_string(),
+        });
+
+        let mut state = create_test_state();
+        state.session_turn = 4;
+        state.hooks.completion_settlement.text_only = true;
+        let settlement = host.deferred_tools_block_for_wire_surface(
+            &[json!({"function": {"name": "settle_work_item"}})],
+            &state,
+            "deepseek-v4-flash",
+            Some(800_000),
+        );
+        assert_eq!(
+            settlement, "<deferred-tools>cache-snapshot-sentinel</deferred-tools>",
+            "settlement must reuse the admitted control-plane snapshot even when its intermediate wire projection differs"
+        );
+
+        state.session_turn = 5;
+        let next_turn = host.deferred_tools_block_for_wire_surface(
+            &[],
+            &state,
+            "deepseek-v4-flash",
+            Some(800_000),
+        );
+        assert_ne!(
+            next_turn, settlement,
+            "a prior turn's discovery manifest must never leak into a later user turn"
+        );
+    }
+
+    #[test]
     fn visible_turn_tools_filters_executor_service_unready_tools() {
         let dir = tempfile::TempDir::new().expect("temp workspace");
         let mut host = ServerAgenticLoopHostBuilder::new(
@@ -11550,7 +25849,7 @@ mod tests {
     }
 
     #[test]
-    fn visible_turn_tools_keep_turn_pipeline_tools_with_runtime_executor() {
+    fn visible_turn_tools_hide_unowned_turn_pipeline_tools() {
         let dir = tempfile::TempDir::new().expect("temp workspace");
         let mut host = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
@@ -11576,8 +25875,190 @@ mod tests {
         let visible = host.visible_turn_tools(&mut state);
         let names = astra_turn_core::tool::schema::tool_names_from_schemas(&visible);
         assert!(
-            names.contains(crate::turn::skill_tool::SKILL_TOOL_NAME),
-            "Astra-owned turn-pipeline tools must not depend on runtime executor readiness: {names:?}"
+            !names.contains(crate::turn::skill_tool::SKILL_TOOL_NAME),
+            "a schema without a server resolver or client delivery lane is not an executable promise: {names:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn admitted_client_owned_skill_uses_typed_result_ledger() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools_with_skill())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        install_in_memory_interaction_sink(&mut host);
+        let mut state = create_test_state();
+        state.current_run_id = Some("test-run".to_string());
+        state.canonical_turn_chain_id = Some("test-chain".to_string());
+        let action_context = test_edge_action_context("u", "test-run").await;
+        state.run_control = Some(action_context.run_control.clone());
+        state.current_run_owner_generation = Some(0);
+        let visible_names = astra_turn_core::tool::schema::tool_names_from_schemas(
+            &host.visible_turn_tools(&mut state),
+        );
+        assert!(
+            visible_names.contains(crate::turn::skill_tool::SKILL_TOOL_NAME),
+            "a client-declared skill is visible only after its result lane is bound"
+        );
+        let tool_calls = vec![json!({
+            "id": "call-skill",
+            "type": "function",
+            "function": {
+                "name": crate::turn::skill_tool::SKILL_TOOL_NAME,
+                "arguments": r#"{"skill_name":"analyze-session"}"#,
+            }
+        })];
+        assert!(host.has_client_tool_delivery_lane());
+        assert!(host.runtime_declared_tool_names.contains("skill"));
+        assert_eq!(
+            host.client_pipeline_tool_calls(&state, &tool_calls).len(),
+            1
+        );
+        host.edge_callback_ledger.lock().await.insert(
+            tool_callback_key("u", "s", "call-skill"),
+            json!({
+                "body": {
+                    "request_id": "call-skill",
+                    "status": "ok",
+                    "output": "local skill instructions"
+                }
+            }),
+        );
+
+        let delivered = host.handle_admitted_tool_calls(&state, &tool_calls).await;
+
+        assert_eq!(delivered.results.len(), 1);
+        assert_eq!(delivered.results[0].request_id, "call-skill");
+        assert!(
+            delivered.results[0]
+                .output
+                .contains("local skill instructions")
+        );
+        assert_eq!(
+            delivered.results[0]
+                .tool_result_fields
+                .as_ref()
+                .and_then(|fields| fields
+                    .get(crate::turn::headless_tool_pipeline::EDGE_RESULT_EXECUTION_ROUTE_FIELD))
+                .and_then(Value::as_str),
+            Some(crate::turn::headless_tool_pipeline::EDGE_RESULT_CLIENT_PIPELINE_ROUTE),
+            "execution ownership must be stamped by the server after ledger admission"
+        );
+        assert!(
+            host.emitted_events.iter().any(|event| {
+                event.get("type").and_then(Value::as_str) == Some("tool_request")
+                    && event.get("request_id").and_then(Value::as_str) == Some("call-skill")
+            }),
+            "a client-declared local skill must be delivered over the existing typed result lane"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn admitted_server_owned_skill_stays_inside_turn_pipeline() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools_with_skill())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        install_in_memory_interaction_sink(&mut host);
+        let mut state = create_test_state();
+        state.skills.resolver = Some(Arc::new(ServerSkillResolver));
+        let tool_calls = vec![json!({
+            "id": "call-skill",
+            "type": "function",
+            "function": {
+                "name": crate::turn::skill_tool::SKILL_TOOL_NAME,
+                "arguments": r#"{"skill_name":"server-skill"}"#,
+            }
+        })];
+
+        let delivered = host.handle_admitted_tool_calls(&state, &tool_calls).await;
+
+        assert!(delivered.results.is_empty());
+        assert!(
+            host.emitted_events
+                .iter()
+                .all(|event| { event.get("type").and_then(Value::as_str) != Some("tool_request") }),
+            "a server-resolved skill must not also be dispatched to the client"
+        );
+    }
+
+    #[test]
+    fn exact_client_skill_target_routes_without_disabling_server_resolver() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools_with_skill())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        install_in_memory_interaction_sink(&mut host);
+        let mut state = create_test_state();
+        state.skills.resolver = Some(Arc::new(ServerSkillResolver));
+        state
+            .skills
+            .client_pipeline_skill_names
+            .insert("project-review".to_string());
+        let client_call = json!({
+            "id": "call-client",
+            "type": "function",
+            "function": {
+                "name": crate::turn::skill_tool::SKILL_TOOL_NAME,
+                "arguments": r#"{"skill_name":"PROJECT-REVIEW"}"#
+            }
+        });
+        let server_call = json!({
+            "id": "call-server",
+            "type": "function",
+            "function": {
+                "name": crate::turn::skill_tool::SKILL_TOOL_NAME,
+                "arguments": r#"{"skill_name":"server-skill"}"#
+            }
+        });
+
+        let routed = host.client_pipeline_tool_calls(&state, &[client_call, server_call]);
+        assert_eq!(routed.len(), 1);
+        assert_eq!(routed[0]["id"], "call-client");
+    }
+
+    #[test]
+    fn client_cannot_self_assert_pipeline_execution_ownership() {
+        let host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .build();
+        let fields = host.edge_result_fields_with_runtime(
+            "call-spoofed",
+            "skill",
+            &json!({"skill_name": "project-review"}),
+            Some(Map::from_iter([(
+                crate::turn::headless_tool_pipeline::EDGE_RESULT_EXECUTION_ROUTE_FIELD.to_string(),
+                Value::String(
+                    crate::turn::headless_tool_pipeline::EDGE_RESULT_CLIENT_PIPELINE_ROUTE
+                        .to_string(),
+                ),
+            )])),
+        );
+
+        assert!(
+            !fields.contains_key(
+                crate::turn::headless_tool_pipeline::EDGE_RESULT_EXECUTION_ROUTE_FIELD
+            ),
+            "only post-ledger server selection may stamp pipeline ownership"
         );
     }
 
@@ -11630,6 +26111,7 @@ mod tests {
                 content: String::new(),
                 invoked_at_turn: 1,
                 reentry_count: 0,
+                execution_topology: None,
             },
         );
 
@@ -11698,9 +26180,10 @@ mod tests {
 
         assert!(visible_names.contains("web_fetch"));
         assert!(
-            visible_names.contains("web_search"),
-            "server-owned shared tools remain available when the selected runtime provider did not advertise that tool"
+            schema_names(&host.deferred_tool_schemas).contains("web_search"),
+            "server-owned shared tools remain discoverable when the selected runtime provider did not advertise that tool"
         );
+        assert!(visible_names.contains("web_search"));
     }
 
     #[test]
@@ -11778,6 +26261,34 @@ mod tests {
             names, sorted,
             "introspect admission entries must not depend on provider/schema assembly order"
         );
+    }
+
+    #[test]
+    fn tool_admission_snapshot_distinguishes_wire_visibility_from_route_readiness() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u-wire-surface".to_string(),
+            "s-wire-surface".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        host.last_turn_tool_schemas = vec![sample_edge_tools()[0].clone()];
+
+        let admission = host.tool_admission_snapshot_entries();
+        let bash = admission
+            .iter()
+            .find(|entry| entry.tool_name == "bash")
+            .expect("bash admission entry");
+        let read_file = admission
+            .iter()
+            .find(|entry| entry.tool_name == "read_file")
+            .expect("read_file admission entry");
+
+        assert!(bash.visible && read_file.visible, "both routes are ready");
+        assert_eq!(bash.provider_visible, Some(true));
+        assert_eq!(read_file.provider_visible, Some(false));
     }
 
     #[test]
@@ -11893,9 +26404,10 @@ mod tests {
             "disabled web_fetch@server-builtin must hide only that selected offer"
         );
         assert!(
-            server_names.contains("web_search"),
-            "unrelated server-routed shared tools remain visible"
+            schema_names(&server_only.deferred_tool_schemas).contains("web_search"),
+            "disabling one offer must preserve unrelated deferred server tools"
         );
+        assert!(server_names.contains("web_search"));
 
         let mut edge_selected = ServerAgenticLoopHostBuilder::new(
             mock_matrixone(),
@@ -11945,9 +26457,10 @@ mod tests {
             "hidden server offers must not remain callable through the internal valid_tools set"
         );
         assert!(
-            host.valid_tools.contains("web_search"),
-            "unrelated shared server tools should remain callable"
+            schema_names(&host.deferred_tool_schemas).contains("web_search"),
+            "unrelated shared server tools should remain discoverable"
         );
+        assert!(!host.valid_tools.contains("web_search"));
     }
 
     #[test]
@@ -12003,40 +26516,44 @@ mod tests {
         let policy =
             TurnInteractionPolicy::from_tool_schemas(TurnInteractionMode::Headless, &final_tools);
 
-        let expected_visible = vec![
+        for required in [
             "bash",
             "read_file",
             "introspect",
+            "notify",
             "reflect",
             "tool_search",
-            "session",
-            "compress_context",
-            "rollback_session_state",
-            "task_board",
-            "agent",
-            "agent_fanout",
-            "enter_plan_mode",
-            "exit_plan_mode",
-            "get_agent_info",
-            "notify",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-        let expected_evidence = vec![
-            "bash",
-            "read_file",
-            "agent",
-            "agent_fanout",
-            "get_agent_info",
-            "notify",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-        assert_eq!(policy.visible_tool_names, expected_visible);
-        assert_eq!(policy.observation_tool_names, expected_evidence);
+            "run_next_work_item",
+            "settle_work_item",
+            "start_work",
+        ] {
+            assert!(
+                policy
+                    .visible_tool_names
+                    .iter()
+                    .any(|name| name == required),
+                "headless policy must retain {required}: {:?}",
+                policy.visible_tool_names
+            );
+        }
+        assert!(policy.observation_tool_names.contains(&"bash".to_string()));
+        assert!(
+            policy
+                .observation_tool_names
+                .contains(&"read_file".to_string())
+        );
+        assert!(
+            policy
+                .observation_tool_names
+                .contains(&"notify".to_string())
+        );
         assert!(!policy.allow_ask_user);
+        assert!(
+            !policy
+                .visible_tool_names
+                .iter()
+                .any(|name| name == "ask_user")
+        );
     }
 
     #[test]
@@ -12066,41 +26583,49 @@ mod tests {
         let policy =
             TurnInteractionPolicy::from_tool_schemas(host.turn_interaction_mode(), &final_tools);
 
-        let expected_visible_without_ask_user = vec![
+        for required in [
             "bash",
             "read_file",
             "introspect",
+            "notify",
             "reflect",
             "tool_search",
-            "session",
-            "compress_context",
-            "rollback_session_state",
-            "task_board",
-            "agent",
-            "agent_fanout",
-            "enter_plan_mode",
-            "exit_plan_mode",
-            "get_agent_info",
-            "notify",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-        let expected_evidence = vec![
-            "bash",
-            "read_file",
-            "agent",
-            "agent_fanout",
-            "get_agent_info",
-            "notify",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-        let mut expected_visible = expected_visible_without_ask_user;
-        expected_visible.insert(2, "ask_user".to_string());
-        assert_eq!(policy.visible_tool_names, expected_visible);
-        assert_eq!(policy.observation_tool_names, expected_evidence);
+            "run_next_work_item",
+            "settle_work_item",
+            "start_work",
+        ] {
+            assert!(
+                policy
+                    .visible_tool_names
+                    .iter()
+                    .any(|name| name == required),
+                "interactive policy must retain {required}: {:?}",
+                policy.visible_tool_names
+            );
+        }
+        assert!(policy.observation_tool_names.contains(&"bash".to_string()));
+        assert!(
+            policy
+                .observation_tool_names
+                .contains(&"read_file".to_string())
+        );
+        assert!(
+            policy
+                .observation_tool_names
+                .contains(&"notify".to_string())
+        );
+        assert!(
+            policy
+                .visible_tool_names
+                .iter()
+                .any(|name| name == "ask_user")
+        );
+        assert!(
+            !policy
+                .observation_tool_names
+                .iter()
+                .any(|name| name == "ask_user")
+        );
         assert!(policy.allow_ask_user);
     }
 
@@ -12156,8 +26681,8 @@ mod tests {
             tool: "bash".to_string(),
             args: json!({"command": "echo hello"}),
             output: "hello\n".to_string(),
-            tool_result_fields: None,
-            status: "ok".to_string(),
+            tool_result_fields: Some(edge_runtime_environment_fields()),
+            status: "completed".to_string(),
             duration_ms: 10,
         }];
 
@@ -12168,8 +26693,53 @@ mod tests {
             .push(json!({"role": "user", "content": "run bash"}));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        // Should complete (tool round runs but no more turns to consume)
-        assert!(outcome.is_ok() || outcome.is_err());
+        assert!(outcome.is_ok(), "tool round should complete: {outcome:?}");
+        assert_eq!(state.final_text.trim(), "Tool response acknowledged.");
+        assert_eq!(state.total_tool_calls, 1);
+        assert!(
+            state
+                .messages
+                .iter()
+                .any(|message| message.to_string().contains("hello")),
+            "edge tool output must be added to the next-round messages: {:?}",
+            state.messages
+        );
+    }
+
+    #[cfg(feature = "bridge-e2e-hooks")]
+    #[tokio::test]
+    async fn bridge_mock_usage_is_counted_once_by_the_agentic_loop() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "usage-user".to_string(),
+            String::new(),
+        )
+        .with_test_llm_rounds(vec![json!({
+            "full_text": "usage accounted once",
+            "usage": {
+                "prompt_tokens": 606,
+                "completion_tokens": 404,
+                "prompt_tokens_details": {
+                    "cached_tokens": 202,
+                    "cache_creation_input_tokens": 303
+                }
+            }
+        })])
+        .build();
+        let mut state = create_test_state();
+
+        let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
+        assert!(outcome.is_ok(), "mock turn failed: {outcome:?}");
+        assert_eq!(state.total_prompt, 101);
+        assert_eq!(state.total_cache_read, 202);
+        assert_eq!(state.total_cache_creation, 303);
+        assert_eq!(state.total_completion, 404);
+        let last = state.recent_rounds.last().expect("physical mock round");
+        assert_eq!(last.prompt_tokens, 101);
+        assert_eq!(last.cache_read_tokens, 202);
+        assert_eq!(last.cache_creation_tokens, 303);
+        assert_eq!(last.completion_tokens, 404);
     }
 
     #[cfg(feature = "bridge-e2e-hooks")]
@@ -13055,7 +27625,8 @@ mod tests {
         let delivered = host
             .handle_admitted_tool_calls(&state, &admission.admitted)
             .await;
-        assert!(delivered.is_empty());
+        assert!(delivered.results.is_empty());
+        assert_eq!(delivered.control, AdmittedToolCallControl::Continue);
         assert!(host.edge_callback_ledger.lock().await.is_empty());
     }
 
@@ -13159,6 +27730,69 @@ mod tests {
             host.take_terminal_control_outcome(),
             None | Some(crate::turn::terminal_control::TerminalControlOutcome::Passthrough)
         ));
+        inference_ledger.assert_quiescent();
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+    async fn provisional_work_admission_keeps_reasoning_preview_live() {
+        let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+        let session_id = "session-work-admission-reasoning";
+        let inference_ledger = crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+        let delay = Duration::from_millis(750);
+        let (gateway_url, provider_completed, server) = spawn_delayed_streaming_gateway(
+            delay,
+            vec![json!({"choices":[{"delta":{"reasoning_content":"live work analysis"}}]})],
+            vec![
+                json!({"choices":[{"delta":{"content":"final answer"}}]}),
+                json!({
+                    "choices":[{"delta":{},"finish_reason":"stop"}],
+                    "usage":{"prompt_tokens":8,"completion_tokens":4}
+                }),
+            ],
+        )
+        .await;
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user-work-preview".to_string(),
+            session_id.to_string(),
+        )
+        .with_test_inference_ledger(inference_ledger.clone())
+        .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
+        .build();
+        host.pending_work_admission_judge = Some(tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Err(astra_services::TurnIntentJudgeError::Transport(
+                "unused test decision".to_string(),
+            ))
+        }));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        host.set_event_tx(tx);
+        let mut state = create_durable_execution_test_state(session_id);
+        state.message = "continue the task".to_string();
+        state.user_intent = state.message.clone();
+
+        let observe_reasoning = async {
+            loop {
+                let event = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+                    .await
+                    .expect("reasoning preview must arrive during provider inference")
+                    .expect("event channel remains open");
+                if event.get("type").and_then(Value::as_str) == Some("reasoning_delta") {
+                    assert_eq!(event["content"].as_str(), Some("live work analysis"));
+                    assert!(
+                        !provider_completed.load(Ordering::SeqCst),
+                        "Work admission buffered reasoning until provider completion"
+                    );
+                    break;
+                }
+            }
+        };
+
+        let (result, ()) = tokio::join!(host.execute_turn(&mut state), observe_reasoning);
+        result.expect("provisional Work turn");
         inference_ledger.assert_quiescent();
         server.abort();
     }
@@ -13597,6 +28231,28 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.kind, astra_core::ErrorKind::ServerError);
+        let phase_outcomes: Vec<_> = host
+            .take_emitted_events()
+            .into_iter()
+            .filter(|event| {
+                event.get("type").and_then(Value::as_str)
+                    == Some(astra_server_types::TURN_PHASE_EVENT_TYPE)
+            })
+            .map(|event| {
+                (
+                    event["phase"].as_str().unwrap_or_default().to_string(),
+                    event["outcome"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            phase_outcomes,
+            vec![
+                ("request_preparation".to_string(), "succeeded".to_string()),
+                ("model_inference".to_string(), "failed".to_string()),
+            ],
+            "a provider failure must retain both the completed pre-provider boundary and the failed model boundary"
+        );
 
         state
             .turn_event_buffer
@@ -13829,6 +28485,7 @@ mod tests {
                 api_key: String::new(),
                 base_url: "https://api.openai.com/v1".to_string(),
                 provider: "openai".to_string(),
+                thinking_capability: None,
                 header_overrides: forwarded,
                 request_body_overrides: None,
                 completions_url_override: Some(format!("http://{addr}/gateway/chat/completions")),
@@ -14052,6 +28709,85 @@ mod tests {
         assert!(host.progress_filter.is_none());
     }
 
+    #[tokio::test]
+    async fn committed_work_board_projection_reaches_live_lane_when_edge_delivery_is_preferred() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .build();
+        host.prefer_client_tool_delivery();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        host.set_event_tx(tx);
+        let event = json!({
+            "type": "work_task_board_update",
+            "session_id": "sess1",
+            "task_board_update": {"schema_version": 1, "work_id": "work-1"},
+        });
+
+        <ServerAgenticLoopHost as crate::turn::agentic_loop::host::AgenticLoopHost>::on_committed_work_task_board_update(
+            &mut host,
+            &create_test_state(),
+            event.clone(),
+        )
+        .await;
+
+        assert_eq!(rx.recv().await, Some(event.clone()));
+        assert_eq!(host.emitted_events, vec![event]);
+    }
+
+    #[test]
+    fn preferred_edge_delivery_keeps_server_tool_feedback_on_live_lane() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .build();
+        host.prefer_client_tool_delivery();
+        host.set_execution_metadata(json!({
+            "workspace": {"kind": "edge_workspace"},
+            "executor": {"kind": "edge_agent", "transport": "edge_ws"},
+            "transport": "edge_ws"
+        }));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        host.set_event_tx(tx);
+
+        host.emit_progress_event(json!({
+            "type": "tool_call",
+            "tool_call": {
+                "id": "server-call",
+                "function": {"name": "introspect", "arguments": "{}"}
+            }
+        }));
+        let server_event = rx
+            .try_recv()
+            .expect("server-owned introspect must remain observable");
+        assert_eq!(server_event["type"], "tool_call");
+        assert_eq!(server_event["transport"], "server_local");
+        assert_eq!(server_event["executor"]["kind"], "server_local");
+
+        host.emit_progress_event(json!({
+            "type": "tool_call",
+            "tool_call": {
+                "id": "edge-call",
+                "function": {"name": "read_file", "arguments": "{}"}
+            }
+        }));
+        assert!(
+            rx.try_recv().is_err(),
+            "edge-owned tool request stays on its committed callback lane"
+        );
+        assert_eq!(
+            host.emitted_events.len(),
+            2,
+            "both events remain durable for replay"
+        );
+    }
+
     #[test]
     fn interaction_misrouted_to_progress_lane_fails_turn_without_delivery() {
         let mut host = ServerAgenticLoopHostBuilder::new(
@@ -14189,7 +28925,233 @@ mod tests {
         assert_eq!(approval["type"], "approval_required");
         assert_eq!(approval["request_id"], "approval-after-burst");
         assert_eq!(gap.take(), 4, "overflow is one coalesced repair boundary");
-        assert_eq!(host.emitted_events.len(), 9);
+        assert_eq!(
+            host.emitted_events.len(),
+            1,
+            "streaming deltas stay on the bounded live lane; only the committed interaction is retained for settlement"
+        );
+        assert_eq!(host.emitted_events[0]["type"], "approval_required");
+    }
+
+    #[tokio::test]
+    async fn full_progress_queue_backpressures_instead_of_dropping_tool_terminal() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .build();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        host.set_event_tx(tx);
+        host.emit_progress_event(json!({"type": "text_delta", "content": "prefix"}));
+
+        let record = ToolCallRecord {
+            tool_call_id: Some("call-skill".into()),
+            name: "skill".into(),
+            ok: true,
+            ms: 54,
+            result_preview: Some("skill loaded".into()),
+            disposition: Some(ToolCallDisposition::Executed),
+            ..Default::default()
+        };
+        {
+            let terminal = <ServerAgenticLoopHost as crate::turn::agentic_loop::host::AgenticLoopHost>::on_pre_resolved_tool_call_terminal(
+                &mut host,
+                Some("run-1"),
+                &record,
+            );
+            tokio::pin!(terminal);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), &mut terminal)
+                    .await
+                    .is_err(),
+                "terminal lifecycle authority must wait for capacity instead of disappearing"
+            );
+
+            assert_eq!(rx.recv().await.unwrap()["type"], "text_delta");
+            terminal.await;
+        }
+        let delivered = rx.recv().await.expect("terminal follows accepted progress");
+        assert_eq!(delivered["type"], "tool_call_end");
+        assert_eq!(delivered["call_id"], "call-skill");
+        assert_eq!(delivered["status"], "completed");
+        assert_eq!(
+            host.emitted_events.len(),
+            1,
+            "transient progress is not replayed, but the terminal receipt remains durable"
+        );
+        assert_eq!(host.emitted_events[0]["type"], "tool_call_end");
+    }
+
+    #[tokio::test]
+    async fn pre_resolved_terminal_batch_retains_all_events_without_per_item_backpressure() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .build();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        host.set_event_tx(tx);
+        host.emit_progress_event(json!({"type": "text_delta", "content": "prefix"}));
+
+        let records = (1..=128)
+            .map(|index| ToolCallRecord {
+                tool_call_id: Some(format!("call-rejected-{index}")),
+                name: "bash".into(),
+                ok: false,
+                result_preview: Some("text-only boundary".into()),
+                disposition: Some(ToolCallDisposition::Rejected),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            <ServerAgenticLoopHost as crate::turn::agentic_loop::host::AgenticLoopHost>::on_pre_resolved_tool_calls_terminal(
+                &mut host,
+                Some("run-1"),
+                &records,
+            ),
+        )
+        .await
+        .expect("a full live lane must not serialize one timeout per terminal record");
+
+        assert_eq!(
+            rx.try_recv().expect("prefix remains queued")["type"],
+            "text_delta"
+        );
+        assert!(rx.try_recv().is_err(), "full live lane remains bounded");
+        assert_eq!(host.emitted_events.len(), 128);
+        assert!(
+            host.emitted_events
+                .iter()
+                .all(|event| { event["type"] == "tool_call_end" && event["status"] == "rejected" })
+        );
+        assert_eq!(
+            host.emitted_events
+                .iter()
+                .filter_map(|event| event["call_id"].as_str())
+                .collect::<Vec<_>>(),
+            (1..=128)
+                .map(|index| format!("call-rejected-{index}"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn text_only_execution_consumes_cached_server_admission_exactly_once() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .build();
+        let mut state = create_test_state();
+        state.hooks.completion_settlement.text_only = true;
+        let call = json!({
+            "id": "call-text-only-cached",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{\"path\":\"src/lib.rs\"}"}
+        });
+
+        assert!(
+            host.admit_terminal_tool_calls(
+                &state,
+                std::slice::from_ref(&call),
+                Some("tool_calls"),
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            host.pending_tool_call_admission
+                .as_ref()
+                .map(|admission| admission.rejected.len()),
+            Some(1)
+        );
+
+        let execution_admission =
+            <ServerAgenticLoopHost as crate::turn::agentic_loop::host::AgenticLoopHost>::admit_tool_calls(
+                &mut host,
+                std::slice::from_ref(&call),
+                Some("tool_calls"),
+            );
+
+        assert!(execution_admission.admitted.is_empty());
+        assert_eq!(execution_admission.rejected.len(), 1);
+        assert_eq!(execution_admission.rejected[0].id, "call-text-only-cached");
+        assert!(
+            execution_admission.rejected[0]
+                .result
+                .contains("text_only_settlement_tool_call")
+        );
+        assert!(host.pending_tool_call_admission.is_none());
+    }
+
+    #[tokio::test]
+    async fn applied_user_intent_receipt_is_retained_without_waiting_for_live_capacity() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .build();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        host.set_event_tx(tx);
+        host.emit_progress_event(json!({"type": "text_delta", "content": "prefix"}));
+        let intent = crate::turn::run_control::QueuedUserIntent {
+            intent_id: "intent-control".into(),
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+            event_index: 7,
+            input: json!({"content": "Do not modify files."}),
+        };
+
+        tokio::time::timeout(
+            Duration::from_millis(25),
+            host.on_user_intent_applied(&intent),
+        )
+        .await
+        .expect("live backpressure must not block durable control application");
+        assert_eq!(rx.recv().await.unwrap()["type"], "text_delta");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(host.emitted_events.len(), 1);
+        assert_eq!(host.emitted_events[0]["type"], "user_intent_applied");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_observer_cannot_block_applied_guidance_or_erase_its_replay() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .build();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        host.set_event_tx(tx);
+        host.emit_progress_event(json!({"type": "text_delta", "content": "fills-lane"}));
+        let intent = crate::turn::run_control::QueuedUserIntent {
+            intent_id: "intent-bounded".into(),
+            delivery: astra_turn_types::UserIntentDelivery::GuideCurrentRun,
+            status: astra_turn_types::UserIntentStatus::AcceptedRemote,
+            event_index: 9,
+            input: json!({"content": "Use the new objective."}),
+        };
+
+        tokio::time::timeout(Duration::from_secs(2), host.on_user_intent_applied(&intent))
+            .await
+            .expect("live projection backpressure must be bounded");
+
+        assert_eq!(host.emitted_events.len(), 1);
+        assert_eq!(host.emitted_events[0]["type"], "user_intent_applied");
+        assert_eq!(host.emitted_events[0]["intent_id"], "intent-bounded");
     }
 
     #[tokio::test]
@@ -14220,11 +29182,50 @@ mod tests {
         drop(rx);
         host.set_event_tx(tx);
         host.emit_progress_event(json!({"type": "text_delta", "content": "detached"}));
+        for sequence in 0..(MAX_STREAMED_TURN_EVENT_BUFFER + 512) {
+            host.emit_progress_event(json!({"type": "reasoning_delta", "sequence": sequence}));
+        }
+        host.emit_progress_event(json!({
+            "type": "tool_call_end",
+            "call_id": "call-after-disconnect",
+            "status": "completed"
+        }));
 
         assert!(!cancel_flag.load(Ordering::SeqCst));
         assert!(!cancel_token.is_cancelled());
         assert!(host.event_tx.is_none());
         assert_eq!(host.emitted_events.len(), 1);
+        assert_eq!(host.emitted_events[0]["type"], "tool_call_end");
+        assert_eq!(host.emitted_events[0]["call_id"], "call-after-disconnect");
+    }
+
+    #[test]
+    fn producer_cannot_spoof_tool_terminal_durable_watermark() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "user1".to_string(),
+            "sess1".to_string(),
+        )
+        .build();
+        host.emit_progress_event(json!({
+            "type": "tool_call_end",
+            "call_id": "call-spoofed",
+            "status": "completed",
+            "_astra_tool_terminal_durably_fanned_out": true,
+        }));
+
+        let retained = host.emitted_events.last().expect("retained terminal");
+        assert!(
+            retained
+                .get(TOOL_TERMINAL_DURABLY_FANNED_OUT_FIELD)
+                .is_none()
+        );
+        assert!(
+            crate::server::run::lifecycle::run_state::tool_terminal_requires_settlement_repair(
+                retained
+            )
+        );
     }
 
     #[test]
@@ -14781,6 +29782,7 @@ mod tests {
             parent_run_id: "run-root".to_string(),
             event_type: ProgressEventType::Cancelled {
                 reason: "user request".to_string(),
+                origin: CancellationOrigin::User,
             },
             timestamp_epoch_ms: 2,
             metadata: None,
@@ -14793,6 +29795,7 @@ mod tests {
         assert_eq!(failed_sse["status"], "failed");
         assert_eq!(cancelled_sse["type"], "agent_cancelled");
         assert_eq!(cancelled_sse["status"], "cancelled");
+        assert_eq!(cancelled_sse["cancellation_origin"], "user");
     }
 
     #[test]
@@ -15041,6 +30044,7 @@ mod tests {
                 content: String::new(),
                 invoked_at_turn: 1,
                 reentry_count: 0,
+                execution_topology: None,
             },
         );
 
@@ -15106,6 +30110,7 @@ mod tests {
                 content: String::new(),
                 invoked_at_turn: 1,
                 reentry_count: 0,
+                execution_topology: None,
             },
         );
         let _turn1 = host.visible_turn_tools(&mut state);
@@ -15179,6 +30184,108 @@ mod tests {
         );
     }
 
+    /// A durable Work binding changes lifecycle state, but it must never
+    /// widen a delegated child's explicit capability envelope. This is the
+    /// unhappy path behind children that were asked to use a network tool yet
+    /// saw only Work-planning tools.
+    #[test]
+    fn bound_work_projection_does_not_bypass_child_tool_allowlist() {
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools_with_web_fetch())
+        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_work_planning_bound(true)
+        .build();
+
+        let mut state = create_test_state();
+        state.skills.request_constraints.allowed_tools =
+            Some(["web_fetch".to_string()].into_iter().collect());
+
+        let visible = schema_names(&host.visible_turn_tools(&mut state));
+        assert!(
+            visible.contains("web_fetch"),
+            "the child's explicitly admitted edge capability must survive: {visible:?}"
+        );
+        for forbidden in [
+            "bash",
+            "read_file",
+            "run_next_work_item",
+            "inspect_work_plan",
+            "propose_work_plan",
+            "inspect_work_criteria",
+            "propose_work_criteria",
+            "settle_work_item",
+        ] {
+            assert!(
+                !visible.contains(forbidden),
+                "bound Work must not widen a child allowlist with {forbidden}: {visible:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delegated_edge_ledger_child_can_activate_allowlisted_deferred_builtin() {
+        let edge_ledger_snapshot = ExecutionBindingSnapshot::inferred(
+            WorkspaceBinding::edge_workspace(
+                "CLI workspace",
+                "/workspace",
+                WorkspaceAuthority::ReadWrite,
+            ),
+            ExecutorBinding::edge_agent(
+                "edge-1",
+                "CLI workspace",
+                crate::server::tool_transport::ToolTransportKind::EdgeLedger,
+                crate::server::tool_transport::ExecutorStatus::Online,
+            ),
+        );
+        let mut host = ServerAgenticLoopHostBuilder::new(
+            mock_matrixone(),
+            mock_encryptor(),
+            "u".to_string(),
+            "s".to_string(),
+        )
+        .with_edge_tools(sample_edge_tools())
+        .with_execution_binding_snapshot(edge_ledger_snapshot)
+        .build();
+        assert!(!schema_names(&host.tool_schemas).contains("web_fetch"));
+
+        host.merge_allowlisted_edge_tool_schemas(&["web_fetch".to_string()]);
+        let mut state = create_test_state();
+        state.skills.request_constraints.allowed_tools = Some(
+            ["web_fetch".to_string(), "tool_search".to_string()]
+                .into_iter()
+                .collect(),
+        );
+
+        let visible = schema_names(&host.visible_turn_tools(&mut state));
+        assert!(
+            visible.contains("web_fetch"),
+            "the allowlisted capability must be immediately callable before prompt-tier pruning: {visible:?}"
+        );
+        assert!(
+            schema_names(&host.deferred_tool_schemas).contains("web_fetch"),
+            "the same capability must remain discoverable if the prompt pipeline cache-prunes it"
+        );
+        let pipeline_visible = host.filtered_runtime_ready_turn_tools(&HashSet::new(), &state);
+        let outcome = host
+            .run_turn_pipeline(
+                &mut state,
+                &pipeline_visible,
+                "openai",
+                "deepseek-v4-flash",
+                "Fetch one URL",
+            )
+            .expect("child context pipeline");
+        assert!(
+            schema_names(&outcome.tool_schemas).contains("web_fetch"),
+            "adaptive context optimization must not prune the child's explicit execution contract"
+        );
+    }
+
     /// Combined scenario: delegation constrains to [bash, read_file, grep, str_replace]
     /// AND a review skill carries a narrower allowed_tools hint. The hard
     /// request policy still wins, but the skill hint must not narrow further.
@@ -15217,6 +30324,7 @@ mod tests {
                 content: String::new(),
                 invoked_at_turn: 1,
                 reentry_count: 0,
+                execution_topology: None,
             },
         );
 
@@ -15509,9 +30617,32 @@ mod tests {
                 AuxiliaryLlmPolicy::CapacityAware
             );
             assert_eq!(
+                parse_auxiliary_llm_policy("boundary_only"),
+                AuxiliaryLlmPolicy::BoundaryOnly
+            );
+            assert_eq!(
                 parse_auxiliary_llm_policy("surprise"),
                 AuxiliaryLlmPolicy::CapacityAware
             );
+        }
+
+        #[test]
+        #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+        fn auxiliary_llm_policy_defaults_to_capacity_aware_work_admission() {
+            let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
+            let _provider_admission = EnvVarGuard::remove("ASTRA_LLM_PROVIDER_ADMISSION_MODE");
+
+            assert_eq!(
+                AuxiliaryLlmPolicy::from_env(),
+                AuxiliaryLlmPolicy::CapacityAware
+            );
+            assert_eq!(
+                should_skip_work_admission_judge(false, false),
+                None,
+                "ordinary turns should receive the bounded semantic decision when quota pressure is absent"
+            );
+            assert_eq!(should_skip_work_admission_judge(true, false), None);
+            assert_eq!(should_skip_work_admission_judge(true, true), None);
         }
 
         #[test]
@@ -15520,6 +30651,44 @@ mod tests {
             let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "disabled");
 
             assert_eq!(AuxiliaryLlmPolicy::from_env(), AuxiliaryLlmPolicy::Disabled);
+        }
+
+        #[test]
+        #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+        fn boundary_only_is_an_explicit_latency_opt_out() {
+            let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "boundary_only");
+
+            assert_eq!(
+                should_skip_work_admission_judge(false, false),
+                Some("ordinary_primary_turn")
+            );
+            assert_eq!(should_skip_work_admission_judge(true, false), None);
+        }
+
+        #[test]
+        #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+        fn capacity_aware_never_erases_work_admission() {
+            let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "capacity_aware");
+            let _mode = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_MODE", "db_fixed_window");
+            let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "20");
+
+            assert_eq!(
+                should_skip_work_admission_judge(false, false),
+                None,
+                "provider quota accounting must not disable semantic Work admission"
+            );
+            assert_eq!(should_skip_work_admission_judge(true, false), None);
+            assert_eq!(
+                should_skip_work_admission_judge(true, true),
+                None,
+                "fanout remains one of the structural ambiguities the Work judge resolves"
+            );
+
+            let _disabled = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "disabled");
+            assert_eq!(
+                should_skip_work_admission_judge(true, true),
+                Some("disabled")
+            );
         }
 
         #[tokio::test]
@@ -15582,6 +30751,90 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn fixed_default_subrun_keeps_explicit_policy_without_judge() {
+            let judge = ScriptedJudge::ok(TurnIntent::default());
+            let mut host = host_with_turn_intent_policy_and_judge(
+                TurnIntentExecutionPolicy::FixedDefault,
+                judge.clone() as Arc<dyn TurnIntentJudge>,
+            );
+            let mut state = crate::turn::agentic_loop::host::tests::make_state();
+            state.inference_purpose = astra_turn_types::InferencePurpose::SubAgent;
+
+            assert_eq!(
+                host.judge_turn_intent(&state).await,
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::FixedDefault
+            );
+            assert!(judge.calls().is_empty());
+        }
+
+        #[tokio::test]
+        async fn historical_work_does_not_suppress_an_explicit_general_intent_judge() {
+            let judge = ScriptedJudge::ok(TurnIntent::default());
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u-bound-admission".to_string(),
+                "s-bound-admission".to_string(),
+            )
+            .with_work_planning_bound(true)
+            .build();
+            host.set_turn_intent_judge(judge.clone() as Arc<dyn TurnIntentJudge>);
+            let state = crate::turn::agentic_loop::host::tests::make_state();
+
+            assert!(matches!(
+                host.judge_turn_intent(&state).await,
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Intent(_)
+            ));
+            assert!(
+                !judge.calls().is_empty(),
+                "a historical graph must not make an unrelated later user turn inherit stale semantics"
+            );
+        }
+
+        #[test]
+        fn builtin_auto_work_admission_keeps_turn_live_without_sidecar() {
+            let auto = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u-auto-admission".to_string(),
+                "s-auto-admission".to_string(),
+            )
+            .build();
+            assert!(
+                !auto.requires_turn_intent_decision(),
+                "built-in Auto admission must keep the primary turn alive when its auxiliary judge is unavailable"
+            );
+
+            let fixed = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u-fixed-admission".to_string(),
+                "s-fixed-admission".to_string(),
+            )
+            .with_turn_intent_policy(TurnIntentExecutionPolicy::FixedDefault)
+            .build();
+            assert!(
+                !fixed.requires_turn_intent_decision(),
+                "FixedDefault is the explicit no-inference policy"
+            );
+
+            let mut injected = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u-injected-admission".to_string(),
+                "s-injected-admission".to_string(),
+            )
+            .build();
+            injected.set_turn_intent_judge(
+                ScriptedJudge::ok(TurnIntent::default()) as Arc<dyn TurnIntentJudge>
+            );
+            assert!(
+                !injected.requires_turn_intent_decision(),
+                "an explicitly injected structured judge owns its own unavailable policy"
+            );
+        }
+
+        #[tokio::test]
         async fn judge_turn_intent_returns_unavailable_when_judge_errors() {
             let judge = ScriptedJudge::err(TurnIntentJudgeError::Transport(
                 "connection reset".to_string(),
@@ -15599,7 +30852,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn judge_turn_intent_returns_unavailable_when_no_judge_set() {
+        async fn ordinary_primary_turn_does_not_start_work_admission_judge() {
             let mut host = ServerAgenticLoopHostBuilder::new(
                 mock_matrixone(),
                 mock_encryptor(),
@@ -15616,6 +30869,138 @@ mod tests {
                 host.judge_turn_intent(&state).await,
                 crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable
             );
+            assert!(
+                host.pending_work_admission_judge.is_none(),
+                "the default ordinary-turn path must not create a second model request"
+            );
+        }
+
+        #[tokio::test]
+        async fn bound_work_does_not_reenter_genesis_admission_at_a_tool_boundary() {
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u-bound-boundary".to_string(),
+                "s-bound-boundary".to_string(),
+            )
+            .with_work_planning_bound(true)
+            .build();
+            let state = crate::turn::agentic_loop::host::tests::make_state();
+
+            assert!(
+                !host
+                    .start_work_admission_preflight(&state, true, true)
+                    .await,
+                "a durable Work binding must not replay genesis during an internal continuation"
+            );
+            assert!(host.pending_work_admission_judge.is_none());
+            assert!(host.pending_work_admission.is_none());
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+        async fn unavailable_work_admission_is_attempted_only_once_per_user_turn() {
+            let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u-unavailable-admission".to_string(),
+                "s-unavailable-admission".to_string(),
+            )
+            .build();
+            let state = crate::turn::agentic_loop::host::tests::make_state();
+
+            assert!(
+                !host
+                    .start_work_admission_preflight(&state, true, false)
+                    .await,
+                "a host without admitted model material cannot start the sidecar"
+            );
+            assert!(host.work_admission_attempted);
+            assert!(
+                !host
+                    .start_work_admission_preflight(&state, true, false)
+                    .await,
+                "the same unavailable sidecar must not restart at every tool round"
+            );
+            assert!(host.pending_work_admission_judge.is_none());
+        }
+
+        #[tokio::test]
+        #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
+        async fn builtin_work_admission_persists_a_typed_graph_at_the_lifecycle_boundary() {
+            let _aux_policy = EnvVarGuard::set(AUX_LLM_POLICY_ENV, "always");
+            let inference_ledger =
+                crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
+            let (gateway_url, requests, server) = spawn_gateway(
+                axum::http::StatusCode::OK,
+                json!({
+                    "choices": [{
+                        "message": {
+                            "content": "{\"work_lifecycle\":\"not_required\",\"workspace_mutation\":\"read_only\",\"execution_topology\":\"primary\",\"acceptance_unit_relationship\":\"independent_outcomes\",\"acceptance_units\":[{\"objective\":\"Inspect source A\",\"expected_result\":\"One cited finding from A\"},{\"objective\":\"Inspect source B\",\"expected_result\":\"One cited finding from B\"}]}"
+                        },
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 8, "completion_tokens": 24}
+                }),
+            )
+            .await;
+            let mut host = ServerAgenticLoopHostBuilder::new(
+                mock_matrixone(),
+                mock_encryptor(),
+                "u-semantic-work".to_string(),
+                "s-semantic-work".to_string(),
+            )
+            .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+                true, false,
+            ))
+            .with_test_inference_ledger(inference_ledger.clone())
+            .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3_000))))
+            .build();
+            let mut state = create_durable_execution_test_state("s-semantic-work");
+            state.session_turn = 2;
+            state.message = "Produce two separately verifiable findings.".to_string();
+            state.user_intent = state.message.clone();
+
+            assert_eq!(
+                host.judge_turn_intent(&state).await,
+                crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable,
+                "the built-in judge runs concurrently and leaves primary admission alive"
+            );
+            assert!(
+                host.resolve_pending_work_admission(true).await,
+                "the gateway response must produce a typed Work decision"
+            );
+            let call = host
+                .take_admitted_work_establishment_call(&state)
+                .expect("a required semantic decision must become a server-owned start_work call");
+            assert_eq!(call["function"]["name"].as_str(), Some("start_work"));
+            let arguments: Value = serde_json::from_str(
+                call["function"]["arguments"]
+                    .as_str()
+                    .expect("start_work arguments"),
+            )
+            .expect("valid start_work JSON");
+            assert_eq!(arguments["tasks"].as_array().map(Vec::len), Some(2));
+
+            let requests = requests.lock().await.clone();
+            assert_eq!(
+                requests.len(),
+                1,
+                "Work admission is one bounded sidecar call"
+            );
+            assert!(
+                requests[0]["messages"]
+                    .as_array()
+                    .is_some_and(|messages| messages.iter().any(|message| {
+                        message["content"]
+                            .as_str()
+                            .is_some_and(|content| content.contains("expected_result"))
+                    })),
+                "the sidecar must use the closed Work-admission contract"
+            );
+            inference_ledger.assert_quiescent();
+            server.abort();
         }
 
         #[tokio::test]
@@ -15783,13 +31168,15 @@ mod tests {
 
         #[tokio::test]
         #[serial_test::serial(auxiliary_llm_capacity_policy_env)]
-        async fn builtin_turn_intent_judge_skips_gateway_when_provider_admission_is_enabled() {
+        async fn builtin_turn_intent_judge_starts_when_provider_admission_is_enabled() {
             use axum::{Router, routing::post};
             use tokio::net::TcpListener;
 
             let _aux_policy = EnvVarGuard::remove(AUX_LLM_POLICY_ENV);
             let _mode = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_MODE", "db_fixed_window");
             let _rpm = EnvVarGuard::set("ASTRA_LLM_PROVIDER_ADMISSION_RPM", "20");
+            let inference_ledger =
+                crate::turn::llm::durable::TestInferenceLedgerPersistence::default();
             let request_count = Arc::new(AtomicUsize::new(0));
             let request_count_for_handler = request_count.clone();
             let app = Router::new().route(
@@ -15802,7 +31189,7 @@ mod tests {
                             "choices": [
                                 {
                                     "message": {
-                                        "content": "{\"requested_scenario\":\"refactoring\"}"
+                                        "content": "{\"work_lifecycle\":\"not_required\",\"workspace_mutation\":\"read_only\",\"execution_topology\":\"primary\",\"acceptance_units\":[{\"objective\":\"Answer the request\",\"expected_result\":\"One direct answer\"}]}"
                                     },
                                     "finish_reason": "stop"
                                 }
@@ -15828,13 +31215,17 @@ mod tests {
                 "u".to_string(),
                 "s".to_string(),
             )
+            .with_capabilities(crate::capabilities::lifecycle_server_capabilities(
+                true, false,
+            ))
+            .with_test_inference_ledger(inference_ledger)
             .with_admitted_model_execution(Some(test_gateway_execution(
                 format!("http://{addr}/gateway/chat/completions"),
                 Some(2_000),
             )))
             .build();
 
-            let mut state = crate::turn::agentic_loop::host::tests::make_state();
+            let mut state = create_durable_execution_test_state("s");
             state.message = "继续，但要系统性一点".to_string();
             state.user_intent = state.message.clone();
 
@@ -15842,11 +31233,11 @@ mod tests {
                 host.judge_turn_intent(&state).await,
                 crate::turn::agentic_loop::host::TurnIntentJudgeOutcome::Unavailable
             );
-            assert_eq!(
-                request_count.load(AtomicOrdering::SeqCst),
-                0,
-                "capacity-aware default must not spend provider RPM on built-in turn intent judge"
+            assert!(
+                host.pending_work_admission_judge.is_some(),
+                "provider quota accounting must not prevent the Work classifier from starting"
             );
+            host.abort_pending_work_admission();
 
             server.abort();
         }

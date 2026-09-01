@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use astra_runtime::{
     orchestration::{
-        InheritedPermissions, PermissionSummary, SpawnAgentExecutor, SpawnRunConfig,
-        SpawnRunResult, project_subrun_status_to_spawn, spawn_completion_status_from_finish_reason,
+        CancellationOrigin, InheritedPermissions, PermissionSummary, SpawnAgentExecutor,
+        SpawnRunConfig, SpawnRunResult, project_subrun_status_to_spawn,
+        spawn_completion_status_from_finish_reason,
     },
     pipeline::step_protocol::InMemoryIdempotencyCache,
     pipeline::step_recorder::StepRecorder,
@@ -24,7 +25,8 @@ use astra_runtime::{
     turn::turn_guard::TurnGuard,
 };
 use astra_turn_core::{
-    agent_live_event::SharedAgentLiveEventSink, tool::schema::tool_names_from_schemas,
+    agent_live_event::SharedAgentLiveEventSink, interruption::InterruptionKind,
+    tool::schema::tool_names_from_schemas,
 };
 use serde_json::{Value, json};
 
@@ -37,6 +39,20 @@ use crate::edge_tools;
 
 /// Re-export from runtime so all CLI components share one type.
 pub type TokenProvider = astra_runtime::capabilities::TokenProvider;
+
+fn cancelled_loop_origin(interruption_kind: Option<InterruptionKind>) -> CancellationOrigin {
+    if interruption_kind == Some(InterruptionKind::UserCancelled) {
+        CancellationOrigin::User
+    } else {
+        CancellationOrigin::Runtime
+    }
+}
+
+fn classified_error_cancellation_origin(
+    error_kind: astra_core::ErrorKind,
+) -> Option<CancellationOrigin> {
+    (error_kind == astra_core::ErrorKind::Cancelled).then_some(CancellationOrigin::Runtime)
+}
 
 #[derive(Default)]
 struct SessionTranscriptBinding {
@@ -110,6 +126,7 @@ pub(crate) fn build_child_messages(
     prefix_messages: Option<&[Value]>,
     child_task: &str,
     force_reasoning_field: bool,
+    turn_chain_id: &str,
 ) -> Vec<Value> {
     fn ensure_assistant_reasoning_fields(messages: &mut [Value]) {
         for msg in messages {
@@ -151,14 +168,23 @@ pub(crate) fn build_child_messages(
             }
             messages.push(bridge);
         }
-        messages.push(json!({ "role": "user", "content": child_task }));
+        let mut current_task = json!({ "role": "user", "content": child_task });
+        astra_turn_types::mark_bridge_turn_message(&mut current_task, turn_chain_id);
+        messages.push(current_task);
         messages
     } else {
         // Fresh mode: system prompt + child task only.
-        vec![
+        let mut messages = vec![
             json!({ "role": "system", "content": system_prompt }),
             json!({ "role": "user", "content": child_task }),
-        ]
+        ];
+        astra_turn_types::mark_bridge_turn_message(
+            messages
+                .last_mut()
+                .expect("fresh child messages always contain the task"),
+            turn_chain_id,
+        );
+        messages
     }
 }
 
@@ -370,6 +396,21 @@ fn stream_event_to_agent_live_kind(
                 content,
             },
         )),
+        StreamEvent::UserIntentReturned {
+            intent_id,
+            delivery,
+            status,
+            event_index,
+            content,
+        } => Some(AgentLiveEventKind::Signal(
+            AgentLiveSignal::UserIntentReturned {
+                intent_id,
+                delivery,
+                status,
+                event_index,
+                content,
+            },
+        )),
         StreamEvent::AgentCommunication(event) => Some(AgentLiveEventKind::Signal(
             AgentLiveSignal::AgentCommunication(event),
         )),
@@ -414,15 +455,19 @@ fn stream_event_to_agent_live_kind(
                 bytes,
             }))
         }
-        StreamEvent::ContextWindowPolicy { .. }
+        StreamEvent::SessionBound(_)
+        | StreamEvent::RunBound(_)
+        | StreamEvent::ContextWindowPolicy { .. }
         | StreamEvent::ContextWindowEstimated(_)
         | StreamEvent::ContextSystemPromptTokens(_)
         | StreamEvent::ContextWindowMeasured(_)
         | StreamEvent::RequestTokenUsage(_)
+        | StreamEvent::RuntimeFeedback(_)
         | StreamEvent::Thinking(_)
         | StreamEvent::AgentLive(_)
         | StreamEvent::AgentLiveGap(_)
         | StreamEvent::Compaction(_)
+        | StreamEvent::WorkTaskBoardUpdate(_)
         | StreamEvent::ExplainReport(_)
         | StreamEvent::ExplainText(_)
         | StreamEvent::VerdictReport(_) => None,
@@ -705,6 +750,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
             .tool_policy
             .resolve_for_model(effective_model.as_deref());
+        let child_cancel_token =
+            crate::cli::skill_subrun::child_cancellation_scope(self.cancel_token.as_ref());
 
         let mut host = SubRunHost {
             api: self.api.clone(),
@@ -719,7 +766,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             max_completion_tokens: None,
             effort: None,
             agent_type: Some(config.agent_type.clone()),
-            cancel_token: self.cancel_token.clone(),
+            cancel_token: Some(child_cancel_token.clone()),
             skill_resolver: self.skill_resolver.clone(),
             progress_tx: None,
             agent_id: config.agent_id.clone(),
@@ -778,6 +825,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 .map(|ip| ip.prefix_messages.as_slice()),
             &config.task,
             force_reasoning_field,
+            &config.run_id,
         );
         if host.journal.is_some() {
             if let Some(session_id) = active_session_id.as_ref() {
@@ -827,16 +875,25 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             restricted_tools
         };
 
-        let task_profile = infer_task_execution_profile(&config.task);
+        let task_profile = if config.read_only {
+            astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::from_structured_intent(
+                false,
+                true,
+                astra_turn_core::chat_turn_heuristics::TaskComplexity::Standard,
+            )
+        } else {
+            infer_task_execution_profile(&config.task)
+        };
         // Local step-recorder session id: kept synthetic (`spawn-...`)
         // because it's only used for local journal / step file
         // persistence — server never sees this.
         let local_subrun_session_id = format!("spawn-{}-{}", config.run_id, config.agent_id);
         let user_id = cli_user_id();
-        let step_recorder = StepRecorder::with_persistence(
+        let step_recorder = StepRecorder::with_persistence_for_run(
             &user_id,
             &local_subrun_session_id,
             &format!("{}-run", config.run_id),
+            &config.run_id,
         );
 
         // Wire session for the *server-facing* `chat_turn_base_payload`:
@@ -857,7 +914,14 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         let progress_emitter = config.progress_emitter.clone();
         let has_parent_permissions = config.parent_address.is_some();
 
-        let max_turns = config.max_turns as usize;
+        let agentic_turn_budget =
+            astra_turn_core::chat_turn_heuristics::resolve_spawned_agentic_turn_budget(
+                task_profile,
+                astra_core::RuntimeLimits::global().max_turns,
+                config.initial_turns as usize,
+                config.hard_turn_limit.map(|turns| turns as usize),
+            );
+        let max_turns = agentic_turn_budget.initial_turns;
 
         let child_thinking = effective_model
             .as_deref()
@@ -870,8 +934,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         );
 
         let mut state = AgenticLoopState {
-            observation_store: None,
             observation_journal: Default::default(),
+            tool_ledger_receipt: Default::default(),
             messages,
             run_transcript_capture: None,
             volatile_pending: Vec::new(),
@@ -880,6 +944,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             session_memory_state: Default::default(),
             current_session_id: server_session_id,
             current_run_id: Some(config.run_id.clone()),
+            current_run_owner_generation: None,
             inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
             context_manifest_pool: None,
             context_manifest_user_id: Some(user_id),
@@ -899,10 +964,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             has_any_usage: false,
             max_turns,
             remaining_turns: max_turns,
-            turn_budget_hint_emitted_90: false,
-            turn_budget_hint_emitted_50: false,
-            turn_budget_hint_emitted_20: false,
-            agentic_turn_budget: task_profile.agentic_turn_budget,
+            agentic_turn_budget,
+            budget_is_explicit: config.hard_turn_limit.is_some(),
             current_round_index: 0,
             llm_rounds_completed: 0,
             last_request_message_count: None,
@@ -944,9 +1007,12 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             cancellation: CancellationState {
                 flag: None,
                 pause_flag: None,
-                token: self.cancel_token.clone(),
+                token: Some(child_cancel_token),
+                execution_lease_lost: None,
+                resolved_origin: None,
             },
             error_recovery: Default::default(),
+            provider_adaptation: Default::default(),
             run_control: None,
             pipeline_session: Some(
                 astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
@@ -989,9 +1055,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
-            max_cumulative_tokens: 0,
             thinking: child_thinking,
-            recent_file_reads: Vec::new(),
             permission_context: Some(config.permission_context),
             permission_handler: None,
             tactical_adapter: None,
@@ -1007,8 +1071,8 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
-            bridge_turn_chain_id: None,
-            bridge_user_query_event_id: None,
+            canonical_turn_chain_id: Some(config.run_id.clone()),
+            root_user_query_event_id: Some(format!("{}:initial-user-query", config.run_id)),
             turn_event_buffer: None,
             harness: astra_runtime::turn::harness_adapter::HarnessSlot::empty(),
         };
@@ -1032,11 +1096,9 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
         let _ = host.flush_agent_transcript(&state);
 
         let loop_result = run_agentic_loop_with_host(&mut host, &mut state).await;
-        if matches!(&loop_result, Ok(AgenticLoopOutcome::Completed)) {
-            astra_runtime::turn::agentic_loop::finalization::mark_execution_incomplete_from_turn_evaluation(
-                &mut state,
-            );
-        }
+        // Preserve the loop's explicit lifecycle. Tool failures remain in the
+        // transcript/evaluation lane; they do not manufacture an interruption
+        // after a child run has completed.
         // The happy-path hook normally keeps this current. A terminal flush
         // retains tool messages appended after the last successful ingest and
         // partial history from cancelled/failed loops.
@@ -1132,7 +1194,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     run_id,
                     status: "delegated".to_string(),
                     finish_reason: "delegated".to_string(),
-                    cancelled_by_user: None,
+                    cancellation_origin: CancellationOrigin::Unverified,
                     output: None,
                     error: None,
                     prompt_tokens,
@@ -1159,7 +1221,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     run_id,
                     status: "failed".to_string(),
                     finish_reason: "terminal_control_rejected".to_string(),
-                    cancelled_by_user: None,
+                    cancellation_origin: CancellationOrigin::Unverified,
                     output: None,
                     error: Some(error),
                     prompt_tokens,
@@ -1221,7 +1283,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     )
                     .to_string(),
                     finish_reason: finish_reason_from_state.unwrap_or_else(|| "normal".to_string()),
-                    cancelled_by_user: None,
+                    cancellation_origin: CancellationOrigin::Unverified,
                     output: Some(state.final_text),
                     error: None,
                     prompt_tokens,
@@ -1235,16 +1297,25 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                 })
             }
             Ok(AgenticLoopOutcome::Cancelled) => {
+                let cancellation_origin =
+                    cancelled_loop_origin(state.interruption.as_ref().map(|record| record.kind));
+                let cancellation_reason = match cancellation_origin {
+                    CancellationOrigin::User => "user cancellation",
+                    CancellationOrigin::Runtime => "runtime cancellation",
+                    CancellationOrigin::Unverified => unreachable!(
+                        "CLI loop cancellation is classified from a local typed interruption"
+                    ),
+                };
                 // Emit cancelled event
                 if let Some(ref emitter) = progress_emitter {
-                    emitter.cancelled("user cancellation");
+                    emitter.cancelled(cancellation_reason, cancellation_origin);
                 }
                 emit_terminated(
                     astra_turn_core::agent_live_event::AgentLiveTermination::Cancelled,
                     Some(
                         finish_reason_from_state
                             .clone()
-                            .unwrap_or_else(|| "user cancellation".to_string()),
+                            .unwrap_or_else(|| cancellation_reason.to_string()),
                     ),
                 );
                 let projection = project_subrun_status_to_spawn(astra_core::STATUS_CANCELLED, None);
@@ -1254,7 +1325,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     status: projection.status.to_string(),
                     finish_reason: finish_reason_from_state
                         .unwrap_or_else(|| projection.finish_reason.to_string()),
-                    cancelled_by_user: Some(true),
+                    cancellation_origin,
                     output: if state.final_text.is_empty() {
                         None
                     } else {
@@ -1285,7 +1356,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     run_id,
                     status: "failed".to_string(),
                     finish_reason: finish_reason_from_state.unwrap_or_else(|| "failed".to_string()),
-                    cancelled_by_user: None,
+                    cancellation_origin: CancellationOrigin::Unverified,
                     output: if state.final_text.is_empty() {
                         None
                     } else {
@@ -1319,8 +1390,43 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
                     status: projection.status.to_string(),
                     finish_reason: finish_reason_from_state
                         .unwrap_or_else(|| projection.finish_reason.to_string()),
-                    cancelled_by_user: None,
+                    cancellation_origin: CancellationOrigin::Unverified,
                     output: Some(reason),
+                    error: None,
+                    prompt_tokens,
+                    completion_tokens,
+                    tool_calls,
+                    turns_completed,
+                    permission_summary,
+                    permission_requests,
+                    permission_requests_approved,
+                    tools_blocked,
+                })
+            }
+            Err(e)
+                if let Some(cancellation_origin) = classified_error_cancellation_origin(e.kind) =>
+            {
+                let reason = "runtime cancellation";
+                if let Some(ref emitter) = progress_emitter {
+                    emitter.cancelled(reason, cancellation_origin);
+                }
+                emit_terminated(
+                    astra_turn_core::agent_live_event::AgentLiveTermination::Cancelled,
+                    Some(reason.to_string()),
+                );
+                let projection = project_subrun_status_to_spawn(astra_core::STATUS_CANCELLED, None);
+                Ok(SpawnRunResult {
+                    agent_id,
+                    run_id,
+                    status: projection.status.to_string(),
+                    finish_reason: finish_reason_from_state
+                        .unwrap_or_else(|| projection.finish_reason.to_string()),
+                    cancellation_origin,
+                    output: if state.final_text.is_empty() {
+                        None
+                    } else {
+                        Some(state.final_text)
+                    },
                     error: None,
                     prompt_tokens,
                     completion_tokens,
@@ -1351,6 +1457,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
 mod tests {
     use super::{
         CliSpawnAgentExecutor, TokenProvider, agent_live_stream_event_sink, build_child_messages,
+        cancelled_loop_origin, classified_error_cancellation_origin,
         emit_agent_transcript_committed,
     };
     use crate::lock_recovery::LockRecovery;
@@ -1362,11 +1469,40 @@ mod tests {
         AgentLiveEvent, AgentLiveEventKind, AgentLiveEventSink, AgentLiveSendError,
         SharedAgentLiveEventSink,
     };
+    use astra_turn_core::interruption::InterruptionKind;
+    use astra_turn_core::orchestration_types::CancellationOrigin;
     use serde_json::json;
     use std::path::PathBuf;
     use std::sync::Arc;
 
     use crate::cli::chat_stream::StreamEvent;
+
+    #[test]
+    fn cancelled_loop_projection_requires_typed_user_interruption() {
+        assert_eq!(
+            cancelled_loop_origin(Some(InterruptionKind::UserCancelled)),
+            CancellationOrigin::User
+        );
+        assert_eq!(cancelled_loop_origin(None), CancellationOrigin::Runtime);
+        assert_eq!(
+            cancelled_loop_origin(Some(InterruptionKind::ExecutionIncomplete)),
+            CancellationOrigin::Runtime
+        );
+    }
+
+    #[test]
+    fn classified_cancelled_error_projects_runtime_but_provider_error_remains_failure() {
+        assert_eq!(
+            classified_error_cancellation_origin(astra_core::ErrorKind::Cancelled),
+            Some(CancellationOrigin::Runtime)
+        );
+        assert_eq!(
+            classified_error_cancellation_origin(astra_core::ErrorKind::ServerError),
+            None,
+            "a real provider failure must remain on the failed branch"
+        );
+    }
+
     fn test_permission_context() -> (
         InheritedPermissions,
         astra_runtime::orchestration::PermissionSyncHandle,
@@ -1665,6 +1801,7 @@ mod tests {
         let err = executor
             .execute(SpawnRunConfig {
                 run_id: "run-1".into(),
+                cancellation_binding_id: "test-run-1-binding".into(),
                 agent_id: "reviewer@panic".into(),
                 spawn_tool_call_id: Some("spawn-call-1".into()),
                 recursion_depth: 1,
@@ -1673,9 +1810,11 @@ mod tests {
                 task: "review".into(),
                 system_prompt_addendum: String::new(),
                 model: Some("test-model".into()),
-                max_turns: 1,
+                initial_turns: 1,
+                hard_turn_limit: Some(1),
                 allowed_tools: Vec::new(),
                 read_only: true,
+                workspace_mutation: Default::default(),
                 working_dir: PathBuf::from("/tmp"),
                 mailbox: None,
                 progress_emitter: None,
@@ -1690,6 +1829,7 @@ mod tests {
                 execution_metadata: None,
                 is_fork_child: false,
                 delegation_chain: Vec::new(),
+                work_item: None,
             })
             .await
             .expect_err("token provider panic should fail execute");
@@ -1728,6 +1868,7 @@ mod tests {
         let result = executor
             .execute(SpawnRunConfig {
                 run_id: "run-live-output".into(),
+                cancellation_binding_id: "test-run-live-output-binding".into(),
                 agent_id: "reviewer@run-live-output".into(),
                 spawn_tool_call_id: Some("call-spawn-live".into()),
                 recursion_depth: 1,
@@ -1736,9 +1877,11 @@ mod tests {
                 task: "Return one concise finding.".into(),
                 system_prompt_addendum: String::new(),
                 model: Some("mock-model".into()),
-                max_turns: 1,
+                initial_turns: 1,
+                hard_turn_limit: Some(1),
                 allowed_tools: Vec::new(),
                 read_only: true,
+                workspace_mutation: Default::default(),
                 working_dir: std::env::temp_dir(),
                 mailbox: None,
                 progress_emitter: None,
@@ -1753,6 +1896,7 @@ mod tests {
                 execution_metadata: None,
                 is_fork_child: false,
                 delegation_chain: Vec::new(),
+                work_item: None,
             })
             .await
             .expect("spawned run");
@@ -1791,8 +1935,13 @@ mod tests {
         let system_prompt = "You are a child agent.";
         let child_task = "Reply: inherited-ok";
 
-        let messages =
-            build_child_messages(system_prompt, Some(&prefix_messages), child_task, false);
+        let messages = build_child_messages(
+            system_prompt,
+            Some(&prefix_messages),
+            child_task,
+            false,
+            "child-run-1",
+        );
 
         // After system, the messages should NOT have two consecutive user roles.
         let non_system: Vec<&str> = messages
@@ -1821,7 +1970,13 @@ mod tests {
             json!({"role": "assistant", "content": "", "tool_calls": [{"id": "1", "function": {"name": "bash", "arguments": "{}"}}]}),
             json!({"role": "tool", "tool_call_id": "1", "content": "done"}),
         ];
-        let messages = build_child_messages("system", Some(&prefix_messages), "child task", false);
+        let messages = build_child_messages(
+            "system",
+            Some(&prefix_messages),
+            "child task",
+            false,
+            "child-run-1",
+        );
 
         let non_system: Vec<&str> = messages
             .iter()
@@ -1849,7 +2004,13 @@ mod tests {
             json!({"role": "user", "content": "hi"}),
             json!({"role": "assistant", "content": "hello"}),
         ];
-        let messages = build_child_messages("ignored", Some(&prefix_messages), "child task", false);
+        let messages = build_child_messages(
+            "ignored",
+            Some(&prefix_messages),
+            "child task",
+            false,
+            "child-run-1",
+        );
 
         // Fork mode: prefix verbatim + child task. No bridge needed
         // because prefix ends with assistant → child task (user) is valid.
@@ -1871,9 +2032,55 @@ mod tests {
             }),
             json!({"role": "tool", "tool_call_id": "1", "content": "done"}),
         ];
-        let messages = build_child_messages("system", Some(&prefix_messages), "child task", true);
+        let messages = build_child_messages(
+            "system",
+            Some(&prefix_messages),
+            "child task",
+            true,
+            "child-run-1",
+        );
         assert_eq!(messages[1]["reasoning_content"], "");
         assert_eq!(messages[3]["role"], "assistant");
         assert_eq!(messages[3]["reasoning_content"], "");
+    }
+
+    #[test]
+    fn child_bridge_identity_marks_only_the_current_task_suffix() {
+        let mut inherited_user = json!({"role": "user", "content": "parent task"});
+        assert!(astra_turn_types::mark_bridge_turn_message(
+            &mut inherited_user,
+            "parent-run"
+        ));
+        let prefix_messages = vec![
+            inherited_user,
+            json!({"role": "assistant", "content": "parent answer"}),
+        ];
+
+        let messages = build_child_messages(
+            "ignored",
+            Some(&prefix_messages),
+            "child task",
+            false,
+            "child-run",
+        );
+
+        let provenances = messages
+            .iter()
+            .map(|message| {
+                astra_turn_types::bridge_turn_message_provenance(message)
+                    .expect("producer-owned provenance must be valid")
+                    .map(|provenance| provenance.turn_chain_id)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            provenances,
+            vec![Some("parent-run".into()), None, Some("child-run".into())]
+        );
+        assert_eq!(
+            messages
+                .last()
+                .and_then(|message| message["content"].as_str()),
+            Some("child task")
+        );
     }
 }

@@ -4,7 +4,6 @@ use crate::server::run::lifecycle::{AgenticRunLifecycleService, ServerSubRunExec
 pub(super) async fn build_runtime_wiring(
     settings: &AppSettings,
     shared_pool: &SharedPool,
-    lease_hold_cache: &Arc<TaskLeaseHoldCache>,
     run_encryptor: &Arc<FernetTokenEncryptor>,
     state: &AppState,
 ) -> Result<RuntimeWiring, Box<dyn std::error::Error>> {
@@ -36,12 +35,8 @@ pub(super) async fn build_runtime_wiring(
         delegation_tracker.clone(),
     ));
     let matrix_rt = Arc::new(
-        crate::matrix_cloud_runtime::MatrixCloudRuntime::attach(
-            shared_pool.clone(),
-            "default",
-            Arc::clone(lease_hold_cache),
-        )
-        .with_encryptor(Arc::clone(run_encryptor)),
+        crate::matrix_cloud_runtime::MatrixCloudRuntime::attach(shared_pool.clone(), "default")
+            .with_encryptor(Arc::clone(run_encryptor)),
     );
     let memory_extraction_service = matrix_rt.clone_memory_extraction_service();
     let workspace_record_store = Arc::new(astra_services::DatabaseWorkspaceRecordStore::new(

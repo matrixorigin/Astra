@@ -49,6 +49,11 @@ pub struct AgenticPostToolPolicyRequest<'a> {
     pub step_recorder: &'a mut StepRecorder,
     pub current_user_id: Option<&'a String>,
     pub current_session_id: Option<&'a String>,
+    /// Sticky workspace safety state that must accompany any warning-driven
+    /// heavy checkpoint written by this policy.  The policy is not an
+    /// authority source; it only preserves the runtime's existing state.
+    pub workspace_observation_quarantine:
+        Option<&'a astra_pipeline::step_protocol::WorkspaceObservationQuarantineV1>,
     pub max_turns: usize,
     pub recent_tools: &'a [String],
     pub last_heavy_checkpoint: &'a mut Option<StepCheckpoint>,
@@ -90,6 +95,7 @@ pub fn apply_agentic_post_tool_policy(
         step_recorder,
         current_user_id,
         current_session_id,
+        workspace_observation_quarantine,
         max_turns,
         recent_tools,
         last_heavy_checkpoint,
@@ -168,24 +174,39 @@ pub fn apply_agentic_post_tool_policy(
             verdict.injections.len(),
         );
 
+        // Ordinary tool completion is already journaled and receives a
+        // terminal heavy checkpoint from the runtime. A durable, fsync-backed
+        // full-message checkpoint after every healthy tool round turns an
+        // O(rounds) transcript into O(rounds²) serialized bytes. Persist here
+        // only when the policy discovered material recovery evidence; healthy
+        // and informational observations do not define a new recovery boundary.
         let checkpoint_blocked_tools = checkpoint_blocked_tools(restricted_tools);
-        if let Some(sid) = current_session_id
-            && let Some(heavy) = step_recorder.build_heavy_checkpoint(
-                messages,
+        if verdict.severity >= VerdictSeverity::Warning
+            && let Some(sid) = current_session_id
+        {
+            let checkpoint_messages =
+                crate::runtime_scaffolding::sanitize_durable_message_values(messages.clone());
+            if let Some(heavy) = step_recorder.build_heavy_checkpoint(
+                &checkpoint_messages,
                 0,
                 (*remaining_turns).min(max_turns) as u32,
                 &checkpoint_blocked_tools,
                 recent_tools,
-            )
-        {
-            let cp = StepCheckpoint::Heavy(Box::new(heavy));
-            let _ = step_checkpoint::write_step_checkpoint(
-                current_user_id.map(|s| s.as_str()).unwrap_or(""),
-                sid,
-                step_recorder.summary().checkpoints,
-                &cp,
-            );
-            *last_heavy_checkpoint = Some(cp);
+            ) {
+                let cp = StepCheckpoint::Heavy(Box::new(heavy));
+                let mut cp = cp;
+                if let StepCheckpoint::Heavy(heavy) = &mut cp {
+                    heavy.workspace_observation_quarantine =
+                        workspace_observation_quarantine.cloned();
+                }
+                let _ = step_checkpoint::write_step_checkpoint(
+                    current_user_id.map(|s| s.as_str()).unwrap_or(""),
+                    sid,
+                    step_recorder.summary().checkpoints,
+                    &cp,
+                );
+                *last_heavy_checkpoint = Some(cp);
+            }
         }
 
         // The threshold remains observable in verdict events and checkpoints,
@@ -279,7 +300,8 @@ mod tests {
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
-        let mut step_recorder = StepRecorder::with_persistence("uid", "sid", "tid");
+        let mut step_recorder =
+            StepRecorder::with_persistence_for_run("uid", "sid", "tid", "test-run");
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
 
@@ -293,6 +315,7 @@ mod tests {
             step_recorder: &mut step_recorder,
             current_user_id: None,
             current_session_id: None,
+            workspace_observation_quarantine: None,
             max_turns: 8,
             recent_tools: &[],
             last_heavy_checkpoint: &mut last_heavy_checkpoint,
@@ -300,6 +323,57 @@ mod tests {
         });
 
         assert!(proceed_advisories(out).is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial(session_journal_dir)]
+    fn healthy_rounds_do_not_multiply_heavy_checkpoint_storage() {
+        let sessions_dir = tempfile::tempdir().expect("temporary session journal");
+        let _journal_guard =
+            astra_services::session_journal::JournalDirGuard::new(sessions_dir.path());
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        let user_id = format!("uid-{suffix}");
+        let session_id = format!("healthy-checkpoint-{suffix}");
+        let mut messages = vec![json!({"role": "user", "content": "inspect"})];
+        let mut verdict_events = Vec::new();
+        let mut restricted_tools = HashSet::new();
+        let mut remaining_turns = 128usize;
+        let mut step_recorder =
+            StepRecorder::with_persistence_for_run(&user_id, &session_id, "tid", "test-run");
+        step_recorder.begin_turn(0);
+        let mut last_heavy_checkpoint = None;
+        let mut turn_guard = TurnGuard::new();
+
+        for turn_index in 0..64 {
+            let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
+                turn_index,
+                messages: &mut messages,
+                turn_guard: &mut turn_guard,
+                verdict_events: &mut verdict_events,
+                restricted_tools: &mut restricted_tools,
+                remaining_turns: &mut remaining_turns,
+                step_recorder: &mut step_recorder,
+                current_user_id: Some(&user_id),
+                current_session_id: Some(&session_id),
+                workspace_observation_quarantine: None,
+                max_turns: 128,
+                recent_tools: &[],
+                last_heavy_checkpoint: &mut last_heavy_checkpoint,
+                interaction_mode: TurnInteractionMode::Prompt,
+            });
+            assert!(proceed_advisories(out).is_empty());
+        }
+
+        assert!(last_heavy_checkpoint.is_none());
+        assert!(
+            astra_pipeline::step_checkpoint::list_checkpoints(&user_id, &session_id)
+                .expect("checkpoint listing")
+                .is_empty(),
+            "healthy tool cadence is journal evidence, not 64 durable transcript copies"
+        );
     }
 
     #[test]
@@ -356,7 +430,8 @@ mod tests {
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
-        let mut step_recorder = StepRecorder::with_persistence("uid", "sid", "tid");
+        let mut step_recorder =
+            StepRecorder::with_persistence_for_run("uid", "sid", "tid", "test-run");
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
         let tool_calls = vec![
@@ -366,7 +441,6 @@ mod tests {
         turn_guard.record_tool_calls(&tool_calls);
         turn_guard.record_tool_result("read_file", "fn main() {}");
         turn_guard.record_tool_result("read_file", "fn main() {}");
-
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
             turn_index: 0,
             messages: &mut messages,
@@ -377,6 +451,7 @@ mod tests {
             step_recorder: &mut step_recorder,
             current_user_id: None,
             current_session_id: None,
+            workspace_observation_quarantine: None,
             max_turns: 8,
             recent_tools: &[],
             last_heavy_checkpoint: &mut last_heavy_checkpoint,
@@ -401,7 +476,11 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(session_journal_dir)]
     fn warning_checkpoint_preserves_configured_remaining_turns() {
+        let sessions_dir = tempfile::tempdir().expect("temporary session journal");
+        let _journal_guard =
+            astra_services::session_journal::JournalDirGuard::new(sessions_dir.path());
         let mut messages = vec![json!({"role": "user", "content": "inspect the code"})];
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
@@ -412,7 +491,8 @@ mod tests {
             .as_nanos();
         let user_id = format!("uid-{suffix}");
         let session_id = format!("post-tool-policy-{suffix}");
-        let mut step_recorder = StepRecorder::with_persistence(&user_id, &session_id, "tid");
+        let mut step_recorder =
+            StepRecorder::with_persistence_for_run(&user_id, &session_id, "tid", "test-run");
         step_recorder.begin_turn(0);
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
@@ -423,6 +503,10 @@ mod tests {
         turn_guard.record_tool_calls(&tool_calls);
         turn_guard.record_tool_result("read_file", "fn main() {}");
         turn_guard.record_tool_result("read_file", "fn main() {}");
+        let quarantine =
+            astra_pipeline::step_protocol::WorkspaceObservationQuarantineV1::weak_process_ownership(
+                Some("warning-call".into()),
+            );
 
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {
             turn_index: 0,
@@ -434,6 +518,7 @@ mod tests {
             step_recorder: &mut step_recorder,
             current_user_id: Some(&user_id),
             current_session_id: Some(&session_id),
+            workspace_observation_quarantine: Some(&quarantine),
             max_turns: 20,
             recent_tools: &["read_file".to_string()],
             last_heavy_checkpoint: &mut last_heavy_checkpoint,
@@ -454,15 +539,32 @@ mod tests {
             heavy.budget_remaining_rounds, 10,
             "behavioral warning must not apply hidden budget penalties"
         );
+        assert_eq!(
+            heavy.workspace_observation_quarantine,
+            Some(quarantine),
+            "warning checkpoint must not erase sticky workspace quarantine"
+        );
     }
 
     #[test]
+    #[serial_test::serial(session_journal_dir)]
     fn cache_waste_info_records_without_retry_or_restriction() {
+        let sessions_dir = tempfile::tempdir().expect("temporary session journal");
+        let _journal_guard =
+            astra_services::session_journal::JournalDirGuard::new(sessions_dir.path());
         let mut messages = Vec::new();
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
-        let mut step_recorder = StepRecorder::with_persistence("uid", "sid", "tid");
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_nanos();
+        let user_id = format!("uid-{suffix}");
+        let session_id = format!("info-checkpoint-{suffix}");
+        let mut step_recorder =
+            StepRecorder::with_persistence_for_run(&user_id, &session_id, "tid", "test-run");
+        step_recorder.begin_turn(0);
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
         turn_guard.record_cache_hit("read_file");
@@ -477,8 +579,9 @@ mod tests {
             restricted_tools: &mut restricted_tools,
             remaining_turns: &mut remaining_turns,
             step_recorder: &mut step_recorder,
-            current_user_id: None,
-            current_session_id: None,
+            current_user_id: Some(&user_id),
+            current_session_id: Some(&session_id),
+            workspace_observation_quarantine: None,
             max_turns: 8,
             recent_tools: &[],
             last_heavy_checkpoint: &mut last_heavy_checkpoint,
@@ -498,6 +601,15 @@ mod tests {
         assert_eq!(remaining_turns, 10);
         assert_eq!(verdict_events.len(), 1);
         assert_eq!(verdict_events[0].severity, "info");
+        assert!(
+            last_heavy_checkpoint.is_none(),
+            "informational observations are not durable recovery boundaries"
+        );
+        assert!(
+            astra_pipeline::step_checkpoint::list_checkpoints(&user_id, &session_id)
+                .expect("checkpoint listing")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -506,7 +618,8 @@ mod tests {
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
-        let mut step_recorder = StepRecorder::with_persistence("uid", "sid", "tid");
+        let mut step_recorder =
+            StepRecorder::with_persistence_for_run("uid", "sid", "tid", "test-run");
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
         let tool_calls = vec![
@@ -526,6 +639,7 @@ mod tests {
             step_recorder: &mut step_recorder,
             current_user_id: None,
             current_session_id: None,
+            workspace_observation_quarantine: None,
             max_turns: 8,
             recent_tools: &[],
             last_heavy_checkpoint: &mut last_heavy_checkpoint,
@@ -564,7 +678,8 @@ mod tests {
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
-        let mut step_recorder = StepRecorder::with_persistence("uid", "sid", "tid");
+        let mut step_recorder =
+            StepRecorder::with_persistence_for_run("uid", "sid", "tid", "test-run");
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
         // Drive the guard to a first-Critical verdict using only public API:
@@ -589,6 +704,7 @@ mod tests {
             step_recorder: &mut step_recorder,
             current_user_id: None,
             current_session_id: None,
+            workspace_observation_quarantine: None,
             max_turns: 8,
             recent_tools: &[],
             last_heavy_checkpoint: &mut last_heavy_checkpoint,
@@ -622,7 +738,8 @@ mod tests {
         let mut verdict_events = Vec::new();
         let mut restricted_tools = HashSet::new();
         let mut remaining_turns = 10usize;
-        let mut step_recorder = StepRecorder::with_persistence("uid", "sid", "tid");
+        let mut step_recorder =
+            StepRecorder::with_persistence_for_run("uid", "sid", "tid", "test-run");
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
         for _ in 0..3 {
@@ -639,6 +756,7 @@ mod tests {
             step_recorder: &mut step_recorder,
             current_user_id: None,
             current_session_id: None,
+            workspace_observation_quarantine: None,
             max_turns: 8,
             recent_tools: &[],
             last_heavy_checkpoint: &mut last_heavy_checkpoint,

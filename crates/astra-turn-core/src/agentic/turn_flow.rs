@@ -62,7 +62,11 @@ mod tests {
 
     #[test]
     fn stall_preflight_records_canonical_tool_calls() {
-        let server = vec![json!({"id":"1","name":"bash","arguments":{}})];
+        let server = vec![json!({
+            "id": "1",
+            "type": "function",
+            "function": {"name": "bash", "arguments": "{}"}
+        })];
         let edge: Vec<Row> = vec![];
         let mut turn_sigs = Vec::new();
         let mut turn_tool_names = Vec::new();

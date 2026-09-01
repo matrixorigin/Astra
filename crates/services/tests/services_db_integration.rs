@@ -40,14 +40,13 @@ use astra_services::{
     DatabaseMarketplaceService, DatabaseMarketplaceStatsService, DatabaseReflectService,
     DatabaseReplayService, DatabaseSessionArtifactStore, DatabaseSessionContextCoordinator,
     DatabaseSessionService, DatabaseSkillService, DatabaseStateProjectionStore,
-    DecisionCreateRequestData, DecisionListFilter, DecisionService, DurableTaskLifecycle,
-    EventCreateRequestData, EventListFilter, EventService, IntrospectionService,
-    MAX_API_LIST_LIMIT, MarketplaceService, MarketplaceStatsService, MatrixOneDurableTaskLifecycle,
-    MatrixOneSyncService, ReflectService, ReplayService, ReserveTurnOutcome, RetrievalStage,
-    SessionArtifactJsonStore, SessionArtifactReference, SessionArtifactReferenceKind,
-    SessionArtifactStore, SessionArtifactStoreError, SessionContextCoordinator,
-    SessionContextCoordinatorError, SessionListFilter, SessionService, SkillSearchQuery,
-    SkillService, SnapshotCreateRequestData, SnapshotListFilter,
+    DecisionCreateRequestData, DecisionListFilter, DecisionService, EventCreateRequestData,
+    EventListFilter, EventService, IntrospectionService, MAX_API_LIST_LIMIT, MarketplaceService,
+    MarketplaceStatsService, MatrixOneSyncService, ReflectService, ReplayService,
+    ReserveTurnOutcome, RetrievalStage, SessionArtifactJsonStore, SessionArtifactReference,
+    SessionArtifactReferenceKind, SessionArtifactStore, SessionArtifactStoreError,
+    SessionContextCoordinator, SessionContextCoordinatorError, SessionListFilter, SessionService,
+    SkillSearchQuery, SkillService, SnapshotCreateRequestData, SnapshotListFilter,
 };
 use astra_turn_types::{
     ActorContextV1, ActorKindV1, AuthorityEpochsV1, SessionKeyV1, SessionSurfaceV1,
@@ -1191,20 +1190,6 @@ async fn cleanup_session_delete_fixture_for_owner(
     .await;
 
     let _ = sqlx::query(
-        "DELETE FROM task_leases \
-         WHERE user_id = ? \
-           AND task_id IN (
-               SELECT task_id FROM agent_tasks
-               WHERE session_id = ? AND user_id = ?
-           )",
-    )
-    .bind(user_id)
-    .bind(session_id)
-    .bind(user_id)
-    .execute(pool)
-    .await;
-
-    let _ = sqlx::query(
         "DELETE FROM user_skill_evaluations \
          WHERE (owner_user_id, run_id) IN (
              SELECT user_id, run_id FROM agent_runs
@@ -1242,14 +1227,11 @@ async fn cleanup_session_delete_fixture_for_owner(
         "transcript_pages",
         "session_artifacts_grants",
         "session_artifacts",
-        "session_todo_counters",
-        "session_todo_idempotency",
         "eval_calibration_assessments",
         "conversation_log",
         "agent_event_edges",
         "agent_events",
         "harness_runs",
-        "agent_tasks",
         "agent_session_execution_slots",
         "agent_runs",
         "agent_sessions",
@@ -1373,31 +1355,6 @@ fn create_owner_local_session_files(
     std::fs::write(&owner_checkpoint_path, "{}").expect("write owner checkpoint");
     std::fs::write(&owner_artifact_path, "{}").expect("write owner artifact");
     (owner_journal_path, owner_session_dir)
-}
-
-async fn cleanup_task_contract_and_results(
-    pool: &sqlx::Pool<sqlx::MySql>,
-    user_id: &str,
-    task_id: &str,
-    result_ids: &[String],
-) {
-    for rid in result_ids {
-        let _ = sqlx::query("DELETE FROM verification_results WHERE user_id = ? AND result_id = ?")
-            .bind(user_id)
-            .bind(rid)
-            .execute(pool)
-            .await;
-    }
-    let _ = sqlx::query("DELETE FROM verification_results WHERE user_id = ? AND task_id = ?")
-        .bind(user_id)
-        .bind(task_id)
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("DELETE FROM task_contracts WHERE user_id = ? AND task_id = ?")
-        .bind(user_id)
-        .bind(task_id)
-        .execute(pool)
-        .await;
 }
 
 async fn cleanup_restore_fixture_for_owner(
@@ -1669,38 +1626,256 @@ async fn add_agent_session_event_count_or_create_is_owner_bound_delta_upsert() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn replay_session_uses_session_event_count_summary_without_event_scan() {
+async fn replay_routes_fail_closed_without_durable_reconstruction() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
 
     let session_id = Uuid::new_v4().to_string();
-    let user_id = Uuid::new_v4().to_string();
-    cleanup_restore_fixture_for_owner(&pool, &user_id, std::slice::from_ref(&session_id)).await;
+    let owner_user_id = Uuid::new_v4().to_string();
+    let foreign_user_id = Uuid::new_v4().to_string();
+    let original_event_id = Uuid::new_v4().to_string();
+    cleanup_restore_fixture_for_owner(&pool, &owner_user_id, std::slice::from_ref(&session_id))
+        .await;
+    cleanup_restore_fixture_for_owner(&pool, &foreign_user_id, std::slice::from_ref(&session_id))
+        .await;
     sqlx::query(
         "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
          VALUES (?, ?, 'replay-summary-count', 'active', 7)",
     )
     .bind(&session_id)
-    .bind(&user_id)
+    .bind(&owner_user_id)
     .execute(&pool)
     .await
     .expect("insert session root");
     sqlx::query(
         "INSERT INTO agent_events (event_id, session_id, user_id, event_type, content, causal_chain_id) \
-         VALUES (?, ?, ?, 'raw_event', 'not authoritative for replay count', ?)",
+         VALUES (?, ?, ?, 'raw_event', 'original event must remain unchanged', ?)",
     )
-    .bind(Uuid::new_v4().to_string())
+    .bind(&original_event_id)
     .bind(&session_id)
-    .bind(&user_id)
+    .bind(&owner_user_id)
     .bind(Uuid::new_v4().to_string())
     .execute(&pool)
     .await
     .expect("insert raw event row");
 
-    let replay = DatabaseReplayService::new(settings)
-        .with_pool(shared)
+    let session_before =
+        sqlx::query("SELECT event_count FROM agent_sessions WHERE session_id = ? AND user_id = ?")
+            .bind(&session_id)
+            .bind(&owner_user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("session before replay guardrail");
+    let event_before = sqlx::query(
+        "SELECT event_id, event_type, content FROM agent_events \
+         WHERE event_id = ? AND session_id = ? AND user_id = ?",
+    )
+    .bind(&original_event_id)
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("original event before replay guardrail");
+    let replay_rows_before: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events \
+         WHERE session_id = ? AND user_id = ? AND event_type = 'replay'",
+    )
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("replay rows before guardrail");
+    assert_eq!(replay_rows_before, 0);
+
+    let replay_service = DatabaseReplayService::new(settings).with_pool(shared);
+    for mock_mode in [true, false] {
+        let (status, body) = replay_service
+            .replay_session(
+                owner_user_id.clone(),
+                session_id.clone(),
+                ReplaySessionRequestData {
+                    sandbox_name: Some("must-not-run".into()),
+                    mock_mode,
+                },
+            )
+            .await
+            .expect_err("owned replay must fail closed");
+        assert_eq!(status, axum::http::StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            body.0.detail.contains("replay") && body.0.detail.contains("unavailable"),
+            "owned replay detail should explain the unavailable capability: {:?}",
+            body.0.detail
+        );
+    }
+
+    for _ in 0..2 {
+        let (status, body) = replay_service
+            .compare_replay(owner_user_id.clone(), session_id.clone())
+            .await
+            .expect_err("owned replay comparison must fail closed");
+        assert_eq!(status, axum::http::StatusCode::NOT_IMPLEMENTED);
+        assert!(
+            body.0.detail.contains("replay") && body.0.detail.contains("unavailable"),
+            "owned comparison detail should explain the unavailable capability: {:?}",
+            body.0.detail
+        );
+    }
+
+    let missing_session_id = Uuid::new_v4().to_string();
+    for result in [
+        replay_service
+            .replay_session(
+                owner_user_id.clone(),
+                missing_session_id.clone(),
+                ReplaySessionRequestData {
+                    sandbox_name: None,
+                    mock_mode: true,
+                },
+            )
+            .await
+            .map(|_| ()),
+        replay_service
+            .compare_replay(owner_user_id.clone(), missing_session_id)
+            .await
+            .map(|_| ()),
+        replay_service
+            .replay_session(
+                foreign_user_id.clone(),
+                session_id.clone(),
+                ReplaySessionRequestData {
+                    sandbox_name: None,
+                    mock_mode: false,
+                },
+            )
+            .await
+            .map(|_| ()),
+        replay_service
+            .compare_replay(foreign_user_id, session_id.clone())
+            .await
+            .map(|_| ()),
+    ] {
+        assert_eq!(
+            result
+                .expect_err("missing or foreign replay must be owner-oblivious")
+                .0,
+            axum::http::StatusCode::NOT_FOUND
+        );
+    }
+
+    let session_after =
+        sqlx::query("SELECT event_count FROM agent_sessions WHERE session_id = ? AND user_id = ?")
+            .bind(&session_id)
+            .bind(&owner_user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("session after replay guardrail");
+    let event_after = sqlx::query(
+        "SELECT event_id, event_type, content FROM agent_events \
+         WHERE event_id = ? AND session_id = ? AND user_id = ?",
+    )
+    .bind(&original_event_id)
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("original event after replay guardrail");
+    let replay_rows_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events \
+         WHERE session_id = ? AND user_id = ? AND event_type = 'replay'",
+    )
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("replay rows after guardrail");
+
+    assert_eq!(
+        session_before.try_get::<i64, _>("event_count").unwrap(),
+        session_after.try_get::<i64, _>("event_count").unwrap(),
+        "owned replay guardrails must not mutate agent_sessions.event_count"
+    );
+    for column in ["event_id", "event_type", "content"] {
+        assert_eq!(
+            event_before.try_get::<String, _>(column).unwrap(),
+            event_after.try_get::<String, _>(column).unwrap(),
+            "owned replay guardrails must not mutate original event column {column}"
+        );
+    }
+    assert_eq!(
+        replay_rows_after, 0,
+        "replay guardrails must not write replay rows"
+    );
+
+    cleanup_restore_fixture_for_owner(&pool, &owner_user_id, &[session_id]).await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn replay_session_missing_or_foreign_remains_owner_oblivious() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+
+    let session_id = Uuid::new_v4().to_string();
+    let owner_user_id = Uuid::new_v4().to_string();
+    let foreign_user_id = Uuid::new_v4().to_string();
+    cleanup_restore_fixture_for_owner(&pool, &owner_user_id, std::slice::from_ref(&session_id))
+        .await;
+    sqlx::query(
+        "INSERT INTO agent_sessions (session_id, user_id, title, status, event_count) \
+         VALUES (?, ?, 'replay-owner-oblivious', 'active', 0)",
+    )
+    .bind(&session_id)
+    .bind(&owner_user_id)
+    .execute(&pool)
+    .await
+    .expect("insert owner session");
+
+    let replay_service = DatabaseReplayService::new(settings).with_pool(shared);
+    let empty_owner_replay = replay_service
         .replay_session(
-            user_id.clone(),
+            owner_user_id.clone(),
+            session_id.clone(),
+            ReplaySessionRequestData {
+                sandbox_name: Some("must-not-run-empty".into()),
+                mock_mode: true,
+            },
+        )
+        .await
+        .expect_err("owned empty replay must fail closed");
+    assert_eq!(
+        empty_owner_replay.0,
+        axum::http::StatusCode::NOT_IMPLEMENTED
+    );
+    assert!(
+        empty_owner_replay
+            .1
+            .0
+            .detail
+            .contains("replay is unavailable"),
+        "owned empty replay should explain the unavailable capability: {:?}",
+        empty_owner_replay.1.0.detail
+    );
+    let empty_owner_compare = replay_service
+        .compare_replay(owner_user_id.clone(), session_id.clone())
+        .await
+        .expect_err("owned empty comparison must fail closed");
+    assert_eq!(
+        empty_owner_compare.0,
+        axum::http::StatusCode::NOT_IMPLEMENTED
+    );
+    assert!(
+        empty_owner_compare
+            .1
+            .0
+            .detail
+            .contains("replay is unavailable"),
+        "owned empty comparison should explain the unavailable capability: {:?}",
+        empty_owner_compare.1.0.detail
+    );
+
+    let replay_result = replay_service
+        .replay_session(
+            foreign_user_id.clone(),
             session_id.clone(),
             ReplaySessionRequestData {
                 sandbox_name: None,
@@ -1708,14 +1883,34 @@ async fn replay_session_uses_session_event_count_summary_without_event_scan() {
             },
         )
         .await
-        .expect("replay session");
+        .expect_err("foreign replay must be hidden");
+    assert_eq!(replay_result.0, axum::http::StatusCode::NOT_FOUND);
+    let compare_result = replay_service
+        .compare_replay(foreign_user_id, session_id.clone())
+        .await
+        .expect_err("foreign comparison must be hidden");
+    assert_eq!(compare_result.0, axum::http::StatusCode::NOT_FOUND);
 
-    assert_eq!(
-        replay.events_replayed, 7,
-        "replay should use the owner-bound agent_sessions.event_count summary, not COUNT(agent_events)"
-    );
+    let missing_session_id = Uuid::new_v4().to_string();
+    let missing_replay_result = replay_service
+        .replay_session(
+            owner_user_id.clone(),
+            missing_session_id.clone(),
+            ReplaySessionRequestData {
+                sandbox_name: None,
+                mock_mode: false,
+            },
+        )
+        .await
+        .expect_err("missing replay must be hidden");
+    assert_eq!(missing_replay_result.0, axum::http::StatusCode::NOT_FOUND);
+    let missing_compare_result = replay_service
+        .compare_replay(owner_user_id.clone(), missing_session_id)
+        .await
+        .expect_err("missing comparison must be hidden");
+    assert_eq!(missing_compare_result.0, axum::http::StatusCode::NOT_FOUND);
 
-    cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id]).await;
+    cleanup_restore_fixture_for_owner(&pool, &owner_user_id, &[session_id]).await;
 }
 
 #[tokio::test]
@@ -1749,10 +1944,6 @@ async fn concurrent_push_session_state_preserves_single_owner_metadata() {
                 .push_session_state(
                     &session_id,
                     &user_a,
-                    None,
-                    Some("owner A plan"),
-                    None,
-                    1,
                     Some("owner-a-branch"),
                     Some("gpt-5.4-owner-a"),
                 )
@@ -1773,10 +1964,6 @@ async fn concurrent_push_session_state_preserves_single_owner_metadata() {
                 .push_session_state(
                     &session_id,
                     &user_b,
-                    None,
-                    Some("owner B plan"),
-                    None,
-                    1,
                     Some("owner-b-branch"),
                     Some("gpt-5.4-owner-b"),
                 )
@@ -3861,251 +4048,6 @@ async fn session_audit_cost_uses_canonical_events_and_active_model_pricing() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn durable_task_resume_loads_verification_history_from_db() {
-    let (shared, _settings) = setup_pool_and_settings().await;
-    let pool = shared.get().clone();
-
-    let user_id = Uuid::new_v4().to_string();
-    let session_id = Uuid::new_v4().to_string();
-    let resume_session_id = Uuid::new_v4().to_string();
-    let foreign_user_id = Uuid::new_v4().to_string();
-    let contract_id = Uuid::new_v4().to_string();
-    let foreign_contract_id = contract_id.clone();
-    let stale_contract_id = Uuid::new_v4().to_string();
-    let task_id = Uuid::new_v4().to_string();
-    let r1 = Uuid::new_v4().to_string();
-    let r2 = Uuid::new_v4().to_string();
-    let foreign_result_id = Uuid::new_v4().to_string();
-    let stale_result_id = Uuid::new_v4().to_string();
-    let result_ids = vec![
-        r1.clone(),
-        r2.clone(),
-        foreign_result_id.clone(),
-        stale_result_id.clone(),
-    ];
-
-    cleanup_task_contract_and_results(&pool, &user_id, &task_id, &result_ids).await;
-    cleanup_task_contract_and_results(&pool, &foreign_user_id, &task_id, &result_ids).await;
-
-    let subtasks_json = serde_json::json!([{
-        "id": "sub-it",
-        "title": "Subtask",
-        "stage": {"state": "executing"},
-        "criteria": [{
-            "id": "c1",
-            "description": "d",
-            "verifier": {"kind": "file_exists", "paths": ["README.md"]},
-            "required": true,
-            "timeout_sec": 120,
-            "global_only": false
-        }],
-        "max_retries": 2,
-        "retry_count": 0,
-        "depends_on": [],
-        "files": []
-    }])
-    .to_string();
-
-    sqlx::query(
-        "INSERT INTO task_contracts \
-         (contract_id, task_id, session_id, user_id, goal, scope_json, subtasks_json, criteria_json, \
-          version, status, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, 'it-goal', CAST(? AS JSON), ?, CAST('[]' AS JSON), 1, 'active', NOW(), NOW())",
-    )
-    .bind(&contract_id)
-    .bind(&task_id)
-    .bind(&session_id)
-    .bind(&user_id)
-    .bind(serde_json::json!({"in_scope": [], "out_of_scope": [], "assumptions": []}).to_string())
-    .bind(&subtasks_json)
-    .execute(&pool)
-    .await
-    .expect("insert task_contracts");
-    sqlx::query(
-        "INSERT INTO task_contracts \
-         (contract_id, task_id, session_id, user_id, goal, scope_json, subtasks_json, criteria_json, \
-          version, status, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, 'stale-goal', CAST(? AS JSON), ?, CAST('[]' AS JSON), 88, 'abandoned', NOW(), NOW())",
-    )
-    .bind(&stale_contract_id)
-    .bind(&task_id)
-    .bind(&session_id)
-    .bind(&user_id)
-    .bind(serde_json::json!({"in_scope": [], "out_of_scope": [], "assumptions": []}).to_string())
-    .bind(&subtasks_json)
-    .execute(&pool)
-    .await
-    .expect("insert stale same-user task_contracts");
-    sqlx::query(
-        "INSERT INTO task_contracts \
-         (contract_id, task_id, session_id, user_id, goal, scope_json, subtasks_json, criteria_json, \
-          version, status, created_at, updated_at) \
-         VALUES (?, ?, ?, ?, 'foreign-goal', CAST(? AS JSON), ?, CAST('[]' AS JSON), 99, 'active', NOW(), NOW())",
-    )
-    .bind(&foreign_contract_id)
-    .bind(&task_id)
-    .bind(&resume_session_id)
-    .bind(&foreign_user_id)
-    .bind(serde_json::json!({"in_scope": [], "out_of_scope": [], "assumptions": []}).to_string())
-    .bind(&subtasks_json)
-    .execute(&pool)
-    .await
-    .expect("insert foreign task_contracts");
-
-    for (rid, status, evidence, expected, dur, err, ts) in [
-        (
-            &r1,
-            "failed",
-            "ev1",
-            "ex1",
-            11_i32,
-            Some("err1"),
-            "2026-09-01 10:00:00.000000",
-        ),
-        (
-            &r2,
-            "passed",
-            "ev2",
-            "ex2",
-            22_i32,
-            None::<&str>,
-            "2026-09-01 10:01:00.000000",
-        ),
-    ] {
-        sqlx::query(
-            "INSERT INTO verification_results \
-             (result_id, contract_id, task_id, subtask_id, criterion_id, session_id, user_id, \
-              status, evidence, expected, duration_ms, error_message, created_at) \
-             VALUES (?, ?, ?, 'sub-it', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(rid)
-        .bind(&contract_id)
-        .bind(&task_id)
-        .bind(if *rid == r1 { "c-a" } else { "c-b" })
-        .bind(&session_id)
-        .bind(&user_id)
-        .bind(status)
-        .bind(evidence)
-        .bind(expected)
-        .bind(dur)
-        .bind(err)
-        .bind(ts)
-        .execute(&pool)
-        .await
-        .expect("insert verification_results");
-    }
-    sqlx::query(
-        "INSERT INTO verification_results \
-         (result_id, contract_id, task_id, subtask_id, criterion_id, session_id, user_id, \
-          status, evidence, expected, duration_ms, error_message, created_at) \
-         VALUES (?, ?, ?, 'sub-it', 'foreign-user-result', ?, ?, 'passed', 'foreign', 'foreign', 1, NULL, ?)",
-    )
-    .bind(&foreign_result_id)
-    .bind(&foreign_contract_id)
-    .bind(&task_id)
-    .bind(&resume_session_id)
-    .bind(&foreign_user_id)
-    .bind("2026-09-01 10:02:00.000000")
-    .execute(&pool)
-    .await
-    .expect("insert foreign verification_results");
-    sqlx::query(
-        "INSERT INTO verification_results \
-         (result_id, contract_id, task_id, subtask_id, criterion_id, session_id, user_id, \
-          status, evidence, expected, duration_ms, error_message, created_at) \
-         VALUES (?, ?, ?, 'sub-it', 'stale-contract-result', ?, ?, 'failed', 'stale', 'stale', 1, 'old', ?)",
-    )
-    .bind(&stale_result_id)
-    .bind(&stale_contract_id)
-    .bind(&task_id)
-    .bind(&session_id)
-    .bind(&user_id)
-    .bind("2026-09-01 10:03:00.000000")
-    .execute(&pool)
-    .await
-    .expect("insert stale verification_results");
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let unscoped_lifecycle =
-        MatrixOneDurableTaskLifecycle::from_shared(&shared, dir.path().to_path_buf());
-    let unscoped_error = match unscoped_lifecycle
-        .resume_task(&task_id, &resume_session_id)
-        .await
-    {
-        Ok(_) => panic!("resume_task without active user context should fail"),
-        Err(error) => error,
-    };
-    assert!(
-        unscoped_error
-            .message
-            .contains("requires MatrixOne durable task lifecycle user context"),
-        "unexpected unscoped resume error: {unscoped_error}"
-    );
-
-    let mut lifecycle =
-        MatrixOneDurableTaskLifecycle::from_shared(&shared, dir.path().to_path_buf());
-    lifecycle.set_session_context(&resume_session_id, &user_id);
-    let ctx = lifecycle
-        .resume_task(&task_id, &resume_session_id)
-        .await
-        .expect("resume_task");
-
-    assert_eq!(ctx.task_id, task_id);
-    assert_eq!(
-        ctx.contract.contract_id, contract_id,
-        "resume must load the active user's contract, not a higher-version foreign-owner row with the same contract_id"
-    );
-    assert_eq!(ctx.contract.goal, "it-goal");
-    // resume_task resets stuck Executing subtasks to Pending so they can be restarted.
-    assert_eq!(ctx.active_subtask, None, "no active subtask after reset");
-    assert_eq!(
-        ctx.contract.subtasks[0].stage.as_str(),
-        "pending",
-        "Executing subtask must be reset to Pending on resume"
-    );
-    assert!(
-        ctx.contract.subtasks[0].stage.can_start(),
-        "reset subtask must be restartable"
-    );
-    assert_eq!(
-        ctx.contract.version, 2,
-        "version must be bumped after reset (was 1 in DB)"
-    );
-    assert_eq!(ctx.verification_history.len(), 1);
-    let rep = &ctx.verification_history[0];
-    assert_eq!(rep.subtask_id, "sub-it");
-    assert!(!rep.all_required_passed);
-    assert_eq!(rep.results.len(), 2);
-    assert!(
-        rep.results
-            .iter()
-            .all(|r| r.criterion_id != "stale-contract-result"),
-        "resume history must be bounded by the active contract, not same-user same-task stale contracts"
-    );
-    assert_eq!(rep.results[0].criterion_id, "c-a");
-    assert!(!rep.results[0].passed);
-    assert_eq!(rep.results[0].evidence, "ev1");
-    assert_eq!(rep.results[0].expected, "ex1");
-    assert_eq!(rep.results[0].duration_ms, 11);
-    assert_eq!(rep.results[0].error.as_deref(), Some("err1"));
-    assert_eq!(rep.results[1].criterion_id, "c-b");
-    assert!(rep.results[1].passed);
-    assert_eq!(rep.results[1].evidence, "ev2");
-    assert_eq!(rep.results[1].expected, "ex2");
-    assert_eq!(rep.results[1].duration_ms, 22);
-    assert_eq!(rep.results[1].error, None);
-    assert!(
-        rep.timestamp.contains("2026-09-01 10:01"),
-        "timestamp last row: {}",
-        rep.timestamp
-    );
-
-    cleanup_task_contract_and_results(&pool, &user_id, &task_id, &result_ids).await;
-    cleanup_task_contract_and_results(&pool, &foreign_user_id, &task_id, &result_ids).await;
-}
-
-#[tokio::test]
-#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_metadata() {
     let (shared, _settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
@@ -4116,11 +4058,6 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
     let session_a = Uuid::new_v4().to_string();
     let session_b = Uuid::new_v4().to_string();
     let checkpoint_id = Uuid::new_v4().to_string();
-    let plan_a_json =
-        serde_json::json!({"subtasks":[{"id":"a1","title":"checkpoint"}]}).to_string();
-    let plan_a_config = serde_json::json!({"mode":"checkpoint"}).to_string();
-    let plan_b_json = serde_json::json!({"subtasks":[{"id":"b1","title":"fallback"}]}).to_string();
-    let plan_b_config = serde_json::json!({"mode":"resume"}).to_string();
     let existing_metadata_a =
         serde_json::json!({"agent_id":"astra-server","note":"keep me"}).to_string();
 
@@ -4142,34 +4079,17 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
     svc.push_session_state(
         &session_a,
         &user_id,
-        Some(&plan_a_json),
-        Some("finish session A"),
-        Some(&plan_a_config),
-        3,
         Some("feature/cloud-sync"),
         Some("gpt-5.4"),
     )
     .await
     .expect("push session state A");
-    svc.push_session_state(
-        &session_b,
-        &user_id,
-        Some(&plan_b_json),
-        Some("finish session B"),
-        Some(&plan_b_config),
-        2,
-        Some("legacy-fallback"),
-        None,
-    )
-    .await
-    .expect("push session state B");
+    svc.push_session_state(&session_b, &user_id, Some("legacy-fallback"), None)
+        .await
+        .expect("push session state B");
     svc.push_session_state(
         &session_a,
         &user_id,
-        None,
-        None,
-        None,
-        0,
         Some("feature/cloud-sync"),
         Some("gpt-5.4"),
     )
@@ -4417,10 +4337,6 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
         restored_a.last_context_trace.is_none(),
         "diagnostic context traces are not causal resume projections"
     );
-    assert!(restored_a.executing_plan_json.is_none());
-    assert!(restored_a.plan_goal.is_none());
-    assert!(restored_a.plan_config_json.is_none());
-    assert_eq!(restored_a.plan_execution_rounds, 0);
 
     let restored_b = restore
         .restore_session(&user_id, &session_b)
@@ -4445,13 +4361,6 @@ async fn session_restore_cloud_roundtrip_separates_causal_resume_from_picker_met
         restored_b.model.is_none(),
         "an event-level model observation without the selected cursor cannot bind the next request"
     );
-    assert!(
-        restored_b.executing_plan_json.is_none(),
-        "uncursored session metadata cannot become active task state"
-    );
-    assert!(restored_b.plan_goal.is_none());
-    assert!(restored_b.plan_config_json.is_none());
-    assert_eq!(restored_b.plan_execution_rounds, 0);
 
     let resumable = restore
         .list_resumable_sessions(&user_id)
@@ -4496,10 +4405,6 @@ async fn session_restore_turn_count_uses_turn_seq_high_watermark() {
     sync.push_session_state(
         &session_id,
         &user_id,
-        None,
-        None,
-        None,
-        0,
         Some("feature/sparse-turns"),
         Some("gpt-5.4"),
     )
@@ -4602,10 +4507,6 @@ async fn sync_audit_no_longer_persists_session_sync_log_on_live_matrixone() {
     svc.push_session_state(
         &session_id,
         &user_id,
-        None,
-        None,
-        None,
-        0,
         Some("feature/prune"),
         Some("gpt-5.4"),
     )
@@ -4623,7 +4524,6 @@ async fn sync_audit_no_longer_persists_session_sync_log_on_live_matrixone() {
             total_tokens: 50,
             had_stalls: false,
             error_count: 0,
-            contract_state_json: None,
         },
     )
     .await
@@ -4723,8 +4623,6 @@ async fn remote_workspace_artifact_restores_without_local_workspace_on_live_matr
         Some("feature/remote-workspace-old"),
     );
     older_workspace.record_turn(120, 45, 0, 0);
-    older_workspace.plan_goal = Some("prove old remote workspace restore".into());
-    older_workspace.plan_execution_rounds = 2;
     older_workspace.last_context_trace = Some(ContextTraceSignal {
         turn_id: "turn-remote-workspace-old".into(),
         captured_at: Some("2026-09-07T10:00:00Z".into()),
@@ -4749,8 +4647,6 @@ async fn remote_workspace_artifact_restores_without_local_workspace_on_live_matr
     );
     newer_workspace.record_turn(120, 45, 0, 0);
     newer_workspace.record_turn(240, 90, 0, 0);
-    newer_workspace.plan_goal = Some("prove newest remote workspace restore".into());
-    newer_workspace.plan_execution_rounds = 4;
     newer_workspace.last_context_trace = Some(ContextTraceSignal {
         turn_id: "turn-remote-workspace-new".into(),
         captured_at: Some("2026-09-07T10:00:00Z".into()),
@@ -4838,14 +4734,6 @@ async fn remote_workspace_artifact_restores_without_local_workspace_on_live_matr
         expected_workspace.model.as_deref()
     );
     assert_eq!(
-        restored.plan_goal.as_deref(),
-        expected_workspace.plan_goal.as_deref()
-    );
-    assert_eq!(
-        restored.plan_execution_rounds,
-        expected_workspace.plan_execution_rounds
-    );
-    assert_eq!(
         restored
             .last_context_trace
             .as_ref()
@@ -4861,7 +4749,8 @@ async fn remote_workspace_artifact_restores_without_local_workspace_on_live_matr
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn remote_composite_snapshot_index_restores_without_local_index_on_live_matrixone() {
+async fn concurrent_remote_composite_snapshot_indexes_merge_without_local_index_on_live_matrixone()
+{
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
     let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
@@ -4883,10 +4772,6 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
     svc.push_session_state(
         &session_id,
         &user_id,
-        None,
-        Some("prove remote composite snapshot restore"),
-        None,
-        0,
         Some("feature/remote-composite"),
         Some("gpt-5.4"),
     )
@@ -4904,7 +4789,6 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
             total_tokens: 321,
             had_stalls: false,
             error_count: 0,
-            contract_state_json: Some(r#"{"mode":"remote-composite"}"#.into()),
         },
     )
     .await
@@ -4946,14 +4830,12 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
     );
 
     let artifact_store = DatabaseSessionArtifactStore::new(settings.clone()).with_pool(shared);
-    let old_artifact =
-        persist_remote_composite_snapshot_index(&session_id, &user_id, &old_index, &artifact_store)
-            .await
-            .expect("persist old remote composite snapshot index");
-    let new_artifact =
+    let (old_artifact, new_artifact) = tokio::join!(
+        persist_remote_composite_snapshot_index(&session_id, &user_id, &old_index, &artifact_store),
         persist_remote_composite_snapshot_index(&session_id, &user_id, &new_index, &artifact_store)
-            .await
-            .expect("persist newest remote composite snapshot index");
+    );
+    let old_artifact = old_artifact.expect("persist old remote composite snapshot index");
+    let new_artifact = new_artifact.expect("persist newest remote composite snapshot index");
     force_session_artifacts_created_at(
         &pool,
         &user_id,
@@ -4986,7 +4868,7 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
         "mutable composite snapshot state must occupy exactly one row"
     );
     let expected_artifact = &new_artifact;
-    let expected_index = &new_index;
+    let expected_index = old_index.clone().merge_by_identity(new_index.clone());
     let expected_snapshot = &new_snapshot;
     let expected_data_snapshot = &new_data_snapshot;
     let expected_git = new_git_commit;
@@ -5009,15 +4891,17 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
         .expect("list composite snapshots");
     assert_eq!(listed.snapshots.len(), expected_index.snapshots.len());
     assert_eq!(listed.current_version(), expected_index.current_version());
+    let listed_snapshot = listed
+        .snapshots
+        .iter()
+        .find(|snapshot| snapshot.snapshot_id == expected_snapshot.snapshot_id)
+        .expect("newest snapshot remains present after projection merge");
+    assert_eq!(listed_snapshot.snapshot_id, expected_snapshot.snapshot_id);
     assert_eq!(
-        listed.snapshots[0].snapshot_id,
-        expected_snapshot.snapshot_id
-    );
-    assert_eq!(
-        listed.snapshots[0].label.as_deref(),
+        listed_snapshot.label.as_deref(),
         expected_snapshot.label.as_deref()
     );
-    assert_eq!(listed.snapshots[0].turn, expected_snapshot.turn);
+    assert_eq!(listed_snapshot.turn, expected_snapshot.turn);
 
     let restored = restore
         .restore_to_composite_snapshot(
@@ -5051,15 +4935,6 @@ async fn remote_composite_snapshot_index_restores_without_local_index_on_live_ma
     assert_eq!(session.turn_count, 7);
     assert_eq!(session.total_tokens_in, 321);
     assert_eq!(session.checkpoint_count, 3);
-    assert_eq!(
-        session.contract_json.as_deref(),
-        Some(r#"{"mode":"remote-composite"}"#)
-    );
-    assert_eq!(
-        session.plan_goal.as_deref(),
-        None,
-        "a checkpoint restore must not splice uncursored session metadata into its exact state"
-    );
     assert!(
         session.resume_bundle.is_none(),
         "the fixture has no complete causal conversation from which to build a resume bundle"
@@ -5084,10 +4959,6 @@ async fn restore_recent_tools_ignores_agent_events_turn_complete_metadata_on_liv
     svc.push_session_state(
         &session_id,
         &user_id,
-        None,
-        None,
-        None,
-        0,
         Some("feature/checkpoint-tools"),
         Some("gpt-5.4"),
     )
@@ -5408,7 +5279,6 @@ async fn checkpoint_cloud_roundtrip_keeps_session_and_step_rows_separate_on_live
             total_tokens: 150,
             had_stalls: false,
             error_count: 0,
-            contract_state_json: None,
         },
     )
     .await
@@ -6022,10 +5892,6 @@ async fn session_owned_services_reject_non_owner_side_effects_on_live_matrixone(
         .push_session_state(
             &session_id,
             &other_user_id,
-            None,
-            None,
-            None,
-            0,
             Some("non-owner-branch"),
             Some("gpt-5.4"),
         )
@@ -6048,7 +5914,6 @@ async fn session_owned_services_reject_non_owner_side_effects_on_live_matrixone(
                 total_tokens: 10,
                 had_stalls: false,
                 error_count: 0,
-                contract_state_json: None,
             },
         )
         .await
@@ -6091,7 +5956,6 @@ async fn session_owned_services_reject_non_owner_side_effects_on_live_matrixone(
                 total_tokens: 999,
                 had_stalls: true,
                 error_count: 9,
-                contract_state_json: None,
             },
         )
         .await;
@@ -6814,8 +6678,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
     let foreign_harness_run_id = Uuid::new_v4().to_string();
     let owner_calibration_id = Uuid::new_v4().to_string();
     let foreign_calibration_id = Uuid::new_v4().to_string();
-    let owner_task_id = Uuid::new_v4().to_string();
-    let foreign_task_id = Uuid::new_v4().to_string();
     let owner_run_id = Uuid::new_v4().to_string();
     let foreign_run_id = Uuid::new_v4().to_string();
     let owner_skill_eval_id = Uuid::new_v4().to_string();
@@ -6927,37 +6789,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         .expect("insert transcript page");
     }
 
-    for (user_id, next_id, version) in [
-        (&owner_user_id, 42_i64, 1_i64),
-        (&other_user_id, 7_i64, 3_i64),
-    ] {
-        sqlx::query(
-            "INSERT INTO session_todo_counters (session_id, user_id, next_id, version) \
-             VALUES (?, ?, ?, ?)",
-        )
-        .bind(&session_id)
-        .bind(user_id)
-        .bind(next_id)
-        .bind(version)
-        .execute(&pool)
-        .await
-        .expect("insert todo counter");
-    }
-
-    for (user_id, marker) in [(&owner_user_id, "owner"), (&other_user_id, "foreign")] {
-        sqlx::query(
-            "INSERT INTO session_todo_idempotency \
-             (session_id, user_id, action, idempotency_key, args_json, output, created_at, updated_at) \
-             VALUES (?, ?, 'upsert', ?, '{}', '{}', NOW(6), NOW(6))",
-        )
-        .bind(&session_id)
-        .bind(user_id)
-        .bind(format!("idem-{marker}"))
-        .execute(&pool)
-        .await
-        .expect("insert todo idempotency");
-    }
-
     for (user_id, calibration_id, marker) in [
         (&owner_user_id, &owner_calibration_id, "owner"),
         (&other_user_id, &foreign_calibration_id, "foreign"),
@@ -6992,36 +6823,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         "foreign",
     )
     .await;
-
-    for (user_id, task_id, marker) in [
-        (&owner_user_id, &owner_task_id, "owner"),
-        (&other_user_id, &foreign_task_id, "foreign"),
-    ] {
-        sqlx::query(
-            "INSERT INTO agent_tasks (task_id, user_id, session_id, title, status) \
-             VALUES (?, ?, ?, ?, 'pending')",
-        )
-        .bind(task_id)
-        .bind(user_id)
-        .bind(&session_id)
-        .bind(format!("session-delete-task-{marker}"))
-        .execute(&pool)
-        .await
-        .expect("insert session task");
-
-        sqlx::query(
-            "INSERT INTO task_leases \
-             (task_id, user_id, holder_agent_id, holder_edge_id, expires_at) \
-             VALUES (?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL 5 MINUTE))",
-        )
-        .bind(task_id)
-        .bind(user_id)
-        .bind(format!("holder-{marker}"))
-        .bind(format!("edge-{marker}"))
-        .execute(&pool)
-        .await
-        .expect("insert task lease");
-    }
 
     for (user_id, run_id, evaluation_id, marker) in [
         (&owner_user_id, &owner_run_id, &owner_skill_eval_id, "owner"),
@@ -7306,7 +7107,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         1
     );
     assert_eq!(deleted_rows_for_table(&delete_audit, "agent_sessions"), 1);
-    assert_eq!(deleted_rows_for_table(&delete_audit, "agent_tasks"), 1);
     assert_eq!(deleted_rows_for_table(&delete_audit, "harness_items"), 1);
     assert_eq!(
         deleted_rows_for_table(&delete_audit, "session_artifacts_grants"),
@@ -7316,7 +7116,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         deleted_rows_for_table(&delete_audit, "session_artifacts"),
         1
     );
-    assert_eq!(deleted_rows_for_table(&delete_audit, "task_leases"), 1);
     assert_eq!(
         deleted_rows_for_table(&delete_audit, "user_skill_evaluations"),
         1
@@ -7337,13 +7136,10 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
         ("session_artifacts_grants", "session_artifacts_grants"),
         ("session_artifacts", "session_artifacts"),
         ("transcript_pages", "transcript_pages"),
-        ("session_todo_counters", "session_todo_counters"),
-        ("session_todo_idempotency", "session_todo_idempotency"),
         (
             "eval_calibration_assessments",
             "eval_calibration_assessments",
         ),
-        ("agent_tasks", "agent_tasks"),
         ("harness_runs", "harness_runs"),
         ("ctx_snapshots", "ctx_snapshots"),
         ("ctx_decision_audits", "ctx_decision_audits"),
@@ -7376,34 +7172,6 @@ async fn session_delete_is_owner_scoped_and_preserves_foreign_rows_on_live_matri
             "{label} foreign rows must not be touched by owner delete"
         );
     }
-
-    let owner_lease_remaining =
-        sqlx::query("SELECT COUNT(*) AS c FROM task_leases WHERE user_id = ? AND task_id = ?")
-            .bind(&owner_user_id)
-            .bind(&owner_task_id)
-            .fetch_one(&pool)
-            .await
-            .expect("count owner task lease")
-            .try_get::<i64, _>("c")
-            .expect("decode owner task lease count");
-    assert_eq!(
-        owner_lease_remaining, 0,
-        "owner task lease must be deleted before owner agent_tasks"
-    );
-
-    let foreign_lease_remaining =
-        sqlx::query("SELECT COUNT(*) AS c FROM task_leases WHERE user_id = ? AND task_id = ?")
-            .bind(&other_user_id)
-            .bind(&foreign_task_id)
-            .fetch_one(&pool)
-            .await
-            .expect("count foreign task lease")
-            .try_get::<i64, _>("c")
-            .expect("decode foreign task lease count");
-    assert_eq!(
-        foreign_lease_remaining, 1,
-        "foreign task lease must not be touched by owner delete"
-    );
 
     let owner_skill_eval_remaining = sqlx::query(
         "SELECT COUNT(*) AS c FROM user_skill_evaluations WHERE owner_user_id = ? AND evaluation_id = ?",
@@ -7639,14 +7407,6 @@ async fn session_delete_removes_owner_scoped_database_rows_and_local_files_on_li
     .await
     .expect("insert owner transcript page");
     sqlx::query(
-        "INSERT INTO session_todo_counters (session_id, user_id, next_id) VALUES (?, ?, 42)",
-    )
-    .bind(&session_id)
-    .bind(&owner_user_id)
-    .execute(&pool)
-    .await
-    .expect("insert todo counter");
-    sqlx::query(
         "INSERT INTO conversation_log \
          (user_id, session_id, seq, turn, entry_type, payload) \
          VALUES (?, ?, 1, 1, 0, '{\"type\":\"snapshot\",\"seq\":1,\"turn\":1,\"messages\":[],\"session_state\":{}}')",
@@ -7708,12 +7468,29 @@ async fn session_delete_removes_owner_scoped_database_rows_and_local_files_on_li
         "transcript_pages",
         "ctx_snapshots",
         "ctx_decision_audits",
-        "session_todo_counters",
         "conversation_log",
     ] {
         let remaining = count_user_session_rows(&pool, label, &owner_user_id, &session_id).await;
         assert_eq!(remaining, 0, "{label} must be removed by hard delete");
     }
+    let tombstones: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM session_deletion_tombstones WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&owner_user_id)
+    .bind(&session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count durable session deletion tombstones");
+    assert_eq!(
+        tombstones, 1,
+        "hard delete must retain its late-writer fence"
+    );
+    sqlx::query("DELETE FROM session_deletion_tombstones WHERE user_id = ? AND session_id = ?")
+        .bind(&owner_user_id)
+        .bind(&session_id)
+        .execute(&pool)
+        .await
+        .expect("clean deletion tombstone fixture");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -7944,6 +7721,89 @@ async fn sync_outbox_create_event_upserts_missing_session_header_live_matrixone(
         &[],
     )
     .await;
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn sync_outbox_late_event_cannot_recreate_deleted_session_live_matrixone() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+    let user_id = Uuid::new_v4().to_string();
+    let session_id = Uuid::new_v4().to_string();
+    let event_id = format!("late-sync-{}", Uuid::new_v4());
+    sqlx::query(
+        "INSERT INTO agent_sessions (user_id, session_id, status, event_count)
+         VALUES (?, ?, 'deleting', 0)",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .execute(&pool)
+    .await
+    .expect("seed deleting session parent");
+    sqlx::query(
+        "INSERT INTO session_deletion_tombstones (user_id, session_id, deleted_at)
+         VALUES (?, ?, CURRENT_TIMESTAMP(6))",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .execute(&pool)
+    .await
+    .expect("seed deletion tombstone");
+    let event_service = DatabaseEventService::new(settings).with_pool(shared);
+
+    let result = event_service
+        .create_event(
+            user_id.clone(),
+            EventCreateRequestData {
+                ingestion_source: astra_services::events::EventIngestionSource::SyncOutbox,
+                event_id: Some(event_id.clone()),
+                session_id: session_id.clone(),
+                event_type: "config_change".into(),
+                content: "{}".into(),
+                agent_id: None,
+                agent_version: None,
+                parent_event_id: None,
+                parent_event_ids: None,
+                causal_chain_id: None,
+                metadata: Some(serde_json::json!({
+                    "sync_outbox": {"payload_hash": "late-after-delete"}
+                })),
+            },
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "deleted sessions must reject late sync events"
+    );
+    let session_status: String = sqlx::query_scalar(
+        "SELECT status FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load deleting sync session parent");
+    let event_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND event_id = ?")
+            .bind(&user_id)
+            .bind(&event_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count late sync events");
+    assert_eq!(session_status, "deleting");
+    assert_eq!(event_rows, 0);
+    sqlx::query("DELETE FROM agent_sessions WHERE user_id = ? AND session_id = ?")
+        .bind(&user_id)
+        .bind(&session_id)
+        .execute(&pool)
+        .await
+        .expect("clean deleting session parent");
+    sqlx::query("DELETE FROM session_deletion_tombstones WHERE user_id = ? AND session_id = ?")
+        .bind(&user_id)
+        .bind(&session_id)
+        .execute(&pool)
+        .await
+        .expect("clean deletion tombstone");
 }
 
 #[tokio::test]

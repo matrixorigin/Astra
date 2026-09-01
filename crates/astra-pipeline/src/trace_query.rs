@@ -577,6 +577,7 @@ mod tests {
     ) -> StepEvent {
         StepEvent {
             event_id: id.to_string(),
+            run_id: "test-run".into(),
             canonical_event_id: canonical.map(|s| s.to_string()),
             step_id: step.to_string(),
             event_type,

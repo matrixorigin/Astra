@@ -3,15 +3,150 @@ use super::super::*;
 pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
     router
         .route(
+            "/v1/works",
+            get(crate::server::work_handlers::get_works_handler)
+                .post(crate::server::work_handlers::post_work_handler),
+        )
+        .route(
+            "/v1/works/session-bindings/{session_id}",
+            get(crate::server::work_handlers::get_work_session_binding_handler)
+                .post(crate::server::work_handlers::post_work_session_binding_handler),
+        )
+        .route(
+            "/v1/works/{work_id}",
+            get(crate::server::work_handlers::get_work_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/actions",
+            post(crate::server::work_handlers::post_work_action_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches",
+            get(crate::server::work_handlers::get_work_branches_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/archived",
+            get(crate::server::work_handlers::get_archived_work_branches_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branch-comparisons",
+            post(crate::server::work_handlers::post_work_branch_comparison_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/read-cursor",
+            axum::routing::put(crate::server::work_handlers::put_work_read_cursor_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/events",
+            get(crate::server::work_handlers::get_work_events_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/criteria",
+            get(crate::server::work_handlers::get_work_criteria_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/turns",
+            post(crate::server::work_handlers::post_work_branch_turn_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/actions",
+            post(crate::server::work_handlers::post_work_branch_action_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/deletion-operations",
+            post(crate::server::work_handlers::post_work_branch_deletion_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/deletion-operations/{operation_id}",
+            get(crate::server::work_handlers::get_work_branch_deletion_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/patch-artifacts",
+            get(crate::server::work_handlers::get_work_branch_patch_artifacts_handler)
+                .post(crate::server::work_handlers::post_work_branch_patch_artifact_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/patch-artifacts/{patch_artifact_id}",
+            get(crate::server::work_handlers::get_work_branch_patch_artifact_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/patch-artifacts/{patch_artifact_id}/content",
+            get(crate::server::work_handlers::get_work_branch_patch_artifact_content_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/patch-materializations",
+            get(crate::server::work_handlers::get_work_patch_materializations_handler)
+                .post(crate::server::work_handlers::post_work_patch_materialization_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/patch-materializations/{operation_id}",
+            get(crate::server::work_handlers::get_work_patch_materialization_handler)
+                .delete(crate::server::work_handlers::delete_work_patch_materialization_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/patch-commits",
+            get(crate::server::work_handlers::get_work_patch_commits_handler)
+                .post(crate::server::work_handlers::post_work_patch_commit_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/patch-commits/{operation_id}",
+            get(crate::server::work_handlers::get_work_patch_commit_handler)
+                .delete(crate::server::work_handlers::delete_work_patch_commit_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/transcript",
+            get(crate::server::work_handlers::get_work_branch_transcript_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/attachments",
+            post(crate::server::work_handlers::post_work_branch_attachment_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/attachments/{attachment_id}",
+            axum::routing::delete(
+                crate::server::work_handlers::delete_work_branch_attachment_handler,
+            ),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/control-operations",
+            post(crate::server::work_handlers::post_work_branch_control_operation_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/control-operations/{operation_id}",
+            get(crate::server::work_handlers::get_work_branch_control_operation_handler)
+                .delete(crate::server::work_handlers::delete_work_branch_control_operation_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/forks",
+            post(crate::server::work_handlers::post_work_branch_fork_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/forks/{operation_id}",
+            get(crate::server::work_handlers::get_work_branch_fork_handler)
+                .delete(crate::server::work_handlers::delete_work_branch_fork_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/task-graph",
+            get(crate::server::work_handlers::get_work_task_graph_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/criteria-proposals",
+            get(crate::server::work_handlers::list_work_criteria_proposals_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/criteria-proposals/{proposal_id}",
+            get(crate::server::work_handlers::get_work_criteria_proposal_handler),
+        )
+        .route(
+            "/v1/works/{work_id}/branches/{branch_id}/criteria-proposals/{proposal_id}/decision",
+            axum::routing::put(
+                crate::server::work_handlers::put_work_criteria_proposal_decision_handler,
+            ),
+        )
+        .route(
             "/runs",
             get(crate::server::run::handlers::list_runs_handler),
         )
-        .route(
-            "/tasks",
-            get(task_handlers::list_tasks_handler).post(task_handlers::create_task_handler),
-        )
-        .route("/tasks/{task_id}", get(task_handlers::get_task_handler))
-        .route("/tasks:rpc", post(task_handlers::task_rpc_handler))
         .route(
             "/preferences",
             get(preferences_handlers::list_preferences_handler),
@@ -21,81 +156,11 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             axum::routing::put(preferences_handlers::put_preference_handler),
         )
         .route(
-            "/tasks/{task_id}/lease/claim",
-            post(task_handlers::post_task_lease_claim_handler),
-        )
-        .route(
-            "/tasks/lease/claim-next",
-            post(task_handlers::post_task_lease_claim_next_handler),
-        )
-        .route(
-            "/tasks/{task_id}/lease/release",
-            post(task_handlers::post_task_lease_release_handler),
-        )
-        .route(
-            "/tasks/{task_id}/lease/renew",
-            post(task_handlers::post_task_lease_renew_handler),
-        )
-        .route(
-            "/tasks/{task_id}/lease",
-            get(task_handlers::get_task_lease_handler),
-        )
-        .route(
-            "/tasks/{task_id}/progress",
-            get(task_handlers::task_progress_handler),
-        )
-        .route(
-            "/tasks/{task_id}/status",
-            axum::routing::put(task_handlers::update_task_status_handler),
-        )
-        .route(
             "/resources/usage",
             get(resource_handlers::get_resource_usage_handler),
         )
         .route(
             "/resources/limits",
             get(resource_handlers::get_resource_limits_handler),
-        )
-        .route(
-            "/plans",
-            post(plan_handlers::create_plan_handler).get(plan_handlers::list_plans_handler),
-        )
-        .route(
-            "/plans/{plan_id}",
-            get(plan_handlers::get_plan_handler)
-                .put(plan_handlers::update_plan_handler)
-                .delete(plan_handlers::delete_plan_handler),
-        )
-        .route(
-            "/plans/{plan_id}/status",
-            get(plan_handlers::plan_status_handler),
-        )
-        .route(
-            "/plans/{plan_id}/execute",
-            post(plan_handlers::execute_plan_handler),
-        )
-        .route(
-            "/plans/{plan_id}/exit-plan-mode",
-            post(plan_handlers::exit_plan_mode_handler),
-        )
-        .route(
-            "/plans/{plan_id}/rewind",
-            post(plan_handlers::rewind_plan_handler),
-        )
-        .route(
-            "/plans/{plan_id}/redo-step",
-            post(plan_handlers::redo_step_handler),
-        )
-        .route(
-            "/plans/{plan_id}/step-runs",
-            get(plan_handlers::list_step_runs_handler).post(plan_handlers::start_step_run_handler),
-        )
-        .route(
-            "/plans/{plan_id}/step-runs/completed",
-            post(plan_handlers::post_completed_step_run_handler),
-        )
-        .route(
-            "/plans/{plan_id}/step-runs/{run_id}/finish",
-            post(plan_handlers::finish_step_run_handler),
         )
 }

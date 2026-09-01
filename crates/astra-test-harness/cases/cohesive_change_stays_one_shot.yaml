@@ -1,0 +1,66 @@
+name: cohesive_change_stays_one_shot
+description: |
+  **What**: Ask Astra to complete one small repository fix together with its
+  proportional regression check and final inspection.
+  **Tests**: Semantic Work admission counts independently accepted outcomes,
+  rather than mistaking setup, implementation, testing, and verification for
+  separate durable tasks.
+  **Why**: Turning the ordinary stages of one change into a task graph adds
+  scheduler churn, changes the prompt-cache epoch, and can block final
+  verification after the actual change is already complete.
+  **Pass means**: DeepSeek Flash edits the fixture, runs the supplied check,
+  reports its real PASS result, and finishes without canonical Work or a
+  routine clarification.
+  **Fail means**: Astra creates Work for one cohesive acceptance outcome,
+  skips execution evidence, or interrupts the user for task management.
+prompt: |
+  Fix the retry-limit regression in
+  `target/astra-harness-cohesive-change/retry.conf`: the required value is 3,
+  not 2. Run `bash target/astra-harness-cohesive-change/verify.sh` as the
+  proportional regression check, inspect the resulting file, and briefly
+  report the change and verification result. Complete this small fix end to
+  end without asking me to manage its internal steps.
+prompt_variants:
+  - id: natural
+    prompt: |
+      Please update `target/astra-harness-cohesive-change/retry.conf` so its
+      retry limit is 3. Then execute
+      `bash target/astra-harness-cohesive-change/verify.sh`, check the final
+      file, and tell me what changed and whether the check passed.
+models:
+  - deepseek-v4-flash
+capability: "custom:cohesive_change_stays_one_shot"
+difficulty: 3
+weight: 3.0
+timeout_seconds: 180
+debug_log: true
+setup_cmd: >-
+  mkdir -p target/astra-harness-cohesive-change &&
+  printf 'retry_limit=2\n' > target/astra-harness-cohesive-change/retry.conf &&
+  printf '#!/usr/bin/env bash\nset -euo pipefail\ngrep -qx "retry_limit=3" "$(dirname "$0")/retry.conf"\nprintf "PASS retry_limit=3\\n"\n' > target/astra-harness-cohesive-change/verify.sh
+teardown_cmd: "rm -rf target/astra-harness-cohesive-change"
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: start_work
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: bash
+    min: 1
+    max: 6
+  - type: journal_tool_call_count
+    name: ask_user
+    min: 0
+    max: 0
+  - type: text_contains
+    needle: "PASS"
+  - type: text_contains
+    needle: "retry_limit=3"
+  - type: tools_count_between
+    min: 2
+    max: 8
+  - type: turn_rounds_between
+    min: 2
+    max: 8

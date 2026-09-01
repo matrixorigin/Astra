@@ -111,11 +111,11 @@ LLM models are **not** configured via env vars. Use the admin CLI:
 ```bash
 astra admin model add <name> <provider> --api-key ... --base-url ...
 astra admin model check <name>                    # probe + activate
-astra admin model list                            # see all configured models
+astra admin model list                            # drains the authoritative paginated catalog
 astra admin config set reasoning_offering_id <id> # optional: pin the judge/summary Offering
 ```
 
-If `reasoning_offering_id` is not set, the server applies its governed default and currently selects the cheapest active Offering by `pricing.completion`. Obtain Offering IDs from `astra admin model list`; model names do not select execution routes.
+If `reasoning_offering_id` is not set, the server applies its governed default and currently selects the cheapest active Offering by `pricing.completion`. `astra admin model list` follows the server's seek-paginated catalog until completion; model names do not select execution routes, and clients must use the exact Offering ID from that complete projection.
 
 ### Memoria
 
@@ -131,7 +131,8 @@ If `reasoning_offering_id` is not set, the server applies its governed default a
 - `ASTRA_RETRIEVAL_TOP_K`, `ASTRA_MAX_TURN_INPUT_TOKENS`
 - `ASTRA_LLM_PROVIDER_ADMISSION_MODE` — provider admission mode; unset/`disabled` by default, `db_fixed_window` enables MatrixOne-backed RPM/TPM claims before outbound LLM attempts
 - `ASTRA_LLM_PROVIDER_ADMISSION_RPM`, `ASTRA_LLM_PROVIDER_ADMISSION_TPM` — provider budget used by admission; at least one is required when admission is enabled
-- `ASTRA_AUX_LLM_POLICY` — global policy for optional auxiliary LLM calls; `capacity_aware` by default skips optional auxiliary calls when provider admission is enabled, `always` preserves them, `disabled` turns them off
+- `ASTRA_LLM_CONNECT_TIMEOUT_S`, `ASTRA_LLM_NONSTREAM_TIMEOUT_S`, `ASTRA_LLM_TOTAL_BUDGET_S`, `ASTRA_LLM_ACTION_PROGRESS_TIMEOUT_S` — provider transport/progress bounds. The `300s` total-budget default is per provider call including retries, not an end-to-end session limit; turn profiles and resource policy still bound the overall run. Interactive resource policy is 30s for a single tool execution, while long-session profiles explicitly allow 300s.
+- `ASTRA_AUX_LLM_POLICY` — policy for bounded auxiliary LLM calls. When unset, Astra uses `capacity_aware`: every eligible primary turn receives one bounded Work-admission decision, while provider admission accounts for its quota like any other inference; unrelated optional judges remain capacity-gated. Set `boundary_only` when a deployment deliberately prefers the single-request fast path, `disabled` to remove every auxiliary call (and accept typed-topology fallback), or `always` to require all eligible auxiliary calls regardless of capacity policy.
 - `ASTRA_CAPTURE_TRACES`
 
 Diagnostic DB history is controlled through `runtime.toml` trace categories, not separate environment variables. Production defaults keep high-volume diagnostic tables off; `trace.profile = "dev"` enables them. For custom profiles, enable `context_assembly` for context manifests, `prompt_assembly` for prompt request deltas, and `harness_snapshots` for durable harness snapshot history.
@@ -147,7 +148,7 @@ Server-loop Memoria observer and post-loop memory cleanup are fixed internal asy
 ### CLI overrides (optional)
 
 - `ASTRA_CLI_SESSION_ID`, `ASTRA_CLI_SESSION_NAME`
-- `ASTRA_CLI_AUTO_APPROVE`, `ASTRA_CLI_MAX_TURNS`
+- `ASTRA_CLI_AUTO_APPROVE`
 - `ASTRA_CLI_ALLOWED_TOOLS`, `ASTRA_CLI_DISALLOWED_TOOLS`, `ASTRA_CLI_ADD_DIRS`
 - `ASTRA_CLI_CREDENTIALS_DIR`
 

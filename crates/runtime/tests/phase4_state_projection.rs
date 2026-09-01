@@ -879,6 +879,7 @@ async fn l3_11b_real_run_engine_populates_projection() {
     run_engine
         .persist_status(
             &user_id,
+            &session_id,
             &child_run_id,
             "completed",
             None,
@@ -937,7 +938,14 @@ async fn delegation_projection_refresh_uses_current_run_status() {
         .await
         .unwrap();
     run_engine
-        .persist_status(&user_id, &child_run_id, "completed", None, None)
+        .persist_status(
+            &user_id,
+            &session_id,
+            &child_run_id,
+            "completed",
+            None,
+            None,
+        )
         .await
         .unwrap();
 

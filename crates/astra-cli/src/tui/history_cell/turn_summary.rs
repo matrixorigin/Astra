@@ -28,7 +28,8 @@ pub(crate) struct TurnSummaryCell {
     pub ttft_ms: Option<u64>,
     pub tokens_in: Option<u64>,
     pub tokens_out: Option<u64>,
-    /// Cache-read portion of `tokens_in`. Drives the `▓░ N%` band.
+    /// Cached input alongside the fresh `tokens_in`. Drives both total provider
+    /// traffic and the cache-rate band.
     pub cache_read_tokens: Option<u64>,
     pub tools: u32,
     pub cumulative_tokens: Option<u64>,
@@ -122,17 +123,24 @@ impl TurnSummaryCell {
         }
 
         if let (Some(tin), Some(tout)) = (self.tokens_in, self.tokens_out) {
+            let provider_tokens = tin
+                .saturating_add(self.cache_read_tokens.unwrap_or(0))
+                .saturating_add(tout);
             sections.push(Section::primary(vec![
-                Span::styled(fmt_tokens(tin + tout), value),
+                Span::styled(fmt_tokens(provider_tokens), value),
                 Span::styled(" tokens", label),
             ]));
         }
 
-        if let (Some(cache_read), Some(tin)) = (self.cache_read_tokens, self.tokens_in)
+        if let (Some(cache_read), Some(fresh_input)) = (self.cache_read_tokens, self.tokens_in)
             && cache_read > 0
-            && tin > 0
         {
-            let pct = ((cache_read as f64 / tin as f64) * 100.0).round() as u32;
+            let total_input = cache_read.saturating_add(fresh_input);
+            let pct = if total_input == 0 {
+                0
+            } else {
+                ((cache_read as f64 / total_input as f64) * 100.0).round() as u32
+            };
             sections.push(Section::primary(vec![
                 Span::styled(format!("{pct}%"), value),
                 Span::styled(" cached", label),
@@ -146,9 +154,14 @@ impl TurnSummaryCell {
             ]));
         }
 
+        let current_provider_tokens = self
+            .tokens_in
+            .unwrap_or(0)
+            .saturating_add(self.cache_read_tokens.unwrap_or(0))
+            .saturating_add(self.tokens_out.unwrap_or(0));
         let cumulative_tokens = self
             .cumulative_tokens
-            .filter(|c| *c > 0)
+            .filter(|c| *c > current_provider_tokens)
             .map(|c| Span::styled(fmt_tokens(c), value));
 
         if let Some(cost) = self.cumulative_cost_usd
@@ -355,11 +368,51 @@ mod tests {
     #[test]
     fn cache_segment_shows_hit_rate_percentage() {
         let mut c = mk_full();
-        // 23.2k tokens in, 18k cache read → ~78%
+        // 23.2k fresh + 18k cached input → ~44% cache hit rate.
         c.cache_read_tokens = Some(18_000);
         let out = render(&c, 120);
         assert!(out.contains("cached"), "cache label missing: {out}");
-        assert!(out.contains("78%"), "expected ~78% hit rate in: {out}");
+        assert!(out.contains("44%"), "expected ~44% hit rate in: {out}");
+    }
+
+    #[test]
+    fn headline_tokens_include_provider_cache_traffic() {
+        let c = TurnSummaryCell {
+            tokens_in: Some(1_200),
+            tokens_out: Some(300),
+            cache_read_tokens: Some(98_800),
+            ..Default::default()
+        };
+        let out = render(&c, 120);
+        assert!(
+            out.contains("100.3k tokens"),
+            "provider traffic should headline: {out}"
+        );
+        assert!(
+            out.contains("99% cached"),
+            "cache traffic should stay visible: {out}"
+        );
+        assert!(
+            !out.contains("1.5k tokens"),
+            "fresh-only billing tokens must not masquerade as provider traffic: {out}"
+        );
+    }
+
+    #[test]
+    fn overall_is_elided_when_it_only_repeats_the_current_turn() {
+        let c = TurnSummaryCell {
+            tokens_in: Some(1_200),
+            tokens_out: Some(300),
+            cache_read_tokens: Some(98_800),
+            cumulative_tokens: Some(100_300),
+            ..Default::default()
+        };
+        let out = render(&c, 120);
+        assert!(out.contains("100.3k tokens"));
+        assert!(
+            !out.contains("overall"),
+            "duplicate overall is noise: {out}"
+        );
     }
 
     #[test]

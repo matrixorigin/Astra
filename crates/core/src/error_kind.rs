@@ -41,6 +41,9 @@ pub enum ErrorKind {
     // ── Streaming ────────────────────────────────────
     /// No SSE chunk received within the idle timeout.
     StreamIdle,
+    /// One physical provider inference exceeded its wall-clock or semantic
+    /// progress deadline. This is not the agent turn/run budget.
+    ProviderDeadline,
     /// Connection reset, TLS failure, or other transport error mid-stream.
     StreamTransport,
 
@@ -113,6 +116,11 @@ pub enum ToolFailureCause {
     CapabilityUnavailable,
     TransientTransport,
     ResourceExhausted,
+    /// The tool invocation itself was valid, but an invoked command returned
+    /// a non-semantic failure status. This is deliberately distinct from
+    /// [`InvalidArguments`]: shell arguments may be valid while a path,
+    /// command composition, or the command's own operation is wrong.
+    CommandFailed,
     Unknown,
 }
 
@@ -154,6 +162,51 @@ impl ToolFailureEvidence {
             recovery_actions,
         }
     }
+
+    /// Build the default recovery contract for a classified failure at an
+    /// unstructured boundary (for example legacy edge output).  Producers
+    /// with richer domain context should construct [`Self::new`] directly;
+    /// this helper exists so every fallback boundary uses the same typed
+    /// cause/action mapping instead of inventing its own retry semantics.
+    #[must_use]
+    pub fn from_error_kind(kind: ErrorKind) -> Self {
+        let (cause, action) = match kind {
+            ErrorKind::ToolInvalidArgs | ErrorKind::InvalidRequest => (
+                ToolFailureCause::InvalidArguments,
+                ToolRecoveryAction::CorrectArguments,
+            ),
+            ErrorKind::ToolNotFound => (
+                ToolFailureCause::ResourceMissing,
+                ToolRecoveryAction::VerifyResource,
+            ),
+            ErrorKind::PolicyDenied | ErrorKind::Auth => (
+                ToolFailureCause::PermissionBoundary,
+                ToolRecoveryAction::SelectAvailableCapability,
+            ),
+            ErrorKind::ToolUnavailable | ErrorKind::ToolBinding => (
+                ToolFailureCause::CapabilityUnavailable,
+                ToolRecoveryAction::SelectAvailableCapability,
+            ),
+            ErrorKind::ResourceLimit | ErrorKind::ConnectionPoolExhausted => (
+                ToolFailureCause::ResourceExhausted,
+                ToolRecoveryAction::ReduceResourcePressure,
+            ),
+            ErrorKind::ToolTimeout
+            | ErrorKind::Network
+            | ErrorKind::RateLimit
+            | ErrorKind::ServerError
+            | ErrorKind::StreamIdle
+            | ErrorKind::StreamTransport => (
+                ToolFailureCause::TransientTransport,
+                ToolRecoveryAction::WaitAndRetry,
+            ),
+            _ => (
+                ToolFailureCause::Unknown,
+                ToolRecoveryAction::InspectStructuredFailure,
+            ),
+        };
+        Self::new(kind, cause, kind.is_retryable(), vec![action])
+    }
 }
 
 impl ErrorKind {
@@ -168,6 +221,7 @@ impl ErrorKind {
             Self::InvalidRequest => "invalid_request",
             Self::ContractViolation => "contract_violation",
             Self::StreamIdle => "stream_idle",
+            Self::ProviderDeadline => "provider_deadline",
             Self::StreamTransport => "stream_transport",
             Self::ConnectionPoolExhausted => "connection_pool_exhausted",
             Self::BudgetExhausted => "budget_exhausted",
@@ -256,6 +310,10 @@ impl ErrorKind {
             Self::StreamIdle => {
                 "Model stopped sending tokens mid-stream (idle timeout). \
                  Retrying the same request. If this recurs, try a different model or reduce input size."
+            }
+            Self::ProviderDeadline => {
+                "The current provider inference exceeded its deadline. Preserve partial evidence \
+                 and use at most one bounded convergence step when it is safe."
             }
             Self::StreamTransport => {
                 "Connection to the LLM provider was lost mid-stream. \
@@ -361,6 +419,10 @@ impl ErrorKind {
             Self::StreamIdle => {
                 "Model stalled mid-stream. If recurring, switch model or reduce input size."
             }
+            Self::ProviderDeadline => {
+                "Inspect the typed deadline phase and elapsed time. This is a provider-attempt \
+                 deadline, not evidence that the agent turn/session budget was exhausted."
+            }
             Self::StreamTransport => {
                 "Transport dropped mid-stream. Check network stability; if persistent, \
                  change model endpoint or provider."
@@ -455,6 +517,7 @@ impl ErrorKind {
             "invalid_request" => Some(Self::InvalidRequest),
             "contract_violation" => Some(Self::ContractViolation),
             "stream_idle" => Some(Self::StreamIdle),
+            "provider_deadline" => Some(Self::ProviderDeadline),
             "stream_transport" => Some(Self::StreamTransport),
             "connection_pool_exhausted" => Some(Self::ConnectionPoolExhausted),
             "budget_exhausted" => Some(Self::BudgetExhausted),
@@ -1048,6 +1111,7 @@ mod tests {
         ErrorKind::InvalidRequest,
         ErrorKind::ContractViolation,
         ErrorKind::StreamIdle,
+        ErrorKind::ProviderDeadline,
         ErrorKind::StreamTransport,
         ErrorKind::ConnectionPoolExhausted,
         ErrorKind::BudgetExhausted,
@@ -1183,6 +1247,7 @@ mod tests {
             ErrorKind::ContextWindow,
             ErrorKind::InvalidRequest,
             ErrorKind::StreamIdle,
+            ErrorKind::ProviderDeadline,
             ErrorKind::BudgetExhausted,
             ErrorKind::Cancelled,
         ] {
@@ -1600,6 +1665,32 @@ mod tests {
         ] {
             assert_eq!(classify_tool_output(st), ErrorKind::DatabaseError);
         }
+    }
+
+    #[test]
+    fn fallback_failure_evidence_has_one_stable_mapping_per_error_kind() {
+        let unavailable = ToolFailureEvidence::from_error_kind(ErrorKind::ToolUnavailable);
+        assert_eq!(unavailable.cause, ToolFailureCause::CapabilityUnavailable);
+        assert_eq!(
+            unavailable.recovery_actions,
+            vec![ToolRecoveryAction::SelectAvailableCapability]
+        );
+        assert!(!unavailable.retryable);
+
+        let network = ToolFailureEvidence::from_error_kind(ErrorKind::Network);
+        assert_eq!(network.cause, ToolFailureCause::TransientTransport);
+        assert_eq!(
+            network.recovery_actions,
+            vec![ToolRecoveryAction::WaitAndRetry]
+        );
+        assert!(network.retryable);
+
+        let timeout = ToolFailureEvidence::from_error_kind(ErrorKind::ToolTimeout);
+        assert_eq!(timeout.cause, ToolFailureCause::TransientTransport);
+        assert!(
+            !timeout.retryable,
+            "local command timeouts are not automatic retries"
+        );
     }
 
     #[test]

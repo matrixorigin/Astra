@@ -121,5 +121,5 @@ pub async fn run_team_crud_db() {
             .expect("count after delete");
     assert_eq!(n, 0, "team_definitions row removed");
 
-    b.ctx.pool.close().await;
+    b.ctx.close().await;
 }

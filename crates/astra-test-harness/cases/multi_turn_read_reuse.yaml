@@ -1,0 +1,55 @@
+name: multi_turn_read_reuse
+description: |
+  **What**: Read a file, perform unrelated work, then request the same file again.
+  **Tests**: The governed read surface remains usable across turns and returns
+  exact content, whether the runtime safely reuses an authorized result or performs
+  a fresh read.
+  **Why**: Cache and dedup are implementation details. The user-facing invariant is
+  that a later admitted read never degrades into a cleared/empty placeholder.
+  **Pass means**: The later read yields the exact package identity and version.
+  **Fail means**: The read is blocked by stale dedup state or returns unusable content.
+prompt: |
+  Read crates/astra-turn-core/Cargo.toml and tell me the version number.
+capability: tool_use
+difficulty: 3
+weight: 2.0
+timeout_seconds: 240
+steps:
+  - prompt: |
+      Now read these files (to fill the context):
+      1. crates/runtime/Cargo.toml
+      2. crates/services/Cargo.toml
+      3. crates/astra-cli/Cargo.toml
+      4. crates/astra-tools/Cargo.toml
+      5. Makefile
+      Just confirm each one read successfully. Say "reads-done" at the end.
+    criteria:
+      - type: text_contains
+        needle: reads-done
+      - type: tool_called
+        name: read_file
+  - prompt: |
+      I need you to read crates/astra-turn-core/Cargo.toml AGAIN
+      (yes, the same file from the first turn). Tell me the package name
+      and version from it. You MUST use read_file — do not answer from memory.
+    criteria:
+      - type: tool_called
+        name: read_file
+      - type: judger
+        question: |
+          The agent was asked to re-read crates/astra-turn-core/Cargo.toml
+          and report its package name and version. The correct answers are:
+          - package name: astra-turn-core
+          - version: 0.1.0
+          Did the agent successfully re-read the file (not return [Cleared] or error)
+          and provide the correct package name and version?
+          Score 1.0 if both correct, 0.5 if partially, 0.0 if it failed to re-read.
+        threshold: 0.7
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: read_file
+  - type: turn_rounds_between
+    min: 3
+    max: 30

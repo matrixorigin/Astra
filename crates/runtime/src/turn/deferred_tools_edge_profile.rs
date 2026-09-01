@@ -42,6 +42,7 @@ pub(crate) fn block_for_model(
     block_for_model_with_context_window(edge_profile, resolved_model_name, None)
 }
 
+#[cfg(test)]
 pub(crate) fn block_for_model_with_context_window(
     edge_profile: &Map<String, Value>,
     resolved_model_name: &str,
@@ -49,37 +50,6 @@ pub(crate) fn block_for_model_with_context_window(
 ) -> Option<String> {
     manifest_for_model(edge_profile, resolved_model_name, resolved_context_window)
         .map(|manifest| manifest.text)
-}
-
-pub(crate) fn block_for_model_filtered(
-    edge_profile: &Map<String, Value>,
-    resolved_model_name: &str,
-    resolved_context_window: Option<u32>,
-    allowed_names: &HashSet<String>,
-) -> Option<String> {
-    if allowed_names.is_empty() {
-        return None;
-    }
-    let manifest = manifest_for_model(edge_profile, resolved_model_name, resolved_context_window)?;
-    let manifest_names: HashSet<String> = manifest.names.iter().cloned().collect();
-    let retained_names: HashSet<String> = manifest_names
-        .intersection(allowed_names)
-        .cloned()
-        .collect();
-    if retained_names.is_empty() {
-        tracing::warn!(
-            target: LOG_TARGET,
-            model = resolved_model_name,
-            manifest_count = manifest_names.len(),
-            allowed_count = allowed_names.len(),
-            "deferred tool manifest filtered to zero names for the current runtime surface"
-        );
-        return None;
-    }
-    if retained_names == manifest_names {
-        return Some(manifest.text);
-    }
-    filter_block_to_names(&manifest.text, &retained_names)
 }
 
 pub(crate) fn names_for_model(
@@ -221,27 +191,6 @@ fn deferred_tools_body(block: &str) -> Option<&str> {
     Some(body)
 }
 
-fn filter_block_to_names(block: &str, allowed_names: &HashSet<String>) -> Option<String> {
-    if allowed_names.is_empty() {
-        return None;
-    }
-    let (prefix, body, suffix) = split_deferred_tools_block(block)?;
-    let allowed_keys: HashSet<String> = allowed_names
-        .iter()
-        .map(|name| xml_escape_text(name).into_owned())
-        .collect();
-    let retained_lines: Vec<&str> = body
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .filter(|line| allowed_keys.contains(*line))
-        .collect();
-    if retained_lines.is_empty() {
-        return None;
-    }
-    Some(format!("{prefix}\n{}\n{suffix}", retained_lines.join("\n")))
-}
-
 fn split_deferred_tools_block(block: &str) -> Option<(&str, &str, &str)> {
     const OPEN: &str = "<deferred-tools>";
     const CLOSE: &str = "</deferred-tools>";
@@ -325,28 +274,6 @@ mod tests {
         let manifest = manifest_for_model(&edge_profile, "gpt-4o", None)
             .expect("consistent manifest should keep omitted metadata");
         assert_eq!(manifest.omitted_names, vec!["web_fetch".to_string()]);
-    }
-
-    #[test]
-    fn block_for_model_filtered_keeps_only_allowed_manifest_entries() {
-        let edge_profile = deferred_profile(
-            &["github", "agent_fanout"],
-            &["github", "agent_fanout"],
-            "gpt-4o",
-        );
-
-        let block = block_for_model_filtered(
-            &edge_profile,
-            "gpt-4o",
-            None,
-            &HashSet::from(["github".to_string()]),
-        )
-        .expect("filtered manifest should keep allowed names");
-
-        assert!(block.contains("\ngithub\n"));
-        assert!(!block.contains("\nagent_fanout\n"));
-        assert!(!block.contains("<tool>"));
-        assert!(!block.contains("<name>"));
     }
 
     #[test]

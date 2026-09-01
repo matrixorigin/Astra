@@ -235,6 +235,7 @@ impl RunLifecycleService for RecordingLifecycle {
             workspace: None,
             executor: None,
             transport: None,
+            accounting: None,
         })
     }
 

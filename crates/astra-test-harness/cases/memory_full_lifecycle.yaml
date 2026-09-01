@@ -1,17 +1,22 @@
 name: memory_full_lifecycle
 description: |
   **What**: Full Memoria lifecycle in 3 turns: store → retrieve → purge.
-  **Tests**: All three core memory endpoints (store, retrieve, purge) work end-to-end through
+  **Tests**: All three core memory actions (remember, recall, forget) work end-to-end through
   the Memoria HTTP pipeline (auth → embedding → indexing → search → deletion).
   **Why**: Each endpoint can fail independently (auth, circuit breaker, embedding service,
   search pipeline). Testing the full lifecycle in one case catches integration failures
   that unit tests cannot, while being cheaper to run than three separate cases.
-  **Pass means**: Turn 1 stores, turn 2 retrieves the stored fact, turn 3 purges it.
+  **Pass means**: Turn 1 creates a fresh fact, turn 2 retrieves it,
+  and turn 3 purges the exact returned ID. Conflict-aware upsert is covered by
+  the memory contract tests; this journey keeps its durable lifecycle isolated.
   **Fail means**: Any endpoint in the pipeline is broken.
 prompt: |
-  Store this fact in your memory using memory:
-  "Project codename is NEPTUNE-2742 and launch date is June 15th."
-  Confirm when stored.
+  Create a temporary test-only memory fact using a freshly generated unique marker for this
+  run (make the marker clearly different from any existing project fact). Store it as a
+  session-scoped working fact with memory(action=remember, memory_type="working"), keep the
+  exact memory_id returned by the successful store, and
+  confirm the marker and ID. Do not update or delete an existing record: if the service reports
+  a conflict, generate a different marker and retry remember.
 capability: memory
 difficulty: 3
 weight: 2.5
@@ -19,34 +24,67 @@ timeout_seconds: 240
 cleanup_memory_records: true
 steps:
   - prompt: |
-      Recall the project codename and launch date you stored earlier.
-      Tell me both values.
+      Recall the fresh temporary marker you stored in the previous turn with
+      memory(action=recall, scope="session"). Restrict the lookup to this session;
+      use the complete marker string from the previous remember result as the query,
+      character-for-character (do not shorten or paraphrase it), and do not accept a
+      similarly named record from another session. Include the word "retrieved" and
+      the marker in your reply.
     criteria:
-      - type: judger
-        question: |
-          The agent stored "NEPTUNE-2742, launch date June 15th" in turn 1.
-          Did it surface BOTH values (codename NEPTUNE-2742 + date June 15th)?
-          It may use memory_retrieve, memory_store lookup, or runtime-injected
-          context — any retrieval path counts.
-          Score 1.0 if both, 0.5 if one, 0.0 if neither.
-        threshold: 0.7
   - prompt: |
-      That project was cancelled. Please purge/delete the NEPTUNE memory
-      using memory_purge with topic "NEPTUNE".
-    criteria:
-      - type: tool_called
-        name: memory
-      - type: hard_judger
-        question: |
-          Did memory_purge succeed (return a confirmation or deleted_count)?
-          A 422, error, or "Unprocessable Entity" response means failure.
-          Score 1.0 for a successful purge confirmation, 0.0 for any error.
-        threshold: 0.7
+      The temporary test fact is no longer needed. Purge it with memory(action=forget), using
+      the exact memory_id returned by the successful remember call, and provide an audit reason.
 criteria:
   - type: exit_code
     code: 0
   - type: tool_called
     name: memory
+  - type: journal_tool_call_count
+    name: memory
+    min: 1
+    max: 1
+    document: arguments
+    path: /action
+    equals: forget
+  - type: journal_tool_value_flow_bound
+    producer: memory
+    producer_document: result
+    producer_path: /memory_id
+    producer_filters:
+      - document: arguments
+        path: /action
+        equals: remember
+      - document: arguments
+        path: /memory_type
+        equals: working
+    consumer: memory
+    consumer_document: result
+    consumer_paths: ["/*/memory_id"]
+    consumer_filters:
+      - document: arguments
+        path: /action
+        equals: recall
+      - document: arguments
+        path: /scope
+        equals: session
+  - type: journal_tool_value_flow_bound
+    producer: memory
+    producer_document: result
+    producer_path: /memory_id
+    producer_filters:
+      - document: arguments
+        path: /action
+        equals: remember
+      - document: arguments
+        path: /memory_type
+        equals: working
+    consumer: memory
+    consumer_document: arguments
+    consumer_paths: [/memory_id, /memory_ids]
+    consumer_filters:
+      - document: arguments
+        path: /action
+        equals: forget
   - type: turn_rounds_between
     min: 1
     max: 20

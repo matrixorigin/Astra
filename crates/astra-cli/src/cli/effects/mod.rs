@@ -169,6 +169,6 @@ impl ThinkingSpinnerKind {
 #[derive(Clone, Copy)]
 pub enum SecStatusLineKind {
     PlanAssemble,
-    /// Normal `/chat/turn`: payload assembly + tool schemas + POST until response headers.
+    /// Normal `/chat/stream`: payload assembly + tool schemas + POST until response headers.
     ChatRequestPrep,
 }

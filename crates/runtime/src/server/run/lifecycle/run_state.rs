@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use serde_json::{Map, Value, json};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use astra_core::{
@@ -308,9 +308,16 @@ fn owner_lease_fields_are_live(owner_pod_id: Option<&str>, expires_at: Option<&s
 
 pub fn should_preserve_manual_pause_on_completion(
     current_status: &RunStatus,
+    waiting_for: Option<&str>,
     final_status: &RunStatus,
 ) -> bool {
-    *current_status == RunStatus::Paused && *final_status == RunStatus::Completed
+    // A paused run without a wait reason is an interrupted/session-continuation
+    // checkpoint, not a user-held pause. In particular, `/resume` may have
+    // released its session slot while a former executor is still unwinding.
+    // That late executor must not recreate a local blocking pause.
+    *current_status == RunStatus::Paused
+        && waiting_for.is_some()
+        && *final_status == RunStatus::Completed
 }
 
 pub async fn should_preserve_manual_pause_from_durable(
@@ -323,7 +330,7 @@ pub async fn should_preserve_manual_pause_from_durable(
         return false;
     }
     match run_engine.load_run(user_id, run_id).await {
-        Ok(Some(run)) => run.status == STATUS_PAUSED,
+        Ok(Some(run)) => run.status == STATUS_PAUSED && run.waiting_for.is_some(),
         Ok(None) => false,
         Err(error) => {
             tracing::warn!(
@@ -425,11 +432,50 @@ pub fn streaming_final_event_for_replay(event: &Value) -> bool {
     )
 }
 
+/// Internal settlement fence written only on the retained copy after the
+/// ordered fanout has durably committed the tool terminal. The persisted/wire
+/// copy is clean, so this field never becomes public protocol.
+pub(crate) const TOOL_TERMINAL_DURABLY_FANNED_OUT_FIELD: &str =
+    "_astra_tool_terminal_durably_fanned_out";
+
+pub fn tool_terminal_requires_settlement_repair(event: &Value) -> bool {
+    durable_event_type(event) == Some("tool_call_end")
+        && event
+            .get(TOOL_TERMINAL_DURABLY_FANNED_OUT_FIELD)
+            .and_then(Value::as_bool)
+            != Some(true)
+}
+
+/// Events that must converge on an attached observer before the terminal run
+/// markers close the stream.
+///
+/// Tool progress is delivered incrementally and may be coalesced when an
+/// observer falls behind. A tool terminal is different from ordinary
+/// progress: settlement repairs it unless the ordered fanout durably committed
+/// it. Replaying a successfully delivered terminal on the same
+/// attached stream is not idempotence; it is a duplicate public event.
+pub fn streaming_convergence_event_for_replay(event: &Value) -> bool {
+    streaming_final_event_for_replay(event) || tool_terminal_requires_settlement_repair(event)
+}
+
 pub fn streaming_event_for_persistence(event: &Value) -> bool {
     streaming_final_event_for_replay(event) || live_delta_event_for_persistence(event)
 }
 
+fn durable_agent_communication(event: &Value) -> bool {
+    event
+        .get("payload_kind")
+        .cloned()
+        .and_then(|kind| {
+            serde_json::from_value::<astra_turn_types::AgentCommunicationPayloadKind>(kind).ok()
+        })
+        .is_some_and(astra_turn_types::AgentCommunicationPayloadKind::is_durable)
+}
+
 pub(super) fn durable_replay_boundary_event(event: &Value) -> bool {
+    if durable_event_type(event) == Some("agent_communication") {
+        return durable_agent_communication(event);
+    }
     matches!(
         durable_event_type(event),
         Some(
@@ -441,6 +487,7 @@ pub(super) fn durable_replay_boundary_event(event: &Value) -> bool {
                 | "workspace_bound"
                 | "executor_bound"
                 | "executor_status_changed"
+                | "work_task_board_update"
                 | "tool_routing_decision"
                 | "tool_transport_started"
                 | "tool_transport_completed"
@@ -531,7 +578,10 @@ pub fn enforce_durable_run_event_batch_budget_with_budget(
 
     let critical_events: Vec<bool> = events
         .iter()
-        .map(streaming_final_event_for_replay)
+        .map(|event| {
+            streaming_final_event_for_replay(event)
+                || durable_event_type(event) == Some("tool_call_end")
+        })
         .collect();
     let critical_count = critical_events.iter().filter(|keep| **keep).count();
     let critical_bytes = event_bytes
@@ -625,6 +675,9 @@ pub fn live_delta_event_for_persistence(event: &Value) -> bool {
             Some("output_delta" | "thinking_delta")
         );
     }
+    if event_type == "agent_communication" {
+        return durable_agent_communication(event);
+    }
     matches!(
         event_type,
         // Reasoning/thinking deltas and raw reasoning_message_content are
@@ -636,17 +689,19 @@ pub fn live_delta_event_for_persistence(event: &Value) -> bool {
             | "workspace_bound"
             | "executor_bound"
             | "executor_status_changed"
+            // The task board is a versioned lifecycle projection, not an
+            // ephemeral rendering hint. Persist it on the ordered live lane
+            // so an attached client, reconnect, or another observer sees the
+            // same canonical Work state.
+            | "work_task_board_update"
             | "compaction"
-            | "agent_communication"
             | "agent_delegated"
             | "agent_spawned"
-            | "agent_progress"
             | "agent_completed"
             | "agent_failed"
             | "agent_waiting"
             | "agent_cancelled"
             | "agent_interrupted"
-            | "task_board_snapshot"
             | "tool_call"
             | "tool_call_start"
             | "tool_routing_decision"
@@ -658,6 +713,12 @@ pub fn live_delta_event_for_persistence(event: &Value) -> bool {
 }
 
 pub fn push_active_run_live_event(run: &mut RunState, event: Value) {
+    // The process-local replay cache mirrors durable reconnect boundaries.
+    // Transient activity (for example per-round agent progress) is delivered
+    // directly to current observers and must not accumulate here.
+    if !live_delta_event_for_persistence(&event) {
+        return;
+    }
     run.events.push(event);
     while run
         .events
@@ -687,11 +748,20 @@ pub struct RunState {
     pub llm_cancel_token: Arc<CancellationToken>,
     /// Live fanout for clients that reattach to an active run after navigating away.
     pub live_tx: Option<broadcast::Sender<Value>>,
+    /// Weak reference to the original POST stream's delivery lane.
+    ///
+    /// Durable terminal control facts use this lane after their storage CAS has
+    /// committed. Keeping this weak is important: process-local control must not
+    /// keep an otherwise completed HTTP stream or its fanout task alive.
+    pub attached_event_tx: Option<mpsc::WeakSender<Value>>,
     pub waiting_for: Option<String>,
     /// True only while an execution task still exists and can observe a pause
     /// flag or queued input. A resumable durable status alone is not proof that
     /// the process-local executor survived.
     pub execution_live: bool,
+    /// The provider/tool loop has stopped, but durable terminal facts and
+    /// accounting have not yet reached their atomic settlement point.
+    pub settlement_in_progress: bool,
 }
 
 #[cfg(test)]
@@ -905,6 +975,35 @@ mod tests {
             .filter(|event| durable_event_type(event) == Some("agent_progress"))
             .count();
         assert!(retained_progress < MAX_DURABLE_RUN_EVENT_BATCH_ROWS);
+    }
+
+    #[test]
+    fn durable_run_event_batch_budget_never_compacts_tool_terminals() {
+        let terminal_count = 40;
+        let mut events = (0..terminal_count)
+            .map(|idx| json!({"type": "tool_call_end", "call_id": format!("call-{idx}")}))
+            .collect::<Vec<_>>();
+        events.extend((0..40).map(|idx| json!({"type": "agent_progress", "seq": idx})));
+        events.push(json!({"event_type": "run_finished", "data": {"prompt_tokens": 1}}));
+
+        let budgeted = enforce_durable_run_event_batch_budget_with_budget(
+            events,
+            DurableRunEventBatchBudget::new(16, MAX_DURABLE_RUN_EVENT_BATCH_BYTES),
+        );
+
+        assert_eq!(
+            budgeted
+                .iter()
+                .filter(|event| durable_event_type(event) == Some("tool_call_end"))
+                .count(),
+            terminal_count,
+            "authoritative tool outcomes may exceed the advisory compaction budget but may never disappear"
+        );
+        assert!(
+            budgeted
+                .iter()
+                .any(|event| durable_event_type(event) == Some("run_finished"))
+        );
     }
 
     #[test]

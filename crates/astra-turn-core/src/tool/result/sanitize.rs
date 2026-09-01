@@ -19,18 +19,37 @@ fn str_replace_diff_block_re() -> &'static Regex {
     })
 }
 
-/// Maximum tool result size in characters before truncation.
-/// ~50K chars ≈ 12.5K tokens — generous for individual tool results while
-/// preventing unbounded context growth from large file reads or verbose bash output.
-pub const MAX_TOOL_RESULT_CHARS: usize = 50_000;
+/// Maximum generic tool-result presentation size in characters.
+///
+/// This is a model-boundary budget, not a durability limit.  A tool may still
+/// return and persist its complete result; only the inline presentation is
+/// bounded here.  Keeping the generic budget near the semantic compressor's
+/// 8K-character (~2K-token) presentation window prevents one exploratory
+/// result from becoming the entire uncached suffix of the next request. Lossy
+/// presentations are
+/// either replaced with an owner-scoped artifact by the runtime or kept behind
+/// a typed tool recovery API so omitted evidence remains recoverable.
+pub const MAX_TOOL_RESULT_CHARS: usize = 8_000;
 /// Maximum `read_file`/`view` payload size that is delivered to the model.
 ///
 /// File read state must use this as an upper bound for "content seen by the
 /// model"; larger internal caches are not evidence that the model saw the
-/// omitted lines.
-pub const READ_FILE_MODEL_RESULT_CHARS: usize = 12_000;
-const HIGH_CHURN_DIFF_RESULT_CHARS: usize = 14_000;
-const HIGH_CHURN_SHELL_RESULT_CHARS: usize = 18_000;
+/// omitted lines.  Keep the default small enough that a normal read does not
+/// consume the entire fresh suffix of a prefix-cache request.  The complete
+/// result remains in the canonical journal and the model can request a
+/// narrower `start_line`/`end_line` window.
+pub const READ_FILE_MODEL_RESULT_CHARS: usize = 4_000;
+/// Live introspection is a diagnostic snapshot, not a durable transcript. A
+/// compact snapshot keeps the next decision cheap; deeper evidence is
+/// available through the typed `facet`/`depth` request on the introspect tool.
+pub const INTROSPECT_MODEL_RESULT_CHARS: usize = 4_000;
+/// A loaded skill is executable instruction context, not exploratory output.
+/// Keep ordinary skill bodies complete through the existing artifact
+/// persistence boundary; otherwise the model must recursively page the skill
+/// with `introspect` before it can follow the workflow it just loaded.
+pub const SKILL_MODEL_RESULT_CHARS: usize = crate::tool_result_storage::PERSIST_THRESHOLD_CHARS;
+const HIGH_CHURN_DIFF_RESULT_CHARS: usize = 8_000;
+const HIGH_CHURN_SHELL_RESULT_CHARS: usize = 8_000;
 
 /// Remove `_cli_*` keys from JSON tool results and diff sentinels from `str_replace` text.
 ///
@@ -88,6 +107,8 @@ pub fn truncate_tool_result_for_model(tool_name: &str, sanitized_content: &str) 
 fn model_result_char_budget(tool_name: &str, content: &str) -> usize {
     match tool_name {
         "read_file" => READ_FILE_MODEL_RESULT_CHARS,
+        "introspect" => INTROSPECT_MODEL_RESULT_CHARS,
+        "skill" => SKILL_MODEL_RESULT_CHARS,
         "git" | "str_replace" | "multi_edit" => HIGH_CHURN_DIFF_RESULT_CHARS,
         // Shell output is too varied to cap as aggressively as structured read
         // tools, but huge diffs/build logs should not dominate the next round.
@@ -113,6 +134,17 @@ fn truncate_tool_result(tool_name: &str, content: &str, max_chars: usize) -> Str
         return content.to_string();
     }
 
+    // An edit-capable source marker is an atomic model→tool contract.  The
+    // semantic compressor's line/JSON elision is intentionally unaware of
+    // that contract and can split a marker before the final boundary.  Keep
+    // marker-bearing results on the shared atomic head/tail path; ordinary
+    // outputs retain the richer semantic compression below.
+    if astra_tools::credential_redaction::redaction_marker_status(content).1 {
+        return astra_tools::credential_redaction::truncate_redacted_head_tail_chars(
+            content, max_chars,
+        );
+    }
+
     // First pass: semantic compression. Budget at ~70% of the raw char cap so
     // there's headroom for the compression marker text itself and for CJK /
     // emoji that expand byte counts per char.
@@ -128,10 +160,15 @@ fn truncate_tool_result(tool_name: &str, content: &str, max_chars: usize) -> Str
     }
 
     // Second pass: head+tail char truncation as ultimate fallback.
-    head_tail_truncate_fallback(&compressed, max_chars)
+    head_tail_truncate_fallback(tool_name, &compressed, max_chars)
 }
 
-fn head_tail_truncate_fallback(content: &str, max_chars: usize) -> String {
+fn head_tail_truncate_fallback(tool_name: &str, content: &str, max_chars: usize) -> String {
+    if astra_tools::credential_redaction::redaction_marker_status(content).1 {
+        return astra_tools::credential_redaction::truncate_redacted_head_tail_chars(
+            content, max_chars,
+        );
+    }
     let total_chars = content.chars().count();
     if total_chars <= max_chars {
         return content.to_string();
@@ -160,9 +197,12 @@ fn head_tail_truncate_fallback(content: &str, max_chars: usize) -> String {
     let omitted = total_chars - head_chars - tail_chars;
     let head = &content[..head_end];
     let tail = &content[tail_start..];
-    format!(
-        "{head}\n\n[… truncated {omitted} characters — use start_line/end_line to read specific sections …]\n\n{tail}"
-    )
+    let recovery = if tool_name == "introspect" {
+        "request a narrower typed facet/depth on introspect to inspect omitted observation"
+    } else {
+        "use start_line/end_line to read specific sections"
+    };
+    format!("{head}\n\n[… truncated {omitted} characters — {recovery} …]\n\n{tail}")
 }
 
 fn strip_cli_json_keys(content: &str) -> String {
@@ -331,6 +371,34 @@ mod tests {
     }
 
     #[test]
+    fn introspect_snapshot_is_bounded_with_typed_recovery_guidance() {
+        let big = "snapshot field\n".repeat(700);
+        let out = tool_result_content_for_model("introspect", &big);
+        assert!(
+            out.chars().count() <= INTROSPECT_MODEL_RESULT_CHARS,
+            "introspect output should not become an uncached diagnostic transcript"
+        );
+        assert!(
+            out.contains("facet") || out.contains("elided"),
+            "the model must have a typed recovery path when the snapshot is bounded"
+        );
+    }
+
+    #[test]
+    fn ordinary_skill_body_stays_complete_at_the_instruction_boundary() {
+        let body = "## Skill phase\nFollow this instruction exactly.\n".repeat(320);
+        assert!(body.chars().count() > MAX_TOOL_RESULT_CHARS);
+        assert!(body.chars().count() < SKILL_MODEL_RESULT_CHARS);
+
+        let out = tool_result_content_for_model("skill", &body);
+        assert_eq!(
+            out,
+            body.trim_end(),
+            "skill instructions must not require pagination"
+        );
+    }
+
+    #[test]
     fn unbounded_model_content_preserves_long_json_shape() {
         let raw = json!({
             "status": "completed",
@@ -393,12 +461,33 @@ mod tests {
     }
 
     #[test]
+    fn final_model_window_keeps_source_marker_atomic() {
+        let raw = format!(
+            "prefix AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n{}",
+            "x".repeat(10_000)
+        );
+        let (issued, _) = astra_tools::credential_redaction::redact_credentials_in_text(&raw);
+        let marker = issued
+            .find("[REDACTED:")
+            .and_then(|start| {
+                issued[start..]
+                    .find(']')
+                    .map(|end| &issued[start..start + end + 1])
+            })
+            .expect("source owner should issue a full marker")
+            .to_string();
+        let out = super::truncate_tool_result("read_file", &issued, 4_000);
+        assert!(out.contains(&marker), "marker was split or dropped: {out}");
+        assert!(!out.contains("AKIAIOSFODNN7EXAMPLE"));
+    }
+
+    #[test]
     fn head_tail_truncate_fallback_reports_omitted_chars_not_bytes() {
         // Calling the fallback directly keeps the char-accounting math covered
         // even when the outer wrapper prefers semantic compression.
         let content = "中".repeat(10_100); // 10_100 chars, 30_300 bytes
         let max = 10_000;
-        let out = super::head_tail_truncate_fallback(&content, max);
+        let out = super::head_tail_truncate_fallback("bash", &content, max);
         // head=4000 chars, tail=4000 chars, omitted=2100 chars (not 6300 bytes)
         assert!(
             out.contains("2100 characters"),

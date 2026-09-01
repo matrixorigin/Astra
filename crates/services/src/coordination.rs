@@ -547,8 +547,18 @@ impl AgentProfileRegistry {
         }
     }
 
-    /// Register or update a profile.
+    /// Register one immutable profile identity.
+    ///
+    /// A registry is execution authority, not a last-writer-wins cache. Silent
+    /// replacement lets an unrelated request change the profile observed by
+    /// an already-admitted delegation.
     pub fn register(&mut self, profile: AgentProfile) -> Result<(), String> {
+        if self.profiles.contains_key(&profile.agent_id) {
+            return Err(format!(
+                "agent profile '{}' is already registered",
+                profile.agent_id
+            ));
+        }
         self.profiles.insert(profile.agent_id.clone(), profile);
         Ok(())
     }
@@ -968,6 +978,21 @@ mod tests {
         let usr = user_agent("u1");
         assert!(!usr.can_delegate);
         assert_eq!(usr.max_delegation_depth, 0);
+    }
+
+    #[test]
+    fn profile_registry_rejects_duplicate_identity_without_overwrite() {
+        let mut registry = AgentProfileRegistry::new();
+        let mut original = AgentProfile::new("coder", "builtin coder", AgentTier::System);
+        original.system_prompt = Some("trusted".to_string());
+        registry.register(original).unwrap();
+        let mut replacement = AgentProfile::new("coder", "tenant coder", AgentTier::User);
+        replacement.system_prompt = Some("polluted".to_string());
+
+        assert!(registry.register(replacement).is_err());
+        let retained = registry.get("coder").unwrap();
+        assert_eq!(retained.name, "builtin coder");
+        assert_eq!(retained.system_prompt.as_deref(), Some("trusted"));
     }
 
     #[test]

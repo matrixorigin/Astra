@@ -1,0 +1,100 @@
+name: work_plan_decomposition_contract
+description: |
+  **What**: Give the model one revision-pinned Work planning context for a realistic migration
+  and ask it to prepare a typed, non-authoritative Task Graph proposal.
+  **Tests**: Outcome-oriented decomposition, explicit dependencies, independent verification,
+  bounded scope, exact concurrency identity, and low-interruption product behavior.
+  **Why**: The LLM owns uncertain decomposition; Astra owns deterministic admission, revisioning,
+  execution, and verification. A useful planner must respect that boundary without falling back
+  to a prose checklist or asking the user to decide routine implementation details.
+  **Pass means**: The proposal is a small acyclic graph that covers implementation, migration,
+  compatibility removal, and verification; it preserves the context id; and it says the proposal
+  is not accepted state until deterministic admission succeeds.
+  **Fail means**: The answer claims work already changed, emits a flat/vague checklist, conflates
+  execution with verification, invents session identity, or unnecessarily interrupts the user.
+prompt: |
+  You are preparing a Work plan proposal from this immutable canonical planning context. Do not
+  call tools. Return exactly one compact JSON object and no Markdown fence or surrounding prose.
+  The object must contain `context_id`, `proposal_status`, `reason`, `additions`, and
+  `dependencies`; `proposal_status` must be `pending_admission`.
+
+  {
+    "schema_version": 1,
+    "context_id": "work-plan-context-v1:7f2a",
+    "basis": {
+      "work_id": "work-migrate-auth",
+      "branch_id": "branch-main",
+      "goal_revision": 3,
+      "criteria_set_revision": 4,
+      "graph_revision": 2
+    },
+    "goal": "Replace the legacy local credential binding with server-issued account identity",
+    "accepted_done_when": [
+      "Fresh login binds server-issued account identity without guessing it locally",
+      "Existing valid profiles migrate without losing unrelated settings",
+      "Invalid or unbound profiles fail with an actionable recovery path",
+      "Legacy binding code and obsolete tests are removed",
+      "Focused offline and online verification passes"
+    ],
+    "current_graph": [{
+      "item_id": "root",
+      "revision": 1,
+      "kind": "milestone",
+      "objective": "Deliver the account identity migration",
+      "expected_result": "All accepted completion criteria have current evidence"
+    }]
+  }
+
+  Propose 3-6 outcome-oriented additions with stable kebab-case item ids. Each addition must have
+  `item_id`, `kind` (`task` or `milestone`), `objective`, and `expected_result`. Dependencies must
+  use `predecessor_item_id` and `successor_item_id`, form an acyclic graph, and make verification
+  depend on implementation/migration rather than treating implementation completion as proof.
+  Do not ask the user to choose routine technical steps. Do not include or invent a session id.
+  Do not claim the graph changed: deterministic proposal admission has not run.
+capability: "custom:work_plan_decomposition_contract"
+difficulty: 4
+weight: 2.0
+timeout_seconds: 240
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tools_count_between
+    min: 0
+    max: 0
+  - type: text_json_value
+    path: /context_id
+    equals: "work-plan-context-v1:7f2a"
+  - type: text_json_value
+    path: /proposal_status
+    equals: pending_admission
+  - type: text_json_array_count
+    path: /additions
+    min: 3
+    max: 6
+  - type: text_json_array_count
+    path: /dependencies
+    min: 1
+    max: 20
+  - type: text_json_path_absent
+    path: /session_id
+  - type: text_json_dag
+    nodes_path: /additions
+    node_id_path: /item_id
+    node_required_string_paths: [/kind, /objective, /expected_result]
+    edges_path: /dependencies
+    predecessor_path: /predecessor_item_id
+    successor_path: /successor_item_id
+  - type: judger
+    question: |
+      Score the response as a typed long-task planning proposal. Give 1.0 only if all are true:
+      (1) it preserves context_id `work-plan-context-v1:7f2a`; (2) it proposes 3-6 concrete,
+      outcome-oriented additions covering implementation, safe migration/recovery, legacy cleanup,
+      and focused verification; (3) dependencies are explicit, refer only to declared item ids,
+      are acyclic, and place verification after the relevant implementation/migration work;
+      (4) verification remains distinct from execution completion; (5) it does not invent a
+      session id, claim the graph already changed, or ask the user to decide routine engineering
+      details; and (6) `proposal_status` is `pending_admission`, accurately expressing that
+      deterministic admission has not run or is still required. Give 0.5 for
+      a safe, bounded proposal with one material omission. Give 0.0 for false mutation claims,
+      invalid/untyped structure, a vague flat checklist, or execution presented as verification.
+    threshold: 0.9

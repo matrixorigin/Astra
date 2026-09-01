@@ -53,7 +53,7 @@ pub(super) async fn create_agent_binding_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<AgentBindingCreateResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _principal = state
+    let principal = state
         .auth_service
         .current_principal_for_request(
             &headers,
@@ -62,7 +62,11 @@ pub(super) async fn create_agent_binding_handler(
         .await?;
     let request = serde_json::from_slice::<astra_services::AgentBindingCreateRequestData>(&body)
         .map_err(|error| agent_binding_json_error_from_body_text(&error.to_string()))?;
-    let record = state.agent_binding_service.create_binding(request).await?;
+    let scope = astra_services::AgentBindingOwnerScope::from_principal(&principal);
+    let record = state
+        .agent_binding_service
+        .create_binding(scope, request)
+        .await?;
     Ok(Json((&record).into()))
 }
 
@@ -76,11 +80,27 @@ fn agent_binding_json_error_from_body_text(detail: &str) -> (StatusCode, Json<Er
 
 pub(super) async fn get_agent_binding_handler(
     State(state): State<AppState>,
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<AgentBindingResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _user = state.auth_service.current_user(&headers).await?;
-    let record = state.agent_binding_service.get_binding(id).await?;
+    let empty_body = Bytes::new();
+    let principal = state
+        .auth_service
+        .current_principal_for_request(
+            &headers,
+            external_request_descriptor(
+                &method,
+                &uri,
+                &headers,
+                "/agent-bindings/{id}",
+                &empty_body,
+            ),
+        )
+        .await?;
+    let scope = astra_services::AgentBindingOwnerScope::from_principal(&principal);
+    let record = state.agent_binding_service.get_binding(scope, id).await?;
     Ok(Json(record.into()))
 }
 
@@ -92,7 +112,7 @@ pub(super) async fn disable_agent_binding_handler(
     Path(id): Path<String>,
     body: Bytes,
 ) -> Result<Json<AgentBindingResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let _principal = state
+    let principal = state
         .auth_service
         .current_principal_for_request(
             &headers,
@@ -105,7 +125,11 @@ pub(super) async fn disable_agent_binding_handler(
             ),
         )
         .await?;
-    let record = state.agent_binding_service.disable_binding(id).await?;
+    let scope = astra_services::AgentBindingOwnerScope::from_principal(&principal);
+    let record = state
+        .agent_binding_service
+        .disable_binding(scope, id)
+        .await?;
     Ok(Json(record.into()))
 }
 

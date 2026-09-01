@@ -95,6 +95,7 @@ pub fn build_extraction_prompt(current_memory: &str, recent_messages: &[Value]) 
          - Pending todos contain only explicit open loops. Clear items that recent evidence shows are closed.\n\
          - Current state is a neutral resumable snapshot, not a completion report or instruction queue.\n\
          - Live repository, process, queue, permission, and verification state is not durable memory and must be rechecked with tools.\n\
+         - Never copy credentials, secret values, authorization headers, or credential-shaped code identifiers from tool output into memory. When authentication code is relevant, describe only the user goal at a semantic level (for example, `authentication handling`) without reproducing token/key/password field names.\n\
          - Do not emit markdown, code fences, commentary, completed-work history, workflow logs, or placeholder values such as None.";
     let user = format!(
         "## Current session memory:\n\n{current_memory}\n\n\
@@ -285,6 +286,8 @@ mod tests {
         assert!(system.contains("Treat assistant claims as unverified"));
         assert!(system.contains("never promote an assistant hypothesis into a learning"));
         assert!(system.contains("supersedes contradictory existing memory"));
+        assert!(system.contains("credential-shaped code identifiers"));
+        assert!(system.contains("authentication handling"));
     }
 
     #[test]

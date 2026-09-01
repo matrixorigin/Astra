@@ -59,6 +59,20 @@ The user contract is:
 
 > Select an available model. Astra states where it runs and who pays, and it does not cross permission, data, or billing boundaries silently.
 
+### Catalog transport contract
+
+`GET /models` and `GET /model-access` return the same seek-paginated catalog
+shape, not a first-page array. Each response contains `items`/`offerings`, a
+stable `(provider, model_name, model_id)` `next_cursor`, the global `total`,
+and a catalog-wide `catalog_revision`. Clients must follow the cursor until it
+is absent, reject a repeated cursor or changing revision, and treat a missing
+Offering after the complete drain as a definitive admission failure.
+
+Model Access readiness and `available_model_count` are calculated from the
+complete effective catalog, not from the current page. Only the first page
+may carry `default_offering_id`; continuation pages carry `null` and clients
+must preserve the first-page server decision.
+
 ## Model Access sources
 
 | Product source | Credential owner | Billing owner | Execution | Availability |

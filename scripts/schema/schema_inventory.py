@@ -42,6 +42,14 @@ SCHEMA_SOURCES: tuple[SchemaSource, ...] = (
         hot_path_hint="mixed",
     ),
     SchemaSource(
+        owner="astra_services::work",
+        domain="work",
+        path="crates/services/src/work.rs",
+        startup_owner="ensure_core_schema via crate::work::WORK_SCHEMA_TABLES",
+        state_class_hint="durable authority and immutable history, with recovery-idempotency (recovery/idempotency) facts",
+        hot_path_hint="projection-sequence (projection/sequence) reads and hot coordination",
+    ),
+    SchemaSource(
         owner="astra_services::config_version_cloud",
         domain="config_versions",
         path="crates/services/src/config_version_cloud.rs",
@@ -85,7 +93,8 @@ SCHEMA_SOURCES: tuple[SchemaSource, ...] = (
 
 
 CREATE_TABLE_RE = re.compile(
-    r"CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\(",
+    r"\bCREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+"
+    r"`?([A-Za-z_][A-Za-z0-9_]*)`?\s*\(",
     re.IGNORECASE,
 )
 
@@ -781,36 +790,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / state_projection",
         product_owner="multi-agent delegation tree, retries, and progress display",
     ),
-    "session_todos": TableMetadata(
-        semantic_owner="runtime::server::session_todo_handlers / astra_tools::task_mgmt",
-        state_class="durable live task board fact",
-        primary_query="task board hydration by user_id/session_id/ordinal, status updates by user_id/session_id/status/updated_at, and user task lists by user_id/status/updated_at",
-        retention_policy="retain as the authoritative session task board until task archive/GC or session hard delete; archived rows may be pruned only after dependency cleanup and idempotency/counter invariants remain intact",
-        rebuildability="not rebuildable after task ids, ordinals, dependency metadata, subtasks, and user-visible edits are lost",
-        merge_guidance="do not use this table as a plan mirror; durable plan and step runs are projected read-only, while session_todos owns user and task-tool checklist state",
-        migration_owner="astra_services::storage / runtime session_todo_handlers",
-        product_owner="task tool, session task board, TUI/dashboard task surface",
-    ),
-    "session_todo_counters": TableMetadata(
-        semantic_owner="runtime::server::session_todo_handlers",
-        state_class="durable monotonic task id allocator",
-        primary_query="owner/session next task id lookup and FOR UPDATE increment by user_id/session_id",
-        retention_policy="retain while the session task board may create new task ids; session hard delete removes owner/session counter after todos are gone",
-        rebuildability="not safely rebuildable from existing todos because deleted task ids must not be reused",
-        merge_guidance="do not merge into session_todos; deleted todos still reserve ids, so the allocator has a different lifecycle from task rows",
-        migration_owner="astra_services::storage / runtime session_todo_handlers",
-        product_owner="task tool id stability and idempotent task creation",
-    ),
-    "session_todo_idempotency": TableMetadata(
-        semantic_owner="runtime::server::session_todo_handlers",
-        state_class="durable task action idempotency fact",
-        primary_query="task action replay lookup by user_id/session_id/action/idempotency_key",
-        retention_policy="retain at least while task action retries, client reconnects, and session replay can repeat the same idempotency key; session hard delete removes owner/session rows",
-        rebuildability="not rebuildable after args_json/output are lost because duplicate retries would re-execute side effects",
-        merge_guidance="keep separate from session_todos; idempotency keys are per action, can outlive a specific task row, and must be queried directly",
-        migration_owner="astra_services::storage / runtime session_todo_handlers",
-        product_owner="task tool retry safety and exactly-once action behavior",
-    ),
     "data_versioning_checkpoints": TableMetadata(
         semantic_owner="astra_services::data_versioning::DatabaseDataVersioningService",
         state_class="durable named data checkpoint fact",
@@ -855,8 +834,8 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         semantic_owner="astra_services::session_restore",
         state_class="durable session restore checkpoint fact",
         primary_query="checkpoint lookup by user_id, session_id, checkpoint_id, number, turn, and created_at",
-        retention_policy="retain while session restore, rollback, tool state, contract state, and checkpoint list APIs may need state_json/tools_json; session hard delete removes owner/session rows",
-        rebuildability="not rebuildable after state_json, tools_json, contract_state_json, summary, and token/error counters are lost",
+        retention_policy="retain while session restore, rollback, tool state, and checkpoint list APIs may need state_json/tools_json; session hard delete removes owner/session rows",
+        rebuildability="not rebuildable after state_json, tools_json, summary, and token/error counters are lost",
         merge_guidance="keep separate from run_checkpoints; this table owns session-level restore snapshots while run_checkpoints own typed run recovery payloads",
         migration_owner="astra_services::storage / session_restore",
         product_owner="session restore, checkpoint list, rollback",
@@ -960,16 +939,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         merge_guidance="keep separate from agent_agents and agent_runs; this table packages runtime capability binding descriptors with idempotent creation semantics",
         migration_owner="astra_services::storage / agent_bindings",
         product_owner="web agent binding, runtime capability descriptors, run creation UX",
-    ),
-    "agent_tasks": TableMetadata(
-        semantic_owner="astra_services::task_orchestrator / multi_agent::task_lease",
-        state_class="durable task orchestration fact",
-        primary_query="task detail/list/search by user_id, task_id, status, session_id, updated_at, title, and task lease joins through agent_id",
-        retention_policy="retain while task board, long-running task recovery, checkpoint, feedback, and task lease coordination need task state; session hard delete removes owner/session tasks after dependent task_leases",
-        rebuildability="not rebuildable after plan_json, checkpoint_json, progress, feedback, outcome, and worker agent_id state are lost",
-        merge_guidance="keep separate from session_todos and task_leases; agent_tasks owns durable orchestration state, todos own user scratchpad tasks, leases own worker coordination",
-        migration_owner="astra_services::storage / task_orchestrator",
-        product_owner="long task orchestration, task board, worker lease coordination",
     ),
     "harness_snapshots": TableMetadata(
         semantic_owner="astra_services::harness diagnostics",
@@ -1141,26 +1110,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / multi_agent::edge_registry",
         product_owner="edge agent status, dispatch routing, no-sticky edge recovery",
     ),
-    "task_leases": TableMetadata(
-        semantic_owner="astra_services::multi_agent::task_lease",
-        state_class="coordination task lease fact",
-        primary_query="claim/renew/release lookup by user_id, task_id, holder_agent_id, holder_edge_id, expires_at, and lease_version",
-        retention_policy="cleanup_expired_data prunes expired rows after task_lease_days default 7 in ordered batches; release deletes active lease after clearing agent_tasks.agent_id",
-        rebuildability="not rebuildable for current ownership; expired leases can be reclaimed but active lease_version state is live coordination",
-        merge_guidance="keep separate from agent_tasks; leases are mutable worker coordination and must lock before/with task rows to avoid claim/release races",
-        migration_owner="astra_services::storage / multi_agent::task_lease",
-        product_owner="distributed task claim, worker heartbeat, multi-agent execution",
-    ),
-    "plan_templates": TableMetadata(
-        semantic_owner="astra_services::task_orchestrator / state_sync",
-        state_class="derived learned plan template fact",
-        primary_query="template lookup and sync by user_id, template_id, goal_pattern, project_type, success_rate, and use_count",
-        retention_policy="retain while learning successful patterns and edge/cloud plan template sync need reusable templates",
-        rebuildability="rebuildable only by relearning from historical successful tasks while source history remains complete",
-        merge_guidance="keep separate from plans; templates are reusable learned patterns, plans are per-session/user execution state",
-        migration_owner="astra_services::storage / task_orchestrator",
-        product_owner="plan learning, task planning, edge/cloud sync",
-    ),
     "plans": TableMetadata(
         semantic_owner="runtime::server::plan_handlers / astra_services::state_sync",
         state_class="durable plan execution state",
@@ -1180,26 +1129,6 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         merge_guidance="keep separate from plans; this table is append-only attempt history with unique subtask attempt semantics",
         migration_owner="astra_services::storage / runtime plan handlers",
         product_owner="plan step audit, retry/redo, execution history",
-    ),
-    "task_contracts": TableMetadata(
-        semantic_owner="astra_services::durable_task",
-        state_class="durable task acceptance contract fact",
-        primary_query="active contract lookup by user_id, contract_id, task_id, status, version, and session_id",
-        retention_policy="retain while durable task verification, restore, and acceptance criteria may need goal/scope/subtasks/criteria; session hard delete removes owner/session contracts after verification_results",
-        rebuildability="not rebuildable after goal, scope_json, subtasks_json, criteria_json, and version are lost",
-        merge_guidance="keep separate from verification_results; contracts define expected criteria, verification rows record evidence for attempts",
-        migration_owner="astra_services::storage / durable_task",
-        product_owner="durable task verification and acceptance criteria",
-    ),
-    "verification_results": TableMetadata(
-        semantic_owner="astra_services::durable_task",
-        state_class="durable verification evidence fact",
-        primary_query="verification evidence by user_id, result_id, contract_id, subtask_id, status, created_at, and task_id",
-        retention_policy="retain with task_contracts while audit/review needs pass/fail evidence; session hard delete removes rows before task_contracts",
-        rebuildability="not rebuildable after evidence, expected, duration, error_message, attempt, and status are lost",
-        merge_guidance="keep separate from task_contracts; evidence rows fan out per criterion/attempt and have different retention pressure",
-        migration_owner="astra_services::storage / durable_task",
-        product_owner="task verification evidence, audit, acceptance review",
     ),
     "wf_triggers": TableMetadata(
         semantic_owner="astra_services::triggers",
@@ -1250,6 +1179,516 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         merge_guidance="keep separate from team_definitions; snapshots are point-in-time audit records and can outlive mutable team config changes",
         migration_owner="astra_services::storage / team_persistence",
         product_owner="team snapshots, audit, reproducibility",
+    ),
+    "works": TableMetadata(
+        semantic_owner="astra_services::work::repository",
+        state_class="durable Work root and current-state authority",
+        primary_query="current work root by owner_id/work_id with current goal, criteria, delivery branch, revision, and archive state",
+        retention_policy="retain for the Work lifecycle and immutable revision/evidence audit; archive through archived_at and delete only with an explicit owner-scoped cleanup policy",
+        rebuildability="not rebuildable from Work events because current pointers, delivery branch, revision, and archive state are the Work root authority",
+        merge_guidance="keep Work root/current state separate from immutable goal, criterion, graph, and item revisions; works owns current pointers and lifecycle identity",
+        migration_owner="astra_services::work",
+        product_owner="Work lifecycle root, current state, and delivery branch",
+    ),
+    "work_goal_revisions": TableMetadata(
+        semantic_owner="astra_services::work::goal",
+        state_class="immutable Work goal revision history",
+        primary_query="goal revision by owner_id/work_id/revision with source, actor, reason, and created_at",
+        retention_policy="retain every accepted goal revision with the Work history; revisions are immutable and removed only with the owning Work archive policy",
+        rebuildability="not rebuildable after goal text, source reference, accepted actor, or revision identity are lost",
+        merge_guidance="keep immutable goal revisions separate from works current_goal_revision; the root points at the current revision but does not replace history",
+        migration_owner="astra_services::work",
+        product_owner="Work goal authority and immutable change history",
+    ),
+    "work_criteria": TableMetadata(
+        semantic_owner="astra_services::work::criteria",
+        state_class="durable Work criterion identity catalog",
+        primary_query="criterion identity by owner_id/work_id/criterion_id",
+        retention_policy="retain criterion identities while revisions or criterion sets reference them; remove only with Work history cleanup",
+        rebuildability="not rebuildable when criterion identity is needed to resolve revision and acceptance evidence",
+        merge_guidance="keep criterion identity separate from work_criterion_revisions and work_criterion_sets; identity, immutable definitions, and accepted membership have distinct authorities",
+        migration_owner="astra_services::work",
+        product_owner="Work criterion identity and lifecycle",
+    ),
+    "work_criterion_revisions": TableMetadata(
+        semantic_owner="astra_services::work::criteria",
+        state_class="immutable Work criterion revision history",
+        primary_query="criterion definition revision by owner_id/work_id/criterion_id/revision and definition_hash",
+        retention_policy="retain all criterion revisions used by accepted sets and checks; revisions are immutable through Work history cleanup",
+        rebuildability="not rebuildable after definition_json, definition_hash, source reference, or revision identity are lost",
+        merge_guidance="keep immutable criterion revisions separate from work_criteria current identity and work_criterion_sets accepted membership",
+        migration_owner="astra_services::work",
+        product_owner="Work criterion definitions and historical acceptance basis",
+    ),
+    "work_criterion_sets": TableMetadata(
+        semantic_owner="astra_services::work::criteria",
+        state_class="immutable accepted Work criterion-set authority",
+        primary_query="criterion-set revision by owner_id/work_id/revision with member_manifest_hash and accepted actor",
+        retention_policy="retain every accepted criterion-set revision for audit and replay; remove only with the owning Work history policy",
+        rebuildability="not rebuildable after member manifest, hash, count, accepted actor, or parent revision are lost",
+        merge_guidance="keep accepted set revisions separate from works.current_criteria_set_revision and individual criterion revisions; the root selects a set while history preserves each accepted manifest",
+        migration_owner="astra_services::work",
+        product_owner="Work acceptance criteria-set authority",
+    ),
+    "work_graph_revisions": TableMetadata(
+        semantic_owner="astra_services::work::graph",
+        state_class="immutable Work graph revision history",
+        primary_query="graph revision by owner_id/work_id/revision with item/edge manifests, hash, parent, and patch reference",
+        retention_policy="retain graph revisions referenced by branches, checks, proposals, and acceptance evidence; remove only with Work history cleanup",
+        rebuildability="not rebuildable after item/edge manifests, hash, parent lineage, or revision identity are lost",
+        merge_guidance="keep immutable graph revisions separate from work_graph_sequences and branch current_graph_revision; sequence allocates ordering while revisions preserve graph authority",
+        migration_owner="astra_services::work",
+        product_owner="Work dependency graph authority and immutable history",
+    ),
+    "work_graph_sequences": TableMetadata(
+        semantic_owner="astra_services::work::graph",
+        state_class="durable Work graph revision sequence authority",
+        primary_query="last graph revision by owner_id/work_id",
+        retention_policy="retain one sequence row for each active Work; update transactionally with graph revision creation and remove with Work cleanup",
+        rebuildability="not safely rebuildable during concurrent graph writes because the sequence is the ordering authority",
+        merge_guidance="keep sequence authority separate from immutable work_graph_revisions and branch projections; it allocates monotonic graph revision identity",
+        migration_owner="astra_services::work",
+        product_owner="Work graph ordering and concurrent revision allocation",
+    ),
+    "work_items": TableMetadata(
+        semantic_owner="astra_services::work::items",
+        state_class="durable Work item current-state authority",
+        primary_query="current item by owner_id/work_id/item_id with last_revision",
+        retention_policy="retain item identity and current revision while Work branches or evidence reference it; clean up with Work lifecycle",
+        rebuildability="not rebuildable as current item authority when the latest revision pointer is lost",
+        merge_guidance="keep item current state separate from immutable work_item_revisions and work_item_edges; work_items points to current content while revisions preserve history",
+        migration_owner="astra_services::work",
+        product_owner="Work item identity and current revision selection",
+    ),
+    "work_item_revisions": TableMetadata(
+        semantic_owner="astra_services::work::items",
+        state_class="immutable Work item revision history",
+        primary_query="item revision by owner_id/work_id/item_id/revision with objective, expected result, declaration state, and parent",
+        retention_policy="retain item revisions referenced by graph, attempts, checks, proposals, and acceptance; remove only with Work history cleanup",
+        rebuildability="not rebuildable after objective, expected result, source reference, declaration state, or parent lineage are lost",
+        merge_guidance="keep immutable item revisions separate from work_items current pointers and work_item_attempts evidence; current state and execution evidence must not overwrite history",
+        migration_owner="astra_services::work",
+        product_owner="Work item declaration and immutable change history",
+    ),
+    "work_item_edges": TableMetadata(
+        semantic_owner="astra_services::work::graph",
+        state_class="immutable graph dependency edge fact",
+        primary_query="dependency edges by owner_id/work_id/graph_revision and predecessor/successor item ids",
+        retention_policy="retain edges with their graph revision while branches, checks, and replay can reference that graph; remove only with graph history cleanup",
+        rebuildability="rebuildable from an identical graph manifest only while the source graph revision remains authoritative",
+        merge_guidance="keep graph edges separate from work_item_revisions and work_graph_sequences; edges are revision-scoped dependency evidence, not item content or sequence allocation",
+        migration_owner="astra_services::work",
+        product_owner="Work dependency graph traversal and validation",
+    ),
+    "work_branches": TableMetadata(
+        semantic_owner="astra_services::work::branches",
+        state_class="durable Work branch root and current-state authority",
+        primary_query="current branch by owner_id/work_id/branch_id with session, basis/current graph revision, archive, and deletion markers",
+        retention_policy="retain branch root and lineage while branch sessions, operations, and evidence need recovery; archive and delete only through the branch deletion operation",
+        rebuildability="not rebuildable from branch events because current branch revision, session binding, graph pointers, and deletion fencing are authority",
+        merge_guidance="keep branch root/current state separate from immutable graph/item revisions and branch operation history; work_branches owns the live branch boundary",
+        migration_owner="astra_services::work",
+        product_owner="Work branch lifecycle, lineage, and current graph selection",
+    ),
+    "work_branch_creation_operations": TableMetadata(
+        semantic_owner="astra_services::work::branches",
+        state_class="durable branch creation recovery and idempotency authority",
+        primary_query="branch creation operation by owner/work/origin branch/operation_id and idempotency_hash, state, executor lease, and outcome",
+        retention_policy="retain pending and terminal operations through retry/recovery and audit; prune only after branch lineage and session cleanup are complete",
+        rebuildability="not rebuildable during recovery because operation idempotency, expected/observed revision, child identity, and executor fencing are authoritative",
+        merge_guidance="keep branch creation operations separate from work_branches and branch events; branch operations are recovery/idempotency authority, while the branch row is current state",
+        migration_owner="astra_services::work",
+        product_owner="Work branch creation recovery and idempotent execution",
+    ),
+    "work_branch_control_operations": TableMetadata(
+        semantic_owner="astra_services::work::branches",
+        state_class="durable branch control recovery and fencing authority",
+        primary_query="branch control operation by owner/work/branch/operation_id, idempotency_hash, expected writer epoch, executor lease, and outcome",
+        retention_policy="retain pending and terminal control operations through retry, takeover, conflict diagnosis, and audit; prune after branch lifecycle cleanup",
+        rebuildability="not rebuildable during concurrent control because expected/observed branch revision, writer epoch, and idempotency are recovery authority",
+        merge_guidance="keep branch control operations separate from work_branches and other operation kinds; this row is the idempotency/recovery/fencing authority for acquire, takeover, and release",
+        migration_owner="astra_services::work",
+        product_owner="Work branch writer coordination and forced takeover recovery",
+    ),
+    "work_branch_deletion_operations": TableMetadata(
+        semantic_owner="astra_services::work::branches",
+        state_class="durable branch deletion recovery and idempotency authority",
+        primary_query="branch deletion operation by owner/work/branch/operation_id, idempotency_hash, operation phase, executor lease, and outcome",
+        retention_policy="retain deletion operations until terminal cleanup and conflict audit complete; remove only after branch/session lineage cleanup is durable",
+        rebuildability="not rebuildable during deletion recovery because expected/observed revisions, phase, outcome, and executor fencing are authoritative",
+        merge_guidance="keep deletion operations separate from work_branches; branch operations own idempotency/recovery while the root row owns deletion markers and current state",
+        migration_owner="astra_services::work",
+        product_owner="Work branch deletion, lineage garbage collection, and recovery",
+    ),
+    "work_branch_subjects": TableMetadata(
+        semantic_owner="astra_services::work::branches",
+        state_class="durable branch-selected immutable subject authority",
+        primary_query="the single materialized subject selected by owner_id/work_id/branch_id with subject record revision, branch/graph revision, subject_ref, and subject_revision",
+        retention_policy="retain one selected subject row per branch while the branch is active or its evidence needs the basis; replace transactionally and delete with branch cleanup, without accumulating mutable current-head history",
+        rebuildability="not rebuildable as Work's selected-subject authority from mutable branch/work declarations; the workspace/materialization service remains the authority for the referenced immutable subject",
+        merge_guidance="keep branch subjects separate from work_branches and immutable item/graph revisions; this row owns Work's selected immutable subject while workspace/materialization owns referenced content",
+        migration_owner="astra_services::work",
+        product_owner="Work branch subject targeting and invalidation",
+    ),
+    "work_patch_artifacts": TableMetadata(
+        semantic_owner="astra_services::work::patches",
+        state_class="immutable Work patch artifact evidence",
+        primary_query="patch artifact by owner/work/patch_artifact_id, session, payload artifact, hash, and branch",
+        retention_policy="retain patch payload identity and hashes while materialization, commit, checks, or acceptance reference them; delete with Work evidence cleanup",
+        rebuildability="not rebuildable after patch hash, payload artifact identity, or source/target basis are lost",
+        merge_guidance="keep patch artifacts separate from patch materialization/commit operations; artifacts preserve evidence while operations own recovery and idempotency",
+        migration_owner="astra_services::work",
+        product_owner="Work patch evidence, integrity, and review",
+    ),
+    "work_patch_materialization_operations": TableMetadata(
+        semantic_owner="astra_services::work::patches",
+        state_class="durable patch materialization recovery and idempotency authority",
+        primary_query="materialization operation by owner/work/operation_id, request_id, target/source branch, phase, recovery_after, executor lease, and outcome",
+        retention_policy="retain pending and terminal operations through retries, recovery_after scheduling, conflict diagnosis, and audit; prune after patch evidence and branch cleanup",
+        rebuildability="not rebuildable during recovery because request identity, phase, expected/observed revisions, and executor fencing are authoritative",
+        merge_guidance="keep patch materialization operations separate from patch artifacts and commit operations; patch operations are the idempotency/recovery authority for each distinct lifecycle",
+        migration_owner="astra_services::work",
+        product_owner="Work patch application recovery and idempotent materialization",
+    ),
+    "work_patch_commit_operations": TableMetadata(
+        semantic_owner="astra_services::work::patches",
+        state_class="durable patch commit recovery and idempotency authority",
+        primary_query="commit operation by owner/work/operation_id, request_id, active target branch, phase, recovery_after, executor lease, and outcome",
+        retention_policy="retain pending and terminal commit operations through retry, recovery, target fencing, and audit; prune after commit evidence and branch lifecycle cleanup",
+        rebuildability="not rebuildable during recovery because request identity, target uniqueness, expected revisions, phase, and executor lease are authoritative",
+        merge_guidance="keep patch commit operations separate from materialization operations and patch artifacts; commit has its own idempotency/recovery and active-target boundary",
+        migration_owner="astra_services::work",
+        product_owner="Work patch commit recovery and target coordination",
+    ),
+    "work_proposal_sequences": TableMetadata(
+        semantic_owner="astra_services::work::proposals",
+        state_class="durable Work proposal ordering authority",
+        primary_query="last proposal sequence by owner_id/work_id/branch_id",
+        retention_policy="retain one sequence row per active Work branch and update transactionally with proposal creation; remove with branch cleanup",
+        rebuildability="not safely rebuildable during concurrent proposal writes because sequence is the ordering authority",
+        merge_guidance="keep proposal sequence separate from work_proposals; sequence allocation orders proposals while proposal rows preserve lifecycle and evidence",
+        migration_owner="astra_services::work",
+        product_owner="Work proposal ordering and concurrency",
+    ),
+    "work_proposals": TableMetadata(
+        semantic_owner="astra_services::work::proposals",
+        state_class="durable Work proposal lifecycle authority",
+        primary_query="proposal by owner/work/branch/proposal_id and proposal_seq, status, expiry, and basis revisions",
+        retention_policy="retain pending proposals and exactly WORK_PROPOSAL_RETAINED_TERMINAL_PER_BRANCH=64 terminal proposals per branch; prune terminal proposals at the bounded sequence floor after acceptance/rejection/expiry",
+        rebuildability="not rebuildable after proposal payload, basis hashes, sequence, status, or expiry are lost",
+        merge_guidance="keep proposals separate from proposal sequences and acceptance decisions; proposal lifecycle, ordering, and acceptance evidence have distinct authorities",
+        migration_owner="astra_services::work",
+        product_owner="Work plan proposal lifecycle and review",
+    ),
+    "work_check_runs": TableMetadata(
+        semantic_owner="astra_services::work::checks",
+        state_class="immutable Work check execution evidence",
+        primary_query="check result by owner/work/check_run_id, branch, item attempt, criterion revision, and produced_at",
+        retention_policy="retain check-run detail while its source check_recorded event is inside the fixed Work event retention window; delete detail as that source event leaves the retention window, while bounded current acceptance facts preserve required hashes",
+        rebuildability="not rebuildable after command/test/artifact output, basis revisions, status, and produced_at are lost",
+        merge_guidance="keep check evidence separate from acceptance decisions and item attempts; checks preserve observed evidence while acceptance records the decision over it",
+        migration_owner="astra_services::work",
+        product_owner="Work checks, verification evidence, and freshness",
+    ),
+    "work_acceptance_decisions": TableMetadata(
+        semantic_owner="astra_services::work::acceptance",
+        state_class="immutable Work acceptance decision evidence",
+        primary_query="acceptance decision by owner/work/decision_id, branch, decision_event_seq, and decided_at",
+        retention_policy="retain acceptance-decision detail while its source gaps_accepted event is inside the fixed Work event retention window; delete detail as that source event leaves the retention window, while bounded current gap facts preserve current acceptance",
+        rebuildability="not rebuildable after decision outcome, basis hashes, actor, and decision time are lost",
+        merge_guidance="keep acceptance decisions separate from check runs, gap acceptances, and current Work pointers; decisions preserve evidence-backed authority rather than a replaceable projection",
+        migration_owner="astra_services::work",
+        product_owner="Work acceptance and release decisions",
+    ),
+    "work_current_gap_acceptances": TableMetadata(
+        semantic_owner="astra_services::work::acceptance",
+        state_class="durable current criterion-gap acceptance authority",
+        primary_query="current gap acceptance by owner/work/branch/criterion_id with decision event sequence, status, and basis",
+        retention_policy="retain this bounded current fact and current acceptance while the branch and criterion remain active, even after source events and check/acceptance detail leave the retention window; replace through a new decision event and clean up with Work history",
+        rebuildability="not rebuildable as current acceptance authority after the current basis, decision, or event sequence is lost",
+        merge_guidance="keep current gap acceptance separate from immutable acceptance decisions and criteria revisions; it is the current branch projection selected by explicit decision evidence",
+        migration_owner="astra_services::work",
+        product_owner="Work current gap handling and acceptance policy",
+    ),
+    "work_event_sequences": TableMetadata(
+        semantic_owner="astra_services::work::events",
+        state_class="durable Work event ordering and retained_from_event_seq coverage-floor authority",
+        primary_query="last_event_seq and retained_from_event_seq coverage floor by owner_id/work_id; the floor defines the fixed retained event window",
+        retention_policy="retain one sequence row per Work and update atomically with canonical event append; retained_from_event_seq is the coverage-floor authority for detail pruning and replay gaps",
+        rebuildability="not safely rebuildable during concurrent event append because last_event_seq ordering and retained_from_event_seq coverage are authority",
+        merge_guidance="keep event sequence separate from work_events and runtime outbox; sequence allocation orders canonical history without becoming event payload or runtime projection state",
+        migration_owner="astra_services::work",
+        product_owner="Work canonical event ordering and append concurrency",
+    ),
+    "work_attention_receipts": TableMetadata(
+        semantic_owner="astra_services::work::attention",
+        state_class="durable Work attention delivery receipt fact",
+        primary_query="current attention receipt by owner_id/work_id with receipt kind, event sequence, and consumer state",
+        retention_policy="retain the latest receipt while attention delivery/recovery needs it; replace idempotently and remove with Work lifecycle cleanup",
+        rebuildability="not rebuildable during delivery recovery after receipt identity and acknowledged sequence are lost",
+        merge_guidance="keep attention receipts separate from canonical work_events and runtime outbox coordination; receipts record consumer acknowledgment rather than event history",
+        migration_owner="astra_services::work",
+        product_owner="Work attention routing and delivery recovery",
+    ),
+    "work_item_attempts": TableMetadata(
+        semantic_owner="astra_services::work::execution",
+        state_class="mutable durable Work item attempt lifecycle and settlement authority",
+        primary_query="attempt by owner/work/branch/item/revision/attempt_id with executor, status, mode, and started_at",
+        retention_policy="retain attempts through check, acceptance, billing, and recovery audit; remove only with Work evidence cleanup after terminal reconciliation",
+        rebuildability="not rebuildable after attempt identity, lifecycle status, executor identity, or terminal result/settlement are lost",
+        merge_guidance="keep attempts separate from work_items/current revisions and check runs; attempts preserve execution evidence while checks preserve validation evidence",
+        migration_owner="astra_services::work",
+        product_owner="Work execution attempts, retries, and audit",
+    ),
+    "work_events": TableMetadata(
+        semantic_owner="astra_services::work::events",
+        state_class="immutable canonical history of Work events in a fixed retained window",
+        primary_query="canonical event by owner_id/work_id/event_seq, branch_id, event_kind, and source_ref within the fixed retained window",
+        retention_policy="retain exactly WORK_EVENT_RETENTION_PER_WORK=10,000 canonical events per Work; prune each event and its check/acceptance detail as it leaves the fixed retention window",
+        rebuildability="not rebuildable after event payload, sequence, payload_hash, or source identity are lost",
+        merge_guidance="keep work_events as canonical history separate from work_runtime_event_outbox coordination; canonical events own replay truth while the outbox owns runtime projection delivery",
+        migration_owner="astra_services::work",
+        product_owner="Work canonical history, replay, and audit",
+    ),
+    "work_runtime_event_outbox": TableMetadata(
+        semantic_owner="astra_services::work::runtime_event_outbox",
+        state_class="durable authoritative Run transaction runtime event fixed-size ring",
+        primary_query="pending runtime event by owner/work/runtime_event_seq, event_kind, source_ref, and ring coverage relative to enqueued/projected sequences",
+        retention_policy="authoritative Run transaction writes a fixed 1024-row ring; prune unprojected rows when the ring advances and surface runtime_events_expired when projection falls behind its coverage",
+        rebuildability="not rebuildable from work_events; the authoritative Run transaction ring may expire before canonical projection and must report runtime_events_expired rather than inventing or silently dropping status",
+        merge_guidance="keep runtime outbox separate from work_events canonical history and outbox slots; it coordinates runtime event projection delivery without becoming the Work history authority",
+        migration_owner="astra_services::work",
+        product_owner="Work runtime event projection and delivery recovery",
+    ),
+    "work_runtime_event_outbox_slots": TableMetadata(
+        semantic_owner="astra_services::work::runtime_event_outbox",
+        state_class="durable runtime outbox enqueued/projected sequence and coverage coordination authority",
+        primary_query="enqueued and projected sequence plus pending/coverage state by owner_id/work_id",
+        retention_policy="retain one slot per Work while runtime projection is active; update transactionally with ring coverage and remove with Work cleanup",
+        rebuildability="not generally rebuildable during runtime projection recovery because enqueued/projected sequence and coverage are coordination authority",
+        merge_guidance="keep outbox slots separate from canonical work_events and outbox rows; slots are hot coordination/projection sequence state, not immutable history or delivery payload",
+        migration_owner="astra_services::work",
+        product_owner="Work runtime projection hot coordination and sequencing",
+    ),
+    "auth_reauthentication_proofs": TableMetadata(
+        semantic_owner="astra_services::auth::reauthentication",
+        state_class="durable reauthentication trust fact",
+        primary_query="unconsumed proof by user_id, proof_id, purpose, proof_hash, and expires_at",
+        retention_policy="retain until consumed or expired, then prune expired proofs in bounded batches; expiry is part of the trust contract",
+        rebuildability="not rebuildable after proof_hash and expiry are lost because those values establish the reauthentication trust fact",
+        merge_guidance="keep separate from bearer tokens and device challenges; reauthentication proof expiry and purpose are a distinct trust boundary",
+        migration_owner="astra_services::storage / auth",
+        product_owner="reauthentication and step-up authorization",
+    ),
+    "conversation_segments": TableMetadata(
+        semantic_owner="astra_services::context::conversation_segments",
+        state_class="immutable content-addressed conversation segment fact",
+        primary_query="segment content by isolation_domain, owner_user_id, segment_hash, or canonical_root_hash",
+        retention_policy="retain while a manifest or transcript references the canonical segment; remove unreferenced content only through bounded context cleanup",
+        rebuildability="rebuildable only from the original canonical transcript bytes, not from a current projection or manifest head",
+        merge_guidance="keep separate from conversation_manifest_nodes and conversation_manifest_segments; content-addressed payloads, manifest graph nodes, and ordered links have different authorities",
+        migration_owner="astra_services::storage / context",
+        product_owner="canonical conversation context storage and deduplicated segment reuse",
+    ),
+    "conversation_manifest_nodes": TableMetadata(
+        semantic_owner="astra_services::context::manifest",
+        state_class="durable immutable context manifest graph authority",
+        primary_query="manifest root and parent lineage by owner session/branch, conversation_seq, compaction_generation, and reachable state",
+        retention_policy="retain reachable manifests and their lineage while session context can be restored; garbage-collect unreachable nodes only after pins and heads no longer reference them",
+        rebuildability="not rebuildable from session_context_heads alone because parent lineage, root hashes, and reachability are manifest authority",
+        merge_guidance="keep separate from session_context_heads, manifest segments, events, and receipts; the manifest graph is immutable context authority, not a current projection or operation acknowledgment",
+        migration_owner="astra_services::storage / context",
+        product_owner="canonical context manifest lineage, compaction, and recovery",
+    ),
+    "conversation_manifest_pins": TableMetadata(
+        semantic_owner="astra_services::context::manifest_gc",
+        state_class="durable manifest retention pin fact",
+        primary_query="active pin by owner parent session/branch, manifest_root, pin_state, and grace_expires_at_ms",
+        retention_policy="retain pins through their grace window and while the pinned manifest is needed for fork or recovery; expire and prune pins in bounded batches",
+        rebuildability="not safely rebuildable while a pin protects context from garbage collection because pin intent and expiry are trust facts",
+        merge_guidance="keep separate from manifest nodes and session context heads; pins fence cleanup without becoming the current context projection",
+        migration_owner="astra_services::storage / context",
+        product_owner="context retention pins, fork safety, and manifest garbage collection",
+    ),
+    "conversation_manifest_segments": TableMetadata(
+        semantic_owner="astra_services::context::manifest",
+        state_class="durable ordered manifest-to-segment projection",
+        primary_query="ordered segment links by owner session/branch, manifest_root, and segment_position",
+        retention_policy="retain with each reachable manifest root; delete links only after the manifest is unreachable and pins/heads permit cleanup",
+        rebuildability="rebuildable from the immutable manifest node and segment content when both remain available",
+        merge_guidance="keep separate from conversation_segments and manifest nodes; ordered fanout is a projection of a manifest root, not segment content or graph lineage",
+        migration_owner="astra_services::storage / context",
+        product_owner="ordered context materialization and manifest segment traversal",
+    ),
+    "inference_invocation_settlement_debts": TableMetadata(
+        semantic_owner="astra_services::inference_execution::settlement",
+        state_class="durable inference settlement recovery authority",
+        primary_query="settlement debt by user_id, invocation_id, optional exact provider_attempt_id plus provider-delivery authorization, session_id or harness_run_id, and terminal_fingerprint",
+        retention_policy="retain until usage, billing, and terminal delivery settlement is acknowledged; retry pending rows with a per-row eligibility deadline, quarantine permanent conflicts outside active recovery batches, and prune only after authoritative reconciliation",
+        rebuildability="not rebuildable while unsettled because this is the recovery authority for logical invocation settlement and any acknowledged exact provider-attempt terminal",
+        merge_guidance="keep separate from inference_invocations, provider attempts, and metric shards; optional attempt identity plus delivery authorization distinguishes a legitimate absent pre-delivery row from loss of an already-authorized physical request",
+        migration_owner="astra_services::storage / inference_execution",
+        product_owner="inference billing, usage settlement, and uncertain-delivery recovery",
+    ),
+    "model_request_context_events": TableMetadata(
+        semantic_owner="astra_services::inference_execution::request_context",
+        state_class="append-only model request context evidence fact",
+        primary_query="accepted or terminal request context by user_id, attempt_id, invocation_id, session/harness owner, and event_stage",
+        retention_policy="retain append-only accepted and terminal evidence through inference audit, usage reconciliation, and recovery; delete with the owning session or harness history",
+        rebuildability="not rebuildable after topology, provider/model context, token counts, and terminal status are lost",
+        merge_guidance="keep append-only request context events separate from model_request_metric_shards; events preserve evidence while shards are a rebuildable aggregate projection",
+        migration_owner="astra_services::storage / inference_execution",
+        product_owner="request context evidence, token accounting, and inference diagnostics",
+    ),
+    "model_request_metric_shards": TableMetadata(
+        semantic_owner="astra_services::inference_execution::metrics",
+        state_class="rebuildable sharded request metrics projection",
+        primary_query="low-cardinality terminal metrics by metric_shard, topology, provider, model_family, purpose, and terminal_status",
+        retention_policy="retain current aggregate shards for scraper and dashboard windows; rebuild or reset them from request context events during bounded maintenance",
+        rebuildability="rebuildable from model_request_context_events terminal evidence; shard rows are not the request history authority",
+        merge_guidance="keep separate from append-only request context events and settlement debts; sharding protects hot metric updates and does not replace evidence or recovery authority",
+        migration_owner="astra_services::storage / inference_execution",
+        product_owner="low-cardinality inference metrics and scraper performance",
+    ),
+    "session_attachment_quarantines": TableMetadata(
+        semantic_owner="astra_services::context::attachments",
+        state_class="durable attachment quarantine decision fact",
+        primary_query="quarantine operation by owner session/branch, quarantine_id, idempotency_hash, and observed/current manifest roots",
+        retention_policy="retain quarantine evidence through attachment recovery and audit; prune with the owning session after the operation is resolved",
+        rebuildability="not rebuildable after observed manifest root, request hash, reason, and idempotency identity are lost",
+        merge_guidance="keep separate from session_attachments and handoff slots; quarantine records a rejected or fenced attachment operation while attachments own active placement",
+        migration_owner="astra_services::storage / context",
+        product_owner="attachment trust fencing, quarantine, and recovery",
+    ),
+    "session_attachments": TableMetadata(
+        semantic_owner="astra_services::context::attachments",
+        state_class="durable attachment placement and trust fact",
+        primary_query="active attachment by owner session/branch, attachment_id, attachment_epoch, idempotency_hash, and expiry",
+        retention_policy="retain active attachments until expires_at_ms or explicit removal, then clean up in bounded batches with the owning session",
+        rebuildability="not rebuildable during an active lease because placement, epoch, idempotency, and observed manifest root fence attachment trust",
+        merge_guidance="keep separate from quarantine, handoffs, and context manifests; active attachment placement is a trust/fencing fact rather than an operation event or projection",
+        migration_owner="astra_services::storage / context",
+        product_owner="session attachment placement, expiry, and authorization fencing",
+    ),
+    "session_context_authority_events": TableMetadata(
+        semantic_owner="astra_services::context::authority",
+        state_class="append-only context authority and fencing evidence fact",
+        primary_query="context operation outcome by owner session/branch, event_id, operation_kind, writer_epoch, and observed root",
+        retention_policy="retain authority events through context replay, conflict diagnosis, and security audit; remove only with the owning session's bounded hard-delete policy",
+        rebuildability="not rebuildable after writer/device/authorization/permission epochs and observed roots are lost",
+        merge_guidance="keep separate from context heads, manifests, operation receipts, and transcript projections; events preserve fencing evidence while those tables own other authority surfaces",
+        migration_owner="astra_services::storage / context",
+        product_owner="context write authority, fencing, and conflict audit",
+    ),
+    "session_context_heads": TableMetadata(
+        semantic_owner="astra_services::context::heads",
+        state_class="mixed current context projection plus live coordination/fencing authority",
+        primary_query="current context head by owner session/branch, latest_manifest_root, canonical_root_hash, completed_turn, and sequence counters",
+        retention_policy="retain the current head while the session/branch is live; replace transactionally and delete with the owning session after manifest/event cleanup",
+        rebuildability="manifest/sequence projection and root are repairable from manifests, authority events, and receipts; while active writer/reservation leases, expiry, writer_epoch, or authority epochs are live, the entire row is not safely rebuildable",
+        merge_guidance="keep separate from manifest/events/receipts: heads are a current projection, manifests own canonical lineage, events own authority history, and receipts own idempotency outcomes; active writer, reservation, and fencing coordination remain distinct from repairable projection state",
+        migration_owner="astra_services::storage / context",
+        product_owner="current context projection, sequence checkpoints, and writer fencing",
+    ),
+    "session_context_operation_receipts": TableMetadata(
+        semantic_owner="astra_services::context::authority",
+        state_class="durable context operation idempotency receipt fact",
+        primary_query="operation receipt by owner session/branch, operation_kind, idempotency_hash, and request_hash",
+        retention_policy="retain receipts for the idempotency/recovery window and while the operation may be retried; delete only with the owning session's operation history",
+        rebuildability="not rebuildable during the retry window because the receipt is the idempotency authority for an accepted context operation",
+        merge_guidance="keep separate from context authority events and current heads; receipts answer idempotent retry lookups while events preserve append-only decisions and heads project current state",
+        migration_owner="astra_services::storage / context",
+        product_owner="context operation idempotency and recovery",
+    ),
+    "session_device_challenges": TableMetadata(
+        semantic_owner="astra_services::auth::device_trust",
+        state_class="durable expiring device challenge trust fact",
+        primary_query="unconsumed challenge by user_id, challenge_id, device/session, purpose, and expires_at",
+        retention_policy="retain until consumed or expiry, then prune expired challenges in bounded batches; expiry is part of the device trust fact",
+        rebuildability="not rebuildable after challenge_digest, device identity, purpose, or expiry are lost",
+        merge_guidance="keep separate from reauthentication proofs and device leases; challenge expiry establishes trust while leases represent current device ownership",
+        migration_owner="astra_services::storage / auth",
+        product_owner="device challenge verification and trust establishment",
+    ),
+    "session_fork_events": TableMetadata(
+        semantic_owner="astra_services::context::forks",
+        state_class="append-only immutable fork transition history",
+        primary_query="fork transition by owner fork_id, transition_seq, parent_session_id, child_session_id, and created_at",
+        retention_policy="retain with parent and child session history for replay and audit; delete only through session fork cleanup after lifecycle closure",
+        rebuildability="not rebuildable after transition sequence, from/to state, and event payload are lost",
+        merge_guidance="keep separate from session_forks; the fork row owns current lifecycle/idempotency while events preserve immutable transition history",
+        migration_owner="astra_services::storage / context",
+        product_owner="fork lifecycle audit and recovery replay",
+    ),
+    "session_forks": TableMetadata(
+        semantic_owner="astra_services::context::forks",
+        state_class="durable fork lifecycle and idempotency authority",
+        primary_query="fork state by owner fork_id, parent/child session and branch, and idempotency_hash",
+        retention_policy="retain while fork activation or recovery can be retried and while parent/child lineage is auditable; clean up only after both session lifecycles permit it",
+        rebuildability="not rebuildable from fork events alone because current state, manifest snapshot, child uniqueness, and idempotency are lifecycle authority",
+        merge_guidance="keep separate from session_fork_events and context manifests; fork operations own recovery/idempotency while event rows own immutable transition history",
+        migration_owner="astra_services::storage / context",
+        product_owner="session fork lifecycle, idempotency, and lineage recovery",
+    ),
+    "session_handoff_events": TableMetadata(
+        semantic_owner="astra_services::context::handoff",
+        state_class="append-only immutable handoff transition history",
+        primary_query="handoff transition by owner session/branch, handoff_id, transition_seq, and created_at",
+        retention_policy="retain with handoff and session audit through recovery; delete only after the handoff lifecycle and owning session are closed",
+        rebuildability="not rebuildable after transition sequence, request hash, and event payload are lost",
+        merge_guidance="keep separate from session_handoffs and handoff slots; events preserve immutable history, handoffs own lifecycle/idempotency, and slots own current coordination",
+        migration_owner="astra_services::storage / context",
+        product_owner="session handoff transition audit and recovery replay",
+    ),
+    "session_handoff_slots": TableMetadata(
+        semantic_owner="astra_services::context::handoff",
+        state_class="durable handoff slot and attachment epoch coordination fact",
+        primary_query="current active_handoff_id and next_attachment_epoch by owner session/branch",
+        retention_policy="retain one slot per live session/branch and update transactionally; release with session cleanup after handoff closure",
+        rebuildability="not safely rebuildable during concurrent handoff or attachment writes because the slot is a fencing and epoch authority",
+        merge_guidance="keep separate from handoffs, handoff events, and attachments; the slot serializes current coordination while those tables preserve lifecycle/history or placement",
+        migration_owner="astra_services::storage / context",
+        product_owner="handoff coordination, attachment epochs, and fencing",
+    ),
+    "session_handoffs": TableMetadata(
+        semantic_owner="astra_services::context::handoff",
+        state_class="durable handoff lifecycle and idempotency authority",
+        primary_query="handoff state by owner session/branch, handoff_id, idempotency_hash, state, and deadline_ms",
+        retention_policy="retain active and recently terminal handoffs through deadline-based recovery and audit; prune only after event history and session lifecycle permit it",
+        rebuildability="not rebuildable from handoff events alone because current state, deadline, record, and idempotency are lifecycle authority",
+        merge_guidance="keep separate from handoff events and handoff slots; lifecycle/idempotency, immutable history, and hot current coordination have separate boundaries",
+        migration_owner="astra_services::storage / context",
+        product_owner="session handoff lifecycle and recovery",
+    ),
+    "session_transcript_projection_heads": TableMetadata(
+        semantic_owner="astra_services::context::transcript_projection",
+        state_class="durable transcript projection sequence head",
+        primary_query="transcript projection head by user_id/session_id, completed_turn, journal_event_seq, conversation_seq, and canonical_root_hash",
+        retention_policy="retain the current projection checkpoint while transcript replay and compaction need it; replace during projection repair and remove with session cleanup",
+        rebuildability="rebuildable from transcript items and canonical journal/manifests when sequence and root evidence remain available",
+        merge_guidance="keep separate from session_context_heads, transcript items, manifests, and events; this is transcript projection state keyed by projection sequence, not canonical history",
+        migration_owner="astra_services::storage / context",
+        product_owner="transcript materialization, compaction, and projection recovery",
+    ),
+    "session_weighted_admission_gates": TableMetadata(
+        semantic_owner="astra_services::context::weighted_admission",
+        state_class="durable hot admission coordination gate",
+        primary_query="scope-level admission gate by scope_name and updated_at",
+        retention_policy="retain one gate per configured scope while admission coordination is enabled; recreate or remove with scope configuration",
+        rebuildability="fully rebuildable by admission bootstrap because it is coordination state rather than context history",
+        merge_guidance="keep separate from weighted reservations; the gate serializes scope coordination while reservations own capacity claims and expiry",
+        migration_owner="astra_services::storage / context",
+        product_owner="weighted context admission hot coordination",
+    ),
+    "session_weighted_admission_reservations": TableMetadata(
+        semantic_owner="astra_services::context::weighted_admission",
+        state_class="durable capacity reservation and fencing fact",
+        primary_query="active reservation by scope_name, reservation_id, owner session/branch, idempotency_hash, and expires_at",
+        retention_policy="retain reservations until expiry or release, then prune expired capacity claims in bounded batches",
+        rebuildability="not safely rebuildable during an active admission window because reserved bytes/tokens/slots and idempotency are capacity authority",
+        merge_guidance="keep separate from weighted gates and context heads; reservations own trust/fencing/capacity claims while gates coordinate and heads project context",
+        migration_owner="astra_services::storage / context",
+        product_owner="weighted admission capacity, idempotency, and recovery",
     ),
     "mcp_servers": TableMetadata(
         semantic_owner="astra_services::mcp_registry",
@@ -1455,12 +1894,23 @@ def discover_production_ddl_source_paths(root: Path | None = None) -> list[str]:
 
 
 def production_source(text: str, *, stop_at_cfg_test: bool) -> str:
+    text = strip_rust_comments(text)
     if stop_at_cfg_test:
-        text = text.split("#[cfg(test)]", 1)[0]
-    return strip_rust_line_comments(text)
+        cfg_test_index = first_cfg_test_marker(text)
+        if cfg_test_index is not None:
+            text = text[:cfg_test_index]
+    return text
 
 
 def strip_rust_line_comments(text: str) -> str:
+    """Remove full-line Rust comments while preserving source line numbers.
+
+    Kept as a small compatibility helper for callers that used the original
+    line-comment filter.  ``production_source`` uses the slightly more
+    complete scanner below so an inline or block comment cannot contribute a
+    false CREATE TABLE match.
+    """
+
     kept: list[str] = []
     for line in text.splitlines():
         if line.lstrip().startswith("//"):
@@ -1470,11 +1920,205 @@ def strip_rust_line_comments(text: str) -> str:
     return "\n".join(kept)
 
 
+def raw_string_prefix(chars: list[str], index: int) -> tuple[int, int] | None:
+    """Return (hash count, closing-prefix index) for a Rust raw string start."""
+
+    if index > 0 and (chars[index - 1].isalnum() or chars[index - 1] == "_"):
+        return None
+    raw_index = index
+    if chars[index] == "b" and index + 1 < len(chars) and chars[index + 1] == "r":
+        raw_index += 1
+    elif chars[index] != "r":
+        return None
+    cursor = raw_index + 1
+    while cursor < len(chars) and chars[cursor] == "#":
+        cursor += 1
+    if cursor >= len(chars) or chars[cursor] != '"':
+        return None
+    return cursor - raw_index - 1, cursor
+
+
+def first_cfg_test_marker(text: str) -> int | None:
+    """Find an active cfg(test) attribute without matching string contents."""
+
+    chars = list(text)
+    index = 0
+    quote: str | None = None
+    raw_hashes: int | None = None
+    escaped = False
+    while index < len(chars):
+        char = chars[index]
+        if raw_hashes is not None:
+            if (
+                char == '"'
+                and index + raw_hashes < len(chars)
+                and chars[index + 1 : index + 1 + raw_hashes]
+                == ["#"] * raw_hashes
+            ):
+                closing_hashes = raw_hashes
+                raw_hashes = None
+                index += 1 + closing_hashes
+                continue
+            index += 1
+            continue
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        raw_prefix = raw_string_prefix(chars, index)
+        if raw_prefix is not None:
+            raw_hashes, opening_quote = raw_prefix
+            index = opening_quote + 1
+            continue
+        if char == '"':
+            quote = char
+            index += 1
+            continue
+        if char == "'" and _looks_like_rust_char_literal(chars, index):
+            quote = char
+            index += 1
+            continue
+        if text.startswith("#[cfg(test)]", index):
+            return index
+        index += 1
+    return None
+
+
+def strip_rust_comments(text: str) -> str:
+    """Strip Rust ``//`` and ``/* ... */`` comments without changing lines.
+
+    This is intentionally a source filter, not a Rust lexer.  It only tracks
+    quoted strings so comment markers inside the SQL literals that contain the
+    production DDL remain intact.
+    """
+
+    chars = list(text)
+    output: list[str] = []
+    index = 0
+    quote: str | None = None
+    raw_hashes: int | None = None
+    escaped = False
+    block_comment_depth = 0
+    while index < len(chars):
+        char = chars[index]
+        next_char = chars[index + 1] if index + 1 < len(chars) else ""
+        if block_comment_depth:
+            if char == "/" and next_char == "*":
+                output.extend((" ", " "))
+                index += 2
+                block_comment_depth += 1
+                continue
+            if char == "*" and next_char == "/":
+                output.extend((" ", " "))
+                index += 2
+                block_comment_depth -= 1
+                continue
+            output.append("\n" if char == "\n" else " ")
+            index += 1
+            continue
+        if raw_hashes is not None:
+            if char == '"' and index + raw_hashes < len(chars) and all(
+                chars[index + offset] == "#" for offset in range(1, raw_hashes + 1)
+            ):
+                output.append(char)
+                output.extend("#" for _ in range(raw_hashes))
+                index += 1 + raw_hashes
+                raw_hashes = None
+            else:
+                output.append(char)
+                index += 1
+            continue
+        if quote is not None:
+            output.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        raw_prefix = raw_string_prefix(chars, index)
+        if raw_prefix is not None:
+            raw_hashes, opening_quote = raw_prefix
+            output.extend(chars[index : opening_quote + 1])
+            index = opening_quote + 1
+            continue
+        if char == '"':
+            quote = char
+            output.append(char)
+            index += 1
+            continue
+        if char == "'" and _looks_like_rust_char_literal(chars, index):
+            quote = char
+            output.append(char)
+            index += 1
+            continue
+        if char == "/" and next_char == "/":
+            output.extend((" ", " "))
+            index += 2
+            while index < len(chars) and chars[index] != "\n":
+                output.append(" ")
+                index += 1
+            continue
+        if char == "/" and next_char == "*":
+            output.extend((" ", " "))
+            index += 2
+            block_comment_depth = 1
+            continue
+        output.append(char)
+        index += 1
+    return "".join(output)
+
+
+def _looks_like_rust_char_literal(chars: list[str], index: int) -> bool:
+    """Recognize a small Rust char literal without mistaking a lifetime for one."""
+
+    next_index = index + 1
+    if next_index >= len(chars) or chars[next_index] in {"\n", "\r"}:
+        return False
+    if chars[next_index] == "\\":
+        return next_index + 2 < len(chars) and chars[next_index + 2] == "'"
+    return next_index + 1 < len(chars) and chars[next_index + 1] == "'"
+
+
 def find_matching_paren(text: str, open_index: int) -> int:
     depth = 0
+    quote: str | None = None
+    escaped = False
+    line_comment = False
+    block_comment = False
     for index in range(open_index, len(text)):
         char = text[index]
-        if char == "(":
+        next_char = text[index + 1] if index + 1 < len(text) else ""
+        if line_comment:
+            if char == "\n":
+                line_comment = False
+            continue
+        if block_comment:
+            if char == "*" and next_char == "/":
+                block_comment = False
+            continue
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+        elif char == "/" and next_char == "/":
+            line_comment = True
+        elif char == "/" and next_char == "*":
+            block_comment = True
+        elif char == "(":
             depth += 1
         elif char == ")":
             depth -= 1
@@ -1487,8 +2131,20 @@ def split_top_level_commas(body: str) -> list[str]:
     parts: list[str] = []
     depth = 0
     start = 0
+    quote: str | None = None
+    escaped = False
     for index, char in enumerate(body):
-        if char == "(":
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+        elif char == "(":
             depth += 1
         elif char == ")":
             depth = max(depth - 1, 0)
@@ -1616,10 +2272,15 @@ def extract_tables_from_source(root: Path, source: SchemaSource) -> list[TableIn
     return tables
 
 
-def build_inventory(root: Path | None = None) -> dict[str, object]:
+def build_inventory(
+    root: Path | None = None,
+    *,
+    sources: Iterable[SchemaSource] | None = None,
+) -> dict[str, object]:
     root = root or REPO_ROOT
+    manifest = tuple(SCHEMA_SOURCES if sources is None else sources)
     tables: list[TableInventory] = []
-    for source in SCHEMA_SOURCES:
+    for source in manifest:
         tables.extend(extract_tables_from_source(root, source))
 
     by_name: dict[str, list[TableInventory]] = {}
@@ -1646,12 +2307,12 @@ def build_inventory(root: Path | None = None) -> dict[str, object]:
     )
 
     return {
-        "schema_sources": [asdict(source) for source in SCHEMA_SOURCES],
+        "schema_sources": [asdict(source) for source in manifest],
         "p1_5_consolidation_reviews": [
             asdict(review) for review in P1_5_CONSOLIDATION_REVIEWS
         ],
         "summary": {
-            "source_count": len(SCHEMA_SOURCES),
+            "source_count": len(manifest),
             "table_declaration_count": len(tables),
             "unique_table_count": len(by_name),
             "duplicate_table_names": duplicates,

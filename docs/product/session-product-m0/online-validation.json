@@ -1,0 +1,29 @@
+{
+  "schema_version": "astra.session-product.m0-online-validation.v1",
+  "recorded_at": "2026-08-03",
+  "evidence_class": "online-integration",
+  "correctness_authority": false,
+  "role": "online integration and output-distribution evidence only; not deterministic correctness proof",
+  "command": "target/release/astra-test --suite crates/astra-test-harness/cases --filter introspection_reflection_source_boundary --models deepseek-v4-flash --force-model deepseek-v4-flash --judger-model deepseek-v4-flash --parallel 1 --runs 1 --working-dir /home/xupeng/astra --verbose",
+  "case": "introspection_reflection_source_boundary",
+  "model": "deepseek-v4-flash",
+  "session_id": "f6bba2b2-74dd-4408-8ec1-bafcba00cc8e",
+  "result": "passed",
+  "duration_ms": 43151,
+  "usage": {"fresh_input_tokens": 1227, "output_tokens": 976, "cache_read_pct": 99},
+  "structural_assertions": [
+    {"name": "process exit code is zero", "passed": true},
+    {"name": "typed tool sequence is exactly introspect then reflect", "passed": true},
+    {"name": "exactly two tools were called", "passed": true},
+    {"name": "journal contains introspect", "passed": true},
+    {"name": "journal contains reflect", "passed": true},
+    {"name": "durable ToolCallCompleted event count is at least two", "passed": true}
+  ],
+  "model_judgement": {
+    "score": 1.0,
+    "threshold": 0.8,
+    "same_family_judger": true,
+    "interpretation": "auxiliary only because the tested model and judger are both DeepSeek"
+  },
+  "observed_boundary": "the answer distinguished current-process introspection from durable-session reflection and did not infer equal counts"
+}

@@ -205,6 +205,8 @@ static TOOL_TABLE: &[ToolMeta] = &[
     // ── Agent info / reflection (read-only) ──────────────────────────
     tool("get_agent_info", RO, C),
     tool("reflect", RO, C),
+    tool("inspect_work_plan", RO, C.union(OR)),
+    tool("inspect_work_criteria", RO, C.union(OR)),
     tool("context_analysis", RO, OR),
     tool("diagnose", RO, OR),
     // ── Consultative ─────────────────────────────────────────────────
@@ -223,6 +225,10 @@ static TOOL_TABLE: &[ToolMeta] = &[
         A.union(FI),
         ToolIdempotency::IdempotentWrite,
     ),
+    // Copies one existing workspace file into the durable session artifact
+    // catalog. Repeating the call creates another artifact identity, so it is
+    // intentionally non-idempotent and approval-gated like other file writes.
+    tool("publish_artifact", MU, A.union(FI)),
     tool("str_replace", MU, A.union(FI)),
     tool("multi_edit", MU, A.union(FI)),
     tool("edit_file", MU, A.union(FI)),
@@ -247,8 +253,25 @@ static TOOL_TABLE: &[ToolMeta] = &[
     tool("adjust_config", MU, OR),
     tool("compress_context", MU, OR),
     tool("env", MU, OR),
-    // ── Mutating — task management (immune to health avoidance) ───────
-    tool("task_board", MU, OR.union(ToolFlags::TASK_MGMT)),
+    // ── Mutating — Work/background-task management ────────────────────
+    tool_idem(
+        "start_work",
+        MU,
+        OR.union(ToolFlags::TASK_MGMT),
+        ToolIdempotency::IdempotentWrite,
+    ),
+    tool_idem(
+        "propose_work_plan",
+        MU,
+        OR.union(ToolFlags::TASK_MGMT),
+        ToolIdempotency::IdempotentWrite,
+    ),
+    tool_idem(
+        "propose_work_criteria",
+        MU,
+        OR.union(ToolFlags::TASK_MGMT),
+        ToolIdempotency::IdempotentWrite,
+    ),
     tool("task_output", RO, OR.union(ToolFlags::TASK_MGMT)),
     tool("task_list", RO, OR.union(ToolFlags::TASK_MGMT)),
     tool("task_stop", MU, OR.union(ToolFlags::TASK_MGMT)),
@@ -310,7 +333,7 @@ impl ToolRegistry {
     /// Returns the effective `ToolCategory` after inspecting `args` for
     /// consolidated tools.
     pub fn category_for(&self, name: &str, args: Option<&serde_json::Value>) -> ToolCategory {
-        if matches!(name, "memory" | "git" | "github" | "task_board") {
+        if matches!(name, "memory" | "git" | "github") {
             return classify(name, args).category;
         }
         self.category(name)
@@ -566,7 +589,7 @@ pub struct ToolClassification {
 ///
 /// This is the primary entry point for all classification decisions.
 /// For shell tools, inspects `args["command"]` to determine if the
-/// command is read-only (e.g. `git status`, `ls`, `cargo check`),
+/// command is read-only (e.g. `git status`, `ls`, `rg pattern`),
 /// which unlocks parallel execution and approval bypass.
 pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassification {
     let r = registry();
@@ -586,25 +609,21 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
         }
     }
 
-    if name == "task_board" {
-        match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
-            Some("list" | "get" | "list_user") => {
-                meta_category = ToolCategory::ReadOnly;
-                meta_flags = OR;
-            }
-            _ => {
-                meta_category = ToolCategory::Mutating;
-                meta_flags = OR;
-            }
-        }
-    }
-
     if name == "git" {
         match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
             Some(
                 "status" | "diff" | "log" | "show" | "blame" | "file_history" | "log_search"
                 | "contributors",
             ) => {
+                meta_category = ToolCategory::ReadOnly;
+                meta_flags = GR;
+            }
+            Some("worktree")
+                if args
+                    .and_then(|a| a.get("sub_action"))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|action| matches!(action, "list" | "ls")) =>
+            {
                 meta_category = ToolCategory::ReadOnly;
                 meta_flags = GR;
             }
@@ -683,14 +702,7 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
         meta_flags.contains(ToolFlags::EXPLORATION) || meta_category == ToolCategory::Consultative
     };
 
-    let idempotency = if shell_read_only {
-        ToolIdempotency::PureRead
-    } else if name == "task_board" {
-        match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
-            Some("list" | "get" | "list_user") => ToolIdempotency::PureRead,
-            _ => ToolIdempotency::NonIdempotent,
-        }
-    } else if matches!(name, "task_output" | "task_list") {
+    let idempotency = if shell_read_only || matches!(name, "task_output" | "task_list") {
         ToolIdempotency::PureRead
     } else if name == "git" {
         match args.and_then(|a| a.get("action")).and_then(|v| v.as_str()) {
@@ -879,6 +891,20 @@ mod tests {
         assert!(status.parallelizable);
         assert_eq!(status.idempotency, ToolIdempotency::PureRead);
 
+        let worktree_list = classify(
+            "git",
+            Some(&serde_json::json!({"action": "worktree", "sub_action": "list"})),
+        );
+        assert_eq!(worktree_list.category, ToolCategory::ReadOnly);
+        assert!(!worktree_list.approval_required);
+        assert!(worktree_list.parallelizable);
+
+        let worktree_add = classify(
+            "git",
+            Some(&serde_json::json!({"action": "worktree", "sub_action": "add"})),
+        );
+        assert_eq!(worktree_add.category, ToolCategory::Mutating);
+
         let push = classify(
             "git",
             Some(&serde_json::json!({
@@ -969,29 +995,6 @@ mod tests {
             );
             assert!(!r.is_read_only_for("memory", Some(&args)));
         }
-    }
-
-    #[test]
-    fn consolidated_task_tool_is_action_aware_for_read_vs_mutating_actions() {
-        use serde_json::json;
-
-        for action in ["list", "get", "list_user"] {
-            let read = classify("task_board", Some(&json!({"action": action})));
-            assert_eq!(read.category, ToolCategory::ReadOnly);
-            assert!(!read.approval_required);
-            assert!(read.parallelizable);
-        }
-
-        let update = classify("task_board", Some(&json!({"action": "update"})));
-        assert_eq!(update.category, ToolCategory::Mutating);
-        assert!(!update.approval_required);
-
-        let stale_background = classify(
-            "task_board",
-            Some(&json!({"action": "background_shell", "command": "npm run dev"})),
-        );
-        assert_eq!(stale_background.category, ToolCategory::Mutating);
-        assert!(!stale_background.approval_required);
     }
 
     #[test]
@@ -1725,11 +1728,11 @@ mod tests {
     }
 
     #[test]
-    fn classify_bash_cargo_check_is_read_only() {
+    fn classify_bash_cargo_check_requires_approval() {
         let args = json!({"command": "cargo check 2>&1 | head -50"});
         let c = classify("bash", Some(&args));
-        assert!(c.parallelizable);
-        assert!(!c.approval_required);
+        assert!(!c.parallelizable);
+        assert!(c.approval_required);
     }
 
     #[test]
@@ -1849,7 +1852,7 @@ mod tests {
         let batch = [
             (json!({"command": "git status"}), true, false),
             (json!({"command": "grep -r TODO ."}), true, false),
-            (json!({"command": "cargo check 2>&1"}), true, false),
+            (json!({"command": "cargo check 2>&1"}), false, true),
             (json!({"command": "cargo build"}), false, true),
             (json!({"command": "git push"}), false, true),
             (json!({"command": "rm temp.txt"}), false, true),
@@ -1911,7 +1914,7 @@ mod tests {
         let read_only_bash = [
             "git log --oneline -10",
             "ls -la src/",
-            "cargo clippy 2>&1 | head -20",
+            "rg TODO 2>&1 | head -20",
             "npm list",
         ];
         for cmd in read_only_bash {
@@ -2041,6 +2044,24 @@ mod tests {
             r.idempotency("WriteFileTool"),
             ToolIdempotency::NonIdempotent
         );
+    }
+
+    #[test]
+    fn work_planning_classification_matches_deterministic_runtime_contract() {
+        let registry = registry();
+        for name in ["inspect_work_plan", "inspect_work_criteria"] {
+            assert_eq!(registry.category(name), ToolCategory::ReadOnly);
+            assert_eq!(registry.idempotency(name), ToolIdempotency::PureRead);
+        }
+        for name in ["propose_work_plan", "propose_work_criteria"] {
+            assert_eq!(registry.category(name), ToolCategory::Mutating);
+            assert_eq!(registry.idempotency(name), ToolIdempotency::IdempotentWrite);
+            assert!(registry.flags(name).contains(ToolFlags::TASK_MGMT));
+            assert!(
+                !registry.flags(name).contains(ToolFlags::APPROVAL_REQUIRED),
+                "non-authoritative Work proposals are internal orchestration, not external side effects"
+            );
+        }
     }
 
     #[test]
@@ -2404,7 +2425,6 @@ mod tests {
             "compress_context",
             "env",
             "notebook_edit",
-            "task_board",
             "context_analysis",
             "diagnose",
             "rollback_file_edits",

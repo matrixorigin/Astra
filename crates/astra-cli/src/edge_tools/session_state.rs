@@ -3,7 +3,7 @@ use std::time::SystemTime;
 use astra_runtime::observability::ObservabilitySessionRollbackSnapshot;
 use serde_json::Value;
 
-use super::{ToolExecutor, task_mgmt::TaskManagerSnapshot};
+use super::ToolExecutor;
 
 #[derive(Debug, Clone)]
 pub(crate) enum SessionStateRollbackAction {
@@ -15,9 +15,6 @@ pub(crate) enum SessionStateRollbackAction {
     Compression {
         turn: u32,
         snapshot: ObservabilitySessionRollbackSnapshot,
-    },
-    TaskState {
-        snapshot: TaskManagerSnapshot,
     },
 }
 
@@ -91,7 +88,6 @@ fn action_kind(action: &SessionStateRollbackAction) -> &'static str {
     match action {
         SessionStateRollbackAction::ConfigOverride { .. } => "config_override",
         SessionStateRollbackAction::Compression { .. } => "compression",
-        SessionStateRollbackAction::TaskState { .. } => "task_state",
     }
 }
 
@@ -131,17 +127,6 @@ impl ToolExecutor {
         self.record_session_state_rollback(
             format!("compress_context:turn-{turn}"),
             SessionStateRollbackAction::Compression { turn, snapshot },
-        );
-    }
-
-    pub(crate) fn record_task_state_rollback(
-        &self,
-        snapshot: TaskManagerSnapshot,
-        label: impl Into<String>,
-    ) {
-        self.record_session_state_rollback(
-            label.into(),
-            SessionStateRollbackAction::TaskState { snapshot },
         );
     }
 
@@ -229,7 +214,6 @@ impl ToolExecutor {
                     Value::Number(serde_json::Number::from(*turn)),
                 );
             }
-            SessionStateRollbackAction::TaskState { .. } => {}
         }
         Value::Object(value)
     }
@@ -260,9 +244,6 @@ impl ToolExecutor {
             }
             SessionStateRollbackAction::Compression { snapshot, .. } => {
                 self.restore_observability_snapshot(snapshot)
-            }
-            SessionStateRollbackAction::TaskState { snapshot } => {
-                self.task_manager.restore_snapshot(snapshot).await
             }
         }
     }

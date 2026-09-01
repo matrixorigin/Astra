@@ -79,5 +79,5 @@ pub async fn run_delegate_http_boundaries() {
         "delegate should fail validation: {del_j}"
     );
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }

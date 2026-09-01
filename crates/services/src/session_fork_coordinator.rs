@@ -1364,4 +1364,169 @@ mod tests {
             Err(SessionForkCoordinatorError::NotFound)
         ));
     }
+
+    #[tokio::test]
+    #[ignore = "requires MatrixOne DB: run with ASTRA_TEST_DB_IT=1"]
+    async fn million_token_scale_fork_stays_constant_size_and_within_latency_budget() {
+        let pool = setup_fork_db_it().await;
+        let suffix = Uuid::new_v4().simple().to_string();
+        let owner = format!("fork-scale-owner-{suffix}");
+        let parent_key =
+            SessionKeyV1::owner_session("fork-it", &owner, format!("parent-{suffix}"), "main");
+        let child_key =
+            SessionKeyV1::owner_session("fork-it", &owner, format!("child-{suffix}"), "main");
+        sqlx::query(
+            "INSERT INTO agent_sessions
+             (session_id, user_id, title, status, event_count, metadata)
+             VALUES (?, ?, 'large-prefix fork parent', 'active', 0, '{}')",
+        )
+        .bind(&parent_key.session_id)
+        .bind(&owner)
+        .execute(pool.get())
+        .await
+        .expect("insert large-prefix parent session");
+
+        let context: Arc<dyn SessionContextCoordinator> =
+            Arc::new(DatabaseSessionContextCoordinator::new(pool.clone()));
+        let service = DatabaseSessionForkCoordinator::new(pool.clone(), context.clone());
+        let parent_lease = match context
+            .acquire_writer(
+                &parent_key,
+                None,
+                &actor(&owner, "large-parent"),
+                Duration::from_secs(60),
+                "large-parent-writer",
+            )
+            .await
+            .expect("acquire large-prefix parent")
+        {
+            AcquireWriterOutcome::Acquired(lease) => lease,
+            other => panic!("unexpected large-prefix parent acquire {other:?}"),
+        };
+        let reservation = match context
+            .reserve_turn(
+                &parent_lease,
+                None,
+                Duration::from_secs(60),
+                "large-parent-reservation",
+            )
+            .await
+            .expect("reserve large-prefix turn")
+        {
+            ReserveTurnOutcome::Reserved(reservation) => reservation,
+            other => panic!("unexpected large-prefix reservation {other:?}"),
+        };
+        let large_content = "abcd".repeat(1024 * 1024);
+        let cursor = match context
+            .commit_turn(
+                &reservation,
+                CanonicalTurnDeltaV1 {
+                    schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
+                    completed_turn: 1,
+                    journal_event_seq: 1,
+                    conversation_seq: 1,
+                    compaction_generation: 0,
+                    config_version_id: None,
+                    mode: astra_turn_types::CanonicalDeltaModeV1::Append,
+                    logical_segments: vec![vec![json!({
+                        "role": "user",
+                        "content": large_content,
+                    })]],
+                },
+                "large-parent-commit",
+            )
+            .await
+            .expect("commit large-prefix turn")
+        {
+            CoordinatorMutationV1::Applied { cursor } => cursor,
+            other => panic!("unexpected large-prefix commit {other:?}"),
+        };
+        let segments_before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_segments WHERE owner_user_id = ?",
+        )
+        .bind(&owner)
+        .fetch_one(pool.get())
+        .await
+        .expect("count large-prefix segments before fork");
+        let request = PrepareSessionForkV1 {
+            idempotency_key: "large-prefix-prepare".into(),
+            parent_key: parent_key.clone(),
+            child_key: child_key.clone(),
+            expected_parent_cursor: cursor.clone(),
+            dimensions: dimensions(&cursor),
+            reason: "prove constant-size large-prefix fork".into(),
+        };
+        let started = std::time::Instant::now();
+        let prepared = service.prepare(&request).await.expect("prepare large fork");
+        let activation = service
+            .activate(
+                &parent_key,
+                &prepared.fork_id,
+                &actor(&owner, "large-child"),
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("activate large fork");
+        let fork_elapsed = started.elapsed();
+        let segments_after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_segments WHERE owner_user_id = ?",
+        )
+        .bind(&owner)
+        .fetch_one(pool.get())
+        .await
+        .expect("count large-prefix segments after fork");
+        let manifest_bytes: i64 = sqlx::query_scalar(
+            "SELECT OCTET_LENGTH(manifest_json) FROM session_forks
+             WHERE isolation_domain = ? AND owner_user_id = ? AND fork_id = ?",
+        )
+        .bind(&parent_key.isolation_domain)
+        .bind(&owner)
+        .bind(&prepared.fork_id)
+        .fetch_one(pool.get())
+        .await
+        .expect("measure fork manifest");
+        let child_manifest_nodes: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_manifest_nodes
+             WHERE isolation_domain = ? AND owner_user_id = ? AND session_id = ?",
+        )
+        .bind(&child_key.isolation_domain)
+        .bind(&owner)
+        .bind(&child_key.session_id)
+        .fetch_one(pool.get())
+        .await
+        .expect("count child manifest nodes");
+
+        context
+            .release_writer(&activation.writer_lease)
+            .await
+            .expect("release child writer");
+        context
+            .release_writer(&parent_lease)
+            .await
+            .expect("release parent writer");
+        crate::session_lifecycle::hard_delete_session(pool.get(), &child_key.session_id, &owner)
+            .await
+            .expect("delete scale-test child session");
+        crate::session_lifecycle::hard_delete_session(pool.get(), &parent_key.session_id, &owner)
+            .await
+            .expect("delete scale-test parent session");
+
+        assert_eq!(segments_before, 1);
+        assert_eq!(
+            segments_after, segments_before,
+            "forking a large prefix must not duplicate content-addressed segments"
+        );
+        assert_eq!(
+            child_manifest_nodes, 0,
+            "the child must retain only a shared-prefix pointer"
+        );
+        assert!(
+            manifest_bytes < 256 * 1024,
+            "fork metadata exceeded 256 KiB: {manifest_bytes} bytes"
+        );
+        assert!(
+            fork_elapsed < Duration::from_millis(100),
+            "large-prefix prepare+activate exceeded 100 ms: {fork_elapsed:?}"
+        );
+    }
 }

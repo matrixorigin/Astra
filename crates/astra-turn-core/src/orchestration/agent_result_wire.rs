@@ -108,7 +108,15 @@ pub fn agent_tool_structured_result_class(value: &Value) -> Option<&'static str>
         .and_then(Value::as_str)
         .map(AgentToolResultStatusKind::parse_wire)?
     {
-        AgentToolResultStatusKind::Completed => Some(AGENT_RESULT_CLASS_SUCCESS),
+        AgentToolResultStatusKind::Completed
+            if value
+                .get("result")
+                .and_then(Value::as_str)
+                .is_some_and(|result| !result.trim().is_empty()) =>
+        {
+            Some(AGENT_RESULT_CLASS_SUCCESS)
+        }
+        AgentToolResultStatusKind::Completed => Some(AGENT_RESULT_CLASS_AGENT_INCOMPLETE),
         status if agent_tool_status_needs_recovery(status) => {
             Some(AGENT_RESULT_CLASS_AGENT_INCOMPLETE)
         }
@@ -122,6 +130,76 @@ pub fn agent_tool_result_needs_recovery(value: &Value) -> bool {
 
 pub fn agent_fanout_result_looks_like(value: &Value) -> bool {
     value.get("group_id").is_some() && value.get("results").is_some()
+}
+
+/// Authority carried by one structured `agent_fanout` control result.
+///
+/// A group identity proves that the fanout lifecycle exists, even when its
+/// current status is failed or incomplete. A failure without a group identity
+/// is authoritative only when it carries an explicit error proving that the
+/// request was rejected before acceptance. Everything else is an observation
+/// that still requires registry reconciliation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentFanoutControlReceiptKind {
+    Group,
+    RejectedBeforeAcceptance,
+}
+
+/// Parse the canonical structured record from an agent-control output.
+///
+/// The returned value comes only from a complete JSON document or its first
+/// complete line. Consumers should derive lifecycle state from this value and
+/// use any trailing text only as non-authoritative display guidance.
+pub fn agent_control_result_value(output: &str) -> Option<Value> {
+    let output = output.trim();
+    if output.is_empty() {
+        return None;
+    }
+    serde_json::from_str(output).ok().or_else(|| {
+        // Some result surfaces append a human recovery hint after the
+        // canonical single-line JSON record. Only that first complete record
+        // is protocol authority; trailing prose must never create authority.
+        let first_record = output.lines().next()?.trim();
+        (!first_record.is_empty())
+            .then(|| serde_json::from_str(first_record).ok())
+            .flatten()
+    })
+}
+
+pub fn agent_fanout_control_receipt_kind(output: &str) -> Option<AgentFanoutControlReceiptKind> {
+    let receipt = agent_control_result_value(output)?;
+    let status = receipt
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|status| !status.is_empty())?;
+    if receipt
+        .get("group_id")
+        .and_then(Value::as_str)
+        .is_some_and(|group_id| !group_id.trim().is_empty())
+    {
+        return Some(AgentFanoutControlReceiptKind::Group);
+    }
+    (AgentToolResultStatusKind::parse_wire(status) == AgentToolResultStatusKind::Failed
+        && receipt
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|error| !error.trim().is_empty()))
+    .then_some(AgentFanoutControlReceiptKind::RejectedBeforeAcceptance)
+}
+
+/// Whether an agent-fanout control result is complete enough to cross an
+/// execution boundary without host reconciliation.
+///
+/// A `start` call has side effects before its response is delivered.  Plain
+/// text, an empty body, or ambiguous JSON without the canonical group identity
+/// cannot prove whether children were accepted, so the host must reconcile it
+/// from the fanout registry. A typed failure with an error is authoritative
+/// evidence that admission stopped before a group existed. Every action uses
+/// this same typed contract; arbitrary non-empty transport text is never a
+/// lifecycle result.
+pub fn agent_fanout_control_result_is_usable(output: &str) -> bool {
+    agent_fanout_control_receipt_kind(output).is_some()
 }
 
 pub fn agent_fanout_structured_result_class(value: &Value) -> Option<&'static str> {
@@ -149,6 +227,8 @@ pub fn agent_fanout_result_has_recoverable_issue(value: &Value) -> bool {
         "interrupted",
         "timed_out",
         "cancelled_by_user",
+        "cancelled_by_runtime",
+        // Backward-compatible read of persisted pre-v2 fanout results.
         "cancelled_by_parent_budget",
         "spawn_rejected",
         "incomplete_results",
@@ -185,6 +265,7 @@ pub fn fanout_slot_status_is_recoverable_issue(status: &str) -> bool {
             | "timed_out"
             | "cancelled"
             | "cancelled_by_user"
+            | "cancelled_by_runtime"
             | "cancelled_by_parent_budget"
             | "spawn_rejected"
     )
@@ -483,7 +564,18 @@ pub fn render_wait_for_agent_status(agent_id: &str, status: &AgentStatus) -> Str
         AgentStatus::Interrupted {
             partial_result,
             finish_reason,
-        } => render_completed_agent_result(agent_id, partial_result, Some(finish_reason)),
+        } => {
+            let reason = agent_finish_reason_text(Some(finish_reason));
+            json!({
+                "status": AgentToolResultStatusKind::Interrupted.as_str(),
+                "agent_id": agent_id,
+                "result": partial_result,
+                "finish_reason": reason,
+                "incomplete": true,
+                "hint": "The child agent stopped before fully finishing. Treat this as incomplete and either continue it or report the interruption explicitly.",
+            })
+            .to_string()
+        }
         AgentStatus::Failed {
             error,
             finish_reason,
@@ -750,6 +842,17 @@ mod tests {
         );
         assert!(!agent_tool_result_needs_recovery(&completed_agent));
 
+        let empty_completed_agent = json!({
+            "status": AgentToolResultStatusKind::Completed.as_str(),
+            "agent_id": "a2",
+            "result": "   "
+        });
+        assert_eq!(
+            agent_tool_structured_result_class(&empty_completed_agent),
+            Some(AGENT_RESULT_CLASS_AGENT_INCOMPLETE)
+        );
+        assert!(agent_tool_result_needs_recovery(&empty_completed_agent));
+
         let fanout = json!({
             "status": "completed",
             "group_id": "review",
@@ -766,6 +869,39 @@ mod tests {
         assert!(agent_fanout_result_has_recoverable_issue(&fanout));
         assert!(fanout_slot_status_is_recoverable_issue("spawn_rejected"));
         assert!(fanout_slot_status_is_recoverable_issue("timed_out"));
+        assert!(fanout_slot_status_is_recoverable_issue(
+            "cancelled_by_runtime"
+        ));
+        assert!(fanout_slot_status_is_recoverable_issue(
+            "cancelled_by_parent_budget"
+        ));
+    }
+
+    #[test]
+    fn fanout_start_requires_typed_identity_before_crossing_the_boundary() {
+        assert!(!agent_fanout_control_result_is_usable(""));
+        assert!(!agent_fanout_control_result_is_usable(
+            r#"{"status":"completed"}"#
+        ));
+        assert!(agent_fanout_control_result_is_usable(
+            r#"{"status":"completed","group_id":"review"}"#
+        ));
+        assert!(agent_fanout_control_result_is_usable(
+            r#"{"status":"failed","error":"invalid target_count"}"#
+        ));
+        assert_eq!(
+            agent_fanout_control_receipt_kind(
+                "{\"status\":\"failed\",\"error\":\"invalid target_count\"}\nRetry with valid arguments."
+            ),
+            Some(AgentFanoutControlReceiptKind::RejectedBeforeAcceptance)
+        );
+        assert!(!agent_fanout_control_result_is_usable(
+            r#"{"status":"failed"}"#
+        ));
+        assert!(!agent_fanout_control_result_is_usable("bounded result"));
+        assert!(agent_fanout_control_result_is_usable(
+            r#"{"status":"running","group_id":"review","results":[]}"#
+        ));
     }
 
     #[test]
@@ -789,6 +925,26 @@ mod tests {
                 .as_str()
                 .is_some_and(|hint| hint.contains("Do not fabricate"))
         );
+    }
+
+    #[test]
+    fn interrupted_status_remains_incomplete_for_non_enum_finish_reason() {
+        let rendered = render_wait_for_agent_status(
+            "a1",
+            &AgentStatus::Interrupted {
+                partial_result: String::new(),
+                finish_reason: "durable_result_unavailable".to_string(),
+            },
+        );
+        let parsed: Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(
+            parsed["status"],
+            AgentToolResultStatusKind::Interrupted.as_str()
+        );
+        assert_eq!(parsed["finish_reason"], "durable_result_unavailable");
+        assert_eq!(parsed["incomplete"], true);
+        assert!(agent_tool_result_needs_recovery(&parsed));
     }
 
     #[test]

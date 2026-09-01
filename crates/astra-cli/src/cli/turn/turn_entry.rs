@@ -8,11 +8,12 @@ use super::turn_stream_runner::{
     TurnAttempt, TurnExecutionInput, TurnExecutionRequest, execute_stream_turn,
 };
 use crate::cli::session::session_adaptation::{finalize_turn_adaptation, prepare_turn_adaptation};
-use crate::cli::session::session_input::{
-    clear_pending_recovery_for_ordinary_chat_input, finalize_effective_line, prepare_input,
-};
+use crate::cli::session::session_input::{finalize_effective_line, prepare_input};
 use crate::cli::session::session_runtime;
 use crate::cli::session::session_state::SessionState;
+use astra_services::session_journal::{
+    JournalWriter, SessionExecutionLease, SessionExecutionLeaseError,
+};
 
 /// Decision returned by `classify_shell_passthrough`.
 ///
@@ -147,7 +148,7 @@ async fn run_chat_turn(request: TurnExecutionRequest<'_>) -> TurnAttempt {
     ensure_default_turn_model(state, input.api, input.token).await;
     if let Some(failure) = model_selection_preflight_failure(
         state.model.as_deref(),
-        input.session_id,
+        Some(input.session_id),
         state.turn.saturating_add(1),
     ) {
         return TurnAttempt::Completed(Box::new(Err(failure)));
@@ -156,6 +157,25 @@ async fn run_chat_turn(request: TurnExecutionRequest<'_>) -> TurnAttempt {
     let attempt = execute_stream_turn(TurnExecutionRequest { state, input }).await;
     finalize_turn_adaptation(state, matches!(attempt, TurnAttempt::Interrupted(_))).await;
     attempt
+}
+
+/// Establish the canonical identity transaction before an interactive turn
+/// can acquire run-control, load prompt history, or reach a provider.
+///
+/// Fresh TUI state is intentionally lazy, but never provisional: the first
+/// submitted input creates the server session and local journal through the
+/// same transaction as `/clear`. Existing and resumed sessions are returned
+/// unchanged, so this boundary is idempotent and preserves their lineage.
+pub(super) async fn ensure_interactive_session_identity(
+    state: &mut SessionState,
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    token: &str,
+) -> Result<String, String> {
+    if let Some(session_id) = state.session_id.clone() {
+        return Ok(session_id);
+    }
+    crate::cli::slash::slash_state::start_fresh_session(api, profile, token, state).await
 }
 
 async fn ensure_default_turn_model(
@@ -242,7 +262,7 @@ pub(crate) async fn handle_chat_input_with_ui(
                 if !risks.is_empty() {
                     ui.show_warning(&format!("  ⚠ shell risk(s): {}", risks.join(", ")));
                 }
-                println!("! {cmd}");
+                stdout_println!("! {cmd}");
                 match std::process::Command::new("sh")
                     .arg("-c")
                     .arg(&cmd)
@@ -269,26 +289,20 @@ pub(crate) async fn handle_chat_input_with_ui(
         }
     };
 
-    ensure_multi_agent_runtime_for_turn(state, ctx.api, token, ctx.profile).await;
+    let session_id =
+        ensure_interactive_session_identity(state, ctx.api, ctx.profile, token).await?;
 
-    if state.session_id.is_none() && state.pending_recovery.is_some() {
-        clear_pending_recovery_for_ordinary_chat_input(state);
-    }
+    // Admission is per actual model turn, not per TUI lifetime. Keep this
+    // token in scope through retry and Turn/TurnError settlement, then release
+    // it so the next interactive turn (or another surface) can proceed.
+    let _execution_lease = acquire_interactive_turn_admission(state)?;
+
+    ensure_multi_agent_runtime_for_turn(state, ctx.api, token, ctx.profile).await;
 
     ui.blank_line();
 
-    if crate::cli::plan::plan_lifecycle::looks_like_pending_local_plan_entry(state)
-        && let Err(error) = crate::cli::plan::plan_lifecycle::enter_remote_plan_mode(
-            ctx.api,
-            ctx.profile,
-            token,
-            state,
-            &line,
-        )
-        .await
-    {
-        ui.show_error(&error);
-        return Ok(());
+    if crate::cli::plan::plan_lifecycle::looks_like_pending_local_plan_entry(state) {
+        crate::cli::slash::slash_plan::enter_local_plan_mode_with_goal(state, &line);
     }
 
     let resume_guidance = state.resume_guidance.take();
@@ -301,7 +315,6 @@ pub(crate) async fn handle_chat_input_with_ui(
     )
     .await;
     let turn_start = Instant::now();
-    let session_id = state.session_id.clone();
     let local_run_control =
         astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control).clone();
     let attempt = run_chat_turn(TurnExecutionRequest {
@@ -315,7 +328,7 @@ pub(crate) async fn handle_chat_input_with_ui(
             input_runtime_required_texts: &finalized_input.runtime_required_texts,
             input_active_system_skills: &finalized_input.active_system_skill_names,
             input_runtime_volatile_texts: &finalized_input.runtime_volatile_texts,
-            session_id: session_id.as_deref(),
+            session_id: &session_id,
             semantic_query_override: None,
         },
     })
@@ -336,7 +349,7 @@ pub(crate) async fn handle_chat_input_with_ui(
         input_active_system_skills: &finalized_input.active_system_skill_names,
         input_runtime_volatile_texts: &finalized_input.runtime_volatile_texts,
         token,
-        session_id: session_id.as_deref(),
+        session_id: &session_id,
         semantic_query_override: None,
         turn_start,
         ui,
@@ -383,6 +396,11 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
         }
     };
 
+    let session_id =
+        ensure_interactive_session_identity(state, ctx.api, ctx.profile, token).await?;
+
+    let _execution_lease = acquire_interactive_turn_admission(state)?;
+
     ensure_multi_agent_runtime_for_turn(state, ctx.api, token, ctx.profile).await;
     let notification_count = state.pending_bg_notifications.len();
     let notifications = state.pending_bg_notifications.join("\n");
@@ -402,7 +420,6 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
     let runtime_envelope =
         astra_turn_core::chat_turn_edge_profile::RUNTIME_RECONCILIATION_USER_ENVELOPE.to_string();
     let turn_start = Instant::now();
-    let session_id = state.session_id.clone();
     let local_run_control =
         astra_core::sync_poison::recover_mutex_lock(&state.active_turn_local_run_control).clone();
     ui.blank_line();
@@ -418,7 +435,7 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
             input_runtime_required_texts: &runtime_required_texts,
             input_active_system_skills: &[],
             input_runtime_volatile_texts: &[],
-            session_id: session_id.as_deref(),
+            session_id: &session_id,
             semantic_query_override: Some(user_intent.as_str()),
         },
     })
@@ -436,7 +453,7 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
         input_active_system_skills: &[],
         input_runtime_volatile_texts: &[],
         token,
-        session_id: session_id.as_deref(),
+        session_id: &session_id,
         semantic_query_override: Some(user_intent.as_str()),
         turn_start,
         ui,
@@ -451,6 +468,60 @@ pub(crate) async fn handle_runtime_notifications_with_ui(
         state.pending_bg_notifications.drain(..consumed);
     }
     Ok(())
+}
+
+pub(super) fn acquire_interactive_turn_admission(
+    state: &mut SessionState,
+) -> Result<Option<SessionExecutionLease>, String> {
+    let Some(session_id) = state.session_id.clone() else {
+        return Ok(None);
+    };
+    let lease = match SessionExecutionLease::try_acquire(&session_id) {
+        Ok(lease) => lease,
+        Err(SessionExecutionLeaseError::Conflict { .. }) => {
+            return Err(format!(
+                "session `{session_id}` already has an active execution"
+            ));
+        }
+        Err(error @ SessionExecutionLeaseError::Io { .. }) => {
+            return Err(error.to_string());
+        }
+    };
+
+    // The in-memory TUI may have been idle while a headless/app-server turn
+    // committed. Refresh every prompt-facing and turn-index authority from one
+    // current-generation physical snapshot after admission and before any
+    // model/tool boundary. A remote-only session with no local journal keeps
+    // its already-restored server continuation.
+    let writer = JournalWriter::new(&session_id)
+        .map_err(|error| format!("failed to open session journal for turn admission: {error}"))?;
+    if writer.path().is_file() {
+        let events = writer.complete_append_order_snapshot().map_err(|error| {
+            format!("failed to refresh session before interactive turn: {error}")
+        })?;
+        let active = crate::cli::session::session_continuation::recover_or_initialize_active_conversation_from_append_order_events(
+            &session_id,
+            &events,
+        )?;
+        let messages = active.materialize();
+        let restored =
+            session_runtime::restored_journal_state_from_append_order_events(true, &events);
+        state.history = restored.session.history;
+        state.turn = restored.session.turn;
+        state.recent_tools = restored.session.recent_tools;
+        state.total_prompt_tokens = restored.session.total_prompt_tokens;
+        state.total_completion_tokens = restored.session.total_completion_tokens;
+        state.total_cache_read_tokens = restored.session.total_cache_read_tokens;
+        state.total_cache_creation_tokens = restored.session.total_cache_creation_tokens;
+        state.last_turn_event = restored.last_turn_event;
+        state.activated_deferred_tool_names =
+            crate::cli::session::session_continuation::continuation_activation_names(
+                &messages,
+                std::mem::take(&mut state.activated_deferred_tool_names),
+            );
+        state.active_conversation = Some(active);
+    }
+    Ok(Some(lease))
 }
 
 async fn ensure_multi_agent_runtime_for_turn(
@@ -474,10 +545,252 @@ async fn ensure_multi_agent_runtime_for_turn(
 #[cfg(test)]
 mod tests {
     use super::{
-        ShellPassthroughDecision, classify_shell_passthrough, ensure_multi_agent_runtime_for_turn,
+        ShellPassthroughDecision, TurnContext, acquire_interactive_turn_admission,
+        classify_shell_passthrough, ensure_interactive_session_identity,
+        ensure_multi_agent_runtime_for_turn, handle_chat_input_with_ui,
         model_selection_preflight_failure,
     };
     use crate::cli::session::session_state::SessionState;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn fresh_interactive_turn_binds_canonical_session_before_provider_preflight() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let session_id = format!("fresh-interactive-{}", uuid::Uuid::new_v4());
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "session_id": session_id,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let _credentials_guard = crate::tests::isolate_credentials();
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let mut state = SessionState {
+            // A selected model with no Offering makes the later provider
+            // preflight fail deterministically, without spending model tokens.
+            model: Some("mock-model".to_string()),
+            ..SessionState::default()
+        };
+        let ctx = TurnContext {
+            api: &api,
+            profile: None,
+            post_commit_tx: None,
+        };
+        let mut ui = crate::tests::TestUi::default();
+
+        handle_chat_input_with_ui("hello".to_string(), Some("token"), &mut state, ctx, &mut ui)
+            .await
+            .expect("a provider preflight failure is settled as a failed turn");
+
+        let followup_ctx = TurnContext {
+            api: &api,
+            profile: None,
+            post_commit_tx: None,
+        };
+        handle_chat_input_with_ui(
+            "hi".to_string(),
+            Some("token"),
+            &mut state,
+            followup_ctx,
+            &mut ui,
+        )
+        .await
+        .expect("the next input must reuse the canonical session after a failed first turn");
+
+        server.verify().await;
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.first().map(|request| request.url.path()),
+            Some("/sessions")
+        );
+        assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
+        assert!(
+            ui.errors
+                .iter()
+                .all(|error| !error.contains("canonical prompt history is unavailable")),
+            "a failed first turn must not poison the next input with display-only history"
+        );
+        let events = astra_services::session_journal::JournalWriter::new(&session_id)
+            .unwrap()
+            .complete_append_order_snapshot()
+            .unwrap();
+        assert!(
+            events.iter().any(|event| event.event_type
+                == astra_services::session_journal::JournalEventType::SessionStart),
+            "the canonical session must exist before any turn failure is settled"
+        );
+        let active = crate::cli::session::session_continuation::
+            recover_or_initialize_active_conversation_from_append_order_events(
+                &session_id,
+                &events,
+            )
+            .expect("a failed first turn must remain canonically resumable");
+        assert!(
+            active.materialize().is_empty(),
+            "display-only failure text must not become canonical prompt history"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_interactive_session_identity_is_reused_without_reset_or_network() {
+        let server = wiremock::MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let session_id = format!("existing-interactive-{}", uuid::Uuid::new_v4());
+        let expected_history = vec![("question".to_string(), "answer".to_string())];
+        let mut state = SessionState {
+            session_id: Some(session_id.clone()),
+            turn: 7,
+            history: expected_history.clone(),
+            ..SessionState::default()
+        };
+
+        let bound = ensure_interactive_session_identity(&mut state, &api, None, "token")
+            .await
+            .unwrap();
+
+        assert_eq!(bound, session_id);
+        assert_eq!(state.turn, 7);
+        assert_eq!(state.history, expected_history);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fresh_session_creation_failure_stops_before_interactive_side_effects() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/sessions"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let mut state = SessionState::default();
+        let ctx = TurnContext {
+            api: &api,
+            profile: None,
+            post_commit_tx: None,
+        };
+        let mut ui = crate::tests::TestUi::default();
+
+        let error =
+            handle_chat_input_with_ui("hello".to_string(), Some("token"), &mut state, ctx, &mut ui)
+                .await
+                .expect_err("session creation must fail before turn admission");
+
+        assert!(error.contains("503"), "{error}");
+        assert_eq!(state.session_id, None);
+        assert_eq!(state.turn, 0);
+        assert!(state.history.is_empty());
+        assert!(state.agent_spawner.is_none());
+        server.verify().await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn interactive_turn_loses_to_headless_before_any_llm_invocation() {
+        let server = wiremock::MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let session_id = format!("sess-interactive-headless-race-{}", uuid::Uuid::new_v4());
+        let _headless_lease =
+            astra_services::session_journal::SessionExecutionLease::try_acquire(&session_id)
+                .unwrap();
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let mut state = SessionState::default();
+        state.set_session_id(session_id.clone());
+        state.model = Some("mock-model".to_string());
+        let ctx = TurnContext {
+            api: &api,
+            profile: None,
+            post_commit_tx: None,
+        };
+        let mut ui = crate::tests::TestUi::default();
+
+        let error = handle_chat_input_with_ui(
+            "do not execute".to_string(),
+            Some("token"),
+            &mut state,
+            ctx,
+            &mut ui,
+        )
+        .await
+        .expect_err("the interactive contender must lose admission");
+
+        assert!(error.contains("already has an active execution"), "{error}");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            0,
+            "the loser must not reach model selection, continuation POST, LLM, or tools"
+        );
+        assert!(
+            state.agent_spawner.is_none(),
+            "admission must precede interactive agent runtime initialization"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interactive_admission_refreshes_terminal_turn_authority_before_execution() {
+        use astra_services::session_journal::{JournalEvent, JournalWriter};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let session_id = format!("sess-interactive-refresh-{}", uuid::Uuid::new_v4());
+        let writer = JournalWriter::new(&session_id).unwrap();
+        writer
+            .append(&JournalEvent::turn(
+                Some(&session_id),
+                1,
+                Some("mock-model"),
+                "first",
+                "done",
+                3,
+                5,
+                0,
+                1,
+            ))
+            .unwrap();
+        writer
+            .append(&JournalEvent::turn_error(
+                Some(&session_id),
+                2,
+                Some("mock-model"),
+                "second",
+                "failed",
+                0,
+            ))
+            .unwrap();
+
+        let mut state = SessionState::default();
+        state.set_session_id(session_id);
+        state.turn = 99;
+        state.history = vec![("stale".to_string(), "state".to_string())];
+        let lease = acquire_interactive_turn_admission(&mut state)
+            .expect("admission")
+            .expect("known session lease");
+
+        assert_eq!(state.turn, 2);
+        assert_eq!(state.history.len(), 2);
+        assert_eq!(state.history[0], ("first".to_string(), "done".to_string()));
+        assert!(state.history[1].1.contains("Previous turn failed"));
+        drop(lease);
+        assert!(
+            acquire_interactive_turn_admission(&mut state)
+                .unwrap()
+                .is_some(),
+            "the lease is per turn, not held for the full interactive session"
+        );
+    }
 
     #[test]
     fn shell_passthrough_returns_none_for_ordinary_input() {
@@ -516,13 +829,14 @@ mod tests {
     async fn turn_boundary_initializes_multi_agent_runtime_when_startup_did_not() {
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         let mut state = SessionState::default();
+        state.set_session_id("turn-session");
 
         ensure_multi_agent_runtime_for_turn(&mut state, &api, "turn-token", Some("test-profile"))
             .await;
 
         assert!(
             state.agent_spawner.is_some(),
-            "a turn with a fresh token must have an agent executor binding"
+            "a session-bound turn must have an agent executor binding"
         );
     }
 

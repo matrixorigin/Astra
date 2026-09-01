@@ -524,6 +524,85 @@ fn render_assistant_section(meta: &ExplainTurnMeta<'_>, verbose: bool) -> Vec<St
     lines
 }
 
+/// Render bounded lifecycle receipts independently from provider LLM rounds.
+/// They are ordered by the runtime-owned round/phase identity, not the
+/// arrival order of live/replayed events. In particular, semantic admission
+/// precedes the first provider turn and must not become a fictitious LLM round.
+fn render_phase_sections(explain_items: &[serde_json::Value]) -> Vec<Vec<String>> {
+    let mut phases = explain_items
+        .iter()
+        .filter(|item| {
+            item.get("type").and_then(serde_json::Value::as_str)
+                == Some(astra_server_types::TURN_PHASE_EVENT_TYPE)
+        })
+        .filter_map(|item| {
+            let mut payload = serde_json::Map::from_iter([
+                (
+                    "schema_version".to_string(),
+                    item.get("schema_version")?.clone(),
+                ),
+                ("phase".to_string(), item.get("phase")?.clone()),
+                ("round_index".to_string(), item.get("round_index")?.clone()),
+                ("outcome".to_string(), item.get("outcome")?.clone()),
+                ("duration_ms".to_string(), item.get("duration_ms")?.clone()),
+            ]);
+            if let Some(attempt_index) = item.get("attempt_index") {
+                payload.insert("attempt_index".to_string(), attempt_index.clone());
+            }
+            let receipt = serde_json::from_value::<astra_server_types::TurnPhaseReceiptV1>(
+                serde_json::Value::Object(payload),
+            )
+            .ok()?;
+            receipt.is_valid().then_some(receipt)
+        })
+        .map(|receipt| {
+            let (label, phase_order, scope) = match receipt.phase {
+                astra_server_types::TurnPhaseKindV1::TurnIntentAdmission => {
+                    ("semantic admission", 0_u8, "preflight".to_string())
+                }
+                astra_server_types::TurnPhaseKindV1::RequestPreparation => (
+                    "request preparation",
+                    1,
+                    phase_scope_label(receipt.round_index, receipt.attempt_index),
+                ),
+                astra_server_types::TurnPhaseKindV1::ModelInference => (
+                    "model inference",
+                    2,
+                    phase_scope_label(receipt.round_index, receipt.attempt_index),
+                ),
+                astra_server_types::TurnPhaseKindV1::ToolExecution => (
+                    "tool execution",
+                    3,
+                    phase_scope_label(receipt.round_index, receipt.attempt_index),
+                ),
+            };
+            (
+                receipt.round_index,
+                receipt.attempt_index,
+                phase_order,
+                vec![format!(
+                    "{scope} {label} outcome={} ms={}",
+                    receipt.outcome.as_str(),
+                    format_ms(Some(receipt.duration_ms))
+                )],
+            )
+        })
+        .collect::<Vec<_>>();
+    phases.sort_by_key(|(round_index, attempt_index, phase_order, _)| {
+        (*round_index, *attempt_index, *phase_order)
+    });
+    phases.into_iter().map(|(_, _, _, lines)| lines).collect()
+}
+
+fn phase_scope_label(round_index: u32, attempt_index: u32) -> String {
+    let round = round_index + 1;
+    if attempt_index == 0 {
+        format!("round[{round}]")
+    } else {
+        format!("round[{round}] attempt[{}]", attempt_index + 1)
+    }
+}
+
 pub(crate) fn render_explain_dag(
     trace: Option<&ContextAssemblyTrace>,
     meta: Option<&ExplainTurnMeta<'_>>,
@@ -533,12 +612,16 @@ pub(crate) fn render_explain_dag(
     if trace.is_none() && meta.is_none() && explain_items.is_empty() {
         return None;
     }
+    let llm_explain_items = explain_items
+        .iter()
+        .filter(|item| item.get("type").and_then(serde_json::Value::as_str) != Some("turn_phase"))
+        .collect::<Vec<_>>();
     let turn_label = trace
         .map(|trace| trace.turn_id.clone())
         .or_else(|| meta.and_then(|meta| meta.turn_label.clone()))
         .unwrap_or_else(|| "turn-?".to_string());
     let total_ms = meta.and_then(|meta| meta.duration_ms).or_else(|| {
-        let total: u64 = explain_items
+        let total: u64 = llm_explain_items
             .iter()
             .filter_map(|item| explain_value_u64(item, "total_ms"))
             .sum();
@@ -550,7 +633,7 @@ pub(crate) fn render_explain_dag(
     });
     let total_rounds = meta
         .and_then(|meta| meta.llm_rounds)
-        .unwrap_or_else(|| explain_items.len().max(1) as u32);
+        .unwrap_or_else(|| llm_explain_items.len().max(1) as u32);
     let mut lines = vec![
         format!("Explain Analyze DAG — {turn_label}"),
         format!(
@@ -582,13 +665,14 @@ pub(crate) fn render_explain_dag(
     let round_batches = meta
         .map(|meta| explain_rounds(meta.tool_call_records))
         .unwrap_or_default();
-    let total_round_count = explain_items.len().max(round_batches.len());
+    let total_round_count = llm_explain_items.len().max(round_batches.len());
     let mut sections = Vec::new();
     if let Some(trace) = trace {
         sections.push(render_context_section(trace, meta, verbose));
     }
+    sections.extend(render_phase_sections(explain_items));
     for idx in 0..total_round_count.max(meta.is_some() as usize) {
-        let explain_item = explain_items.get(idx);
+        let explain_item = llm_explain_items.get(idx).copied();
         let round_index = idx as u32;
         let batches = round_batches
             .iter()
@@ -742,5 +826,39 @@ mod tests {
         assert!(
             text.contains("llm ms=? fresh_in=21 cache_read=144 cache_write=? out=8 tool_calls=1")
         );
+    }
+
+    #[test]
+    fn render_explain_dag_keeps_semantic_admission_outside_llm_rounds() {
+        let explain_items = vec![
+            serde_json::json!({
+                "type": "turn_phase",
+                "schema_version": 1,
+                "phase": "turn_intent_admission",
+                "round_index": 0,
+                "outcome": "decided",
+                "duration_ms": 5_021,
+            }),
+            serde_json::json!({
+                "type": "turn_phase",
+                "schema_version": 1,
+                "phase": "model_inference",
+                "round_index": 0,
+                "attempt_index": 1,
+                "outcome": "succeeded",
+                "duration_ms": 73,
+            }),
+            serde_json::json!({
+                "total_ms": 73,
+                "steps": [{"step": "llm", "duration_ms": 73}],
+            }),
+        ];
+
+        let text = render_explain_dag(None, None, &explain_items, false).expect("text");
+        assert!(text.contains("preflight semantic admission outcome=decided ms=5.0s"));
+        assert!(text.contains("round[1] attempt[2] model inference outcome=succeeded ms=73ms"));
+        assert!(text.contains("rounds=1"));
+        assert!(text.contains("round[1]"));
+        assert!(!text.contains("round[2]"));
     }
 }

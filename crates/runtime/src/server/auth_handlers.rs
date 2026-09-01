@@ -183,8 +183,11 @@ async fn memory_proxy_call_for_user(
         None
     };
     let body = apply_memory_proxy_identity(body, user_id, endpoint);
+    let strict_recall_limit = strict_recall_scope
+        .as_ref()
+        .map(|_| strict_session_recall_limit(&body));
 
-    let response = state
+    let mut response = state
         .memoria_forwarder
         .forward(method, endpoint, body)
         .await
@@ -204,24 +207,103 @@ async fn memory_proxy_call_for_user(
             }
         })?;
 
-    if let Some(scope) = strict_recall_scope.as_ref()
-        && let Err(error) = astra_memoria::validate_strict_recall_payload(&response, scope)
-    {
-        tracing::error!(
-            target: "astra_runtime::auth",
-            user_id = %scope.user_id,
-            session_id = %scope.session_id,
-            endpoint,
-            error = %error,
-            "Memoria returned content outside the authenticated session scope"
-        );
-        return Err(error_response(
-            StatusCode::BAD_GATEWAY,
-            "memory backend violated the requested session scope",
-        ));
+    if let Some(scope) = strict_recall_scope.as_ref() {
+        if let Err(error) = astra_memoria::validate_strict_recall_payload(&response, scope) {
+            tracing::error!(
+                target: "astra_runtime::auth",
+                user_id = %scope.user_id,
+                session_id = %scope.session_id,
+                endpoint,
+                error = %error,
+                "Memoria returned content outside the authenticated session scope"
+            );
+            return Err(error_response(
+                StatusCode::BAD_GATEWAY,
+                "memory backend violated the requested session scope",
+            ));
+        }
+
+        // Semantic retrieval is not the authority for strict session memory:
+        // its vector/index path may lag a just-written `working` row. Reconcile
+        // every strict session recall from Memoria's owner/session/type list;
+        // this keeps read-your-write behavior correct even when an older
+        // working row is already present in the semantic result. No local
+        // overlay or cross-session recall is introduced. The list is bounded
+        // by the caller's top_k and validated against the same owner/session
+        // scope before it can reach the client.
+        {
+            let limit = strict_recall_limit.unwrap_or(10);
+            let list_request = serde_json::json!({
+                "user_id": user_id,
+                "session_id": scope.session_id,
+                "memory_type": "working",
+                "limit": limit,
+            });
+            match state
+                .memoria_forwarder
+                .forward(reqwest::Method::GET, "/v1/memories", list_request)
+                .await
+            {
+                Ok(working) => {
+                    if let Err(error) =
+                        astra_memoria::validate_strict_recall_payload(&working, scope)
+                    {
+                        tracing::error!(
+                            target: "astra_runtime::auth",
+                            user_id = %scope.user_id,
+                            session_id = %scope.session_id,
+                            error = %error,
+                            "Memoria working-memory reconciliation violated session scope"
+                        );
+                    } else {
+                        astra_memoria::merge_strict_recall_working_memory(
+                            &mut response,
+                            &working,
+                            limit,
+                        );
+                    }
+                }
+                Err(error) => {
+                    // A degraded list path must not turn a valid semantic
+                    // response into a hard failure.  The caller still gets
+                    // the original scoped result and an explicit diagnostic.
+                    tracing::debug!(
+                        target: "astra_runtime::auth",
+                        user_id = %scope.user_id,
+                        session_id = %scope.session_id,
+                        error = %error,
+                        "Memoria working-memory reconciliation unavailable"
+                    );
+                }
+            }
+        }
+
+        if let Err(error) = astra_memoria::validate_strict_recall_payload(&response, scope) {
+            tracing::error!(
+                target: "astra_runtime::auth",
+                user_id = %scope.user_id,
+                session_id = %scope.session_id,
+                endpoint,
+                error = %error,
+                "Memoria returned content outside the authenticated session scope"
+            );
+            return Err(error_response(
+                StatusCode::BAD_GATEWAY,
+                "memory backend violated the requested session scope",
+            ));
+        }
     }
 
     Ok(Json(response))
+}
+
+const MAX_STRICT_SESSION_RECALL_ITEMS: usize = 50;
+
+fn strict_session_recall_limit(body: &serde_json::Value) -> usize {
+    body.get("top_k")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(10)
+        .clamp(1, MAX_STRICT_SESSION_RECALL_ITEMS as u64) as usize
 }
 
 fn is_strict_session_recall(endpoint: &str, body: &serde_json::Value) -> bool {
@@ -657,6 +739,7 @@ pub(super) async fn memoria_proxy_snapshot_rollback_handler(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let name = encode_memoria_memory_id(&name);
     memoria_management_proxy_call(
         &state,
         &headers,
@@ -672,6 +755,7 @@ pub(super) async fn memoria_proxy_snapshot_diff_handler(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let name = encode_memoria_memory_id(&name);
     memoria_management_proxy_call(
         &state,
         &headers,
@@ -710,6 +794,7 @@ pub(super) async fn memoria_proxy_branch_checkout_handler(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let name = encode_memoria_memory_id(&name);
     memoria_management_proxy_call(
         &state,
         &headers,
@@ -725,6 +810,7 @@ pub(super) async fn memoria_proxy_branch_merge_handler(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let name = encode_memoria_memory_id(&name);
     memoria_management_proxy_call(
         &state,
         &headers,
@@ -740,6 +826,7 @@ pub(super) async fn memoria_proxy_branch_diff_handler(
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let name = encode_memoria_memory_id(&name);
     memoria_management_proxy_call(
         &state,
         &headers,
@@ -862,6 +949,38 @@ mod tests {
             "/v1/memories",
             &json!({"session_id": "session-7", "session_scope": "only"})
         ));
+    }
+
+    #[test]
+    fn strict_recall_reconciliation_appends_only_bounded_working_items() {
+        let mut response = json!({
+            "items": [{
+                "memory_id": "existing",
+                "memory_type": "episodic",
+                "user_id": "user-3",
+                "session_id": "session-7"
+            }]
+        });
+        let working = json!({
+            "items": [
+                {"memory_id": "existing", "memory_type": "working", "user_id": "user-3", "session_id": "session-7"},
+                {"memory_id": "working-1", "memory_type": "working", "user_id": "user-3", "session_id": "session-7"},
+                {"memory_id": "not-working", "memory_type": "episodic", "user_id": "user-3", "session_id": "session-7"},
+                {"memory_id": "working-2", "memory_type": "working", "user_id": "user-3", "session_id": "session-7"}
+            ]
+        });
+
+        assert!(astra_memoria::merge_strict_recall_working_memory(
+            &mut response,
+            &working,
+            3
+        ));
+        let items = response["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["memory_id"], "working-1");
+        assert_eq!(items[1]["memory_id"], "working-2");
+        assert_eq!(items[2]["memory_id"], "existing");
+        assert!(!items.iter().any(|item| item["memory_id"] == "not-working"));
     }
 
     #[test]

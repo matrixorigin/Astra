@@ -32,9 +32,18 @@ async fn collect_full_sse_stream(
     let mut stream = resp.into_body().into_data_stream();
     let mut acc = Vec::new();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    while let Ok(Some(chunk)) = tokio::time::timeout_at(deadline, stream.next()).await {
-        let chunk = chunk.expect("body chunk");
-        acc.extend_from_slice(&chunk);
+    loop {
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(chunk)) => {
+                let chunk = chunk.expect("body chunk");
+                acc.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(_) => panic!(
+                "SSE stream did not terminate within {timeout_secs}s; collected {} bytes",
+                acc.len()
+            ),
+        }
     }
     (status, String::from_utf8_lossy(&acc).into_owned())
 }
@@ -81,7 +90,7 @@ async fn read_full_http_request(socket: &mut tokio::net::TcpStream) -> String {
     String::from_utf8_lossy(&acc).into_owned()
 }
 
-async fn stream_chat_full_nonbridge(
+async fn stream_chat_full_server_owned(
     app: &axum::Router,
     auth: &str,
     payload: serde_json::Value,
@@ -93,28 +102,6 @@ async fn stream_chat_full_nonbridge(
         .header("content-type", "application/json")
         .body(Body::from(payload.to_string()))
         .expect("stream request");
-    collect_full_sse_stream(app, req, 30).await
-}
-
-async fn chat_turn_full(
-    app: &axum::Router,
-    auth: &str,
-    mut payload: serde_json::Value,
-) -> (StatusCode, String) {
-    payload
-        .as_object_mut()
-        .expect("bridge test payload object")
-        .entry("inference_purpose")
-        .or_insert_with(|| json!(astra_turn_types::InferencePurpose::PrimaryAgent));
-    let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
-    let req = Request::builder()
-        .method("POST")
-        .uri("/chat/turn")
-        .header("authorization", auth)
-        .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", &test_secret)
-        .body(Body::from(payload.to_string()))
-        .expect("turn request");
     collect_full_sse_stream(app, req, 30).await
 }
 
@@ -539,85 +526,6 @@ async fn spawn_raw_stream_rate_limit_then_sse_server(
     (format!("http://{addr}"), hits)
 }
 
-async fn spawn_raw_tool_call_block_parse_server() -> (String, RawTransportServerHits) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind tool-call block-parse recovery mock llm listener");
-    let addr = listener
-        .local_addr()
-        .expect("tool-call block-parse local_addr");
-    let hits = RawTransportServerHits::new();
-    let hits_task = hits.clone();
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut socket, _)) = listener.accept().await else {
-                break;
-            };
-            let hits = hits_task.clone();
-            tokio::spawn(async move {
-                let req = read_full_http_request(&mut socket).await;
-                let is_stream = req.contains("\"stream\":true");
-                if is_stream {
-                    hits.record_stream(&req);
-                    let part1 = json!({
-                        "choices": [{
-                            "delta": {
-                                "tool_calls": [{
-                                    "index": 0,
-                                    "id": "call-1",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "bash",
-                                        "arguments": "{\"command\":\"p"
-                                    }
-                                }]
-                            }
-                        }]
-                    });
-                    let part2 = json!({
-                        "choices": [{
-                            "delta": {
-                                "tool_calls": [{
-                                    "index": 0,
-                                    "function": {
-                                        "arguments": "wd\"}"
-                                    }
-                                }]
-                            }
-                        }]
-                    });
-                    let body = format!(
-                        "data: {part1}\n\ndata: {part2}\n\ndata: {{\"choices\":[INVALID]}}\n\n"
-                    );
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    socket
-                        .write_all(response.as_bytes())
-                        .await
-                        .expect("write tool-call block-parse stream response");
-                    let _ = socket.shutdown().await;
-                } else {
-                    hits.record_nonstream(&req);
-                    let body = r#"{"choices":[{"message":{"content":"probe ok"}}]}"#;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    socket
-                        .write_all(response.as_bytes())
-                        .await
-                        .expect("write tool-call block-parse nonstream response");
-                    let _ = socket.shutdown().await;
-                }
-            });
-        }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-    (format!("http://{addr}"), hits)
-}
-
 async fn spawn_raw_server_loop_block_parse_server(
     partial_text: &str,
 ) -> (String, RawTransportServerHits) {
@@ -671,74 +579,6 @@ async fn spawn_raw_server_loop_block_parse_server(
     });
     tokio::time::sleep(std::time::Duration::from_millis(40)).await;
     (format!("http://{addr}"), hits)
-}
-
-async fn spawn_raw_hanging_stream_server(partial_text: &str) -> (String, RawTransportServerHits) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind hanging mock llm listener");
-    let addr = listener.local_addr().expect("hanging local_addr");
-    let hits = RawTransportServerHits::new();
-    let hits_task = hits.clone();
-    let partial_text = partial_text.to_string();
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut socket, _)) = listener.accept().await else {
-                break;
-            };
-            let hits = hits_task.clone();
-            let partial_text = partial_text.clone();
-            tokio::spawn(async move {
-                let req = read_full_http_request(&mut socket).await;
-                let is_stream = req.contains("\"stream\":true");
-                if is_stream {
-                    hits.record_stream(&req);
-                    let partial = format!(
-                        "data: {}\n\n",
-                        json!({"choices":[{"delta":{"content": partial_text}}]})
-                    );
-                    let chunk = format!("{:X}\r\n{}\r\n", partial.len(), partial);
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{chunk}"
-                    );
-                    socket
-                        .write_all(response.as_bytes())
-                        .await
-                        .expect("write hanging partial stream response");
-                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                    let _ = socket.shutdown().await;
-                } else {
-                    hits.record_nonstream(&req);
-                    let body = r#"{"choices":[{"message":{"content":"probe ok"}}]}"#;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    socket
-                        .write_all(response.as_bytes())
-                        .await
-                        .expect("write hanging nonstream response");
-                    let _ = socket.shutdown().await;
-                }
-            });
-        }
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-    (format!("http://{addr}"), hits)
-}
-
-async fn spawn_http_app_server(app: axum::Router) -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind live http listener");
-    let addr = listener.local_addr().expect("live http local_addr");
-    tokio::spawn(async move {
-        axum::serve(listener, app.into_make_service())
-            .await
-            .expect("serve live http app");
-    });
-    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-    format!("http://{addr}")
 }
 
 async fn wait_for_artifact_count(
@@ -1002,7 +842,7 @@ pub async fn run_session_artifact_http_matches_session_artifacts_rows() {
     );
     cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &ctx.session_id).await;
     cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &other_session_id).await;
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 pub async fn run_published_session_artifact_round_trip() {
@@ -1043,7 +883,7 @@ pub async fn run_published_session_artifact_round_trip() {
             "test_llm_rounds": [{ "full_text": "Artifact publish verified." }]
         }
     });
-    let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
+    let (status, body) = stream_chat_full_server_owned(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
     assert!(
         body.contains("Artifact publish verified."),
@@ -1079,7 +919,11 @@ pub async fn run_published_session_artifact_round_trip() {
         serde_json::from_str(&content_json).expect("parse llm_capture content");
     assert_eq!(source.as_deref(), Some("server_loop_host"));
     assert!(turn.unwrap_or_default() >= 1);
-    assert!(round.unwrap_or_default() >= 0);
+    let round = round.expect("published llm_capture artifact should persist round");
+    assert!(
+        round >= 0,
+        "artifact round should be non-negative, got {round}"
+    );
     assert_eq!(
         content["response"]["full_text"].as_str(),
         Some("Artifact publish verified.")
@@ -1132,7 +976,7 @@ pub async fn run_published_session_artifact_round_trip() {
         "published artifact should still be session-scoped over HTTP: {wrong_session_j}"
     );
     cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 pub async fn run_session_artifact_latest_and_download_routes() {
@@ -1160,7 +1004,7 @@ pub async fn run_session_artifact_latest_and_download_routes() {
             "test_llm_rounds": [{ "full_text": "Artifact download verified." }]
         }
     });
-    let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
+    let (status, body) = stream_chat_full_server_owned(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
     assert!(
         body.contains("Artifact download verified."),
@@ -1307,7 +1151,7 @@ pub async fn run_session_artifact_latest_and_download_routes() {
     );
     cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
     cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &other_session_id).await;
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 pub async fn run_failed_session_artifact_latest_and_download_routes() {
@@ -1346,15 +1190,19 @@ pub async fn run_failed_session_artifact_latest_and_download_routes() {
             }]
         }
     });
-    let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
+    let (status, body) = stream_chat_full_server_owned(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
     assert!(
         body.contains(failure_message),
         "SSE body should surface the scripted failure: {body}"
     );
     assert!(
-        body.contains("\"status\":\"failed\""),
-        "SSE body should report the failed terminal status: {body}"
+        body.contains("\"status\":\"paused\""),
+        "a transport failure must leave the user a resumable paused run: {body}"
+    );
+    assert!(
+        body.contains("\"resumable\":true"),
+        "SSE body should tell the client the interrupted run can resume: {body}"
     );
 
     wait_for_artifact_count(
@@ -1399,8 +1247,7 @@ pub async fn run_failed_session_artifact_latest_and_download_routes() {
     // for normalizing `ClassifiedError.details.usage` from OpenAI-style
     // (`prompt_tokens`/`completion_tokens`) into the canonical form before
     // flattening. If this assertion regresses, error artifacts have drifted
-    // away from the canonical schema shared by the SSE path
-    // (see `bridge_sse_helpers::apply_forward_llm_sse_event`).
+    // away from the canonical schema shared by the server-owned SSE path.
     assert_eq!(
         latest_j["content"]["response"]["usage"]["input_tokens"].as_i64(),
         Some(17)
@@ -1451,127 +1298,7 @@ pub async fn run_failed_session_artifact_latest_and_download_routes() {
         Some(3)
     );
     cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
-    ctx.pool.close().await;
-}
-
-struct BridgeFailureArtifactScenario<'a> {
-    title: &'a str,
-    suite: &'a str,
-    agent_id: &'a str,
-    user_message: &'a str,
-    stream_blocks: Vec<String>,
-    expected_outcome: &'a str,
-    expected_code: &'a str,
-    partial_text: &'a str,
-}
-
-async fn run_bridge_failure_session_artifact_latest_and_download_routes(
-    scenario: BridgeFailureArtifactScenario<'_>,
-) {
-    let BridgeFailureArtifactScenario {
-        title,
-        suite,
-        agent_id,
-        user_message,
-        stream_blocks,
-        expected_outcome,
-        expected_code,
-        partial_text,
-    } = scenario;
-    let b = bootstrap().await;
-    let ctx = &b.ctx;
-    let app = &ctx.app;
-    let auth = &b.auth_header;
-    let pool = &ctx.pool;
-
-    let (st_sess, sess) = post_json(
-        app,
-        "/sessions",
-        Some(auth.as_str()),
-        json!({ "title": title, "metadata": { "full_llm_capture": true, "suite": suite } }),
-    )
-    .await;
-    assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
-    let session_id = sess["session_id"].as_str().expect("session_id").to_string();
-
-    let payload = json!({
-        "agent_id": agent_id,
-        "session_id": &session_id,
-        "messages": [{ "role": "user", "content": user_message }],
-        "model_selection": seeded_model_selection(ctx),
-        "test_llm_stream_blocks": stream_blocks
-    });
-    let (status, body) = chat_turn_full(app, auth, payload).await;
-    assert_eq!(status, StatusCode::OK, "chat/turn: {body}");
-    assert!(
-        body.contains(partial_text),
-        "bridge SSE should include the partial streamed text: {body}"
-    );
-    assert!(
-        body.contains(&format!("\"code\":\"{expected_code}\"")),
-        "bridge SSE should expose the expected failure code: {body}"
-    );
-
-    wait_for_artifact_count(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "llm_capture",
-        1,
-        std::time::Duration::from_secs(15),
-    )
-    .await;
-
-    let artifact_id = latest_llm_capture_artifact_id(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "latest bridge failed llm_capture row",
-    )
-    .await;
-
-    let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
-    let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
-    assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
-    assert_eq!(latest_j["artifact_id"].as_str(), Some(artifact_id.as_str()));
-    assert_eq!(latest_j["artifact_kind"].as_str(), Some("llm_capture"));
-    assert_eq!(latest_j["source"].as_str(), Some("bridge_inprocess"));
-    assert_eq!(
-        latest_j["metadata"]["outcome"].as_str(),
-        Some(expected_outcome)
-    );
-    assert_eq!(
-        latest_j["content"]["response"]["kind"].as_str(),
-        Some(expected_code)
-    );
-    assert_eq!(
-        latest_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
-    );
-
-    let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
-    let (st_download, _download_headers, download_body) =
-        get_bytes(app, &download_path, Some(auth), &[]).await;
-    assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let _download_descriptor =
-        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
-    let download_j = latest_j.clone();
-    assert_eq!(download_j["artifact_kind"].as_str(), Some("llm_capture"));
-    assert_eq!(download_j["source"].as_str(), Some("bridge_inprocess"));
-    assert_eq!(
-        download_j["metadata"]["outcome"].as_str(),
-        Some(expected_outcome)
-    );
-    assert_eq!(
-        download_j["content"]["response"]["kind"].as_str(),
-        Some(expected_code)
-    );
-    assert_eq!(
-        download_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
-    );
-    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 pub async fn run_server_loop_block_parse_preserves_partial_without_replay_routes() {
@@ -1623,7 +1350,7 @@ pub async fn run_server_loop_block_parse_preserves_partial_without_replay_routes
         "session_id": &session_id,
         "model_selection": model_selection(offering_id_from_model_response(&model_j))
     });
-    let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
+    let (status, body) = stream_chat_full_server_owned(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
     assert!(
         body.contains(partial_text),
@@ -1634,12 +1361,13 @@ pub async fn run_server_loop_block_parse_preserves_partial_without_replay_routes
         "server-loop SSE should expose the original typed stream failure: {body}"
     );
     assert!(
-        body.contains("\"status\":\"failed\""),
-        "server-loop SSE should terminate the run after a partial stream failure: {body}"
+        body.contains("\"status\":\"paused\"") && body.contains("\"resumable\":true"),
+        "a partial stream failure must preserve a resumable run: {body}"
     );
     assert!(
-        !body.contains("\"type\":\"turn_complete\""),
-        "a failed partial stream must not emit turn_complete: {body}"
+        body.contains("\"type\":\"run_interrupted\"")
+            && body.contains("\"type\":\"turn_complete\""),
+        "the server must publish the interruption and one terminal summary: {body}"
     );
 
     wait_for_artifact_count(
@@ -1705,7 +1433,7 @@ pub async fn run_server_loop_block_parse_preserves_partial_without_replay_routes
         .execute(pool)
         .await;
     cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 pub async fn run_server_loop_transport_preserves_partial_without_replay_routes() {
@@ -1757,7 +1485,7 @@ pub async fn run_server_loop_transport_preserves_partial_without_replay_routes()
         "session_id": &session_id,
         "model_selection": model_selection(offering_id_from_model_response(&model_j))
     });
-    let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
+    let (status, body) = stream_chat_full_server_owned(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
     assert!(
         body.contains(partial_text),
@@ -1768,12 +1496,13 @@ pub async fn run_server_loop_transport_preserves_partial_without_replay_routes()
         "server-loop SSE should retain the typed transport failure: {body}"
     );
     assert!(
-        body.contains("\"status\":\"failed\""),
-        "server-loop transport failure should terminate the run: {body}"
+        body.contains("\"status\":\"paused\"") && body.contains("\"resumable\":true"),
+        "server-loop transport failure should leave a resumable paused run: {body}"
     );
     assert!(
-        !body.contains("\"type\":\"turn_complete\""),
-        "server-loop transport failure must not emit turn_complete: {body}"
+        body.contains("\"type\":\"run_interrupted\"")
+            && body.contains("\"type\":\"turn_complete\""),
+        "the server must publish the interruption and one terminal summary: {body}"
     );
 
     wait_for_artifact_count(
@@ -1839,7 +1568,7 @@ pub async fn run_server_loop_transport_preserves_partial_without_replay_routes()
         .execute(pool)
         .await;
     cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 pub async fn run_server_loop_idle_preserves_partial_without_replay_routes() {
@@ -1893,7 +1622,7 @@ pub async fn run_server_loop_idle_preserves_partial_without_replay_routes() {
         "session_id": &session_id,
         "model_selection": model_selection(offering_id_from_model_response(&model_j))
     });
-    let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
+    let (status, body) = stream_chat_full_server_owned(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
     assert!(
         body.contains(partial_text),
@@ -1904,12 +1633,13 @@ pub async fn run_server_loop_idle_preserves_partial_without_replay_routes() {
         "server-loop SSE should retain the typed idle failure: {body}"
     );
     assert!(
-        body.contains("\"status\":\"failed\""),
-        "server-loop idle timeout should terminate the run: {body}"
+        body.contains("\"status\":\"paused\"") && body.contains("\"resumable\":true"),
+        "server-loop idle timeout should leave a resumable paused run: {body}"
     );
     assert!(
-        !body.contains("\"type\":\"turn_complete\""),
-        "server-loop idle timeout must not emit turn_complete: {body}"
+        body.contains("\"type\":\"run_interrupted\"")
+            && body.contains("\"type\":\"turn_complete\""),
+        "the server must publish the interruption and one terminal summary: {body}"
     );
 
     wait_for_artifact_count(
@@ -1975,7 +1705,7 @@ pub async fn run_server_loop_idle_preserves_partial_without_replay_routes() {
         .execute(pool)
         .await;
     cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 pub async fn run_server_loop_rate_limit_failure_session_artifact_latest_and_download_routes() {
@@ -2028,23 +1758,21 @@ pub async fn run_server_loop_rate_limit_failure_session_artifact_latest_and_down
         "session_id": &session_id,
         "model_selection": model_selection(offering_id_from_model_response(&model_j))
     });
-    let (status, body) = stream_chat_full_nonbridge(app, auth, payload.clone()).await;
+    let (status, body) = stream_chat_full_server_owned(app, auth, payload.clone()).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
     assert!(
-        body.contains("[rate_limit] LLM request rejected: 429"),
-        "server-loop SSE should surface the normalized provider rate-limit text after retry exhaustion: {body}"
+        body.contains("\"kind\":\"rate_limited\"")
+            && body.contains("Please wait ~30s before retrying."),
+        "server-loop SSE should surface an actionable typed rate-limit interruption: {body}"
     );
     assert!(
-        body.contains("\"code\":\"LLM_RATE_LIMIT\""),
-        "server-loop rate-limit exhaustion should surface a rate-limit client code: {body}"
+        body.contains("\"status\":\"paused\"") && body.contains("\"resumable\":true"),
+        "rate-limit exhaustion should leave a resumable paused run: {body}"
     );
     assert!(
-        body.contains("\"status\":\"failed\""),
-        "server-loop rate-limit exhaustion should terminate as failed: {body}"
-    );
-    assert!(
-        !body.contains("\"type\":\"turn_complete\""),
-        "rate-limit failure should not emit turn_complete after terminal error: {body}"
+        body.contains("\"type\":\"run_interrupted\"")
+            && body.contains("\"type\":\"turn_complete\""),
+        "the server must publish the interruption and one terminal summary: {body}"
     );
 
     wait_for_artifact_count(
@@ -2087,7 +1815,7 @@ pub async fn run_server_loop_rate_limit_failure_session_artifact_latest_and_down
         Some("rate_limit")
     );
 
-    let (cooldown_status, cooldown_body) = stream_chat_full_nonbridge(app, auth, payload).await;
+    let (cooldown_status, cooldown_body) = stream_chat_full_server_owned(app, auth, payload).await;
     assert_eq!(
         cooldown_status,
         StatusCode::OK,
@@ -2098,12 +1826,14 @@ pub async fn run_server_loop_rate_limit_failure_session_artifact_latest_and_down
         "follow-up turn should be rejected by local rate-limit cooldown: {cooldown_body}"
     );
     assert!(
-        cooldown_body.contains("\"code\":\"LLM_RATE_LIMIT\""),
-        "cooldown reject should surface the rate-limit client code: {cooldown_body}"
+        cooldown_body.contains("\"kind\":\"rate_limited\"")
+            && cooldown_body.contains("\"resume_action\":{\"wait_and_retry\":"),
+        "cooldown reject should give an actionable typed rate-limit interruption: {cooldown_body}"
     );
     assert!(
-        !cooldown_body.contains("\"type\":\"turn_complete\""),
-        "cooldown reject should not emit turn_complete: {cooldown_body}"
+        cooldown_body.contains("\"status\":\"paused\"")
+            && cooldown_body.contains("\"type\":\"turn_complete\""),
+        "cooldown reject should settle a resumable paused turn: {cooldown_body}"
     );
 
     assert_eq!(
@@ -2120,7 +1850,7 @@ pub async fn run_server_loop_rate_limit_failure_session_artifact_latest_and_down
         .execute(pool)
         .await;
     cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 pub async fn run_server_loop_rate_limit_retry_success_session_artifact_latest_and_download_routes()
@@ -2173,7 +1903,7 @@ pub async fn run_server_loop_rate_limit_retry_success_session_artifact_latest_an
         "session_id": &session_id,
         "model_selection": model_selection(offering_id_from_model_response(&model_j))
     });
-    let (status, body) = stream_chat_full_nonbridge(app, auth, payload).await;
+    let (status, body) = stream_chat_full_server_owned(app, auth, payload).await;
     assert_eq!(status, StatusCode::OK, "chat/stream: {body}");
     assert!(
         body.contains(success_text),
@@ -2242,1000 +1972,7 @@ pub async fn run_server_loop_rate_limit_retry_success_session_artifact_latest_an
         .execute(pool)
         .await;
     cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
-    ctx.pool.close().await;
-}
-
-pub async fn run_bridge_failed_session_artifact_latest_and_download_routes() {
-    let partial_text = "half bridge answer";
-    run_bridge_failure_session_artifact_latest_and_download_routes(BridgeFailureArtifactScenario {
-        title: "bridge artifact failed latest download",
-        suite: "bridge_artifact_failed_latest_download",
-        agent_id: "system-matrix-bridge-failure-artifact",
-        user_message: "trigger a bridge stream failure",
-        stream_blocks: vec![format!(
-            "data: {{\"type\":\"text_delta\",\"content\":\"{partial_text}\"}}\n\n"
-        )],
-        expected_outcome: "stream_incomplete",
-        expected_code: "STREAM_INCOMPLETE",
-        partial_text,
-    })
-    .await;
-}
-
-pub async fn run_bridge_sse_parse_error_session_artifact_latest_and_download_routes() {
-    let partial_text = "bridge parse partial";
-    run_bridge_failure_session_artifact_latest_and_download_routes(BridgeFailureArtifactScenario {
-        title: "bridge artifact sse parse latest download",
-        suite: "bridge_artifact_sse_parse_latest_download",
-        agent_id: "system-matrix-bridge-parse-error-artifact",
-        user_message: "trigger a bridge parse failure after partial output",
-        stream_blocks: vec![
-            format!("data: {{\"type\":\"text_delta\",\"content\":\"{partial_text}\"}}\n\n"),
-            "data: {not-json}\n\n".to_string(),
-        ],
-        expected_outcome: "sse_parse_error",
-        expected_code: "SSE_PARSE_ERROR",
-        partial_text,
-    })
-    .await;
-}
-
-pub async fn run_bridge_tail_parse_error_artifact_preserves_partial_state_routes() {
-    let b = bootstrap().await;
-    let ctx = &b.ctx;
-    let app = &ctx.app;
-    let auth = &b.auth_header;
-    let pool = &ctx.pool;
-
-    let (st_sess, sess) = post_json(
-        app,
-        "/sessions",
-        Some(auth.as_str()),
-        json!({
-            "title": "bridge artifact tail parse preserves partial state",
-            "metadata": { "full_llm_capture": true, "suite": "bridge_artifact_tail_parse_partial_state" }
-        }),
-    )
-    .await;
-    assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
-    let session_id = sess["session_id"].as_str().expect("session_id").to_string();
-
-    let partial_text = "bridge tail partial";
-    let partial_reasoning = "bridge thinking";
-    let payload = json!({
-        "agent_id": "system-matrix-bridge-tail-parse-artifact",
-        "session_id": &session_id,
-        "messages": [{ "role": "user", "content": "trigger a bridge tail parse failure after partial state" }],
-        "model_selection": seeded_model_selection(ctx),
-        "test_llm_stream_blocks": [
-            format!("data: {{\"type\":\"text_delta\",\"content\":\"{partial_text}\"}}\n\n"),
-            format!("data: {{\"type\":\"reasoning_delta\",\"content\":\"{partial_reasoning}\"}}\n\n"),
-            "data: {\"type\":\"tool_call_start\",\"tool\":\"bash\",\"call_id\":\"call-1\",\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}\n\n".to_string(),
-            "data: {\"type\":\"usage\",\"input_tokens\":13,\"output_tokens\":5}\n\n".to_string(),
-            "data: {\"type\":\"usage\",\"input_tokens\":13".to_string()
-        ]
-    });
-    let (status, body) = chat_turn_full(app, auth, payload).await;
-    assert_eq!(status, StatusCode::OK, "chat/turn: {body}");
-    assert!(
-        body.contains(partial_text),
-        "bridge SSE should include partial text: {body}"
-    );
-    assert!(
-        body.contains("\"code\":\"SSE_PARSE_ERROR\""),
-        "bridge SSE should expose the tail parse failure code: {body}"
-    );
-
-    wait_for_artifact_count(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "llm_capture",
-        1,
-        std::time::Duration::from_secs(15),
-    )
-    .await;
-
-    let artifact_id = latest_llm_capture_artifact_id(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "latest bridge tail parse llm_capture row",
-    )
-    .await;
-
-    let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
-    let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
-    assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
-    assert_eq!(latest_j["artifact_id"].as_str(), Some(artifact_id.as_str()));
-    assert_eq!(
-        latest_j["metadata"]["outcome"].as_str(),
-        Some("sse_parse_error")
-    );
-    assert_eq!(
-        latest_j["content"]["response"]["kind"].as_str(),
-        Some("SSE_PARSE_ERROR")
-    );
-    assert_eq!(
-        latest_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
-    );
-    assert_eq!(
-        latest_j["content"]["response"]["partial_reasoning"].as_str(),
-        Some(partial_reasoning)
-    );
-    assert_eq!(
-        latest_j["content"]["response"]["tool_calls"][0]["function"]["name"].as_str(),
-        Some("bash")
-    );
-    // SSE `usage` frames use the canonical token-usage schema
-    // (see `turn::token_usage::TokenUsage::to_json_map` and
-    // `bridge_sse_helpers::apply_forward_llm_sse_event` for the allow-listed
-    // keys). The artifact preserves them verbatim, so the assertion must
-    // match the wire shape — `input_tokens` / `output_tokens`, NOT the
-    // OpenAI-style `prompt_tokens` / `completion_tokens`.
-    assert_eq!(
-        latest_j["content"]["response"]["usage"]["input_tokens"].as_i64(),
-        Some(13)
-    );
-    assert_eq!(
-        latest_j["content"]["response"]["usage"]["output_tokens"].as_i64(),
-        Some(5)
-    );
-
-    let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
-    let (st_download, _download_headers, download_body) =
-        get_bytes(app, &download_path, Some(auth), &[]).await;
-    assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let _download_descriptor =
-        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
-    let download_j = latest_j.clone();
-    assert_eq!(
-        download_j["metadata"]["outcome"].as_str(),
-        Some("sse_parse_error")
-    );
-    assert_eq!(
-        download_j["content"]["response"]["kind"].as_str(),
-        Some("SSE_PARSE_ERROR")
-    );
-    assert_eq!(
-        download_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
-    );
-    assert_eq!(
-        download_j["content"]["response"]["partial_reasoning"].as_str(),
-        Some(partial_reasoning)
-    );
-    assert_eq!(
-        download_j["content"]["response"]["tool_calls"][0]["function"]["name"].as_str(),
-        Some("bash")
-    );
-    // Same canonical-schema rationale as the `latest_j` assertion above.
-    assert_eq!(
-        download_j["content"]["response"]["usage"]["input_tokens"].as_i64(),
-        Some(13)
-    );
-    assert_eq!(
-        download_j["content"]["response"]["usage"]["output_tokens"].as_i64(),
-        Some(5)
-    );
-    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
-    ctx.pool.close().await;
-}
-
-pub async fn run_bridge_transport_preserves_partial_without_replay_routes() {
-    let partial_text = "bridge transport partial";
-    let (base_url, hits) = spawn_raw_partial_transport_server(partial_text).await;
-
-    let b = bootstrap().await;
-    let ctx = &b.ctx;
-    let app = &ctx.app;
-    let auth = &b.auth_header;
-    let pool = &ctx.pool;
-    let model_name = format!("bridge-transport-{}", ctx.suffix);
-
-    let (st_model, model_j) = post_json(
-        app,
-        "/models",
-        Some(auth.as_str()),
-        json!({
-            "name": model_name,
-            "provider": "openai",
-            "context_window": 200000,
-            "api_key": "transport-e2e-key",
-            "base_url": base_url
-        }),
-    )
-    .await;
-    assert_eq!(st_model, StatusCode::CREATED, "create model: {model_j}");
-    sqlx::query("UPDATE infra_llm_models SET is_active = 1 WHERE model_name = ?")
-        .bind(&model_name)
-        .execute(pool)
-        .await
-        .expect("force-activate transport test model");
-    let (st_sess, sess) = post_json(
-        app,
-        "/sessions",
-        Some(auth.as_str()),
-        json!({
-            "title": "bridge transport failed latest download",
-            "metadata": { "full_llm_capture": true, "suite": "bridge_transport_failed_latest_download" }
-        }),
-    )
-    .await;
-    assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
-    let session_id = sess["session_id"].as_str().expect("session_id").to_string();
-
-    let payload = json!({
-        "agent_id": "system-matrix-bridge-transport-artifact",
-        "session_id": &session_id,
-        "model_selection": model_selection(offering_id_from_model_response(&model_j)),
-        "messages": [{ "role": "user", "content": "trigger a bridge transport failure after partial output" }]
-    });
-    let (status, body) = chat_turn_full(app, auth, payload).await;
-    assert_eq!(status, StatusCode::OK, "chat/turn: {body}");
-    assert!(
-        body.contains(partial_text),
-        "bridge SSE should include the partial streamed text before transport failure: {body}"
-    );
-    assert!(
-        body.contains("\"code\":\"stream_transport\""),
-        "bridge SSE should expose the transport failure code: {body}"
-    );
-    assert!(
-        !body.contains("\"type\":\"turn_complete\""),
-        "bridge transport failure must not emit turn_complete: {body}"
-    );
-
-    wait_for_artifact_count(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "llm_capture",
-        1,
-        std::time::Duration::from_secs(15),
-    )
-    .await;
-
-    let artifact_id = latest_llm_capture_artifact_id(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "latest bridge transport llm_capture row",
-    )
-    .await;
-
-    let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
-    let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
-    assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
-    assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("error"));
-    assert_eq!(
-        latest_j["content"]["response"]["kind"].as_str(),
-        Some("stream_transport")
-    );
-    assert_eq!(
-        latest_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
-    );
-
-    let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
-    let (st_download, _download_headers, download_body) =
-        get_bytes(app, &download_path, Some(auth), &[]).await;
-    assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let _download_descriptor =
-        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
-    let download_j = latest_j.clone();
-    assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
-    assert_eq!(
-        download_j["content"]["response"]["kind"].as_str(),
-        Some("stream_transport")
-    );
-    assert_eq!(
-        download_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
-    );
-
-    assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
-    assert_no_primary_nonstream_fallback(
-        &hits,
-        "a bridge transport break after visible output must not replay as non-stream",
-    );
-    let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
-        .bind(&model_name)
-        .execute(pool)
-        .await;
-    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
-    ctx.pool.close().await;
-}
-
-pub async fn run_bridge_client_disconnect_session_artifact_latest_and_download_routes() {
-    let partial_text = "bridge disconnect partial";
-    let (base_url, hits) = spawn_raw_hanging_stream_server(partial_text).await;
-
-    let b = bootstrap().await;
-    let ctx = &b.ctx;
-    let app = &ctx.app;
-    let auth = &b.auth_header;
-    let pool = &ctx.pool;
-    let model_name = format!("bridge-disconnect-{}", ctx.suffix);
-
-    let (st_model, model_j) = post_json(
-        app,
-        "/models",
-        Some(auth.as_str()),
-        json!({
-            "name": model_name,
-            "provider": "openai",
-            "context_window": 200000,
-            "api_key": "disconnect-e2e-key",
-            "base_url": base_url
-        }),
-    )
-    .await;
-    assert_eq!(st_model, StatusCode::CREATED, "create model: {model_j}");
-    sqlx::query("UPDATE infra_llm_models SET is_active = 1 WHERE model_name = ?")
-        .bind(&model_name)
-        .execute(pool)
-        .await
-        .expect("force-activate disconnect test model");
-
-    let (st_sess, sess) = post_json(
-        app,
-        "/sessions",
-        Some(auth.as_str()),
-        json!({
-            "title": "bridge client disconnect latest download",
-            "metadata": { "full_llm_capture": true, "suite": "bridge_client_disconnect_latest_download" }
-        }),
-    )
-    .await;
-    assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
-    let session_id = sess["session_id"].as_str().expect("session_id").to_string();
-
-    let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
-    let base_http = spawn_http_app_server(app.clone()).await;
-    let addr = base_http.trim_start_matches("http://");
-    let mut socket = tokio::net::TcpStream::connect(addr)
-        .await
-        .expect("connect live http socket");
-    let request_body = json!({
-        "agent_id": "system-matrix-bridge-client-disconnect",
-        "inference_purpose": astra_turn_types::InferencePurpose::PrimaryAgent,
-        "session_id": &session_id,
-        "model_selection": model_selection(offering_id_from_model_response(&model_j)),
-        "messages": [{ "role": "user", "content": "trigger a bridge client disconnect after partial output" }]
-    })
-    .to_string();
-    let request = format!(
-        "POST /chat/turn HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {}\r\nContent-Type: application/json\r\nx-mo-bridge-test-secret: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        auth.as_str(),
-        test_secret,
-        request_body.len(),
-        request_body
-    );
-    socket
-        .write_all(request.as_bytes())
-        .await
-        .expect("write disconnect request");
-
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    let mut saw_partial = false;
-    let mut received = Vec::new();
-    let mut buf = [0_u8; 4096];
-    while let Ok(Ok(read)) = tokio::time::timeout_at(deadline, socket.read(&mut buf)).await {
-        if read == 0 {
-            break;
-        }
-        received.extend_from_slice(&buf[..read]);
-        if received
-            .windows(partial_text.len())
-            .any(|window| window == partial_text.as_bytes())
-        {
-            saw_partial = true;
-            break;
-        }
-    }
-    assert!(
-        saw_partial,
-        "should receive partial streamed text before disconnect; provider_stream_hits={} provider_nonstream_hits={} received_bytes={}",
-        hits.stream_hits.load(Ordering::SeqCst),
-        hits.nonstream_hits.load(Ordering::SeqCst),
-        received.len(),
-    );
-    drop(socket);
-
-    wait_for_artifact_count(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "llm_capture",
-        1,
-        std::time::Duration::from_secs(15),
-    )
-    .await;
-
-    let artifact_id = latest_llm_capture_artifact_id(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "latest bridge disconnect llm_capture row",
-    )
-    .await;
-
-    let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
-    let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
-    assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
-    assert_eq!(
-        latest_j["metadata"]["outcome"].as_str(),
-        Some("client_disconnect")
-    );
-    assert_eq!(
-        latest_j["content"]["response"]["kind"].as_str(),
-        Some("CLIENT_DISCONNECT")
-    );
-    assert_eq!(
-        latest_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
-    );
-
-    let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
-    let (st_download, _download_headers, download_body) =
-        get_bytes(app, &download_path, Some(auth), &[]).await;
-    assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let _download_descriptor =
-        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
-    let download_j = latest_j.clone();
-    assert_eq!(
-        download_j["metadata"]["outcome"].as_str(),
-        Some("client_disconnect")
-    );
-    assert_eq!(
-        download_j["content"]["response"]["kind"].as_str(),
-        Some("CLIENT_DISCONNECT")
-    );
-    assert_eq!(
-        download_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
-    );
-
-    assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
-    assert_no_primary_nonstream_fallback(
-        &hits,
-        "client disconnect must cancel the active stream without replaying inference",
-    );
-    let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
-        .bind(&model_name)
-        .execute(pool)
-        .await;
-    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
-    ctx.pool.close().await;
-}
-
-pub async fn run_bridge_idle_preserves_partial_without_replay_routes() {
-    let _idle_env = set_stream_idle_timeouts_for_test(250, 250);
-    let partial_text = "bridge idle partial";
-    let (base_url, hits) =
-        spawn_raw_idle_after_progress_server(partial_text, std::time::Duration::from_secs(2)).await;
-
-    let b = bootstrap().await;
-    let ctx = &b.ctx;
-    let app = &ctx.app;
-    let auth = &b.auth_header;
-    let pool = &ctx.pool;
-    let model_name = format!("bridge-idle-{}", ctx.suffix);
-
-    let (st_model, model_j) = post_json(
-        app,
-        "/models",
-        Some(auth.as_str()),
-        json!({
-            "name": model_name,
-            "provider": "openai",
-            "context_window": 200000,
-            "api_key": "idle-e2e-key",
-            "base_url": base_url
-        }),
-    )
-    .await;
-    assert_eq!(st_model, StatusCode::CREATED, "create model: {model_j}");
-    sqlx::query("UPDATE infra_llm_models SET is_active = 1 WHERE model_name = ?")
-        .bind(&model_name)
-        .execute(pool)
-        .await
-        .expect("force-activate idle test model");
-    let (st_sess, sess) = post_json(
-        app,
-        "/sessions",
-        Some(auth.as_str()),
-        json!({
-            "title": "bridge idle failed latest download",
-            "metadata": { "full_llm_capture": true, "suite": "bridge_idle_failed_latest_download" }
-        }),
-    )
-    .await;
-    assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
-    let session_id = sess["session_id"].as_str().expect("session_id").to_string();
-
-    let payload = json!({
-        "agent_id": "system-matrix-bridge-idle-artifact",
-        "session_id": &session_id,
-        "model_selection": model_selection(offering_id_from_model_response(&model_j)),
-        "messages": [{ "role": "user", "content": "trigger a bridge idle failure after partial output" }]
-    });
-    let (status, body) = chat_turn_full(app, auth, payload).await;
-    assert_eq!(status, StatusCode::OK, "chat/turn: {body}");
-    assert!(
-        body.contains(partial_text),
-        "bridge SSE should include the partial streamed text before idle failure: {body}"
-    );
-    assert!(
-        body.contains("\"code\":\"stream_idle\""),
-        "bridge SSE should expose the idle failure code: {body}"
-    );
-    assert!(
-        !body.contains("\"type\":\"turn_complete\""),
-        "idle failure should not emit turn_complete after terminal error: {body}"
-    );
-
-    wait_for_artifact_count(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "llm_capture",
-        1,
-        std::time::Duration::from_secs(15),
-    )
-    .await;
-
-    let artifact_id = latest_llm_capture_artifact_id(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "latest bridge idle llm_capture row",
-    )
-    .await;
-
-    let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
-    let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
-    assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
-    assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("error"));
-    assert_eq!(
-        latest_j["content"]["response"]["kind"].as_str(),
-        Some("stream_idle")
-    );
-    assert_eq!(
-        latest_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
-    );
-
-    let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
-    let (st_download, _download_headers, download_body) =
-        get_bytes(app, &download_path, Some(auth), &[]).await;
-    assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let _download_descriptor =
-        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
-    let download_j = latest_j.clone();
-    assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
-    assert_eq!(
-        download_j["content"]["response"]["kind"].as_str(),
-        Some("stream_idle")
-    );
-    assert_eq!(
-        download_j["content"]["response"]["partial_full_text"].as_str(),
-        Some(partial_text)
-    );
-
-    assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
-    assert_no_primary_nonstream_fallback(
-        &hits,
-        "a bridge idle timeout after visible output must not replay as non-stream",
-    );
-    let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
-        .bind(&model_name)
-        .execute(pool)
-        .await;
-    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
-    ctx.pool.close().await;
-}
-
-pub async fn run_bridge_rate_limit_failure_session_artifact_latest_and_download_routes() {
-    let (base_url, hits) =
-        spawn_raw_stream_rate_limit_server(None, r#"{"error":{"message":"rate limit exceeded"}}"#)
-            .await;
-
-    let b = bootstrap().await;
-    let ctx = &b.ctx;
-    let app = &ctx.app;
-    let auth = &b.auth_header;
-    let pool = &ctx.pool;
-    let model_name = format!("bridge-rate-limit-{}", ctx.suffix);
-
-    let (st_model, model_j) = post_json(
-        app,
-        "/models",
-        Some(auth.as_str()),
-        json!({
-            "name": model_name,
-            "provider": "openai",
-            "context_window": 200000,
-            "api_key": "rate-limit-e2e-key",
-            "base_url": base_url
-        }),
-    )
-    .await;
-    assert_eq!(st_model, StatusCode::CREATED, "create model: {model_j}");
-    sqlx::query("UPDATE infra_llm_models SET is_active = 1 WHERE model_name = ?")
-        .bind(&model_name)
-        .execute(pool)
-        .await
-        .expect("force-activate rate-limit test model");
-
-    let (st_sess, sess) = post_json(
-        app,
-        "/sessions",
-        Some(auth.as_str()),
-        json!({
-            "title": "bridge rate limit latest download",
-            "metadata": { "full_llm_capture": true, "suite": "bridge_rate_limit_latest_download" }
-        }),
-    )
-    .await;
-    assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
-    let session_id = sess["session_id"].as_str().expect("session_id").to_string();
-
-    let payload = json!({
-        "agent_id": "system-matrix-bridge-rate-limit-artifact",
-        "session_id": &session_id,
-        "model_selection": model_selection(offering_id_from_model_response(&model_j)),
-        "messages": [{ "role": "user", "content": "trigger repeated bridge rate limits" }]
-    });
-    let (status, body) = chat_turn_full(app, auth, payload.clone()).await;
-    assert_eq!(status, StatusCode::OK, "chat/turn: {body}");
-    assert!(
-        body.contains("\"code\":\"rate_limit\""),
-        "bridge SSE should expose the provider rate-limit code after retry exhaustion: {body}"
-    );
-    assert!(
-        !body.contains("\"type\":\"turn_complete\""),
-        "rate-limit failure should not emit turn_complete after terminal error: {body}"
-    );
-
-    wait_for_artifact_count(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "llm_capture",
-        1,
-        std::time::Duration::from_secs(15),
-    )
-    .await;
-
-    let artifact_id = latest_llm_capture_artifact_id(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "latest bridge rate-limit llm_capture row",
-    )
-    .await;
-
-    let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
-    let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
-    assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
-    assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("error"));
-    assert_eq!(
-        latest_j["content"]["response"]["kind"].as_str(),
-        Some("rate_limit")
-    );
-
-    let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
-    let (st_download, _download_headers, download_body) =
-        get_bytes(app, &download_path, Some(auth), &[]).await;
-    assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let _download_descriptor =
-        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
-    let download_j = latest_j.clone();
-    assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
-    assert_eq!(
-        download_j["content"]["response"]["kind"].as_str(),
-        Some("rate_limit")
-    );
-
-    let (cooldown_status, cooldown_body) = chat_turn_full(app, auth, payload).await;
-    assert_eq!(
-        cooldown_status,
-        StatusCode::OK,
-        "cooldown chat/turn: {cooldown_body}"
-    );
-    assert!(
-        cooldown_body.contains("\"code\":\"RATE_LIMITED\""),
-        "follow-up turn should be rejected by local rate-limit cooldown: {cooldown_body}"
-    );
-    assert!(
-        !cooldown_body.contains("\"type\":\"turn_complete\""),
-        "cooldown reject should not emit turn_complete: {cooldown_body}"
-    );
-
-    assert_eq!(
-        hits.stream_hits.load(Ordering::SeqCst),
-        3,
-        "the third consecutive rate limit must enter cooldown without a fourth provider call"
-    );
-    assert_no_primary_nonstream_fallback(
-        &hits,
-        "repeated stream 429s plus cooldown reject should not issue a non-stream fallback",
-    );
-    let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
-        .bind(&model_name)
-        .execute(pool)
-        .await;
-    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
-    ctx.pool.close().await;
-}
-
-pub async fn run_bridge_rate_limit_retry_success_session_artifact_latest_and_download_routes() {
-    let success_text = "bridge after-429 success";
-    let (base_url, hits) = spawn_raw_stream_rate_limit_then_sse_server(success_text).await;
-
-    let b = bootstrap().await;
-    let ctx = &b.ctx;
-    let app = &ctx.app;
-    let auth = &b.auth_header;
-    let pool = &ctx.pool;
-    let model_name = format!("bridge-rate-limit-retry-{}", ctx.suffix);
-
-    let (st_model, model_j) = post_json(
-        app,
-        "/models",
-        Some(auth.as_str()),
-        json!({
-            "name": model_name,
-            "provider": "openai",
-            "context_window": 200000,
-            "api_key": "rate-limit-retry-e2e-key",
-            "base_url": base_url
-        }),
-    )
-    .await;
-    assert_eq!(st_model, StatusCode::CREATED, "create model: {model_j}");
-    sqlx::query("UPDATE infra_llm_models SET is_active = 1 WHERE model_name = ?")
-        .bind(&model_name)
-        .execute(pool)
-        .await
-        .expect("force-activate rate-limit retry test model");
-
-    let (st_sess, sess) = post_json(
-        app,
-        "/sessions",
-        Some(auth.as_str()),
-        json!({
-            "title": "bridge rate limit retry success latest download",
-            "metadata": { "full_llm_capture": true, "suite": "bridge_rate_limit_retry_success_latest_download" }
-        }),
-    )
-    .await;
-    assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
-    let session_id = sess["session_id"].as_str().expect("session_id").to_string();
-
-    let payload = json!({
-        "agent_id": "system-matrix-bridge-rate-limit-retry-success",
-        "session_id": &session_id,
-        "model_selection": model_selection(offering_id_from_model_response(&model_j)),
-        "messages": [{ "role": "user", "content": "trigger one bridge rate limit and then recover" }]
-    });
-    let (status, body) = chat_turn_full(app, auth, payload).await;
-    assert_eq!(status, StatusCode::OK, "chat/turn: {body}");
-    assert!(
-        body.contains(success_text),
-        "bridge SSE should include the recovered text after one 429 retry: {body}"
-    );
-    assert!(
-        body.contains("\"type\":\"turn_complete\""),
-        "successful 429 retry should still emit turn_complete: {body}"
-    );
-    assert!(
-        !body.contains("\"type\":\"error\""),
-        "successful 429 retry should not expose an error event to the client: {body}"
-    );
-
-    wait_for_artifact_count(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "llm_capture",
-        1,
-        std::time::Duration::from_secs(15),
-    )
-    .await;
-
-    let artifact_id = latest_llm_capture_artifact_id(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "latest bridge rate-limit retry llm_capture row",
-    )
-    .await;
-
-    let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
-    let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
-    assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
-    assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("success"));
-    assert_eq!(
-        latest_j["content"]["response"]["full_text"].as_str(),
-        Some(success_text)
-    );
-
-    let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
-    let (st_download, _download_headers, download_body) =
-        get_bytes(app, &download_path, Some(auth), &[]).await;
-    assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let _download_descriptor =
-        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
-    let download_j = latest_j.clone();
-    assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("success"));
-    assert_eq!(
-        download_j["content"]["response"]["full_text"].as_str(),
-        Some(success_text)
-    );
-
-    assert_eq!(
-        hits.stream_hits.load(Ordering::SeqCst),
-        2,
-        "expected one 429 stream attempt and one successful retry stream"
-    );
-    assert_no_primary_nonstream_fallback(
-        &hits,
-        "successful stream retry should not require a non-stream fallback",
-    );
-    let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
-        .bind(&model_name)
-        .execute(pool)
-        .await;
-    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
-    ctx.pool.close().await;
-}
-
-pub async fn run_bridge_tool_call_parse_failure_does_not_replay_or_execute_routes() {
-    let (base_url, hits) = spawn_raw_tool_call_block_parse_server().await;
-
-    let b = bootstrap().await;
-    let ctx = &b.ctx;
-    let app = &ctx.app;
-    let auth = &b.auth_header;
-    let pool = &ctx.pool;
-    let model_name = format!("bridge-tool-call-parse-no-replay-{}", ctx.suffix);
-
-    let (st_model, model_j) = post_json(
-        app,
-        "/models",
-        Some(auth.as_str()),
-        json!({
-            "name": model_name,
-            "provider": "openai",
-            "context_window": 200000,
-            "api_key": "tool-call-parse-no-replay-e2e-key",
-            "base_url": base_url
-        }),
-    )
-    .await;
-    assert_eq!(st_model, StatusCode::CREATED, "create model: {model_j}");
-    sqlx::query("UPDATE infra_llm_models SET is_active = 1 WHERE model_name = ?")
-        .bind(&model_name)
-        .execute(pool)
-        .await
-        .expect("force-activate tool-call parse no-replay test model");
-
-    let (st_sess, sess) = post_json(
-        app,
-        "/sessions",
-        Some(auth.as_str()),
-        json!({
-            "title": "bridge malformed tool call without replay",
-            "metadata": { "full_llm_capture": true, "suite": "bridge_tool_call_parse_no_replay" }
-        }),
-    )
-    .await;
-    assert_eq!(st_sess, StatusCode::CREATED, "create session: {sess}");
-    let session_id = sess["session_id"].as_str().expect("session_id").to_string();
-
-    let payload = json!({
-        "agent_id": "system-matrix-bridge-tool-call-parse-no-replay",
-        "session_id": &session_id,
-        "model_selection": model_selection(offering_id_from_model_response(&model_j)),
-        "messages": [{ "role": "user", "content": "trigger a bridge tool-call parse failure after partial arguments" }]
-    });
-    let (status, body) = chat_turn_full(app, auth, payload).await;
-    assert_eq!(status, StatusCode::OK, "chat/turn: {body}");
-    assert!(
-        body.contains("\"type\":\"tool_call_start\""),
-        "bridge SSE should surface a tool_call_start event from streamed provider deltas: {body}"
-    );
-    assert!(
-        !body.contains("\"type\":\"tool_request\""),
-        "an untrusted partial tool call must never become an executable request: {body}"
-    );
-    assert_eq!(
-        body.matches("\"type\":\"tool_call_start\"").count(),
-        1,
-        "tool_call_start should be emitted once for the streamed call: {body}"
-    );
-    assert!(
-        body.contains("\"code\":\"stream_transport\""),
-        "bridge should expose the original typed parse failure: {body}"
-    );
-    assert!(
-        !body.contains("\"type\":\"turn_complete\""),
-        "a malformed tool-call stream must not complete the turn: {body}"
-    );
-
-    wait_for_artifact_count(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "llm_capture",
-        1,
-        std::time::Duration::from_secs(15),
-    )
-    .await;
-
-    let artifact_id = latest_llm_capture_artifact_id(
-        pool,
-        &ctx.user_id,
-        &session_id,
-        "latest bridge tool-call parse failure llm_capture row",
-    )
-    .await;
-
-    let latest_path = format!("/sessions/{session_id}/artifacts/latest/llm_capture");
-    let (st_latest, latest_j) = get_json(app, &latest_path, Some(auth), &[]).await;
-    assert_eq!(st_latest, StatusCode::OK, "artifact latest: {latest_j}");
-    assert_eq!(latest_j["metadata"]["outcome"].as_str(), Some("error"));
-    assert_eq!(
-        latest_j["content"]["response"]["kind"].as_str(),
-        Some("stream_transport")
-    );
-    assert_eq!(
-        latest_j["content"]["response"]["tool_calls"][0]["function"]["name"].as_str(),
-        Some("bash")
-    );
-    // Capture the last arguments fragment that crossed the bridge boundary;
-    // later provider bytes never become executable state after the parse error.
-    assert_eq!(
-        latest_j["content"]["response"]["tool_calls"][0]["function"]["arguments"].as_str(),
-        Some("{\"command\":\"p")
-    );
-
-    let download_path = format!("/sessions/{session_id}/artifacts/{artifact_id}/download");
-    let (st_download, _download_headers, download_body) =
-        get_bytes(app, &download_path, Some(auth), &[]).await;
-    assert_eq!(st_download, StatusCode::OK, "artifact download");
-    let _download_descriptor =
-        assert_presigned_artifact_download(&session_id, &artifact_id, &download_body);
-    let download_j = latest_j.clone();
-    assert_eq!(download_j["metadata"]["outcome"].as_str(), Some("error"));
-    assert_eq!(
-        download_j["content"]["response"]["kind"].as_str(),
-        Some("stream_transport")
-    );
-    assert_eq!(
-        download_j["content"]["response"]["tool_calls"][0]["function"]["name"].as_str(),
-        Some("bash")
-    );
-    assert_eq!(
-        download_j["content"]["response"]["tool_calls"][0]["function"]["arguments"].as_str(),
-        Some("{\"command\":\"p")
-    );
-
-    assert_eq!(hits.stream_hits.load(Ordering::SeqCst), 1);
-    assert_no_primary_nonstream_fallback(
-        &hits,
-        "a malformed tool-call stream after visible progress must not replay as non-stream",
-    );
-    let _ = sqlx::query("DELETE FROM infra_llm_models WHERE model_name = ?")
-        .bind(&model_name)
-        .execute(pool)
-        .await;
-    cleanup_session_data(&ctx.shared_pool, &ctx.user_id, &session_id).await;
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 pub async fn run_session_artifact_latest_route_uses_stable_tiebreaker() {
@@ -3304,5 +2041,5 @@ pub async fn run_session_artifact_latest_route_uses_stable_tiebreaker() {
         "latest route should surface the newest payload under a tied timestamp"
     );
     cleanup_session_data(&ctx.shared_pool, &user_id, &session_id).await;
-    ctx.pool.close().await;
+    ctx.close().await;
 }

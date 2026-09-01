@@ -1,0 +1,110 @@
+name: active_run_tool_result_retention
+description: |
+  **What**: Accumulate eight tool results inside one active Server-owned run, then
+  use the most recent result without re-reading or path discovery.
+  **Tests**: Active-run tool-result pairing, ordering, and bounded execution.
+  **Why**: The runtime must preserve the current run's latest authoritative result
+  until the model consumes it. Whether internal compaction happens is independent.
+  **Pass means**: The eighth result produces the exact dependency version with eight
+  exact reads and no churn.
+  **Fail means**: Pairing/order is broken, the latest result is lost, or extra work is
+  needed to recover it.
+prompt: |
+  In this one run, call read_file exactly eight times, once for each exact path
+  below and in the listed order. Do not call any other tool and do not discover
+  alternative paths:
+  1. Cargo.toml
+  2. crates/core/Cargo.toml
+  3. crates/runtime/Cargo.toml
+  4. crates/astra-cli/Cargo.toml
+  5. crates/astra-tools/Cargo.toml
+  6. crates/services/Cargo.toml
+  7. Makefile
+  8. crates/astra-turn-core/Cargo.toml
+  After the eighth result, report the exact `dashmap` dependency version from
+  that file in this format: DASHMAP_VERSION: <version>
+capability: tool_use
+difficulty: 3
+weight: 2.0
+timeout_seconds: 180
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: read_file
+  - type: text_contains
+    needle: "DASHMAP_VERSION: 6.1.0"
+  # Efficiency is part of correctness here: a final correct answer after
+  # path-discovery or re-read loops does not validate context retention.
+  - type: all_of
+    criteria:
+      - type: tools_count_between
+        min: 8
+        max: 8
+      - type: turn_rounds_between
+        min: 2
+        max: 15
+  - type: journal_tool_call_count
+    name: read_file
+    min: 1
+    max: 1
+    document: arguments
+    path: /path
+    equals: Cargo.toml
+  - type: journal_tool_call_count
+    name: read_file
+    min: 1
+    max: 1
+    document: arguments
+    path: /path
+    equals: crates/core/Cargo.toml
+  - type: journal_tool_call_count
+    name: read_file
+    min: 1
+    max: 1
+    document: arguments
+    path: /path
+    equals: crates/runtime/Cargo.toml
+  - type: journal_tool_call_count
+    name: read_file
+    min: 1
+    max: 1
+    document: arguments
+    path: /path
+    equals: crates/astra-cli/Cargo.toml
+  - type: journal_tool_call_count
+    name: read_file
+    min: 1
+    max: 1
+    document: arguments
+    path: /path
+    equals: crates/astra-tools/Cargo.toml
+  - type: journal_tool_call_count
+    name: read_file
+    min: 1
+    max: 1
+    document: arguments
+    path: /path
+    equals: crates/services/Cargo.toml
+  - type: journal_tool_call_count
+    name: read_file
+    min: 1
+    max: 1
+    document: arguments
+    path: /path
+    equals: Makefile
+  - type: journal_tool_call_count
+    name: read_file
+    min: 1
+    max: 1
+    document: arguments
+    path: /path
+    equals: crates/astra-turn-core/Cargo.toml
+  - type: judger
+    question: |
+      In one active run the agent read 8 exact files, with
+      crates/astra-turn-core/Cargo.toml last, under context pressure. Did it
+      correctly state "DASHMAP_VERSION: 6.1.0" from that file after the
+      eighth result?
+      Score 1.0 if exact, 0.5 if close but wrong, 0.0 if it did not answer.
+    threshold: 0.7

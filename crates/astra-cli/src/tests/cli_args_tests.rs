@@ -182,29 +182,17 @@ fn cli_string_flags() {
 }
 
 #[test]
-fn cli_numeric_flags() {
-    // max-turns
-    let cli = Cli::try_parse_from(["astra", "--max-turns", "10"]).unwrap();
-    assert_eq!(cli.max_turns, Some(10));
-    let cli = Cli::try_parse_from(["astra"]).unwrap();
-    assert!(cli.max_turns.is_none());
-
-    // max-budget
-    let cases: &[(&str, f64)] = &[
-        ("5.50", 5.50),
-        ("0.001", 0.001),
-        ("999.99", 999.99),
-        ("10", 10.0),
-    ];
-    for (input, expected) in cases {
-        let cli = Cli::try_parse_from(["astra", "--max-budget", input]).unwrap();
+fn removed_cli_control_flags_are_rejected() {
+    for args in [
+        ["astra", "--max-turns", "10"],
+        ["astra", "--max-budget", "1.0"],
+    ] {
         assert!(
-            (cli.max_budget - expected).abs() < f64::EPSILON,
-            "max-budget {input}"
+            Cli::try_parse_from(args).is_err(),
+            "removed control flag should be rejected: {:?}",
+            args[1]
         );
     }
-    let cli = Cli::try_parse_from(["astra"]).unwrap();
-    assert!((cli.max_budget - 0.0).abs() < f64::EPSILON);
 }
 
 #[test]
@@ -456,6 +444,35 @@ fn cli_chat_subcommand() {
         }
         _ => panic!("expected Chat"),
     }
+    let cli = Cli::try_parse_from(["astra", "chat", "--message", "- task item"]).unwrap();
+    match &cli.command {
+        Some(Command::Chat(args)) => assert_eq!(args.message.as_deref(), Some("- task item")),
+        _ => panic!("expected Chat with a hyphen-leading message"),
+    }
+    let cli = Cli::try_parse_from([
+        "astra",
+        "chat",
+        "-m",
+        "hello",
+        "--max-wall-time-seconds",
+        "71",
+    ])
+    .unwrap();
+    match &cli.command {
+        Some(Command::Chat(args)) => assert_eq!(args.max_wall_time_seconds, Some(71)),
+        _ => panic!("expected Chat with wall deadline"),
+    }
+    assert!(
+        Cli::try_parse_from([
+            "astra",
+            "chat",
+            "-m",
+            "hello",
+            "--max-wall-time-seconds",
+            "70",
+        ])
+        .is_err()
+    );
     // Auto-approve
     let cli = Cli::try_parse_from(["astra", "chat", "-y"]).unwrap();
     match &cli.command {
@@ -482,7 +499,6 @@ fn cli_chat_subcommand() {
     for (input, expected) in [
         ("auto", "auto"),
         ("bypass", "bypass"),
-        ("skip", "bypass"),
         ("accept_edits", "accept_edits"),
         ("plan", "plan"),
     ] {
@@ -575,8 +591,6 @@ fn cli_session_capture_subcommand() {
 #[test]
 fn cli_rejects_invalid_input() {
     let cases: &[(&[&str], &str)] = &[
-        (&["--max-turns", "abc"], "non-numeric max-turns"),
-        (&["--max-budget", "abc"], "non-numeric max-budget"),
         (&["chat", "--explain", "laser"], "invalid explain mode"),
         (
             &["chat", "--permission-mode", "invalid", "-m", "test"],
@@ -588,11 +602,6 @@ fn cli_rejects_invalid_input() {
         argv.extend_from_slice(args);
         assert!(Cli::try_parse_from(argv).is_err(), "should reject: {desc}");
     }
-    // Negative budget: clap rejects it (treats "-1" as a flag)
-    assert!(
-        Cli::try_parse_from(["astra", "--max-budget", "-1.0"]).is_err(),
-        "should reject negative budget"
-    );
 }
 
 // ── Composite / integration ───────────────────────────────────────────
@@ -615,8 +624,6 @@ fn cli_all_top_level_flags_combined() {
         "-y",
         "--system-prompt",
         "Review code",
-        "--max-turns",
-        "3",
         "--output-format",
         "json",
         "--allowed-tools",
@@ -640,7 +647,6 @@ fn cli_all_top_level_flags_combined() {
     assert!(cli.print);
     assert!(cli.yes);
     assert_eq!(cli.system_prompt.as_deref(), Some("Review code"));
-    assert_eq!(cli.max_turns, Some(3));
     assert_eq!(cli.output_format, "json");
     assert_eq!(cli.allowed_tools, vec!["Read", "Edit"]);
     assert_eq!(cli.disallowed_tools, vec!["Bash"]);

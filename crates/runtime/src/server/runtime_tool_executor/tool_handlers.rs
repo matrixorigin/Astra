@@ -18,14 +18,18 @@ use crate::server::tool_agent_runtime::{execute_agent_fanout_tool, execute_agent
 use crate::server::tool_database_snapshots::{execute_mo_query, rollback_database_snapshots};
 use crate::server::tool_execution_result::tool_result_from_output;
 use crate::server::tool_file_runtime::{
-    execute_rollback_file_edits, execute_server_delete_file, execute_server_multi_edit,
-    execute_server_run_script, execute_server_str_replace, execute_server_write_file,
+    execute_publish_artifact, execute_rollback_file_edits, execute_server_delete_file,
+    execute_server_multi_edit, execute_server_run_script, execute_server_str_replace,
+    execute_server_write_file,
 };
 use crate::server::tool_introspect::{current_introspect_snapshot, render_introspect_snapshot};
 use crate::server::tool_local_execution::memory_args_with_context;
 use crate::server::tool_plan_gate::{execute_enter_plan_mode, execute_exit_plan_mode};
 use crate::server::tool_session_state_rollback::{
     self, RollbackSessionStateContext, SessionStateRestoreContext,
+};
+use crate::server::tool_work_lifecycle::{
+    execute_run_next_work_item, execute_settle_work_item, execute_start_work,
 };
 
 /// Register a tool handler and log an error on failure (duplicate name).
@@ -67,7 +71,21 @@ pub(super) fn runtime_tool_engine() -> ToolEngine<RuntimeToolExecutor> {
     register_handler_or_log!(engine, "tool_search", ToolSearchToolHandler);
     register_handler_or_log!(engine, "memory", MemoryToolHandler);
     register_handler_or_log!(engine, "session", SessionToolHandler);
-    register_handler_or_log!(engine, "task_board", TaskBoardToolHandler);
+    register_handler_or_log!(engine, "start_work", StartWorkToolHandler);
+    register_handler_or_log!(engine, "run_next_work_item", RunNextWorkItemToolHandler);
+    register_handler_or_log!(engine, "settle_work_item", SettleWorkItemToolHandler);
+    register_handler_or_log!(engine, "inspect_work_plan", InspectWorkPlanToolHandler);
+    register_handler_or_log!(engine, "propose_work_plan", ProposeWorkPlanToolHandler);
+    register_handler_or_log!(
+        engine,
+        "inspect_work_criteria",
+        InspectWorkCriteriaToolHandler
+    );
+    register_handler_or_log!(
+        engine,
+        "propose_work_criteria",
+        ProposeWorkCriteriaToolHandler
+    );
     register_handler_or_log!(engine, "agent", AgentToolHandler);
     register_handler_or_log!(engine, "agent_fanout", AgentFanoutToolHandler);
     register_handler_or_log!(engine, "ask_user", AskUserToolHandler);
@@ -87,6 +105,7 @@ pub(super) fn runtime_tool_engine() -> ToolEngine<RuntimeToolExecutor> {
         "rollback_database_snapshots",
         RollbackDatabaseSnapshotsToolHandler
     );
+    register_handler_or_log!(engine, "publish_artifact", PublishArtifactToolHandler);
     register_handler_or_log!(engine, "run_script", RunScriptToolHandler);
 
     if let Err(error) = engine.register_prefix_handler_with_validator(
@@ -102,6 +121,108 @@ pub(super) fn runtime_tool_engine() -> ToolEngine<RuntimeToolExecutor> {
     }
 
     engine
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct StartWorkToolHandler;
+
+#[async_trait]
+impl ToolHandler<RuntimeToolExecutor> for StartWorkToolHandler {
+    async fn execute(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        self.execute_invocation(
+            context,
+            args,
+            ToolInvocationMetadata::default(),
+            cancel_token,
+        )
+        .await
+    }
+
+    async fn execute_invocation(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        invocation: ToolInvocationMetadata<'_>,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            return astra_tools::cancelled_tool_result("start_work", false);
+        }
+        execute_start_work(context, args, invocation).await
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RunNextWorkItemToolHandler;
+
+#[async_trait]
+impl ToolHandler<RuntimeToolExecutor> for RunNextWorkItemToolHandler {
+    async fn execute(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        self.execute_invocation(
+            context,
+            args,
+            ToolInvocationMetadata::default(),
+            cancel_token,
+        )
+        .await
+    }
+
+    async fn execute_invocation(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        invocation: ToolInvocationMetadata<'_>,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            return astra_tools::cancelled_tool_result("run_next_work_item", false);
+        }
+        execute_run_next_work_item(context, args, invocation).await
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SettleWorkItemToolHandler;
+
+#[async_trait]
+impl ToolHandler<RuntimeToolExecutor> for SettleWorkItemToolHandler {
+    async fn execute(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        self.execute_invocation(
+            context,
+            args,
+            ToolInvocationMetadata::default(),
+            cancel_token,
+        )
+        .await
+    }
+
+    async fn execute_invocation(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        invocation: ToolInvocationMetadata<'_>,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            return astra_tools::cancelled_tool_result("settle_work_item", false);
+        }
+        execute_settle_work_item(context, args, invocation).await
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -161,9 +282,7 @@ impl MemoryToolHandler {
     ) -> astra_tools::ToolResult {
         // P2-C: Cooperative cancellation check at heavy handler entry
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::ToolResult::error(
-                "Memory tool not executed: run was cancelled".to_string(),
-            );
+            return astra_tools::cancelled_tool_result("memory", false);
         }
         let action = match astra_tools::memory_tool_contract::memory_action_from_args(args) {
             Ok(action) => action,
@@ -263,19 +382,32 @@ impl ToolHandler<RuntimeToolExecutor> for SessionToolHandler {
     ) -> astra_tools::ToolResult {
         // P2-C: Cooperative cancellation check at heavy handler entry
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::ToolResult::error(
-                "Session tool not executed: run was cancelled".to_string(),
-            );
+            return astra_tools::cancelled_tool_result("session", false);
         }
         crate::server::tool_session_runtime::execute_with_executor(context, args).await
     }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct TaskBoardToolHandler;
+struct InspectWorkPlanToolHandler;
 
 #[async_trait]
-impl ToolHandler<RuntimeToolExecutor> for TaskBoardToolHandler {
+impl ToolHandler<RuntimeToolExecutor> for InspectWorkPlanToolHandler {
+    async fn execute(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        crate::server::tool_work_plan::inspect(context, args, cancel_token).await
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ProposeWorkPlanToolHandler;
+
+#[async_trait]
+impl ToolHandler<RuntimeToolExecutor> for ProposeWorkPlanToolHandler {
     async fn execute(
         &self,
         context: &RuntimeToolExecutor,
@@ -298,14 +430,53 @@ impl ToolHandler<RuntimeToolExecutor> for TaskBoardToolHandler {
         invocation: ToolInvocationMetadata<'_>,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
-        // P2-C: Cooperative cancellation check at heavy handler entry
-        if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::ToolResult::error(
-                "Task tool not executed: run was cancelled".to_string(),
-            );
-        }
-        crate::server::tool_task_runtime::execute_with_executor(context, args, invocation.run_id)
-            .await
+        crate::server::tool_work_plan::propose(context, args, invocation, cancel_token).await
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct InspectWorkCriteriaToolHandler;
+
+#[async_trait]
+impl ToolHandler<RuntimeToolExecutor> for InspectWorkCriteriaToolHandler {
+    async fn execute(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        crate::server::tool_work_criteria::inspect(context, args, cancel_token).await
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ProposeWorkCriteriaToolHandler;
+
+#[async_trait]
+impl ToolHandler<RuntimeToolExecutor> for ProposeWorkCriteriaToolHandler {
+    async fn execute(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        self.execute_invocation(
+            context,
+            args,
+            ToolInvocationMetadata::default(),
+            cancel_token,
+        )
+        .await
+    }
+
+    async fn execute_invocation(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        invocation: ToolInvocationMetadata<'_>,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        crate::server::tool_work_criteria::propose(context, args, invocation, cancel_token).await
     }
 }
 
@@ -338,9 +509,7 @@ impl ToolHandler<RuntimeToolExecutor> for AgentToolHandler {
     ) -> astra_tools::ToolResult {
         // P2-C: Cooperative cancellation check at heavy handler entry
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::ToolResult::error(
-                "Agent tool not executed: run was cancelled".to_string(),
-            );
+            return astra_tools::cancelled_tool_result("agent", false);
         }
         execute_agent_tool(
             &context.default_executor,
@@ -381,9 +550,7 @@ impl ToolHandler<RuntimeToolExecutor> for AgentFanoutToolHandler {
     ) -> astra_tools::ToolResult {
         // P2-C: Cooperative cancellation check at heavy handler entry
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::ToolResult::error(
-                "Agent fanout not executed: run was cancelled".to_string(),
-            );
+            return astra_tools::cancelled_tool_result("agent_fanout", false);
         }
         execute_agent_fanout_tool(
             context.agent_tool_context.as_ref(),
@@ -407,9 +574,7 @@ impl ToolHandler<RuntimeToolExecutor> for AskUserToolHandler {
     ) -> astra_tools::ToolResult {
         // P2-C: 重型 handler 入口处合作式取消检查
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::ToolResult::error(
-                "Ask user not executed: run was cancelled".to_string(),
-            );
+            return astra_tools::cancelled_tool_result("ask_user", false);
         }
         context.server_ask_user(args).await
     }
@@ -428,9 +593,7 @@ impl ToolHandler<RuntimeToolExecutor> for EnterPlanModeToolHandler {
     ) -> astra_tools::ToolResult {
         // P2-C: Cooperative cancellation check at heavy handler entry
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::ToolResult::error(
-                "Enter plan mode not executed: run was cancelled".to_string(),
-            );
+            return astra_tools::cancelled_tool_result("enter_plan_mode", false);
         }
         astra_tools::ToolResult::text(
             execute_enter_plan_mode(
@@ -458,11 +621,25 @@ impl ToolHandler<RuntimeToolExecutor> for ExitPlanModeToolHandler {
         args: &Value,
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
+        self.execute_invocation(
+            context,
+            args,
+            ToolInvocationMetadata::default(),
+            cancel_token,
+        )
+        .await
+    }
+
+    async fn execute_invocation(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        invocation: ToolInvocationMetadata<'_>,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
         // P2-C: Cooperative cancellation check at heavy handler entry
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::ToolResult::error(
-                "Exit plan mode not executed: run was cancelled".to_string(),
-            );
+            return astra_tools::cancelled_tool_result("exit_plan_mode", false);
         }
         astra_tools::ToolResult::text(
             execute_exit_plan_mode(
@@ -472,6 +649,19 @@ impl ToolHandler<RuntimeToolExecutor> for ExitPlanModeToolHandler {
                 context.plan_mode_cache.as_ref(),
                 context.plan_resume_hint_handle.as_ref(),
                 context.plan_authoring_active_handle.as_ref(),
+                context.approval_gate.as_deref(),
+                &invocation
+                    .tool_call_id
+                    .map(|tool_call_id| {
+                        format!("plan-review:{}:{tool_call_id}", context.session_id)
+                    })
+                    .unwrap_or_else(|| {
+                        format!(
+                            "plan-review:{}:{}",
+                            context.session_id,
+                            uuid::Uuid::new_v4()
+                        )
+                    }),
                 args,
             )
             .await,
@@ -595,9 +785,7 @@ impl ToolHandler<RuntimeToolExecutor> for ReflectToolHandler {
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::ToolResult::error(
-                "Reflect tool not executed: run was cancelled".to_string(),
-            );
+            return astra_tools::cancelled_tool_result("reflect", false);
         }
 
         let topic = string_arg(args, "topic");
@@ -729,10 +917,7 @@ impl ToolHandler<RuntimeToolExecutor> for DefaultExecutorToolHandler {
     ) -> astra_tools::ToolResult {
         // P2-C: Cooperative cancellation check at heavy handler entry
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::ToolResult::error(format!(
-                "Tool '{}' not executed: run was cancelled",
-                self.name
-            ));
+            return astra_tools::cancelled_tool_result(self.name, false);
         }
         context.default_executor.execute(self.name, args).await
     }
@@ -751,9 +936,10 @@ impl ToolHandler<RuntimeToolExecutor> for WriteFileToolHandler {
     ) -> astra_tools::ToolResult {
         // P2-C: 重型 handler 入口处合作式取消检查
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::ToolResult::error(
-                "Write file not executed: run was cancelled".to_string(),
-            );
+            return astra_tools::cancelled_tool_result("write_file", false);
+        }
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            return astra_tools::cancelled_tool_result("write_file", false);
         }
         let turn_index = context.journal_turn_index.load(Ordering::Relaxed);
         if args
@@ -761,19 +947,19 @@ impl ToolHandler<RuntimeToolExecutor> for WriteFileToolHandler {
             .and_then(|value| value.as_bool())
             .unwrap_or(false)
         {
-            tool_result_from_output(execute_server_delete_file(
+            execute_server_delete_file(
                 &context.workspace_root,
                 args,
                 turn_index,
                 context.file_journal.as_ref(),
-            ))
+            )
         } else {
-            tool_result_from_output(execute_server_write_file(
+            execute_server_write_file(
                 &context.workspace_root,
                 args,
                 turn_index,
                 context.file_journal.as_ref(),
-            ))
+            )
         }
     }
 }
@@ -791,9 +977,10 @@ impl ToolHandler<RuntimeToolExecutor> for StrReplaceToolHandler {
     ) -> astra_tools::ToolResult {
         // P2-C: 重型 handler 入口处合作式取消检查
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::ToolResult::error(
-                "Str replace not executed: run was cancelled".to_string(),
-            );
+            return astra_tools::cancelled_tool_result("str_replace", false);
+        }
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            return astra_tools::cancelled_tool_result("str_replace", false);
         }
         let args = match astra_tools::fs_ops::normalize_str_replace_args(args) {
             Ok(args) => args,
@@ -805,19 +992,19 @@ impl ToolHandler<RuntimeToolExecutor> for StrReplaceToolHandler {
             .and_then(|value| value.as_array())
             .is_some()
         {
-            tool_result_from_output(execute_server_multi_edit(
+            execute_server_multi_edit(
                 &context.workspace_root,
                 &args,
                 turn_index,
                 context.file_journal.as_ref(),
-            ))
+            )
         } else {
-            tool_result_from_output(execute_server_str_replace(
+            execute_server_str_replace(
                 &context.workspace_root,
                 &args,
                 turn_index,
                 context.file_journal.as_ref(),
-            ))
+            )
         }
     }
 }
@@ -834,8 +1021,56 @@ impl ToolHandler<RuntimeToolExecutor> for RollbackFileEditsToolHandler {
         cancel_token: Option<&CancellationToken>,
     ) -> astra_tools::ToolResult {
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::ToolResult::error(
-                "File rollback not executed: run was cancelled".to_string(),
+            return astra_tools::cancelled_tool_result("rollback_file_edits", false);
+        }
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            return astra_tools::cancelled_tool_result("rollback_file_edits", false);
+        }
+        if args.get("scope").and_then(Value::as_str) == Some("source_receipt") {
+            let receipt_id = match args.get("receipt_id").and_then(Value::as_str) {
+                Some(receipt_id) if !receipt_id.trim().is_empty() => receipt_id,
+                _ => {
+                    return tool_result_from_output(
+                        serde_json::json!({
+                            "success": false,
+                            "scope": "source_receipt",
+                            "error": "missing 'receipt_id' for scope=source_receipt",
+                        })
+                        .to_string(),
+                    );
+                }
+            };
+            let Some(owner_scope) = context.server_source_preimage_owner_scope() else {
+                return tool_result_from_output(
+                    serde_json::json!({
+                        "success": false,
+                        "scope": "source_receipt",
+                        "error": "source receipt restore requires an active owner/session",
+                    })
+                    .to_string(),
+                );
+            };
+            return tool_result_from_output(
+                match astra_tools::source_preimage::restore_receipt(
+                    &context.workspace_root,
+                    &owner_scope,
+                    receipt_id,
+                ) {
+                    Ok(()) => serde_json::json!({
+                        "success": true,
+                        "scope": "source_receipt",
+                        "receipt_id": receipt_id,
+                        "summary": "Restored the retained source preimage.",
+                    })
+                    .to_string(),
+                    Err(error) => serde_json::json!({
+                        "success": false,
+                        "scope": "source_receipt",
+                        "receipt_id": receipt_id,
+                        "error": error,
+                    })
+                    .to_string(),
+                },
             );
         }
         tool_result_from_output(execute_rollback_file_edits(
@@ -860,11 +1095,28 @@ impl ToolHandler<RuntimeToolExecutor> for BashToolHandler {
     ) -> astra_tools::ToolResult {
         // P2-C: Cooperative cancellation check at heavy handler entry
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::ToolResult::error(
-                "Bash tool not executed: run was cancelled".to_string(),
-            );
+            return astra_tools::cancelled_tool_result("bash", false);
         }
-        context.server_bash(args).await
+        context
+            .server_bash(
+                args,
+                astra_tools::tool_engine::ToolInvocationMetadata::default(),
+                cancel_token,
+            )
+            .await
+    }
+
+    async fn execute_invocation(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        if cancel_token.is_some_and(|t| t.is_cancelled()) {
+            return astra_tools::cancelled_tool_result("bash", false);
+        }
+        context.server_bash(args, invocation, cancel_token).await
     }
 }
 
@@ -896,9 +1148,7 @@ impl ToolHandler<RuntimeToolExecutor> for RollbackSessionStateToolHandler {
     ) -> astra_tools::ToolResult {
         // P2-C: Cooperative cancellation check at heavy handler entry
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::ToolResult::error(
-                "Rollback session state not executed: run was cancelled".to_string(),
-            );
+            return astra_tools::cancelled_tool_result("rollback_session_state", false);
         }
         tool_result_from_output(
             tool_session_state_rollback::execute_rollback_session_state(
@@ -909,7 +1159,6 @@ impl ToolHandler<RuntimeToolExecutor> for RollbackSessionStateToolHandler {
                         user_id: &context.user_id,
                         session_id: &context.session_id,
                         observability_session: context.observability_session.as_ref(),
-                        task_manager: &context.task_manager(),
                     },
                 },
                 args,
@@ -936,9 +1185,7 @@ impl ToolHandler<RuntimeToolExecutor> for MoQueryToolHandler {
     ) -> astra_tools::ToolResult {
         // P2-C: Cooperative cancellation check at heavy handler entry
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::ToolResult::error(
-                "Mo query not executed: run was cancelled".to_string(),
-            );
+            return astra_tools::cancelled_tool_result("mo_query", false);
         }
         execute_mo_query(
             context.database_snapshot_journal.as_ref(),
@@ -968,6 +1215,33 @@ impl ToolHandler<RuntimeToolExecutor> for RollbackDatabaseSnapshotsToolHandler {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
+struct PublishArtifactToolHandler;
+
+#[async_trait]
+impl ToolHandler<RuntimeToolExecutor> for PublishArtifactToolHandler {
+    async fn execute(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        // P2-C: 重型 handler 入口处合作式取消检查
+        if cancel_token.is_some_and(|t| t.is_cancelled()) {
+            return astra_tools::cancelled_tool_result("publish_artifact", false);
+        }
+        execute_publish_artifact(
+            args,
+            context.session_artifact_store.as_deref(),
+            &context.workspace_root,
+            &context.session_id,
+            &context.user_id,
+            context.journal_turn_index.load(Ordering::Relaxed),
+        )
+        .await
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
 struct RunScriptToolHandler;
 
 #[async_trait]
@@ -980,11 +1254,13 @@ impl ToolHandler<RuntimeToolExecutor> for RunScriptToolHandler {
     ) -> astra_tools::ToolResult {
         // P2-C: Cooperative cancellation check at heavy handler entry
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::ToolResult::error(
-                "Run script not executed: run was cancelled".to_string(),
-            );
+            return astra_tools::cancelled_tool_result("run_script", false);
         }
-        execute_server_run_script(args, context, &context.workspace_root).await
+        // The unified server owner boundary acquires and retains the
+        // top-level writer guard through receipt projection. Authenticated
+        // nested callbacks reuse that authority; recursive run_script is
+        // rejected before this handler is reached.
+        execute_server_run_script(args, context, &context.workspace_root, cancel_token).await
     }
 }
 
@@ -1002,10 +1278,7 @@ impl DynamicToolHandler<RuntimeToolExecutor> for McpToolHandler {
     ) -> astra_tools::ToolResult {
         // P2-C: 重型 handler 入口处合作式取消检查
         if cancel_token.is_some_and(|t| t.is_cancelled()) {
-            return astra_tools::ToolResult::error(format!(
-                "MCP tool '{}' not executed: run was cancelled",
-                name
-            ));
+            return astra_tools::cancelled_tool_result(name, false);
         }
         context.execute_mcp_tool(name, args, None, None).await
     }
@@ -1033,7 +1306,6 @@ mod tests {
             "str_replace",
             "bash",
             "run_script",
-            "task_board",
             "session",
             "memory",
             "rollback_file_edits",

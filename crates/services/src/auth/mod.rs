@@ -680,6 +680,11 @@ pub struct AuthTokenRecord {
 pub struct DatabaseAuthService {
     matrixone: MatrixOneSettings,
     pool: Option<SharedPool>,
+    /// Optional control-plane pool reserved for authentication. Keeping
+    /// authentication off the long-running work pool prevents a burst of
+    /// agent/session persistence from starving login, registration, refresh,
+    /// and logout for every user.
+    control_pool: Option<SharedPool>,
     jwt: JwtSettings,
     encryptor: Option<FernetTokenEncryptor>,
     ext_providers: Vec<ExternalAuthProviderConfig>,
@@ -713,6 +718,7 @@ impl fmt::Debug for DatabaseAuthService {
         f.debug_struct("DatabaseAuthService")
             .field("matrixone", &self.matrixone)
             .field("pool_configured", &self.pool.is_some())
+            .field("control_pool_configured", &self.control_pool.is_some())
             .field("jwt", &self.jwt)
             .field("encryptor_configured", &self.encryptor.is_some())
             .field(
@@ -754,6 +760,7 @@ impl DatabaseAuthService {
             matrixone,
             jwt,
             pool: None,
+            control_pool: None,
             encryptor: None,
             ext_providers: Vec::new(),
             external_client: HttpExternalProviderClient::shared(),
@@ -923,6 +930,14 @@ impl DatabaseAuthService {
         self
     }
 
+    /// Route authentication queries through a bounded control-plane pool.
+    /// The regular pool remains the fallback for tests and deployments that
+    /// do not configure a separate reservation.
+    pub fn with_control_pool(mut self, pool: SharedPool) -> Self {
+        self.control_pool = Some(pool);
+        self
+    }
+
     pub fn with_encryptor(mut self, encryptor: FernetTokenEncryptor) -> Self {
         self.encryptor = Some(encryptor);
         self
@@ -1071,7 +1086,11 @@ impl DatabaseAuthService {
     }
 
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
-        crate::require_shared_pool(self.pool.as_ref(), "DatabaseAuthService", &self.matrixone)
+        crate::require_shared_pool(
+            self.control_pool.as_ref().or(self.pool.as_ref()),
+            "DatabaseAuthService",
+            &self.matrixone,
+        )
     }
 
     fn provider_config(
@@ -1095,7 +1114,7 @@ impl DatabaseAuthService {
         authorized: &ProviderAuthorizedRequest,
         request_id: &str,
     ) -> Result<(), AuthHttpError> {
-        if let Some(pool) = self.pool.as_ref() {
+        if let Some(pool) = self.control_pool.as_ref().or(self.pool.as_ref()) {
             return self
                 .record_provider_request_authorization_durable(pool, authorized, request_id)
                 .await;

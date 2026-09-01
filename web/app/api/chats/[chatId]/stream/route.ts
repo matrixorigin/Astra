@@ -180,6 +180,8 @@ function proxyRunStream(params: {
     assistantMessage: unknown;
   };
 }) {
+  const interactionProtocolHeader = "x-astra-agent-interaction-api-major";
+  const expectedInteractionProtocol = "1";
   const {
     backendResponse,
     backendAbortController,
@@ -294,6 +296,29 @@ function proxyRunStream(params: {
           );
           setChatActiveRun(ownerUserId, chatId, undefined);
           enqueueFrame({ type: "error", message: detail });
+          closeController();
+          return;
+        }
+        const actualInteractionProtocol = resolvedBackendResponse.headers.get(
+          interactionProtocolHeader,
+        );
+        if (actualInteractionProtocol !== expectedInteractionProtocol) {
+          backendAbortController.abort();
+          const message = actualInteractionProtocol
+            ? `Astra Server interaction protocol ${actualInteractionProtocol} is incompatible with Web ${expectedInteractionProtocol}. Restart or upgrade the Server.`
+            : "Astra Server is missing the interaction protocol contract. Restart or upgrade the Server before starting another turn.";
+          updateStreamingAssistantMessage(
+            ownerUserId,
+            chatId,
+            assistantMessageId,
+            { content: message, status: "failed" },
+          );
+          setChatActiveRun(ownerUserId, chatId, undefined);
+          enqueueFrame({
+            type: "error",
+            code: "RUNTIME_PROTOCOL_MISMATCH",
+            message,
+          });
           closeController();
           return;
         }

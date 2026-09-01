@@ -18,7 +18,6 @@ pub mod slash_skill;
 pub mod slash_state;
 pub mod slash_stats;
 pub mod slash_sync;
-pub mod slash_task;
 pub mod slash_team;
 pub mod slash_telemetry;
 pub mod slash_tools;

@@ -14,6 +14,7 @@ astra-services.workspace = true
 astra-text-utils.workspace = true
 astra-turn-types.workspace = true
 async-trait.workspace = true
+fs2.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 regex.workspace = true

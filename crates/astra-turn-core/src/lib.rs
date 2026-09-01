@@ -99,6 +99,7 @@ pub mod thinking_config;
 pub mod token_accounting;
 pub mod tool;
 pub mod tool_allowlist;
+pub mod tool_ledger_receipt;
 pub mod trace_alert;
 pub mod turn_event_sink;
 pub mod turn_metrics;
@@ -121,7 +122,6 @@ pub mod result_quality {
 pub mod complete;
 pub mod hydrate_reflect;
 pub mod loop_circuit_breaker;
-pub mod persist;
 pub mod retrieval;
 pub mod trace_event;
 pub mod turn_trace_collector;

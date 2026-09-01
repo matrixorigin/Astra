@@ -186,7 +186,7 @@ pub(super) async fn completions_handler(
             provider_timeout,
         )
         .await;
-    let parsed = match parsed {
+    let parsed = match parsed.into_result() {
         Ok(parsed) => parsed,
         Err(error) if crate::turn::llm::durable::is_ledger_error(&error) => {
             return Err(inference_ledger_http_error(error));

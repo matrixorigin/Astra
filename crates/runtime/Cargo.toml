@@ -5,7 +5,7 @@ edition.workspace = true
 
 [features]
 default = ["harness"]
-# Full `/chat/turn` ledger inject tests (see `tests/chat_turn_bridge_ledger_inject_e2e.rs`).
+# Enables deterministic edge-callback controls for system-matrix journeys.
 bridge-e2e-hooks = []
 # Enables OTLP trace export via `astra-logging` (build with `--features otel`).
 otel = ["astra-logging/otel"]
@@ -13,16 +13,6 @@ otel = ["astra-logging/otel"]
 harness = ["dep:astra-harness"]
 # Crash recovery with skill checkpointing (Phase 3).
 crash-recovery = ["astra-skills/crash-recovery"]
-
-[[test]]
-name = "chat_turn_bridge_ledger_inject_e2e"
-path = "tests/chat_turn_bridge_ledger_inject_e2e.rs"
-required-features = ["bridge-e2e-hooks"]
-
-[[test]]
-name = "edge_cloud_round_trip_e2e"
-path = "tests/edge_cloud_round_trip_e2e.rs"
-required-features = ["bridge-e2e-hooks"]
 
 [[test]]
 name = "system_matrix_http_e2e"

@@ -1,9 +1,11 @@
 import { cn } from '@/lib/utils/cn';
 
-type TuiEntityMarkKind = 'chat' | 'project' | 'search' | 'harness' | 'new';
+type TuiEntityMarkKind = 'chat' | 'now' | 'work' | 'project' | 'search' | 'harness' | 'new';
 
 const MARKS: Record<TuiEntityMarkKind, string> = {
   chat: 'C',
+  now: 'N',
+  work: 'W',
   project: 'P',
   search: 'S',
   harness: 'H',

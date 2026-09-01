@@ -398,6 +398,18 @@ pub trait SessionArtifactJsonStore: Send + Sync {
         record: SessionArtifactJsonRecord,
     ) -> Result<StoredSessionArtifact, SessionArtifactStoreError>;
 
+    /// Atomically merges a composite-snapshot index projection with the
+    /// currently stored value. Implementations backed by shared storage must
+    /// serialize the read/merge/write operation; replacing the whole
+    /// projection from a stale reader can otherwise discard snapshots written
+    /// by another executor.
+    async fn merge_composite_snapshot_index_projection(
+        &self,
+        record: SessionArtifactJsonRecord,
+    ) -> Result<StoredSessionArtifact, SessionArtifactStoreError> {
+        self.upsert_json_artifact_projection(record).await
+    }
+
     async fn load_json_artifact(
         &self,
         user_id: &str,
@@ -1008,6 +1020,162 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         .bind(record.source.as_deref())
         .bind(turn)
         .bind(round)
+        .bind(content_json)
+        .bind(metadata_json)
+        .bind(&record.user_id)
+        .bind(&record.session_id)
+        .bind(&record.artifact_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        self.load_json_artifact(&record.user_id, &record.session_id, &record.artifact_id)
+            .await?
+            .ok_or(SessionArtifactStoreError::ArtifactNotFound {
+                artifact_id: record.artifact_id,
+                session_id: record.session_id,
+                user_id: record.user_id,
+            })
+    }
+
+    async fn merge_composite_snapshot_index_projection(
+        &self,
+        mut record: SessionArtifactJsonRecord,
+    ) -> Result<StoredSessionArtifact, SessionArtifactStoreError> {
+        validate_session_id(&record.session_id)?;
+        if !is_valid_mutable_artifact_projection_id(&record.artifact_id) {
+            return Err(SessionArtifactStoreError::InvalidMutableProjectionId {
+                prefix: MUTABLE_ARTIFACT_PROJECTION_ID_PREFIX,
+                artifact_id: record.artifact_id,
+            });
+        }
+        if !record.references.is_empty() {
+            return Err(SessionArtifactStoreError::MutableProjectionReferencesUnsupported);
+        }
+
+        let incoming: astra_core::composite_snapshot::CompositeSnapshotIndex =
+            serde_json::from_value(record.content.clone())?;
+        if incoming
+            .snapshots
+            .iter()
+            .any(|snapshot| snapshot.session_id != record.session_id)
+        {
+            return Err(SessionArtifactStoreError::InvalidDatabaseValue {
+                artifact_id: record.artifact_id,
+                column: "content_json",
+                value: "session_id mismatch".to_string(),
+                reason: "composite snapshot belongs to a different session",
+            });
+        }
+
+        let pool = self.get_pool().await?;
+        self.require_owned_session(&pool, &record.user_id, &record.session_id)
+            .await?;
+        let initial_content = serde_json::to_string(&record.content)?;
+        let initial_metadata = record.metadata.as_ref().map(Value::to_string);
+        let initial_turn = encode_counter(record.turn, SessionArtifactStoreError::TurnOverflow)?;
+        let initial_round = encode_counter(record.round, SessionArtifactStoreError::RoundOverflow)?;
+        let mut tx = pool.begin().await?;
+
+        // Claim the stable identity before locking it. Concurrent first
+        // writers serialize on the unique key; subsequent writers serialize
+        // on the row lock below.
+        query(
+            "INSERT INTO session_artifacts \
+             (artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
+              content_json, metadata, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6)) \
+             ON DUPLICATE KEY UPDATE updated_at = updated_at",
+        )
+        .bind(&record.artifact_id)
+        .bind(&record.session_id)
+        .bind(&record.user_id)
+        .bind(&record.artifact_kind)
+        .bind(record.source.as_deref())
+        .bind(initial_turn)
+        .bind(initial_round)
+        .bind(&initial_content)
+        .bind(&initial_metadata)
+        .execute(&mut *tx)
+        .await?;
+
+        let existing = query(
+            "SELECT artifact_kind, content_json, referenced_by_manifest_count, \
+                    referenced_by_state_items_count, referenced_by_citation_count \
+             FROM session_artifacts \
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ? FOR UPDATE",
+        )
+        .bind(&record.user_id)
+        .bind(&record.session_id)
+        .bind(&record.artifact_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let existing_kind = existing.string_column("artifact_kind")?;
+        if existing_kind != record.artifact_kind {
+            return Err(
+                SessionArtifactStoreError::MutableProjectionIdentityConflict {
+                    artifact_id: record.artifact_id,
+                    existing_kind,
+                    requested_kind: record.artifact_kind,
+                },
+            );
+        }
+        let counter_references = [
+            "referenced_by_manifest_count",
+            "referenced_by_state_items_count",
+            "referenced_by_citation_count",
+        ]
+        .into_iter()
+        .try_fold(0_i64, |total, column| {
+            existing.i64_column(column).map(|value| total + value)
+        })?;
+        let durable_references: i64 = query_scalar(
+            "SELECT COUNT(*) FROM session_artifact_references \
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        )
+        .bind(&record.user_id)
+        .bind(&record.session_id)
+        .bind(&record.artifact_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if counter_references != 0 || durable_references != 0 {
+            return Err(SessionArtifactStoreError::MutableProjectionReferencesUnsupported);
+        }
+
+        let existing_index: astra_core::composite_snapshot::CompositeSnapshotIndex =
+            serde_json::from_str(&existing.string_column("content_json")?)?;
+        if existing_index
+            .snapshots
+            .iter()
+            .any(|snapshot| snapshot.session_id != record.session_id)
+        {
+            return Err(SessionArtifactStoreError::InvalidDatabaseValue {
+                artifact_id: record.artifact_id,
+                column: "content_json",
+                value: "session_id mismatch".to_string(),
+                reason: "stored composite snapshot belongs to a different session",
+            });
+        }
+        let merged = existing_index.merge_by_identity(incoming);
+        record.turn = merged.snapshots.last().map(|snapshot| snapshot.turn);
+        record.content = serde_json::to_value(&merged)?;
+        record.metadata = Some(serde_json::json!({
+            "snapshot_count": merged.snapshots.len(),
+            "latest_version": merged.current_version(),
+        }));
+        let content_json = serde_json::to_string(&record.content)?;
+        let metadata_json = record.metadata.as_ref().map(Value::to_string);
+        let turn = encode_counter(record.turn, SessionArtifactStoreError::TurnOverflow)?;
+
+        query(
+            "UPDATE session_artifacts \
+             SET source = ?, turn = ?, round = ?, content_json = ?, metadata = ?, \
+                 status = 'active', updated_at = CURRENT_TIMESTAMP(6) \
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        )
+        .bind(record.source.as_deref())
+        .bind(turn)
+        .bind(initial_round)
         .bind(content_json)
         .bind(metadata_json)
         .bind(&record.user_id)

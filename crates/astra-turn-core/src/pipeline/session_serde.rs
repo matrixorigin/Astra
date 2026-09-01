@@ -169,6 +169,7 @@ mod tests {
                 pending_prompt_snapshot: None,
                 session_current_date: Some("2026-05-25".to_string()),
                 turns_completed: 0,
+                latest_runtime_feedback: None,
             },
             "1999-12-31",
         );
@@ -292,6 +293,7 @@ mod tests {
                 pending_prompt_snapshot: None,
                 session_current_date: Some("2026-05-25".to_string()),
                 turns_completed: 0,
+                latest_runtime_feedback: None,
             },
             "1999-12-31",
         );

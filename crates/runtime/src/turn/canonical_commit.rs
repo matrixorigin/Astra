@@ -61,6 +61,19 @@ impl CanonicalRewriteProof {
             ) == self.authorized_prefix_root
     }
 
+    fn authorizes_scratch_normalization(
+        &self,
+        prior_messages: &[Value],
+        messages: &[Value],
+    ) -> bool {
+        self.valid
+            && !self.rewritten
+            && prior_messages.len() == self.authorized_prefix_len
+            && astra_turn_types::canonical_conversation_root(prior_messages)
+                == self.authorized_prefix_root
+            && messages.starts_with(prior_messages)
+    }
+
     pub(crate) fn replacement_generation(&self) -> Option<u64> {
         self.valid
             .then(|| self.base_compaction_generation.saturating_add(1))
@@ -76,15 +89,20 @@ pub(crate) fn canonical_commit_delta(
     had_canonical_head: bool,
     messages: &[Value],
     rewrite_proof: Option<&CanonicalRewriteProof>,
-    cancellation_requested: bool,
+    preserve_execution_scratch: bool,
 ) -> Result<Option<(astra_turn_types::CanonicalDeltaModeV1, Vec<Vec<Value>>)>, String> {
     let prefix_preserved = messages.starts_with(prior_messages);
     let rewrite_authorized =
         had_canonical_head && rewrite_proof.is_some_and(|proof| proof.authorizes(messages));
-    let mode = if prefix_preserved {
-        astra_turn_types::CanonicalDeltaModeV1::Append
-    } else if rewrite_authorized {
+    let scratch_normalization_authorized = had_canonical_head
+        && !preserve_execution_scratch
+        && contains_execution_scratch(prior_messages)
+        && rewrite_proof
+            .is_some_and(|proof| proof.authorizes_scratch_normalization(prior_messages, messages));
+    let mode = if rewrite_authorized || scratch_normalization_authorized {
         astra_turn_types::CanonicalDeltaModeV1::Replace
+    } else if prefix_preserved {
+        astra_turn_types::CanonicalDeltaModeV1::Append
     } else {
         return Err("canonical conversation mutated the admitted prefix without a verified compaction rewrite".into());
     };
@@ -93,22 +111,38 @@ pub(crate) fn canonical_commit_delta(
     } else {
         &messages[prior_messages.len()..]
     };
-    let canonical_changed =
+    let canonical_changed = if preserve_execution_scratch {
+        // An interrupted turn may resume from its tool boundary, so retain
+        // complete call/result groups until recovery has settled it.
         astra_turn_core::prompt_facing::sanitize_canonical_continuation_messages_with_turn_semantics(
             changed_messages.to_vec(),
         )
-        .map_err(|error| {
-            format!("canonical turn contains invalid user-turn semantics: {error}")
-        })?;
+    } else {
+        // Tool frames are execution scratch, not cross-turn conversation.
+        // Durable typed state and the final assistant response carry the
+        // completed turn's semantics without replaying every intermediate
+        // payload into all future model requests.
+        astra_turn_core::prompt_facing::sanitize_completed_canonical_turn_messages_with_turn_semantics(
+            changed_messages.to_vec(),
+        )
+    }
+    .map_err(|error| format!("canonical turn contains invalid user-turn semantics: {error}"))?;
     let logical_segments = pack_canonical_turn_segments(canonical_changed);
     if logical_segments.is_empty() {
-        return if cancellation_requested {
+        return if preserve_execution_scratch {
             Ok(None)
         } else {
             Err("canonical turn produced no committable messages".into())
         };
     }
     Ok(Some((mode, logical_segments)))
+}
+
+fn contains_execution_scratch(messages: &[Value]) -> bool {
+    messages.iter().any(|message| {
+        message.get("role").and_then(Value::as_str) == Some("tool")
+            || opens_structured_tool_group(message)
+    })
 }
 
 pub(crate) fn pack_canonical_turn_segments(mut messages: Vec<Value>) -> Vec<Vec<Value>> {

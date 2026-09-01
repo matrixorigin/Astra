@@ -14,7 +14,10 @@
 
 use std::collections::{HashMap, VecDeque};
 
-/// A verification command to run before the loop is allowed to complete.
+/// A verification command surfaced at the completion boundary.
+///
+/// Only [`StopHook::authoritative`] hooks form a terminal contract; discovery
+/// hooks are advisory guidance and never block completion on their own.
 #[derive(Debug, Clone)]
 pub struct StopHook {
     /// Human-readable label (e.g. "type-check", "lint").
@@ -30,6 +33,12 @@ pub struct StopHook {
     /// Cache key for skipping re-runs. If present and the cache contains a
     /// passing result for this key, the hook is omitted from the prompt.
     pub cache_key: Option<String>,
+    /// Whether this hook is an explicit completion contract.
+    ///
+    /// Declarative hooks supplied by the caller/project are authoritative and
+    /// may be checked at terminal settlement. Auto-detected guidance remains
+    /// advisory because it is necessarily a best-effort guess about scope.
+    pub authoritative: bool,
 }
 
 /// Cached result from a previous stop-hook execution.
@@ -253,6 +262,7 @@ mod tests {
             depends_on: Vec::new(),
             timeout_secs: None,
             cache_key: None,
+            authoritative: false,
         }
     }
 
@@ -270,6 +280,7 @@ mod tests {
             depends_on: Vec::new(),
             timeout_secs: None,
             cache_key: None,
+            authoritative: false,
         }];
         let msg = build_stop_hook_prompt(&hooks).unwrap();
         let content = msg["content"].as_str().unwrap();
@@ -325,6 +336,7 @@ mod tests {
                 depends_on: vec!["build".into()],
                 timeout_secs: None,
                 cache_key: None,
+                authoritative: false,
             },
             StopHook {
                 label: "lint".into(),
@@ -333,6 +345,7 @@ mod tests {
                 depends_on: vec!["test".into()],
                 timeout_secs: None,
                 cache_key: None,
+                authoritative: false,
             },
         ];
         let layers = build_execution_layers(&hooks).unwrap();
@@ -354,6 +367,7 @@ mod tests {
                 depends_on: vec!["build".into()],
                 timeout_secs: None,
                 cache_key: None,
+                authoritative: false,
             },
             StopHook {
                 label: "lint".into(),
@@ -362,6 +376,7 @@ mod tests {
                 depends_on: vec!["build".into()],
                 timeout_secs: None,
                 cache_key: None,
+                authoritative: false,
             },
             StopHook {
                 label: "deploy".into(),
@@ -370,6 +385,7 @@ mod tests {
                 depends_on: vec!["test".into(), "lint".into()],
                 timeout_secs: None,
                 cache_key: None,
+                authoritative: false,
             },
         ];
         let layers = build_execution_layers(&hooks).unwrap();
@@ -389,6 +405,7 @@ mod tests {
                 depends_on: vec!["b".into()],
                 timeout_secs: None,
                 cache_key: None,
+                authoritative: false,
             },
             StopHook {
                 label: "b".into(),
@@ -397,6 +414,7 @@ mod tests {
                 depends_on: vec!["a".into()],
                 timeout_secs: None,
                 cache_key: None,
+                authoritative: false,
             },
         ];
         assert!(build_execution_layers(&hooks).is_none());
@@ -429,6 +447,7 @@ mod tests {
                 depends_on: Vec::new(),
                 timeout_secs: None,
                 cache_key: Some("lint-key".into()),
+                authoritative: false,
             },
             simple_hook("test", "make test"),
         ];
@@ -448,6 +467,7 @@ mod tests {
                 depends_on: vec!["build".into()],
                 timeout_secs: Some(60),
                 cache_key: None,
+                authoritative: false,
             },
         ];
         let msg = build_stop_hook_prompt(&hooks).unwrap();

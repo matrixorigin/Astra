@@ -1,4 +1,4 @@
-use crate::tool::args::shape::tool_call_name;
+use crate::tool::args::shape::{parse_tool_call_arguments, tool_call_name};
 
 // ── Fallback messages when guards fire ──────────────────────────────
 /// Replacement text when the LLM leaks the system prompt.
@@ -210,25 +210,11 @@ pub fn find_hallucinated_tools(
 pub fn find_malformed_args(tool_calls: &[serde_json::Value]) -> Vec<String> {
     let mut malformed = Vec::new();
     for tc in tool_calls {
-        let name = tc
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?")
-            .to_string();
-        if let Some(args) = tc.get("arguments") {
-            // Arguments can be a JSON string (needs parsing) or already an object
-            match args {
-                serde_json::Value::String(s) => {
-                    if !s.is_empty() && serde_json::from_str::<serde_json::Value>(s).is_err() {
-                        malformed.push(name);
-                    }
-                }
-                serde_json::Value::Object(_) => {} // already valid
-                serde_json::Value::Null => {}      // no args, fine
-                _ => {
-                    malformed.push(name); // unexpected type
-                }
-            }
+        let Some(name) = tool_call_name(tc) else {
+            continue;
+        };
+        if parse_tool_call_arguments(tc).is_err() {
+            malformed.push(name.to_string());
         }
     }
     malformed
@@ -422,9 +408,9 @@ mod tests {
     #[test]
     fn hallucinated_tools_detected() {
         let calls = vec![
-            serde_json::json!({"name": "bash", "arguments": "{}"}),
-            serde_json::json!({"name": "imaginary_tool", "arguments": "{}"}),
-            serde_json::json!({"name": "execute_code", "arguments": "{}"}),
+            serde_json::json!({"id":"call-1","type":"function","function":{"name":"bash","arguments":"{}"}}),
+            serde_json::json!({"id":"call-2","type":"function","function":{"name":"imaginary_tool","arguments":"{}"}}),
+            serde_json::json!({"id":"call-3","type":"function","function":{"name":"execute_code","arguments":"{}"}}),
         ];
         let allowed = &["bash", "read_file", "grep"];
         let result = find_hallucinated_tools(&calls, allowed);
@@ -434,8 +420,8 @@ mod tests {
     #[test]
     fn no_hallucination_when_all_valid() {
         let calls = vec![
-            serde_json::json!({"name": "bash", "arguments": "{}"}),
-            serde_json::json!({"name": "grep", "arguments": "{}"}),
+            serde_json::json!({"id":"call-1","type":"function","function":{"name":"bash","arguments":"{}"}}),
+            serde_json::json!({"id":"call-2","type":"function","function":{"name":"grep","arguments":"{}"}}),
         ];
         let allowed = &["bash", "read_file", "grep"];
         assert!(find_hallucinated_tools(&calls, allowed).is_empty());
@@ -472,8 +458,8 @@ mod tests {
     #[test]
     fn malformed_args_detected() {
         let calls = vec![
-            serde_json::json!({"name": "bash", "arguments": "{invalid json"}),
-            serde_json::json!({"name": "grep", "arguments": "{\"pattern\": \"test\"}"}),
+            serde_json::json!({"id":"call-1","type":"function","function":{"name":"bash","arguments":"{invalid json"}}),
+            serde_json::json!({"id":"call-2","type":"function","function":{"name":"grep","arguments":"{\"pattern\": \"test\"}"}}),
         ];
         let result = find_malformed_args(&calls);
         assert_eq!(result, vec!["bash"]);
@@ -481,20 +467,26 @@ mod tests {
 
     #[test]
     fn malformed_args_object_is_valid() {
-        let calls = vec![serde_json::json!({"name": "bash", "arguments": {"command": "ls"}})];
+        let calls = vec![
+            serde_json::json!({"id":"call-1","type":"function","function":{"name":"bash","arguments":{"command":"ls"}}}),
+        ];
         assert!(find_malformed_args(&calls).is_empty());
     }
 
     #[test]
-    fn malformed_args_null_is_valid() {
-        let calls = vec![serde_json::json!({"name": "bash", "arguments": null})];
-        assert!(find_malformed_args(&calls).is_empty());
+    fn malformed_args_null_is_rejected() {
+        let calls = vec![
+            serde_json::json!({"id":"call-1","type":"function","function":{"name":"bash","arguments":null}}),
+        ];
+        assert_eq!(find_malformed_args(&calls), vec!["bash"]);
     }
 
     #[test]
-    fn malformed_args_empty_string_is_valid() {
-        let calls = vec![serde_json::json!({"name": "bash", "arguments": ""})];
-        assert!(find_malformed_args(&calls).is_empty());
+    fn malformed_args_empty_string_is_rejected() {
+        let calls = vec![
+            serde_json::json!({"id":"call-1","type":"function","function":{"name":"bash","arguments":""}}),
+        ];
+        assert_eq!(find_malformed_args(&calls), vec!["bash"]);
     }
 
     // ── Fabrication markers ─────────────────────────────────────
@@ -565,7 +557,9 @@ mod tests {
     #[test]
     fn echo_not_triggered_when_tools_present() {
         let query = "How does authentication work?";
-        let calls = vec![serde_json::json!({"name": "grep", "arguments": "{}"})];
+        let calls = vec![
+            serde_json::json!({"id":"call-1","type":"function","function":{"name":"grep","arguments":"{}"}}),
+        ];
         let report = check_response_quality(query, &calls, &["grep"], query);
         assert!(!report.is_echo, "tool calls mean it's not just an echo");
     }
@@ -576,7 +570,9 @@ mod tests {
     fn quality_report_clean() {
         let report = check_response_quality(
             "Here's what I found...",
-            &[serde_json::json!({"name": "bash", "arguments": "{}"})],
+            &[
+                serde_json::json!({"id":"call-1","type":"function","function":{"name":"bash","arguments":"{}"}}),
+            ],
             &["bash"],
             "list files",
         );
@@ -586,7 +582,9 @@ mod tests {
 
     #[test]
     fn quality_report_multiple_issues() {
-        let calls = vec![serde_json::json!({"name": "fake_tool", "arguments": "{bad json"})];
+        let calls = vec![
+            serde_json::json!({"id":"call-1","type":"function","function":{"name":"fake_tool","arguments":"{bad json"}}),
+        ];
         let report = check_response_quality(
             "Check path/to/your/file for details and edit it",
             &calls,
@@ -716,10 +714,10 @@ mod tests {
     #[test]
     fn hallucinated_tool_detected_among_valid_calls() {
         let tool_calls = vec![
-            serde_json::json!({"name": "read_file", "arguments": "{\"path\": \"src/main.rs\"}"}),
-            serde_json::json!({"name": "super_analyze_code", "arguments": "{}"}),
-            serde_json::json!({"name": "grep", "arguments": "{\"pattern\": \"TODO\"}"}),
-            serde_json::json!({"name": "quantum_refactor", "arguments": "{}"}),
+            serde_json::json!({"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{\"path\": \"src/main.rs\"}"}}),
+            serde_json::json!({"id":"call-2","type":"function","function":{"name":"super_analyze_code","arguments":"{}"}}),
+            serde_json::json!({"id":"call-3","type":"function","function":{"name":"grep","arguments":"{\"pattern\": \"TODO\"}"}}),
+            serde_json::json!({"id":"call-4","type":"function","function":{"name":"quantum_refactor","arguments":"{}"}}),
         ];
         let allowed = vec!["read_file", "grep", "write_file", "bash"];
         let hallucinated = find_hallucinated_tools(&tool_calls, &allowed);
@@ -735,8 +733,8 @@ mod tests {
     #[test]
     fn no_false_positive_on_valid_tools() {
         let tool_calls = vec![
-            serde_json::json!({"name": "read_file", "arguments": "{}"}),
-            serde_json::json!({"name": "bash", "arguments": "{}"}),
+            serde_json::json!({"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{}"}}),
+            serde_json::json!({"id":"call-2","type":"function","function":{"name":"bash","arguments":"{}"}}),
         ];
         let allowed = vec!["read_file", "bash", "grep"];
         assert!(
@@ -750,9 +748,9 @@ mod tests {
     #[test]
     fn malformed_args_detected_in_mixed_calls() {
         let tool_calls = vec![
-            serde_json::json!({"name": "read_file", "arguments": "{\"path\": \"ok.rs\"}"}),
-            serde_json::json!({"name": "bash", "arguments": "{broken json!!!"}),
-            serde_json::json!({"name": "grep", "arguments": serde_json::json!({"pattern": "x"})}),
+            serde_json::json!({"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{\"path\": \"ok.rs\"}"}}),
+            serde_json::json!({"id":"call-2","type":"function","function":{"name":"bash","arguments":"{broken json!!!"}}),
+            serde_json::json!({"id":"call-3","type":"function","function":{"name":"grep","arguments":{"pattern":"x"}}}),
         ];
         let malformed = find_malformed_args(&tool_calls);
         assert_eq!(malformed, vec!["bash"], "only the broken-JSON call flagged");
@@ -765,8 +763,8 @@ mod tests {
     #[test]
     fn xml_artifact_tool_name_handled_gracefully() {
         let tool_calls = vec![
-            serde_json::json!({"name": "", "arguments": "{}"}),
-            serde_json::json!({"name": "read_file", "arguments": "{}"}),
+            serde_json::json!({"id":"call-1","type":"function","function":{"name":"","arguments":"{}"}}),
+            serde_json::json!({"id":"call-2","type":"function","function":{"name":"read_file","arguments":"{}"}}),
         ];
         let allowed = vec!["read_file"];
         let hallucinated = find_hallucinated_tools(&tool_calls, &allowed);

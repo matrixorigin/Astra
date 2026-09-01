@@ -1142,16 +1142,16 @@ mod tests {
     }
 
     #[test]
-    fn git_action_blame_missing_file_param() {
+    fn git_action_blame_missing_path_param() {
         let root = repo_root();
         let result = blame(&root, &json!({}));
-        assert!(result.contains("Error: missing 'file'"));
+        assert!(result.contains("Error: missing 'path'"));
     }
 
     #[test]
     fn git_action_blame_known_file() {
         let root = repo_root();
-        let result = blame(&root, &json!({"file": "README.md"}));
+        let result = blame(&root, &json!({"path": "README.md"}));
         assert!(
             result.contains("L1") || result.contains("Error") || result.contains("No blame"),
             "unexpected blame: {result}"
@@ -1163,7 +1163,7 @@ mod tests {
         let root = repo_root();
         let result = blame(
             &root,
-            &json!({"file": "README.md", "line_start": 1, "line_end": 3}),
+            &json!({"path": "README.md", "start_line": 1, "end_line": 3}),
         );
         if result.contains("L1") {
             let blame_lines: Vec<&str> = result.lines().filter(|l| l.starts_with('L')).collect();
@@ -1454,7 +1454,7 @@ mod tests {
     #[test]
     fn git_action_blame_nonexistent_file() {
         let root = repo_root();
-        let result = blame(&root, &json!({"file": "nonexistent_file_xyz.rs"}));
+        let result = blame(&root, &json!({"path": "nonexistent_file_xyz.rs"}));
         assert!(
             result.contains("Error"),
             "should error on nonexistent file: {result}"
@@ -1464,7 +1464,7 @@ mod tests {
     #[test]
     fn git_action_blame_output_format() {
         let root = repo_root();
-        let result = blame(&root, &json!({"file": "README.md"}));
+        let result = blame(&root, &json!({"path": "README.md"}));
         if result.contains("L1") {
             // Should have structured format: L<n> <commit> <date> [<author>] <content>
             let first_line = result.lines().next().unwrap_or("");
@@ -1482,7 +1482,7 @@ mod tests {
     #[test]
     fn git_action_blame_summary_footer() {
         let root = repo_root();
-        let result = blame(&root, &json!({"file": "README.md"}));
+        let result = blame(&root, &json!({"path": "README.md"}));
         if !result.contains("Error") && !result.contains("No blame") {
             assert!(
                 result.contains("lines,")

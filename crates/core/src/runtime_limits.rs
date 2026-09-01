@@ -160,6 +160,27 @@ impl RuntimeLimits {
             (None, configured) => configured,
         }
     }
+
+    /// Resolve input capacity for an admitted registered model.
+    ///
+    /// Registered execution must carry its catalog context window. Falling
+    /// back to a process-wide token number would silently invent a different
+    /// physical model limit for child runs.
+    pub fn require_admitted_model_input_tokens(
+        &self,
+        model: Option<&str>,
+        context_window: Option<u32>,
+    ) -> Result<u64, String> {
+        let context_window = context_window.ok_or_else(|| {
+            "admitted model execution requires positive context_window metadata".to_string()
+        })?;
+        if context_window == 0 {
+            return Err(
+                "admitted model execution requires positive context_window metadata".to_string(),
+            );
+        }
+        Ok(self.effective_max_turn_input_tokens_with_context_window(model, Some(context_window)))
+    }
 }
 
 /// Configured context window size for a model.
@@ -348,6 +369,30 @@ mod tests {
                 Some(1_000_000)
             ),
             800_000
+        );
+    }
+
+    #[test]
+    fn admitted_model_input_tokens_require_catalog_context_and_honor_admin_cap() {
+        let limits = RuntimeLimits {
+            max_turn_input_tokens: 150_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            limits
+                .require_admitted_model_input_tokens(Some("custom-model"), Some(1_000_000))
+                .unwrap(),
+            150_000
+        );
+        assert!(
+            limits
+                .require_admitted_model_input_tokens(Some("custom-model"), None)
+                .is_err()
+        );
+        assert!(
+            limits
+                .require_admitted_model_input_tokens(Some("custom-model"), Some(0))
+                .is_err()
         );
     }
 }

@@ -131,6 +131,19 @@ impl ToolExecutionOutcome {
             is_error: true,
         }
     }
+
+    /// Mark a successful git operation whose owner has actually changed the
+    /// bound repository/worktree.  This is consumed by the executor to mint
+    /// the same typed mutation receipt as structured file writers.
+    pub fn with_workspace_mutation_applied(mut self) -> Self {
+        self.tool_result_fields
+            .get_or_insert_with(serde_json::Map::new)
+            .insert(
+                "workspace_mutation_applied".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1265,16 +1278,19 @@ pub fn blame(project_root: &Path, args: &Value) -> String {
         Err(e) => return e,
     };
 
-    let file = match args.get("file").and_then(Value::as_str) {
+    let file = match args.get("path").and_then(Value::as_str) {
         Some(f) => f,
-        None => return "Error: missing 'file' parameter".to_string(),
+        None => return "Error: missing 'path' parameter".to_string(),
     };
     if let Err(e) = reject_path_traversal(file, project_root) {
         return e;
     }
 
-    let line_start = args.get("line_start").and_then(Value::as_u64);
-    let line_end = args.get("line_end").and_then(Value::as_u64);
+    let line_start = args.get("start_line").and_then(Value::as_u64);
+    let line_end = args.get("end_line").and_then(Value::as_u64);
+    if line_start.is_none() && line_end.is_some() {
+        return "Error: 'end_line' requires 'start_line'".to_string();
+    }
 
     let head = match repo.head_id() {
         Ok(h) => h,
@@ -1285,9 +1301,13 @@ pub fn blame(project_root: &Path, args: &Value) -> String {
     let mut options = gix::repository::blame_file::Options::default();
     if let Some(start) = line_start {
         let end = line_end.unwrap_or(start);
-        match gix::blame::BlameRanges::from_one_based_inclusive_ranges(vec![
-            (start as u32)..=(end as u32),
-        ]) {
+        let Ok(start) = u32::try_from(start) else {
+            return "Error: 'start_line' exceeds the supported line range".to_string();
+        };
+        let Ok(end) = u32::try_from(end) else {
+            return "Error: 'end_line' exceeds the supported line range".to_string();
+        };
+        match gix::blame::BlameRanges::from_one_based_inclusive_ranges(vec![start..=end]) {
             Ok(ranges) => options.ranges = ranges,
             Err(e) => return format!("Error: invalid line range: {e}"),
         }
@@ -2588,6 +2608,7 @@ pub fn commit_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionO
                 tool_result_fields,
                 is_error: false,
             }
+            .with_workspace_mutation_applied()
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -2637,7 +2658,7 @@ pub fn revert_commit_with_metadata(project_root: &Path, args: &Value) -> ToolExe
                 .as_deref()
                 .map(short_commit_sha)
                 .unwrap_or_else(|| "???".to_string());
-            let tool_result_fields = revert_commit_sha.map(|revert_commit_sha| {
+            let tool_result_fields = revert_commit_sha.as_ref().map(|revert_commit_sha| {
                 serde_json::Map::from_iter([
                     (
                         "reverted_commit_sha".to_string(),
@@ -2649,15 +2670,15 @@ pub fn revert_commit_with_metadata(project_root: &Path, args: &Value) -> ToolExe
                     ),
                     (
                         "revert_commit_sha".to_string(),
-                        Value::String(revert_commit_sha.clone()),
+                        Value::String(revert_commit_sha.to_string()),
                     ),
                     (
                         "revert_commit_short_sha".to_string(),
-                        Value::String(short_commit_sha(&revert_commit_sha)),
+                        Value::String(short_commit_sha(revert_commit_sha)),
                     ),
                 ])
             });
-            ToolExecutionOutcome {
+            let outcome = ToolExecutionOutcome {
                 output: format!(
                     "✓ Reverted commit: {} via {}",
                     short_commit_sha(&target_commit_sha),
@@ -2665,6 +2686,11 @@ pub fn revert_commit_with_metadata(project_root: &Path, args: &Value) -> ToolExe
                 ),
                 tool_result_fields,
                 is_error: false,
+            };
+            if revert_commit_sha.is_some() {
+                outcome.with_workspace_mutation_applied()
+            } else {
+                outcome
             }
         }
         Ok(out) => {
@@ -2785,11 +2811,23 @@ pub fn stash_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionOu
                         )]));
                     }
                 }
-                ToolExecutionOutcome {
+                let mut outcome = ToolExecutionOutcome {
                     output,
                     tool_result_fields,
                     is_error: false,
+                };
+                let applied = match action {
+                    "apply" | "pop" | "drop" => true,
+                    "push" | "save" => outcome
+                        .tool_result_fields
+                        .as_ref()
+                        .is_some_and(|fields| fields.contains_key("stash_ref")),
+                    _ => false,
+                };
+                if applied {
+                    outcome = outcome.with_workspace_mutation_applied();
                 }
+                outcome
             } else {
                 let err = stderr.trim();
                 if err.contains("No local changes") || err.contains("No stash entries") {
@@ -3279,16 +3317,16 @@ mod tests {
     }
 
     #[test]
-    fn git_action_blame_missing_file_param() {
+    fn git_action_blame_missing_path_param() {
         let root = repo_root();
         let result = blame(&root, &json!({}));
-        assert!(result.contains("Error: missing 'file'"));
+        assert!(result.contains("Error: missing 'path'"));
     }
 
     #[test]
     fn git_action_blame_known_file() {
         let root = repo_root();
-        let result = blame(&root, &json!({"file": "README.md"}));
+        let result = blame(&root, &json!({"path": "README.md"}));
         assert!(
             result.contains("L1") || result.contains("Error") || result.contains("No blame"),
             "unexpected blame: {result}"
@@ -3300,7 +3338,7 @@ mod tests {
         let root = repo_root();
         let result = blame(
             &root,
-            &json!({"file": "README.md", "line_start": 1, "line_end": 3}),
+            &json!({"path": "README.md", "start_line": 1, "end_line": 3}),
         );
         if result.contains("L1") {
             let blame_lines: Vec<&str> = result.lines().filter(|l| l.starts_with('L')).collect();
@@ -3309,6 +3347,22 @@ mod tests {
                 "should have at most 3 lines: {blame_lines:?}"
             );
         }
+    }
+
+    #[test]
+    fn git_action_blame_rejects_incomplete_or_unrepresentable_ranges() {
+        let root = repo_root();
+        assert_eq!(
+            blame(&root, &json!({"path": "README.md", "end_line": 3})),
+            "Error: 'end_line' requires 'start_line'"
+        );
+        assert_eq!(
+            blame(
+                &root,
+                &json!({"path": "README.md", "start_line": u64::from(u32::MAX) + 1})
+            ),
+            "Error: 'start_line' exceeds the supported line range"
+        );
     }
 
     #[test]
@@ -3839,7 +3893,7 @@ mod tests {
     #[test]
     fn git_action_blame_nonexistent_file() {
         let root = repo_root();
-        let result = blame(&root, &json!({"file": "nonexistent_file_xyz.rs"}));
+        let result = blame(&root, &json!({"path": "nonexistent_file_xyz.rs"}));
         assert!(
             result.contains("Error"),
             "should error on nonexistent file: {result}"
@@ -3849,7 +3903,7 @@ mod tests {
     #[test]
     fn git_action_blame_output_format() {
         let root = repo_root();
-        let result = blame(&root, &json!({"file": "README.md"}));
+        let result = blame(&root, &json!({"path": "README.md"}));
         if result.contains("L1") {
             // Should have structured format: L<n> <commit> <date> [<author>] <content>
             let first_line = result.lines().next().unwrap_or("");
@@ -3867,7 +3921,7 @@ mod tests {
     #[test]
     fn git_action_blame_summary_footer() {
         let root = repo_root();
-        let result = blame(&root, &json!({"file": "README.md"}));
+        let result = blame(&root, &json!({"path": "README.md"}));
         if !result.contains("Error") && !result.contains("No blame") {
             assert!(
                 result.contains("lines,")
@@ -4423,6 +4477,12 @@ mod tests {
             .tool_result_fields
             .as_ref()
             .expect("commit should return commit metadata");
+        assert_eq!(
+            commit_fields
+                .get("workspace_mutation_applied")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
         let commit_sha = commit_fields
             .get("commit_sha")
             .and_then(Value::as_str)
@@ -4448,6 +4508,12 @@ mod tests {
             .tool_result_fields
             .as_ref()
             .expect("revert_commit should return metadata");
+        assert_eq!(
+            revert_fields
+                .get("workspace_mutation_applied")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
         assert_eq!(
             revert_fields
                 .get("reverted_commit_sha")

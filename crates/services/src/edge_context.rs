@@ -134,6 +134,16 @@ pub struct EdgeSkillRef {
     /// Skill version.
     #[serde(default)]
     pub version: Option<String>,
+    /// Untrusted routing metadata shown to the model before activation.
+    #[serde(default)]
+    pub description: String,
+    /// Optional semantic activation hint. This is metadata, never executable
+    /// skill instruction content.
+    #[serde(default)]
+    pub when_to_use: Option<String>,
+    /// Alternative names accepted by the client-side resolver.
+    #[serde(default)]
+    pub aliases: Vec<String>,
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────

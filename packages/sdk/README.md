@@ -1,8 +1,8 @@
 # @astra/sdk
 
-TypeScript SDK for the Astra agent runtime: JWT auth, sessions, runs, **run list**, **multi-agent delegation**, **session lifecycle** (update / close / resume / cancel / activity), **reflect** and **decision-trace**, **events** (session timeline and causal chains), **edge connection status**, memory, **§5.5** edge callbacks, task leases, **SSE** (`POST /chat/stream`), and **WebSocket** (`/chat/ws`).
+TypeScript SDK for the Astra agent runtime: JWT auth, sessions, runs, **run list**, **multi-agent delegation**, **session lifecycle** (update / close / resume / cancel / activity), **reflect** and **decision-trace**, **events** (session timeline and causal chains), **edge connection status**, memory, **§5.5** edge callbacks, **SSE** (`POST /chat/stream`), and **WebSocket** (`/chat/ws`).
 
-Paths match the Rust server and [`astra-thin-client`](../../crates/astra-thin-client/src/paths.rs) (no `/api` prefix by default). Use `pathPrefix` if your gateway mounts the API under a prefix (for example `/api` → `https://host/api/auth/login`).
+Supported paths match the currently registered Rust runtime routes and [`astra-thin-client`](../../crates/astra-thin-client/src/paths.rs) (no `/api` prefix by default). Use `pathPrefix` if your gateway mounts the API under a prefix (for example `/api` → `https://host/api/auth/login`). Legacy task/plan/agent-job helpers remain in the clients for source compatibility with older servers, but the current runtime intentionally returns `404` for those routes and they are not runtime capabilities.
 
 **Distribution:** This package is versioned in the Astra monorepo and consumed via `file:../packages/sdk` (see `web/package.json`). Publishing to the public npm registry is optional; set `repository` / `publishConfig` when you are ready to release.
 
@@ -212,7 +212,7 @@ When a **local edge** runs tools, use the same routes as `astra-thin-client`:
 | Approval | `postApprovalRespond(body)` | `POST /approval/respond` |
 | Register edge | `registerEdge(body, { edgeTransportId })` | `POST /agents/edge` |
 | Heartbeat | `postEdgeHeartbeat(body, { edgeTransportId })` | `POST /agents/edge/heartbeat` |
-| Lease | `getTaskLease`, `postTaskLeaseClaim` / `Release` / `Renew` | `/tasks/{id}/lease/...` |
+| Legacy task lease helpers | `getTaskLease`, `postTaskLeaseClaim` / `Release` / `Renew` | `/tasks/{id}/lease/...` (not registered by the current runtime) |
 
 Constants and path helpers are exported from `@astra/sdk` (for example `PATH_CHAT_STREAM`, `joinApiPath`, `ASTRA_EDGE_ID_HEADER`).
 
@@ -239,7 +239,7 @@ Constants and path helpers are exported from `@astra/sdk` (for example `PATH_CHA
 | `getEdgesStatus` | `GET /edges/status` |
 | `memoryStore` / `memorySearch` / … | `/memory/*` |
 | `listSkills` | `GET /skills` (maps `skills[]` to `SkillInfo[]`) |
-| §5.5 | `postToolResult`, `postApprovalRespond`, `registerEdge`, `postEdgeHeartbeat`, task lease methods |
+| §5.5 | `postToolResult`, `postApprovalRespond`, `registerEdge`, `postEdgeHeartbeat` |
 
 ### `AstraWebSocket`
 

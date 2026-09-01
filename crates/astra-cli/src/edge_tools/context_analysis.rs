@@ -226,6 +226,7 @@ fn analyze_turn(
 
     // Memory retrieval breakdown
     let memory_detail = json!({
+        "outcome": mem.outcome,
         "query": mem.query.chars().take(80).collect::<String>(),
         "candidates_considered": mem.candidates_considered,
         "selected": mem.memories_selected.len(),

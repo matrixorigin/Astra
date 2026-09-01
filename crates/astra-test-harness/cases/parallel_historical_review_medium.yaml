@@ -1,0 +1,104 @@
+name: parallel_historical_review_medium
+description: |
+  **What**: Review a fixed, historical medium-sized commit from two
+  complementary angles and return one synthesized report.
+  **Tests**: Real repository evidence, bounded foreground fanout, terminal
+  child delivery, and parent synthesis without turning reviewer perspectives
+  into separate durable work items.
+  **Why**: A stable historical fixture gives a meaningful review workload
+  without making every fast regression depend on the size of the moving HEAD.
+  **Pass means**: Both reviewers inspect commit 449b13b95, settle terminally,
+  and the parent reports one combined review with no generic spawn fallback.
+prompt: |
+  Review the exact historical commit 449b13b95 from the repository's main
+  branch (not the current working-tree changes) from two independent angles:
+  (1) correctness, data integrity, and
+  lifecycle risks; (2) tests, API contracts, and regression coverage. Use
+  exactly one foreground two-agent fanout with defaults.agent_type="code-review"
+  and defaults.complexity="normal". Each child must inspect the commit with git
+  evidence and return bounded findings. Then synthesize one report
+  that cites the commit hash and distinguishes evidence from recommendations.
+  The two perspectives are evidence for one report, not separate deliverables.
+  Do not edit files.
+prompt_variants:
+  - id: chinese_user_boundary
+    prompt: |
+      请只审查 main 分支历史提交 449b13b95，不要审查当前工作区改动。用两个独立视角：
+      （1）正确性、数据完整性和生命周期风险；（2）测试、API 契约和回归覆盖。
+      只进行一次前台 two-agent fanout，defaults.agent_type="code-review"，
+      defaults.complexity="normal"；两个子 agent 都必须用 git 证据审查该提交，最后综合成一份报告，
+      并明确区分证据和建议。不要修改文件。
+models:
+  - deepseek-v4-flash
+capability: delegation
+difficulty: 4
+weight: 3.0
+timeout_seconds: 180
+debug_log: true
+setup_cmd: git merge-base --is-ancestor 449b13b95 origin/main
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: agent_fanout
+    min: 1
+    max: 1
+    document: arguments
+    path: /action
+    equals: start
+  - type: journal_tool_json
+    name: agent_fanout
+    document: arguments
+    path: /target_count
+    equals: 2
+  - type: session_event_count
+    event_type: agent_terminated
+    min: 2
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /fanout/accepted
+    equals: 2
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /fanout/terminal
+    equals: 2
+  - type: journal_tool_json
+    name: agent_fanout
+    document: result
+    path: /provenance/all_slots_delivered
+    equals: true
+  - type: journal_tool_outcome_count
+    name: agent_fanout
+    ok: false
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: start_work
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: agent
+    min: 0
+    max: 0
+  - type: journal_turn_evaluation_success
+    equals: true
+  - type: text_contains
+    needle: "449b13b95"
+  - type: journal_child_tool_call_count
+    parent: agent_fanout
+    child: bash
+    min: 2
+    max: 100
+  - type: journal_tool_json_contains
+    name: bash
+    document: arguments
+    path: /command
+    contains: "449b13b95"
+  - type: tools_count_between
+    min: 4
+    max: 18
+  - type: turn_rounds_between
+    min: 2
+    max: 12

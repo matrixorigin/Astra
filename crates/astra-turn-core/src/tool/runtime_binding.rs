@@ -65,6 +65,17 @@ pub fn runtime_binding_denial_message(name: &str, action: Option<&str>) -> Strin
         );
     }
 
+    if crate::tool::registry::meta::tool_meta(name)
+        .is_some_and(|meta| meta.requires.contains(&Capability::GitHubAuth))
+    {
+        return format!(
+            "Tool `{name}` is not available in this turn because no owner-scoped GitHub \
+             connection is active. Astra will not use credentials from the Server host. \
+             Connect GitHub for this account or use a connected Edge runtime; retrying or \
+             selecting the tool cannot grant that authority."
+        );
+    }
+
     format!(
         "Tool `{name}` is not available in this turn because its required runtime \
          capability is not connected. Calling `tool_search(query=\"select:{name}\")` \
@@ -99,7 +110,10 @@ mod tests {
         assert!(tool_name_requires_runtime_binding("mcp__weather"));
         assert!(!tool_name_requires_runtime_binding("mcp__"));
         assert!(!tool_name_requires_runtime_binding("mcp__bad/name"));
-        assert!(!tool_name_requires_runtime_binding("github"));
+        assert!(tool_name_requires_runtime_binding("github"));
+        assert!(tool_name_requires_runtime_binding("task_list"));
+        assert!(tool_name_requires_runtime_binding("task_output"));
+        assert!(tool_name_requires_runtime_binding("task_stop"));
         assert!(!tool_name_requires_runtime_binding("reflect"));
         assert!(!tool_name_requires_runtime_binding("definitely_unknown"));
     }
@@ -109,7 +123,8 @@ mod tests {
         assert!(tool_name_requires_executor_binding("agent_fanout"));
         assert!(tool_name_requires_executor_binding("agent"));
         assert!(!tool_name_requires_executor_binding("mcp__weather"));
-        assert!(!tool_name_requires_executor_binding("github"));
+        assert!(tool_name_requires_executor_binding("github"));
+        assert!(tool_name_requires_executor_binding("task_list"));
         assert!(!tool_name_requires_executor_binding("reflect"));
     }
 
@@ -141,6 +156,20 @@ mod tests {
             "{message}"
         );
         assert!(!message.contains("action ``"), "{message}");
+    }
+
+    #[test]
+    fn github_denial_names_the_owner_scoped_permission_boundary() {
+        let message = runtime_binding_denial_message("github", Some("get_pr"));
+        assert!(
+            message.contains("owner-scoped GitHub connection"),
+            "{message}"
+        );
+        assert!(
+            message.contains("will not use credentials from the Server host"),
+            "{message}"
+        );
+        assert!(message.contains("connected Edge runtime"), "{message}");
     }
 
     #[test]

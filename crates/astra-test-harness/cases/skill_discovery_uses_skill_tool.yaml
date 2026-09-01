@@ -16,10 +16,22 @@ criteria:
     code: 0
   - type: tool_called
     name: skill
-  - type: judger
-    question: |
-      Did the agent invoke the `skill` tool (check tools_used) with a
-      skill name (ideally `analyze-session` or `analyze_session`)?
-      Score 1.0 if `skill` appears in tools_used. Score 0.0 otherwise.
-      The final text answer does not matter — only the tool_use.
-    threshold: 0.9
+  - type: journal_tool_call_count
+    name: skill
+    min: 1
+    max: 1
+    document: arguments
+    path: /skill_name
+    equals: analyze-session
+  - type: tools_count_between
+    min: 1
+    max: 1
+  - type: tool_result_class_count
+    class: execution_error
+    min: 0
+    max: 0
+  - type: text_contains
+    # Phase titles are skill content, not part of the skill-tool protocol.
+    # Assert the requested phase was returned without pinning the harness to a
+    # particular revision of analyze-session's wording.
+    needle: "Phase 1"

@@ -247,6 +247,13 @@ fn analysis_view_for_topic_facet(topic: ObservationTopic, facet: ObservationFace
         (ObservationTopic::Execution, ObservationFacet::Errors) => "execution_errors",
         (ObservationTopic::Execution, ObservationFacet::Trace) => "execution_trace",
         (ObservationTopic::Execution, _) => "execution_tools",
+        // Keep the requested runtime facet in the analysis view. Previously
+        // every runtime facet fell through to `runtime_performance`, so a
+        // typed `topic=runtime, facet=errors` request silently disabled the
+        // error-pattern/evidence path even though the report still claimed
+        // that errors were being analyzed.
+        (ObservationTopic::Runtime, ObservationFacet::Errors) => "runtime_errors",
+        (ObservationTopic::Runtime, ObservationFacet::Trace) => "runtime_trace",
         (ObservationTopic::Knowledge, _) => "knowledge_context",
         (ObservationTopic::Runtime, _) => "runtime_performance",
         (ObservationTopic::Overview, _) => "overview",
@@ -434,6 +441,33 @@ mod tests {
             assert_eq!(request.topic, topic, "facet={facet}");
             assert_eq!(request.analysis_view, analysis_view, "facet={facet}");
         }
+    }
+
+    #[test]
+    fn runtime_error_and_trace_facets_keep_their_analysis_view() {
+        let errors = ReflectRequest::from_observation_params(
+            Some("runtime"),
+            Some("errors"),
+            Some("diagnostic"),
+            Some("session"),
+            20,
+            "what failed?",
+        );
+        assert_eq!(errors.topic, ObservationTopic::Runtime);
+        assert_eq!(errors.facet, ObservationFacet::Errors);
+        assert_eq!(errors.analysis_view, "runtime_errors");
+
+        let trace = ReflectRequest::from_observation_params(
+            Some("runtime"),
+            Some("trace"),
+            Some("diagnostic"),
+            Some("session"),
+            20,
+            "where was the time spent?",
+        );
+        assert_eq!(trace.topic, ObservationTopic::Runtime);
+        assert_eq!(trace.facet, ObservationFacet::Trace);
+        assert_eq!(trace.analysis_view, "runtime_trace");
     }
 
     #[test]

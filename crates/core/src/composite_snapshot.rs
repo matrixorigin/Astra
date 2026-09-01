@@ -451,6 +451,41 @@ pub struct CompositeSnapshotIndex {
 }
 
 impl CompositeSnapshotIndex {
+    /// Merge independently produced indexes by durable snapshot identity.
+    ///
+    /// Incoming entries win only when both sides describe the same snapshot.
+    /// Versions are then rebuilt deterministically so concurrent writers that
+    /// both allocated the same next version remain addressable instead of one
+    /// silently replacing the other.
+    pub fn merge_by_identity(mut self, incoming: Self) -> Self {
+        let mut merged = std::collections::BTreeMap::new();
+        for snapshot in self.snapshots.drain(..) {
+            merged.insert(snapshot.snapshot_id.clone(), snapshot);
+        }
+        for snapshot in incoming.snapshots {
+            merged.insert(snapshot.snapshot_id.clone(), snapshot);
+        }
+        let mut snapshots: Vec<_> = merged.into_values().collect();
+        snapshots.sort_by(|left, right| {
+            (
+                left.version == 0,
+                left.version,
+                left.created_at.as_str(),
+                left.snapshot_id.as_str(),
+            )
+                .cmp(&(
+                    right.version == 0,
+                    right.version,
+                    right.created_at.as_str(),
+                    right.snapshot_id.as_str(),
+                ))
+        });
+        for (offset, snapshot) in snapshots.iter_mut().enumerate() {
+            snapshot.version = u64::try_from(offset).unwrap_or(u64::MAX).saturating_add(1);
+        }
+        Self { snapshots }
+    }
+
     pub fn normalize_versions(&mut self) {
         let mut next_version = 1;
         for snapshot in &mut self.snapshots {
@@ -999,6 +1034,52 @@ mod tests {
         let deser: CompositeSnapshotIndex = serde_json::from_str(&json).unwrap();
         assert_eq!(deser.snapshots.len(), 2);
         assert_eq!(deser.snapshots[1].refs.len(), 2);
+    }
+
+    #[test]
+    fn index_merge_preserves_concurrent_next_versions() {
+        let mut base = CompositeSnapshotBuilder::new("s1", 1)
+            .session_state("base")
+            .build();
+        base.snapshot_id = "base".into();
+        base.created_at = "2026-08-08T00:00:00Z".into();
+        base.version = 1;
+        let mut left = CompositeSnapshotBuilder::new("s1", 2)
+            .session_state("left")
+            .build();
+        left.snapshot_id = "left".into();
+        left.created_at = "2026-08-08T00:00:01Z".into();
+        left.version = 2;
+        let mut right = CompositeSnapshotBuilder::new("s1", 2)
+            .session_state("right")
+            .build();
+        right.snapshot_id = "right".into();
+        right.created_at = "2026-08-08T00:00:02Z".into();
+        right.version = 2;
+
+        let merged = CompositeSnapshotIndex {
+            snapshots: vec![base.clone(), left],
+        }
+        .merge_by_identity(CompositeSnapshotIndex {
+            snapshots: vec![base, right],
+        });
+
+        assert_eq!(
+            merged
+                .snapshots
+                .iter()
+                .map(|snapshot| snapshot.snapshot_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["base", "left", "right"]
+        );
+        assert_eq!(
+            merged
+                .snapshots
+                .iter()
+                .map(|snapshot| snapshot.version)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 
     #[test]

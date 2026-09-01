@@ -1,42 +1,24 @@
 //! Tool search over available tool schemas.
 //!
-//! Takes a set of tool schemas and a query, returning ranked matches.
+//! Takes a set of tool schemas and an explicit selection, returning compact
+//! activation metadata. Natural-language intent resolution belongs to the
+//! model that sees the deferred catalog; this module never guesses intent
+//! from overlapping description text.
 //! Extracted from edge_tools as a standalone function.
 
 use astra_turn_types::STABLE_TOOL_ALIAS_SCHEMA_KEY;
 use serde_json::{Value, json};
 
-use crate::relevance_score::Scoreable;
-
-const KEYWORD_DESCRIPTION_MAX_CHARS: usize = 180;
 const SELECT_DESCRIPTION_MAX_CHARS: usize = 220;
 const TOOL_RESULT_STATUS_COMPLETED: &str = "completed";
 const TOOL_RESULT_STATUS_FAILED: &str = "failed";
 
-struct ToolSchemaAdapter<'a>(&'a Value);
-
-impl Scoreable for ToolSchemaAdapter<'_> {
-    fn score_name(&self) -> &str {
-        tool_schema_name(self.0).unwrap_or("")
-    }
-
-    fn score_description(&self) -> &str {
-        self.0
-            .get("function")
-            .and_then(|f| f.get("description"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-    }
-}
-
-/// Search available tool schemas by keyword or exact name.
+/// Activate available tool schemas by explicit name.
 ///
 /// The `schemas` parameter should be a slice of tool schema JSON values,
 /// each with a `function.name` and `function.description` field.
 ///
-/// Query modes:
-/// - `select:tool_name` or `select:a,b,c` — direct selection by name
-/// - Otherwise — keyword search with scoring
+/// Query mode: `select:tool_name` or `select:a,b,c`.
 pub fn tool_search(schemas: &[Value], args: &Value) -> String {
     let query = match args.get("query").and_then(Value::as_str) {
         Some(q) => {
@@ -49,11 +31,6 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
         None => return tool_search_error("'query' is required").to_string(),
     };
 
-    let max_results = args
-        .get("max_results")
-        .and_then(Value::as_u64)
-        .unwrap_or(5)
-        .min(20) as usize;
     let valid_schemas: Vec<&Value> = schemas
         .iter()
         .filter(|schema| tool_schema_name(schema).is_some())
@@ -153,42 +130,10 @@ pub fn tool_search(schemas: &[Value], args: &Value) -> String {
         return result.to_string();
     }
 
-    // Keyword search mode — delegates scoring to shared utility.
-    let adapters: Vec<ToolSchemaAdapter> = valid_schemas
-        .iter()
-        .map(|schema| ToolSchemaAdapter(schema))
-        .collect();
-    let ranked = crate::relevance_score::rank_by_relevance(&adapters, query, max_results);
-
-    let matches: Vec<Value> = ranked
-        .into_iter()
-        .map(|(idx, score)| {
-            let tool = valid_schemas[idx];
-            let func = tool.get("function").unwrap_or(tool);
-            let name = func.get("name").and_then(Value::as_str).unwrap_or("");
-            let desc = discovery_description(func);
-            let (short_desc, was_truncated) =
-                compact_description(desc, KEYWORD_DESCRIPTION_MAX_CHARS);
-            json!({
-                "name": name,
-                "description": short_desc,
-                "description_truncated": was_truncated,
-                "score": score
-            })
-        })
-        .collect();
-
-    let outcome = keyword_outcome(valid_schemas.len(), matches.len());
-    let mut result = json!({
-        "mode": "keyword",
-        "status": TOOL_RESULT_STATUS_COMPLETED,
-        "search_status": outcome,
-        "query": query,
-        "matches": matches,
-        "total_tools": valid_schemas.len()
-    });
-    add_tool_search_guidance(&mut result, outcome, keyword_message(outcome, query));
-    result.to_string()
+    tool_search_error(
+        "'query' must use select:NAME or select:NAME1,NAME2; intent matching is not performed",
+    )
+    .to_string()
 }
 
 pub use astra_core::tool_schema::tool_schema_name;
@@ -342,16 +287,6 @@ fn select_outcome(total_tools: usize, found: usize, missing: usize) -> &'static 
     }
 }
 
-fn keyword_outcome(total_tools: usize, matches: usize) -> &'static str {
-    if total_tools == 0 {
-        "empty_surface"
-    } else if matches == 0 {
-        "not_found"
-    } else {
-        "ok"
-    }
-}
-
 fn add_tool_search_guidance(result: &mut Value, outcome: &str, message: Option<String>) {
     if outcome == "ok" {
         return;
@@ -402,18 +337,6 @@ fn select_message(status: &str, result: &Value) -> Option<String> {
         "partial" => Some(format!(
             "Some requested tools are not available in this turn: {}.",
             missing.join(", ")
-        )),
-        _ => None,
-    }
-}
-
-fn keyword_message(status: &str, query: &str) -> Option<String> {
-    match status {
-        "empty_surface" => Some(format!(
-            "No tools are searchable in this turn for query `{query}`."
-        )),
-        "not_found" => Some(format!(
-            "No tools matched query `{query}` in this turn's searchable tool set."
         )),
         _ => None,
     }
@@ -557,52 +480,38 @@ mod tests {
     }
 
     #[test]
-    fn keyword_search_finds_file_tools() {
+    fn natural_language_query_never_guesses_tool_intent() {
         let schemas = sample_schemas();
-        let result = tool_search(&schemas, &json!({"query": "file"}));
+        let result = tool_search(
+            &schemas,
+            &json!({"query": "read a file and inspect its contents"}),
+        );
         let parsed = parse_result(&result);
 
-        assert_eq!(parsed["mode"].as_str(), Some("keyword"));
-        assert_eq!(parsed["query"].as_str(), Some("file"));
-        assert_eq!(parsed["total_tools"].as_u64(), Some(schemas.len() as u64));
-        let names = match_names(&parsed);
+        assert_eq!(parsed["mode"].as_str(), Some("error"));
+        assert_eq!(parsed["status"].as_str(), Some("failed"));
         assert!(
-            names.iter().any(|name| name == "read_file"),
-            "keyword search should include read_file: {parsed}"
-        );
-        assert!(
-            names.iter().any(|name| name == "write_file"),
-            "keyword search should include write_file: {parsed}"
-        );
-        assert!(
-            parsed["matches"][0].get("parameters").is_none(),
-            "keyword mode must stay compact and omit callable parameter schemas: {parsed}"
+            parsed["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("intent matching is not performed")),
+            "description overlap must never select a tool: {parsed}"
         );
     }
 
     #[test]
-    fn keyword_search_cannot_return_tools_outside_schema_pool() {
+    fn description_text_cannot_redirect_selection() {
         let schemas = vec![json!({
             "type": "function",
             "function": {
-                "name": "tool_search",
-                "description": "Search the current tool surface"
+                "name": "agent_fanout",
+                "description": "Read files, inspect source, and search the current tool surface"
             }
         })];
-        let parsed = parse_result(&tool_search(
-            &schemas,
-            &json!({"query": "mo_query powershell database shell"}),
-        ));
+        let parsed = parse_result(&tool_search(&schemas, &json!({"query": "read file"})));
 
-        assert_eq!(parsed["mode"].as_str(), Some("keyword"));
-        assert_eq!(parsed["total_tools"].as_u64(), Some(1));
-        let names = match_names(&parsed);
-        assert!(
-            !names
-                .iter()
-                .any(|name| name == "mo_query" || name == "powershell"),
-            "tool_search must rank only schemas provided by the current runtime surface: {parsed}"
-        );
+        assert_eq!(parsed["mode"], "error");
+        assert_eq!(parsed["status"], "failed");
+        assert!(parsed.get("matches").is_none());
     }
 
     #[test]
@@ -621,7 +530,7 @@ mod tests {
         assert_eq!(parsed["total_tools"].as_u64(), Some(schemas.len() as u64));
         assert!(
             parsed["matches"][0].get("score").is_none(),
-            "select mode must return schema entries, not keyword scores: {parsed}"
+            "select mode must return schema entries, not relevance scores: {parsed}"
         );
     }
 
@@ -902,10 +811,6 @@ mod tests {
             strings(&["custom_shape"])
         );
         assert_eq!(selected["total_tools"].as_u64(), Some(2));
-
-        let keyword = parse_result(&tool_search(&schemas, &json!({"query": "bad read"})));
-        assert_eq!(match_names(&keyword), strings(&["read_file"]));
-        assert_eq!(keyword["total_tools"].as_u64(), Some(2));
     }
 
     #[test]
@@ -975,17 +880,6 @@ mod tests {
             selected.get("recovery").is_none(),
             "tool_search must return data, not prompt instructions: {selected}"
         );
-
-        let keyword = parse_result(&tool_search(&[], &json!({"query": "filesystem"})));
-        assert_eq!(keyword["mode"].as_str(), Some("keyword"));
-        assert_eq!(keyword["status"].as_str(), Some("completed"));
-        assert_eq!(keyword["search_status"].as_str(), Some("empty_surface"));
-        assert_eq!(keyword["total_tools"].as_u64(), Some(0));
-        assert!(match_names(&keyword).is_empty());
-        assert!(
-            keyword.get("recovery").is_none(),
-            "tool_search must return data, not prompt instructions: {keyword}"
-        );
     }
 
     // ── select: mode must return compact schema shape ─────────────────────
@@ -1012,7 +906,7 @@ mod tests {
     }
 
     #[test]
-    fn select_vs_keyword_params() {
+    fn select_returns_compact_parameter_shape() {
         // select: mode returns compact parameter shape because the full
         // callable schema is injected into tools[] on the next request.
         let schemas = schemas_with_params();
@@ -1027,10 +921,6 @@ mod tests {
             params["properties"]["path"].get("description").is_none(),
             "select result should keep callable shape but strip nested prose: {parsed}"
         );
-
-        let result = tool_search(&schemas, &json!({"query": "file"}));
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        assert!(parsed["matches"][0].get("parameters").is_none());
     }
 
     #[test]
@@ -1078,13 +968,6 @@ mod tests {
             }
         })];
 
-        let keyword = tool_search(&schemas, &json!({"query": "future_work"}));
-        let keyword: Value = serde_json::from_str(&keyword).unwrap();
-        assert_eq!(
-            keyword["matches"][0]["description"],
-            "start needs action+scope; observe needs work_id"
-        );
-
         let selected = tool_search(&schemas, &json!({"query": "select:future_work"}));
         let selected: Value = serde_json::from_str(&selected).unwrap();
         assert_eq!(
@@ -1100,9 +983,9 @@ mod tests {
     }
 
     #[test]
-    fn select_vs_keyword_description() {
-        // select and keyword stay compact; full prose arrives through the
-        // selected tool schema in the next tools[] request.
+    fn select_description_stays_compact() {
+        // Full prose arrives through the selected tool schema in the next
+        // tools[] request.
         let long_desc = "x".repeat(500);
         let schemas = vec![json!({
             "type": "function",
@@ -1121,49 +1004,34 @@ mod tests {
             parsed["matches"][0]["description_truncated"].as_bool(),
             Some(true)
         );
-        let result = tool_search(&schemas, &json!({"query": "big"}));
-        let parsed: Value = serde_json::from_str(&result).unwrap();
-        let desc = parsed["matches"][0]["description"].as_str().unwrap();
-        assert!(desc.len() <= 200);
     }
 
     #[test]
-    fn keyword_search_preserves_deferred_agent_constraints() {
+    fn explicit_selection_preserves_deferred_agent_constraints() {
         let schemas = crate::schemas::all_tool_schemas();
 
-        let result = tool_search(
-            &schemas,
-            &json!({"query": "agent_fanout", "max_results": 20}),
-        );
+        let result = tool_search(&schemas, &json!({"query": "select:agent_fanout"}));
         let parsed: Value = serde_json::from_str(&result).unwrap();
-        let matches = parsed["matches"].as_array().unwrap();
-        let fanout = matches
-            .iter()
-            .find(|m| m["name"].as_str() == Some("agent_fanout"))
-            .expect("agent_fanout should be discoverable by keyword");
+        let fanout = &parsed["matches"][0];
         let desc = fanout["description"].as_str().unwrap_or_default();
         assert!(
             desc.contains("exactly that many slots")
                 && desc.contains("description+prompt")
                 && desc.contains("never embed diffs")
                 && desc.contains("no brief/agents/background"),
-            "keyword summary must keep the current fanout shape and shared-workspace constraints: {desc}"
+            "selection summary must keep the current fanout shape and shared-workspace constraints: {desc}"
         );
 
-        let result = tool_search(&schemas, &json!({"query": "agent", "max_results": 20}));
+        let result = tool_search(&schemas, &json!({"query": "select:agent"}));
         let parsed: Value = serde_json::from_str(&result).unwrap();
-        let matches = parsed["matches"].as_array().unwrap();
-        let agent = matches
-            .iter()
-            .find(|m| m["name"].as_str() == Some("agent"))
-            .expect("agent should be discoverable by keyword");
+        let agent = &parsed["matches"][0];
         let desc = agent["description"].as_str().unwrap_or_default();
         assert!(
             desc.contains("description+prompt")
                 && desc.contains("agent_id")
                 && desc.contains("foreground")
                 && desc.contains("run_chain"),
-            "keyword summary must keep agent action constraints: {desc}"
+            "selection summary must keep agent action constraints: {desc}"
         );
     }
 }

@@ -241,16 +241,6 @@ const MCP_SUBCOMMANDS: &[(&str, &str)] = &[
     ("history", "Recent MCP tool-call history"),
 ];
 
-const TASK_SUBCOMMANDS: &[(&str, &str)] = &[
-    ("list", "List background tasks"),
-    ("pending", "List claimable task queue"),
-    ("run", "Run a background task prompt"),
-    ("result", "Task result (needs id)"),
-    ("status", "Task status (needs id/query)"),
-];
-
-const TUI_TASK_SUBCOMMANDS: &[(&str, &str)] = &[("list", "Open background work")];
-
 const MEMORY_SUBCOMMANDS: &[(&str, &str)] = &[
     // ── Browse ──
     ("list", "List memories grouped by type"),
@@ -393,6 +383,10 @@ const CONFIG_SUBCOMMANDS: &[(&str, &str)] = &[("edit", "Open the runtime configu
 const HELP_SUBCOMMANDS: &[(&str, &str)] = &[("keys", "Keyboard shortcuts")];
 
 const TUI_AGENT_SUBCOMMANDS: &[(&str, &str)] = &[("list", "Open the agent workbench")];
+const WORK_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("start", "Track this conversation as durable Work"),
+    ("status", "Open the canonical Work task board"),
+];
 
 // `/skill` itself opens the `$` skill browser. Do not advertise marketplace
 // management commands in the TUI until they have a first-class native flow.
@@ -537,13 +531,12 @@ CommandMeta::new("/clear", "Start a new session", CommandGroup::Core)
     .with_tui_route(TuiCommandRoute::Native)
     .primary(),
     CommandMeta::new(
-        "/task",
-        "Open background work",
+        "/work",
+        "Start durable Work in this conversation or open its task board",
         CommandGroup::MemoryTasks,
     )
-    .with_subcommands(TASK_SUBCOMMANDS)
-    .with_tui_subcommands(TUI_TASK_SUBCOMMANDS)
-    .with_arg_hint("[list]")
+    .with_subcommands(WORK_SUBCOMMANDS)
+    .with_arg_hint("[status | start <goal>]")
     .with_tui_route(TuiCommandRoute::Native)
     .primary(),
     // ── Observability ─────────────────────────────────────────────────────
@@ -1057,13 +1050,6 @@ mod tests {
 
     #[test]
     fn workbench_subcommands_only_advertise_native_actions() {
-        let task = resolve_command_meta("/task").expect("task command registered");
-        assert!(task.subcommands.iter().any(|(name, _)| *name == "run"));
-        assert_eq!(
-            task.visible_tui_subcommands(),
-            [("list", "Open background work")]
-        );
-
         let agent = resolve_command_meta("/agent").expect("agent command registered");
         assert_eq!(
             agent.visible_tui_subcommands(),
@@ -1192,7 +1178,7 @@ mod tests {
     #[test]
     fn native_routes_cover_inline_panels_and_selectors_without_decorative_subtypes() {
         for command in [
-            "/help", "/model", "/clear", "/stop", "/context", "/mcp", "/task", "/agent", "/reflect",
+            "/help", "/model", "/clear", "/stop", "/context", "/mcp", "/agent", "/reflect",
         ] {
             let meta = resolve_command_meta(command).unwrap_or_else(|| panic!("missing {command}"));
             assert_eq!(meta.tui_route, TuiCommandRoute::Native, "{command}");
@@ -1209,16 +1195,6 @@ mod tests {
     #[test]
     fn resolve_command_meta_returns_none_for_unknown_command() {
         assert!(resolve_command_meta("/nonexistent_cmd_xyz").is_none());
-    }
-
-    #[test]
-    fn task_slash_command_replaces_legacy_job_surface() {
-        let task = resolve_command_meta("/task").expect("should resolve /task");
-        assert_eq!(task.name, "/task");
-        assert!(
-            resolve_command_meta("/job").is_none(),
-            "legacy /job must not remain registered"
-        );
     }
 
     #[test]
@@ -1241,7 +1217,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "/help", "/model", "/stop", "/plan", "/memory", "/task", "/inspect", "/context",
+                "/help", "/model", "/stop", "/plan", "/memory", "/work", "/inspect", "/context",
                 "/agent", "/allow",
             ]
         );

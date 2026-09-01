@@ -242,6 +242,7 @@ fn declarative_hooks_for_when(project_root: &Path, cfg: &FileRoot, phase: &str) 
             depends_on: Vec::new(),
             timeout_secs: None,
             cache_key: None,
+            authoritative: true,
         });
     }
     out
@@ -291,6 +292,7 @@ fn auto_detect_verify_changes_hook(
         depends_on: Vec::new(),
         timeout_secs: None,
         cache_key: None,
+        authoritative: false,
     }]
 }
 

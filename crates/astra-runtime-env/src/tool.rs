@@ -10,6 +10,10 @@ use crate::{
     NetworkCapability,
 };
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolLoadPolicy {
@@ -63,6 +67,38 @@ pub enum RequiredNetwork {
     Open,
 }
 
+/// Which role inside canonical Work may receive a tool in its model-facing
+/// surface. This is independent from executor capability: a coordinator and
+/// a selected task executor can share the same server, while having opposite
+/// authority over Work transitions.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkExecutionRole {
+    /// The tool is useful in either a coordinator or a selected task attempt.
+    #[default]
+    Any,
+    /// The tool authors, observes, or dispatches Work and must not distract a
+    /// selected task executor with a second Work-control surface.
+    Coordinator,
+    /// The coordinator may select a task, while a primary-session attempt may
+    /// idempotently replay only its already server-owned assignment. A
+    /// delegated attempt has an immutable binding and cannot redispatch.
+    CoordinatorOrPrimaryAttempt,
+    /// The tool acts on exactly one selected WorkItem attempt.
+    Attempt,
+}
+
+/// Runtime authority context for a model-facing Work tool surface.
+///
+/// A primary-session attempt and a delegated child both execute one selected
+/// item, while only the coordinator authors or dispatches the graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkExecutionContext {
+    Coordinator,
+    PrimaryAttempt,
+    DelegatedAttempt,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolEffect {
     pub reads_workspace: bool,
@@ -89,6 +125,15 @@ impl ToolEffect {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolRequirements {
     pub executor: RequiredExecutor,
+    /// The canonical Work role eligible to receive this tool. The default
+    /// preserves ordinary non-Work and shared-tool behavior.
+    #[serde(default)]
+    pub work_execution_role: WorkExecutionRole,
+    /// The action operates on a single durable WorkItem attempt.  A session
+    /// coordinator may own the Work graph, but it is not thereby authorized
+    /// to perform an attempt-owned transition.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub work_item_attempt: bool,
     pub workspace: RequiredWorkspace,
     pub filesystem_read: bool,
     pub filesystem_write: bool,
@@ -105,6 +150,8 @@ impl ToolRequirements {
     pub const fn none() -> Self {
         Self {
             executor: RequiredExecutor::None,
+            work_execution_role: WorkExecutionRole::Any,
+            work_item_attempt: false,
             workspace: RequiredWorkspace::None,
             filesystem_read: false,
             filesystem_write: false,
@@ -125,6 +172,26 @@ impl ToolRequirements {
         }
     }
 
+    /// Control-plane action whose authority is derived from the exact durable
+    /// WorkItem attempt bound to the current run.
+    pub const fn work_item_attempt_control_plane() -> Self {
+        Self {
+            work_execution_role: WorkExecutionRole::Attempt,
+            work_item_attempt: true,
+            ..Self::control_plane()
+        }
+    }
+
+    /// A Work graph lifecycle action. A selected WorkItem already has its
+    /// exact assignment; exposing coordinator actions there creates a second
+    /// control plane and invites self-dispatch loops.
+    pub const fn work_coordinator_control_plane() -> Self {
+        Self {
+            work_execution_role: WorkExecutionRole::Coordinator,
+            ..Self::control_plane()
+        }
+    }
+
     pub const fn service_executor() -> Self {
         Self {
             executor: RequiredExecutor::ServiceExecutor,
@@ -140,9 +207,9 @@ impl ToolRequirements {
         }
     }
 
-    pub const fn server_network_credentials() -> Self {
+    pub const fn service_or_runtime_network_credentials() -> Self {
         Self {
-            executor: RequiredExecutor::ServiceExecutor,
+            executor: RequiredExecutor::ServiceOrRuntimeExecutor,
             network: RequiredNetwork::AllowList,
             credentials: true,
             ..Self::none()
@@ -178,11 +245,16 @@ impl ToolRequirements {
     pub const fn shell() -> Self {
         Self {
             executor: RequiredExecutor::RuntimeExecutor,
-            workspace: RequiredWorkspace::ReadWrite,
+            // A shell is an execution capability, not inherently a workspace
+            // write.  Read-only runtimes still need it for diagnostics,
+            // builds, tests, and authenticated CLI reads.  The workspace
+            // mount/sandbox enforces physical write authority; invocation
+            // permission handles commands that request broader effects.
+            workspace: RequiredWorkspace::ReadOnly,
             process_spawn: true,
             shell: true,
             filesystem_read: true,
-            filesystem_write: true,
+            filesystem_write: false,
             ..Self::none()
         }
     }
@@ -191,6 +263,28 @@ impl ToolRequirements {
         Self {
             background_session: true,
             ..Self::shell()
+        }
+    }
+
+    /// Execute a project script whose contents are not available for
+    /// argument-level effect classification. Unlike an interactive shell
+    /// command, this capability requires a writable workspace up front.
+    pub const fn project_script() -> Self {
+        Self {
+            workspace: RequiredWorkspace::ReadWrite,
+            filesystem_write: true,
+            ..Self::shell()
+        }
+    }
+
+    /// Control an already-created runtime background session. These tools do
+    /// not themselves need shell or filesystem authority, but they do require
+    /// the runtime process registry that owns the task handle.
+    pub const fn background_session() -> Self {
+        Self {
+            executor: RequiredExecutor::RuntimeExecutor,
+            background_session: true,
+            ..Self::none()
         }
     }
 
@@ -211,6 +305,14 @@ impl ToolRequirements {
     pub const fn git_clone() -> Self {
         Self {
             network: RequiredNetwork::AllowList,
+            ..Self::git_write()
+        }
+    }
+
+    pub const fn git_remote_write() -> Self {
+        Self {
+            network: RequiredNetwork::AllowList,
+            credentials: true,
             ..Self::git_write()
         }
     }
@@ -264,6 +366,47 @@ impl ToolRegistry {
         self.tools.values()
     }
 
+    /// Whether a tool may appear in the surface for a coordinator or selected
+    /// WorkItem attempt. This is an authority property of the tool contract,
+    /// rather than a prompt convention or a caller-maintained name list, so
+    /// every topology applies the same role boundary.
+    pub fn permits_work_execution_role(&self, name: &str, work_item_attempt_bound: bool) -> bool {
+        self.permits_work_execution_context(
+            name,
+            if work_item_attempt_bound {
+                WorkExecutionContext::DelegatedAttempt
+            } else {
+                WorkExecutionContext::Coordinator
+            },
+        )
+    }
+
+    pub fn permits_work_execution_context(
+        &self,
+        name: &str,
+        context: WorkExecutionContext,
+    ) -> bool {
+        self.get(name).is_none_or(|spec| {
+            matches!(
+                (spec.required.work_execution_role, context),
+                (WorkExecutionRole::Any, _)
+                    | (
+                        WorkExecutionRole::Coordinator,
+                        WorkExecutionContext::Coordinator
+                    )
+                    | (
+                        WorkExecutionRole::CoordinatorOrPrimaryAttempt,
+                        WorkExecutionContext::Coordinator | WorkExecutionContext::PrimaryAttempt,
+                    )
+                    | (
+                        WorkExecutionRole::Attempt,
+                        WorkExecutionContext::PrimaryAttempt
+                            | WorkExecutionContext::DelegatedAttempt,
+                    )
+            )
+        })
+    }
+
     /// Content-addressed contract of one built-in tool. Unrelated registry
     /// additions do not invalidate durable invocations of this tool.
     pub fn tool_contract_version(&self, name: &str) -> Option<String> {
@@ -279,8 +422,17 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         // Blocking clarification is part of the default safety loop: when the
         // model needs a user decision, ask_user must already be callable.
         control_plane("ask_user", ToolLoadPolicy::AlwaysLoad),
-        control_plane("agent", ToolLoadPolicy::Deferred),
-        control_plane("agent_fanout", ToolLoadPolicy::Deferred),
+        // Child agents are an execution topology, not a second Work graph.
+        // A selected WorkItem may recursively decompose through this surface;
+        // capability, permission, depth and cancellation policy still apply.
+        // Single-child delegation and parallel fan-out are sibling execution
+        // topologies. Keep both schemas on the stable candidate surface: an
+        // asynchronous semantic admission may refine the recommendation, but
+        // it must not make the correct carrier undiscoverable on the first
+        // provider request. Capability, permission, depth and cancellation
+        // admission still decide whether either call may execute.
+        control_plane("agent", ToolLoadPolicy::AlwaysLoad),
+        control_plane("agent_fanout", ToolLoadPolicy::AlwaysLoad),
         control_plane("enter_plan_mode", ToolLoadPolicy::Deferred),
         control_plane("exit_plan_mode", ToolLoadPolicy::Deferred),
         control_plane("get_agent_info", ToolLoadPolicy::Deferred),
@@ -296,17 +448,56 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         control_plane("rollback_session_state", ToolLoadPolicy::Deferred),
         control_plane("session", ToolLoadPolicy::Deferred),
         control_plane("skill", ToolLoadPolicy::AlwaysLoad),
-        control_plane("task_board", ToolLoadPolicy::AlwaysLoad),
-        control_plane("task_output", ToolLoadPolicy::Deferred),
-        control_plane("task_stop", ToolLoadPolicy::Deferred),
-        control_plane("task_list", ToolLoadPolicy::Deferred),
+        work_coordinator_control_plane("start_work", ToolLoadPolicy::AlwaysLoad),
+        // This is intentionally distinct from the generic `agent` surface:
+        // it selects and starts one canonical Work item from durable state.
+        work_coordinator_or_primary_attempt_control_plane(
+            "run_next_work_item",
+            ToolLoadPolicy::AlwaysLoad,
+        ),
+        // Settlement authority is checked against the runtime-owned active
+        // attempt identity, so the tool can share one surface across primary
+        // and explicitly delegated execution without trusting model arguments.
+        work_attempt_control_plane("settle_work_item", ToolLoadPolicy::AlwaysLoad),
+        // Work planning is a core continuation surface, not an optional
+        // discovery feature. A bound session must be able to inspect and
+        // revise its durable graph without changing the tool schema epoch (or
+        // spending a model round on tool_search). Keeping these schemas on the
+        // stable candidate surface also makes a second `start_work` request a
+        // typed continuation rather than a discovery detour.
+        // The root run remains the Work coordinator while it executes a
+        // foreground WorkItem. User guidance may change the graph or its
+        // acceptance criteria mid-attempt; forcing the root to settle or
+        // abandon the attempt before it can inspect and revision-pin that
+        // change makes durable Work impossible to steer. Delegated attempts
+        // remain isolated and receive none of these graph-authoring tools.
+        work_coordinator_or_primary_attempt_control_plane(
+            "inspect_work_plan",
+            ToolLoadPolicy::AlwaysLoad,
+        ),
+        work_coordinator_or_primary_attempt_control_plane(
+            "propose_work_plan",
+            ToolLoadPolicy::AlwaysLoad,
+        ),
+        work_coordinator_or_primary_attempt_control_plane(
+            "inspect_work_criteria",
+            ToolLoadPolicy::AlwaysLoad,
+        ),
+        work_coordinator_or_primary_attempt_control_plane(
+            "propose_work_criteria",
+            ToolLoadPolicy::AlwaysLoad,
+        ),
+        background_control("task_output", ToolLoadPolicy::Deferred),
+        background_control("task_stop", ToolLoadPolicy::Deferred),
+        background_control("task_list", ToolLoadPolicy::Deferred),
         server_service("memory", ToolLoadPolicy::AlwaysLoad),
         server_service("mo_query", ToolLoadPolicy::Deferred),
         server_service("rollback_database_snapshots", ToolLoadPolicy::Deferred),
         control_plane("tool_search", ToolLoadPolicy::AlwaysLoad),
         shared_network("web_search", ToolLoadPolicy::Deferred),
         shared_network("web_fetch", ToolLoadPolicy::Deferred),
-        server_network_credentials("github", ToolLoadPolicy::Deferred),
+        service_or_runtime_network_credentials("github", ToolLoadPolicy::Deferred),
+        project_write("publish_artifact", ToolLoadPolicy::Deferred),
         project_read("read_file", ToolLoadPolicy::AlwaysLoad),
         project_read("list_dir", ToolLoadPolicy::AlwaysLoad),
         project_read("grep", ToolLoadPolicy::AlwaysLoad),
@@ -322,7 +513,7 @@ fn builtin_tool_specs() -> Vec<ToolSpec> {
         project_write("rollback_file_edits", ToolLoadPolicy::Deferred),
         shell("bash", ToolLoadPolicy::AlwaysLoad),
         shell("powershell", ToolLoadPolicy::Deferred),
-        shell("run_script", ToolLoadPolicy::Deferred),
+        project_script("run_script", ToolLoadPolicy::Deferred),
         background_shell("background_shell", ToolLoadPolicy::Internal),
         git_read("git", ToolLoadPolicy::AlwaysLoad),
         git_clone("git_clone", ToolLoadPolicy::Internal),
@@ -715,9 +906,15 @@ impl CapabilityResolver {
         args: &Value,
         capabilities: &EffectiveCapabilitySet,
     ) -> Result<(), ToolUnavailableReason> {
-        if tool_name == "git" && git_action_requires_write(args) {
-            let spec = git_write(tool_name, ToolLoadPolicy::AlwaysLoad);
-            return self.check(&spec, capabilities);
+        if tool_name == "git" {
+            if git_action_requires_remote_write(args) {
+                let spec = git_remote_write(tool_name, ToolLoadPolicy::AlwaysLoad);
+                return self.check(&spec, capabilities);
+            }
+            if git_action_requires_write(args) {
+                let spec = git_write(tool_name, ToolLoadPolicy::AlwaysLoad);
+                return self.check(&spec, capabilities);
+            }
         }
         if tool_name == "lsp" && lsp_action_requires_write(args) {
             let spec = project_write(tool_name, ToolLoadPolicy::Deferred);
@@ -1173,6 +1370,42 @@ fn control_plane(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     }
 }
 
+fn work_coordinator_control_plane(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
+    ToolSpec {
+        name: name.to_string(),
+        load_policy,
+        effect: ToolEffect::none(),
+        required: ToolRequirements::work_coordinator_control_plane(),
+    }
+}
+
+fn work_coordinator_or_primary_attempt_control_plane(
+    name: &str,
+    load_policy: ToolLoadPolicy,
+) -> ToolSpec {
+    ToolSpec {
+        name: name.to_string(),
+        load_policy,
+        required: ToolRequirements {
+            work_execution_role: WorkExecutionRole::CoordinatorOrPrimaryAttempt,
+            ..ToolRequirements::control_plane()
+        },
+        effect: ToolEffect::none(),
+    }
+}
+
+fn work_attempt_control_plane(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
+    ToolSpec {
+        name: name.to_string(),
+        load_policy,
+        required: ToolRequirements {
+            work_execution_role: WorkExecutionRole::Attempt,
+            ..ToolRequirements::control_plane()
+        },
+        effect: ToolEffect::none(),
+    }
+}
+
 fn server_service(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
         name: name.to_string(),
@@ -1194,7 +1427,7 @@ fn shared_network(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     }
 }
 
-fn server_network_credentials(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
+fn service_or_runtime_network_credentials(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
         name: name.to_string(),
         load_policy,
@@ -1203,7 +1436,7 @@ fn server_network_credentials(name: &str, load_policy: ToolLoadPolicy) -> ToolSp
             uses_credentials: true,
             ..ToolEffect::none()
         },
-        required: ToolRequirements::server_network_credentials(),
+        required: ToolRequirements::service_or_runtime_network_credentials(),
     }
 }
 
@@ -1228,6 +1461,10 @@ fn git_action_requires_write(args: &Value) -> bool {
         args.get("action").and_then(Value::as_str),
         Some("commit" | "stash" | "revert_commit" | "push" | "clone")
     )
+}
+
+fn git_action_requires_remote_write(args: &Value) -> bool {
+    matches!(args.get("action").and_then(Value::as_str), Some("push"))
 }
 
 fn lsp_action_requires_write(args: &Value) -> bool {
@@ -1272,6 +1509,20 @@ fn shell(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     }
 }
 
+fn project_script(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
+    ToolSpec {
+        name: name.to_string(),
+        load_policy,
+        effect: ToolEffect {
+            reads_workspace: true,
+            writes_workspace: true,
+            spawns_process: true,
+            ..ToolEffect::none()
+        },
+        required: ToolRequirements::project_script(),
+    }
+}
+
 fn background_shell(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
     ToolSpec {
         name: name.to_string(),
@@ -1282,6 +1533,15 @@ fn background_shell(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
             ..ToolEffect::none()
         },
         required: ToolRequirements::background_shell(),
+    }
+}
+
+fn background_control(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
+    ToolSpec {
+        name: name.to_string(),
+        load_policy,
+        effect: ToolEffect::none(),
+        required: ToolRequirements::background_session(),
     }
 }
 
@@ -1308,6 +1568,22 @@ fn git_write(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
             ..ToolEffect::none()
         },
         required: ToolRequirements::git_write(),
+    }
+}
+
+fn git_remote_write(name: &str, load_policy: ToolLoadPolicy) -> ToolSpec {
+    ToolSpec {
+        name: name.to_string(),
+        load_policy,
+        effect: ToolEffect {
+            reads_workspace: true,
+            writes_workspace: true,
+            uses_network: true,
+            uses_credentials: true,
+            mutates_external_state: true,
+            ..ToolEffect::none()
+        },
+        required: ToolRequirements::git_remote_write(),
     }
 }
 
@@ -1375,6 +1651,73 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    #[test]
+    fn work_execution_role_controls_attempt_and_coordinator_surfaces() {
+        let registry = registry();
+        let settlement = registry.get("settle_work_item").expect("settlement tool");
+        assert!(!settlement.required.work_item_attempt);
+        assert_eq!(
+            settlement.required.work_execution_role,
+            WorkExecutionRole::Attempt
+        );
+        // Visibility is not settlement authority: the runtime requires an
+        // exact active attempt owned by the current executor Run.
+        assert!(!registry.permits_work_execution_role("settle_work_item", false));
+        assert!(registry.permits_work_execution_role("settle_work_item", true));
+        assert!(registry.permits_work_execution_role("start_work", false));
+        assert!(!registry.permits_work_execution_role("start_work", true));
+        assert!(
+            !registry
+                .permits_work_execution_context("start_work", WorkExecutionContext::PrimaryAttempt)
+        );
+        assert!(
+            !registry.permits_work_execution_context(
+                "start_work",
+                WorkExecutionContext::DelegatedAttempt
+            )
+        );
+        assert!(registry.permits_work_execution_role("run_next_work_item", false));
+        assert!(!registry.permits_work_execution_role("run_next_work_item", true));
+        assert!(registry.permits_work_execution_context(
+            "run_next_work_item",
+            WorkExecutionContext::PrimaryAttempt
+        ));
+        for tool in [
+            "inspect_work_plan",
+            "propose_work_plan",
+            "inspect_work_criteria",
+            "propose_work_criteria",
+        ] {
+            assert!(
+                registry.permits_work_execution_context(tool, WorkExecutionContext::Coordinator)
+            );
+            assert!(
+                registry.permits_work_execution_context(tool, WorkExecutionContext::PrimaryAttempt)
+            );
+            assert!(
+                !registry
+                    .permits_work_execution_context(tool, WorkExecutionContext::DelegatedAttempt)
+            );
+        }
+        assert!(registry.permits_work_execution_role("web_fetch", false));
+        assert!(registry.permits_work_execution_role("web_fetch", true));
+    }
+
+    #[test]
+    fn settlement_contract_does_not_claim_a_child_run_requirement() {
+        let registry = registry();
+        let settlement = serde_json::to_value(
+            registry
+                .get("settle_work_item")
+                .expect("attempt settlement"),
+        )
+        .expect("serialize settlement contract");
+        assert!(
+            settlement.pointer("/required/work_item_attempt").is_none(),
+            "primary-session attempts must not be represented as child-run requirements"
+        );
     }
 
     #[test]
@@ -1640,6 +1983,63 @@ mod tests {
     }
 
     #[test]
+    fn execution_topology_entrypoints_are_always_load() {
+        let registry = registry();
+        for name in ["agent", "agent_fanout"] {
+            let spec = registry
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} registered"));
+            assert_eq!(spec.required.executor, RequiredExecutor::ControlPlane);
+            assert_eq!(
+                spec.required.work_execution_role,
+                WorkExecutionRole::Any,
+                "{name} is recursive execution topology, not Work graph authority"
+            );
+            assert_eq!(
+                spec.load_policy,
+                ToolLoadPolicy::AlwaysLoad,
+                "{name} must be selectable on the first provider request"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_topology_is_available_at_every_work_execution_depth() {
+        let registry = registry();
+        for tool in ["agent", "agent_fanout"] {
+            for context in [
+                WorkExecutionContext::Coordinator,
+                WorkExecutionContext::PrimaryAttempt,
+                WorkExecutionContext::DelegatedAttempt,
+            ] {
+                assert!(
+                    registry.permits_work_execution_context(tool, context),
+                    "{tool} must remain an execution topology in {context:?}"
+                );
+            }
+        }
+        assert!(
+            !registry
+                .permits_work_execution_context("start_work", WorkExecutionContext::PrimaryAttempt),
+            "recursive execution must not grant recursive Work authoring"
+        );
+    }
+
+    #[test]
+    fn background_task_controls_require_the_runtime_process_registry() {
+        let registry = registry();
+        for name in ["task_list", "task_output", "task_stop"] {
+            let spec = registry
+                .get(name)
+                .unwrap_or_else(|| panic!("{name} registered"));
+            assert_eq!(spec.required.executor, RequiredExecutor::RuntimeExecutor);
+            assert!(spec.required.background_session);
+            assert!(!spec.required.shell);
+            assert_eq!(spec.required.workspace, RequiredWorkspace::None);
+        }
+    }
+
+    #[test]
     fn dynamic_mcp_tools_are_request_scoped_deferred_not_builtin_always_load() {
         let registry = registry();
         let name = "mcp__filesystem__read_file";
@@ -1888,13 +2288,13 @@ mod tests {
             binding.runtime.launch_driver,
             crate::RuntimeLaunchDriver::Kubernetes
         );
-        for tool in ["read_file", "list_dir", "grep", "glob", "git"] {
+        for tool in ["read_file", "list_dir", "grep", "glob", "git", "bash"] {
             assert!(
                 binding.tool_surface.contains(tool),
                 "{tool} should be visible for read-only snapshot with runtime"
             );
         }
-        for tool in ["write_file", "str_replace", "bash", "run_script"] {
+        for tool in ["write_file", "str_replace", "run_script"] {
             assert!(
                 !binding.tool_surface.contains(tool),
                 "{tool} must stay hidden for read-only snapshot"
@@ -1977,6 +2377,61 @@ mod tests {
                 &binding.capabilities,
             ),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn git_push_requires_network_and_credentials_beyond_local_git_writes() {
+        let registry = registry();
+        let workspace = WorkspaceBinding::local_filesystem("/repo", WorkspaceAuthority::ReadWrite);
+        let executor = ExecutorBinding::local_cli();
+        let runtime = RuntimeBinding::host_process("local-host");
+
+        let mut no_network = PolicyIntent::local_developer();
+        no_network.network = crate::NetworkPolicy::Disabled;
+        let no_network = RunBinding::resolve(
+            workspace.clone(),
+            executor.clone(),
+            runtime.clone(),
+            no_network,
+            &registry,
+        );
+        assert_eq!(
+            CapabilityResolver.check_tool_call(
+                &registry,
+                "git",
+                &serde_json::json!({"action": "push"}),
+                &no_network.capabilities,
+            ),
+            Err(ToolUnavailableReason::PolicyDenied(
+                "network_allow_list".to_string()
+            ))
+        );
+        assert_eq!(
+            CapabilityResolver.check_tool_call(
+                &registry,
+                "git",
+                &serde_json::json!({"action": "commit"}),
+                &no_network.capabilities,
+            ),
+            Ok(()),
+            "a local commit does not require network authority"
+        );
+
+        let mut no_credentials = PolicyIntent::local_developer();
+        no_credentials.credentials = crate::CredentialPolicy::Disabled;
+        let no_credentials =
+            RunBinding::resolve(workspace, executor, runtime, no_credentials, &registry);
+        assert_eq!(
+            CapabilityResolver.check_tool_call(
+                &registry,
+                "git",
+                &serde_json::json!({"action": "push"}),
+                &no_credentials.capabilities,
+            ),
+            Err(ToolUnavailableReason::PolicyDenied(
+                "credentials".to_string()
+            ))
         );
     }
 
@@ -2216,7 +2671,7 @@ mod tests {
         let registry = registry();
         let binding = RunBinding::edge_developer("/repo", &registry);
         let schemas = vec![
-            serde_json::json!({"type": "function", "function": {"name": "task_board"}}),
+            serde_json::json!({"type": "function", "function": {"name": "inspect_work_plan"}}),
             serde_json::json!({"type": "function", "function": {"name": "introspect"}}),
             serde_json::json!({"type": "function", "function": {"name": "reflect"}}),
             serde_json::json!({"type": "function", "function": {"name": "agent_fanout"}}),
@@ -2234,7 +2689,7 @@ mod tests {
         assert!(names.iter().any(|name| name == "read_file"));
         assert!(names.iter().any(|name| name == "bash"));
         for hidden in [
-            "task_board",
+            "inspect_work_plan",
             "introspect",
             "reflect",
             "agent_fanout",

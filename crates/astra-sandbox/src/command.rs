@@ -448,7 +448,7 @@ fn workspace_out_write_target(command: &str, workspace_root: Option<&Path>) -> O
         return Some(target);
     }
 
-    let commands = super::bash_ast::simple_command_words(command)?;
+    let commands = super::bash_ast::parse_plain_bash_commands(command)?;
     for words in commands {
         let Some((executable, arguments)) = effective_mutation_command(&words) else {
             continue;

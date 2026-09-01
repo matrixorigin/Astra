@@ -98,7 +98,17 @@ impl TerminalGuard {
         let early_guard = RawModeGuard;
 
         let backend = CrosstermBackend::new(stdout());
-        let terminal = CustomTerminal::with_options(backend)?;
+        let mut terminal = CustomTerminal::with_options(backend)?;
+        // Startup diagnostics and the banner are printed before the TUI takes
+        // ownership of the terminal.  A terminal that reports its cursor at
+        // the origin cannot safely preserve that inline output: the first
+        // viewport would overwrite only changed cells and leave stale
+        // characters behind.  Clear that ambiguous origin case once, while
+        // retaining the normal inline banner for terminals that report a
+        // non-zero cursor row.
+        if terminal.viewport_area.top() == 0 {
+            terminal.clear_visible_screen()?;
+        }
 
         let is_zellij = std::env::var("ZELLIJ_SESSION_NAME").is_ok();
         let guard = Self {
@@ -510,7 +520,7 @@ impl Drop for TerminalGuard {
         let _ = execute!(stdout(), cursor::MoveTo(0, area.bottom()), cursor::Show);
         let _ = disable_raw_mode();
         let _ = execute!(stdout(), DisableBracketedPaste);
-        let _ = println!();
+        let _ = stdout_println!();
     }
 }
 

@@ -638,6 +638,18 @@ pub fn merge_sandbox_denied_tool_result_fields(
         MESSAGE_FIELD.to_string(),
         Value::String(normalize_sandbox_denied_message(message).into_owned()),
     );
+    fields.insert("status".to_string(), Value::String("failed".to_string()));
+    fields.insert("retryable".to_string(), Value::Bool(false));
+    fields.insert(
+        "recovery_evidence".to_string(),
+        serde_json::to_value(astra_core::ToolFailureEvidence::new(
+            astra_core::ErrorKind::PolicyDenied,
+            astra_core::ToolFailureCause::PermissionBoundary,
+            false,
+            vec![astra_core::ToolRecoveryAction::SelectAvailableCapability],
+        ))
+        .expect("sandbox denial evidence must serialize"),
+    );
     fields
 }
 
@@ -702,6 +714,8 @@ fn quote_aware_tokens(input: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::Value;
+
     use super::{
         SANDBOX_DENIED_ERROR_KIND, SANDBOX_DENIED_PREFIX, explicit_file_tool_path_arg,
         explicit_file_tool_path_targets, extract_first_absolute_path,
@@ -1254,6 +1268,12 @@ mod tests {
             fields.get("message").and_then(|value| value.as_str()),
             Some("path outside")
         );
+        assert_eq!(fields.get("status").and_then(Value::as_str), Some("failed"));
+        assert_eq!(
+            fields.get("retryable").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(fields["recovery_evidence"]["cause"], "permission_boundary");
     }
 
     #[test]

@@ -8,12 +8,17 @@ use astra_services::ExternalAuthProviderConfig;
 pub(super) fn build_auth_service(
     settings: &AppSettings,
     shared_pool: &SharedPool,
+    control_pool: Option<&SharedPool>,
     shared_encryptor: &Arc<FernetTokenEncryptor>,
 ) -> Result<Arc<dyn AuthService>, Box<dyn std::error::Error>> {
+    let mut service = DatabaseAuthService::new(settings.matrixone.clone(), settings.jwt.clone())
+        .with_pool(shared_pool.clone())
+        .with_encryptor(shared_encryptor.as_ref().clone());
+    if let Some(control_pool) = control_pool {
+        service = service.with_control_pool(control_pool.clone());
+    }
     Ok(Arc::new(
-        DatabaseAuthService::new(settings.matrixone.clone(), settings.jwt.clone())
-            .with_pool(shared_pool.clone())
-            .with_encryptor(shared_encryptor.as_ref().clone())
+        service
             .with_provider_request_auth(settings.provider_request_auth.clone())
             .with_edge_token_auth(settings.edge_token_auth.clone())
             .with_external_providers(
@@ -35,9 +40,23 @@ pub(super) fn build_auth_service(
     ))
 }
 
+fn build_health_checker(
+    settings: &AppSettings,
+    shared_pool: &SharedPool,
+    control_pool: Option<&SharedPool>,
+) -> MatrixOneHealthChecker {
+    let checker =
+        MatrixOneHealthChecker::new(settings.matrixone.clone()).with_pool(shared_pool.clone());
+    match control_pool {
+        Some(pool) => checker.with_control_pool(pool.clone()),
+        None => checker,
+    }
+}
+
 pub(super) fn build_core_state(
     settings: &AppSettings,
     shared_pool: &SharedPool,
+    control_pool: Option<&SharedPool>,
     shared_encryptor: &Arc<FernetTokenEncryptor>,
     auth_service: Arc<dyn AuthService>,
 ) -> AppState {
@@ -61,16 +80,10 @@ pub(super) fn build_core_state(
         shared_pool.clone(),
         Arc::clone(&session_context_coordinator),
     ));
-    let session_publish_service = Arc::new(astra_services::DatabaseSessionPublishService::new(
-        shared_pool.clone(),
-        Arc::clone(&session_context_coordinator),
-    ));
 
     AppState::new(
         ServiceInfo::default(),
-        Arc::new(
-            MatrixOneHealthChecker::new(settings.matrixone.clone()).with_pool(shared_pool.clone()),
-        ),
+        Arc::new(build_health_checker(settings, shared_pool, control_pool)),
     )
     .with_cors_origins(settings.api.cors_origins.clone())
     .with_shared_pool(shared_pool.clone())
@@ -80,7 +93,6 @@ pub(super) fn build_core_state(
     )
     .with_session_handoff_service(session_handoff_service)
     .with_session_fork_coordinator(session_fork_coordinator)
-    .with_session_publish_service(session_publish_service)
     .with_plan_repository(Arc::new(astra_plan::CloudPlanRepository::new(
         shared_pool.get().clone(),
     )))
@@ -208,48 +220,42 @@ pub(super) fn install_admin_services(
     state: AppState,
     settings: &AppSettings,
     shared_pool: &SharedPool,
+    control_pool: Option<&SharedPool>,
 ) -> Result<AppState, Box<dyn std::error::Error>> {
+    let pool = control_pool.unwrap_or(shared_pool);
     Ok(state
         .with_admin_authorizer(Arc::new(
             DatabaseAdminAuthorizer::new(settings.matrixone.clone(), settings.jwt.clone())
-                .with_pool(shared_pool.clone()),
+                .with_pool(pool.clone()),
         ))
         .with_admin_initializer(Arc::new(
-            DatabaseAdminInitializer::new(settings.matrixone.clone())
-                .with_pool(shared_pool.clone()),
+            DatabaseAdminInitializer::new(settings.matrixone.clone()).with_pool(pool.clone()),
         ))
         .with_admin_token_writer(Arc::new(
             DatabaseAdminTokenWriter::from_env(settings.matrixone.clone())
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?
-                .with_pool(shared_pool.clone()),
+                .with_pool(pool.clone()),
         ))
         .with_admin_token_reader(Arc::new(
-            DatabaseAdminTokenReader::new(settings.matrixone.clone())
-                .with_pool(shared_pool.clone()),
+            DatabaseAdminTokenReader::new(settings.matrixone.clone()).with_pool(pool.clone()),
         ))
         .with_admin_audit_reader(Arc::new(
-            DatabaseAdminAuditReader::new(settings.matrixone.clone())
-                .with_pool(shared_pool.clone()),
+            DatabaseAdminAuditReader::new(settings.matrixone.clone()).with_pool(pool.clone()),
         ))
         .with_admin_feedback_stats_reader(Arc::new(
             DatabaseAdminFeedbackStatsReader::new(settings.matrixone.clone())
-                .with_pool(shared_pool.clone()),
+                .with_pool(pool.clone()),
         ))
         .with_admin_user_role_manager(Arc::new(
-            DatabaseAdminUserRoleManager::new(settings.matrixone.clone())
-                .with_pool(shared_pool.clone()),
+            DatabaseAdminUserRoleManager::new(settings.matrixone.clone()).with_pool(pool.clone()),
         ))
         .with_admin_config_service(Arc::new(
             astra_services::DatabaseAdminConfigService::new(settings.matrixone.clone())
-                .with_pool(shared_pool.clone()),
+                .with_pool(pool.clone()),
         )))
 }
 
-pub(super) fn install_execution_services(
-    state: AppState,
-    shared_pool: &SharedPool,
-    lease_hold_cache: &Arc<TaskLeaseHoldCache>,
-) -> AppState {
+pub(super) fn install_execution_services(state: AppState, shared_pool: &SharedPool) -> AppState {
     let metrics = state.multi_agent_metrics.clone();
     let edge_registry_service: Arc<dyn EdgeRegistryService> = Arc::new(
         DatabaseEdgeRegistryService::from_shared(shared_pool).with_metrics(metrics.clone()),
@@ -264,13 +270,8 @@ pub(super) fn install_execution_services(
         &load_deployment_tool_policy(),
     );
     state
-        .with_task_service(Arc::new(MatrixOneTaskService::from_shared(shared_pool)))
         .with_edge_registry_service(edge_registry_service)
         .with_edge_dispatch_service(edge_dispatch_service)
-        .with_task_lease_service(Arc::new(
-            DatabaseTaskLeaseService::from_shared(shared_pool, Arc::clone(lease_hold_cache))
-                .with_metrics(metrics),
-        ))
         .with_tool_execution_service(tool_execution_service)
 }
 

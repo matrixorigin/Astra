@@ -5,6 +5,7 @@ import {
   useCallback,
   useEffect,
   useRef,
+  useState,
   type Dispatch,
   type SetStateAction,
 } from "react";
@@ -14,11 +15,13 @@ import {
   getChatWorkSurface,
   getChatWorkSurfaceRun,
   queueChatRunInput,
+  respondChatRunApproval,
   resumeChatRun,
   stopChatRun,
   streamChatMessage,
   streamExistingChatRun,
   updateChatModel,
+  type PendingRunApproval,
 } from "@/lib/api/chats";
 import { mergeStreamRunUpdate } from "@/lib/api/active-run-merge";
 import { createAssistantPatchController } from "@/lib/api/assistant-patch-controller";
@@ -179,6 +182,9 @@ export interface UseStreamLifecycleParams {
 }
 
 export interface UseStreamLifecycleReturn {
+  pendingApproval: PendingRunApproval | null;
+  approvalResponsePending: boolean;
+  respondToApproval: (decision: "allow" | "deny") => Promise<void>;
   nextStreamAbortSignal: () => AbortSignal;
   applyWorkSurfaceStreamEvent: (event: WorkSurfaceEvent) => void;
   resetWorkSurfaceRun: (
@@ -269,6 +275,14 @@ export function useStreamLifecycle(
     }
   });
   const runControlMutationRef = useRef(false);
+  const [pendingApproval, setPendingApproval] = useState<PendingRunApproval | null>(null);
+  const [approvalResponsePending, setApprovalResponsePending] = useState(false);
+  const handleApprovalRequired = useCallback((approval: PendingRunApproval) => {
+    setPendingApproval(approval);
+  }, []);
+  const clearPendingInteraction = useCallback(() => {
+    setPendingApproval(null);
+  }, []);
   const workSurfaceRepairInFlightRef = useRef(false);
   const workSurfaceRepairPendingRef = useRef(false);
 
@@ -486,6 +500,8 @@ export function useStreamLifecycle(
         {
           signal: nextStreamAbortSignal(),
           onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
+          onApprovalRequired: handleApprovalRequired,
+          onInteractionResolved: clearPendingInteraction,
           onRunUpdated: (run) => {
             setDetail((current) => ({
               ...current,
@@ -715,6 +731,8 @@ export function useStreamLifecycle(
         await streamChatMessage(detail.chat.id, streamPayload, {
           signal: nextStreamAbortSignal(),
           onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
+          onApprovalRequired: handleApprovalRequired,
+          onInteractionResolved: clearPendingInteraction,
           onLocalMessages: ({
             userMessage: localUserMessage,
             assistantMessage: localAssistantMessage,
@@ -1006,6 +1024,8 @@ export function useStreamLifecycle(
           {
             signal: nextStreamAbortSignal(),
             onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
+            onApprovalRequired: handleApprovalRequired,
+            onInteractionResolved: clearPendingInteraction,
             onRunUpdated: (run) => {
               setDetail((current) => ({
                 ...current,
@@ -1384,6 +1404,8 @@ export function useStreamLifecycle(
           {
             signal: nextStreamAbortSignal(),
             onWorkSurfaceEvent: applyWorkSurfaceStreamEvent,
+            onApprovalRequired: handleApprovalRequired,
+            onInteractionResolved: clearPendingInteraction,
             onRunUpdated: (run) => {
               setDetail((current) => ({
                 ...current,
@@ -1603,6 +1625,35 @@ export function useStreamLifecycle(
     [detail.chat.id, detail.chat.model, setDetail],
   );
 
+  const respondToApproval = useCallback(
+    async (decision: "allow" | "deny") => {
+      if (!pendingApproval || approvalResponsePending) return;
+      const approval = pendingApproval;
+      setApprovalResponsePending(true);
+      try {
+        await respondChatRunApproval(detail.chat.id, approval, decision);
+        setPendingApproval((current) =>
+          current?.requestId === approval.requestId ? null : current,
+        );
+      } catch (error) {
+        addToast(
+          error instanceof Error
+            ? error.message
+            : "Failed to submit the approval decision.",
+          "error",
+        );
+      } finally {
+        setApprovalResponsePending(false);
+      }
+    },
+    [
+      addToast,
+      approvalResponsePending,
+      detail.chat.id,
+      pendingApproval,
+    ],
+  );
+
   // -- Cleanup on unmount --
   useEffect(() => {
     const stopReconcile = stopReconcileRef.current;
@@ -1628,6 +1679,9 @@ export function useStreamLifecycle(
   ]);
 
   return {
+    pendingApproval,
+    approvalResponsePending,
+    respondToApproval,
     nextStreamAbortSignal,
     applyWorkSurfaceStreamEvent,
     resetWorkSurfaceRun,

@@ -35,7 +35,6 @@ use cli::slash::slash_router::handle_slash_command;
 // SSE streaming types moved to cli/streaming_types.rs
 // Session state moved to cli/session_state.rs
 #[cfg(test)]
-pub(crate) use crate::cli::plan::plan_monitor::{format_duration_short, format_plan_progress};
 #[cfg(test)]
 pub(crate) use cli::session::session_state::SessionState;
 
@@ -113,8 +112,17 @@ mod trace_overlay_tests {
     }
 }
 
-#[tokio::main]
-pub async fn run() -> i32 {
+pub fn run() -> i32 {
+    match astra_core::process_runtime::build_process_runtime() {
+        Ok(runtime) => runtime.block_on(run_async()),
+        Err(error) => {
+            eprintln!("Error: unable to initialize Astra runtime: {error}");
+            3
+        }
+    }
+}
+
+async fn run_async() -> i32 {
     let explicit_env_config = match astra_core::config::explicit_env_config_requested() {
         Ok(value) => value,
         Err(error) => {
@@ -129,12 +137,21 @@ pub async fn run() -> i32 {
         Ok(cli) => cli,
         Err(error) => {
             let exit_code = error.exit_code();
-            if let Err(print_error) = error.print() {
-                eprintln!("Error: failed to render command-line diagnostics: {print_error}");
+            if error.use_stderr() {
+                if let Err(print_error) = error.print() {
+                    eprintln!("Error: failed to render command-line diagnostics: {print_error}");
+                }
+            } else {
+                let rendered = error.render().to_string();
+                let _ = crate::cli::stream::output_sink::write_stdout_records(&rendered);
             }
             return exit_code;
         }
     };
+    if let Err(error) = cli.validate_external_message_shorthand() {
+        eprintln!("Error: {error}");
+        return 2;
+    }
     cli::diagnostic_log::init_cli_observability(&cli);
     let mut cli_overlay = astra_config::runtime_config::RuntimeConfig::default();
     let mut has_cli_overlay = false;
@@ -173,14 +190,6 @@ pub async fn run() -> i32 {
                 return 2;
             }
         }
-    }
-    if let Some(turns) = cli.max_turns {
-        let Ok(turns) = u32::try_from(turns) else {
-            eprintln!("{}", "Error: --max-turns exceeds u32 range".red());
-            return 2;
-        };
-        cli_overlay.runtime_limits.max_turns = turns;
-        has_cli_overlay = true;
     }
     match apply_trace_cli_overlay(
         &mut cli_overlay,
@@ -248,8 +257,6 @@ pub async fn run() -> i32 {
         resume,
         yes: auto_approve,
         system_prompt,
-        max_turns,
-        max_budget,
         allowed_tools,
         disallowed_tools,
         add_dir,
@@ -287,7 +294,6 @@ pub async fn run() -> i32 {
     let _ = (startup_trace, bare);
     let cli_context = match cli::cli_config::cli_context::CliContext::from_launch_options(
         no_journal_content,
-        max_turns,
         &allowed_tools,
         &disallowed_tools,
         &add_dir,
@@ -429,7 +435,6 @@ pub async fn run() -> i32 {
                     resolved_model.as_deref(),
                     Some(&sid),
                     no_instructions,
-                    max_budget,
                     &cli_context,
                 )
                 .await;
@@ -459,7 +464,6 @@ pub async fn run() -> i32 {
         system_prompt,
         &api,
         no_instructions,
-        max_budget,
         &cli_context,
     )
     .await
@@ -477,8 +481,8 @@ mod tests {
     pub(crate) use crate::test_utils::isolate_credentials;
 
     use super::{
-        Cli, SessionState, cli, execute_cli_command, format_duration_short, format_plan_progress,
-        format_project_instructions, handle_slash_command, resolve_system_prompt, session_journal,
+        Cli, SessionState, cli, execute_cli_command, format_project_instructions,
+        handle_slash_command, resolve_system_prompt, session_journal,
     };
     use astra_runtime::prompts;
     use axum::{Router, routing::get, routing::post};
@@ -489,13 +493,13 @@ mod tests {
         SessionShowArgs,
     };
     use cli::cli_config::cli_utils::{
-        CredentialsFile, Profile, load_credentials, prefix_chars, save_credentials,
+        CredentialsFile, Profile, load_credentials, save_credentials,
     };
     use cli::permission_manager;
     use cli::project_instructions::discover_instructions_from_paths;
     use cli::session::session_runtime::initialize_session_state;
     use cli::slash::slash_memory::handle_memory_domain_command;
-    use cli::slash::{slash_health, slash_stats, slash_task, slash_tools};
+    use cli::slash::{slash_health, slash_stats, slash_tools};
 
     async fn mock_models_response() -> axum::Json<serde_json::Value> {
         axum::Json(crate::test_utils::mock_model_catalog_json(&[
@@ -675,21 +679,27 @@ mod tests {
         let app = Router::new().route(
             "/models",
             get(|| async {
-                axum::Json(serde_json::json!([{
-                    "offering_id": "offer-model",
-                    "access_id": "self-hosted",
-                    "access_kind": "self_hosted",
-                    "access_label": "Self-hosted",
-                    "execution_placement": "server",
-                    "name": "Display Model",
-                    "provider": "openai",
-                    "description": null,
-                    "is_active": true,
-                    "context_window": 128000,
-                    "max_completion_tokens": null,
-                    "architecture": null,
-                    "thinking_capability": null
-                }]))
+                axum::Json(serde_json::json!({
+                    "items": [{
+                        "offering_id": "offer-model",
+                        "access_id": "self-hosted",
+                        "access_kind": "self_hosted",
+                        "access_label": "Self-hosted",
+                        "execution_placement": "server",
+                        "name": "Display Model",
+                        "provider": "openai",
+                        "description": null,
+                        "is_active": true,
+                        "context_window": 128000,
+                        "max_completion_tokens": null,
+                        "architecture": null,
+                        "thinking_capability": null
+                    }],
+                    "next_cursor": null,
+                    "limit": 50,
+                    "total": 1,
+                    "catalog_revision": "sha256:test"
+                }))
             }),
         );
         let base = spawn_mock_app(app).await;
@@ -758,7 +768,15 @@ mod tests {
     async fn slash_model_with_token_does_not_update_state_when_model_list_is_empty() {
         let app = Router::new().route(
             "/models",
-            get(|| async { axum::Json(serde_json::json!([])) }),
+            get(|| async {
+                axum::Json(serde_json::json!({
+                    "items": [],
+                    "next_cursor": null,
+                    "limit": 50,
+                    "total": 0,
+                    "catalog_revision": "sha256:empty"
+                }))
+            }),
         );
         let base = spawn_mock_app(app).await;
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
@@ -897,7 +915,6 @@ mod tests {
             None,
             &api,
             false,
-            0.0,
             &cli::cli_config::cli_context::CliContext::default(),
         )
         .await;
@@ -916,7 +933,6 @@ mod tests {
             None,
             &api,
             false,
-            0.0,
             &cli::cli_config::cli_context::CliContext::default(),
         )
         .await;
@@ -962,7 +978,6 @@ mod tests {
             None,
             &api,
             false,
-            0.0,
             &cli::cli_config::cli_context::CliContext::default(),
         )
         .await;
@@ -1012,7 +1027,6 @@ mod tests {
             None,
             &api,
             false,
-            0.0,
             &cli::cli_config::cli_context::CliContext::default(),
         )
         .await;
@@ -1042,7 +1056,6 @@ mod tests {
             None,
             &api,
             false,
-            0.0,
             &cli::cli_config::cli_context::CliContext::default(),
         )
         .await
@@ -1064,7 +1077,6 @@ mod tests {
             None,
             &api,
             false,
-            0.0,
             &cli::cli_config::cli_context::CliContext::default(),
         )
         .await
@@ -1086,7 +1098,6 @@ mod tests {
             None,
             &api,
             false,
-            0.0,
             &cli::cli_config::cli_context::CliContext::default(),
         )
         .await
@@ -1110,7 +1121,6 @@ mod tests {
             None,
             &api,
             false,
-            0.0,
             &cli::cli_config::cli_context::CliContext::default(),
         )
         .await
@@ -1206,125 +1216,6 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
-    }
-
-    // ── find_task_by_query ────────────────────────────────────────────────────
-
-    use astra_services::TaskService as _;
-
-    #[tokio::test]
-    async fn find_task_by_id_prefix() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
-        let tid = svc
-            .create_task(
-                "u1",
-                "s1",
-                astra_services::TaskCreateRequest {
-                    title: "Build auth".into(),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-
-        // Full ID match
-        let found = slash_task::find_task_by_query(&svc, "u1", &tid)
-            .await
-            .unwrap();
-        assert_eq!(found, Some(tid.clone()));
-
-        // Prefix match (first 8 Unicode scalars)
-        let prefix = prefix_chars(&tid, 8);
-        let found = slash_task::find_task_by_query(&svc, "u1", &prefix)
-            .await
-            .unwrap();
-        assert_eq!(found, Some(tid));
-    }
-
-    #[tokio::test]
-    async fn find_task_by_title_substring() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
-        svc.create_task(
-            "u1",
-            "s1",
-            astra_services::TaskCreateRequest {
-                title: "Refactor authentication module".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        // Case-insensitive title match
-        let found = slash_task::find_task_by_query(&svc, "u1", "authentication")
-            .await
-            .unwrap();
-        assert!(found.is_some());
-
-        let found = slash_task::find_task_by_query(&svc, "u1", "AUTH")
-            .await
-            .unwrap();
-        assert!(found.is_some());
-    }
-
-    #[tokio::test]
-    async fn find_task_by_title_substring_fails_on_ambiguity() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
-        for title in [
-            "Refactor authentication module",
-            "Refactor authentication tests",
-        ] {
-            svc.create_task(
-                "u1",
-                "s1",
-                astra_services::TaskCreateRequest {
-                    title: title.into(),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        }
-
-        let err = slash_task::find_task_by_query(&svc, "u1", "authentication")
-            .await
-            .unwrap_err();
-        assert!(err.contains("task query 'authentication' is ambiguous"));
-    }
-
-    #[tokio::test]
-    async fn find_task_not_found() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
-        let found = slash_task::find_task_by_query(&svc, "u1", "nonexistent")
-            .await
-            .unwrap();
-        assert!(found.is_none());
-    }
-
-    #[tokio::test]
-    async fn find_task_wrong_user() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
-        svc.create_task(
-            "user-a",
-            "s1",
-            astra_services::TaskCreateRequest {
-                title: "Private task".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        // Different user can't find it
-        let found = slash_task::find_task_by_query(&svc, "user-b", "Private")
-            .await
-            .unwrap();
-        assert!(found.is_none());
     }
 
     // ── Resume user verification ─────────────────────────────────────────────
@@ -1837,47 +1728,6 @@ total_tokens_out: 500
         assert!(!exit);
     }
 
-    #[test]
-    fn format_duration_short_values() {
-        let cases = [(0u64, "0s"), (45, "45s"), (92, "1m32s"), (7500, "2h5m")];
-        for (secs, expected) in cases {
-            assert_eq!(
-                format_duration_short(std::time::Duration::from_secs(secs)),
-                expected,
-                "failed for {secs}s"
-            );
-        }
-    }
-
-    #[test]
-    fn format_plan_progress_values() {
-        // empty
-        let s = format_plan_progress(0, 0, None, std::time::Duration::from_secs(0));
-        assert!(s.contains("0/0 (0%)"));
-        assert!(s.contains("0s elapsed"));
-
-        // first subtask, no ETA when done==0
-        let s = format_plan_progress(0, 5, None, std::time::Duration::from_secs(10));
-        assert!(s.contains("0/5 (0%)"));
-        assert!(!s.contains("remaining"));
-
-        // midway with ETA
-        let avg = Some(std::time::Duration::from_secs(60));
-        let s = format_plan_progress(3, 7, avg, std::time::Duration::from_secs(180));
-        assert!(s.contains("3/7 (42%)"));
-        assert!(s.contains("~4m0s remaining"));
-
-        // complete
-        let avg = Some(std::time::Duration::from_secs(30));
-        let s = format_plan_progress(5, 5, avg, std::time::Duration::from_secs(150));
-        assert!(s.contains("5/5 (100%)"));
-        assert!(s.contains("remaining"));
-
-        // bar fills at 50%
-        let s = format_plan_progress(3, 6, None, std::time::Duration::from_secs(0));
-        assert!(s.contains("████████░░░░░░░░"));
-    }
-
     // ── /allow command tests ──
 
     #[test]
@@ -1910,7 +1760,6 @@ total_tokens_out: 500
             None,
             &cli::cli_config::cli_context::CliContext::from_launch_options(
                 false,
-                None,
                 &[],
                 &[],
                 &[],
@@ -1931,7 +1780,6 @@ total_tokens_out: 500
     fn session_state_invalid_permission_mode_does_not_fallback_to_prompt() {
         let context = cli::cli_config::cli_context::CliContext::from_launch_options(
             false,
-            None,
             &[],
             &[],
             &[],
@@ -1949,7 +1797,6 @@ total_tokens_out: 500
     fn session_state_cli_context_permission_mode_overrides_auto_approve() {
         let context = cli::cli_config::cli_context::CliContext::from_launch_options(
             false,
-            None,
             &[],
             &[],
             &[],
@@ -1967,82 +1814,6 @@ total_tokens_out: 500
             permission_manager::PermissionMode::Plan
         );
     }
-
-    #[tokio::test]
-    async fn task_run_stores_result_in_checkpoint() {
-        use astra_services::{TaskCreateRequest, TaskService, task_orchestrator::TaskCheckpoint};
-
-        // Use a temp dir for LocalTaskService
-        let tmp = tempfile::tempdir().unwrap();
-        let svc = astra_services::LocalTaskService::new(tmp.path().to_path_buf());
-
-        // Create a task record (simulates what `astra task run` does).
-        let tid = svc
-            .create_task(
-                "test-user",
-                "test-session",
-                TaskCreateRequest {
-                    title: "run: test prompt".to_string(),
-                    description: Some("test prompt".to_string()),
-                    plan: None,
-                    parent_task_id: None,
-                    project_type: None,
-                    goal_pattern: None,
-                },
-            )
-            .await
-            .unwrap();
-
-        // Mark in-progress
-        svc.update_status("test-user", &tid, astra_services::TaskStatus::InProgress)
-            .await
-            .unwrap();
-
-        // Save checkpoint with result (simulates background task completion)
-        let mut state_map = serde_json::Map::new();
-        state_map.insert(
-            "full_text".to_string(),
-            serde_json::Value::String("Hello from agent".to_string()),
-        );
-        state_map.insert("prompt_tokens".to_string(), serde_json::json!(100));
-        state_map.insert("completion_tokens".to_string(), serde_json::json!(50));
-        state_map.insert("tool_calls_count".to_string(), serde_json::json!(3));
-
-        svc.save_checkpoint(
-            "test-user",
-            &tid,
-            &TaskCheckpoint {
-                active_subtask_id: None,
-                turn: 0,
-                session_id: Some("test-session".to_string()),
-                state: state_map,
-            },
-        )
-        .await
-        .unwrap();
-
-        // Complete the task
-        svc.complete_task("test-user", &tid).await.unwrap();
-
-        // Read back and verify (simulates `astra task result`).
-        let record = svc.get_task("test-user", &tid).await.unwrap().unwrap();
-        assert_eq!(record.status, astra_services::TaskStatus::Completed);
-        let cp = record.checkpoint.unwrap();
-        assert_eq!(
-            cp.state.get("full_text").and_then(|v| v.as_str()),
-            Some("Hello from agent")
-        );
-        assert_eq!(
-            cp.state.get("prompt_tokens").and_then(|v| v.as_u64()),
-            Some(100)
-        );
-        assert_eq!(
-            cp.state.get("tool_calls_count").and_then(|v| v.as_u64()),
-            Some(3)
-        );
-    }
-
-    // ── @file system-prompt tests ──
 
     #[test]
     fn resolve_system_prompt_literal_text() {

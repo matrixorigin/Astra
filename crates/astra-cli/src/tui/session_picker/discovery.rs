@@ -26,7 +26,6 @@ pub(crate) struct SessionEntry {
     pub model: String,
     pub updated_at: String,
     pub checkpoints: u32,
-    pub plan_goal: Option<String>,
 }
 
 /// IO abstraction for loading session metadata.
@@ -90,7 +89,6 @@ impl SessionSource for FsSessionSource {
                         model: ws.model.unwrap_or_else(|| "default".to_string()),
                         updated_at: ws.updated_at,
                         checkpoints: ws.checkpoints.len() as u32,
-                        plan_goal: ws.plan_goal,
                     })
                     .or_else(|| {
                         peek.map(|peek| SessionEntry {
@@ -107,7 +105,6 @@ impl SessionSource for FsSessionSource {
                             model: peek.model.unwrap_or_else(|| "default".to_string()),
                             updated_at: peek.created_at.unwrap_or_default(),
                             checkpoints: 0,
-                            plan_goal: None,
                         })
                     })
             })

@@ -72,6 +72,45 @@ describe('streamChatMessage cancellation semantics', () => {
     globalThis.TextDecoder = TextDecoder as typeof globalThis.TextDecoder;
   });
 
+  it('surfaces durable plan approval and clears it when the run resumes', async () => {
+    const onApprovalRequired = vi.fn();
+    const onInteractionResolved = vi.fn();
+    const onRunUpdated = vi.fn();
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ok: true,
+      body: sseBody([
+        'data: {"type":"run_started","run_id":"run-plan"}\n\n',
+        'data: {"type":"approval_required","request_id":"review-1","tool":"exit_plan_mode","session_id":"session-plan","run_id":"run-plan","approval_kind":"standard","display_label":"Review plan","detail":"1. Verify\\n2. Ship"}\n\n',
+        'data: {"type":"run_resumed","run_id":"run-plan","interaction_outcome":"approved"}\n\n',
+        'data: {"type":"run_finished","run_id":"run-plan","status":"completed"}\n\n',
+      ]),
+    });
+
+    await streamChatMessage('chat-123', defaultPayload, {
+      onApprovalRequired,
+      onInteractionResolved,
+      onRunUpdated,
+    });
+
+    expect(onApprovalRequired).toHaveBeenCalledWith({
+      requestId: 'review-1',
+      tool: 'exit_plan_mode',
+      sessionId: 'session-plan',
+      runId: 'run-plan',
+      approvalKind: 'standard',
+      displayLabel: 'Review plan',
+      detail: '1. Verify\n2. Ship',
+    });
+    expect(onRunUpdated).toHaveBeenCalledWith(
+      expect.objectContaining({
+        runId: 'run-plan',
+        status: 'waiting',
+        waitingFor: 'tool_approval',
+      }),
+    );
+    expect(onInteractionResolved).toHaveBeenCalledTimes(1);
+  });
+
   it('forwards live-gap repair evidence to the work-surface consumer', async () => {
     const onWorkSurfaceEvent = vi.fn();
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({

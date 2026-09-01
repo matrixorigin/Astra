@@ -11,10 +11,7 @@ use astra_core::{
 
 use crate::db_row::RowExt as EventDbRow;
 use crate::pagination::MAX_API_LIST_LIMIT;
-use crate::storage::{
-    add_agent_session_event_count_or_create, agent_session_exists_for_user,
-    bump_agent_session_event_count,
-};
+use crate::storage::bump_agent_session_event_count;
 use crate::sync_outbox::{sync_outbox_canonical_payload_hash, sync_outbox_stable_event_id};
 use astra_core::canonical_names::{
     metadata_duration_ms, metadata_tool_call_id, metadata_tool_name,
@@ -1056,17 +1053,15 @@ async fn ensure_event_session_requirement(
     if sync_outbox_ingestion {
         return ensure_sync_event_session_header(tx, session_id, user_id).await;
     }
-    let exists = agent_session_exists_for_user(&mut **tx, session_id, user_id)
+    crate::storage::admit_session_event_write(tx, session_id, user_id, false)
         .await
-        .map_err(internal_error)?;
-    if exists {
-        Ok(())
-    } else {
-        Err(error_response(
-            StatusCode::NOT_FOUND,
-            format!("Session {} not found", session_id),
-        ))
-    }
+        .map_err(|error| match error {
+            sqlx::Error::RowNotFound => error_response(
+                StatusCode::NOT_FOUND,
+                format!("Session {} not found", session_id),
+            ),
+            error => internal_error(error),
+        })
 }
 
 async fn ensure_sync_event_session_header(
@@ -1074,23 +1069,15 @@ async fn ensure_sync_event_session_header(
     session_id: &str,
     user_id: &str,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    match add_agent_session_event_count_or_create(tx, session_id, user_id, 0, None).await {
-        Ok(()) => Ok(()),
-        Err(sqlx::Error::RowNotFound) => {
-            let exists = agent_session_exists_for_user(&mut **tx, session_id, user_id)
-                .await
-                .map_err(internal_error)?;
-            if exists {
-                Ok(())
-            } else {
-                Err(error_response(
-                    StatusCode::CONFLICT,
-                    format!("session_id {session_id} is owned by another user"),
-                ))
-            }
-        }
-        Err(error) => Err(internal_error(error)),
-    }
+    crate::storage::admit_session_event_write(tx, session_id, user_id, true)
+        .await
+        .map_err(|error| match error {
+            sqlx::Error::RowNotFound => error_response(
+                StatusCode::CONFLICT,
+                format!("session_id {session_id} is unavailable for event ingestion"),
+            ),
+            error => internal_error(error),
+        })
 }
 
 async fn repair_sync_event_session_summary(

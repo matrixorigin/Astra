@@ -7,7 +7,7 @@
 mod common;
 
 use astra_services::tool_invocation_ledger::{
-    DatabaseToolInvocationLedger, ToolInvocationLedgerStoreError,
+    DatabaseToolInvocationLedger, ToolInvocationDispatchAdmission, ToolInvocationLedgerStoreError,
 };
 use astra_turn_types::{
     DispatchCertainty, DurableToolReference, ToolInvocationCompletionSource,
@@ -51,6 +51,14 @@ fn decision() -> ToolInvocationDecision {
     ToolInvocationDecision::new(&json!({"route": "server_local"})).unwrap()
 }
 
+fn dispatch_admission() -> ToolInvocationDispatchAdmission {
+    ToolInvocationDispatchAdmission {
+        expected_control_epoch: -1,
+        expected_owner_generation: 0,
+        expected_owner_pod_id: "tool-invocation-ledger-test-owner".to_string(),
+    }
+}
+
 fn named_decision(policy: &str) -> ToolInvocationDecision {
     ToolInvocationDecision::new(&json!({"route": "server_local", "policy": policy})).unwrap()
 }
@@ -78,6 +86,11 @@ fn failure(output: &str) -> ToolInvocationTerminalOutcome {
 }
 
 async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, identity: &ToolInvocationIdentity) {
+    let _ = sqlx::query("DELETE FROM agent_run_events WHERE user_id = ? AND run_id = ?")
+        .bind(&identity.user_id)
+        .bind(&identity.run_id)
+        .execute(pool)
+        .await;
     let _ = sqlx::query("DELETE FROM tool_invocation_ledger WHERE user_id = ? AND session_id = ?")
         .bind(&identity.user_id)
         .bind(&identity.session_id)
@@ -113,6 +126,65 @@ async fn cleanup(pool: &sqlx::Pool<sqlx::MySql>, identity: &ToolInvocationIdenti
         .await;
 }
 
+async fn append_user_intent(
+    pool: &sqlx::Pool<sqlx::MySql>,
+    identity: &ToolInvocationIdentity,
+    intent_id: &str,
+) {
+    let mut tx = pool.begin().await.unwrap();
+    let previous_event_index: i64 = sqlx::query_scalar(
+        "SELECT last_event_idx FROM agent_runs
+         WHERE user_id = ? AND run_id = ? FOR UPDATE",
+    )
+    .bind(&identity.user_id)
+    .bind(&identity.run_id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    let event_index = previous_event_index + 1;
+    let payload = json!({
+        "event_type": "user_intent",
+        "idempotency_key": format!("user_intent:{intent_id}"),
+        "data": {
+            "intent_id": intent_id,
+            "delivery": "guide_current_run",
+            "input": {"content": "replace stale work"},
+        },
+    });
+    let updated = sqlx::query(
+        "UPDATE agent_runs SET last_event_idx = ?
+         WHERE user_id = ? AND run_id = ? AND last_event_idx = ?",
+    )
+    .bind(event_index)
+    .bind(&identity.user_id)
+    .bind(&identity.run_id)
+    .bind(previous_event_index)
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(updated.rows_affected(), 1);
+    sqlx::query(
+        "INSERT INTO agent_run_events
+         (id, run_id, event_idx, user_id, session_id, event_type, event_id,
+          idempotency_key, event_hash, producer_pod_id, payload_json, created_at)
+         VALUES (?, ?, ?, ?, ?, 'user_intent', ?, ?, ?,
+                 'tool-invocation-ledger-test-owner', ?, NOW(6))",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(&identity.run_id)
+    .bind(event_index)
+    .bind(&identity.user_id)
+    .bind(&identity.session_id)
+    .bind(intent_id)
+    .bind(format!("user_intent:{intent_id}"))
+    .bind(format!("{:064x}", 1))
+    .bind(payload.to_string())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+}
+
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
 async fn large_terminal_outcome_commits_and_roundtrips_without_a_varchar_projection_limit() {
@@ -131,7 +203,12 @@ async fn large_terminal_outcome_commits_and_roundtrips_without_a_varchar_project
         .await
         .unwrap();
     ledger
-        .claim_dispatch(&invocation, "large-result-worker", 90_000)
+        .claim_dispatch(
+            &invocation,
+            "large-result-worker",
+            90_000,
+            dispatch_admission(),
+        )
         .await
         .unwrap();
 
@@ -178,7 +255,7 @@ async fn terminal_run_compaction_atomically_preserves_replay_and_blocks_new_disp
             .await
             .unwrap();
         ledger
-            .claim_dispatch(identity, "archive-worker", 90_000)
+            .claim_dispatch(identity, "archive-worker", 90_000, dispatch_admission())
             .await
             .unwrap();
         expected.push(
@@ -254,7 +331,12 @@ async fn terminal_run_compaction_atomically_preserves_replay_and_blocks_new_disp
         .await
         .unwrap();
     ledger
-        .claim_dispatch(&expired_dispatch, "expired-worker", 90_000)
+        .claim_dispatch(
+            &expired_dispatch,
+            "expired-worker",
+            90_000,
+            dispatch_admission(),
+        )
         .await
         .unwrap();
     sqlx::query(
@@ -281,7 +363,12 @@ async fn terminal_run_compaction_atomically_preserves_replay_and_blocks_new_disp
         .await
         .unwrap();
     ledger
-        .claim_dispatch(&active_dispatch, "active-worker", 90_000)
+        .claim_dispatch(
+            &active_dispatch,
+            "active-worker",
+            90_000,
+            dispatch_admission(),
+        )
         .await
         .unwrap();
     sqlx::query("UPDATE agent_runs SET status = 'completed' WHERE user_id = ? AND run_id = ?")
@@ -543,17 +630,249 @@ async fn insert_active_run(pool: &sqlx::Pool<sqlx::MySql>, identity: &ToolInvoca
     .unwrap();
     sqlx::query(
         "INSERT INTO agent_runs
-         (run_id, user_id, session_id, root_run_id, ancestor_path, status)
-         VALUES (?, ?, ?, ?, ?, 'running')",
+         (run_id, user_id, session_id, root_run_id, ancestor_path, status,
+          owner_pod_id, owner_lease_expires_at, run_generation)
+         VALUES (?, ?, ?, ?, ?, 'running', 'tool-invocation-ledger-test-owner',
+                 TIMESTAMPADD(MINUTE, 10, NOW(6)), 0)",
     )
     .bind(&identity.run_id)
     .bind(&identity.user_id)
     .bind(&identity.session_id)
     .bind(&identity.run_id)
-    .bind(format!("/{}", identity.run_id))
+    // Root runs use their bare run id as the canonical ancestry path. A
+    // leading separator describes no valid root→child chain and production
+    // execution authority correctly rejects it.
+    .bind(&identity.run_id)
     .execute(pool)
     .await
     .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
+async fn dispatch_claim_atomically_orders_guidance_owner_and_invocation_state() {
+    let shared = common::setup_pool().await;
+    let pool = shared.get().clone();
+    let prefix = Uuid::new_v4().simple().to_string();
+    let first = identity(&prefix, "intent-first");
+    cleanup(&pool, &first).await;
+    insert_active_run(&pool, &first).await;
+    let ledger = DatabaseToolInvocationLedger::new(shared);
+    let invocation_fingerprint = fingerprint("atomic dispatch");
+    let invocation_decision = decision();
+
+    ledger
+        .prepare(&first, &invocation_fingerprint, &invocation_decision)
+        .await
+        .unwrap();
+    append_user_intent(&pool, &first, "intent-first").await;
+    for _ in 0..2 {
+        assert!(matches!(
+            ledger
+                .claim_dispatch(&first, "worker", 90_000, dispatch_admission())
+                .await,
+            Err(ToolInvocationLedgerStoreError::ActionSuperseded {
+                user_intent_event_index: 0,
+                ..
+            })
+        ));
+    }
+    let rejected = ledger.get(&first).await.unwrap().unwrap();
+    assert_eq!(rejected.state, ToolInvocationState::Rejected);
+    assert_eq!(
+        rejected.dispatch_certainty,
+        DispatchCertainty::NotDispatched
+    );
+    assert_eq!(rejected.attempt_count, 0);
+    assert!(matches!(
+        rejected.completion_source,
+        Some(ToolInvocationCompletionSource::SupersededByGuidance {
+            user_intent_event_index: 0,
+            ..
+        })
+    ));
+    let grant_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_run_events
+         WHERE user_id = ? AND run_id = ? AND event_type = 'action_admission_granted'",
+    )
+    .bind(&first.user_id)
+    .bind(&first.run_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(grant_count, 0);
+
+    let wrong_owner = identity(&prefix, "wrong-owner");
+    ledger
+        .prepare(&wrong_owner, &invocation_fingerprint, &invocation_decision)
+        .await
+        .unwrap();
+    let mut wrong_owner_admission = dispatch_admission();
+    wrong_owner_admission.expected_control_epoch = 0;
+    wrong_owner_admission.expected_owner_pod_id = "stale-owner".to_string();
+    assert!(matches!(
+        ledger
+            .claim_dispatch(&wrong_owner, "worker", 90_000, wrong_owner_admission)
+            .await,
+        Err(ToolInvocationLedgerStoreError::RunOwnerMismatch { .. })
+    ));
+    assert_eq!(
+        ledger.get(&wrong_owner).await.unwrap().unwrap().state,
+        ToolInvocationState::Prepared
+    );
+
+    let stale_generation = identity(&prefix, "stale-generation");
+    ledger
+        .prepare(
+            &stale_generation,
+            &invocation_fingerprint,
+            &invocation_decision,
+        )
+        .await
+        .unwrap();
+    let mut stale_generation_admission = dispatch_admission();
+    stale_generation_admission.expected_control_epoch = 0;
+    stale_generation_admission.expected_owner_generation = 1;
+    assert!(matches!(
+        ledger
+            .claim_dispatch(
+                &stale_generation,
+                "worker",
+                90_000,
+                stale_generation_admission,
+            )
+            .await,
+        Err(ToolInvocationLedgerStoreError::RunOwnerGenerationMismatch { .. })
+    ));
+
+    let missing = identity(&prefix, "missing-prepared-row");
+    let mut observed_admission = dispatch_admission();
+    observed_admission.expected_control_epoch = 0;
+    assert!(matches!(
+        ledger
+            .claim_dispatch(&missing, "worker", 90_000, observed_admission.clone())
+            .await,
+        Err(ToolInvocationLedgerStoreError::NotFound { .. })
+    ));
+    let grants_after_rollback: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_run_events
+         WHERE user_id = ? AND run_id = ? AND event_type = 'action_admission_granted'",
+    )
+    .bind(&first.user_id)
+    .bind(&first.run_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        grants_after_rollback, 0,
+        "failed claim must roll back its grant"
+    );
+
+    let admitted = identity(&prefix, "claim-first");
+    ledger
+        .prepare(&admitted, &invocation_fingerprint, &invocation_decision)
+        .await
+        .unwrap();
+    let dispatched = ledger
+        .claim_dispatch(&admitted, "worker", 90_000, observed_admission.clone())
+        .await
+        .unwrap();
+    assert_eq!(dispatched.state, ToolInvocationState::Dispatched);
+    assert_eq!(dispatched.attempt_count, 1);
+    assert!(matches!(
+        ledger
+            .claim_dispatch(&admitted, "worker-2", 90_000, observed_admission)
+            .await,
+        Err(ToolInvocationLedgerStoreError::ActionAlreadyStarted { .. })
+    ));
+    assert_eq!(
+        ledger.get(&admitted).await.unwrap().unwrap().attempt_count,
+        1,
+        "an already-dispatched invocation must never be replayed"
+    );
+
+    // Per-call linearization is the batch contract: A may claim before new
+    // guidance, while B, which has not claimed yet, must close as superseded
+    // without receiving a dispatch grant.
+    append_user_intent(&pool, &first, "between-concurrent-claims").await;
+    let pending_batch_member = identity(&prefix, "batch-member-after-guidance");
+    ledger
+        .prepare(
+            &pending_batch_member,
+            &invocation_fingerprint,
+            &invocation_decision,
+        )
+        .await
+        .unwrap();
+    let mut between_claims_admission = dispatch_admission();
+    between_claims_admission.expected_control_epoch = 1;
+    assert!(matches!(
+        ledger
+            .claim_dispatch(
+                &pending_batch_member,
+                "worker-b",
+                90_000,
+                between_claims_admission,
+            )
+            .await,
+        Err(ToolInvocationLedgerStoreError::ActionSuperseded {
+            user_intent_event_index: 2,
+            ..
+        })
+    ));
+    let pending_batch_member = ledger.get(&pending_batch_member).await.unwrap().unwrap();
+    assert_eq!(pending_batch_member.state, ToolInvocationState::Rejected);
+    assert_eq!(
+        pending_batch_member.dispatch_certainty,
+        DispatchCertainty::NotDispatched
+    );
+    assert_eq!(pending_batch_member.attempt_count, 0);
+
+    let expired_lease = identity(&prefix, "expired-lease");
+    ledger
+        .prepare(
+            &expired_lease,
+            &invocation_fingerprint,
+            &invocation_decision,
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE agent_runs SET owner_lease_expires_at = TIMESTAMPADD(SECOND, -1, NOW(6))
+         WHERE user_id = ? AND run_id = ?",
+    )
+    .bind(&first.user_id)
+    .bind(&first.run_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut expired_admission = dispatch_admission();
+    expired_admission.expected_control_epoch = 0;
+    assert!(matches!(
+        ledger
+            .claim_dispatch(&expired_lease, "worker", 90_000, expired_admission)
+            .await,
+        Err(ToolInvocationLedgerStoreError::ActionAdmissionFailed { .. })
+    ));
+    assert_eq!(
+        ledger.get(&expired_lease).await.unwrap().unwrap().state,
+        ToolInvocationState::Prepared
+    );
+    let final_grant_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_run_events
+         WHERE user_id = ? AND run_id = ? AND event_type = 'action_admission_granted'",
+    )
+    .bind(&first.user_id)
+    .bind(&first.run_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        final_grant_count, 1,
+        "only A's successful claim may leave an admission grant"
+    );
+
+    cleanup(&pool, &first).await;
 }
 
 #[tokio::test]
@@ -659,7 +978,9 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
     assert!(cached_record.completion_source.is_some());
     assert_eq!(ledger.get(&cached).await.unwrap().unwrap(), cached_record);
     assert!(matches!(
-        ledger.claim_dispatch(&cached, "worker-cache", 90_000).await,
+        ledger
+            .claim_dispatch(&cached, "worker-cache", 90_000, dispatch_admission())
+            .await,
         Err(ToolInvocationLedgerStoreError::StateMismatch {
             actual: ToolInvocationState::Succeeded,
             ..
@@ -669,7 +990,9 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
     let dispatch = |ledger: DatabaseToolInvocationLedger,
                     identity: ToolInvocationIdentity,
                     owner: &'static str| async move {
-        ledger.claim_dispatch(&identity, owner, 90_000).await
+        ledger
+            .claim_dispatch(&identity, owner, 90_000, dispatch_admission())
+            .await
     };
     let (race_a, race_b) = tokio::join!(
         dispatch(ledger.clone(), second.clone(), "worker-a"),
@@ -739,7 +1062,7 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
         .await
         .unwrap();
     ledger
-        .claim_dispatch(&abandoned, "worker-abandoned", 90_000)
+        .claim_dispatch(&abandoned, "worker-abandoned", 90_000, dispatch_admission())
         .await
         .unwrap();
     assert!(matches!(
@@ -774,7 +1097,12 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
     assert_eq!(expired.state, ToolInvocationState::OutcomeUnknown);
     assert!(matches!(
         ledger
-            .claim_dispatch(&abandoned, "replacement-worker", 90_000)
+            .claim_dispatch(
+                &abandoned,
+                "replacement-worker",
+                90_000,
+                dispatch_admission(),
+            )
             .await,
         Err(ToolInvocationLedgerStoreError::StateMismatch {
             actual: ToolInvocationState::OutcomeUnknown,
@@ -783,12 +1111,14 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
     ));
 
     let dispatched = ledger
-        .claim_dispatch(&first, "worker-first", 90_000)
+        .claim_dispatch(&first, "worker-first", 90_000, dispatch_admission())
         .await
         .unwrap();
     assert_eq!(dispatched.attempt_count, 1);
     assert!(matches!(
-        ledger.claim_dispatch(&first, "worker-other", 90_000).await,
+        ledger
+            .claim_dispatch(&first, "worker-other", 90_000, dispatch_admission())
+            .await,
         Err(ToolInvocationLedgerStoreError::StateMismatch {
             actual: ToolInvocationState::Dispatched,
             ..
@@ -800,7 +1130,9 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
         .await
         .unwrap();
     assert!(matches!(
-        ledger.claim_dispatch(&first, "worker-other", 90_000).await,
+        ledger
+            .claim_dispatch(&first, "worker-other", 90_000, dispatch_admission())
+            .await,
         Err(ToolInvocationLedgerStoreError::StateMismatch { .. })
     ));
     let reconciled = ledger
@@ -872,7 +1204,12 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
     ));
     assert!(matches!(
         ledger
-            .claim_dispatch(&prepared_before_closure, "worker-after-closure", 90_000)
+            .claim_dispatch(
+                &prepared_before_closure,
+                "worker-after-closure",
+                90_000,
+                dispatch_admission(),
+            )
             .await,
         Err(ToolInvocationLedgerStoreError::RunNotExecutable { status, .. })
             if status == "completed"
@@ -970,7 +1307,7 @@ async fn run_closure_serializes_with_new_admission_and_dispatch_claim() {
         let identity = dispatch_identity.clone();
         tokio::spawn(async move {
             ledger
-                .claim_dispatch(&identity, "concurrent-worker", 90_000)
+                .claim_dispatch(&identity, "concurrent-worker", 90_000, dispatch_admission())
                 .await
         })
     };

@@ -6,10 +6,12 @@ use astra_services::session_journal::{
 
 #[must_use]
 pub fn journal_record_duplicate_within_turn(
+    tool_call_id: String,
     name: String,
     args_preview: Option<String>,
 ) -> ToolCallRecord {
     ToolCallRecord {
+        tool_call_id: Some(tool_call_id),
         name,
         ok: true,
         ms: 0,
@@ -70,6 +72,7 @@ pub fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> (&str, bool) {
 /// count and tag so it's self-identifying.
 #[must_use]
 pub fn journal_record_cross_turn_cache_hit(
+    tool_call_id: String,
     name: String,
     output_len: u32,
     args_preview: Option<String>,
@@ -77,6 +80,7 @@ pub fn journal_record_cross_turn_cache_hit(
 ) -> ToolCallRecord {
     let preview = format_cross_turn_cache_hit_preview(output_len, cached_body);
     ToolCallRecord {
+        tool_call_id: Some(tool_call_id),
         name,
         ok: true,
         ms: 0,
@@ -111,8 +115,13 @@ fn format_cross_turn_cache_hit_preview(output_len: u32, cached_body: Option<&str
 }
 
 #[must_use]
-pub fn journal_record_unknown_tool(name: String, tool_elapsed_ms: u64) -> ToolCallRecord {
+pub fn journal_record_unknown_tool(
+    tool_call_id: String,
+    name: String,
+    tool_elapsed_ms: u64,
+) -> ToolCallRecord {
     ToolCallRecord {
+        tool_call_id: Some(tool_call_id),
         name: name.clone(),
         ok: false,
         ms: tool_elapsed_ms,
@@ -132,6 +141,7 @@ pub fn journal_record_unknown_tool(name: String, tool_elapsed_ms: u64) -> ToolCa
 
 #[must_use]
 pub fn journal_record_tool_not_admitted(
+    tool_call_id: String,
     name: String,
     args_preview: Option<String>,
     reason: &str,
@@ -139,6 +149,7 @@ pub fn journal_record_tool_not_admitted(
 ) -> ToolCallRecord {
     let preview: String = format!("Deferred: {reason}").chars().take(500).collect();
     ToolCallRecord {
+        tool_call_id: Some(tool_call_id),
         name,
         ok: false,
         ms: tool_elapsed_ms,
@@ -159,27 +170,36 @@ pub fn journal_record_tool_not_admitted(
 
 #[must_use]
 pub fn journal_record_deferred_activation_hint(
+    tool_call_id: String,
     name: String,
     args_preview: Option<String>,
     reason: &str,
     tool_elapsed_ms: u64,
 ) -> ToolCallRecord {
-    let mut record = journal_record_tool_not_admitted(name, args_preview, reason, tool_elapsed_ms);
+    let mut record =
+        journal_record_tool_not_admitted(tool_call_id, name, args_preview, reason, tool_elapsed_ms);
     record.ok = true;
+    record.error = Some("deferred_tool_activated".to_string());
     record.result_class = Some(NOOP_OR_CACHED_RESULT_CLASS.to_string());
     record.error_kind = None;
-    record.disposition = Some(ToolCallDisposition::Deferred);
+    // Activation affects the next provider request, whose invocation receives
+    // a new call id.  The current exact call has already received its result
+    // and is therefore terminal; reserving Deferred for a same-id callback
+    // owner prevents an uncloseable ledger slot.
+    record.disposition = Some(ToolCallDisposition::Suppressed);
     record
 }
 
 #[must_use]
 pub fn journal_record_blocked_tool(
+    tool_call_id: String,
     name: String,
     reason: String,
     args_preview: Option<String>,
     tool_elapsed_ms: u64,
 ) -> ToolCallRecord {
     ToolCallRecord {
+        tool_call_id: Some(tool_call_id),
         name,
         ok: false,
         ms: tool_elapsed_ms,
@@ -199,14 +219,16 @@ pub fn journal_record_blocked_tool(
 
 #[must_use]
 pub fn journal_record_suppressed_tool_retry(
+    tool_call_id: String,
     name: String,
     reason_code: &str,
     reason: String,
     args_preview: Option<String>,
     tool_elapsed_ms: u64,
 ) -> ToolCallRecord {
-    let preview: String = format!("Deferred: {reason}").chars().take(500).collect();
+    let preview: String = format!("Suppressed: {reason}").chars().take(500).collect();
     ToolCallRecord {
+        tool_call_id: Some(tool_call_id),
         name,
         ok: true,
         ms: tool_elapsed_ms,
@@ -219,7 +241,7 @@ pub fn journal_record_suppressed_tool_retry(
         surgically_removed: None,
         original_tool_name: None,
         result_class: Some(NOOP_OR_CACHED_RESULT_CLASS.to_string()),
-        disposition: Some(ToolCallDisposition::Deferred),
+        disposition: Some(ToolCallDisposition::Suppressed),
         ..Default::default()
     }
 }
@@ -305,7 +327,12 @@ mod tests {
 
     #[test]
     fn duplicate_record_fields() {
-        let r = journal_record_duplicate_within_turn("bash".into(), Some("x".into()));
+        let r = journal_record_duplicate_within_turn(
+            "call-duplicate".into(),
+            "bash".into(),
+            Some("x".into()),
+        );
+        assert_eq!(r.tool_call_id.as_deref(), Some("call-duplicate"));
         assert!(r.ok);
         assert_eq!(r.error.as_deref(), Some("duplicate_within_turn"));
         assert_eq!(r.result_class.as_deref(), Some(NOOP_OR_CACHED_RESULT_CLASS));
@@ -314,22 +341,35 @@ mod tests {
 
     #[test]
     fn cache_hit_record_has_output_bytes() {
-        let r = journal_record_cross_turn_cache_hit("read_file".into(), 12, None, None);
+        let r = journal_record_cross_turn_cache_hit(
+            "call-cache".into(),
+            "read_file".into(),
+            12,
+            None,
+            None,
+        );
         assert_eq!(r.output_bytes, Some(12));
         assert_eq!(r.result_class.as_deref(), Some(NOOP_OR_CACHED_RESULT_CLASS));
         assert!(r.is_noop_or_cached_result());
     }
 
     #[test]
-    fn cache_hit_record_old_api_remains_source_compatible() {
-        let r = journal_record_cross_turn_cache_hit("read_file".into(), 12, None, None);
+    fn cache_hit_record_carries_exact_call_identity() {
+        let r = journal_record_cross_turn_cache_hit(
+            "call-cache".into(),
+            "read_file".into(),
+            12,
+            None,
+            None,
+        );
         assert_eq!(r.output_bytes, Some(12));
         assert!(
             r.result_preview
                 .as_deref()
                 .is_some_and(|preview| preview.contains("12 bytes")),
-            "legacy API should still emit a cache-hit preview: {r:?}"
+            "cache hit should still emit a cache-hit preview: {r:?}"
         );
+        assert_eq!(r.tool_call_id.as_deref(), Some("call-cache"));
     }
 
     #[test]
@@ -343,6 +383,7 @@ mod tests {
         // `result_preview` with a synthetic explanatory string that
         // makes the cache-hit nature explicit.
         let r = journal_record_cross_turn_cache_hit(
+            "call-cache".into(),
             "read_file".into(),
             2000,
             Some("src/lib.rs".into()),
@@ -371,6 +412,7 @@ mod tests {
         let body: String = "中".repeat(100);
         assert_eq!(body.len(), 300, "setup: 100 Han chars must be 300 bytes");
         let r = journal_record_cross_turn_cache_hit(
+            "call-cache".into(),
             "read_file".into(),
             body.len() as u32,
             None,
@@ -400,6 +442,7 @@ mod tests {
         assert_eq!(body.len(), 600, "setup: 200 Han chars must be 600 bytes");
 
         let r = journal_record_cross_turn_cache_hit(
+            "call-cache".into(),
             "read_file".into(),
             body.len() as u32,
             None,
@@ -475,6 +518,7 @@ mod tests {
         // still emit a non-empty preview so downstream tooling
         // isn't misled.
         let r = journal_record_cross_turn_cache_hit(
+            "call-cache".into(),
             "read_file".into(),
             1024,
             Some("src/lib.rs".into()),
@@ -489,7 +533,8 @@ mod tests {
 
     #[test]
     fn unknown_tool_error_tag() {
-        let r = journal_record_unknown_tool("nope".into(), 7);
+        let r = journal_record_unknown_tool("call-unknown".into(), "nope".into(), 7);
+        assert_eq!(r.tool_call_id.as_deref(), Some("call-unknown"));
         assert!(!r.ok);
         assert_eq!(r.ms, 7);
         assert_eq!(r.error.as_deref(), Some("unknown_tool: nope"));
@@ -500,12 +545,14 @@ mod tests {
     #[test]
     fn tool_not_admitted_record_is_protocol_failure_not_synthetic_success() {
         let r = journal_record_tool_not_admitted(
+            "call-not-admitted".into(),
             "agent_fanout".into(),
             Some("{}".into()),
             "Tool 'agent_fanout' must be activated first",
             3,
         );
         assert!(!r.ok);
+        assert_eq!(r.tool_call_id.as_deref(), Some("call-not-admitted"));
         assert_eq!(r.ms, 3);
         assert_eq!(r.error.as_deref(), Some("tool_not_admitted"));
         assert_eq!(r.args_preview.as_deref(), Some("{}"));
@@ -522,14 +569,16 @@ mod tests {
     #[test]
     fn deferred_activation_hint_record_is_synthetic_success() {
         let r = journal_record_deferred_activation_hint(
+            "call-activation".into(),
             "memory".into(),
             Some("{}".into()),
             "Tool 'memory' requires activation first",
             3,
         );
         assert!(r.ok);
+        assert_eq!(r.tool_call_id.as_deref(), Some("call-activation"));
         assert_eq!(r.ms, 3);
-        assert_eq!(r.error.as_deref(), Some("tool_not_admitted"));
+        assert_eq!(r.error.as_deref(), Some("deferred_tool_activated"));
         assert_eq!(r.args_preview.as_deref(), Some("{}"));
         assert!(
             r.result_preview
@@ -539,17 +588,20 @@ mod tests {
         assert!(r.is_synthetic_placeholder());
         assert_eq!(r.result_class.as_deref(), Some(NOOP_OR_CACHED_RESULT_CLASS));
         assert!(r.is_noop_or_cached_result());
+        assert_eq!(r.effective_disposition(), ToolCallDisposition::Suppressed);
     }
 
     #[test]
     fn blocked_tool_error_tag() {
         let r = journal_record_blocked_tool(
+            "call-blocked".into(),
             "bash".into(),
             "denied by policy".into(),
             Some(r#"{"command":"echo hi"}"#.into()),
             9,
         );
         assert!(!r.ok);
+        assert_eq!(r.tool_call_id.as_deref(), Some("call-blocked"));
         assert_eq!(r.ms, 9);
         assert_eq!(r.error.as_deref(), Some("blocked_tool: denied by policy"));
         assert_eq!(r.args_preview.as_deref(), Some(r#"{"command":"echo hi"}"#));
@@ -558,6 +610,7 @@ mod tests {
     #[test]
     fn suppressed_retry_record_is_synthetic_success() {
         let r = journal_record_suppressed_tool_retry(
+            "call-suppressed".into(),
             "agent".into(),
             "nonprogress_retry_deferred",
             "retry later".into(),
@@ -565,10 +618,19 @@ mod tests {
             0,
         );
         assert!(r.ok);
+        assert_eq!(r.tool_call_id.as_deref(), Some("call-suppressed"));
         assert_eq!(r.error.as_deref(), Some("nonprogress_retry_deferred"));
         assert!(r.is_synthetic_placeholder());
         assert_eq!(r.result_class.as_deref(), Some(NOOP_OR_CACHED_RESULT_CLASS));
         assert!(r.is_noop_or_cached_result());
+        assert_eq!(r.effective_disposition(), ToolCallDisposition::Suppressed);
+        let summary = astra_services::session_journal::ToolOutcomeSummary::from_records(
+            std::slice::from_ref(&r),
+        );
+        assert_eq!(summary.requested, 1);
+        assert_eq!(summary.suppressed, 1);
+        assert_eq!(summary.deferred, 0);
+        assert!(summary.is_consistent());
         assert!(
             !r.was_blocked_by_policy(),
             "retry deferral must not look like a hard policy block"

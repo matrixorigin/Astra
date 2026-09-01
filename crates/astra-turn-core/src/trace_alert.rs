@@ -32,8 +32,6 @@ pub struct TraceAlert {
 /// Returns alerts to be logged, surfaced in UI, or escalated.
 pub fn evaluate_alerts(
     turn: u32,
-    model_id: &str,
-    execution_source: &str,
     feedback: &ContextFeedback,
     stats: &PipelineStats,
     recovery: &RecoveryState,
@@ -67,26 +65,7 @@ pub fn evaluate_alerts(
         });
     }
 
-    // Rule 3: Cache regression against at least three prior observations for
-    // the same model. Cache namespaces and reuse profiles are model-specific.
-    if let Some(session_avg) = stats.model_cache_regression_baseline(model_id, execution_source) {
-        let recent_ratio = feedback.cache_hit_ratio;
-        if session_avg - recent_ratio > 0.10 {
-            alerts.push(TraceAlert {
-                severity: AlertSeverity::Warning,
-                rule: "cache_regression".into(),
-                message: format!(
-                    "Prompt-cache read share {:.0}% is {:.0}% below session avg {:.0}%.",
-                    recent_ratio * 100.0,
-                    (session_avg - recent_ratio) * 100.0,
-                    session_avg * 100.0,
-                ),
-                turn,
-            });
-        }
-    }
-
-    // Rule 4: Compaction cascade — 2+ events in 3 turns
+    // Rule 3: Compaction cascade — 2+ events in 3 turns
     if stats.has_compaction_cascade() {
         alerts.push(TraceAlert {
             severity: AlertSeverity::Warning,
@@ -96,7 +75,7 @@ pub fn evaluate_alerts(
         });
     }
 
-    // Rule 5: Recovery loop — PTL errors >= 2
+    // Rule 4: Recovery loop — PTL errors >= 2
     if recovery.consecutive_ptl_errors >= 2 {
         alerts.push(TraceAlert {
             severity: AlertSeverity::Error,
@@ -109,7 +88,7 @@ pub fn evaluate_alerts(
         });
     }
 
-    // Rule 6: Predictive miss — > 20% error between estimated and actual
+    // Rule 5: Predictive miss — > 20% error between estimated and actual
     if stats.turns_executed >= 2 {
         let estimated_input = feedback.tokens.total_input();
         // If there's a big gap between what we expected and what we got,
@@ -154,7 +133,7 @@ mod tests {
         let f = make_feedback(0, 5000);
         let stats = PipelineStats::default();
         let recovery = RecoveryState::default();
-        let alerts = evaluate_alerts(2, "model-a", "test", &f, &stats, &recovery);
+        let alerts = evaluate_alerts(2, &f, &stats, &recovery);
         assert!(alerts.iter().any(|a| a.rule == "cache_cold_start"));
     }
 
@@ -162,14 +141,7 @@ mod tests {
     fn explicit_cache_break_emits_prompt_cache_break_alert() {
         let mut f = make_feedback(0, 5000);
         f.cache_break_detected = Some(CacheBreakReason::CacheControlChanged);
-        let alerts = evaluate_alerts(
-            3,
-            "model-a",
-            "test",
-            &f,
-            &PipelineStats::default(),
-            &RecoveryState::default(),
-        );
+        let alerts = evaluate_alerts(3, &f, &PipelineStats::default(), &RecoveryState::default());
         assert!(alerts.iter().any(|a| a.rule == "prompt_cache_break"));
         assert!(!alerts.iter().any(|a| a.rule == "cache_cold_start"));
     }
@@ -179,7 +151,7 @@ mod tests {
         let f = make_feedback(0, 5000);
         let stats = PipelineStats::default();
         let recovery = RecoveryState::default();
-        let alerts = evaluate_alerts(1, "model-a", "test", &f, &stats, &recovery);
+        let alerts = evaluate_alerts(1, &f, &stats, &recovery);
         assert!(!alerts.iter().any(|a| a.rule == "cache_cold_start"));
     }
 
@@ -193,76 +165,11 @@ mod tests {
         };
         let recovery = RecoveryState::default();
 
-        let alerts = evaluate_alerts(5, "model-a", "test", &f, &stats, &recovery);
+        let alerts = evaluate_alerts(5, &f, &stats, &recovery);
 
         assert!(
             alerts.is_empty(),
             "healthy feedback should not alert: {alerts:?}"
-        );
-    }
-
-    #[test]
-    fn cache_regression_alert_on_3_turn_drop() {
-        let f = make_feedback(100, 900); // ratio = 0.1
-        let mut stats = PipelineStats::default();
-        for _ in 0..3 {
-            stats.record("model-a", "test", &make_feedback(850, 150));
-        }
-        stats.record("model-a", "test", &f);
-        let recovery = RecoveryState::default();
-        let alerts = evaluate_alerts(5, "model-a", "test", &f, &stats, &recovery);
-        let alert = alerts
-            .iter()
-            .find(|alert| alert.rule == "cache_regression")
-            .expect("cache regression alert");
-        assert_eq!(
-            alert.message,
-            "Prompt-cache read share 10% is 75% below session avg 85%."
-        );
-    }
-
-    #[test]
-    fn cache_regression_does_not_compare_different_models() {
-        let mut stats = PipelineStats::default();
-        for _ in 0..3 {
-            stats.record("model-a", "test", &make_feedback(900, 100));
-        }
-        let model_b_feedback = make_feedback(100, 900);
-        stats.record("model-b", "test", &model_b_feedback);
-
-        let alerts = evaluate_alerts(
-            5,
-            "model-b",
-            "test",
-            &model_b_feedback,
-            &stats,
-            &RecoveryState::default(),
-        );
-
-        assert!(!alerts.iter().any(|alert| alert.rule == "cache_regression"));
-    }
-
-    #[test]
-    fn cache_regression_does_not_compare_different_execution_sources() {
-        let mut stats = PipelineStats::default();
-        for _ in 0..4 {
-            stats.record("model-a", "root_agentic_loop", &make_feedback(900, 100));
-        }
-        let child_feedback = make_feedback(100, 900);
-        stats.record("model-a", "fanout_child", &child_feedback);
-
-        let alerts = evaluate_alerts(
-            5,
-            "model-a",
-            "fanout_child",
-            &child_feedback,
-            &stats,
-            &RecoveryState::default(),
-        );
-
-        assert!(
-            !alerts.iter().any(|alert| alert.rule == "cache_regression"),
-            "a fanout child has a distinct prompt/cache surface: {alerts:?}"
         );
     }
 
@@ -277,7 +184,7 @@ mod tests {
         stats.turns_executed = 6;
         stats.record_compaction(2000);
         let recovery = RecoveryState::default();
-        let alerts = evaluate_alerts(7, "model-a", "test", &f, &stats, &recovery);
+        let alerts = evaluate_alerts(7, &f, &stats, &recovery);
         assert!(alerts.iter().any(|a| a.rule == "compaction_cascade"));
     }
 
@@ -288,7 +195,7 @@ mod tests {
         let mut recovery = RecoveryState::default();
         recovery.record_ptl_error();
         recovery.record_ptl_error();
-        let alerts = evaluate_alerts(5, "model-a", "test", &f, &stats, &recovery);
+        let alerts = evaluate_alerts(5, &f, &stats, &recovery);
         assert!(alerts.iter().any(|a| a.rule == "recovery_loop"));
         assert!(alerts.iter().any(|a| a.severity == AlertSeverity::Error));
     }
@@ -302,7 +209,7 @@ mod tests {
             ..Default::default()
         };
         let recovery = RecoveryState::default();
-        let alerts = evaluate_alerts(4, "model-a", "test", &f, &stats, &recovery);
+        let alerts = evaluate_alerts(4, &f, &stats, &recovery);
         assert!(alerts.iter().any(|a| a.rule == "predictive_miss"));
     }
 }

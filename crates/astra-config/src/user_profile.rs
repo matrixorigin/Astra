@@ -408,6 +408,39 @@ pub enum WorkspaceMutationIntent {
     MustMutate,
 }
 
+/// Requested state boundary for a mutating turn's completion evidence.
+///
+/// This is semantic control-plane data produced alongside
+/// [`WorkspaceMutationIntent`].  It prevents a task whose accepted outcome is
+/// entirely outside the bound workspace (for example managed system state)
+/// from being forced to manufacture a workspace edit.  Unknown remains
+/// workspace-scoped for fail-closed completion, and mixed tasks still owe the
+/// ordinary bound-workspace receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationCompletionScope {
+    /// The judge omitted or could not determine the state boundary.
+    #[default]
+    Unknown,
+    /// The requested mutation is confined to the bound workspace.
+    Workspace,
+    /// The requested mutation is confined to executor-managed external state.
+    External,
+    /// The requested outcome includes both workspace and external state.
+    Mixed,
+}
+
+impl MutationCompletionScope {
+    /// Whether a mutating turn must present a bound-workspace mutation receipt.
+    ///
+    /// Unknown is deliberately strict so a missing classifier field cannot
+    /// weaken the established workspace completion contract.
+    #[must_use]
+    pub const fn requires_workspace_receipt(self) -> bool {
+        !matches!(self, Self::External)
+    }
+}
+
 /// Domain assigned to the current turn by the semantic LLM judge.
 ///
 /// This value is intentionally part of [`TurnIntent`]: downstream routing
@@ -462,6 +495,25 @@ pub enum TurnCommunicativeAct {
     Unknown,
 }
 
+/// Semantic decision about whether this user turn must be represented as
+/// canonical Work. It is produced by the turn-intent judge; runtime code must
+/// never reconstruct it from user wording or a tool name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkLifecycleIntent {
+    /// The judge cannot reliably decide. Runtime preserves ordinary tool
+    /// availability rather than inventing a lifecycle requirement.
+    #[default]
+    Unknown,
+    /// The requested outcome is genuinely one-shot and does not need durable
+    /// task tracking.
+    NotRequired,
+    /// The requested outcome needs visible/durable decomposition or the user
+    /// explicitly asks for canonical task tracking. Execution must establish
+    /// Work before it delegates independent tasks.
+    Required,
+}
+
 impl TurnCommunicativeAct {
     /// Whether this act may need a tool-bearing model surface.
     ///
@@ -485,8 +537,10 @@ pub struct TurnIntent {
     /// infer a replacement from user text, memory snippets, or tool names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain: Option<TurnIntentDomain>,
-    /// Judge-owned communicative role. This field is required when decoding
-    /// judge output so obsolete schemas fail instead of silently guessing.
+    /// Judge-owned communicative role. Missing output defaults to `Unknown`:
+    /// an incomplete auxiliary response must not erase another independently
+    /// valid typed decision such as `work_lifecycle = Required`.
+    #[serde(default)]
     pub communicative_act: TurnCommunicativeAct,
     /// Scenario the current user turn asks to enter, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -497,7 +551,13 @@ pub struct TurnIntent {
     /// Judge-owned relationship between this message and the session
     /// objective. This replaces the former continuation + reanchor booleans,
     /// whose combinations could represent contradictory states.
+    #[serde(default)]
     pub objective_relation: ObjectiveRelation,
+    /// Judge-owned requirement for canonical Work lifecycle. This is kept
+    /// separate from the broad `Task` communicative act: a small one-step task
+    /// is still a task, but it need not create an enduring task graph.
+    #[serde(default)]
+    pub work_lifecycle: WorkLifecycleIntent,
     /// Optional typed feedback classification. The exact instruction stays in
     /// the canonical user message; this field supplies kind and target only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -506,6 +566,9 @@ pub struct TurnIntent {
     /// mutation. Defaults to `Unknown` so judge failures fail closed.
     #[serde(default)]
     pub workspace_mutation: WorkspaceMutationIntent,
+    /// State boundary whose mutation evidence can satisfy this turn.
+    #[serde(default)]
+    pub mutation_completion_scope: MutationCompletionScope,
     /// Whether the user explicitly requires browser-capable verification for
     /// this turn. Strong browser-verification retry consumes only this
     /// structured field plus tool evidence.
@@ -539,6 +602,12 @@ impl TurnIntent {
     }
 
     #[must_use]
+    pub fn with_work_lifecycle(mut self, lifecycle: WorkLifecycleIntent) -> Self {
+        self.work_lifecycle = lifecycle;
+        self
+    }
+
+    #[must_use]
     pub fn with_feedback(mut self, feedback: UserFeedback) -> Self {
         self.feedback = Some(feedback);
         self
@@ -547,6 +616,12 @@ impl TurnIntent {
     #[must_use]
     pub fn with_workspace_mutation(mut self, mutation: WorkspaceMutationIntent) -> Self {
         self.workspace_mutation = mutation;
+        self
+    }
+
+    #[must_use]
+    pub fn with_mutation_completion_scope(mut self, scope: MutationCompletionScope) -> Self {
+        self.mutation_completion_scope = scope;
         self
     }
 
@@ -577,6 +652,7 @@ impl TurnIntent {
     #[must_use]
     pub fn requires_workspace_mutation(&self) -> bool {
         self.workspace_mutation == WorkspaceMutationIntent::MustMutate
+            && self.mutation_completion_scope.requires_workspace_receipt()
     }
 }
 
@@ -971,10 +1047,35 @@ mod tests {
             WorkspaceMutationIntent::Unknown
         );
         assert!(!TurnIntent::default().requires_workspace_mutation());
+        assert_eq!(
+            TurnIntent::default().work_lifecycle,
+            WorkLifecycleIntent::Unknown
+        );
 
         let mutating =
             TurnIntent::default().with_workspace_mutation(WorkspaceMutationIntent::MustMutate);
         assert!(mutating.requires_workspace_mutation());
+
+        let external = mutating
+            .clone()
+            .with_mutation_completion_scope(MutationCompletionScope::External);
+        assert!(
+            !external.requires_workspace_mutation(),
+            "an explicit external-only outcome must not manufacture a workspace edit"
+        );
+        for scope in [
+            MutationCompletionScope::Unknown,
+            MutationCompletionScope::Workspace,
+            MutationCompletionScope::Mixed,
+        ] {
+            assert!(
+                mutating
+                    .clone()
+                    .with_mutation_completion_scope(scope)
+                    .requires_workspace_mutation(),
+                "{scope:?} must retain the bound-workspace receipt gate"
+            );
+        }
     }
 
     #[test]

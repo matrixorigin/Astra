@@ -1,6 +1,6 @@
 name: session_tool_result_artifact_recovery
 description: |
-  **What**: Produce a tool result larger than the inline persistence threshold,
+  **What**: Produce a tool result larger than the bounded model presentation,
   then recover its first durable window through the advertised `introspect`
   artifact handle.
   **Tests**: The full edge → recording → session-owned artifact → model recovery
@@ -29,8 +29,29 @@ criteria:
     code: 0
   - type: tool_sequence
     tools: [bash, introspect]
-  - type: tools_count_between
-    min: 2
-    max: 2
+  - type: journal_tool_call_count
+    name: bash
+    min: 1
+    max: 1
+    document: arguments
+    path: /command
+    equals: "yes RECOVERED_EVIDENCE_OK | head -c 36000"
+  - type: journal_tool_call_count
+    name: introspect
+    min: 1
+    max: 1
+  - type: journal_tool_json
+    name: introspect
+    document: arguments
+    path: /offset
+    equals: 0
+  - type: journal_tool_json
+    name: introspect
+    document: arguments
+    path: /max_bytes
+    equals: 256
+  - type: journal_artifact_consumed
+    producer: bash
+    consumer: introspect
   - type: text_contains
     needle: RECOVERED_EVIDENCE_OK

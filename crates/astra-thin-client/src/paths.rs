@@ -1,10 +1,23 @@
 //! Canonical paths for the thin client protocol (§5.5 + `router_builder`).
 
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+
+/// Encode model names as one URL path segment while preserving the standard
+/// unreserved characters. Model names are provider data and may contain `/`,
+/// `?`, or `#`; interpolating them directly changes the route identity.
+const MODEL_SEGMENT_ENCODE_SET: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+#[inline]
+fn model_segment(name: &str) -> String {
+    utf8_percent_encode(name, MODEL_SEGMENT_ENCODE_SET).to_string()
+}
+
 /// `POST` — chat turn as SSE (`data: {json}\\n\\n` per event).
 pub const CHAT_STREAM: &str = "/chat/stream";
-
-/// `POST` — low-level chat turn bridge (same SSE framing as stream).
-pub const CHAT_TURN: &str = "/chat/turn";
 
 /// `POST` — design doc: edge posts tool execution results (optional route).
 pub const TOOLS_RESULT: &str = "/tools/result";
@@ -20,6 +33,80 @@ pub const PROVIDER_INTERACTION_RESPOND: &str = "/provider-interactions/respond";
 
 /// `GET` — list durable runs.
 pub const RUNS: &str = "/runs";
+
+/// Canonical Work catalog and Start Work boundary.
+pub const WORKS: &str = "/v1/works";
+
+/// Resolve an already-known internal session to its public Work identity.
+#[inline]
+pub fn work_session_binding(session_id: &str) -> Option<String> {
+    is_safe_path_segment(session_id).then(|| format!("{WORKS}/session-bindings/{session_id}"))
+}
+
+/// Exact Work resource path. Work identities are path segments, never
+/// caller-supplied path fragments.
+#[inline]
+pub fn work(work_id: &str) -> Option<String> {
+    is_safe_path_segment(work_id).then(|| format!("{WORKS}/{work_id}"))
+}
+
+/// Establish one server-owned attachment to a Work branch.
+#[inline]
+pub fn work_branch_attachments(work_id: &str, branch_id: &str) -> Option<String> {
+    if !is_safe_path_segment(work_id) || !is_safe_path_segment(branch_id) {
+        return None;
+    }
+    Some(format!(
+        "{WORKS}/{work_id}/branches/{branch_id}/attachments"
+    ))
+}
+
+/// Release one exact Work branch attachment.
+#[inline]
+pub fn work_branch_attachment(
+    work_id: &str,
+    branch_id: &str,
+    attachment_id: &str,
+) -> Option<String> {
+    if !is_safe_path_segment(work_id)
+        || !is_safe_path_segment(branch_id)
+        || !is_safe_path_segment(attachment_id)
+    {
+        return None;
+    }
+    Some(format!(
+        "{WORKS}/{work_id}/branches/{branch_id}/attachments/{attachment_id}"
+    ))
+}
+
+/// Submit a typed Work branch controller operation.
+#[inline]
+pub fn work_branch_control_operations(work_id: &str, branch_id: &str) -> Option<String> {
+    if !is_safe_path_segment(work_id) || !is_safe_path_segment(branch_id) {
+        return None;
+    }
+    Some(format!(
+        "{WORKS}/{work_id}/branches/{branch_id}/control-operations"
+    ))
+}
+
+/// Continue one Work branch without exposing its internal session identity.
+#[inline]
+pub fn work_branch_turns(work_id: &str, branch_id: &str) -> Option<String> {
+    if !is_safe_path_segment(work_id) || !is_safe_path_segment(branch_id) {
+        return None;
+    }
+    Some(format!("{WORKS}/{work_id}/branches/{branch_id}/turns"))
+}
+
+/// Read the bounded canonical Task Graph for one Work branch.
+#[inline]
+pub fn work_branch_task_graph(work_id: &str, branch_id: &str) -> Option<String> {
+    if !is_safe_path_segment(work_id) || !is_safe_path_segment(branch_id) {
+        return None;
+    }
+    Some(format!("{WORKS}/{work_id}/branches/{branch_id}/task-graph"))
+}
 
 /// `GET` — optional tool capacity from server and connected edge providers.
 pub const RUNTIME_CAPABILITIES: &str = "/runtime/capabilities";
@@ -54,6 +141,11 @@ pub fn session(id: &str) -> String {
 #[inline]
 pub fn session_close(id: &str) -> String {
     format!("/sessions/{id}/close")
+}
+
+#[inline]
+pub fn session_cancel(id: &str) -> String {
+    format!("/sessions/{id}/cancel")
 }
 
 #[inline]
@@ -221,7 +313,7 @@ pub const MODEL_ACCESS: &str = "/model-access";
 
 #[inline]
 pub fn model(name: &str) -> String {
-    format!("/models/{name}")
+    format!("/models/{}", model_segment(name))
 }
 
 #[inline]
@@ -231,7 +323,7 @@ pub fn model_memory() -> &'static str {
 
 #[inline]
 pub fn model_check(model_name: &str) -> String {
-    format!("/models/{model_name}/check")
+    format!("/models/{}/check", model_segment(model_name))
 }
 
 pub const SKILLS: &str = "/skills";
@@ -242,52 +334,12 @@ pub fn skill(id: &str) -> String {
 }
 
 pub const SKILLS_STATUS: &str = "/skills/status";
-pub const SKILLS_TEST: &str = "/skills/test";
 
 /// Memory proxy routes (server uses POST for search).
 pub const MEMORY_STORE: &str = "/memory/store";
 pub const MEMORY_SEARCH: &str = "/memory/search";
 pub const MEMORY_RETRIEVE: &str = "/memory/retrieve";
 pub const MEMORY_PURGE: &str = "/memory/purge";
-
-/// Agent background job API (`router_builder`: list/create, detail, progress, status update).
-pub const AGENT_JOBS: &str = "/agent-jobs";
-
-#[inline]
-pub fn agent_job(id: &str) -> String {
-    format!("/agent-jobs/{id}")
-}
-
-#[inline]
-pub fn agent_job_progress(id: &str) -> String {
-    format!("/agent-jobs/{id}/progress")
-}
-
-#[inline]
-pub fn agent_job_status(id: &str) -> String {
-    format!("/agent-jobs/{id}/status")
-}
-
-/// `GET /agent-jobs/{id}/lease` — current lease row (or null).
-#[inline]
-pub fn agent_job_lease(id: &str) -> String {
-    format!("/agent-jobs/{id}/lease")
-}
-
-#[inline]
-pub fn agent_job_lease_claim(id: &str) -> String {
-    format!("/agent-jobs/{id}/lease/claim")
-}
-
-#[inline]
-pub fn agent_job_lease_release(id: &str) -> String {
-    format!("/agent-jobs/{id}/lease/release")
-}
-
-#[inline]
-pub fn agent_job_lease_renew(id: &str) -> String {
-    format!("/agent-jobs/{id}/lease/renew")
-}
 
 /// Context snapshots (`GET/POST /context`, `GET /context/{id}`).
 pub const CONTEXT: &str = "/context";
@@ -364,48 +416,6 @@ pub fn session_audit_errors(session_id: &str) -> String {
     format!("/sessions/{session_id}/audit/errors")
 }
 
-// ── Plan lifecycle endpoints (cloud-authoritative) ──────────────────────────
-
-/// `POST /plans` / `GET /plans`
-pub const PLANS: &str = "/plans";
-
-#[inline]
-pub fn plan(id: &str) -> String {
-    format!("/plans/{id}")
-}
-
-#[inline]
-pub fn plan_status(id: &str) -> String {
-    format!("/plans/{id}/status")
-}
-
-#[inline]
-pub fn plan_exit_mode(id: &str) -> String {
-    format!("/plans/{id}/exit-plan-mode")
-}
-
-#[inline]
-pub fn plan_rewind(id: &str) -> String {
-    format!("/plans/{id}/rewind")
-}
-/// `POST /plans/{id}/step-runs` (create) and `GET /plans/{id}/step-runs` (list).
-/// Same path, different methods — read + write share the prefix for API
-/// consumer intuition.
-#[inline]
-pub fn plan_step_runs(id: &str) -> String {
-    format!("/plans/{id}/step-runs")
-}
-
-#[inline]
-pub fn plan_step_run_completed(id: &str) -> String {
-    format!("/plans/{id}/step-runs/completed")
-}
-
-#[inline]
-pub fn plan_step_run_finish(plan_id: &str, run_id: &str) -> String {
-    format!("/plans/{plan_id}/step-runs/{run_id}/finish")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,7 +426,6 @@ mod tests {
     fn constants_start_with_slash() {
         for path in [
             CHAT_STREAM,
-            CHAT_TURN,
             TOOLS_RESULT,
             APPROVAL_RESPOND,
             RUNS,
@@ -433,12 +442,10 @@ mod tests {
             MODELS,
             SKILLS,
             SKILLS_STATUS,
-            SKILLS_TEST,
             MEMORY_STORE,
             MEMORY_SEARCH,
             MEMORY_RETRIEVE,
             MEMORY_PURGE,
-            AGENT_JOBS,
             CONTEXT,
             COMPLETIONS,
             ADMIN_INIT,
@@ -469,6 +476,11 @@ mod tests {
     #[test]
     fn session_close_path() {
         assert_eq!(session_close("s1"), "/sessions/s1/close");
+    }
+
+    #[test]
+    fn session_cancel_path() {
+        assert_eq!(session_cancel("s1"), "/sessions/s1/cancel");
     }
 
     #[test]
@@ -618,6 +630,10 @@ mod tests {
     #[test]
     fn model_path() {
         assert_eq!(model("gpt-4"), "/models/gpt-4");
+        assert_eq!(
+            model("bedrock/claude?variant#1"),
+            "/models/bedrock%2Fclaude%3Fvariant%231"
+        );
         assert_eq!(MODEL_ACCESS, "/model-access");
     }
 
@@ -629,51 +645,15 @@ mod tests {
     #[test]
     fn model_check_path() {
         assert_eq!(model_check("gpt-4"), "/models/gpt-4/check");
+        assert_eq!(
+            model_check("bedrock/claude"),
+            "/models/bedrock%2Fclaude/check"
+        );
     }
 
     #[test]
     fn skill_versions_path() {
         assert_eq!(skill_versions("bash"), "/skills/bash/versions");
-    }
-
-    // --- Agent job paths ---
-
-    #[test]
-    fn job_path() {
-        assert_eq!(agent_job("t1"), "/agent-jobs/t1");
-    }
-
-    #[test]
-    fn job_progress_path() {
-        assert_eq!(agent_job_progress("t1"), "/agent-jobs/t1/progress");
-    }
-
-    #[test]
-    fn job_status_path() {
-        assert_eq!(agent_job_status("t1"), "/agent-jobs/t1/status");
-    }
-
-    #[test]
-    fn job_lease_path() {
-        assert_eq!(agent_job_lease("t1"), "/agent-jobs/t1/lease");
-    }
-
-    #[test]
-    fn job_lease_claim_path() {
-        assert_eq!(agent_job_lease_claim("t1"), "/agent-jobs/t1/lease/claim");
-    }
-
-    #[test]
-    fn job_lease_release_path() {
-        assert_eq!(
-            agent_job_lease_release("t1"),
-            "/agent-jobs/t1/lease/release"
-        );
-    }
-
-    #[test]
-    fn job_lease_renew_path() {
-        assert_eq!(agent_job_lease_renew("t1"), "/agent-jobs/t1/lease/renew");
     }
 
     // --- Context path ---
@@ -721,7 +701,40 @@ mod tests {
     }
 
     #[test]
-    fn id_with_special_chars() {
-        assert_eq!(agent_job("a/b"), "/agent-jobs/a/b");
+    fn work_paths_accept_resource_ids_and_reject_path_fragments() {
+        assert_eq!(work("work-1").as_deref(), Some("/v1/works/work-1"));
+        assert_eq!(
+            work_session_binding("session-1").as_deref(),
+            Some("/v1/works/session-bindings/session-1")
+        );
+        assert_eq!(
+            work_branch_attachments("work-1", "branch.main").as_deref(),
+            Some("/v1/works/work-1/branches/branch.main/attachments")
+        );
+        assert_eq!(
+            work_branch_turns("work-1", "branch.main").as_deref(),
+            Some("/v1/works/work-1/branches/branch.main/turns")
+        );
+        assert_eq!(
+            work_branch_task_graph("work-1", "branch.main").as_deref(),
+            Some("/v1/works/work-1/branches/branch.main/task-graph")
+        );
+        assert_eq!(
+            work_branch_attachment("work-1", "branch.main", "attachment-1").as_deref(),
+            Some("/v1/works/work-1/branches/branch.main/attachments/attachment-1")
+        );
+        assert_eq!(
+            work_branch_control_operations("work-1", "branch.main").as_deref(),
+            Some("/v1/works/work-1/branches/branch.main/control-operations")
+        );
+        for unsafe_id in ["", ".", "..", "work/other", "work?other", "work%2Fother"] {
+            assert!(work(unsafe_id).is_none());
+            assert!(work_session_binding(unsafe_id).is_none());
+            assert!(work_branch_attachments("work-1", unsafe_id).is_none());
+            assert!(work_branch_turns(unsafe_id, "branch-1").is_none());
+            assert!(work_branch_task_graph("work-1", unsafe_id).is_none());
+            assert!(work_branch_attachment("work-1", "branch-1", unsafe_id).is_none());
+            assert!(work_branch_control_operations("work-1", unsafe_id).is_none());
+        }
     }
 }

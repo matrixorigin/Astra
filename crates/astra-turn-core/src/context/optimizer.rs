@@ -609,7 +609,6 @@ mod tests {
     use crate::section_types::{CompressionPriority, PlannedSection, SectionSource};
     use crate::session_latches::SessionLatches;
     use crate::token_accounting::TokenAccounting;
-    use std::collections::HashMap;
 
     fn build_test_plan_and_bound() -> (ContextPlan, ContextBound, SessionLatches) {
         let statics = StaticSections::test_default();
@@ -637,8 +636,6 @@ mod tests {
             tool_results: vec![],
             tokens: TokenAccounting::default(),
             active_skills: vec![],
-            recent_file_reads: HashMap::new(),
-            remaining_turns: 10,
             turn_index: 1,
             recovery: RecoveryState::default(),
             last_user_message: "test".into(),

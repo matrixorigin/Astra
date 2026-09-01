@@ -69,6 +69,24 @@ async fn setup_pool() -> astra_core::SharedPool {
         .clone()
 }
 
+async fn insert_session(pool: &astra_core::SharedPool, user_id: &str, session_id: &str) {
+    let result = sqlx::query(
+        "INSERT INTO agent_sessions
+         (session_id, user_id, agent_id, title, status, metadata, created_at, updated_at)
+         VALUES (?, ?, 'phase1-agent', 'phase1 durability session', 'active', '{}', NOW(6), NOW(6))",
+    )
+    .bind(session_id)
+    .bind(user_id)
+    .execute(pool.get())
+    .await;
+    if let Err(error) = result {
+        panic!(
+            "insert_session must establish the durable run admission scope: {error}; pool={:?}",
+            pool.stats()
+        );
+    }
+}
+
 fn test_ids() -> (String, String, String) {
     let suffix = Uuid::new_v4();
     (
@@ -110,8 +128,10 @@ fn durable_record(run_id: &str, session_id: &str, user_id: &str) -> DurableRunRe
         agent_binding_schema_version: None,
         model_offering_id: None,
         resolved_model_name: None,
+        capability_server_refs_json: None,
         runtime_profile: None,
-        provider_request_fingerprint: None,
+        start_request_fingerprint: None,
+        work_binding: None,
         events: vec![json!({"event_type": "run_started", "data": {}})],
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
@@ -258,6 +278,7 @@ impl SessionService for Phase1HttpSession {
 #[derive(Clone)]
 struct Phase1HttpRunLifecycle {
     store: Arc<RwLock<DatabaseRunStateStore>>,
+    session_id: String,
 }
 
 impl Phase1HttpRunLifecycle {
@@ -324,6 +345,7 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
             workspace: None,
             executor: None,
             transport: None,
+            accounting: None,
         })
     }
 
@@ -367,6 +389,7 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
         Ok(CancelRunRecord {
             run_id,
             status: "cancelled".to_string(),
+            execution_settled: true,
         })
     }
 
@@ -424,6 +447,7 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
             store
                 .append_event(
                     &user_id,
+                    &run.session_id,
                     &run_id,
                     json!({
                         "event_type": "user_intent",
@@ -447,6 +471,7 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
             intent_id,
             status: astra_turn_types::UserIntentStatus::AcceptedRemote,
             duplicate,
+            event_index: 0,
         })
     }
 
@@ -457,7 +482,14 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
     ) -> Result<RunMutationRecord, (StatusCode, Json<ErrorResponse>)> {
         self.store()
             .await
-            .update_run_status(&user_id, &run_id, "waiting", Some("user"), None)
+            .update_run_status(
+                &user_id,
+                &self.session_id,
+                &run_id,
+                "waiting",
+                Some("user"),
+                None,
+            )
             .await
             .map_err(|error| {
                 (
@@ -471,7 +503,7 @@ impl RunLifecycleService for Phase1HttpRunLifecycle {
 
 fn build_phase1_http_app(
     pool: astra_core::SharedPool,
-    _session_id: String,
+    session_id: String,
     user_id: String,
     store: Arc<RwLock<DatabaseRunStateStore>>,
 ) -> Router {
@@ -481,7 +513,7 @@ fn build_phase1_http_app(
             user_id: user_id.clone(),
         }))
         .with_session_service(Arc::new(Phase1HttpSession { user_id }))
-        .with_run_lifecycle_service(Arc::new(Phase1HttpRunLifecycle { store }));
+        .with_run_lifecycle_service(Arc::new(Phase1HttpRunLifecycle { store, session_id }));
     build_app(state)
 }
 
@@ -521,11 +553,12 @@ async fn http_post_user_intent(app: &Router, run_id: &str, key: &str, input: Val
     assert_eq!(response.status(), StatusCode::OK);
 }
 
-#[tokio::test]
+shared_db_test! {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn l2_lease_race_has_single_owner() {
     let pool = setup_pool().await;
     let (run_id, session_id, user_id) = test_ids();
+    insert_session(&pool, &user_id, &session_id).await;
     let store = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("owner-a");
     store
         .insert_run(durable_record(&run_id, &session_id, &user_id))
@@ -545,11 +578,14 @@ async fn l2_lease_race_has_single_owner() {
     assert_eq!(wins, 1, "exactly one pod may own a live lease");
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn l2_recovery_ignores_live_runs_owned_by_other_pods() {
     let pool = setup_pool().await;
     let (run_id, session_id, user_id) = test_ids();
+    insert_session(&pool, &user_id, &session_id).await;
     let owner_a = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("owner-a");
     owner_a
         .insert_run(durable_record(&run_id, &session_id, &user_id))
@@ -578,11 +614,14 @@ async fn l2_recovery_ignores_live_runs_owned_by_other_pods() {
     );
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn l2_event_idx_and_idempotency_use_agent_runs() {
     let pool = setup_pool().await;
     let (run_id, session_id, user_id) = test_ids();
+    insert_session(&pool, &user_id, &session_id).await;
     let store = DatabaseRunStateStore::new(pool.clone());
     store
         .insert_run(durable_record(&run_id, &session_id, &user_id))
@@ -590,16 +629,9 @@ async fn l2_event_idx_and_idempotency_use_agent_runs() {
         .unwrap();
     store
         .append_event(
-                    &user_id,
-                    &run_id,
-            json!({"event_type": "user_input", "idempotency_key": "same-key", "data": {"text": "one"}}),
-        )
-        .await
-        .unwrap();
-    store
-        .append_event(
-                    &user_id,
-                    &run_id,
+            &user_id,
+            &session_id,
+            &run_id,
             json!({"event_type": "user_input", "idempotency_key": "same-key", "data": {"text": "one"}}),
         )
         .await
@@ -607,6 +639,16 @@ async fn l2_event_idx_and_idempotency_use_agent_runs() {
     store
         .append_event(
             &user_id,
+            &session_id,
+            &run_id,
+            json!({"event_type": "user_input", "idempotency_key": "same-key", "data": {"text": "one"}}),
+        )
+        .await
+        .unwrap();
+    store
+        .append_event(
+            &user_id,
+            &session_id,
             &run_id,
             json!({"event_type": "tool_result", "data": {}}),
         )
@@ -636,11 +678,14 @@ async fn l2_event_idx_and_idempotency_use_agent_runs() {
     assert_eq!(counter, 2);
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn l2_graceful_checkpoint_recovers_as_waiting() {
     let pool = setup_pool().await;
     let (run_id, session_id, user_id) = test_ids();
+    insert_session(&pool, &user_id, &session_id).await;
     let store = Arc::new(DatabaseRunStateStore::new(pool));
     store
         .insert_run(durable_record(&run_id, &session_id, &user_id))
@@ -651,6 +696,7 @@ async fn l2_graceful_checkpoint_recovers_as_waiting() {
         store
             .save_checkpoint(
                 &user_id,
+                &session_id,
                 &run_id,
                 &json!({
                     "version": "checkpoint_v1",
@@ -671,7 +717,7 @@ async fn l2_graceful_checkpoint_recovers_as_waiting() {
     );
     assert!(
         store
-            .save_checkpoint(&user_id, &run_id, r#"{"version":"bad"}"#)
+            .save_checkpoint(&user_id, &session_id, &run_id, r#"{"version":"bad"}"#)
             .await
             .is_err()
     );
@@ -688,11 +734,14 @@ async fn l2_graceful_checkpoint_recovers_as_waiting() {
     }));
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn l2_crash_recovery_marks_running_failed() {
     let pool = setup_pool().await;
     let (run_id, session_id, user_id) = test_ids();
+    insert_session(&pool, &user_id, &session_id).await;
     let store = Arc::new(DatabaseRunStateStore::new(pool));
     store
         .insert_run(durable_record(&run_id, &session_id, &user_id))
@@ -710,11 +759,14 @@ async fn l2_crash_recovery_marks_running_failed() {
     );
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn l2_retry_scope_and_batch_contracts_hold() {
     let pool = setup_pool().await;
     let (run_id, session_id, user_id) = test_ids();
+    insert_session(&pool, &user_id, &session_id).await;
     let store = DatabaseRunStateStore::new(pool.clone());
     let mut record = durable_record(&run_id, &session_id, &user_id);
     record.retry_scope = Some("siblings".to_string());
@@ -772,17 +824,22 @@ async fn l2_retry_scope_and_batch_contracts_hold() {
     );
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn l2_sse_heartbeat_contract_is_15_seconds() {
     assert_eq!(SSE_HEARTBEAT_INTERVAL_SECS, 15);
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn l3_s04_reconnect_replays_monotonic_events() {
     let pool = setup_pool().await;
     let (run_id, session_id, user_id) = test_ids();
+    insert_session(&pool, &user_id, &session_id).await;
     let store = DatabaseRunStateStore::new(pool);
     store
         .insert_run(durable_record(&run_id, &session_id, &user_id))
@@ -792,6 +849,7 @@ async fn l3_s04_reconnect_replays_monotonic_events() {
         store
             .append_event(
                 &user_id,
+                &session_id,
                 &run_id,
                 json!({"event_type": "text_delta", "data": {"idx": idx}}),
             )
@@ -802,6 +860,7 @@ async fn l3_s04_reconnect_replays_monotonic_events() {
         store
             .append_event(
                 &user_id,
+                &session_id,
                 &run_id,
                 json!({"event_type": "approval_decision", "data": {"idx": idx}}),
             )
@@ -822,11 +881,14 @@ async fn l3_s04_reconnect_replays_monotonic_events() {
     assert_eq!(indexes, (0..20).collect::<Vec<_>>());
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
     let pool = setup_pool().await;
     let (run_id, session_id, user_id) = test_ids();
+    insert_session(&pool, &user_id, &session_id).await;
     let store_a = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("phase1-pod-a");
     store_a
         .insert_run(durable_record(&run_id, &session_id, &user_id))
@@ -854,6 +916,7 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
             .await
             .append_event(
                 &user_id,
+                &session_id,
                 &run_id,
                 json!({"event_type": "text_delta", "data": {"disconnect": disconnect}}),
             )
@@ -878,6 +941,7 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
         .await
         .save_checkpoint(
             &user_id,
+            &session_id,
             &run_id,
             &json!({
                 "version": "checkpoint_v1",
@@ -928,6 +992,7 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
             .await
             .append_event(
                 &user_id,
+                &session_id,
                 &run_id,
                 json!({"event_type": "run_paused", "data": {"waiting_for": "user"}}),
             )
@@ -937,8 +1002,9 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
             .read()
             .await
             .append_event(
-                    &user_id,
-                    &run_id,
+                &user_id,
+                &session_id,
+                &run_id,
                 json!({"event_type": "approval_required", "data": {"request_id": format!("approval-{idx}")}}),
             )
             .await
@@ -946,7 +1012,14 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
         active_store
             .read()
             .await
-            .update_run_status(&user_id, &run_id, "waiting", Some("user"), None)
+            .update_run_status(
+                &user_id,
+                &session_id,
+                &run_id,
+                "waiting",
+                Some("user"),
+                None,
+            )
             .await
             .unwrap();
         let waiting = http_get_run_stream(&app, &run_id, next_index).await;
@@ -1021,11 +1094,14 @@ async fn l3_s04_t01_t17_full_reconnect_survives_restart_and_approvals() {
     );
 }
 
-#[tokio::test]
+}
+
+shared_db_test! {
 #[ignore = "requires MatrixOne; run with ASTRA_TEST_DB_IT=1"]
 async fn l3_s10_retry_scope_is_persisted_for_retry_runs() {
     let pool = setup_pool().await;
     let (run_id, session_id, user_id) = test_ids();
+    insert_session(&pool, &user_id, &session_id).await;
     let original = format!("{run_id}-original");
     let store = DatabaseRunStateStore::new(pool);
     store
@@ -1041,4 +1117,5 @@ async fn l3_s10_retry_scope_is_persisted_for_retry_runs() {
     let loaded = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
     assert_eq!(loaded.retry_scope.as_deref(), Some("subtree"));
     assert!(loaded.retry_of.is_some());
+}
 }

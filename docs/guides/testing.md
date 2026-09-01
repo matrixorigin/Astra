@@ -46,6 +46,9 @@ cargo check --manifest-path Cargo.toml
 ```bash
 ASTRA_TEST_DB_IT=1 \
 ASTRA_TEST_BRIDGE_SECRET=system-matrix-e2e-secret \
+ASTRA_BACKEND_SERVICE_KEY=test-service-key-e2e \
+ASTRA_LLM_RETRY_BASE_MS=10 ASTRA_DEFAULT_RETRY_AFTER_MS=10 ASTRA_BCRYPT_COST=4 \
+RUST_MIN_STACK=16777216 \
 cargo test -p astra-runtime --test system_matrix_http_e2e --features bridge-e2e-hooks -- \
   --ignored --nocapture
 ```

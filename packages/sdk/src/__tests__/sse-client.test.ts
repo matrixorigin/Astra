@@ -27,6 +27,21 @@ function createMockStream(chunks: string[]): ReadableStream<Uint8Array> {
   });
 }
 
+function createErroredStream(chunks: string[]): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  let idx = 0;
+  return new ReadableStream({
+    pull(controller) {
+      if (idx < chunks.length) {
+        controller.enqueue(encoder.encode(chunks[idx]));
+        idx++;
+      } else {
+        controller.error(new Error("socket reset after terminal"));
+      }
+    },
+  });
+}
+
 function mockFetchStream(chunks: string[], status = 200) {
   return vi.fn().mockResolvedValue({
     ok: status >= 200 && status < 300,
@@ -123,6 +138,54 @@ describe("SSEClient — Connection", () => {
     expect(call[1].method).toBe("POST");
     expect(call[1].body).toBe(body);
     expect(call[1].headers["Content-Type"]).toBe("application/json");
+  });
+
+  test("required terminal reports a partial EOF as a transport error", async () => {
+    globalThis.fetch = mockFetchStream([
+      'data: {"type":"text_delta","content":"partial"}\n\n',
+    ]);
+    const events: StreamEvent[] = [];
+    const client = new SSEClient({
+      url: "http://localhost/stream",
+      onEvent: (event) => events.push(event),
+      maxRetries: 0,
+      requireTerminalEvent: true,
+    });
+
+    await client.connect();
+
+    expect(events.at(-1)).toMatchObject({
+      type: "error",
+      retryable: false,
+    });
+    expect((events.at(-1) as { message?: string }).message).toContain(
+      "terminal event",
+    );
+  });
+
+  test("terminal event wins over a trailing socket reset", async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      body: createErroredStream([
+        'data: {"type":"turn_complete","assistant_text":"done"}\n\n',
+      ]),
+      headers: new Headers(),
+    } as unknown as Response);
+    const events: StreamEvent[] = [];
+    const client = new SSEClient({
+      url: "http://localhost/stream",
+      onEvent: (event) => events.push(event),
+      maxRetries: 0,
+      requireTerminalEvent: true,
+    });
+
+    await client.connect();
+
+    expect(events).toEqual([
+      { type: "turn_complete", assistant_text: "done" },
+    ]);
   });
 });
 

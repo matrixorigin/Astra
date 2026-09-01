@@ -1,4 +1,5 @@
 pub mod adjust;
+pub mod capability_matrix;
 pub mod debug;
 pub mod forensics;
 mod kernel;
@@ -10,6 +11,10 @@ pub mod trace;
 pub mod verifiers;
 
 pub use adjust::{AdjustCommand, AdjustSender, adjust_channel};
+pub use capability_matrix::{
+    CAPABILITY_CASES, CapabilityCase, CapabilityQuadrant, CaseKind, MatrixIssue, ModelValidation,
+    Topology, TraceContractViolation, validate_capability_matrix, verify_trace_contract,
+};
 pub use debug::{Breakpoint, DebugKernel};
 pub use kernel::{HarnessLimits, HarnessProfile, StandardKernel};
 pub use query::{HarnessQueryReceiver, HarnessQuerySender, query_channel};
@@ -39,6 +44,13 @@ pub struct RuntimeSnapshot {
     // ── Budget (inner agentic loop iterations) ──
     pub turns_used: u32,
     pub turns_limit: Option<u32>,
+    /// Number of bounded, non-agentic settlement rounds explicitly reserved
+    /// by the runtime beyond the configured agentic ceiling. This is an
+    /// explicit runtime fact: the harness must not infer settlement authority
+    /// from a changing `turns_limit`, because doing so could accidentally turn
+    /// an ordinary over-budget execution into an allowed one.
+    #[serde(default)]
+    pub settlement_rounds_reserved: u32,
     /// Outer session/REPL turn number (1-based). Distinct from inner loop rounds.
     #[serde(default)]
     pub session_turn: u32,
@@ -113,6 +125,7 @@ impl RuntimeSnapshot {
             context_utilization: None,
             turns_used: 0,
             turns_limit: None,
+            settlement_rounds_reserved: 0,
             session_turn: 0,
             tokens_used_session: 0,
             tokens_prompt: 0,
@@ -352,6 +365,7 @@ mod tests {
             context_utilization: Some(0.25),
             turns_used: 7,
             turns_limit: Some(20),
+            settlement_rounds_reserved: 0,
             session_turn: 3,
             tokens_used_session: 150_000,
             tokens_prompt: 90_000,

@@ -125,6 +125,23 @@ mod enabled {
         } else {
             None
         };
+        // `begin_budget_settlement` deliberately adds a bounded, text-only
+        // boundary after the agentic hard limit. Keep that accounting fact
+        // explicit in the snapshot so the harness can allow only the exact
+        // runtime-owned settlement boundary without weakening its ordinary
+        // over-budget guard. The runtime currently permits at most one retry
+        // for this boundary; cap the exported fact defensively as well.
+        let settlement_rounds_reserved = if state.hooks.completion_settlement.text_only
+            || state.hooks.completion_settlement.work_settlement_only
+        {
+            state
+                .max_turns
+                .saturating_sub(state.agentic_turn_budget.hard_turn_limit)
+                .min(2)
+                .min(u32::MAX as usize) as u32
+        } else {
+            0
+        };
 
         let tokens_used_session = state.total_prompt
             + state.total_completion
@@ -193,6 +210,7 @@ mod enabled {
             context_utilization,
             turns_used,
             turns_limit,
+            settlement_rounds_reserved,
             session_turn: state.session_turn,
             tokens_used_session,
             tokens_prompt: state.total_prompt,
@@ -215,7 +233,7 @@ mod enabled {
             consecutive_errors: state.error_recovery.consecutive_same_error,
             captured_at_unix_millis: now,
             session_start_unix_millis,
-            causal_chain_id: state.bridge_turn_chain_id.clone(),
+            causal_chain_id: state.canonical_turn_chain_id.clone(),
             schema_version: 3,
         }
     }
@@ -407,6 +425,30 @@ mod enabled {
             assert_eq!(snap.turns_limit, Some(25));
             assert_eq!(snap.turns_used, 7); // current_round_index + 1
             assert_eq!(snap.session_turn, 3); // outer session turn
+            assert_eq!(snap.settlement_rounds_reserved, 0);
+        }
+
+        #[test]
+        fn capture_snapshot_reports_runtime_settlement_boundary() {
+            let mut state = make_state();
+            state.agentic_turn_budget.hard_turn_limit = 10;
+            state.max_turns = 11;
+            state.hooks.completion_settlement.text_only = true;
+
+            let snap = capture_snapshot(&state, 0);
+            assert_eq!(snap.settlement_rounds_reserved, 1);
+
+            state.max_turns = 12;
+            let snap = capture_snapshot(&state, 0);
+            assert_eq!(snap.settlement_rounds_reserved, 2);
+
+            state.max_turns = 13;
+            let snap = capture_snapshot(&state, 0);
+            assert_eq!(snap.settlement_rounds_reserved, 2);
+
+            state.hooks.completion_settlement.text_only = false;
+            let snap = capture_snapshot(&state, 0);
+            assert_eq!(snap.settlement_rounds_reserved, 0);
         }
 
         #[test]

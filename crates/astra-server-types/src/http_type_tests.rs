@@ -1,6 +1,6 @@
 use super::*;
 use astra_services::runs::{
-    ExecutionBudget, ExecutionPolicyRequest, SkillAutoRouteExecutionPolicy,
+    ExecutionBudget, ExecutionPolicyRequest, ExecutionTimeBudget, SkillAutoRouteExecutionPolicy,
     TurnIntentExecutionPolicy,
 };
 use axum::http::StatusCode;
@@ -61,6 +61,7 @@ fn deserialization_applies_defaults() {
     let req: ChatRequest = serde_json::from_str(r#"{"message":"hi"}"#).unwrap();
     assert_eq!(req.message, "hi");
     assert!(req.execution_budget.is_none());
+    assert!(req.execution_time_budget.is_none());
     assert!(!req.explain);
     assert!(req.session_id.is_none());
     assert!(req.agent_id.is_none());
@@ -148,6 +149,7 @@ fn chat_request_all_fields() {
                 "transport": "http",
                 "endpoint_url": "http://catalog:8081/api/v1/model-gateway",
                 "protocol": "openai_chat_completions",
+                "model_context_window": 128000,
                 "metadata": {}
             }
         },
@@ -162,8 +164,14 @@ fn chat_request_all_fields() {
         "context": {"key": "value"},
         "stable_runtime_system_prompt": "Extension instructions take precedence on semantic overlap.",
         "agent_bindings": [
-            {"id": "binding-foundation"},
-            {"id": "binding-extension"}
+            {
+                "id": "binding-foundation",
+                "capability_server_refs": {"mcp": "tools", "skills": "skills"}
+            },
+            {
+                "id": "binding-extension",
+                "capability_server_refs": {"mcp": "tools", "skills": "skills"}
+            }
         ],
         "execution_budget": {"initial_turns": 10, "hard_turn_limit": 18},
         "execution_policy": {
@@ -204,6 +212,11 @@ fn chat_request_all_fields() {
     );
     assert_eq!(req.agent_bindings.len(), 2);
     assert_eq!(req.agent_bindings[0].id, "binding-foundation");
+    assert_eq!(req.agent_bindings[0].capability_server_refs.mcp, "tools");
+    assert_eq!(
+        req.agent_bindings[0].capability_server_refs.skills,
+        "skills"
+    );
     assert_eq!(req.agent_bindings[1].id, "binding-extension");
     assert_eq!(
         req.execution_budget,
@@ -287,20 +300,27 @@ fn chat_request_rejects_runtime_auth_credentials_map() {
 }
 
 #[test]
-fn chat_request_rejects_removed_agent_binding_capability_refs() {
+fn chat_request_agent_binding_capability_refs_are_strict() {
     let result = serde_json::from_str::<ChatRequest>(
         r#"{"message":"hello","model_selection":{"offering_id":"offer-gpt-4"},"agent_binding":{"id":"ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391","capability_server_refs":{"mcp":"tools","skills":"skills","models":"models"}}}"#,
     );
     assert!(
         result.is_err(),
-        "agent_binding.capability_server_refs must be rejected"
+        "agent_binding.capability_server_refs must reject undeclared server kinds"
     );
     let err = result.err().unwrap();
     assert!(
-        err.to_string()
-            .contains("unknown field `capability_server_refs`"),
+        err.to_string().contains("unknown field `models`"),
         "unexpected error: {err}"
     );
+
+    let request = serde_json::from_str::<ChatRequest>(
+        r#"{"message":"hello","model_selection":{"offering_id":"offer-gpt-4"},"agent_binding":{"id":"ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391","capability_server_refs":{"mcp":"tools","skills":"skills"}}}"#,
+    )
+    .expect("logical MCP and skill server refs are the canonical runtime binding shape");
+    let binding = request.agent_binding.expect("agent binding");
+    assert_eq!(binding.capability_server_refs.mcp, "tools");
+    assert_eq!(binding.capability_server_refs.skills, "skills");
 }
 
 #[test]
@@ -315,6 +335,24 @@ fn chat_request_execution_budget_roundtrip() {
             initial_turns: Some(4),
             hard_turn_limit: Some(9),
         })
+    );
+}
+
+#[test]
+fn chat_request_execution_time_budget_roundtrip_is_independent_from_round_budget() {
+    let req: ChatRequest = serde_json::from_str(
+        r#"{"message":"budget","execution_time_budget":{"remaining_seconds":37}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        req.execution_time_budget,
+        Some(ExecutionTimeBudget {
+            remaining_seconds: 37,
+        })
+    );
+    assert!(
+        req.execution_budget.is_none(),
+        "wall time must not opt into or expand the round budget"
     );
 }
 
@@ -559,6 +597,8 @@ fn health_response_serializes() {
         memoria: "connected".into(),
         persist_ok: 42,
         persist_fail: 1,
+        interaction_api_major: AGENT_INTERACTION_API_MAJOR.to_string(),
+        build_git_sha: "a".repeat(40),
     };
     let v = serde_json::to_value(&resp).unwrap();
     assert_eq!(v["status"], "ok");
@@ -566,6 +606,7 @@ fn health_response_serializes() {
     assert_eq!(v["memoria"], "connected");
     assert_eq!(v["persist_ok"], 42);
     assert_eq!(v["persist_fail"], 1);
+    assert_eq!(v["interaction_api_major"], AGENT_INTERACTION_API_MAJOR);
 }
 
 #[test]
@@ -643,6 +684,7 @@ fn run_status_response_serializes() {
         workspace: Some(json!({"kind": "server_sandbox"})),
         executor: Some(json!({"kind": "server_local"})),
         transport: Some("server_local".into()),
+        accounting: None,
     };
     let v = serde_json::to_value(&resp).unwrap();
     assert_eq!(v["waiting_for"], "tool_call");
@@ -660,10 +702,12 @@ fn cancel_run_response_serializes() {
     let resp = CancelRunResponse {
         run_id: "r1".into(),
         status: "cancelled".into(),
+        execution_settled: true,
     };
     let v = serde_json::to_value(&resp).unwrap();
     assert_eq!(v["run_id"], "r1");
     assert_eq!(v["status"], "cancelled");
+    assert_eq!(v["execution_settled"], true);
 }
 
 #[test]
@@ -1039,6 +1083,7 @@ fn run_list_record_to_response_preserves_optional_total_and_cursor() {
             workspace: None,
             executor: None,
             transport: None,
+            accounting: None,
         }],
         total: None,
         limit: 20,
@@ -1106,6 +1151,7 @@ fn run_status_record_to_response() {
         workspace: None,
         executor: None,
         transport: None,
+        accounting: None,
     };
     let resp: RunStatusResponse = record.into();
     assert_eq!(resp.status, "waiting");
@@ -1128,6 +1174,7 @@ fn run_status_record_to_response() {
         workspace: None,
         executor: None,
         transport: None,
+        accounting: None,
     };
     let resp: RunStatusResponse = record.into();
     assert!(resp.waiting_for.is_none());
@@ -1138,6 +1185,7 @@ fn cancel_run_record_to_response() {
     let record = CancelRunRecord {
         run_id: "r1".into(),
         status: "cancelled".into(),
+        execution_settled: true,
     };
     let resp: CancelRunResponse = record.into();
     assert_eq!(resp.run_id, "r1");
@@ -1241,6 +1289,213 @@ fn chat_request_parses_provider_resolved_model_selection() {
 }
 
 #[test]
+fn chat_request_work_binding_is_explicit_and_strict() {
+    let request: ChatRequest = serde_json::from_value(json!({
+        "message": "continue",
+        "session_id": "session-1",
+        "work_binding": {"work_id": "work-1", "branch_id": "branch-1"}
+    }))
+    .expect("typed Work binding");
+    let binding = request.work_binding.expect("Work binding");
+    assert_eq!(binding.work_id, "work-1");
+    assert_eq!(binding.branch_id, "branch-1");
+    assert!(binding.item.is_none());
+    let request: ChatRequest = serde_json::from_value(json!({
+        "message": "continue",
+        "session_id": "session-1",
+        "work_binding": {
+            "work_id": "work-1",
+            "branch_id": "branch-1",
+            "item": {
+                "item_id": "root",
+                "item_revision": 1,
+                "attempt_id": "run-1"
+            }
+        }
+    }))
+    .expect("typed WorkItem attempt binding");
+    assert_eq!(
+        request
+            .work_binding
+            .expect("Work binding")
+            .item
+            .expect("WorkItem binding")
+            .attempt_id,
+        "run-1"
+    );
+    assert!(
+        serde_json::from_value::<ChatRequest>(json!({
+            "message": "continue",
+            "session_id": "session-1",
+            "work_binding": {
+                "work_id": "work-1",
+                "branch_id": "branch-1",
+                "item": {"item_id": "root", "item_revision": 1}
+            }
+        }))
+        .is_err(),
+        "partial WorkItem bindings must fail closed"
+    );
+    assert!(
+        serde_json::from_value::<ChatRequest>(json!({
+            "message": "continue",
+            "session_id": "session-1",
+            "work_binding": {
+                "work_id": "work-1",
+                "branch_id": "branch-1",
+                "intent": "guess"
+            }
+        }))
+        .is_err(),
+        "untyped/unknown Work binding fields must fail closed"
+    );
+}
+
+#[test]
+fn work_create_request_is_a_strict_typed_command() {
+    let request: WorkCreateRequestV1 = serde_json::from_value(json!({
+        "request_id": "start-work-1",
+        "goal": "Ship the canonical Start Work boundary.",
+        "criteria": [{
+            "criterion_id": "tests-pass",
+            "kind": "test_check",
+            "statement": "Relevant tests pass.",
+            "command": "cargo test -p astra-runtime work_handlers"
+        }]
+    }))
+    .expect("typed Work create request");
+    assert_eq!(request.request_id, "start-work-1");
+    assert_eq!(request.goal, "Ship the canonical Start Work boundary.");
+    assert!(
+        serde_json::from_value::<WorkCreateRequestV1>(json!({
+            "request_id": "start-work-1",
+            "goal": "Ship the canonical Start Work boundary.",
+            "criteria": [],
+            "session_id": "client-controlled-session"
+        }))
+        .is_err(),
+        "public Work creation must never accept an internal session identity"
+    );
+    assert!(
+        serde_json::from_value::<WorkCreateRequestV1>(json!({
+            "request_id": "start-work-1",
+            "goal": "Missing criteria is not an implicit inference request."
+        }))
+        .is_err()
+    );
+    assert!(
+        serde_json::from_value::<WorkCreateRequestV1>(json!({
+            "request_id": "start-work-1",
+            "goal": "Do not accept an unverifiable model label.",
+            "criteria": [{
+                "criterion_id": "looks-good",
+                "kind": "model_assessment",
+                "statement": "The model thinks this is done."
+            }]
+        }))
+        .is_err(),
+        "reserved criterion labels must not become constructible verification contracts"
+    );
+}
+
+#[test]
+fn work_turn_request_cannot_smuggle_runtime_or_session_authority() {
+    let request: WorkTurnRequestV1 = serde_json::from_value(json!({
+        "request_id": "continue-1",
+        "attachment_id": "attachment-1",
+        "message": "Continue from the current Work facts."
+    }))
+    .expect("typed Work turn request");
+    assert_eq!(request.request_id, "continue-1");
+    assert_eq!(request.message, "Continue from the current Work facts.");
+    for forbidden in [
+        json!({
+            "request_id": "continue-1",
+            "attachment_id": "attachment-1",
+            "message": "Continue.",
+            "session_id": "client-session"
+        }),
+        json!({
+            "request_id": "continue-1",
+            "attachment_id": "attachment-1",
+            "message": "Continue.",
+            "model_selection": {"offering_id": "client-route"}
+        }),
+        json!({
+            "request_id": "continue-1",
+            "attachment_id": "attachment-1",
+            "message": "Continue.",
+            "work_binding": {"work_id": "other", "branch_id": "other"}
+        }),
+    ] {
+        assert!(
+            serde_json::from_value::<WorkTurnRequestV1>(forbidden).is_err(),
+            "Work continuation authority is entirely path/server owned"
+        );
+    }
+}
+
+#[test]
+fn work_control_release_request_is_strict_and_carries_exact_basis() {
+    let request: WorkBranchControlOperationRequestV1 = serde_json::from_value(json!({
+        "request_id": "release-1",
+        "expected_branch_revision": 2,
+        "expected_writer_epoch": 7,
+        "expected_canonical_root_hash": "sha256:root",
+        "command": {
+            "kind": "release_branch_control",
+            "attachment_id": "attachment-1"
+        }
+    }))
+    .expect("typed Work controller release");
+    assert_eq!(request.expected_branch_revision, 2);
+    assert_eq!(request.expected_writer_epoch, 7);
+    assert!(matches!(
+        request.command,
+        WorkBranchControlCommandV1::ReleaseBranchControl { ref attachment_id }
+            if attachment_id == "attachment-1"
+    ));
+    assert!(
+        serde_json::from_value::<WorkBranchControlOperationRequestV1>(json!({
+            "request_id": "release-1",
+            "expected_branch_revision": 2,
+            "expected_writer_epoch": 7,
+            "expected_canonical_root_hash": "sha256:root",
+            "command": {
+                "kind": "release_branch_control",
+                "attachment_id": "attachment-1"
+            },
+            "session_id": "client-controlled-session"
+        }))
+        .is_err(),
+        "controller release must not accept internal session authority"
+    );
+}
+
+#[test]
+fn work_task_graph_query_is_an_exact_pinned_pagination_contract() {
+    let query: WorkTaskGraphQueryV1 = serde_json::from_value(json!({
+        "graph_revision": 7,
+        "item_offset": 8,
+        "item_limit": 8,
+        "dependency_offset": 128,
+        "dependency_limit": 128
+    }))
+    .expect("typed Task Graph query");
+    assert_eq!(query.graph_revision, Some(7));
+    assert_eq!(query.item_offset, Some(8));
+    assert!(
+        serde_json::from_value::<WorkTaskGraphQueryV1>(json!({
+            "graph_revision": 7,
+            "item_offset": 8,
+            "session_id": "internal-session"
+        }))
+        .is_err(),
+        "Task Graph reads must not accept internal identity or unknown controls"
+    );
+}
+
+#[test]
 fn chat_request_into_data_maps_all_fields() {
     let mut ctx = Map::new();
     ctx.insert("tool".into(), json!("calc"));
@@ -1253,6 +1508,11 @@ fn chat_request_into_data_maps_all_fields() {
         stable_runtime_system_prompt: Some("Prefer extension skills on semantic overlap.".into()),
         runtime_system_prompt: Some("Runtime SQL scope db_name: retail.".into()),
         session_id: Some("s1".into()),
+        work_binding: Some(astra_services::runs::WorkRuntimeBindingRequest {
+            work_id: "work-1".into(),
+            branch_id: "branch-1".into(),
+            item: None,
+        }),
         agent_id: Some("a1".into()),
         model_selection: Some(astra_turn_types::ModelSelection {
             offering_id: "offer-gpt-4".into(),
@@ -1283,13 +1543,15 @@ fn chat_request_into_data_maps_all_fields() {
                 "Bearer runtime-token".to_string(),
             )]),
         }],
-        mcp_binding_ids: None,
         context: Some(ctx.clone()),
         edge_executor_id: Some("edge-1".into()),
         capabilities: vec!["bash".into(), "fs".into()],
         execution_budget: Some(ExecutionBudget {
             initial_turns: Some(3),
             hard_turn_limit: Some(7),
+        }),
+        execution_time_budget: Some(ExecutionTimeBudget {
+            remaining_seconds: 37,
         }),
         execution_policy: ExecutionPolicyRequest {
             turn_intent: TurnIntentExecutionPolicy::FixedDefault,
@@ -1318,6 +1580,12 @@ fn chat_request_into_data_maps_all_fields() {
         Some("Runtime SQL scope db_name: retail.")
     );
     assert_eq!(data.session_id.as_deref(), Some("s1"));
+    assert_eq!(
+        data.work_binding
+            .as_ref()
+            .map(|binding| (binding.work_id.as_str(), binding.branch_id.as_str())),
+        Some(("work-1", "branch-1"))
+    );
     assert_eq!(data.agent_id.as_deref(), Some("a1"));
     assert!(
         data.model.is_none(),
@@ -1343,7 +1611,6 @@ fn chat_request_into_data_maps_all_fields() {
     );
     assert_eq!(data.runtime_mcp_bindings.len(), 1);
     assert_eq!(data.runtime_mcp_bindings[0].id, "external_nl2sql");
-    assert!(data.mcp_binding_ids.is_none());
     assert_eq!(data.context, Some(ctx));
     assert_eq!(data.edge_executor_id.as_deref(), Some("edge-1"));
     assert_eq!(data.capabilities, vec!["bash", "fs"]);
@@ -1353,6 +1620,12 @@ fn chat_request_into_data_maps_all_fields() {
         Some(ExecutionBudget {
             initial_turns: Some(3),
             hard_turn_limit: Some(7),
+        })
+    );
+    assert_eq!(
+        data.execution_time_budget,
+        Some(ExecutionTimeBudget {
+            remaining_seconds: 37,
         })
     );
     assert!(data.explain);
@@ -1380,20 +1653,40 @@ fn chat_request_into_data_maps_defaults() {
     assert!(data.attachments.is_empty());
     assert!(data.runtime_system_prompt.is_none());
     assert!(data.session_id.is_none());
+    assert!(data.work_binding.is_none());
     assert!(data.agent_id.is_none());
     assert!(data.model.is_none());
     assert!(data.resolved_model_selection.is_none());
+    assert_eq!(
+        data.model_selection_mode,
+        astra_services::runs::ModelSelectionMode::ExplicitOffering
+    );
     assert!(data.admitted_model_execution.is_none());
     assert!(data.runtime_mcp_bindings.is_empty());
-    assert!(data.mcp_binding_ids.is_none());
     assert!(data.context.is_none());
     assert!(data.edge_executor_id.is_none());
     assert!(data.capabilities.is_empty());
     assert!(data.execution_budget.is_none());
+    assert!(data.execution_time_budget.is_none());
     assert_eq!(data.execution_policy, ExecutionPolicyRequest::default());
     assert!(!data.explain);
     assert!(data.interaction_mode.is_none());
     assert!(!data.interactive_client);
+}
+
+#[test]
+fn chat_request_rejects_removed_mcp_binding_ids_field() {
+    let error = match serde_json::from_str::<ChatRequest>(
+        r#"{"message":"test","mcp_binding_ids":["retired-binding"]}"#,
+    ) {
+        Ok(_) => panic!("removed mcp_binding_ids must be rejected at the wire boundary"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("unknown field `mcp_binding_ids`")
+    );
 }
 
 #[test]
@@ -1407,6 +1700,7 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         stable_runtime_system_prompt: None,
         runtime_system_prompt: None,
         session_id: None,
+        work_binding: None,
         agent_id: None,
         model_selection: None,
         resolved_model_selection: None,
@@ -1423,11 +1717,11 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         allow_tools: None,
         enabled_tools: None,
         runtime_mcp_bindings: Vec::new(),
-        mcp_binding_ids: None,
         context: None,
         edge_executor_id: None,
         capabilities: Vec::new(),
         execution_budget: None,
+        execution_time_budget: None,
         execution_policy: ExecutionPolicyRequest::default(),
         explain: false,
         interaction_mode: None,
@@ -1445,4 +1739,113 @@ fn chat_request_into_data_merges_plan_subtask_into_context() {
         ctx.get("is_plan_subtask").and_then(|v| v.as_bool()),
         Some(true)
     );
+}
+
+#[test]
+fn patch_materialization_request_is_closed_and_revision_pinned() {
+    let value = json!({
+        "request_id": "request-1",
+        "patch_artifact_id": "patch-1",
+        "expected_target_branch_revision": 4,
+        "expected_target_graph_revision": 3
+    });
+    serde_json::from_value::<WorkPatchMaterializationRequestV1>(value.clone())
+        .expect("complete materialization request");
+    let mut widened = value.clone();
+    widened
+        .as_object_mut()
+        .expect("request object")
+        .insert("provider_ref".into(), json!("must-stay-server-owned"));
+    assert!(serde_json::from_value::<WorkPatchMaterializationRequestV1>(widened).is_err());
+    let mut internal_basis = value;
+    internal_basis
+        .as_object_mut()
+        .expect("request object")
+        .insert(
+            "expected_target_subject_ref".into(),
+            json!("internal-workspace"),
+        );
+    assert!(serde_json::from_value::<WorkPatchMaterializationRequestV1>(internal_basis).is_err());
+}
+
+#[test]
+fn patch_commit_request_is_closed_revision_pinned_and_cannot_assert_identity() {
+    let value = json!({
+        "request_id": "commit-1",
+        "patch_artifact_id": "patch-1",
+        "expected_target_branch_revision": 4,
+        "expected_target_graph_revision": 3,
+        "message": "Commit reviewed changes"
+    });
+    serde_json::from_value::<WorkPatchCommitRequestV1>(value.clone())
+        .expect("complete patch commit request");
+    for internal in ["provider_ref", "policy_decision_ref", "author_email"] {
+        let mut widened = value.clone();
+        widened
+            .as_object_mut()
+            .expect("request object")
+            .insert(internal.into(), json!("caller-controlled"));
+        assert!(
+            serde_json::from_value::<WorkPatchCommitRequestV1>(widened).is_err(),
+            "{internal} must remain server-owned"
+        );
+    }
+}
+
+#[test]
+fn patch_export_request_is_closed_and_cannot_assert_provider_authority() {
+    let value = json!({
+        "request_id": "export-1",
+        "expected_branch_revision": 4,
+        "expected_graph_revision": 3
+    });
+    serde_json::from_value::<WorkPatchArtifactExportRequestV1>(value.clone())
+        .expect("complete export request");
+    let mut widened = value.clone();
+    widened
+        .as_object_mut()
+        .expect("request object")
+        .insert("provider_ref".into(), json!("caller-provider"));
+    assert!(serde_json::from_value::<WorkPatchArtifactExportRequestV1>(widened).is_err());
+    let mut internal_basis = value;
+    internal_basis
+        .as_object_mut()
+        .expect("request object")
+        .insert("expected_subject_ref".into(), json!("internal-workspace"));
+    assert!(serde_json::from_value::<WorkPatchArtifactExportRequestV1>(internal_basis).is_err());
+}
+
+#[test]
+fn patch_artifact_page_query_is_closed() {
+    let value = json!({
+        "before_created_at": "2026-08-02T12:00:00.000001Z",
+        "before_patch_artifact_id": "patch-1",
+        "limit": 20
+    });
+    serde_json::from_value::<WorkPatchArtifactsQueryV1>(value.clone())
+        .expect("complete patch artifact page query");
+    let mut widened = value;
+    widened
+        .as_object_mut()
+        .expect("query object")
+        .insert("include_content".into(), json!(true));
+    assert!(serde_json::from_value::<WorkPatchArtifactsQueryV1>(widened).is_err());
+}
+
+#[test]
+fn patch_materialization_page_query_is_closed() {
+    let value = json!({
+        "source_branch_id": "branch-alternative-1",
+        "before_created_at": "2026-08-02T12:00:00.000001Z",
+        "before_operation_id": "materialization-1",
+        "limit": 20
+    });
+    serde_json::from_value::<WorkPatchMaterializationsQueryV1>(value.clone())
+        .expect("complete materialization page query");
+    let mut widened = value;
+    widened
+        .as_object_mut()
+        .expect("query object")
+        .insert("include_executor_lease".into(), json!(true));
+    assert!(serde_json::from_value::<WorkPatchMaterializationsQueryV1>(widened).is_err());
 }

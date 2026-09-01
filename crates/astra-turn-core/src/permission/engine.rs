@@ -51,6 +51,7 @@ use astra_tools::agent_tool_contract::{
     AgentAction, AgentFanoutAction, agent_action_from_args, agent_fanout_action_from_args,
 };
 use serde_json::Value;
+use std::collections::BTreeSet;
 
 use crate::action_compensation::{explicit_approval_reason, primary_approval_reason};
 use crate::approval_fingerprint::{ApprovalFingerprint, FingerprintedOverrides};
@@ -1583,8 +1584,61 @@ fn is_internal_orchestration_control(tool_name: &str, args: &Value) -> bool {
             agent_fanout_action_from_args(args),
             Ok(AgentFanoutAction::Start | AgentFanoutAction::GetResults)
         ),
+        // Establishes internal declared-work state around the exact current
+        // run. It grants no external capability and cannot claim completion.
+        "start_work" => true,
+        "propose_work_plan" => is_safe_additive_work_plan_proposal(args),
+        // This action only persists a bounded non-authoritative proposal.
+        // Accepted Done-when criteria require a separate explicit decision,
+        // so model-authored statement/command text is not a policy signal.
+        "propose_work_criteria" => true,
         _ => false,
     }
+}
+
+const SAFE_WORK_PLAN_MAX_ADDITIONS: usize = 16;
+const SAFE_WORK_PLAN_MAX_DEPENDENCIES: usize = 64;
+
+/// The no-interruption Work admission class.
+///
+/// This deliberately examines only the typed graph shape. Model-authored
+/// objective/result prose is not a policy signal. A dependency may point from
+/// accepted work into a new node, but may not add a new prerequisite to an
+/// already accepted node.
+fn is_safe_additive_work_plan_proposal(args: &Value) -> bool {
+    let Some(additions) = args.get("additions").and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(dependencies) = args.get("dependencies").and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(revisions) = args.get("revisions").and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(dependency_removals) = args.get("dependency_removals").and_then(Value::as_array)
+    else {
+        return false;
+    };
+    if additions.is_empty()
+        || additions.len() > SAFE_WORK_PLAN_MAX_ADDITIONS
+        || dependencies.len() > SAFE_WORK_PLAN_MAX_DEPENDENCIES
+        || !revisions.is_empty()
+        || !dependency_removals.is_empty()
+    {
+        return false;
+    }
+    let new_item_ids = additions
+        .iter()
+        .filter_map(|item| item.get("item_id").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    if new_item_ids.len() != additions.len() {
+        return false;
+    }
+    dependencies.iter().all(|edge| {
+        edge.get("successor_item_id")
+            .and_then(Value::as_str)
+            .is_some_and(|successor| new_item_ids.contains(successor))
+    })
 }
 
 fn content_aware_fingerprint(tool_name: &str, args: &Value) -> ApprovalFingerprint {
@@ -3432,5 +3486,115 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(meta.risk_tag(), Some(RiskTag::MCPUnknownCapability));
+    }
+
+    #[test]
+    fn work_plan_policy_auto_admits_only_typed_non_disruptive_increments() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Prompt,
+        );
+        let safe = serde_json::json!({
+            "context_id": "work-plan-context:basis",
+            "reason": "Add the next independently verifiable task",
+            "additions": [{
+                "item_id": "new-task",
+                "kind": "task",
+                "objective": "Text is not a policy signal, even if it says delete everything",
+                "expected_result": "A typed new node exists"
+            }],
+            "revisions": [],
+            "dependencies": [{
+                "predecessor_item_id": "accepted-task",
+                "successor_item_id": "new-task"
+            }],
+            "dependency_removals": []
+        });
+        let admitted = evaluate_permission("propose_work_plan", &safe, &ctx);
+        assert!(matches!(admitted.decision, HardDecision::Allow));
+        assert!(matches!(
+            admitted.source,
+            DecisionSource::InternalOrchestration
+        ));
+
+        let mut reorders_accepted_work = safe;
+        reorders_accepted_work["dependencies"][0]["predecessor_item_id"] =
+            Value::String("new-task".to_string());
+        reorders_accepted_work["dependencies"][0]["successor_item_id"] =
+            Value::String("accepted-task".to_string());
+        let reviewed = evaluate_permission("propose_work_plan", &reorders_accepted_work, &ctx);
+        assert!(matches!(
+            reviewed.decision,
+            HardDecision::NeedExternal { .. }
+        ));
+
+        let broad = serde_json::json!({
+            "context_id": "work-plan-context:basis",
+            "reason": "Expand the bounded frontier",
+            "additions": (0..=SAFE_WORK_PLAN_MAX_ADDITIONS)
+                .map(|index| serde_json::json!({
+                    "item_id": format!("task-{index}"),
+                    "kind": "task",
+                    "objective": "Typed objective",
+                    "expected_result": "Typed result"
+                }))
+                .collect::<Vec<_>>(),
+            "revisions": [],
+            "dependencies": [],
+            "dependency_removals": []
+        });
+        let broad = evaluate_permission("propose_work_plan", &broad, &ctx);
+        assert!(matches!(broad.decision, HardDecision::NeedExternal { .. }));
+
+        let mut revises_existing_work = reorders_accepted_work.clone();
+        revises_existing_work["dependencies"] = serde_json::json!([]);
+        revises_existing_work["revisions"] = serde_json::json!([{
+            "item_id": "accepted-task",
+            "expected_revision": 1,
+            "kind": "task",
+            "objective": "Keep the declared objective",
+            "expected_result": "Keep the declared result",
+            "declaration_state": "cancelled"
+        }]);
+        let reviewed = evaluate_permission("propose_work_plan", &revises_existing_work, &ctx);
+        assert!(matches!(
+            reviewed.decision,
+            HardDecision::NeedExternal { .. }
+        ));
+
+        let deny_ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Deny,
+        );
+        let denied = evaluate_permission("propose_work_plan", &reorders_accepted_work, &deny_ctx);
+        assert!(matches!(denied.decision, HardDecision::Deny { .. }));
+    }
+
+    #[test]
+    fn provisional_criteria_proposal_never_uses_authored_text_as_policy_input() {
+        let ctx = crate::permission::types::PermissionSyncContext::root(
+            crate::permission::types::PermissionMode::Prompt,
+        );
+        for statement in [
+            "Relevant tests pass.",
+            "Words such as delete, network, or production are not policy signals.",
+        ] {
+            let proposal = serde_json::json!({
+                "context_id": "work-plan-context:basis",
+                "members": [{
+                    "member_kind": "new",
+                    "criterion_id": "tests-pass",
+                    "definition": {
+                        "kind": "test_check",
+                        "statement": statement,
+                        "command": "cargo test"
+                    }
+                }]
+            });
+            let decision = evaluate_permission("propose_work_criteria", &proposal, &ctx);
+            assert!(matches!(decision.decision, HardDecision::Allow));
+            assert!(matches!(
+                decision.source,
+                DecisionSource::InternalOrchestration
+            ));
+        }
     }
 }

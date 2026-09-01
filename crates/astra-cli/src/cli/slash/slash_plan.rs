@@ -3,12 +3,16 @@ use crate::cli::theme;
 use astra_runtime::plan;
 use crossterm::style::Stylize;
 
-fn pending_plan_state() -> plan::PlanModeState {
-    plan::PlanModeState::new(String::new())
+pub(crate) fn enter_local_plan_mode(state: &mut SessionState) {
+    enter_local_plan_mode_with_goal(state, "");
 }
 
-pub(crate) fn enter_local_plan_mode(state: &mut SessionState) {
-    state.cloud_plan_mirror = Some(pending_plan_state());
+/// Enter the client-side permission overlay without inventing a second remote
+/// plan lifecycle. The Server owns durable plan approval when the model calls
+/// `enter_plan_mode`; an explicit `/plan` only chooses the mode for this
+/// interactive client and preserves the user's goal for display/prompting.
+pub(crate) fn enter_local_plan_mode_with_goal(state: &mut SessionState, goal: &str) {
+    state.cloud_plan_mirror = Some(plan::PlanModeState::new(goal.trim().to_string()));
     state.plan_mode_sync_error = None;
     state
         .perm_manager
@@ -31,7 +35,7 @@ async fn resolve_plan_token(
     if let Some(token) = token {
         return Some(token.to_string());
     }
-    crate::cli::plan::plan_lifecycle::fresh_token_for_plan(api, profile).await
+    crate::cli::session::session_runtime::fresh_access_token(api, profile).await
 }
 
 pub(crate) async fn handle_plan_command(
@@ -56,25 +60,8 @@ pub(crate) async fn handle_plan_command(
     }
 
     if plan_request.is_empty() && state.cloud_plan_mirror.is_some() {
-        let Some(token) = resolve_plan_token(api, profile, token).await else {
-            eprintln!("{}", "  Not logged in. Use /login.".yellow());
-            return Ok(());
-        };
-        let plan_id =
-            crate::cli::plan::plan_lifecycle::exit_remote_plan_mode(api, &token, state, true)
-                .await?;
-        if let Some(plan_id) = plan_id {
-            eprintln!(
-                "  {} Exited plan mode. Approved plan: {}",
-                theme::icon_ok(),
-                plan_id
-            );
-        } else {
-            eprintln!("  {} Exited plan mode.", theme::icon_ok());
-        }
-        state
-            .perm_manager
-            .set_mode(crate::cli::permission_manager::PermissionMode::Auto);
+        exit_local_plan_mode(state);
+        eprintln!("  {} Exited plan mode.", theme::icon_ok());
         return Ok(());
     }
 
@@ -93,17 +80,7 @@ pub(crate) async fn handle_plan_command(
         return Ok(());
     };
 
-    crate::cli::plan::plan_lifecycle::enter_remote_plan_mode(
-        api,
-        profile,
-        &token,
-        state,
-        plan_request,
-    )
-    .await?;
-    state
-        .perm_manager
-        .set_mode(crate::cli::permission_manager::PermissionMode::Plan);
+    enter_local_plan_mode_with_goal(state, plan_request);
     eprintln!(
         "  {} Plan mode active. Goal: {}",
         theme::icon_ok(),
@@ -125,11 +102,9 @@ pub(crate) async fn handle_plan_command(
 
 #[cfg(test)]
 mod tests {
-    use super::handle_plan_command;
+    use super::{enter_local_plan_mode_with_goal, handle_plan_command};
     use crate::cli::session::session_state::SessionState;
     use astra_runtime::plan;
-    use wiremock::matchers::{header, method, path, query_param};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
     async fn bare_plan_arms_pending_local_entry() {
@@ -185,35 +160,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bare_plan_from_active_remote_mode_exits_via_remote_lifecycle() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/plans"))
-            .and(header("authorization", "Bearer token"))
-            .and(query_param("session_id", "sess-1"))
-            .and(query_param("phase", "planning"))
-            .and(query_param("limit", "1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "plans": [
-                    { "plan_id": "plan-1", "goal": "Ship auth" }
-                ]
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/plans/plan-1/exit-plan-mode"))
-            .and(header("authorization", "Bearer token"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "plan_id": "plan-1",
-                "phase": "refining",
-                "goal": "Ship auth",
-                "version": 7,
-                "plan": { "subtasks": [] }
-            })))
-            .mount(&server)
-            .await;
-
-        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+    async fn bare_plan_exits_active_mode_without_remote_plan_lifecycle() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         let mut state = SessionState::default();
         state.session_id = Some("sess-1".to_string());
         state.cloud_plan_mirror = Some(plan::PlanModeState::new("Ship auth".to_string()));
@@ -228,7 +176,18 @@ mod tests {
         assert!(state.cloud_plan_mirror.is_none());
         assert!(
             !state.plan_mode_active(),
-            "remote /plan exit should restore normal-chat mode"
+            "explicit /plan exit should restore normal-chat mode"
         );
+    }
+
+    #[test]
+    fn local_plan_goal_is_trimmed_and_enters_read_only_mode() {
+        let mut state = SessionState::default();
+
+        enter_local_plan_mode_with_goal(&mut state, "  Ship auth safely  ");
+
+        let mirror = state.cloud_plan_mirror.as_ref().expect("plan mirror");
+        assert_eq!(mirror.goal, "Ship auth safely");
+        assert!(state.plan_mode_active());
     }
 }

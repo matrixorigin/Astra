@@ -114,6 +114,17 @@ impl std::fmt::Display for PermanentEdgeConnectionError {
 
 impl std::error::Error for PermanentEdgeConnectionError {}
 
+fn validate_interaction_api_major(actual: &str) -> Result<(), PermanentEdgeConnectionError> {
+    if actual == astra_server_types::AGENT_INTERACTION_API_MAJOR {
+        return Ok(());
+    }
+    Err(PermanentEdgeConnectionError(format!(
+        "Incompatible Server interaction contract: expected {}, received {}",
+        astra_server_types::AGENT_INTERACTION_API_MAJOR,
+        actual,
+    )))
+}
+
 fn is_permanent_connection_error(error: &(dyn std::error::Error + 'static)) -> bool {
     if error
         .downcast_ref::<PermanentEdgeConnectionError>()
@@ -959,6 +970,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
     })?;
     let auth_msg = EdgeClientMessage::Auth {
         edge_agent_id: config.edge_id.clone(),
+        interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.to_string(),
         hostname,
         workspace_dir: Some(workspace.to_string_lossy().to_string()),
         capabilities: Some(edge_runtime_environment_capabilities(
@@ -977,7 +989,11 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
     match auth_response {
         Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<EdgeServerMessage>(&text)
         {
-            Ok(EdgeServerMessage::AuthOk { user_id }) => {
+            Ok(EdgeServerMessage::AuthOk {
+                user_id,
+                interaction_api_major,
+            }) => {
+                validate_interaction_api_major(&interaction_api_major)?;
                 tracing::info!(user_id = %user_id, "Authenticated successfully");
                 // The token that just proved itself is the SNAPSHOT this
                 // connection authenticated with — not the current shared value
@@ -1221,9 +1237,9 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                         }
                                     };
                                     let result = tokio::select! {
-                                        _ = cancel.cancelled() => astra_tools::ToolResult::error(
-                                            format!("Tool '{tool}' cancelled before completion")
-                                        ),
+                                        _ = cancel.cancelled() => {
+                                            astra_tools::cancelled_tool_result(&tool, true)
+                                        },
                                         result = tokio::time::timeout(Duration::from_secs(timeout_secs), execution) => {
                                             match result {
                                                 Ok(result) => result,
@@ -1242,7 +1258,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                                     let _ = completed_tx.send(completion).await;
                                 });
                             }
-                            Ok(EdgeServerMessage::Pong) => {
+                            Ok(EdgeServerMessage::Pong {}) => {
                                 // heartbeat ack
                             }
                             Ok(EdgeServerMessage::ToolCancel { request_id, delivery_generation }) => {
@@ -1326,7 +1342,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                 write.send(Message::Text(serde_json::to_string(&result_msg)?.into())).await?;
             }
             _ = heartbeat.tick() => {
-                let ping = EdgeClientMessage::Ping;
+                let ping = EdgeClientMessage::Ping {};
                 if write.send(Message::Text(serde_json::to_string(&ping)?.into())).await.is_err() {
                     tracing::warn!("Failed to send heartbeat");
                     break;
@@ -1520,6 +1536,16 @@ mod tests {
             .expect("explicit false must be a valid bounded-run configuration");
 
         assert!(!args.reconnect);
+    }
+
+    #[test]
+    fn interaction_contract_mismatch_is_a_permanent_edge_connection_error() {
+        assert!(
+            validate_interaction_api_major(astra_server_types::AGENT_INTERACTION_API_MAJOR).is_ok()
+        );
+        let error = validate_interaction_api_major("1").unwrap_err();
+        assert!(error.to_string().contains("expected 3"));
+        assert!(is_permanent_connection_error(&error));
     }
 
     #[test]

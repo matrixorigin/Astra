@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, SemaphorePermit};
 
-use crate::tool::args::shape::{canonicalize_tool_call_name_in_place, tool_call_name};
+use crate::tool::args::shape::{canonicalize_tool_call_for_execution, tool_call_name};
 
 const METRIC_TOOL_EXECUTION_ATTEMPTS_TOTAL: &str = "astra_tool_execution_attempts_total";
 const METRIC_TOOL_EXECUTION_WAIT_MS_TOTAL: &str = "astra_tool_execution_wait_ms_total";
@@ -168,10 +168,8 @@ fn canonical_tool_name(tc: &Value) -> String {
     extract_tool_name(tc).to_string()
 }
 
-fn canonical_tool_call_for_exec(tc: &Value) -> Value {
-    let mut owned = tc.clone();
-    let _ = canonicalize_tool_call_name_in_place(&mut owned);
-    owned
+fn canonical_tool_call_for_exec(tc: &Value) -> Result<Value, &'static str> {
+    canonicalize_tool_call_for_execution(tc)
 }
 
 fn tool_call_id(tc: &Value) -> String {
@@ -184,10 +182,7 @@ fn tool_call_id(tc: &Value) -> String {
 /// Parse the `arguments` field from a tool call into a `serde_json::Value`.
 /// Returns `None` if the field is missing or not parseable.
 pub fn parse_tool_args(tc: &Value) -> Option<Value> {
-    let raw = tc
-        .get("function")
-        .and_then(|f| f.get("arguments"))
-        .or_else(|| tc.get("arguments"))?;
+    let raw = tc.get("function").and_then(|f| f.get("arguments"))?;
 
     match raw {
         Value::Object(_) => Some(raw.clone()),
@@ -296,6 +291,38 @@ pub async fn execute_parallel_round(
     tool_calls: &[Value],
     executor: ToolExecutorFn,
 ) -> ParallelRoundOutcome {
+    let mut admitted_ids = std::collections::HashSet::with_capacity(tool_calls.len());
+    let duplicate_id = tool_calls.iter().find_map(|tool_call| {
+        canonical_tool_call_for_exec(tool_call)
+            .ok()
+            .and_then(|canonical| canonical["id"].as_str().map(str::to_owned))
+            .filter(|id| !admitted_ids.insert(id.clone()))
+    });
+    if let Some(duplicate_id) = duplicate_id {
+        tracing::warn!(
+            tool_call_id = %duplicate_id,
+            batch_size = tool_calls.len(),
+            "rejecting tool batch with duplicate durable identity"
+        );
+        return ParallelRoundOutcome {
+            results: tool_calls
+                .iter()
+                .enumerate()
+                .map(|(original_index, tool_call)| ToolExecResult {
+                    original_index,
+                    call_id: tool_call_id(tool_call),
+                    tool_name: canonical_tool_name(tool_call),
+                    content: format!(
+                        "Invalid tool-call batch: duplicate tool call id `{duplicate_id}`"
+                    ),
+                    success: false,
+                })
+                .collect(),
+            parallel_count: 0,
+            sequential_count: 0,
+            sibling_aborted: true,
+        };
+    }
     let (read_only, mutating) = partition_tool_calls(tool_calls);
     let total = tool_calls.len();
     let mut results: Vec<Option<ToolExecResult>> = vec![None; total];
@@ -308,9 +335,21 @@ pub async fn execute_parallel_round(
         let mut join_set = tokio::task::JoinSet::new();
 
         for (idx, tc) in read_only {
-            let tc_owned = canonical_tool_call_for_exec(tc);
-            let fallback_call_id = tool_call_id(&tc_owned);
-            let fallback_tool_name = canonical_tool_name(&tc_owned);
+            let fallback_call_id = tool_call_id(tc);
+            let fallback_tool_name = canonical_tool_name(tc);
+            let tc_owned = match canonical_tool_call_for_exec(tc) {
+                Ok(tool_call) => tool_call,
+                Err(reason) => {
+                    results[idx] = Some(ToolExecResult {
+                        original_index: idx,
+                        call_id: fallback_call_id,
+                        tool_name: fallback_tool_name,
+                        content: format!("Invalid tool call: {reason}"),
+                        success: false,
+                    });
+                    continue;
+                }
+            };
             let sem = semaphore.clone();
             let exec = executor.clone();
             join_set.spawn(async move {
@@ -394,8 +433,26 @@ pub async fn execute_parallel_round(
             continue;
         }
 
-        let (call_id, tool_name, content, success) =
-            executor(canonical_tool_call_for_exec(tc)).await;
+        let canonical = match canonical_tool_call_for_exec(tc) {
+            Ok(tool_call) => tool_call,
+            Err(reason) => {
+                sibling_aborted = true;
+                let tool_name = canonical_tool_name(tc);
+                trigger_tool = Some(tool_name.clone());
+                trigger_position = Some(mut_pos);
+                mutating_executed += 1;
+                results[idx] = Some(ToolExecResult {
+                    original_index: idx,
+                    call_id: tool_call_id(tc),
+                    tool_name,
+                    content: format!("Invalid tool call: {reason}"),
+                    success: false,
+                });
+                continue;
+            }
+        };
+
+        let (call_id, tool_name, content, success) = executor(canonical).await;
         mutating_executed += 1;
 
         // Sibling abort: any mutating-tool failure aborts remaining siblings.
@@ -871,6 +928,90 @@ mod tests {
         assert_eq!(outcome.results[0].content, "result of read_file");
     }
 
+    #[tokio::test]
+    async fn execute_parallel_round_rejects_flat_legacy_call_without_invoking_executor() {
+        let calls = vec![json!({
+            "id": "flat-1",
+            "name": "read_file",
+            "arguments": {"path": "README.md"}
+        })];
+        let executions = Arc::new(AtomicUsize::new(0));
+        let observed = executions.clone();
+        let exec: ToolExecutorFn = Arc::new(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { unreachable!("invalid flat call must never reach executor") })
+        });
+
+        let outcome = execute_parallel_round(&calls, exec).await;
+
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert_eq!(outcome.results.len(), 1);
+        assert!(!outcome.results[0].success);
+        assert!(outcome.results[0].content.contains("top-level"));
+    }
+
+    #[tokio::test]
+    async fn execute_parallel_round_rejects_nested_id_without_invoking_executor() {
+        let calls = vec![json!({
+            "function": {
+                "id": "nested-1",
+                "name": "read_file",
+                "arguments": {"path": "README.md"}
+            }
+        })];
+        let executions = Arc::new(AtomicUsize::new(0));
+        let observed = executions.clone();
+        let exec: ToolExecutorFn = Arc::new(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { unreachable!("nested-id call must never reach executor") })
+        });
+
+        let outcome = execute_parallel_round(&calls, exec).await;
+
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert_eq!(outcome.results.len(), 1);
+        assert!(outcome.results[0].content.contains("top-level"));
+    }
+
+    async fn assert_duplicate_batch_never_executes(calls: Vec<Value>) {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let observed = executions.clone();
+        let exec: ToolExecutorFn = Arc::new(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { unreachable!("duplicate-id batch must never reach executor") })
+        });
+
+        let outcome = execute_parallel_round(&calls, exec).await;
+
+        assert_eq!(executions.load(Ordering::SeqCst), 0);
+        assert_eq!(outcome.results.len(), calls.len());
+        assert!(outcome.results.iter().all(|result| !result.success));
+        assert!(
+            outcome
+                .results
+                .iter()
+                .all(|result| result.content.contains("duplicate tool call id"))
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_parallel_round_rejects_duplicate_id_with_same_payload() {
+        assert_duplicate_batch_never_executes(vec![
+            make_tool_call("read_file", "same"),
+            make_tool_call("read_file", "same"),
+        ])
+        .await;
+    }
+
+    #[tokio::test]
+    async fn execute_parallel_round_rejects_duplicate_id_with_conflicting_payloads() {
+        assert_duplicate_batch_never_executes(vec![
+            make_tool_call("read_file", "same"),
+            make_tool_call("write_file", "same"),
+        ])
+        .await;
+    }
+
     #[test]
     fn partition_bash_with_parsed_object_args() {
         let calls = vec![
@@ -888,14 +1029,14 @@ mod tests {
     fn partition_mixed_batch_bash_read_only_commands() {
         let calls = vec![
             make_tool_call("read_file", "1"),
-            make_bash_call("2", "cargo check 2>&1 | head -50"),
+            make_bash_call("2", "rg TODO 2>&1 | head -50"),
             make_bash_call("3", "git diff HEAD"),
             make_tool_call("write_file", "4"),
             make_bash_call("5", "cargo build"),
             make_tool_call("grep", "6"),
         ];
         let (ro, mut_) = partition_tool_calls(&calls);
-        // read_file + bash(cargo check|head) + bash(git diff) + grep = 4
+        // read_file + bash(rg|head) + bash(git diff) + grep = 4
         assert_eq!(ro.len(), 4);
         // write_file + bash(cargo build) = 2
         assert_eq!(mut_.len(), 2);

@@ -7,12 +7,48 @@ import {
 } from '@/lib/work-surface';
 import { WORKSPACE_EXECUTION_BLOCKED_MESSAGE } from '@/lib/run-status-messages';
 
-const task = {
-  id: 'task-1',
-  title: 'Implement panel',
-  status: 'in_progress',
-  created_at: '2026-06-10T00:00:00.000Z',
-  updated_at: '2026-06-10T00:00:00.000Z',
+const taskGraph = {
+  schema_version: 2 as const,
+  scope: 'declared_work' as const,
+  basis: {
+    work_id: 'work-1', work_revision: 1, goal_revision: 1, goal: 'Implement panel',
+    criteria_set_revision: 1, criteria_member_count: 0,
+    criteria_manifest_hash: `sha256:${'a'.repeat(64)}` as const,
+    branch_id: 'branch-1', branch_revision: 1, branch_goal_revision: 1,
+    branch_criteria_set_revision: 1, branch_basis_graph_revision: 1,
+    graph_revision: 1, graph_item_count: 1, graph_edge_count: 0,
+    graph_manifest_hash: `sha256:${'b'.repeat(64)}` as const,
+  },
+  cursor: { graph_revision: 1, item_offset: 0, dependency_offset: 0 },
+  next_cursor: null,
+  items: {
+    offset: 0, limit: 8, total: 1,
+    entries: [{
+      item_id: 'root', revision: 1, kind: 'milestone' as const,
+      objective: 'Implement panel', expected_result: 'A reviewable panel',
+      declaration_state: 'active' as const,
+      execution: {
+        status: 'running' as const,
+        terminal: false as const,
+        run: {
+          run_id: 'run-1',
+          attempt_id: 'run-1',
+          graph_revision: 1,
+          run_generation: 1,
+          last_event_idx: 1,
+          updated_at: '2026-08-04T00:00:00Z',
+        },
+      },
+      delivery: {
+        status: 'unreported' as const,
+        summary: null,
+        blocker_kind: null,
+        unavailable_capabilities: [],
+      },
+      verification: { status: 'unknown' as const, latest_check: null },
+    }],
+  },
+  dependencies: { offset: 0, limit: 128, total: 0, entries: [] },
 };
 
 describe('work surface reducer', () => {
@@ -30,43 +66,22 @@ describe('work surface reducer', () => {
     });
   });
 
-  it('applies task board snapshots as the authoritative task state', () => {
-    const state = applyWorkSurfaceEvent(createEmptyWorkSurface(), {
-      type: 'task_board_snapshot',
-      session_id: 'session-1',
-      run_id: 'run-1',
-      reason: 'task_update',
-      workspace: {
-        kind: 'server_sandbox',
-        display_name: 'Server sandbox',
-        cwd: '/tmp/astra-workspaces/session-1',
-        authority: 'read_write',
-        fallback_policy: 'disabled',
+  it('hydrates the canonical Work binding and Task Graph together', () => {
+    const state = hydrateWorkSurface(createEmptyWorkSurface(), {
+      sessionId: 'session-1',
+      runId: 'run-1',
+      workBinding: {
+        schema_version: 1,
+        work_id: 'work-1',
+        branch_id: 'branch-1',
+        graph_revision: 1,
       },
-      executor: {
-        kind: 'server_local',
-        executor_id: 'server-local',
-        display_name: 'Server sandbox',
-        transport: 'server_local',
-        status: 'online',
-      },
-      transport: 'server_local',
-      tasks: [task],
+      taskGraph,
+      events: [],
     });
 
-    expect(state.sessionId).toBe('session-1');
-    expect(state.runId).toBe('run-1');
-    expect(state.workspace).toMatchObject({
-      kind: 'server_sandbox',
-      cwd: '/tmp/astra-workspaces/session-1',
-    });
-    expect(state.executor).toMatchObject({
-      kind: 'server_local',
-      transport: 'server_local',
-    });
-    expect(state.hydrated).toBe(true);
-    expect(state.loading).toBe(false);
-    expect(state.tasks).toEqual([task]);
+    expect(state.workBinding).toMatchObject({ work_id: 'work-1', branch_id: 'branch-1' });
+    expect(state.taskGraph).toEqual(taskGraph);
   });
 
   it('does not carry stale bindings across hydrated projections', () => {
@@ -94,7 +109,7 @@ describe('work surface reducer', () => {
     state = hydrateWorkSurface(state, {
       sessionId: 'session-1',
       runId: 'run-new',
-      tasks: [],
+      taskGraph: null,
       events: [],
     });
 
@@ -125,7 +140,7 @@ describe('work surface reducer', () => {
         },
         transport: 'edge_ws',
         fallbackPolicy: 'disabled',
-        tasks: [],
+        taskGraph: null,
         events: [{ type: 'text_done', full_text: 'done' }],
       },
     );
@@ -144,7 +159,7 @@ describe('work surface reducer', () => {
     const state = hydrateWorkSurface(createEmptyWorkSurface('session-1'), {
       sessionId: 'session-1',
       runId: 'run-new',
-      tasks: [],
+      taskGraph: null,
       events: [
         {
           type: 'workspace_bound',
@@ -180,7 +195,7 @@ describe('work surface reducer', () => {
     const state = hydrateWorkSurface(createEmptyWorkSurface('session-1'), {
       sessionId: 'session-1',
       runId: 'run-new',
-      tasks: [],
+      taskGraph: null,
       events: [
         {
           type: 'binding_projection',
@@ -269,6 +284,36 @@ describe('work surface reducer', () => {
       arguments: '{"command":"echo hi"}',
       result: 'Error: denied',
       status: 'error',
+    });
+  });
+
+  it('rebuilds from a terminal-only tool event and never downgrades replayed evidence', () => {
+    let state = applyWorkSurfaceEvent(createEmptyWorkSurface('session-1'), {
+      type: 'tool_call_end',
+      call_id: 'call-terminal-only',
+      tool: 'introspect',
+      arguments: { scope: 'current_run' },
+      result: { snapshot: 'available' },
+      status: 'completed',
+      success: true,
+      duration_ms: 37,
+    });
+    state = applyWorkSurfaceEvent(state, {
+      type: 'tool_call_end',
+      call_id: 'call-terminal-only',
+      tool: 'introspect',
+      status: 'completed',
+      success: true,
+    });
+
+    expect(state.tools).toHaveLength(1);
+    expect(state.tools[0]).toMatchObject({
+      callId: 'call-terminal-only',
+      tool: 'introspect',
+      arguments: '{"scope":"current_run"}',
+      result: '{"snapshot":"available"}',
+      status: 'done',
+      durationMs: 37,
     });
   });
 
@@ -808,7 +853,7 @@ describe('work surface reducer', () => {
       sessionId: 'session-1',
       runId: 'run-1',
       status: 'cancelled',
-      tasks: [],
+      taskGraph: null,
       events: [
         {
           type: 'tool_transport_started',
@@ -1696,7 +1741,7 @@ describe('work surface reducer', () => {
     const state = hydrateWorkSurface(createEmptyWorkSurface(), {
       sessionId: 'session-1',
       runId: 'run-1',
-      tasks: [task],
+      taskGraph,
       events: [
         {
           type: 'agent_spawned',
@@ -1729,7 +1774,7 @@ describe('work surface reducer', () => {
       generatedAt: '2026-06-10T00:00:00.000Z',
     });
 
-    expect(state.tasks).toEqual([task]);
+    expect(state.taskGraph).toEqual(taskGraph);
     expect(state.runId).toBe('run-1');
     expect(state.agents).toHaveLength(1);
     expect(state.agents[0]).toMatchObject({
@@ -1778,7 +1823,7 @@ describe('work surface reducer', () => {
     const hydrated = hydrateWorkSurface(state, {
       sessionId: 'session-1',
       runId: 'run-new',
-      tasks: [task],
+      taskGraph,
       events: [
         {
           type: 'tool_call_start',
@@ -1797,7 +1842,7 @@ describe('work surface reducer', () => {
     const state = hydrateWorkSurface(createEmptyWorkSurface('session-1'), {
       sessionId: 'session-1',
       runId: 'run-1',
-      tasks: [task],
+      taskGraph,
       events: [],
       warnings: ['Run activity is temporarily unavailable.'],
     });
@@ -1806,7 +1851,7 @@ describe('work surface reducer', () => {
     expect(state.warnings).toEqual([
       'Run activity is temporarily unavailable.',
     ]);
-    expect(state.tasks).toEqual([task]);
+    expect(state.taskGraph).toEqual(taskGraph);
   });
 
   it('updates subagents from live current-protocol progress events', () => {

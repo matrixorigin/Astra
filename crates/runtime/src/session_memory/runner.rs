@@ -12,6 +12,7 @@ use astra_services::session_journal::{
 use astra_turn_core::cloud_session_memory_extract::{
     SESSION_MEMORY_TEMPLATE, build_extraction_prompt, extract_section,
 };
+use astra_turn_core::observer::filter_memory_operation_turns;
 use astra_turn_types::{InferencePurpose, is_runtime_owned_message, session_facts::SessionFacts};
 
 use crate::memory_hooks::{MemoryInferencePort, MemoryInferenceRequest};
@@ -335,6 +336,10 @@ impl SessionMemorySnapshot {
 
 /// What the worker produced.
 pub(crate) enum ExtractionArtifacts {
+    NoChange {
+        selector_model: String,
+        failed_candidates: Vec<LlmCandidateFailure>,
+    },
     Persisted {
         source: SessionMemoryExtractionSource,
         bytes_written: u64,
@@ -342,6 +347,7 @@ pub(crate) enum ExtractionArtifacts {
         content: String,
         selector_model: Option<String>,
         failed_candidates: Vec<LlmCandidateFailure>,
+        cleanup_error_reason: Option<SessionMemoryExtractionErrorReason>,
     },
     LlmFailedPersistedFallback {
         error_reason: SessionMemoryExtractionErrorReason,
@@ -351,6 +357,7 @@ pub(crate) enum ExtractionArtifacts {
         content: String,
         selector_model: Option<String>,
         failed_candidates: Vec<LlmCandidateFailure>,
+        cleanup_error_reason: Option<SessionMemoryExtractionErrorReason>,
     },
     PersistFailed {
         error_reason: SessionMemoryExtractionErrorReason,
@@ -369,9 +376,22 @@ struct LlmExtractionFailure {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum LlmMemoryUpdate {
+    Changed(String),
+    NoChange,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct StoreSessionMemoryFailure {
     reason: SessionMemoryExtractionErrorReason,
     detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StoredSessionMemory {
+    bytes_written: u64,
+    attempt: u32,
+    cleanup_error_reason: Option<SessionMemoryExtractionErrorReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -430,13 +450,14 @@ pub(crate) async fn run_extraction<C: MemoryInferencePort>(
         )
         .await
         {
-            Ok((bytes_written, store_attempt)) => ExtractionArtifacts::Persisted {
+            Ok(stored) => ExtractionArtifacts::Persisted {
                 source: SessionMemoryExtractionSource::RuleFallback,
-                bytes_written,
-                store_attempt,
+                bytes_written: stored.bytes_written,
+                store_attempt: stored.attempt,
                 content: fallback,
                 selector_model: None,
                 failed_candidates: Vec::new(),
+                cleanup_error_reason: stored.cleanup_error_reason,
             },
             Err(error) => ExtractionArtifacts::PersistFailed {
                 error_reason: error.reason,
@@ -450,22 +471,59 @@ pub(crate) async fn run_extraction<C: MemoryInferencePort>(
     }
 
     let mut failed_candidates = Vec::new();
+    // `llm_timeout` is the budget for the selector stage as a whole, not a
+    // multiplier for every configured fallback model. Otherwise N unhealthy
+    // candidates can keep one session worker alive for N × timeout and make
+    // post-loop settlement report a false terminal state. Fast failures still
+    // leave the remaining budget available to a later candidate.
+    let selector_started = std::time::Instant::now();
     for (candidate_index, client) in memory_clients.iter().enumerate() {
         let Ok(logical_attempt) = u32::try_from(candidate_index) else {
             break;
         };
+        let remaining = llm_timeout.saturating_sub(selector_started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
         let candidate_scope = inference_scope.with_logical_attempt(logical_attempt);
-        match update_memory_with_llm(
-            &base_memory,
-            messages,
-            client,
-            &candidate_scope,
-            llm_timeout,
-            max_output_tokens,
+        let attempt = tokio::time::timeout(
+            remaining,
+            update_memory_with_llm(
+                &base_memory,
+                messages,
+                client,
+                &candidate_scope,
+                remaining,
+                max_output_tokens,
+            ),
         )
         .await
-        {
-            Ok(updated) => {
+        .unwrap_or_else(|_| {
+            Err(LlmExtractionFailure {
+                reason: SessionMemoryExtractionErrorReason::LlmTimeout,
+                detail: Some("selector stage deadline expired".to_string()),
+            })
+        });
+        match attempt {
+            Ok(update) => {
+                let updated = match update {
+                    LlmMemoryUpdate::Changed(updated) => updated,
+                    LlmMemoryUpdate::NoChange
+                        if session_facts_have_durable_content(session_facts) =>
+                    {
+                        // Narrative extraction is sparse, while facts are deterministic
+                        // runtime state. A valid empty narrative patch must stop selector
+                        // retries, but it must not discard newly observed tool/file/error
+                        // facts that still need a durable snapshot.
+                        base_memory.clone()
+                    }
+                    LlmMemoryUpdate::NoChange => {
+                        return ExtractionArtifacts::NoChange {
+                            selector_model: client.model_name().to_string(),
+                            failed_candidates,
+                        };
+                    }
+                };
                 let updated = canonicalize_session_memory_markdown(
                     session_id,
                     &updated,
@@ -481,14 +539,15 @@ pub(crate) async fn run_extraction<C: MemoryInferencePort>(
                 )
                 .await
                 {
-                    Ok((bytes_written, store_attempt)) => {
+                    Ok(stored) => {
                         return ExtractionArtifacts::Persisted {
                             source: SessionMemoryExtractionSource::Llm,
-                            bytes_written,
-                            store_attempt,
+                            bytes_written: stored.bytes_written,
+                            store_attempt: stored.attempt,
                             content: updated,
                             selector_model: Some(client.model_name().to_string()),
                             failed_candidates,
+                            cleanup_error_reason: stored.cleanup_error_reason,
                         };
                     }
                     Err(error) => {
@@ -527,15 +586,16 @@ pub(crate) async fn run_extraction<C: MemoryInferencePort>(
     )
     .await
     {
-        Ok((bytes_written, store_attempt)) => ExtractionArtifacts::LlmFailedPersistedFallback {
+        Ok(stored) => ExtractionArtifacts::LlmFailedPersistedFallback {
             error_reason: last_failure
                 .map_or(SessionMemoryExtractionErrorReason::LlmError, |f| f.reason),
             error_detail: last_failure.and_then(|f| f.detail.clone()),
-            bytes_written,
-            store_attempt,
+            bytes_written: stored.bytes_written,
+            store_attempt: stored.attempt,
             content: fallback,
             selector_model: last_failure.map(|f| f.model_name.clone()),
             failed_candidates,
+            cleanup_error_reason: stored.cleanup_error_reason,
         },
         Err(store_error) => ExtractionArtifacts::PersistFailed {
             error_reason: store_error.reason,
@@ -548,12 +608,20 @@ pub(crate) async fn run_extraction<C: MemoryInferencePort>(
     }
 }
 
+fn session_facts_have_durable_content(facts: &SessionFacts) -> bool {
+    !facts.active_files.is_empty()
+        || !facts.recent_tool_calls.is_empty()
+        || !facts.blocked_tools.is_empty()
+        || facts.error_state != Default::default()
+}
+
 fn session_memory_extraction_messages(messages: &[Value]) -> Vec<Value> {
     astra_core::history_work::record_serialized_value(
         astra_core::history_work::HistoryWorkSite::MemoryExtractionPromptSanitization,
         messages,
     );
-    astra_turn_core::prompt_facing::sanitize_prompt_facing_messages(messages.to_vec())
+    let messages = filter_memory_operation_turns(messages);
+    astra_turn_core::prompt_facing::sanitize_prompt_facing_messages(messages)
         .into_iter()
         .filter(|msg| !is_ephemeral_message_for_session_memory(msg))
         .collect()
@@ -693,6 +761,75 @@ pub async fn load_current_session_memory_preferring_local_with_freshness(
         .and_then(|metadata| metadata.last_extracted_turn);
     let remote = load_current_session_memory_snapshot(memoria, session_id).await;
 
+    select_current_session_memory(local, local_turn, remote)
+}
+
+/// Interactive variant of the local-first session-memory read.
+///
+/// The local artifact is already owner/session scoped and can safely preserve
+/// continuity when the optional remote freshness check misses its interactive
+/// deadline. Background extraction and governance continue to use the
+/// unbounded-by-interactive-policy loader above.
+pub async fn load_current_session_memory_preferring_local_with_deadline(
+    memoria: &dyn MemoriaPort,
+    session_id: &str,
+    deadline: Duration,
+) -> Option<LoadedSessionMemory> {
+    let local = load_local_session_memory_artifact(session_id);
+    let local_turn = load_local_session_memory_metadata(session_id)
+        .and_then(|metadata| metadata.last_extracted_turn);
+    let remote = match tokio::time::timeout(
+        deadline,
+        load_current_session_memory_snapshot(memoria, session_id),
+    )
+    .await
+    {
+        Ok(remote) => remote,
+        Err(_) => {
+            tracing::warn!(
+                session_id = %session_id,
+                deadline_ms = deadline.as_millis(),
+                has_local_snapshot = local.is_some(),
+                "session memory freshness check exceeded its interactive budget; continuing with local context when available"
+            );
+            None
+        }
+    };
+
+    select_current_session_memory(local, local_turn, remote)
+}
+
+/// Interactive remote-only session-memory read. A missed deadline means that
+/// optional context is absent for this request; canonical conversation state
+/// remains the continuity authority.
+pub async fn load_current_session_memory_with_deadline(
+    memoria: &dyn MemoriaPort,
+    session_id: &str,
+    deadline: Duration,
+) -> Option<LoadedSessionMemory> {
+    match tokio::time::timeout(
+        deadline,
+        load_current_session_memory_with_freshness(memoria, session_id),
+    )
+    .await
+    {
+        Ok(memory) => memory,
+        Err(_) => {
+            tracing::warn!(
+                session_id = %session_id,
+                deadline_ms = deadline.as_millis(),
+                "session memory read exceeded its interactive budget; continuing without optional session context"
+            );
+            None
+        }
+    }
+}
+
+fn select_current_session_memory(
+    local: Option<String>,
+    local_turn: Option<u32>,
+    remote: Option<SessionMemorySnapshot>,
+) -> Option<LoadedSessionMemory> {
     match (local, local_turn, remote) {
         (Some(local), Some(local_turn), Some(remote)) if local_turn >= remote.updated_turn => {
             Some(LoadedSessionMemory {
@@ -820,16 +957,6 @@ fn parse_section_lines(section: &str) -> Vec<String> {
     out
 }
 
-fn seed_active_goal(narrative: &SessionNarrative) -> Option<String> {
-    [
-        narrative.task_spec.as_str(),
-        narrative.session_title.as_str(),
-    ]
-    .into_iter()
-    .map(single_line)
-    .find(|candidate| !candidate.is_empty())
-}
-
 fn normalize_narrative(narrative: &mut SessionNarrative) {
     narrative.session_title = truncate_chars(&single_line(&narrative.session_title), 200);
     narrative.task_spec = truncate_chars(&single_line(&narrative.task_spec), 1_000);
@@ -843,11 +970,6 @@ fn normalize_narrative(narrative: &mut SessionNarrative) {
         .current_state
         .retain(|state| !state.trim().is_empty());
     dedup_preserve_order(&mut narrative.active_goals);
-    if narrative.active_goals.is_empty()
-        && let Some(goal) = seed_active_goal(narrative)
-    {
-        narrative.active_goals.push(goal);
-    }
     dedup_preserve_order(&mut narrative.pending_todos);
     dedup_preserve_order(&mut narrative.corrections);
     dedup_preserve_order(&mut narrative.learnings);
@@ -950,7 +1072,7 @@ async fn update_memory_with_llm(
     invocation_scope: &astra_turn_types::InferenceInvocationScope,
     llm_timeout: Duration,
     max_output_tokens: usize,
-) -> Result<String, LlmExtractionFailure> {
+) -> Result<LlmMemoryUpdate, LlmExtractionFailure> {
     let prompt = build_extraction_prompt(current_memory, messages);
     let call = client.complete(MemoryInferenceRequest {
         purpose: InferencePurpose::MemoryExtraction,
@@ -963,7 +1085,10 @@ async fn update_memory_with_llm(
     let parsed = match call.await {
         Err(error) => {
             return Err(LlmExtractionFailure {
-                reason: if error.kind == astra_core::ErrorKind::StreamIdle {
+                reason: if matches!(
+                    error.kind,
+                    astra_core::ErrorKind::StreamIdle | astra_core::ErrorKind::ProviderDeadline
+                ) {
                     SessionMemoryExtractionErrorReason::LlmTimeout
                 } else {
                     SessionMemoryExtractionErrorReason::LlmError
@@ -998,10 +1123,7 @@ async fn update_memory_with_llm(
         );
     }
     if patch.is_empty() {
-        return Err(LlmExtractionFailure {
-            reason: SessionMemoryExtractionErrorReason::EmptyResponse,
-            detail: Some("session-memory patch contained no canonical fields".to_string()),
-        });
+        return Ok(LlmMemoryUpdate::NoChange);
     }
     let mut snapshot = SessionMemorySnapshot::from_markdown(
         "__llm_update__",
@@ -1010,7 +1132,7 @@ async fn update_memory_with_llm(
         SessionFacts::default(),
     );
     snapshot.narrative.apply_patch(patch);
-    Ok(snapshot.to_markdown())
+    Ok(LlmMemoryUpdate::Changed(snapshot.to_markdown()))
 }
 
 fn parse_session_narrative_patch(
@@ -1048,13 +1170,16 @@ fn summarize_llm_detail(text: &str) -> String {
     truncate_chars(&text.split_whitespace().collect::<Vec<_>>().join(" "), 220)
 }
 
+const SESSION_MEMORY_STORE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
+const STALE_SNAPSHOT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+
 async fn store_session_memory(
     memoria: &Arc<dyn MemoriaPort>,
     session_id: &str,
     turn_number: u32,
     session_facts: &SessionFacts,
     content: &str,
-) -> Result<(u64, u32), StoreSessionMemoryFailure> {
+) -> Result<StoredSessionMemory, StoreSessionMemoryFailure> {
     let encoded = SessionMemorySnapshot::from_markdown(
         session_id,
         content,
@@ -1066,29 +1191,53 @@ async fn store_session_memory(
     let mut last_detail = None;
 
     for attempt in 1..=2 {
-        match memoria
-            .store(
+        let store = tokio::time::timeout(
+            SESSION_MEMORY_STORE_ATTEMPT_TIMEOUT,
+            memoria.store(
                 &encoded,
                 SESSION_MEMORY_MEMORIA_TYPE,
                 Some(session_id),
                 Some("T3"),
-            )
-            .await
-        {
-            Ok(memory_id) => {
-                if let Err(reason) =
-                    cleanup_prior_session_memory_entries(memoria, session_id, &memory_id, &encoded)
-                        .await
-                {
+            ),
+        )
+        .await;
+        match store {
+            Err(_) => {
+                last_detail = Some(format!(
+                    "session-memory store attempt exceeded {}ms",
+                    SESSION_MEMORY_STORE_ATTEMPT_TIMEOUT.as_millis()
+                ));
+                if attempt == 2 {
+                    return Err(StoreSessionMemoryFailure {
+                        reason: SessionMemoryExtractionErrorReason::WriteFailed,
+                        detail: last_detail,
+                    });
+                }
+            }
+            Ok(Ok(memory_id)) => {
+                let cleanup_error_reason = tokio::time::timeout(
+                    STALE_SNAPSHOT_CLEANUP_TIMEOUT,
+                    cleanup_prior_session_memory_entries(memoria, session_id, &memory_id, &encoded),
+                )
+                .await
+                .map_or(
+                    Some(SessionMemoryExtractionErrorReason::PurgeFailed),
+                    Result::err,
+                );
+                if let Some(reason) = cleanup_error_reason {
                     tracing::warn!(
                         session_id = %session_id,
                         ?reason,
                         "new session-memory snapshot is durable but stale snapshot cleanup was incomplete"
                     );
                 }
-                return Ok((encoded.len() as u64, attempt));
+                return Ok(StoredSessionMemory {
+                    bytes_written: encoded.len() as u64,
+                    attempt,
+                    cleanup_error_reason,
+                });
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 last_detail = Some(summarize_llm_detail(&error));
                 if attempt == 2 {
                     return Err(StoreSessionMemoryFailure {
@@ -1450,7 +1599,10 @@ fn truncate(text: &str, max_chars: usize) -> &str {
 mod tests {
     use super::*;
     use crate::memory_hooks::DirectMemoryInferenceClient;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
 
     use crate::turn::cloud::memoria_compact::MemoriaMemory;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1494,6 +1646,64 @@ mod tests {
     struct TopKMemoria {
         retrieve_results: Vec<MemoriaMemory>,
         requested_top_k: Mutex<Vec<usize>>,
+    }
+
+    struct PendingMemoria;
+
+    struct PendingStoreMemoria;
+
+    #[async_trait::async_trait]
+    impl MemoriaPort for PendingMemoria {
+        async fn retrieve_ext(
+            &self,
+            _query: &str,
+            _session_id: Option<&str>,
+            _top_k: usize,
+            _filter_session: bool,
+        ) -> Result<Vec<MemoriaMemory>, String> {
+            std::future::pending().await
+        }
+
+        async fn store(
+            &self,
+            _content: &str,
+            _memory_type: &str,
+            _session_id: Option<&str>,
+            _trust_tier: Option<&str>,
+        ) -> Result<String, String> {
+            Ok(String::new())
+        }
+
+        async fn purge_working(&self, _session_id: &str) -> Result<u64, String> {
+            Ok(0)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MemoriaPort for PendingStoreMemoria {
+        async fn retrieve_ext(
+            &self,
+            _query: &str,
+            _session_id: Option<&str>,
+            _top_k: usize,
+            _filter_session: bool,
+        ) -> Result<Vec<MemoriaMemory>, String> {
+            Ok(Vec::new())
+        }
+
+        async fn store(
+            &self,
+            _content: &str,
+            _memory_type: &str,
+            _session_id: Option<&str>,
+            _trust_tier: Option<&str>,
+        ) -> Result<String, String> {
+            std::future::pending().await
+        }
+
+        async fn purge_working(&self, _session_id: &str) -> Result<u64, String> {
+            Ok(0)
+        }
     }
 
     #[async_trait::async_trait]
@@ -1798,9 +2008,51 @@ mod tests {
             _request: MemoryInferenceRequest<'_>,
         ) -> Result<String, astra_core::ClassifiedError> {
             Err(astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::StreamIdle,
+                astra_core::ErrorKind::ProviderDeadline,
                 "provider request deadline expired",
             ))
+        }
+    }
+
+    #[derive(Debug)]
+    struct HangingMemoryInference {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl MemoryInferencePort for HangingMemoryInference {
+        fn model_name(&self) -> &str {
+            "hanging-memory-model"
+        }
+
+        async fn complete(
+            &self,
+            _request: MemoryInferenceRequest<'_>,
+        ) -> Result<String, astra_core::ClassifiedError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::future::pending().await
+        }
+    }
+
+    #[derive(Debug)]
+    struct ScriptedMemoryInference {
+        model_name: &'static str,
+        response: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl MemoryInferencePort for ScriptedMemoryInference {
+        fn model_name(&self) -> &str {
+            self.model_name
+        }
+
+        async fn complete(
+            &self,
+            _request: MemoryInferenceRequest<'_>,
+        ) -> Result<String, astra_core::ClassifiedError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.response.to_string())
         }
     }
 
@@ -1818,6 +2070,95 @@ mod tests {
         .expect_err("provider deadline must remain a typed extraction timeout");
 
         assert_eq!(error.reason, SessionMemoryExtractionErrorReason::LlmTimeout);
+    }
+
+    #[tokio::test]
+    async fn valid_empty_sparse_patch_is_success_and_stops_candidate_fanout() {
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let second_calls = Arc::new(AtomicUsize::new(0));
+        let clients = [
+            ScriptedMemoryInference {
+                model_name: "semantic-selector",
+                response: "{}",
+                calls: Arc::clone(&first_calls),
+            },
+            ScriptedMemoryInference {
+                model_name: "must-not-run",
+                response: r#"{"session_title":"invented by an unnecessary retry"}"#,
+                calls: Arc::clone(&second_calls),
+            },
+        ];
+        let memoria = Arc::new(CapturingMemoria::default());
+        let memoria_port = Arc::clone(&memoria) as Arc<dyn MemoriaPort>;
+
+        let artifacts = run_extraction(
+            &memoria_port,
+            &test_scope("sess-no-semantic-change"),
+            &[json!({"role": "user", "content": "hi"})],
+            1,
+            "",
+            &SessionFacts::default(),
+            &clients,
+            Duration::from_secs(3),
+            256,
+        )
+        .await;
+
+        assert!(matches!(
+            artifacts,
+            ExtractionArtifacts::NoChange {
+                ref selector_model,
+                ref failed_candidates,
+            } if selector_model == "semantic-selector" && failed_candidates.is_empty()
+        ));
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_calls.load(Ordering::SeqCst), 0);
+        assert!(memoria.operations.lock().unwrap().is_empty());
+        assert!(memoria.stored.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_narrative_patch_still_persists_deterministic_session_facts() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = ScriptedMemoryInference {
+            model_name: "semantic-selector",
+            response: "{}",
+            calls: Arc::clone(&calls),
+        };
+        let facts = SessionFacts {
+            blocked_tools: vec!["runtime_executor".to_string()],
+            turn: 4,
+            ..Default::default()
+        };
+        let memoria = Arc::new(CapturingMemoria::default());
+        let memoria_port = Arc::clone(&memoria) as Arc<dyn MemoriaPort>;
+
+        let artifacts = run_extraction(
+            &memoria_port,
+            &test_scope("sess-facts-only-change"),
+            &[json!({"role": "user", "content": "continue"})],
+            4,
+            "",
+            &facts,
+            &[client],
+            Duration::from_secs(3),
+            256,
+        )
+        .await;
+
+        assert!(matches!(
+            artifacts,
+            ExtractionArtifacts::Persisted {
+                source: SessionMemoryExtractionSource::Llm,
+                ..
+            }
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(memoria.stored.lock().unwrap().len(), 1);
+        let encoded = memoria.stored.lock().unwrap()[0].0.clone();
+        let snapshot = decode_session_memory_snapshot(&encoded, "sess-facts-only-change")
+            .expect("persisted entry must preserve its structured snapshot");
+        assert_eq!(snapshot.facts, facts);
     }
 
     #[test]
@@ -1978,9 +2319,10 @@ mod tests {
             "memory_extraction_test"
         );
         assert_eq!(scopes.lock().unwrap()[0].logical_attempt(), 0);
-        assert_eq!(
-            deadlines.lock().unwrap().as_slice(),
-            &[Duration::from_secs(3)]
+        let deadline = deadlines.lock().unwrap()[0];
+        assert!(
+            deadline <= Duration::from_secs(3) && deadline >= Duration::from_millis(2_900),
+            "provider deadline should preserve the requested three-second budget, got {deadline:?}"
         );
     }
 
@@ -2621,6 +2963,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selector_fallbacks_share_one_bounded_deadline() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let clients = [
+            HangingMemoryInference {
+                calls: Arc::clone(&calls),
+            },
+            HangingMemoryInference {
+                calls: Arc::clone(&calls),
+            },
+        ];
+        let memoria = Arc::new(CapturingMemoria::default()) as Arc<dyn MemoriaPort>;
+        let started = std::time::Instant::now();
+
+        let artifacts = run_extraction(
+            &memoria,
+            &test_scope("sess-global-selector-deadline"),
+            &sample_messages(),
+            1,
+            "",
+            &SessionFacts::default(),
+            &clients,
+            Duration::from_millis(25),
+            512,
+        )
+        .await;
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "fallback count must not multiply the selector deadline"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "an exhausted shared budget must not start another provider"
+        );
+        match artifacts {
+            ExtractionArtifacts::LlmFailedPersistedFallback {
+                error_reason,
+                failed_candidates,
+                ..
+            } => {
+                assert_eq!(error_reason, SessionMemoryExtractionErrorReason::LlmTimeout);
+                assert_eq!(failed_candidates.len(), 1);
+            }
+            _ => panic!("expected a bounded timeout fallback"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deterministic_fallback_bounds_a_hung_durable_store() {
+        let memoria = Arc::new(PendingStoreMemoria) as Arc<dyn MemoriaPort>;
+        let artifacts = run_extraction::<CapturingMemoryInference>(
+            &memoria,
+            &test_scope("sess-hung-store"),
+            &sample_messages(),
+            1,
+            "",
+            &SessionFacts::default(),
+            &[],
+            Duration::ZERO,
+            512,
+        )
+        .await;
+
+        match artifacts {
+            ExtractionArtifacts::PersistFailed {
+                error_reason,
+                persist_error_detail,
+                ..
+            } => {
+                assert_eq!(
+                    error_reason,
+                    SessionMemoryExtractionErrorReason::WriteFailed
+                );
+                assert!(
+                    persist_error_detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.contains("store attempt exceeded")),
+                    "timeout must remain diagnosable: {persist_error_detail:?}"
+                );
+            }
+            _ => panic!("expected bounded store failure"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn durable_snapshot_success_does_not_wait_for_stale_cleanup() {
+        let memoria = Arc::new(PendingMemoria) as Arc<dyn MemoriaPort>;
+        let artifacts = run_extraction::<CapturingMemoryInference>(
+            &memoria,
+            &test_scope("sess-hung-cleanup"),
+            &sample_messages(),
+            1,
+            "",
+            &SessionFacts::default(),
+            &[],
+            Duration::ZERO,
+            512,
+        )
+        .await;
+
+        match artifacts {
+            ExtractionArtifacts::Persisted {
+                cleanup_error_reason,
+                ..
+            } => assert_eq!(
+                cleanup_error_reason,
+                Some(SessionMemoryExtractionErrorReason::PurgeFailed),
+                "post-write cleanup is best-effort and must not erase durable success"
+            ),
+            _ => panic!("expected durable fallback with bounded cleanup"),
+        }
+    }
+
+    #[tokio::test]
     async fn run_extraction_stores_new_snapshot_before_cleaning_prior_entries() {
         let memoria = Arc::new(CapturingMemoria::default());
         memoria.retrieve_results.lock().unwrap().extend([
@@ -2787,10 +3244,17 @@ mod tests {
         )
         .await;
 
-        assert!(
-            matches!(artifacts, ExtractionArtifacts::Persisted { .. }),
-            "the new durable snapshot remains successful even if stale cleanup fails"
-        );
+        match artifacts {
+            ExtractionArtifacts::Persisted {
+                cleanup_error_reason,
+                ..
+            } => assert_eq!(
+                cleanup_error_reason,
+                Some(SessionMemoryExtractionErrorReason::PurgeFailed),
+                "the durable write and cleanup degradation must both remain observable"
+            ),
+            _ => panic!("the new durable snapshot remains successful even if cleanup fails"),
+        }
     }
 
     #[tokio::test]
@@ -2811,10 +3275,17 @@ mod tests {
         )
         .await;
 
-        assert!(
-            matches!(artifacts, ExtractionArtifacts::Persisted { .. }),
-            "page-capped cleanup must not roll back the new snapshot"
-        );
+        match artifacts {
+            ExtractionArtifacts::Persisted {
+                cleanup_error_reason,
+                ..
+            } => assert_eq!(
+                cleanup_error_reason,
+                Some(SessionMemoryExtractionErrorReason::PurgeFailed),
+                "bounded cleanup exhaustion must surface as structured degradation"
+            ),
+            _ => panic!("page-capped cleanup must not roll back the new snapshot"),
+        }
     }
 
     #[tokio::test]
@@ -2871,8 +3342,9 @@ mod tests {
             3,
             SessionFacts::default(),
         );
+        snapshot.narrative.active_goals = vec!["stale active goal".to_string()];
         let patch = parse_session_narrative_patch(
-            r#"{"current_state":["typed lane is wired"],"pending_todos":[]}"#,
+            r#"{"current_state":["typed lane is wired"],"active_goals":[],"pending_todos":[]}"#,
         )
         .expect("valid sparse patch")
         .0;
@@ -2884,6 +3356,12 @@ mod tests {
         assert!(canonical.contains("typed lane is wired"));
         assert!(!canonical.contains("stale todo"));
         assert!(!canonical.contains("## Pending Todos"));
+        assert!(!canonical.contains("stale active goal"));
+        assert!(snapshot.narrative.active_goals.is_empty());
+        assert!(
+            !canonical.contains("## Active Goals"),
+            "explicitly clearing active goals must not resurrect task_spec as a goal"
+        );
     }
 
     #[test]
@@ -3220,6 +3698,54 @@ mod tests {
         assert_eq!(loaded.updated_turn, Some(3));
     }
 
+    #[tokio::test]
+    async fn interactive_session_memory_deadline_preserves_local_continuity() {
+        use astra_services::SessionArtifactStore;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _dir_guard = astra_services::session_journal::JournalDirGuard::new(tmp.path());
+        let session_id = "sess-interactive-memory-deadline";
+        let path = astra_services::local_session_artifact_store()
+            .session_path(session_id, "session-memory.md")
+            .unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            "# Session Memory\n\n## Current State\n- preserve local continuity\n",
+        )
+        .unwrap();
+        persist_local_session_memory_metadata(
+            session_id,
+            &SessionMemoryArtifactMetadata {
+                session_id: session_id.to_string(),
+                last_extracted_turn: Some(7),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let loaded = load_current_session_memory_preferring_local_with_deadline(
+            &PendingMemoria,
+            session_id,
+            Duration::from_millis(20),
+        )
+        .await
+        .expect("local context should survive a stalled remote freshness check");
+        assert!(loaded.content.contains("preserve local continuity"));
+        assert_eq!(loaded.updated_turn, Some(7));
+
+        assert!(
+            load_current_session_memory_with_deadline(
+                &PendingMemoria,
+                "remote-only-session",
+                Duration::from_millis(20),
+            )
+            .await
+            .is_none(),
+            "remote-only optional context should fail soft at the interactive deadline"
+        );
+    }
+
     #[test]
     fn from_markdown_does_not_infer_goal_semantics_from_wording() {
         let snapshot = SessionMemorySnapshot::from_markdown(
@@ -3297,6 +3823,38 @@ review uncommitted changes
             vec![
                 json!({"role": "user", "content": "我说过的所有话，还有回复"}),
                 json!({"role": "assistant", "content": "你问过我总结这段会话。"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn session_memory_extraction_excludes_structured_memory_operation_turns() {
+        let messages = vec![
+            json!({"role": "user", "content": "Remember the release date is June 15."}),
+            json!({
+                "role": "assistant",
+                "content": serde_json::Value::Null,
+                "tool_calls": [{
+                    "id": "memory-call-1",
+                    "function": {"name": "memory", "arguments": "{\"action\":\"remember\"}"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "name": "memory",
+                "tool_call_id": "memory-call-1",
+                "content": "{\"memory_id\":\"m1\"}"
+            }),
+            json!({"role": "assistant", "content": "Stored memory m1."}),
+            json!({"role": "user", "content": "Rust ownership prevents data races."}),
+            json!({"role": "assistant", "content": "That is a useful fact."}),
+        ];
+
+        assert_eq!(
+            session_memory_extraction_messages(&messages),
+            vec![
+                json!({"role": "user", "content": "Rust ownership prevents data races."}),
+                json!({"role": "assistant", "content": "That is a useful fact."}),
             ]
         );
     }

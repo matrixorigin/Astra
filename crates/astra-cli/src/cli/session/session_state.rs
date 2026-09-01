@@ -4,9 +4,7 @@
 //! for the CLI REPL. It also includes helper types like `ExplainMode` and `SkillDevState`.
 
 use crate::cli::cli_config::cli_context::CliContext;
-use crate::cli::durable_bridge;
 use crate::cli::permission_manager::PermissionManager;
-use crate::cli::plan::plan_executor;
 use crate::cli::slash::slash_team;
 use crate::mcp_client;
 use astra_runtime::plan as runtime_plan;
@@ -45,7 +43,6 @@ pub(crate) struct ContinuationAnchor {
     pub recent_user_input: Option<String>,
     pub objective_context: Vec<String>,
     pub assistant_direction: Option<String>,
-    pub active_task_board: Vec<String>,
     pub has_session_memory_recap: bool,
 }
 
@@ -55,14 +52,12 @@ impl ContinuationAnchor {
         recent_user_input: Option<String>,
         objective_context: Vec<String>,
         assistant_direction: Option<String>,
-        active_task_board: Vec<String>,
     ) -> Self {
         Self {
             text: text.into(),
             recent_user_input,
             objective_context,
             assistant_direction,
-            active_task_board,
             has_session_memory_recap: false,
         }
     }
@@ -70,10 +65,6 @@ impl ContinuationAnchor {
     pub(crate) fn with_session_memory_recap(mut self) -> Self {
         self.has_session_memory_recap = true;
         self
-    }
-
-    pub(crate) fn has_active_task_board(&self) -> bool {
-        !self.active_task_board.is_empty()
     }
 
     #[cfg(test)]
@@ -159,12 +150,6 @@ pub(crate) struct SessionState {
     /// bounded self-mod/task rollback across turns.
     pub session_state_journal:
         std::sync::Arc<std::sync::Mutex<crate::edge_tools::SessionStateRollbackJournal>>,
-    /// Session-scoped task manager so task mutations survive across turns.
-    pub task_manager: std::sync::Arc<crate::edge_tools::TaskManager>,
-    /// Broadcast sender for the HttpTaskStore. Fired after each
-    /// successful `route_task_action` so the observer refetches.
-    /// `None` when offline (in-memory store has its own notifications).
-    pub task_notify_tx: Option<tokio::sync::broadcast::Sender<String>>,
     /// Sticky task/thread summary used to anchor ultra-short follow-ups like
     /// "继续" even after history compaction prunes earlier turns.
     pub continuation_anchor: Option<ContinuationAnchor>,
@@ -207,8 +192,6 @@ pub(crate) struct SessionState {
     pub total_cache_creation_tokens: u64,
     /// Per-turn cost accumulator (sum of all turns in this session).
     pub total_session_cost: f64,
-    /// Maximum session cost in USD before auto-exit (0.0 = unlimited).
-    pub max_budget_limit: f64,
     /// Cached pricing data for the active model (used by /cost).
     pub cached_pricing: astra_services::models::PricingData,
     pub skill_dev: Option<SkillDevState>,
@@ -236,8 +219,6 @@ pub(crate) struct SessionState {
     pub perm_manager: PermissionManager,
     /// User ID for event ingestion attribution.
     pub ingestion_user_id: Option<String>,
-    /// Local/cloud service for background shell commands.
-    pub task_service: Option<std::sync::Arc<dyn astra_services::TaskService>>,
     /// Cross-session tool health data for error budget persistence.
     pub tool_health_entries: Vec<astra_turn_core::tool_health_persistence::ToolHealthEntry>,
     /// Last successfully synced tool health snapshot, used to compute deltas.
@@ -259,21 +240,6 @@ pub(crate) struct SessionState {
     /// When set, the mirror in `cloud_plan_mirror` may be stale and
     /// callers that want fresh data should re-sync before reading.
     pub plan_mode_sync_error: Option<String>,
-    /// Plan being auto-executed — subtasks sent sequentially through chat.
-    pub executing_plan: Option<astra_services::task_orchestrator::TaskPlan>,
-    /// Configuration for current plan execution.
-    pub plan_execution_config: Option<runtime_plan::PlanExecutionConfig>,
-    /// Goal text for the executing plan (for summary generation).
-    pub executing_plan_goal: Option<String>,
-    /// Cloud `plan_id` this execution is mirroring to, for posting
-    /// `plan_step_runs` rows to the server. `None` keeps execution purely
-    /// local (no step-run persistence).
-    pub executing_plan_id: Option<String>,
-    /// Number of parallel execution rounds completed (for summary).
-    pub plan_execution_rounds: usize,
-    /// ID of the currently-executing plan subtask (set during plan execution,
-    /// read by apply_turn_success to tag journal events).
-    pub current_plan_subtask_id: Option<String>,
     /// Whether the last chat turn was interrupted by Ctrl+C (used by plan auto-execution).
     pub last_turn_interrupted: bool,
     /// Last turn's journal event — for /turn command display.
@@ -291,6 +257,11 @@ pub(crate) struct SessionState {
     pub runtime_compaction_state: Option<serde_json::Value>,
     /// Consecutive context-window failures restored from the latest heavy checkpoint.
     pub runtime_consecutive_context_window_errors: u32,
+    /// Sticky workspace-observation safety state restored from a heavy
+    /// checkpoint.  This is not execution authority; it only keeps later
+    /// turns conservative until the session/workspace binding changes.
+    pub workspace_observation_quarantine:
+        Option<astra_pipeline::step_protocol::WorkspaceObservationQuarantineV1>,
     /// Tool replay guard rebuilt from step events on resume.
     /// Unified skill registry (single source of truth for all skill resolution).
     pub unified_skill_registry: std::sync::Arc<astra_runtime::skills::UnifiedSkillRegistry>,
@@ -301,18 +272,6 @@ pub(crate) struct SessionState {
     /// Skills surfaced by `discover_skills` during this CLI session.
     pub discovered_skills: std::collections::HashSet<String>,
     pub mcp_manager: std::sync::Arc<tokio::sync::RwLock<mcp_client::McpClientManager>>,
-    /// Active durable-task contract for plan execution verification.
-    pub durable_task_state: Option<durable_bridge::DurableTaskState>,
-    /// Last delivery report — kept after plan completion so `/report` works post-plan.
-    pub last_delivery_report: Option<astra_services::durable_task::TaskDeliveryReport>,
-    /// Last terminal error from the plan executor, used for prompt/TUI recovery messaging.
-    pub plan_execution_last_error: Option<String>,
-    /// The current plan attempt reached an explicit resumable pause boundary.
-    /// This distinguishes a normal pause from an executor that vanished
-    /// without a terminal lifecycle event.
-    pub plan_execution_paused: bool,
-    /// Stacked operator notes while plan execution is paused (`correct` / `note` at ⏸>).
-    pub plan_execution_corrections: Vec<String>,
     /// Delegation engine for multi-agent coordination.
     /// Constructed at REPL startup with a real `CliDelegateSubRunExecutor` when
     /// the user is authenticated. Falls back to stub creation during plan execution
@@ -324,22 +283,6 @@ pub(crate) struct SessionState {
     /// Shared team persistence service (in-memory or API-backed).
     /// Used for execution history and snapshot persistence.
     pub team_store: std::sync::Arc<dyn astra_services::team_persistence::TeamPersistenceService>,
-    /// Handle for communicating with the plan executor.
-    /// When Some, a plan executor is alive (either actively running or paused
-    /// waiting for Resume/Cancel).
-    pub plan_handle: Option<plan_executor::PlanExecutorHandle>,
-
-    /// When Some, a plan-executor tool is waiting for user approval.
-    /// In blocking mode this is handled inline; kept for edge-case fallback.
-    pub pending_approval:
-        Option<tokio::sync::oneshot::Sender<crate::cli::chat_stream::ApprovalResponse>>,
-    /// True while plan display is in the middle of printing streaming LLM tokens.
-    /// Used to insert a newline before the next non-token event.
-    pub plan_in_token_stream: bool,
-    /// Streaming markdown renderer for plan execution token output.
-    pub plan_md_renderer: Option<crate::cli::stream::streaming_md::StreamingMarkdown>,
-    /// Thinking preview pane for plan execution (reasoning visibility).
-    pub plan_thinking_pane: Option<crate::cli::effects::ThinkingPreviewPane>,
     /// Project-level instructions loaded from `.astra/instructions.md`.
     /// Injected into every turn's effective message as `<project_instructions>`.
     pub project_instructions: Option<String>,
@@ -483,11 +426,6 @@ pub(crate) struct SessionState {
     /// Notifications from background tasks (completed/failed/stalled)
     /// queued for injection into the model's next turn context.
     pub pending_bg_notifications: Vec<String>,
-    /// Turns since the model last used any task tool action.
-    /// Reset to 0 whenever a task tool call is observed.
-    pub turns_since_task_use: u32,
-    /// Turns since the last task reminder was injected.
-    pub turns_since_task_reminder: u32,
     /// Shared command queue for background task operations.
     /// The tool executor pushes spawn/kill/output commands; the TUI drains them.
     pub bg_task_commands: std::sync::Arc<std::sync::Mutex<Vec<crate::edge_tools::BgTaskCommand>>>,
@@ -543,8 +481,6 @@ impl Default for SessionState {
             session_state_journal: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::edge_tools::SessionStateRollbackJournal::default(),
             )),
-            task_manager: std::sync::Arc::new(crate::edge_tools::TaskManager::in_memory()),
-            task_notify_tx: None,
             continuation_anchor: None,
             diagnostics_context: None,
             queued_message: None,
@@ -563,7 +499,6 @@ impl Default for SessionState {
             total_cache_read_tokens: 0,
             total_cache_creation_tokens: 0,
             total_session_cost: 0.0,
-            max_budget_limit: 0.0,
             cached_pricing: Default::default(),
             skill_dev: None,
             active_system_skills: Vec::new(),
@@ -586,17 +521,10 @@ impl Default for SessionState {
                 &std::env::current_dir().unwrap_or_default(),
             ),
             ingestion_user_id: None,
-            task_service: None,
             tool_health_entries: Vec::new(),
             synced_tool_health_entries: Vec::new(),
             cloud_plan_mirror: None,
             plan_mode_sync_error: None,
-            executing_plan: None,
-            plan_execution_config: None,
-            executing_plan_goal: None,
-            executing_plan_id: None,
-            plan_execution_rounds: 0,
-            current_plan_subtask_id: None,
             last_turn_interrupted: false,
             last_turn_event: None,
             session_persistence_error: None,
@@ -604,6 +532,7 @@ impl Default for SessionState {
             runtime_pipeline_state: None,
             runtime_compaction_state: None,
             runtime_consecutive_context_window_errors: 0,
+            workspace_observation_quarantine: None,
             unified_skill_registry: astra_runtime::skills::default_unified_registry().clone(),
             skill_quality_tracker: astra_skills::quality::SkillQualityTracker::new(),
             skill_improvement_tracker: astra_skills::improvement::ImprovementTracker::new(),
@@ -611,21 +540,11 @@ impl Default for SessionState {
             mcp_manager: std::sync::Arc::new(tokio::sync::RwLock::new(
                 mcp_client::McpClientManager::new(),
             )),
-            durable_task_state: None,
-            last_delivery_report: None,
-            plan_execution_last_error: None,
-            plan_execution_paused: false,
-            plan_execution_corrections: Vec::new(),
             delegation_engine: None,
             team_registry: slash_team::TeamRegistry::new(),
             team_store: std::sync::Arc::new(
                 astra_services::team_persistence::InMemoryTeamStore::new(),
             ),
-            plan_handle: None,
-            pending_approval: None,
-            plan_in_token_stream: false,
-            plan_md_renderer: None,
-            plan_thinking_pane: None,
             project_instructions: None,
             // Create shared messaging infrastructure eagerly so /messaging always has data
             messaging_metrics: Some(std::sync::Arc::new(astra_messaging::MessagingMetrics::new())),
@@ -674,8 +593,6 @@ impl Default for SessionState {
             tui_ask_user_request_tx: None,
             tui_plan_review_request_tx: None,
             pending_bg_notifications: Vec::new(),
-            turns_since_task_use: 0,
-            turns_since_task_reminder: 0,
             bg_task_commands: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             bg_task_list_cache: std::sync::Arc::new(tokio::sync::RwLock::new(String::new())),
             bash_detach_slot: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
@@ -720,31 +637,27 @@ impl SessionState {
         self.runtime_pipeline_state = None;
         self.runtime_compaction_state = None;
         self.runtime_consecutive_context_window_errors = 0;
+        self.workspace_observation_quarantine = None;
     }
 
-    /// Set the current session id and keep the Tier 1 task manager in sync
-    /// (so `session_todos` reads/writes hit the correct session). Prefer
-    /// this over `self.session_id = Some(...)` at any path that rebinds
-    /// the session.
+    /// Set the current session id and advance the attachment generation when
+    /// the identity changes.
     pub fn set_session_id(&mut self, session_id: impl Into<String>) {
         let sid: String = session_id.into();
         if self.session_id.as_deref() != Some(sid.as_str()) {
             self.advance_session_attachment();
         }
-        self.task_manager.rebind(&sid);
         self.perm_manager.set_active_session_id(&sid);
         self.session_id = Some(sid);
     }
 
-    /// Clear the current session id. Task manager falls back to an empty
-    /// session binding; the next `set_session_id` rebinds.
+    /// Clear the current session id and its session-scoped runtime state.
     pub fn clear_session_id(&mut self) {
         if self.session_id.is_some() {
             self.advance_session_attachment();
         } else {
             self.active_conversation = None;
         }
-        self.task_manager.rebind("");
         self.perm_manager.clear_active_session_id();
         self.session_id = None;
         // Deferred materialization is evidence from this session's retained
@@ -790,27 +703,11 @@ impl SessionState {
         self.journal = None;
         self.recent_tools.clear();
         self.activated_deferred_tool_names.clear();
-        self.executing_plan = None;
-        self.plan_execution_config = None;
-        self.executing_plan_goal = None;
-        self.executing_plan_id = None;
-        self.plan_execution_rounds = 0;
-        self.current_plan_subtask_id = None;
         self.last_turn_interrupted = false;
         self.last_turn_event = None;
         self.session_persistence_error = None;
         self.latest_context_assembly_trace = None;
         self.clear_runtime_recovery_state();
-        self.durable_task_state = None;
-        self.last_delivery_report = None;
-        self.plan_execution_last_error = None;
-        self.plan_execution_paused = false;
-        self.plan_execution_corrections.clear();
-        self.plan_handle = None;
-        self.pending_approval = None;
-        self.plan_in_token_stream = false;
-        self.plan_md_renderer = None;
-        self.plan_thinking_pane = None;
         self.redo_stack.clear();
         self.clear_resume_recovery_state();
         self.drift_compressed_turns.clear();
@@ -828,8 +725,6 @@ impl SessionState {
         self.csl_manager = None;
         self.perm_manager.clear_session_overrides();
         self.pending_bg_notifications.clear();
-        self.turns_since_task_use = 0;
-        self.turns_since_task_reminder = 0;
     }
 
     /// Reset live state before restoring a different session into this REPL.
@@ -937,15 +832,10 @@ mod default_tests {
                 findings: vec!["finding".into()],
                 recommended_action: "act".into(),
             }),
-            executing_plan_goal: Some("goal".into()),
-            executing_plan_id: Some("plan-1".into()),
-            plan_execution_rounds: 5,
             last_turn_interrupted: true,
             plan_mode_sync_error: Some("err".into()),
             session_persistence_error: Some("journal append failed".into()),
             pending_bg_notifications: vec!["bg".into()],
-            turns_since_task_use: 9,
-            turns_since_task_reminder: 7,
             ..Default::default()
         };
         state.perm_manager.record_approval("bash", None, true);
@@ -977,16 +867,11 @@ mod default_tests {
         assert!(!state.session_lessons_loaded);
         assert!(state.latest_skill_diagnosis.is_none());
         assert!(state.latest_turn_quality_feedback.is_none());
-        assert!(state.executing_plan_goal.is_none());
-        assert!(state.executing_plan_id.is_none());
-        assert_eq!(state.plan_execution_rounds, 0);
         assert!(!state.last_turn_interrupted);
         assert!(state.plan_mode_sync_error.is_none());
         assert!(state.session_persistence_error.is_none());
         assert!(state.perm_manager.export_session_overrides().is_none());
         assert!(state.pending_bg_notifications.is_empty());
-        assert_eq!(state.turns_since_task_use, 0);
-        assert_eq!(state.turns_since_task_reminder, 0);
     }
 
     #[test]
@@ -1047,7 +932,6 @@ mod default_tests {
             notifications_enabled: false,
             notification_method: crate::cli::notifications::NotificationMethod::Bell,
             notification_threshold_secs: 30,
-            max_budget_limit: 12.5,
             project_instructions: Some("follow repo policy".into()),
             runtime_config: runtime_config.clone(),
             ..Default::default()
@@ -1065,7 +949,6 @@ mod default_tests {
             crate::cli::notifications::NotificationMethod::Bell
         );
         assert_eq!(state.notification_threshold_secs, 30);
-        assert_eq!(state.max_budget_limit, 12.5);
         assert_eq!(
             state.project_instructions.as_deref(),
             Some("follow repo policy")
@@ -1174,8 +1057,6 @@ mod default_tests {
             recent_tools: vec!["bash".into()],
             activated_deferred_tool_names: vec!["write_file".into()],
             discovered_skills: ["skill-b".to_string()].into_iter().collect(),
-            executing_plan_id: Some("plan-1".into()),
-            plan_execution_last_error: Some("stale".into()),
             plan_mode_sync_error: Some("sync".into()),
             resume_guidance: Some("resume".into()),
             resume_restricted_tools: vec!["read_file".into()],
@@ -1191,8 +1072,6 @@ mod default_tests {
         assert!(state.recent_tools.is_empty());
         assert!(state.activated_deferred_tool_names.is_empty());
         assert!(state.discovered_skills.is_empty());
-        assert!(state.executing_plan_id.is_none());
-        assert!(state.plan_execution_last_error.is_none());
         assert!(state.plan_mode_sync_error.is_none());
         assert!(state.resume_guidance.is_none());
         assert!(state.resume_restricted_tools.is_empty());

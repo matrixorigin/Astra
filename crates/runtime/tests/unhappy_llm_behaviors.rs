@@ -29,15 +29,17 @@ use std::collections::BTreeSet;
 
 fn tc(name: &str, args: Value) -> Value {
     json!({
-        "name": name,
-        "arguments": args,
+        "id": format!("call-{name}"),
+        "type": "function",
+        "function": {"name": name, "arguments": args},
     })
 }
 
 fn tc_str_args(name: &str, args: &str) -> Value {
     json!({
-        "name": name,
-        "arguments": args,
+        "id": format!("call-{name}"),
+        "type": "function",
+        "function": {"name": name, "arguments": args},
     })
 }
 
@@ -82,14 +84,17 @@ fn fabricated_tool_names_produce_warning_listing_unknown_tools() {
 fn malformed_json_args_flag_tool_even_when_name_is_valid() {
     let tool_calls = vec![
         tc_str_args("read_file", "{not json"),
-        tc_str_args("bash", "{}"), // valid empty
-        tc_str_args("grep", ""),   // empty string is fine
+        tc_str_args("bash", "{}"),
+        tc_str_args("grep", ""),
     ];
     let allowed = &["read_file", "bash", "grep"];
     let result = apply_response_guards("running tools now", &tool_calls, allowed, "help");
 
     assert!(result.replacement.is_none());
-    assert_eq!(result.quality.malformed_args, vec!["read_file".to_string()]);
+    assert_eq!(
+        result.quality.malformed_args,
+        vec!["read_file".to_string(), "grep".to_string()]
+    );
     assert!(result.quality.hallucinated_tools.is_empty());
 
     let warning = result.quality.to_warning().expect("warning expected");

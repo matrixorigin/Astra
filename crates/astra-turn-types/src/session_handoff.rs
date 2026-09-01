@@ -257,6 +257,11 @@ pub struct HandoffRiskEvidenceV1 {
     pub unknown_effect_invocation_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forced_authorization_id: Option<String>,
+    /// Database time at which the Server fenced the old authority, stopped
+    /// every durable run, and sealed the complete set of possibly dispatched
+    /// effects. Absence means takeover is not yet safe to hydrate or expose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effects_sealed_at_unix_ms: Option<i64>,
 }
 
 impl HandoffRiskEvidenceV1 {
@@ -269,6 +274,9 @@ impl HandoffRiskEvidenceV1 {
         }
         if let Some(id) = &self.forced_authorization_id {
             validate_identity("forced_authorization_id", id, 512)?;
+        }
+        if self.effects_sealed_at_unix_ms.is_some_and(|time| time <= 0) {
+            return Err(SessionHandoffValidationError::InvalidCoordinate);
         }
         for id in &self.unknown_effect_invocation_ids {
             validate_identity("unknown_effect_invocation_id", id, 512)?;
@@ -287,6 +295,10 @@ impl HandoffRiskEvidenceV1 {
 
     pub fn permits_forced_fence(&self) -> bool {
         self.forced_authorization_id.is_some()
+    }
+
+    pub fn effects_are_sealed(&self) -> bool {
+        self.effects_sealed_at_unix_ms.is_some()
     }
 }
 
@@ -364,6 +376,15 @@ impl SessionHandoffRecordV1 {
         self.risk.validate()?;
         if self.mode == SessionHandoffModeV1::Forced && !self.risk.permits_forced_fence() {
             return Err(SessionHandoffValidationError::ForcedEvidenceRequired);
+        }
+        if self.mode == SessionHandoffModeV1::Forced
+            && matches!(
+                self.state,
+                SessionHandoffStateV1::Hydrating | SessionHandoffStateV1::Active
+            )
+            && !self.risk.effects_are_sealed()
+        {
+            return Err(SessionHandoffValidationError::ForcedEffectsNotSealed);
         }
         Ok(())
     }
@@ -478,6 +499,8 @@ pub enum SessionHandoffValidationError {
     },
     #[error("forced takeover requires a verified authorization identity")]
     ForcedEvidenceRequired,
+    #[error("forced takeover effects were not sealed after fencing")]
+    ForcedEffectsNotSealed,
     #[error("too many unknown effect identities")]
     TooManyEffects,
     #[error("duplicate unknown effect identity")]
@@ -547,6 +570,7 @@ mod tests {
                     unsynced_suffix_root: None,
                     unknown_effect_invocation_ids: vec!["invocation-unknown".into()],
                     forced_authorization_id: Some("reauth-proof".into()),
+                    effects_sealed_at_unix_ms: None,
                 }
             } else {
                 HandoffRiskEvidenceV1::default()
@@ -602,6 +626,19 @@ mod tests {
                 1_003,
             )
             .unwrap();
+        forced
+            .transition(
+                SessionHandoffStateV1::Fenced,
+                SessionHandoffStateV1::Hydrating,
+                1_004,
+            )
+            .unwrap();
+        assert_eq!(
+            forced.validate(),
+            Err(SessionHandoffValidationError::ForcedEffectsNotSealed)
+        );
+        forced.risk.effects_sealed_at_unix_ms = Some(1_004);
+        forced.validate().unwrap();
     }
 
     #[test]

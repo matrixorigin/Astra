@@ -79,24 +79,24 @@ pub fn handle_config_command(arg: &str) {
 fn show_config() {
     let config = RuntimeConfig::load();
 
-    println!("\n{}", "Runtime Configuration".bold().magenta());
-    println!("{}", "═".repeat(50).dim());
+    stdout_println!("\n{}", "Runtime Configuration".bold().magenta());
+    stdout_println!("{}", "═".repeat(50).dim());
 
     // Compression settings
-    println!("\n{}", "📦 Compression".bold());
-    println!(
+    stdout_println!("\n{}", "📦 Compression".bold());
+    stdout_println!(
         "  max_history_tokens: {}",
         config.compression.max_history_tokens.to_string().yellow()
     );
-    println!(
+    stdout_println!(
         "  compression_threshold: {}",
         format!("{:.0}%", config.compression.compression_threshold * 100.0).yellow()
     );
-    println!(
+    stdout_println!(
         "  preserve_tool_calls: {}",
         config.compression.preserve_tool_calls.to_string().yellow()
     );
-    println!(
+    stdout_println!(
         "  preserve_recent_turns: {}",
         config
             .compression
@@ -104,33 +104,33 @@ fn show_config() {
             .to_string()
             .yellow()
     );
-    println!(
+    stdout_println!(
         "  strategy: {}",
         format!("{:?}", config.compression.strategy).yellow()
     );
 
     // Memory settings
-    println!("\n{}", "🧠 Memory".bold());
-    println!(
+    stdout_println!("\n{}", "🧠 Memory".bold());
+    stdout_println!(
         "  retrieval_top_k: {}",
         config.memory.retrieval_top_k.to_string().yellow()
     );
-    println!(
+    stdout_println!(
         "  min_relevance_score: {}",
         format!("{:.2}", config.memory.min_relevance_score).yellow()
     );
-    println!(
+    stdout_println!(
         "  session_weight: {}",
         format!("{:.2}", config.memory.session_weight).yellow()
     );
-    println!(
+    stdout_println!(
         "  long_term_weight: {}",
         format!("{:.2}", config.memory.long_term_weight).yellow()
     );
 
     // Token budget settings
-    println!("\n{}", "🎯 Token Budget".bold());
-    println!(
+    stdout_println!("\n{}", "🎯 Token Budget".bold());
+    stdout_println!(
         "  max_turn_input_tokens: {}",
         config
             .token_budget
@@ -148,7 +148,7 @@ fn show_config() {
     );
     match effective_model.as_deref() {
         Some(model) if effective_budget != config.token_budget.max_turn_input_tokens as u64 => {
-            println!(
+            stdout_println!(
                 "  effective_for_{}: {} {}",
                 model,
                 effective_budget.to_string().magenta(),
@@ -156,7 +156,7 @@ fn show_config() {
             );
         }
         Some(model) => {
-            println!(
+            stdout_println!(
                 "  effective_for_{}: {} {}",
                 model,
                 effective_budget.to_string().magenta(),
@@ -164,13 +164,13 @@ fn show_config() {
             );
         }
         None => {
-            println!(
+            stdout_println!(
                 "  {}",
                 "(no active model known; effective budget = configured)".dim()
             );
         }
     }
-    println!(
+    stdout_println!(
         "  system_prompt_reserve: {}",
         config
             .token_budget
@@ -178,26 +178,26 @@ fn show_config() {
             .to_string()
             .yellow()
     );
-    println!(
+    stdout_println!(
         "  tools_reserve: {}",
         config.token_budget.tools_reserve.to_string().yellow()
     );
 
     // Trace configuration
-    println!("\n{}", "📊 Trace".bold());
-    println!(
+    stdout_println!("\n{}", "📊 Trace".bold());
+    stdout_println!(
         "  profile: {}",
         format!("{:?}", config.trace.profile)
             .to_lowercase()
             .yellow()
     );
-    println!(
+    stdout_println!(
         "  min_level: {}",
         format!("{:?}", config.trace.min_level)
             .to_lowercase()
             .yellow()
     );
-    println!(
+    stdout_println!(
         "  enabled_categories: {}",
         config
             .trace
@@ -208,7 +208,7 @@ fn show_config() {
             .join(", ")
             .yellow()
     );
-    println!(
+    stdout_println!(
         "  sinks: {}",
         config
             .trace
@@ -220,11 +220,11 @@ fn show_config() {
             .yellow()
     );
 
-    println!(
+    stdout_println!(
         "\n{}",
         "Use `/config paths` to see configuration file locations.".dim()
     );
-    println!(
+    stdout_println!(
         "{}",
         "Use `/config sources` to see where each value came from.".dim()
     );
@@ -246,14 +246,14 @@ fn show_sources() {
     // Final merged config
     let final_config = RuntimeConfig::load();
 
-    println!(
+    stdout_println!(
         "\n{}",
         "Configuration Sources (showing non-default values)"
             .bold()
             .magenta()
     );
-    println!("{}", "═".repeat(55).dim());
-    println!(
+    stdout_println!("{}", "═".repeat(55).dim());
+    stdout_println!(
         "  {} = default, {} = user, {} = project, {} = env",
         "D".dim(),
         "U".blue(),
@@ -279,7 +279,7 @@ fn show_sources() {
     // Compression
     if final_config.compression.max_history_tokens != defaults.compression.max_history_tokens {
         shown_any = true;
-        println!(
+        stdout_println!(
             "  • {} = {} [{}]",
             "compression.max_history_tokens".magenta(),
             final_config
@@ -296,7 +296,7 @@ fn show_sources() {
         > 0.001
     {
         shown_any = true;
-        println!(
+        stdout_println!(
             "  • {} = {} [{}]",
             "compression.compression_threshold".magenta(),
             format!("{:.2}", final_config.compression.compression_threshold).yellow(),
@@ -307,7 +307,7 @@ fn show_sources() {
     // Memory
     if final_config.memory.retrieval_top_k != defaults.memory.retrieval_top_k {
         shown_any = true;
-        println!(
+        stdout_println!(
             "  • {} = {} [{}]",
             "memory.retrieval_top_k".magenta(),
             final_config.memory.retrieval_top_k.to_string().yellow(),
@@ -320,7 +320,7 @@ fn show_sources() {
         != defaults.token_budget.max_turn_input_tokens
     {
         shown_any = true;
-        println!(
+        stdout_println!(
             "  • {} = {} [{}]",
             "token_budget.max_turn_input_tokens".magenta(),
             final_config
@@ -335,7 +335,7 @@ fn show_sources() {
     // Trace
     if final_config.trace.profile != defaults.trace.profile {
         shown_any = true;
-        println!(
+        stdout_println!(
             "  • {} = {} [profile]",
             "trace.profile".magenta(),
             format!("{:?}", final_config.trace.profile)
@@ -345,7 +345,7 @@ fn show_sources() {
     }
     if final_config.trace.min_level != defaults.trace.min_level {
         shown_any = true;
-        println!(
+        stdout_println!(
             "  • {} = {} [level]",
             "trace.min_level".magenta(),
             format!("{:?}", final_config.trace.min_level)
@@ -359,7 +359,7 @@ fn show_sources() {
         != defaults.trace.category_enabled(TraceCategory::LlmExchanges)
     {
         shown_any = true;
-        println!(
+        stdout_println!(
             "  • {} = {} [{}]",
             "trace.llm_exchanges".magenta(),
             final_config
@@ -372,15 +372,15 @@ fn show_sources() {
     }
 
     if !shown_any {
-        println!("\n{}", "  All settings are at their default values.".dim());
+        stdout_println!("\n{}", "  All settings are at their default values.".dim());
     }
 
-    println!("\n{}", "Priority: env > project > user > defaults".dim());
+    stdout_println!("\n{}", "Priority: env > project > user > defaults".dim());
 }
 
 fn show_paths() {
-    println!("\n{}", "Configuration Paths".bold().magenta());
-    println!("{}", "═".repeat(50).dim());
+    stdout_println!("\n{}", "Configuration Paths".bold().magenta());
+    stdout_println!("{}", "═".repeat(50).dim());
 
     // User config
     let user_config = dirs::home_dir()
@@ -388,8 +388,8 @@ fn show_paths() {
         .unwrap_or_else(|| PathBuf::from("~/.astra/config/runtime.toml"));
     let user_exists = user_config.exists();
 
-    println!("\n{}", "User-level (highest priority):".bold());
-    println!(
+    stdout_println!("\n{}", "User-level (highest priority):".bold());
+    stdout_println!(
         "  {} {}",
         user_config.display(),
         if user_exists {
@@ -405,8 +405,8 @@ fn show_paths() {
         .unwrap_or_else(|_| PathBuf::from(".astra/config/runtime.toml"));
     let project_exists = project_config.exists();
 
-    println!("\n{}", "Project-level:".bold());
-    println!(
+    stdout_println!("\n{}", "Project-level:".bold());
+    stdout_println!(
         "  {} {}",
         project_config.display(),
         if project_exists {
@@ -417,7 +417,7 @@ fn show_paths() {
     );
 
     // Environment variables
-    println!("\n{}", "Environment Variables:".bold());
+    stdout_println!("\n{}", "Environment Variables:".bold());
     let env_vars = [
         ("ASTRA_MAX_HISTORY_TOKENS", "compression.max_history_tokens"),
         (
@@ -435,7 +435,7 @@ fn show_paths() {
 
     for (var, config_path) in env_vars {
         let value = std::env::var(var).ok();
-        println!(
+        stdout_println!(
             "  {} → {} {}",
             var.magenta(),
             config_path.dim(),
@@ -447,7 +447,7 @@ fn show_paths() {
         );
     }
 
-    println!(
+    stdout_println!(
         "\n{}",
         "Priority: env vars > project > user > defaults".dim()
     );
@@ -475,7 +475,7 @@ fn export_config(path: Option<PathBuf>) {
         }
         match std::fs::write(&p, &toml) {
             Ok(_) => {
-                println!(
+                stdout_println!(
                     "{} Configuration exported to {}",
                     theme::icon_ok(),
                     p.display()
@@ -487,8 +487,8 @@ fn export_config(path: Option<PathBuf>) {
         }
     } else {
         // Print to stdout
-        println!("\n{}", "# Runtime Configuration (TOML)".dim());
-        println!("{}", toml);
+        stdout_println!("\n{}", "# Runtime Configuration (TOML)".dim());
+        stdout_println!("{}", toml);
     }
 }
 
@@ -496,18 +496,18 @@ fn show_diff() {
     let current = RuntimeConfig::load();
     let default = RuntimeConfig::default();
 
-    println!(
+    stdout_println!(
         "\n{}",
         "Configuration Differences from Defaults".bold().magenta()
     );
-    println!("{}", "═".repeat(50).dim());
+    stdout_println!("{}", "═".repeat(50).dim());
 
     let mut has_diff = false;
 
     // Compression
     if current.compression.max_history_tokens != default.compression.max_history_tokens {
         has_diff = true;
-        println!(
+        stdout_println!(
             "  compression.max_history_tokens: {} → {}",
             default.compression.max_history_tokens.to_string().dim(),
             current.compression.max_history_tokens.to_string().yellow()
@@ -517,7 +517,7 @@ fn show_diff() {
         > 0.001
     {
         has_diff = true;
-        println!(
+        stdout_println!(
             "  compression.compression_threshold: {} → {}",
             format!("{:.2}", default.compression.compression_threshold).dim(),
             format!("{:.2}", current.compression.compression_threshold).yellow()
@@ -527,7 +527,7 @@ fn show_diff() {
     // Memory
     if current.memory.retrieval_top_k != default.memory.retrieval_top_k {
         has_diff = true;
-        println!(
+        stdout_println!(
             "  memory.retrieval_top_k: {} → {}",
             default.memory.retrieval_top_k.to_string().dim(),
             current.memory.retrieval_top_k.to_string().yellow()
@@ -537,7 +537,7 @@ fn show_diff() {
     // Token budget
     if current.token_budget.max_turn_input_tokens != default.token_budget.max_turn_input_tokens {
         has_diff = true;
-        println!(
+        stdout_println!(
             "  token_budget.max_turn_input_tokens: {} → {}",
             default.token_budget.max_turn_input_tokens.to_string().dim(),
             current
@@ -551,7 +551,7 @@ fn show_diff() {
     // Trace
     if current.trace.profile != default.trace.profile {
         has_diff = true;
-        println!(
+        stdout_println!(
             "  trace.profile: {} → {}",
             format!("{:?}", default.trace.profile).to_lowercase().dim(),
             format!("{:?}", current.trace.profile)
@@ -561,7 +561,7 @@ fn show_diff() {
     }
     if current.trace.min_level != default.trace.min_level {
         has_diff = true;
-        println!(
+        stdout_println!(
             "  trace.min_level: {} → {}",
             format!("{:?}", default.trace.min_level)
                 .to_lowercase()
@@ -575,7 +575,7 @@ fn show_diff() {
         != default.trace.category_enabled(TraceCategory::LlmExchanges)
     {
         has_diff = true;
-        println!(
+        stdout_println!(
             "  trace.llm_exchanges: {} → {}",
             default
                 .trace
@@ -591,12 +591,12 @@ fn show_diff() {
     }
 
     if !has_diff {
-        println!("\n{}", "  All settings are at their default values.".dim());
+        stdout_println!("\n{}", "  All settings are at their default values.".dim());
     }
 }
 
 fn print_help() {
-    println!(
+    stdout_println!(
         r#"
 {title}
 
@@ -677,7 +677,7 @@ fn run_config_edit() {
         };
         let filtered = filter_settings(&catalog_with_values(&catalog, &working), &query);
         if filtered.is_empty() {
-            println!("{}", format!("No settings match `{query}`.").dim());
+            stdout_println!("{}", format!("No settings match `{query}`.").dim());
             continue;
         }
 
@@ -709,7 +709,7 @@ fn run_config_edit() {
             Ok(next) => {
                 working = next;
                 dirty = true;
-                println!(
+                stdout_println!(
                     "  {} {} = {}",
                     theme::icon_ok(),
                     item.id.clone().magenta(),
@@ -723,7 +723,7 @@ fn run_config_edit() {
     }
 
     if !dirty {
-        println!("{}", "No changes made.".dim());
+        stdout_println!("{}", "No changes made.".dim());
         return;
     }
 
@@ -736,12 +736,12 @@ fn run_config_edit() {
         .flatten()
         .unwrap_or(false);
     if !save {
-        println!("{}", "Discarded — no files written.".dim());
+        stdout_println!("{}", "Discarded — no files written.".dim());
         return;
     }
     match write_user_runtime_toml(&working) {
         Ok(path) => {
-            println!(
+            stdout_println!(
                 "  {} {}",
                 theme::icon_ok(),
                 format!("Saved to {}", path.display()).magenta()
@@ -758,7 +758,7 @@ fn run_config_edit() {
                     parent: None,
                 };
                 if let Ok(id) = store.put(&working, meta) {
-                    println!(
+                    stdout_println!(
                         "  {}  config version: {}",
                         "·".dim(),
                         id.to_string().magenta()

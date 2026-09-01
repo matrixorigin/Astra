@@ -25,6 +25,45 @@
     clippy::single_match,
     clippy::unnecessary_mut_passed
 )]
+#![cfg_attr(not(test), deny(clippy::print_stdout))]
+
+/// Allocation-free public stdout boundary. Machine protocols call
+/// `output_sink` directly so their typed write status remains visible.
+#[cfg(not(test))]
+macro_rules! stdout_print {
+    ($($arg:tt)*) => {{
+        let _ = $crate::cli::stream::output_sink::write_stdout_fmt(format_args!($($arg)*));
+    }};
+}
+
+#[cfg(not(test))]
+macro_rules! stdout_println {
+    () => {{
+        let _ = $crate::cli::stream::output_sink::write_stdout_fmt_line(format_args!(""));
+    }};
+    ($($arg:tt)*) => {{
+        let _ = $crate::cli::stream::output_sink::write_stdout_fmt_line(format_args!($($arg)*));
+    }};
+}
+
+// Preserve libtest's per-test capture and isolation. Integration tests build
+// the production library and therefore exercise the real central sink.
+#[cfg(test)]
+macro_rules! stdout_print {
+    ($($arg:tt)*) => {{
+        std::print!($($arg)*);
+    }};
+}
+
+#[cfg(test)]
+macro_rules! stdout_println {
+    () => {{
+        std::println!();
+    }};
+    ($($arg:tt)*) => {{
+        std::println!($($arg)*);
+    }};
+}
 
 // ═══════════════════════════ Top-level utility modules ═══════════════════
 pub mod admin_cli;
@@ -54,7 +93,6 @@ pub(crate) use crate::cli::stream::streaming_types::{
 };
 
 // Session state
-pub(crate) use crate::cli::plan::plan_monitor::{format_duration_short, format_plan_progress};
 pub(crate) use cli::session::session_state::{ExplainMode, SessionState, SkillDevState};
 
 // Cloud sync
@@ -75,7 +113,6 @@ pub(crate) mod tests {
     pub(crate) use super::test_utils::wait_until;
 
     pub(crate) use crate::cli::slash::slash_session::resolve_journal_target_session;
-    pub(crate) use crate::cli::slash::slash_task;
     pub(crate) use astra_services::session_journal;
     use axum::{Router, routing::get};
 

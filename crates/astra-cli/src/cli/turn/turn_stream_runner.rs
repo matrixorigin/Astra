@@ -31,7 +31,12 @@ pub(crate) struct TurnExecutionInput<'a> {
     pub(crate) input_runtime_required_texts: &'a [String],
     pub(crate) input_active_system_skills: &'a [String],
     pub(crate) input_runtime_volatile_texts: &'a [String],
-    pub(crate) session_id: Option<&'a str>,
+    /// Canonical session identity established before interactive turn admission.
+    ///
+    /// Unlike headless requests, an interactive turn owns durable local state
+    /// from its first boundary and must never enter the agentic loop with a
+    /// provisional or display-only identity.
+    pub(crate) session_id: &'a str,
     pub(crate) semantic_query_override: Option<&'a str>,
 }
 
@@ -107,7 +112,7 @@ fn build_turn_stream_params<'a>(
         && let Some(session_id) = state
             .session_id
             .as_deref()
-            .or(input.session_id)
+            .or(Some(input.session_id))
             .map(str::to_owned)
     {
         match crate::cli::session::session_continuation::recover_or_initialize_active_conversation(
@@ -132,7 +137,7 @@ fn build_turn_stream_params<'a>(
         input_runtime_volatile_texts: input.input_runtime_volatile_texts,
         input_work_unit_observations: &prepared.input_work_unit_observations,
         semantic_query_override: input.semantic_query_override,
-        session_id: input.session_id,
+        session_id: Some(input.session_id),
         offering_id: crate::cli::slash::slash_config::active_offering_id_for_request(),
         model: astra_core::model_override::normalize_model_override(state.model.as_deref()),
         provider: None,
@@ -153,12 +158,14 @@ fn build_turn_stream_params<'a>(
         latest_skill_diagnosis: state.latest_skill_diagnosis.as_ref(),
         latest_turn_quality_feedback: state.latest_turn_quality_feedback.as_ref(),
         unified_skill_registry: &state.unified_skill_registry,
-        is_plan_subtask: state.current_plan_subtask_id.is_some(),
-        plan_subtask_id: state.current_plan_subtask_id.as_deref(),
+        is_plan_subtask: false,
+        plan_subtask_id: None,
         delegation_engine: state.delegation_engine.clone(),
         cancel_token: Some(prepared.cancel_token.clone()),
+        execution_time_budget: None,
         run_control: Some(prepared.run_control.clone()),
         incremental_state: Some(prepared.incremental_state.clone()),
+        request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: state.tui_stream_event_tx.clone(),
         stream_json_emitter: None,
@@ -182,8 +189,6 @@ fn build_turn_stream_params<'a>(
         git_commit_journal: Some(state.git_commit_journal.clone()),
         git_worktree_journal: Some(state.git_worktree_journal.clone()),
         session_state_journal: Some(state.session_state_journal.clone()),
-        task_manager: Some(state.task_manager.clone()),
-        task_notify_tx: state.task_notify_tx.clone(),
         bg_task_commands: Some(state.bg_task_commands.clone()),
         bg_task_list_cache: Some(state.bg_task_list_cache.clone()),
         bash_detach_slot: Some(state.bash_detach_slot.clone()),
@@ -191,6 +196,7 @@ fn build_turn_stream_params<'a>(
         pipeline_state: state.runtime_pipeline_state.clone(),
         compaction_state: state.runtime_compaction_state.clone(),
         consecutive_context_window_errors: state.runtime_consecutive_context_window_errors,
+        workspace_observation_quarantine: state.workspace_observation_quarantine.clone(),
         // Headless read observations share a lifecycle with the turn-local
         // workspace epoch. They must not be imported from session state.
         idempotency_cache: None,
@@ -199,7 +205,6 @@ fn build_turn_stream_params<'a>(
             .as_ref()
             .map(|conversation| conversation.materialize()),
         append_system_prompt: prepared.append_system_prompt.clone(),
-        session_memory_extractor: state.session_memory_extractor.clone(),
         #[cfg(feature = "harness")]
         harness_sink: Some(state.harness_sink.clone()),
         #[cfg(feature = "harness")]
@@ -224,9 +229,26 @@ async fn await_stream_with_interrupts<'a>(
     let drain_timeout = std::time::Duration::from_secs(10);
     tokio::select! {
         biased;
-        result = &mut stream_fut => (result, false),
+        result = &mut stream_fut => {
+            if let Err(failure) = &result
+                && failure.partial.remote_cancel_required
+            {
+                prepared.run_control.request_cancel_for_runtime();
+                cancel_token_for_signal.cancel();
+                let fallback_run_id = incremental_state.snapshot().run_id;
+                report_server_run_detach_after_internal_failure(
+                    failure
+                        .partial
+                        .remote_cancel_run_id
+                        .as_deref()
+                        .or(failure.partial.run_id.as_deref()),
+                    fallback_run_id.as_deref(),
+                );
+            }
+            (result, false)
+        },
         _ = tokio::signal::ctrl_c() => {
-            prepared.run_control.request_cancel();
+            prepared.run_control.request_cancel_for_user();
             cancel_token_for_signal.cancel();
             notify_server_to_cancel_run(api, bearer, &incremental_state, "Ctrl+C");
             if tui_cancel_token.is_none() {
@@ -246,7 +268,7 @@ async fn await_stream_with_interrupts<'a>(
                 None => std::future::pending().await,
             }
         } => {
-            prepared.run_control.request_cancel();
+            prepared.run_control.request_cancel_for_user();
             cancel_token_for_signal.cancel();
             notify_server_to_cancel_run(api, bearer, &incremental_state, "TUI cancel");
             let drained = drain_after_cancel(
@@ -258,6 +280,40 @@ async fn await_stream_with_interrupts<'a>(
             (drained, true)
         }
     }
+}
+
+pub(crate) fn report_server_run_detach_after_internal_failure(
+    failure_run_id: Option<&str>,
+    fallback_run_id: Option<&str>,
+) {
+    let run_id = failure_run_id
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            fallback_run_id
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+        });
+    let Some(run_id) = run_id else {
+        tracing::error!(
+            target: "astra::cli::cancel",
+            source = "internal_stream_failure",
+            "durable run cancellation required but no run_id was captured"
+        );
+        return;
+    };
+    // DELETE /chat/runs/{run_id} is the public, run-level User cancellation
+    // command. A parser, callback, or response-transport failure is not user
+    // authority and must never be rewritten as that durable fact. Dropping
+    // this response detaches the client; the server-owned execution and its
+    // durable recovery path remain authoritative until an attached-stream
+    // capability can express exact-generation Runtime cancellation.
+    tracing::warn!(
+        target: "astra::cli::stream",
+        run_id = %run_id,
+        source = "internal_stream_failure",
+        "client detached from an unsettled durable run; server recovery retains lifecycle authority"
+    );
 }
 
 /// Fire-and-forget: tell the server to cancel the durable run that is
@@ -310,30 +366,23 @@ fn notify_server_to_cancel_run(
 mod tests {
     use super::{
         PreparedTurnStreamState, TurnExecutionInput, build_turn_stream_params,
-        prepare_turn_stream_state,
+        prepare_turn_stream_state, report_server_run_detach_after_internal_failure,
     };
     use crate::cli::session::session_state::SessionState;
     use crate::cli::turn::local_run_control::LocalRunControl;
     use std::sync::Arc;
 
-    #[tokio::test]
-    async fn prepare_turn_stream_state_does_not_inject_task_board_prompt() {
-        let state = SessionState::default();
-        state.task_manager.rebind("sess-stream");
-        let create = state
-            .task_manager
-            .create(&serde_json::json!({"title": "Validate stream projection"}))
-            .await;
-        assert!(!create.starts_with("Error:"), "{create}");
-
-        let prepared = prepare_turn_stream_state(&state).await;
-        let prompt = prepared.append_system_prompt.as_deref().unwrap_or_default();
-        assert!(
-            !prompt.contains("Validate stream projection")
-                && !prompt.contains("Active task board")
-                && !prompt.contains("Active Task Board"),
-            "task board must flow through plan context, not append_system_prompt: {prompt}"
+    #[test]
+    fn internal_callback_failure_does_not_fabricate_user_cancellation() {
+        report_server_run_detach_after_internal_failure(
+            Some("run-callback-failed"),
+            Some("run-consuming-stream"),
         );
+    }
+
+    #[test]
+    fn internal_callback_failure_can_report_legacy_stream_identity_without_mutation() {
+        report_server_run_detach_after_internal_failure(None, Some("run-legacy-stream"));
     }
 
     #[tokio::test]
@@ -390,7 +439,7 @@ mod tests {
                 input_runtime_required_texts: &[],
                 input_active_system_skills: &[],
                 input_runtime_volatile_texts: &[],
-                session_id: Some(&session_id),
+                session_id: &session_id,
                 semantic_query_override: None,
             },
             &prepared,
@@ -448,14 +497,13 @@ mod tests {
     }
 
     #[test]
-    fn build_turn_stream_params_respects_render_policy_and_plan_subtask() {
+    fn build_turn_stream_params_respects_render_policy_without_legacy_plan_subtask() {
         let canonical_messages = vec![
             serde_json::json!({"role": "user", "content": "canonical question"}),
             serde_json::json!({"role": "assistant", "content": "canonical answer"}),
         ];
         let mut state = SessionState {
             tui_render_policy: Some(crate::cli::stream::stream_render::RenderPolicy::Silent),
-            current_plan_subtask_id: Some("subtask-1".into()),
             resume_restricted_tools: vec!["read_file".into()],
             runtime_pipeline_state: Some(serde_json::json!({"stats": {"ema": 0.7}})),
             runtime_compaction_state: Some(serde_json::json!({
@@ -504,7 +552,7 @@ mod tests {
                 input_runtime_required_texts: &[],
                 input_active_system_skills: &[],
                 input_runtime_volatile_texts: &[],
-                session_id: Some("sess-1"),
+                session_id: "sess-1",
                 semantic_query_override: None,
             },
             &prepared,
@@ -514,8 +562,8 @@ mod tests {
             params.render_policy,
             crate::cli::stream::stream_render::RenderPolicy::Silent
         );
-        assert!(params.is_plan_subtask);
-        assert_eq!(params.plan_subtask_id, Some("subtask-1"));
+        assert!(!params.is_plan_subtask);
+        assert_eq!(params.plan_subtask_id, None);
         assert_eq!(params.append_system_prompt.as_deref(), Some("task board"));
         assert_eq!(params.resume_restricted_tools, &["read_file".to_string()]);
         assert_eq!(

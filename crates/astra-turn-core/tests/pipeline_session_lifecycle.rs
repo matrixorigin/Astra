@@ -7,8 +7,6 @@
 //! - Shadow mode produces clean diffs when pipeline is deterministic
 //! - Warm start preserves cross-session continuity
 
-use std::collections::HashMap;
-
 use astra_turn_core::context_feedback::ContextFeedback;
 use astra_turn_core::context_sources::{
     AgentContext, EdgeProfile, ExternalSources, MemoryEntry, SessionContext, StaticSections,
@@ -65,8 +63,6 @@ fn make_turn_state(turn_index: u32, message_count: usize) -> TurnState {
         tool_results: vec![],
         tokens: TokenAccounting::default(),
         active_skills: vec!["code-review".into()],
-        recent_file_reads: HashMap::new(),
-        remaining_turns: 20 - turn_index,
         turn_index,
         recovery: RecoveryState::default(),
         last_user_message: format!("Turn {} message", turn_index),

@@ -67,5 +67,5 @@ pub async fn run_evaluation_read_http_smoke() {
     let (st_obs, obs_j) = get_json(&ctx.app, &obs_path, None, xuid).await;
     assert_eq!(st_obs, StatusCode::OK, "observability: {obs_j}");
 
-    b.ctx.pool.close().await;
+    b.ctx.close().await;
 }

@@ -18,6 +18,7 @@ use super::{
 
 const RUNTIME_SNAPSHOT_REF: &str = "urn:astra:context:local:introspect:runtime_snapshot";
 const INVOCATION_LIFECYCLE_REF: &str = "urn:astra:evidence:durable:introspect:invocation_lifecycle";
+pub const INTROSPECT_REPORT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IntrospectReport {
@@ -31,6 +32,10 @@ pub struct IntrospectReport {
     pub include_context: bool,
     pub data_coverage: ObservationDataCoverage,
     pub summary: String,
+    /// Canonical bounded runtime facts for machine consumers such as the
+    /// Desktop. Text summaries are projections of this frame, never a second
+    /// authority that clients must parse.
+    pub runtime_feedback: Option<crate::context_feedback::RuntimeFeedbackFrame>,
     pub view: ObservationView,
     #[serde(default)]
     pub observations: Vec<ObservationRecord>,
@@ -50,6 +55,25 @@ pub fn build_introspect_report(
     snapshot: &IntrospectSnapshot,
     request: &IntrospectRequest,
 ) -> IntrospectReport {
+    if matches!(
+        request.horizon,
+        astra_core::ObservationHorizon::Turn
+            | astra_core::ObservationHorizon::Session
+            | astra_core::ObservationHorizon::CrossSession
+    ) {
+        let requested_horizon = request.horizon.as_str();
+        let mut live_request = request.clone();
+        live_request.horizon = astra_core::ObservationHorizon::Recent;
+        let mut report = build_introspect_report(snapshot, &live_request);
+        let warning = format!(
+            "requested historical horizon={requested_horizon}; introspect returned the recent live projection only; use reflect for persisted causal evidence"
+        );
+        report.data_coverage.overall = "partial".to_string();
+        report.data_coverage.warnings.push(warning.clone());
+        report.view.data_coverage = report.data_coverage.clone();
+        report.summary = format!("{warning}. {}", report.summary);
+        return report;
+    }
     if matches!(
         request.facet,
         ObservationFacet::Cache | ObservationFacet::SessionMemory
@@ -73,25 +97,50 @@ pub fn build_introspect_report(
         data_coverage: data_coverage.clone(),
     };
 
-    let summary = introspect_summary(snapshot, request);
+    let summary = format!(
+        "snapshot_cutoff=before_current_introspect_execution; later calls are absent. {}",
+        introspect_summary(snapshot, request),
+    );
     let mut observations = build_introspect_observations(snapshot, request, &summary);
 
+    let runtime_summary = snapshot.runtime_feedback.as_ref().map_or_else(
+        || "runtime_feedback=not_yet_observed".to_string(),
+        |frame| {
+            let pressure = frame.context.token_pressure.map_or_else(
+                || "unknown".to_string(),
+                |value| format!("{:.0}%", value * 100.0),
+            );
+            let cache_share = prompt_cache_read_share_pct(snapshot).map_or_else(
+                || "unknown".to_string(),
+                |value| format!("{value:.0}%"),
+            );
+            let (input_total, cached_read, cache_create) = frame.run_usage.map_or_else(
+                || ("unknown".into(), "unknown".into(), "unknown".into()),
+                |usage| (
+                    usage.total_input().to_string(),
+                    usage.cache_read.to_string(),
+                    usage.cache_creation.to_string(),
+                ),
+            );
+            format!(
+                "snapshot_cutoff=before_current_introspect_execution pressure={} prompt_cache_read_share={} prompt_cache_scope=current_runtime_snapshot input_total={} cached_read={} cache_create={} turns={} signals={} tool_failures={}{}",
+                pressure,
+                cache_share,
+                input_total,
+                cached_read,
+                cache_create,
+                turn_budget_label(snapshot),
+                snapshot.alerts.len(),
+                snapshot.tool_errors.len(),
+                snapshot_age_suffix(snapshot),
+            )
+        },
+    );
     let mut evidence = vec![ObservationEvidence {
         ref_id: RUNTIME_SNAPSHOT_REF.to_string(),
         evidence_class: "observed_evidence".to_string(),
         source: "runtime.introspect_snapshot".to_string(),
-        summary: format!(
-            "pressure={:.0}% prompt_cache_read_share={:.0}% prompt_cache_scope=current_runtime_snapshot input_total={} cached_read={} cache_create={} turns={} signals={} tool_failures={}{}",
-            snapshot.token_pressure * 100.0,
-            prompt_cache_read_share_pct(snapshot),
-            snapshot.total_input_tokens,
-            snapshot.cache_read_tokens,
-            snapshot.cache_creation_tokens,
-            turn_budget_label(snapshot),
-            snapshot.alerts.len(),
-            snapshot.tool_errors.len(),
-            snapshot_age_suffix(snapshot),
-        ),
+        summary: runtime_summary,
         confidence: ObservationConfidence::evidence(0.75),
     }];
     if let Some(lifecycle) = snapshot.invocation_lifecycle.as_ref() {
@@ -122,7 +171,7 @@ pub fn build_introspect_report(
         build_introspect_graph_slice(snapshot, request, &observations, &evidence, &action_hints);
 
     IntrospectReport {
-        schema_version: 1,
+        schema_version: INTROSPECT_REPORT_SCHEMA_VERSION,
         tool: "introspect".to_string(),
         topic: request.topic.as_str().to_string(),
         facet: request.facet.as_str().to_string(),
@@ -132,6 +181,7 @@ pub fn build_introspect_report(
         include_context: request.include_context,
         data_coverage,
         summary,
+        runtime_feedback: snapshot.runtime_feedback.clone(),
         view,
         observations,
         evidence,
@@ -213,7 +263,7 @@ fn build_edge_local_unavailable_report(request: &IntrospectRequest) -> Introspec
     }];
 
     IntrospectReport {
-        schema_version: 1,
+        schema_version: INTROSPECT_REPORT_SCHEMA_VERSION,
         tool: "introspect".to_string(),
         topic: request.topic.as_str().to_string(),
         facet: facet.to_string(),
@@ -223,6 +273,7 @@ fn build_edge_local_unavailable_report(request: &IntrospectRequest) -> Introspec
         include_context: request.include_context,
         data_coverage,
         summary,
+        runtime_feedback: None,
         view,
         observations,
         evidence: Vec::new(),
@@ -419,11 +470,24 @@ fn introspect_summary(snapshot: &IntrospectSnapshot, request: &IntrospectRequest
                 snapshot.alerts.len()
             )
         }
-        _ => format!(
-            "Runtime snapshot healthy - pressure {:.0}%, prompt_cache_read_share {:.0}% (scope=current_runtime_snapshot), turns {}",
-            snapshot.token_pressure * 100.0,
-            prompt_cache_read_share_pct(snapshot),
-            turn_budget_label(snapshot),
+        _ => snapshot.runtime_feedback.as_ref().map_or_else(
+            || "Runtime feedback not yet observed".to_string(),
+            |frame| {
+                let pressure = frame.context.token_pressure.map_or_else(
+                    || "unknown".to_string(),
+                    |value| format!("{:.0}%", value * 100.0),
+                );
+                let cache_share = prompt_cache_read_share_pct(snapshot).map_or_else(
+                    || "unknown".to_string(),
+                    |value| format!("{value:.0}%"),
+                );
+                format!(
+                    "Runtime snapshot healthy - pressure {}, prompt_cache_read_share {} (scope=current_runtime_snapshot), turns {}",
+                    pressure,
+                    cache_share,
+                    turn_budget_label(snapshot),
+                )
+            },
         ),
     }
 }
@@ -837,12 +901,17 @@ fn build_introspect_action_hints(
     }
 
     // ── 3. Token pressure hint ──
-    if snapshot.token_pressure > 0.80 {
+    if let Some(pressure) = snapshot
+        .runtime_feedback
+        .as_ref()
+        .and_then(|frame| frame.context.token_pressure)
+        && pressure > 0.80
+    {
         hints.push(ObservationActionHint {
             target_type: "pressure_mitigation".to_string(),
             summary: format!(
                 "Token pressure {:.0}% — prefer targeted reads (line ranges) over full files; batch independent calls",
-                snapshot.token_pressure * 100.0
+                pressure * 100.0
             ),
             confidence: ObservationConfidence::classification_evidence(0.60, 0.90),
             observation_refs: vec![evidence_ref.clone()],
@@ -1285,24 +1354,22 @@ mod tests {
     }
 
     #[test]
-    fn report_evidence_preserves_unlimited_turn_budget_and_snapshot_age() {
+    fn report_evidence_preserves_runtime_progress_and_snapshot_age() {
         let snapshot = IntrospectSnapshot {
-            turns_completed: 3,
-            turns_remaining: 0,
-            turn_budget_unlimited: true,
+            runtime_feedback: Some(crate::introspect::test_runtime_feedback(3, 3, 0)),
             snapshot_age_turns: 2,
             ..Default::default()
         };
 
         let report = build_introspect_report(&snapshot, &IntrospectRequest::default());
         assert!(
-            report.summary.contains("turns 3/∞"),
-            "summary should not render 3/0 or 3/3: {}",
+            report.summary.contains("remaining=0"),
+            "summary should preserve exhausted slice state: {}",
             report.summary
         );
         let evidence_summary = &report.evidence[0].summary;
         assert!(
-            evidence_summary.contains("turns=3/∞"),
+            evidence_summary.contains("remaining=0"),
             "evidence should preserve unlimited turn budget: {evidence_summary}"
         );
         assert!(

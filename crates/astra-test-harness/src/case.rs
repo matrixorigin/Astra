@@ -27,6 +27,14 @@ pub struct Case {
     /// what a developer would paste into `astra chat -m "..."`.
     pub prompt: String,
 
+    /// Meaning-preserving rewrites of one user turn. They are dormant unless
+    /// the runner enables prompt-variant expansion, then each rewrite is
+    /// evaluated with the exact same typed criteria as the canonical journey.
+    /// This is a metamorphic test: it detects prompt-shape overfitting without
+    /// requiring byte-identical model answers.
+    #[serde(default, skip_serializing)]
+    pub prompt_variants: Vec<PromptVariant>,
+
     /// Optional model list for this case. When omitted, the CLI
     /// `--models` flag provides the fallback list. When BOTH are
     /// omitted, the runner errors.
@@ -67,9 +75,10 @@ pub struct Case {
     pub capability: Option<Capability>,
 
     /// Optional prompt-cache reuse scope this case requires from the
-    /// target model. Cases that require cross-turn cache reuse can be
-    /// skip-passed for models that only support intra-turn tool-loop
-    /// reuse.
+    /// target model. A model profile that explicitly cannot satisfy the
+    /// scope yields an `unavailable` run; it is never skip-passed. Unknown
+    /// metadata leaves the case runnable so its criteria can provide real
+    /// evidence.
     #[serde(default)]
     pub required_cache_scope: Option<PromptCacheReuseScope>,
 
@@ -88,11 +97,13 @@ pub struct Case {
     #[serde(default)]
     pub steps: Vec<CaseStep>,
 
-    /// Environment variables injected into the astra subprocess.
-    /// Use for tuning knobs like `ASTRA_MAX_TURN_INPUT_TOKENS` without
-    /// introducing new CLI flags.
+    /// Environment variables injected into the `astra` CLI subprocess only.
+    ///
+    /// These values do not configure the remote Server. Server-owned behavior
+    /// (for example compaction policy) must be configured on the Server that
+    /// the harness profile targets and proved through durable Server evidence.
     #[serde(default)]
-    pub env: std::collections::HashMap<String, String>,
+    pub cli_env: std::collections::HashMap<String, String>,
 
     /// Shell command to run before the case (e.g., create temp files).
     /// Runs in `working_dir` or CWD. Non-zero exit aborts the case.
@@ -129,6 +140,22 @@ pub struct CaseStep {
     pub timeout_seconds: Option<u64>,
 }
 
+/// One meaning-preserving rewrite of a user turn in a case journey.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PromptVariant {
+    /// Stable report suffix (`case@id`). Lowercase ASCII keeps artifact paths
+    /// and filters portable across platforms.
+    pub id: String,
+    /// Follow-up index in `Case.steps`. Omit to target the initial prompt.
+    /// Keeping the target explicit lets long-session referent handling use the
+    /// same metamorphic contract without cloning a scenario-specific case.
+    #[serde(default)]
+    pub step_index: Option<usize>,
+    /// Complete replacement for the selected user prompt.
+    pub prompt: String,
+}
+
 /// Capability dimension for aggregated reporting.
 ///
 /// Known variants use snake_case. Custom capabilities MUST use the
@@ -150,6 +177,33 @@ pub enum Capability {
 }
 
 pub type PromptCacheReuseScope = astra_services::PromptCacheReuseScopeData;
+
+/// Canonicalize the execution matrix at its trust boundary. Model IDs are
+/// opaque and case-sensitive; whitespace is never part of an ID, and a
+/// duplicate would create two indistinguishable report rows with the same
+/// run_index.
+pub(crate) fn canonicalize_model_ids(models: &[String]) -> Result<Vec<String>, String> {
+    let mut canonical = Vec::with_capacity(models.len());
+    for raw in models {
+        let model = raw.trim();
+        if model.is_empty() {
+            return Err("model matrix contains an empty or whitespace-only ID".into());
+        }
+        if model != raw {
+            return Err(format!(
+                "model matrix ID {raw:?} has surrounding whitespace; IDs must be canonical"
+            ));
+        }
+        if canonical.iter().any(|seen| seen == model) {
+            return Err(format!("model matrix contains duplicate ID {model:?}"));
+        }
+        canonical.push(model.to_string());
+    }
+    if canonical.is_empty() {
+        return Err("model matrix must contain at least one model ID".into());
+    }
+    Ok(canonical)
+}
 
 impl<'de> serde::Deserialize<'de> for Capability {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
@@ -229,6 +283,101 @@ fn default_weight() -> f64 {
 
 fn default_timeout_seconds() -> u64 {
     180
+}
+
+const MAX_PROMPT_VARIANTS_PER_CASE: usize = 8;
+
+fn validate_prompt_variants(case: &Case) -> Result<(), String> {
+    if case.prompt_variants.len() > MAX_PROMPT_VARIANTS_PER_CASE {
+        return Err(format!(
+            "prompt_variants has {} entries; maximum is {MAX_PROMPT_VARIANTS_PER_CASE}",
+            case.prompt_variants.len()
+        ));
+    }
+    let id_pattern = regex::Regex::new(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+        .expect("prompt variant id regex is static");
+    let mut ids = std::collections::BTreeSet::new();
+    let mut rewrites = std::collections::BTreeSet::new();
+    for (index, variant) in case.prompt_variants.iter().enumerate() {
+        if !id_pattern.is_match(&variant.id) {
+            return Err(format!(
+                "prompt_variants[{index}].id {:?} must match [a-z0-9][a-z0-9_-]{{0,63}}",
+                variant.id
+            ));
+        }
+        if !ids.insert(variant.id.as_str()) {
+            return Err(format!(
+                "prompt_variants contains duplicate id {:?}",
+                variant.id
+            ));
+        }
+        let prompt = variant.prompt.trim();
+        if prompt.is_empty() {
+            return Err(format!("prompt_variants[{index}].prompt must not be empty"));
+        }
+        let canonical = match variant.step_index {
+            None => case.prompt.trim(),
+            Some(step_index) => case
+                .steps
+                .get(step_index)
+                .ok_or_else(|| {
+                    format!(
+                        "prompt_variants[{index}].step_index {step_index} is out of range for {} follow-up step(s)",
+                        case.steps.len()
+                    )
+                })?
+                .prompt
+                .trim(),
+        };
+        if prompt == canonical {
+            return Err(format!(
+                "prompt_variants[{index}].prompt duplicates its targeted canonical prompt"
+            ));
+        }
+        if !rewrites.insert((variant.step_index, prompt.to_string())) {
+            return Err(format!(
+                "prompt_variants[{index}] duplicates another rewrite for the same turn"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Expand dormant prompt variants into ordinary cases with shared criteria.
+/// The original case weight is divided across the equivalence class so
+/// enabling robustness checks cannot silently increase that capability's
+/// aggregate score. Returns the number of added executions.
+pub fn expand_prompt_variants(cases: &mut Vec<Case>) -> Result<usize, String> {
+    let mut expanded = Vec::new();
+    let mut names = std::collections::BTreeSet::new();
+    let mut added = 0usize;
+    for mut canonical in cases.clone() {
+        validate_prompt_variants(&canonical)
+            .map_err(|error| format!("case {:?}: {error}", canonical.name))?;
+        let variants = std::mem::take(&mut canonical.prompt_variants);
+        let shared_weight = canonical.weight / (variants.len() + 1) as f64;
+        canonical.weight = shared_weight;
+        if !names.insert(canonical.name.clone()) {
+            return Err(format!("duplicate expanded case name {:?}", canonical.name));
+        }
+        expanded.push(canonical.clone());
+        for variant in variants {
+            let mut case = canonical.clone();
+            case.name = format!("{}@{}", canonical.name, variant.id);
+            match variant.step_index {
+                None => case.prompt = variant.prompt,
+                Some(step_index) => case.steps[step_index].prompt = variant.prompt,
+            }
+            if !names.insert(case.name.clone()) {
+                return Err(format!("duplicate expanded case name {:?}", case.name));
+            }
+            expanded.push(case);
+            added += 1;
+        }
+    }
+    expanded.sort_by(|left, right| left.name.cmp(&right.name));
+    *cases = expanded;
+    Ok(added)
 }
 
 /// Flags the harness owns and must not be overridden by a case.
@@ -341,6 +490,21 @@ impl Case {
                 anyhow::anyhow!("parse {}: {msg}", path.display())
             }
         })?;
+        let mut case = case;
+        if case.name.trim().is_empty() {
+            anyhow::bail!("case {}: name must not be empty", path.display());
+        }
+        if case.prompt.trim().is_empty() {
+            anyhow::bail!("case {}: prompt must not be empty", path.display());
+        }
+        validate_prompt_variants(&case)
+            .map_err(|error| anyhow::anyhow!("case {}: {error}", path.display()))?;
+        if let Some(models) = case.models.clone() {
+            case.models = Some(
+                canonicalize_model_ids(&models)
+                    .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?,
+            );
+        }
         // Fail fast on reserved-flag abuse so a typo in one case
         // doesn't silently poison an entire suite run.
         validate_extra_cli_args(&case.extra_cli_args)
@@ -377,9 +541,29 @@ impl Case {
         crate::criteria::validate_criteria(&case.criteria)
             .map_err(|e| anyhow::anyhow!("case {}: {e}", path.display()))?;
         for (i, step) in case.steps.iter().enumerate() {
+            if step.prompt.trim().is_empty() {
+                anyhow::bail!(
+                    "case {}: steps[{i}].prompt must not be empty",
+                    path.display()
+                );
+            }
+            if step.timeout_seconds == Some(0) {
+                anyhow::bail!(
+                    "case {}: steps[{i}].timeout_seconds must be >= 1",
+                    path.display()
+                );
+            }
             // Validate step criteria at load time.
             if let Err(e) = crate::criteria::validate_criteria(&step.criteria) {
                 anyhow::bail!("case {}: steps[{i}].{e}", path.display(),);
+            }
+            if crate::criteria::requires_session_capture(&step.criteria) {
+                anyhow::bail!(
+                    "case {}: steps[{i}] contains a session/journal criterion; \
+                     step outcomes are evaluated before the complete session is captured, so \
+                     move this assertion to case-level criteria",
+                    path.display(),
+                );
             }
         }
         Ok(case)
@@ -423,6 +607,16 @@ impl Case {
             out.push(Case::from_path(&path)?);
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
+        if let Some(duplicate) = out
+            .windows(2)
+            .find(|pair| pair[0].name == pair[1].name)
+            .map(|pair| pair[0].name.clone())
+        {
+            anyhow::bail!(
+                "case suite {} contains duplicate case name {duplicate:?}",
+                dir.display()
+            );
+        }
         Ok(out)
     }
 }
@@ -446,6 +640,118 @@ mod tests {
     }
 
     #[test]
+    fn prompt_variants_expand_with_shared_oracle_and_preserved_total_weight() {
+        let mut cases = vec![
+            serde_yaml_ng::from_str::<Case>(
+                r#"name: semantic-contract
+prompt: canonical wording
+weight: 6.0
+prompt_variants:
+  - id: zh
+    prompt: 等价中文表达
+  - id: reordered
+    step_index: 0
+    prompt: same intent in a different order
+steps:
+  - prompt: canonical follow-up
+criteria:
+  - type: text_contains
+    needle: receipt
+"#,
+            )
+            .expect("variant case"),
+        ];
+        assert!(
+            serde_json::to_value(&cases[0])
+                .expect("case serializes")
+                .get("prompt_variants")
+                .is_none(),
+            "harness-only metamorphic metadata must not change the executor protocol"
+        );
+
+        let added = expand_prompt_variants(&mut cases).expect("variants expand");
+
+        assert_eq!(added, 2);
+        assert_eq!(
+            cases
+                .iter()
+                .map(|case| case.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "semantic-contract",
+                "semantic-contract@reordered",
+                "semantic-contract@zh"
+            ]
+        );
+        assert!((cases.iter().map(|case| case.weight).sum::<f64>() - 6.0).abs() < f64::EPSILON);
+        assert!(cases.iter().all(|case| case.criteria.len() == 1));
+        assert!(cases.iter().all(|case| case.prompt_variants.is_empty()));
+        assert_eq!(cases[0].steps[0].prompt, "canonical follow-up");
+        assert_eq!(cases[1].steps[0].prompt, "same intent in a different order");
+        assert_eq!(cases[2].prompt, "等价中文表达");
+    }
+
+    #[test]
+    fn case_rejects_fake_or_ambiguous_prompt_variants() {
+        let dir = tempdir().unwrap();
+        for (filename, variants) in [
+            (
+                "duplicate.yaml",
+                "  - id: same\n    prompt: canonical wording\n",
+            ),
+            (
+                "unsafe-id.yaml",
+                "  - id: ../escape\n    prompt: equivalent wording\n",
+            ),
+            (
+                "bad-step.yaml",
+                "  - id: missing-step\n    step_index: 0\n    prompt: equivalent wording\n",
+            ),
+        ] {
+            let path = dir.path().join(filename);
+            std::fs::write(
+                &path,
+                format!(
+                    "name: semantic-contract\nprompt: canonical wording\nprompt_variants:\n{variants}"
+                ),
+            )
+            .unwrap();
+            assert!(Case::from_path(&path).is_err(), "{filename} must fail");
+        }
+    }
+
+    #[test]
+    fn case_rejects_empty_or_zero_timeout_follow_up() {
+        let dir = tempdir().unwrap();
+        for (filename, step) in [
+            ("empty-step.yaml", "  - prompt: '   '\n"),
+            (
+                "zero-timeout.yaml",
+                "  - prompt: follow up\n    timeout_seconds: 0\n",
+            ),
+        ] {
+            let path = dir.path().join(filename);
+            std::fs::write(
+                &path,
+                format!("name: semantic-contract\nprompt: canonical wording\nsteps:\n{step}"),
+            )
+            .unwrap();
+
+            assert!(Case::from_path(&path).is_err(), "{filename} must fail");
+        }
+    }
+
+    #[test]
+    fn load_dir_rejects_duplicate_names_for_every_suite() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.yaml"), "name: same\nprompt: one\n").unwrap();
+        std::fs::write(dir.path().join("b.yaml"), "name: same\nprompt: two\n").unwrap();
+
+        let error = Case::load_dir(dir.path()).expect_err("duplicate names must fail at load");
+        assert!(error.to_string().contains("duplicate case name \"same\""));
+    }
+
+    #[test]
     fn bundled_introspection_reflection_case_keeps_durable_checks_strict() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("cases/introspection_reflection_source_boundary.yaml");
@@ -455,11 +761,11 @@ mod tests {
         assert!(case
             .criteria
             .iter()
-            .any(|criterion| matches!(criterion, crate::criteria::Criterion::JournalToolCalled { name, optional: false } if name == "introspect")));
+            .any(|criterion| matches!(criterion, crate::criteria::Criterion::JournalToolCallCount { name, min: 1, max: 1, .. } if name == "introspect")));
         assert!(case
             .criteria
             .iter()
-            .any(|criterion| matches!(criterion, crate::criteria::Criterion::JournalToolCalled { name, optional: false } if name == "reflect")));
+            .any(|criterion| matches!(criterion, crate::criteria::Criterion::JournalToolCallCount { name, min: 1, max: 1, .. } if name == "reflect")));
     }
 
     #[test]
@@ -467,18 +773,108 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/memory_full_lifecycle.yaml");
         let case = Case::from_path(&path).expect("bundled memory lifecycle case must parse");
 
-        assert!(matches!(
-            case.steps[1].criteria.last(),
-            Some(crate::criteria::Criterion::HardJudger { .. })
-        ));
+        assert!(case.criteria.iter().any(|criterion| matches!(
+            criterion,
+                crate::criteria::Criterion::JournalToolCallCount {
+                    name,
+                    min: 1,
+                    max: 1,
+                document: Some(crate::criteria::JournalToolDocument::Arguments),
+                path: Some(path),
+                equals: Some(value),
+            } if name == "memory" && path == "/action" && value == "forget"
+        )));
+        let has_memory_flow = |consumer_document, consumer_paths, action| {
+            case.criteria.iter().any(|criterion| {
+                matches!(
+                    criterion,
+                    crate::criteria::Criterion::JournalToolValueFlowBound {
+                        producer,
+                        producer_document: crate::criteria::JournalToolDocument::Result,
+                        producer_path,
+                        producer_filters,
+                        consumer,
+                        consumer_document: actual_consumer_document,
+                        consumer_paths: actual_consumer_paths,
+                        consumer_filters,
+                    } if producer == "memory"
+                        && consumer == "memory"
+                        && producer_path == "/memory_id"
+                        && producer_filters.iter().any(|filter| {
+                            filter.document == crate::criteria::JournalToolDocument::Arguments
+                                && filter.path == "/action"
+                                && filter.equals == serde_json::json!("remember")
+                        })
+                        && producer_filters.iter().any(|filter| {
+                            filter.document == crate::criteria::JournalToolDocument::Arguments
+                                && filter.path == "/memory_type"
+                                && filter.equals == serde_json::json!("working")
+                        })
+                    && *actual_consumer_document == consumer_document
+                    && *actual_consumer_paths == consumer_paths
+                        && consumer_filters.iter().any(|filter| {
+                            filter.document == crate::criteria::JournalToolDocument::Arguments
+                                && filter.path == "/action"
+                                && filter.equals == serde_json::json!(action)
+                        })
+                        && (action != "recall"
+                            || consumer_filters.iter().any(|filter| {
+                                filter.document == crate::criteria::JournalToolDocument::Arguments
+                                    && filter.path == "/scope"
+                                    && filter.equals == serde_json::json!("session")
+                            }))
+                )
+            })
+        };
+        assert!(
+            has_memory_flow(
+                crate::criteria::JournalToolDocument::Result,
+                vec!["/*/memory_id".to_string()],
+                "recall",
+            ),
+            "memory lifecycle must prove remember->recall ID provenance"
+        );
+        assert!(
+            has_memory_flow(
+                crate::criteria::JournalToolDocument::Arguments,
+                vec!["/memory_id".to_string(), "/memory_ids".to_string()],
+                "forget",
+            ),
+            "memory lifecycle must prove remember->forget ID provenance"
+        );
         assert!(case.cleanup_memory_records);
     }
 
     #[test]
-    fn bundled_compaction_tool_result_case_makes_efficiency_bounds_hard() {
+    fn rejects_step_level_session_criteria_before_execution() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("step-session.yaml");
+        std::fs::write(
+            &path,
+            r#"name: invalid-step-session
+prompt: first
+steps:
+  - prompt: second
+    criteria:
+      - type: journal_tool_called
+        name: memory
+"#,
+        )
+        .unwrap();
+
+        let error = Case::from_path(&path).expect_err("step journal criteria must fail fast");
+        assert!(
+            error
+                .to_string()
+                .contains("steps[0] contains a session/journal criterion")
+        );
+    }
+
+    #[test]
+    fn bundled_active_run_tool_result_case_makes_efficiency_bounds_hard() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("cases/compaction_tool_result_clearing.yaml");
-        let case = Case::from_path(&path).expect("bundled compaction case must parse");
+            .join("cases/active_run_tool_result_retention.yaml");
+        let case = Case::from_path(&path).expect("bundled active-run case must parse");
 
         let hard_group = case
             .criteria
@@ -499,9 +895,99 @@ mod tests {
         assert!(
             hard_group.iter().any(|criterion| matches!(
                 criterion,
-                crate::criteria::Criterion::TurnRoundsBetween { min: 5, max: 15 }
+                crate::criteria::Criterion::TurnRoundsBetween { min: 2, max: 15 }
             )),
             "the scenario must fail on an inefficient multi-round loop"
+        );
+        let exact_read_paths = case
+            .criteria
+            .iter()
+            .filter(|criterion| {
+                matches!(
+                    criterion,
+                    crate::criteria::Criterion::JournalToolCallCount {
+                        name,
+                        min: 1,
+                        max: 1,
+                        document: Some(crate::criteria::JournalToolDocument::Arguments),
+                        path: Some(path),
+                        equals: Some(_),
+                    } if name == "read_file" && path == "/path"
+                )
+            })
+            .count();
+        assert_eq!(
+            exact_read_paths, 8,
+            "all eight requested reads must be proved by durable argument evidence"
+        );
+        assert!(
+            !case.prompt.contains("DASHMAP_VERSION: 6.1.0"),
+            "the capability prompt must not disclose the answer it is meant to recover"
+        );
+    }
+
+    #[test]
+    fn ordinary_tool_cases_do_not_claim_compaction() {
+        fn claims_compaction(criterion: &crate::criteria::Criterion) -> bool {
+            match criterion {
+                crate::criteria::Criterion::SessionEventCount { event_type, .. } => {
+                    event_type == "CompactionFired"
+                }
+                crate::criteria::Criterion::AnyOf { criteria }
+                | crate::criteria::Criterion::AllOf { criteria } => {
+                    criteria.iter().any(claims_compaction)
+                }
+                _ => false,
+            }
+        }
+
+        let cases_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("cases");
+        for name in [
+            "multi_turn_read_reuse.yaml",
+            "active_run_tool_result_retention.yaml",
+            "multi_turn_tool_pairing_integrity.yaml",
+        ] {
+            let case = Case::from_path(&cases_dir.join(name)).expect("tool case must parse");
+            assert!(
+                !case.criteria.iter().any(claims_compaction)
+                    && !case
+                        .steps
+                        .iter()
+                        .flat_map(|step| &step.criteria)
+                        .any(claims_compaction),
+                "{name} exercises ordinary tool continuity and must not claim compaction"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_work_journey_has_strict_protocol_and_interaction_contract() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("cases/work_semantic_delegation_order.yaml");
+        let case = Case::from_path(&path).expect("bundled Work journey must parse");
+
+        assert!(
+            case.criteria.iter().any(|criterion| matches!(
+                criterion,
+                crate::criteria::Criterion::JournalToolOutcomeCount {
+                    name,
+                    ok: false,
+                    min: 0,
+                    max: 0,
+                } if name == "start_work"
+            )),
+            "the Work journey must reject failed lifecycle initialization from durable typed evidence"
+        );
+        assert!(
+            case.criteria.iter().any(|criterion| matches!(
+                criterion,
+                crate::criteria::Criterion::ProviderPromptCacheReadRatio {
+                    min,
+                    warmup_turns: 0,
+                    warmup_rounds: 1,
+                } if (*min - 0.95).abs() < f64::EPSILON
+            )),
+            "the Work journey must report the 95% provider prompt-cache quality target after warmup"
         );
     }
 
@@ -515,6 +1001,24 @@ mod tests {
             error.to_string().contains("cleanup_memory_record"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn case_schema_names_subprocess_environment_as_cli_only() {
+        let case = serde_yaml_ng::from_str::<Case>(
+            "name: cli-env\nprompt: hello\ncli_env:\n  ASTRA_TRACE: verbose\n",
+        )
+        .expect("explicit CLI environment must parse");
+        assert_eq!(
+            case.cli_env.get("ASTRA_TRACE").map(String::as_str),
+            Some("verbose")
+        );
+
+        let error = serde_yaml_ng::from_str::<Case>(
+            "name: ambiguous-env\nprompt: hello\nenv:\n  ASTRA_TRACE: verbose\n",
+        )
+        .expect_err("ambiguous env must not look like Server configuration");
+        assert!(error.to_string().contains("env"), "{error}");
     }
 
     #[test]

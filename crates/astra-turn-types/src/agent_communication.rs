@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 pub const AGENT_COMMUNICATION_SCHEMA_VERSION: &str = "astra.agent_communication.v1";
 
@@ -7,6 +8,48 @@ pub const AGENT_COMMUNICATION_SCHEMA_VERSION: &str = "astra.agent_communication.
 pub enum AgentCommunicationDirection {
     Sent,
     Received,
+}
+
+/// Semantic class of an inter-agent payload.
+///
+/// This stays typed all the way through persistence policy so retention does
+/// not depend on ad-hoc string matching at a storage boundary.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCommunicationPayloadKind {
+    Text,
+    Progress,
+    Request,
+    Response,
+    Signal,
+    Ack,
+    Nack,
+}
+
+impl AgentCommunicationPayloadKind {
+    /// Progress is an observation of current execution, not recoverable
+    /// conversation state. The dedicated live progress projection owns it.
+    pub fn is_durable(self) -> bool {
+        !matches!(self, Self::Progress)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Progress => "progress",
+            Self::Request => "request",
+            Self::Response => "response",
+            Self::Signal => "signal",
+            Self::Ack => "ack",
+            Self::Nack => "nack",
+        }
+    }
+}
+
+impl fmt::Display for AgentCommunicationPayloadKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -39,7 +82,7 @@ pub struct AgentCommunicationEvent {
     pub message_id: String,
     pub from: AgentCommunicationParty,
     pub to: AgentCommunicationTarget,
-    pub payload_kind: String,
+    pub payload_kind: AgentCommunicationPayloadKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

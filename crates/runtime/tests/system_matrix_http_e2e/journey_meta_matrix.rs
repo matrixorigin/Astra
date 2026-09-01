@@ -50,5 +50,5 @@ pub async fn run_meta_root_and_health() {
     assert_eq!(degraded["database"].as_str(), Some("connected"));
     assert_eq!(degraded["memoria"].as_str(), Some("unavailable"));
 
-    b.ctx.pool.close().await;
+    b.ctx.close().await;
 }

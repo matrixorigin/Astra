@@ -24,9 +24,9 @@
 //! * `plan_step_runs` is append-only. Every subtask attempt creates a new row
 //!   — never UPDATE, never DELETE.
 
+use crate::TaskStatus;
 use crate::state::PlanModeState;
 use astra_core::matrixone_statement_with_null_shape;
-use astra_services::task_orchestrator::TaskStatus;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -800,6 +800,31 @@ impl PlanRepository for CloudPlanRepository {
                 tx.rollback().await.map_err(map_sqlx)?;
                 return Err(PlanLoadError::NotFound(pid.to_string()));
             }
+        } else {
+            // Clear the routing hint of the exact plan this session is
+            // leaving. `plans.session_id` is a denormalized discovery index;
+            // retaining it after approval makes a completed authoring plan
+            // look active again on the next resume.
+            let active: Option<(Option<String>,)> = sqlx::query_as(
+                "SELECT active_plan_id FROM agent_sessions WHERE user_id = ? AND session_id = ?",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+            if let Some(active_plan_id) = active.and_then(|(id,)| id) {
+                sqlx::query(
+                    "UPDATE plans SET session_id = NULL, updated_at = NOW(6) \
+                     WHERE user_id = ? AND plan_id = ? AND session_id = ?",
+                )
+                .bind(user_id)
+                .bind(active_plan_id)
+                .bind(session_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+            }
         }
 
         // Session row may not exist yet — no-op in that case.
@@ -1438,9 +1463,6 @@ impl PlanRepository for InMemoryPlanRepository {
         plan_id: Option<&str>,
     ) -> Result<(), PlanLoadError> {
         let mut guard = astra_core::sync_poison::recover_rwlock_write(&self.inner);
-        guard
-            .active_plans
-            .remove(&(user_id.to_string(), session_id.to_string()));
         if let Some(plan_id) = plan_id {
             validate_plan_id(plan_id)?;
             if !guard
@@ -1449,6 +1471,19 @@ impl PlanRepository for InMemoryPlanRepository {
             {
                 return Err(PlanLoadError::NotFound(plan_id.to_string()));
             }
+        }
+
+        let previous = guard
+            .active_plans
+            .remove(&(user_id.to_string(), session_id.to_string()));
+        if plan_id.is_none()
+            && let Some(previous) = previous
+            && let Some(state) = guard.plans.get_mut(&(user_id.to_string(), previous))
+            && state.session_hint.as_deref() == Some(session_id)
+        {
+            state.session_hint = None;
+        }
+        if let Some(plan_id) = plan_id {
             guard
                 .active_plans
                 .retain(|(uid, _), active| uid != user_id || active != plan_id);
@@ -1456,6 +1491,12 @@ impl PlanRepository for InMemoryPlanRepository {
                 (user_id.to_string(), session_id.to_string()),
                 plan_id.to_string(),
             );
+            if let Some(state) = guard
+                .plans
+                .get_mut(&(user_id.to_string(), plan_id.to_string()))
+            {
+                state.session_hint = Some(session_id.to_string());
+            }
         }
         Ok(())
     }
@@ -1909,17 +1950,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clearing_active_plan_removes_session_discovery_hint() {
+        let repo = InMemoryPlanRepository::new();
+        let mut state = PlanModeState::new_with_owner("review plan".into(), "u-1".into());
+        repo.save("u-1", "plan-review", &mut state, None)
+            .await
+            .unwrap();
+        repo.set_active_plan("u-1", "session-1", Some("plan-review"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            repo.list_for_user(
+                "u-1",
+                PlanListFilter {
+                    session_id: Some("session-1"),
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap()
+            .len(),
+            1
+        );
+
+        repo.set_active_plan("u-1", "session-1", None)
+            .await
+            .unwrap();
+
+        assert!(
+            repo.list_for_user(
+                "u-1",
+                PlanListFilter {
+                    session_id: Some("session-1"),
+                    ..Default::default()
+                }
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "an approved plan must not be rediscovered as active through its stale session hint"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_active_plan_switch_preserves_previous_binding() {
+        let repo = InMemoryPlanRepository::new();
+        let mut state = PlanModeState::new_with_owner("current plan".into(), "u-1".into());
+        repo.save("u-1", "current-plan", &mut state, None)
+            .await
+            .unwrap();
+        repo.set_active_plan("u-1", "session-1", Some("current-plan"))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            repo.set_active_plan("u-1", "session-1", Some("missing-plan"))
+                .await,
+            Err(PlanLoadError::NotFound(_))
+        ));
+        assert_eq!(
+            repo.active_plan_for_session("u-1", "session-1")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("current-plan"),
+            "a failed switch must be atomic"
+        );
+    }
+
+    #[tokio::test]
     async fn atomic_step_writes_keep_plan_projection_and_attempt_evidence_in_lockstep() {
         let repo = InMemoryPlanRepository::new();
         let mut initial = PlanModeState::new_with_owner("ship durable work".into(), "u-1".into());
         initial.plan.subtasks = vec![
-            astra_services::task_orchestrator::SubtaskPlan {
+            crate::SubtaskPlan {
                 id: "build".into(),
                 title: "Build projection".into(),
                 status: TaskStatus::Pending,
                 ..Default::default()
             },
-            astra_services::task_orchestrator::SubtaskPlan {
+            crate::SubtaskPlan {
                 id: "verify".into(),
                 title: "Verify projection".into(),
                 status: TaskStatus::Pending,
@@ -2036,15 +2147,12 @@ mod tests {
     async fn atomic_step_write_conflict_leaves_plan_and_attempts_unchanged() {
         let repo = InMemoryPlanRepository::new();
         let mut initial = PlanModeState::new_with_owner("goal".into(), "u-1".into());
-        initial
-            .plan
-            .subtasks
-            .push(astra_services::task_orchestrator::SubtaskPlan {
-                id: "step".into(),
-                title: "Step".into(),
-                status: TaskStatus::Pending,
-                ..Default::default()
-            });
+        initial.plan.subtasks.push(crate::SubtaskPlan {
+            id: "step".into(),
+            title: "Step".into(),
+            status: TaskStatus::Pending,
+            ..Default::default()
+        });
         repo.save("u-1", "plan-conflict", &mut initial, None)
             .await
             .unwrap();

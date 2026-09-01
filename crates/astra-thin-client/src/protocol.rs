@@ -128,6 +128,9 @@ pub struct RunUserIntentResponse {
     pub intent_id: String,
     pub status: astra_turn_types::UserIntentStatus,
     pub duplicate: bool,
+    /// Exact durable cursor of the accepted intent. Acknowledgement without
+    /// this authority is a protocol violation, not an accepted guidance fact.
+    pub event_index: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -210,6 +213,7 @@ pub enum SessionTranscriptReadScope<'a> {
 
 /// `POST /tools/result` (§5.5).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ToolResultRequest {
     pub session_id: String,
     pub run_id: String,
@@ -221,8 +225,12 @@ pub struct ToolResultRequest {
     pub edge_agent_id: String,
     pub output: String,
     pub duration_ms: u64,
-    /// Hash of the tool result content for idempotent deduplication.
-    /// Computed from the full callback identity plus output.
+    /// Hash of the canonical callback payload for idempotent deduplication.
+    ///
+    /// This covers every field that affects result authority, including the
+    /// producing Edge identity and executor-owned structured metadata. A
+    /// result receipt is therefore not an unsigned side-channel attached to
+    /// an otherwise idempotent callback.
     pub result_hash: String,
     /// Structured tool-result metadata forwarded through the cloud ledger.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -243,24 +251,34 @@ pub struct ToolResultRequestParts {
 }
 
 impl ToolResultRequest {
-    /// Compute a content-based hash of the scoped tool result identity + output.
+    /// Compute the v2 canonical hash for every authority-bearing callback
+    /// field. JSON object keys are sorted recursively, so independently
+    /// constructed metadata maps produce the same digest.
     pub fn compute_result_hash(
         session_id: &str,
         run_id: &str,
         turn_chain_id: &str,
         request_id: &str,
+        edge_agent_id: &str,
+        status: &str,
         output: &str,
+        duration_ms: u64,
+        tool_result_fields: Option<&Map<String, Value>>,
     ) -> String {
+        let payload = serde_json::json!({
+            "schema": "astra.tool_result_hash.v2",
+            "session_id": session_id,
+            "run_id": run_id,
+            "turn_chain_id": turn_chain_id,
+            "request_id": request_id,
+            "edge_agent_id": edge_agent_id,
+            "status": status,
+            "output": output,
+            "duration_ms": duration_ms,
+            "tool_result_fields": tool_result_fields,
+        });
         let mut hasher = Sha256::new();
-        hasher.update(session_id.as_bytes());
-        hasher.update(b":");
-        hasher.update(run_id.as_bytes());
-        hasher.update(b":");
-        hasher.update(turn_chain_id.as_bytes());
-        hasher.update(b":");
-        hasher.update(request_id.as_bytes());
-        hasher.update(b":");
-        hasher.update(output.as_bytes());
+        hash_canonical_json(&mut hasher, &payload);
         hex::encode(hasher.finalize())
     }
 
@@ -279,8 +297,17 @@ impl ToolResultRequest {
             duration_ms,
             tool_result_fields,
         } = parts;
-        let result_hash =
-            Self::compute_result_hash(&session_id, &run_id, &turn_chain_id, &request_id, &output);
+        let result_hash = Self::compute_result_hash(
+            &session_id,
+            &run_id,
+            &turn_chain_id,
+            &request_id,
+            &edge_agent_id,
+            &status,
+            &output,
+            duration_ms,
+            tool_result_fields.as_ref(),
+        );
         Self {
             session_id,
             run_id,
@@ -294,32 +321,67 @@ impl ToolResultRequest {
             tool_result_fields,
         }
     }
+}
 
-    /// Parse a dispatch result JSON string back into `(output, is_error)`.
-    ///
-    /// The JSON is the serialized `ToolResultRequest` produced by
-    /// `edge_callback_handlers` / `deliver_result`.  Both the tool-executor
-    /// fallback path and the turn-bridge polling path need to extract the
-    /// same two fields — this avoids duplicated parsing logic.
-    pub fn parse_output_and_error(result_json: &str) -> (String, bool) {
-        let v: serde_json::Value = serde_json::from_str(result_json)
-            .unwrap_or_else(|_| serde_json::json!({"output": result_json}));
-        let output = v
-            .get("output")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let is_error = v
-            .get("status")
-            .and_then(|v| v.as_str())
-            .map(|s| matches!(s, "error" | "failed"))
-            .unwrap_or(false);
-        (output, is_error)
+fn hash_canonical_json(hasher: &mut Sha256, value: &Value) {
+    match value {
+        Value::Null => hasher.update(b"null"),
+        Value::Bool(true) => hasher.update(b"true"),
+        Value::Bool(false) => hasher.update(b"false"),
+        Value::Number(value) => hasher.update(value.to_string().as_bytes()),
+        Value::String(value) => hasher.update(
+            serde_json::to_string(value)
+                .expect("serializing a JSON string cannot fail")
+                .as_bytes(),
+        ),
+        Value::Array(values) => {
+            hasher.update(b"[");
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    hasher.update(b",");
+                }
+                hash_canonical_json(hasher, value);
+            }
+            hasher.update(b"]");
+        }
+        Value::Object(values) => {
+            hasher.update(b"{");
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            for (index, key) in keys.into_iter().enumerate() {
+                if index > 0 {
+                    hasher.update(b",");
+                }
+                hasher.update(
+                    serde_json::to_string(key)
+                        .expect("serializing a JSON object key cannot fail")
+                        .as_bytes(),
+                );
+                hasher.update(b":");
+                hash_canonical_json(hasher, &values[key]);
+            }
+            hasher.update(b"}");
+        }
+    }
+}
+
+/// Classify the exact closed-world status vocabulary used by Edge callbacks.
+///
+/// `Some(false)` is a successful terminal disposition, `Some(true)` is a
+/// terminal non-success, and `None` rejects unknown or non-canonical wire
+/// values. Callers must not trim or case-fold this control field.
+pub fn tool_result_status_is_error(status: &str) -> Option<bool> {
+    match status {
+        "completed" => Some(false),
+        "failed" | "partial_failure" | "denied" | "rejected" | "cancelled" | "interrupted"
+        | "timeout" => Some(true),
+        _ => None,
     }
 }
 
 /// `POST /approval/respond` (§5.5).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalRespondRequest {
     pub request_id: String,
     pub decision: ApprovalDecision,
@@ -355,6 +417,7 @@ pub enum ApprovalKind {
 /// into the canonical questionnaire answer type and validates it against the
 /// durable prompt before recording any terminal outcome.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct UserPromptRespondRequest {
     pub request_id: String,
     pub session_id: String,
@@ -383,6 +446,7 @@ pub struct ProviderInteractionRespondRequest {
 
 /// `POST /agents/edge` — matches server `EdgeRegisterRequest` (Phase 3 registry).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct EdgeRegisterRequest {
     pub edge_agent_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -406,6 +470,7 @@ impl EdgeRegisterRequest {
 
 /// `POST /agents/edge/heartbeat`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct EdgeHeartbeatRequest {
     pub edge_agent_id: String,
     /// Number of in-flight tool requests on this edge executor.
@@ -425,33 +490,16 @@ pub struct EdgeHeartbeatRequest {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum EdgeHeartbeatReplayPolicy {
-    /// Older servers returned executable `pending_requests` without durable
-    /// result evidence. Clients must surface these entries and must not replay
-    /// them automatically.
     #[default]
-    LegacyPendingPayloadRequiresManualReconciliation,
-    /// The server returns identities only. Reconciliation must use the
-    /// canonical durable invocation/result protocol.
     DurableResultReconciliationRequired,
-    /// A newer server policy unknown to this client. Unknown policy never
-    /// grants replay authority; the client surfaces it for reconciliation.
-    #[serde(other)]
-    Unknown,
-}
-
-/// Minimal shape accepted from the retired executable-pending heartbeat
-/// response. Extra legacy payload fields are intentionally ignored: they are
-/// diagnostic evidence, never execution authority.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct LegacyEdgePendingRequest {
-    pub request_id: String,
 }
 
 /// `POST /agents/edge/heartbeat` response shared by Server and thin clients.
 ///
 /// The response never authorizes tool execution. A non-empty unresolved or
-/// legacy pending set requires durable reconciliation.
+/// unresolved set requires durable reconciliation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct EdgeHeartbeatResponse {
     pub ok: bool,
     pub user_id: String,
@@ -459,32 +507,15 @@ pub struct EdgeHeartbeatResponse {
     pub edge_agent_id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unresolved_request_ids: Vec<String>,
-    #[serde(default)]
     pub replay_policy: EdgeHeartbeatReplayPolicy,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ack_request_ids: Vec<String>,
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        rename = "pending_requests"
-    )]
-    pub legacy_pending_requests: Vec<LegacyEdgePendingRequest>,
 }
 
 impl EdgeHeartbeatResponse {
     pub fn requires_reconciliation(&self) -> bool {
         !self.unresolved_request_ids.is_empty()
-            || !self.legacy_pending_requests.is_empty()
-            || self.replay_policy == EdgeHeartbeatReplayPolicy::Unknown
     }
-}
-
-/// `POST /agent-jobs/{id}/lease/{claim,release,renew}` — matches server lease handlers.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct TaskLeaseMutationRequest {
-    pub edge_agent_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ttl_sec: Option<i64>,
 }
 
 /// Classified SSE JSON line (`data: …` payload). Unknown `type` values are preserved as [`StreamEvent::Other`].
@@ -526,6 +557,7 @@ pub enum StreamEvent {
         run_id: String,
         turn_chain_id: String,
         request_id: String,
+        schema_admitted_by_server: bool,
         tool: String,
         args: Value,
     },
@@ -601,6 +633,14 @@ pub enum StreamEvent {
         content: String,
         index: u64,
     },
+    RunUserIntentReturned {
+        run_id: String,
+        intent_id: String,
+        delivery: astra_turn_types::UserIntentDelivery,
+        event_index: u64,
+        content: String,
+        index: u64,
+    },
     RunError {
         message: String,
         error_kind: Option<String>,
@@ -625,6 +665,12 @@ pub enum StreamEvent {
         cache_creation_tokens: Option<u64>,
         total_tokens: Option<u64>,
         tool_call_count: Option<u64>,
+        raw: Value,
+    },
+    /// Canonical runtime observation. Kept as raw JSON in the dependency-light
+    /// thin client; the schema is authored and validated by the Server.
+    RuntimeFeedback {
+        runtime_feedback: Value,
         raw: Value,
     },
     TurnComplete {
@@ -721,21 +767,33 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
             call_id: obj.get("call_id").cloned().unwrap_or(Value::Null),
             arguments: obj.get("arguments").cloned(),
         },
-        "tool_call_end" | "tool_result" => StreamEvent::ToolCallEnd {
+        "tool_call_end" => StreamEvent::ToolCallEnd {
             call_id: obj.get("call_id").cloned().unwrap_or(Value::Null),
             result: obj.get("result").cloned().unwrap_or(Value::Null),
         },
-        "tool_request" => StreamEvent::ToolRequest {
-            session_id: get_str(&obj, "session_id"),
-            run_id: get_str(&obj, "run_id"),
-            turn_chain_id: get_str(&obj, "turn_chain_id"),
-            request_id: get_str(&obj, "request_id"),
-            tool: get_str(&obj, "tool"),
-            args: obj
-                .get("args")
-                .cloned()
-                .unwrap_or_else(|| Value::Object(Default::default())),
-        },
+        "tool_request" => {
+            if obj
+                .get("schema_admitted_by_server")
+                .and_then(Value::as_bool)
+                != Some(true)
+            {
+                return Err(crate::error::ThinClientError::SseParse(
+                    "tool_request omitted Server wire-schema admission evidence".to_string(),
+                ));
+            }
+            StreamEvent::ToolRequest {
+                session_id: get_str(&obj, "session_id"),
+                run_id: get_str(&obj, "run_id"),
+                turn_chain_id: get_str(&obj, "turn_chain_id"),
+                request_id: get_str(&obj, "request_id"),
+                schema_admitted_by_server: true,
+                tool: get_str(&obj, "tool"),
+                args: obj
+                    .get("args")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Object(Default::default())),
+            }
+        }
         "plan_created" => StreamEvent::PlanCreated {
             plan: obj
                 .get("plan")
@@ -826,6 +884,20 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
                 index: required_field(&obj, "index", &raw)?,
             }
         }
+        "user_intent_returned" => {
+            let status: astra_turn_types::UserIntentStatus = required_field(&obj, "status", &raw)?;
+            if status != astra_turn_types::UserIntentStatus::Returned {
+                return Err(crate::error::ThinClientError::InvalidSseJson(raw));
+            }
+            StreamEvent::RunUserIntentReturned {
+                run_id: required_field(&obj, "run_id", &raw)?,
+                intent_id: required_field(&obj, "intent_id", &raw)?,
+                delivery: required_field(&obj, "delivery", &raw)?,
+                event_index: required_field(&obj, "event_index", &raw)?,
+                content: required_field(&obj, "content", &raw)?,
+                index: required_field(&obj, "index", &raw)?,
+            }
+        }
         "run_error" => StreamEvent::RunError {
             message: obj
                 .get("message")
@@ -857,6 +929,21 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
             tool_call_count: obj.get("tool_call_count").and_then(|v| v.as_u64()),
             raw,
         },
+        "runtime_feedback" => {
+            let runtime_feedback = obj
+                .get("runtime_feedback")
+                .filter(|value| value.is_object())
+                .cloned()
+                .ok_or_else(|| {
+                    crate::error::ThinClientError::SseParse(
+                        "runtime_feedback event omitted its object frame".to_string(),
+                    )
+                })?;
+            StreamEvent::RuntimeFeedback {
+                runtime_feedback,
+                raw,
+            }
+        }
         "turn_complete" => StreamEvent::TurnComplete {
             assistant_text: optional_str(&obj, "assistant_text"),
             followup_suggestion: optional_str(&obj, "followup_suggestion"),
@@ -881,26 +968,11 @@ pub fn classify_stream_event(value: Value) -> Result<StreamEvent, crate::error::
             raw,
         },
         "approval_required" => StreamEvent::ApprovalRequired {
-            request_id: get_str(&obj, "request_id"),
-            tool: get_str(&obj, "tool"),
-            approval_kind: obj
-                .get("approval_kind")
-                .cloned()
-                .and_then(|value| serde_json::from_value::<ApprovalKind>(value).ok())
-                .unwrap_or(ApprovalKind::Explicit),
-            path: obj
-                .get("path")
-                .and_then(|v| v.as_str())
-                .map(std::string::ToString::to_string),
-            detail: obj
-                .get("detail")
-                .and_then(|v| v.as_str())
-                .map(std::string::ToString::to_string)
-                .or_else(|| {
-                    obj.get("path")
-                        .and_then(|v| v.as_str())
-                        .map(std::string::ToString::to_string)
-                }),
+            request_id: required_field(&obj, "request_id", &raw)?,
+            tool: required_field(&obj, "tool", &raw)?,
+            approval_kind: required_field(&obj, "approval_kind", &raw)?,
+            path: optional_str(&obj, "path"),
+            detail: optional_str(&obj, "detail"),
             raw,
         },
         "user_prompt_required" => StreamEvent::UserPromptRequired {
@@ -988,52 +1060,40 @@ mod tests {
             response.replay_policy,
             EdgeHeartbeatReplayPolicy::DurableResultReconciliationRequired
         );
-        assert!(response.legacy_pending_requests.is_empty());
     }
 
     #[test]
-    fn heartbeat_response_decodes_legacy_pending_payload_as_non_executable_evidence() {
-        let response: EdgeHeartbeatResponse = serde_json::from_value(json!({
+    fn heartbeat_response_rejects_retired_pending_payload() {
+        let error = serde_json::from_value::<EdgeHeartbeatResponse>(json!({
             "ok": true,
             "user_id": "user-1",
             "edge_id": "transport-1",
             "edge_agent_id": "edge-1",
+            "replay_policy": "durable_result_reconciliation_required",
             "pending_requests": [{
                 "request_id": "legacy-request",
                 "tool_name": "bash",
                 "args": {"cmd": "echo must-not-run"}
             }]
         }))
-        .expect("legacy heartbeat response");
-
-        assert!(response.requires_reconciliation());
-        assert_eq!(
-            response.replay_policy,
-            EdgeHeartbeatReplayPolicy::LegacyPendingPayloadRequiresManualReconciliation
-        );
-        assert_eq!(
-            response.legacy_pending_requests,
-            vec![LegacyEdgePendingRequest {
-                request_id: "legacy-request".to_string(),
-            }]
-        );
+        .expect_err("retired pending_requests payload must be rejected");
+        assert!(error.to_string().contains("pending_requests"));
     }
 
     #[test]
-    fn heartbeat_response_unknown_policy_fails_safe_without_breaking_heartbeat() {
-        let response: EdgeHeartbeatResponse = serde_json::from_value(json!({
+    fn heartbeat_response_rejects_unknown_policy() {
+        let error = serde_json::from_value::<EdgeHeartbeatResponse>(json!({
             "ok": true,
             "user_id": "user-1",
             "edge_id": "transport-1",
             "edge_agent_id": "edge-1",
             "replay_policy": "future_provider_attested_reconciliation"
         }))
-        .expect("unknown policy must remain forward compatible");
-
-        assert_eq!(response.replay_policy, EdgeHeartbeatReplayPolicy::Unknown);
+        .expect_err("unknown replay policy must be rejected");
         assert!(
-            response.requires_reconciliation(),
-            "unknown policy must never imply automatic replay authority"
+            error
+                .to_string()
+                .contains("future_provider_attested_reconciliation")
         );
     }
 
@@ -1192,6 +1252,31 @@ mod tests {
     }
 
     #[test]
+    fn classify_runtime_feedback_preserves_the_server_authored_frame() {
+        let frame = serde_json::json!({
+            "schema_version": 4,
+            "identity": {"session_id": "s", "run_id": "r"}
+        });
+        let event = serde_json::json!({
+            "type": "runtime_feedback",
+            "runtime_feedback": frame,
+        });
+
+        match classify_stream_event(event).unwrap() {
+            StreamEvent::RuntimeFeedback {
+                runtime_feedback, ..
+            } => assert_eq!(runtime_feedback, frame),
+            event => panic!("unexpected {event:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_runtime_feedback_rejects_a_missing_frame() {
+        let event = serde_json::json!({"type": "runtime_feedback"});
+        assert!(classify_stream_event(event).is_err());
+    }
+
+    #[test]
     fn classify_tool_request_design_shape() {
         let v = serde_json::json!({
             "type": "tool_request",
@@ -1199,6 +1284,7 @@ mod tests {
             "run_id": "r1",
             "turn_chain_id": "chain1",
             "request_id": "tr-1",
+            "schema_admitted_by_server": true,
             "tool": "bash",
             "args": {"command": "ls"}
         });
@@ -1208,6 +1294,7 @@ mod tests {
                 run_id,
                 turn_chain_id,
                 request_id,
+                schema_admitted_by_server,
                 tool,
                 args,
             } => {
@@ -1215,11 +1302,25 @@ mod tests {
                 assert_eq!(run_id, "r1");
                 assert_eq!(turn_chain_id, "chain1");
                 assert_eq!(request_id, "tr-1");
+                assert!(schema_admitted_by_server);
                 assert_eq!(tool, "bash");
                 assert_eq!(args["command"], "ls");
             }
             e => panic!("unexpected {e:?}"),
         }
+    }
+
+    #[test]
+    fn classify_tool_request_without_server_schema_admission_fails_closed() {
+        let error = classify_stream_event(serde_json::json!({
+            "type": "tool_request",
+            "request_id": "tr-1",
+            "tool": "web_fetch",
+            "args": {"url": "https://example.com"}
+        }))
+        .expect_err("missing Server admission evidence must reject the request");
+
+        assert!(error.to_string().contains("wire-schema admission"));
     }
 
     #[test]
@@ -1249,24 +1350,35 @@ mod tests {
     }
 
     #[test]
-    fn classify_approval_required_without_kind_defaults_to_explicit() {
-        let v = serde_json::json!({
+    fn classify_approval_required_rejects_missing_or_invalid_kind_and_detail_alias() {
+        let missing = serde_json::json!({
             "type": "approval_required",
-            "request_id": "ap-legacy",
+            "request_id": "ap-missing",
             "tool": "write_file",
             "path": "src/lib.rs"
         });
-        match classify_stream_event(v).unwrap() {
-            StreamEvent::ApprovalRequired {
-                approval_kind,
-                detail,
-                ..
-            } => {
-                assert_eq!(approval_kind, ApprovalKind::Explicit);
-                assert_eq!(detail.as_deref(), Some("src/lib.rs"));
-            }
-            other => panic!("unexpected {other:?}"),
-        }
+        assert!(classify_stream_event(missing).is_err());
+
+        let invalid = serde_json::json!({
+            "type": "approval_required",
+            "request_id": "ap-invalid",
+            "tool": "write_file",
+            "approval_kind": "future",
+        });
+        assert!(classify_stream_event(invalid).is_err());
+
+        let exact = serde_json::json!({
+            "type": "approval_required",
+            "request_id": "ap-exact",
+            "tool": "write_file",
+            "approval_kind": "explicit",
+            "path": "src/lib.rs"
+        });
+        let StreamEvent::ApprovalRequired { detail, .. } = classify_stream_event(exact).unwrap()
+        else {
+            panic!("expected approval event")
+        };
+        assert!(detail.is_none(), "path must not alias typed detail");
     }
 
     #[test]
@@ -1295,19 +1407,25 @@ mod tests {
     }
 
     #[test]
-    fn classify_tool_call_end_and_legacy_tool_result() {
-        for value in [
+    fn classify_tool_call_end_rejects_retired_alias() {
+        match classify_stream_event(
             serde_json::json!({"type":"tool_call_end","call_id":"c1","result":"ok"}),
-            serde_json::json!({"type":"tool_result","call_id":"c2","result":"legacy"}),
-        ] {
-            match classify_stream_event(value).unwrap() {
-                StreamEvent::ToolCallEnd { call_id, result } => {
-                    assert!(call_id == "c1" || call_id == "c2");
-                    assert!(result == "ok" || result == "legacy");
-                }
-                other => panic!("unexpected {other:?}"),
+        )
+        .unwrap()
+        {
+            StreamEvent::ToolCallEnd { call_id, result } => {
+                assert_eq!(call_id, "c1");
+                assert_eq!(result, "ok");
             }
+            other => panic!("unexpected {other:?}"),
         }
+        assert!(matches!(
+            classify_stream_event(
+                serde_json::json!({"type":"tool_result","call_id":"c2","result":"retired"})
+            )
+            .unwrap(),
+            StreamEvent::Other { .. }
+        ));
     }
 
     #[test]
@@ -1658,6 +1776,31 @@ mod tests {
                 && intent_id == "intent-7"
                 && content == "inspect the failing test"
         ));
+
+        let returned = classify_stream_event(serde_json::json!({
+            "type": "user_intent_returned",
+            "run_id": "run-child",
+            "intent_id": "intent-8",
+            "delivery": "guide_current_run",
+            "status": "returned",
+            "event_index": 8,
+            "content": "preserve this draft",
+            "index": 14
+        }))
+        .unwrap();
+        assert!(matches!(
+            returned,
+            StreamEvent::RunUserIntentReturned {
+                run_id,
+                intent_id,
+                event_index: 8,
+                content,
+                index: 14,
+                ..
+            } if run_id == "run-child"
+                && intent_id == "intent-8"
+                && content == "preserve this draft"
+        ));
     }
 
     #[test]
@@ -1677,6 +1820,39 @@ mod tests {
             error,
             crate::error::ThinClientError::InvalidSseJson(_)
         ));
+    }
+
+    #[test]
+    fn run_user_intent_ack_requires_exact_durable_cursor() {
+        let response: RunUserIntentResponse = serde_json::from_value(serde_json::json!({
+            "run_id": "run-1",
+            "intent_id": "intent-1",
+            "status": "accepted_remote",
+            "duplicate": false,
+            "event_index": 17
+        }))
+        .expect("current protocol response with an exact cursor must decode");
+        assert_eq!(response.event_index, 17);
+
+        let missing = serde_json::from_value::<RunUserIntentResponse>(serde_json::json!({
+            "run_id": "run-1",
+            "intent_id": "intent-1",
+            "status": "accepted_remote",
+            "duplicate": false
+        }));
+        assert!(
+            missing.is_err(),
+            "an acknowledgement without authority must fail"
+        );
+
+        let null = serde_json::from_value::<RunUserIntentResponse>(serde_json::json!({
+            "run_id": "run-1",
+            "intent_id": "intent-1",
+            "status": "accepted_remote",
+            "duplicate": false,
+            "event_index": null
+        }));
+        assert!(null.is_err(), "a null durable cursor must fail");
     }
 
     #[test]
@@ -1714,46 +1890,37 @@ mod tests {
         }
     }
 
-    // ── ToolResultRequest serialization / parse_output_and_error ──────
+    // ── ToolResultRequest serialization / status contract ────────────
 
     #[test]
-    fn tool_result_parse_output_and_error_success() {
-        let json = r#"{"request_id":"r1","edge_agent_id":"agt","status":"success","output":"hello","duration_ms":42}"#;
-        let (output, is_error) = ToolResultRequest::parse_output_and_error(json);
-        assert_eq!(output, "hello");
-        assert!(!is_error);
-    }
-
-    #[test]
-    fn tool_result_parse_output_and_error_error_status() {
-        let json = r#"{"request_id":"r1","edge_agent_id":"agt","status":"error","output":"fail"}"#;
-        let (output, is_error) = ToolResultRequest::parse_output_and_error(json);
-        assert_eq!(output, "fail");
-        assert!(is_error);
-    }
-
-    #[test]
-    fn tool_result_parse_output_and_error_legacy_failed_status() {
-        let json = r#"{"request_id":"r1","edge_agent_id":"agt","status":"failed","output":"fail"}"#;
-        let (output, is_error) = ToolResultRequest::parse_output_and_error(json);
-        assert_eq!(output, "fail");
-        assert!(is_error);
-    }
-
-    #[test]
-    fn tool_result_parse_output_and_error_non_json_fallback() {
-        // When input is not JSON, fallback uses the whole string as output
-        let (output, is_error) = ToolResultRequest::parse_output_and_error("plain text result");
-        assert_eq!(output, "plain text result");
-        assert!(!is_error);
-    }
-
-    #[test]
-    fn tool_result_parse_output_and_error_missing_output() {
-        let json = r#"{"request_id":"r1","edge_agent_id":"agt","status":"success"}"#;
-        let (output, is_error) = ToolResultRequest::parse_output_and_error(json);
-        assert_eq!(output, "");
-        assert!(!is_error);
+    fn tool_result_status_contract_is_exact_and_closed_world() {
+        for status in ["completed"] {
+            assert_eq!(tool_result_status_is_error(status), Some(false), "{status}");
+        }
+        for status in [
+            "failed",
+            "partial_failure",
+            "denied",
+            "rejected",
+            "cancelled",
+            "interrupted",
+            "timeout",
+        ] {
+            assert_eq!(tool_result_status_is_error(status), Some(true), "{status}");
+        }
+        for status in [
+            "",
+            "unknown",
+            "success",
+            "ok",
+            "skipped",
+            "error",
+            "timed_out",
+            " OK ",
+            "SUCCESS",
+        ] {
+            assert_eq!(tool_result_status_is_error(status), None, "{status:?}");
+        }
     }
 
     #[test]
@@ -1764,7 +1931,7 @@ mod tests {
             turn_chain_id: "chain-1".into(),
             request_id: "req-1".into(),
             edge_agent_id: "agent-1".into(),
-            status: "success".into(),
+            status: "completed".into(),
             output: "done".into(),
             duration_ms: 100,
             tool_result_fields: None,
@@ -1790,7 +1957,7 @@ mod tests {
             turn_chain_id: "chain-1".into(),
             request_id: "req-1".into(),
             edge_agent_id: "agent-1".into(),
-            status: "success".into(),
+            status: "completed".into(),
             output: "done".into(),
             duration_ms: 100,
             tool_result_fields: Some(fields),
@@ -1806,6 +1973,111 @@ mod tests {
     }
 
     #[test]
+    fn tool_result_hash_binds_authority_fields_and_canonicalizes_metadata() {
+        let fields_a = Map::from_iter([
+            ("z".to_string(), serde_json::json!({"b": 2, "a": 1})),
+            (
+                "a".to_string(),
+                serde_json::json!([{"y": true, "x": false}, "quoted\nUnicode: 雪", 1.5]),
+            ),
+        ]);
+        let fields_b = Map::from_iter([
+            (
+                "a".to_string(),
+                serde_json::json!([{"x": false, "y": true}, "quoted\nUnicode: 雪", 1.5]),
+            ),
+            ("z".to_string(), serde_json::json!({"a": 1, "b": 2})),
+        ]);
+        let base = ToolResultRequestParts {
+            session_id: "sess-1".into(),
+            run_id: "run-1".into(),
+            turn_chain_id: "chain-1".into(),
+            request_id: "req-1".into(),
+            edge_agent_id: "edge-a".into(),
+            status: "completed".into(),
+            output: "done".into(),
+            duration_ms: 10,
+            tool_result_fields: Some(fields_a),
+        };
+        let first = ToolResultRequest::new_with_hash(base.clone());
+        let same = ToolResultRequest::new_with_hash(ToolResultRequestParts {
+            tool_result_fields: Some(fields_b),
+            ..base.clone()
+        });
+        assert_eq!(first.result_hash, same.result_hash);
+
+        let wire = serde_json::to_string(&first).expect("serialize v2 callback");
+        let decoded: ToolResultRequest =
+            serde_json::from_str(&wire).expect("deserialize v2 callback");
+        assert_eq!(decoded.result_hash, first.result_hash);
+        assert_eq!(
+            decoded.result_hash,
+            ToolResultRequest::compute_result_hash(
+                &decoded.session_id,
+                &decoded.run_id,
+                &decoded.turn_chain_id,
+                &decoded.request_id,
+                &decoded.edge_agent_id,
+                &decoded.status,
+                &decoded.output,
+                decoded.duration_ms,
+                decoded.tool_result_fields.as_ref(),
+            )
+        );
+
+        for changed in [
+            ToolResultRequestParts {
+                session_id: "sess-2".into(),
+                ..base.clone()
+            },
+            ToolResultRequestParts {
+                run_id: "run-2".into(),
+                ..base.clone()
+            },
+            ToolResultRequestParts {
+                turn_chain_id: "chain-2".into(),
+                ..base.clone()
+            },
+            ToolResultRequestParts {
+                request_id: "req-2".into(),
+                ..base.clone()
+            },
+            ToolResultRequestParts {
+                status: "failed".into(),
+                ..base.clone()
+            },
+            ToolResultRequestParts {
+                edge_agent_id: "edge-b".into(),
+                ..base.clone()
+            },
+            ToolResultRequestParts {
+                duration_ms: 11,
+                ..base.clone()
+            },
+            ToolResultRequestParts {
+                output: "different output".into(),
+                ..base.clone()
+            },
+            ToolResultRequestParts {
+                tool_result_fields: None,
+                ..base.clone()
+            },
+            ToolResultRequestParts {
+                tool_result_fields: Some(Map::from_iter([(
+                    "receipt".to_string(),
+                    serde_json::json!({"schema": "different"}),
+                )])),
+                ..base.clone()
+            },
+        ] {
+            assert_ne!(
+                first.result_hash,
+                ToolResultRequest::new_with_hash(changed).result_hash
+            );
+        }
+    }
+
+    #[test]
     fn tool_result_serde_roundtrip_preserves_edge_agent_id() {
         let req = ToolResultRequest::new_with_hash(ToolResultRequestParts {
             session_id: "sess-1".into(),
@@ -1813,7 +2085,7 @@ mod tests {
             turn_chain_id: "chain-1".into(),
             request_id: "r1".into(),
             edge_agent_id: "ea-1".into(),
-            status: "success".into(),
+            status: "completed".into(),
             output: "ok".into(),
             duration_ms: 10,
             tool_result_fields: None,
@@ -1836,8 +2108,26 @@ mod tests {
     }
 
     #[test]
-    fn transcript_item_decodes_legacy_and_typed_tool_evidence() {
-        let legacy: SessionTranscriptItem = serde_json::from_value(serde_json::json!({
+    fn edge_callback_requests_reject_unknown_fields() {
+        let tool_result = r#"{"session_id":"s1","run_id":"r1","turn_chain_id":"c1","request_id":"req1","edge_agent_id":"ea1","status":"completed","output":"ok","duration_ms":10,"result_hash":"h","tool_call_id":"retired"}"#;
+        assert!(serde_json::from_str::<ToolResultRequest>(tool_result).is_err());
+
+        let approval = r#"{"request_id":"req1","decision":"allow","session_id":"s1","run_id":"r1","timed_out":false}"#;
+        assert!(serde_json::from_str::<ApprovalRespondRequest>(approval).is_err());
+
+        let prompt = r#"{"request_id":"req1","session_id":"s1","run_id":"r1","cancelled":false,"owner_run_id":"wrong"}"#;
+        assert!(serde_json::from_str::<UserPromptRespondRequest>(prompt).is_err());
+
+        let register = r#"{"edge_agent_id":"ea1","edge_id":"retired"}"#;
+        assert!(serde_json::from_str::<EdgeRegisterRequest>(register).is_err());
+
+        let heartbeat = r#"{"edge_agent_id":"ea1","pending_request_count":0,"last_seen_request_ids":[],"pending_requests":[]}"#;
+        assert!(serde_json::from_str::<EdgeHeartbeatRequest>(heartbeat).is_err());
+    }
+
+    #[test]
+    fn transcript_item_decodes_plain_and_typed_tool_evidence() {
+        let plain: SessionTranscriptItem = serde_json::from_value(serde_json::json!({
             "session_id": "session-1",
             "item_seq": 1,
             "run_id": "run-1",
@@ -1846,9 +2136,9 @@ mod tests {
             "created_at": "2026-07-12T00:00:00"
         }))
         .unwrap();
-        assert!(legacy.tool_calls.is_empty());
-        assert!(legacy.tool_result.is_none());
-        assert!(legacy.source_event_id.is_none());
+        assert!(plain.tool_calls.is_empty());
+        assert!(plain.tool_result.is_none());
+        assert!(plain.source_event_id.is_none());
 
         let typed: SessionTranscriptItem = serde_json::from_value(serde_json::json!({
             "session_id": "session-1",

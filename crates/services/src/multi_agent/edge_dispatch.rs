@@ -221,6 +221,20 @@ pub trait EdgeDispatchService: Send + Sync {
         result_json: &str,
     ) -> Result<bool, String>;
 
+    /// Whether this exact dispatch was already terminalized as a server-owned
+    /// cancellation.  The callback endpoint may acknowledge a late
+    /// `cancelled` result in that one case: the durable terminal outcome wins,
+    /// and accepting it cannot reopen or overwrite the dispatch.  This is
+    /// deliberately narrower than a generic terminal-row probe so a divergent
+    /// replay of a completed result remains a protocol error.
+    async fn is_server_cancelled_dispatch(
+        &self,
+        _identity: &EdgeDispatchIdentity,
+        _edge_agent_id: &str,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
     /// Move an in-flight dispatch to a failed terminal state.
     async fn fail_dispatch(
         &self,
@@ -1399,6 +1413,51 @@ impl EdgeDispatchService for DatabaseEdgeDispatchService {
             self.wait_coordinator.resolve(identity, result_json).await;
         }
         Ok(accepted)
+    }
+
+    async fn is_server_cancelled_dispatch(
+        &self,
+        identity: &EdgeDispatchIdentity,
+        edge_agent_id: &str,
+    ) -> Result<bool, String> {
+        let row = sqlx::query(
+            "SELECT status, CAST(result_json AS CHAR) AS result_json \
+             FROM edge_pending_dispatch \
+             WHERE user_id = ? AND session_id = ? AND run_id = ? AND turn_chain_id = ? \
+               AND request_id = ? AND edge_agent_id = ?",
+        )
+        .bind(&identity.user_id)
+        .bind(&identity.session_id)
+        .bind(&identity.run_id)
+        .bind(&identity.turn_chain_id)
+        .bind(&identity.request_id)
+        .bind(edge_agent_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("edge_dispatch inspect cancelled terminal: {e}"))?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let status = row
+            .try_get::<String, _>("status")
+            .map_err(|e| format!("edge_dispatch cancelled terminal status decode: {e}"))?;
+        if status != "failed" {
+            return Ok(false);
+        }
+        let Some(body) = row
+            .try_get::<Option<String>, _>("result_json")
+            .map_err(|e| format!("edge_dispatch cancelled terminal result decode: {e}"))?
+        else {
+            return Ok(false);
+        };
+        let value: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+            format!("edge_dispatch cancelled terminal payload is invalid JSON: {e}")
+        })?;
+        Ok(
+            value.get("status").and_then(serde_json::Value::as_str) == Some("error")
+                && value.get("output").and_then(serde_json::Value::as_str)
+                    == Some("edge dispatch cancelled"),
+        )
     }
 
     #[tracing::instrument(skip(self, identity), fields(user_id = %identity.user_id, session_id = %identity.session_id, run_id = %identity.run_id, turn_chain_id = %identity.turn_chain_id, edge_agent_id = %edge_agent_id, request_id = %identity.request_id, reason = %reason))]

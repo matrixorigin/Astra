@@ -490,18 +490,18 @@ fn server_config(
 
     validate_url(url.trim())?;
     let credential = credential_transport(key_value)?;
-    let transport = match transport.trim().to_ascii_lowercase().as_str() {
+    let transport = match transport {
         "sse" => Transport::Sse {
             url: url.trim().to_string(),
             auth_token: credential.auth_token,
             headers: credential.headers,
         },
-        "http" | "streamable_http" | "streamable-http" => Transport::StreamableHttp {
+        "streamable_http" => Transport::StreamableHttp {
             url: url.trim().to_string(),
             auth_token: credential.auth_token,
             headers: credential.headers,
         },
-        "ws" | "websocket" => Transport::Ws {
+        "ws" => Transport::Ws {
             url: url.trim().to_string(),
             auth_token: credential.auth_token,
             headers: credential.headers,
@@ -540,18 +540,18 @@ fn request_scoped_server_config(
         auth_token: binding.auth_token.clone(),
         headers: binding.headers.clone(),
     };
-    let transport = match binding.transport.trim().to_ascii_lowercase().as_str() {
+    let transport = match binding.transport.as_str() {
         "sse" => Transport::Sse {
             url: binding.url.trim().to_string(),
             auth_token: credential.auth_token,
             headers: credential.headers,
         },
-        "http" | "streamable_http" | "streamable-http" => Transport::StreamableHttp {
+        "streamable_http" => Transport::StreamableHttp {
             url: binding.url.trim().to_string(),
             auth_token: credential.auth_token,
             headers: credential.headers,
         },
-        "ws" | "websocket" => Transport::Ws {
+        "ws" => Transport::Ws {
             url: binding.url.trim().to_string(),
             auth_token: credential.auth_token,
             headers: credential.headers,
@@ -2089,7 +2089,7 @@ mod tests {
     fn request_scoped_server_config_preserves_headers_and_sanitizes_namespace() {
         let binding = RuntimeMcpBindingRequest {
             id: "external nl2sql".to_string(),
-            transport: "streamable-http".to_string(),
+            transport: "streamable_http".to_string(),
             url: "https://tools.example.test/mcp/http".to_string(),
             auth_token: Some("token-value".to_string()),
             headers: HashMap::from([(
@@ -2151,6 +2151,19 @@ mod tests {
             err.1.0.error_code.as_deref(),
             Some("mcp_runtime_binding_invalid")
         );
+
+        for retired_transport in ["http", "streamable-http", "websocket", "WS"] {
+            let retired = RuntimeMcpBindingRequest {
+                id: "retired-transport".to_string(),
+                transport: retired_transport.to_string(),
+                url: "http://127.0.0.1/mcp".to_string(),
+                auth_token: None,
+                headers: HashMap::new(),
+            };
+            let error = request_scoped_server_config(&retired)
+                .expect_err("retired MCP transport aliases must fail closed");
+            assert_eq!(error.0, StatusCode::BAD_REQUEST, "{retired_transport}");
+        }
     }
 
     #[tokio::test]

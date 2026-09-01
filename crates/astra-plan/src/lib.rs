@@ -1,6 +1,7 @@
 //! Astra Plan — shared plan state, execution helpers, and persistence boundaries.
 
 pub mod execution;
+pub mod model;
 pub mod repository;
 pub mod resume;
 pub mod state;
@@ -8,6 +9,7 @@ pub mod state;
 pub use execution::{
     FileConflict, ParallelGroups, analyze_parallelism, format_subtask_prompt_with_operator_notes,
 };
+pub use model::{SubtaskPlan, TaskPlan, TaskStatus};
 pub use repository::{
     CloudPlanRepository, FinalizeStepRun, InMemoryPlanRepository, NewStepRun, PlanListFilter,
     PlanLoadError, PlanRepository, PlanStepRun, RecordCompletedStepRun, SavedPlanInfo,

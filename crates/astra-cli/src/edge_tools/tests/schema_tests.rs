@@ -312,6 +312,10 @@ fn git_commit_and_revert_actions_declare_required_fields() {
     let schemas = all_tool_schemas();
     let git = tool_schema(&schemas, "git");
     assert_eq!(
+        conditional_required_for(git, "blame"),
+        vec!["path".to_string()]
+    );
+    assert_eq!(
         conditional_required_for(git, "commit"),
         vec!["message".to_string()]
     );
@@ -465,90 +469,6 @@ fn mo_query_schema_requires_sql() {
     assert_eq!(required_fields(mo_query), vec!["sql".to_string()]);
 }
 
-#[test]
-fn task_board_schema_requires_title_and_task_id() {
-    let schemas = all_tool_schemas();
-    let task = tool_schema(&schemas, "task_board");
-    assert_eq!(
-        conditional_required_for(task, "create"),
-        vec!["title".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(task, "update"),
-        vec!["task_id".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(task, "get"),
-        vec!["task_id".to_string()]
-    );
-    assert_eq!(
-        conditional_required_for(task, "stop"),
-        vec!["task_id".to_string()]
-    );
-}
-
-#[test]
-fn task_board_schema_publishes_action_owned_fields() {
-    let schemas = all_tool_schemas();
-    let task = tool_schema(&schemas, "task_board");
-    let create = conditional_allowed_for(task, "create");
-    let update = conditional_allowed_for(task, "update");
-
-    assert_eq!(
-        create,
-        astra_tools::task_tool_contract::task_action_allowed_fields("create")
-            .unwrap()
-            .iter()
-            .map(|field| (*field).to_string())
-            .collect::<Vec<_>>()
-    );
-    assert!(
-        !create.iter().any(|field| field == "new_status"),
-        "task_board.create must not advertise update-only status fields"
-    );
-    assert!(
-        update.iter().any(|field| field == "new_status"),
-        "task_board.update must advertise status changes"
-    );
-    assert_eq!(
-        update,
-        astra_tools::task_tool_contract::task_action_allowed_fields("update")
-            .unwrap()
-            .iter()
-            .map(|field| (*field).to_string())
-            .collect::<Vec<_>>()
-    );
-}
-
-/// `task_board` is the durable checklist surface. Background execution control lives
-/// on typed `task_output` / `task_stop` / `task_list` tools, not the checklist
-/// action enum and not a generic job action union.
-#[test]
-fn task_board_schema_does_not_advertise_background_actions() {
-    let schemas = all_tool_schemas();
-    let task = tool_schema(&schemas, "task_board");
-    let actions: Vec<&str> = task["function"]["parameters"]["properties"]["action"]["enum"]
-        .as_array()
-        .expect("task_board.action must be an enum")
-        .iter()
-        .filter_map(|v| v.as_str())
-        .collect();
-    for banned in &["background_shell", "background_agent", "output", "kill"] {
-        assert!(
-            !actions.contains(banned),
-            "task_board.action enum still advertises `{banned}` — it must move to \
-             typed background task control tools. Got: {actions:?}"
-        );
-    }
-    // Sanity: the checklist verbs are still there.
-    for kept in &["create", "update", "list", "get", "stop"] {
-        assert!(
-            actions.contains(kept),
-            "task.action must still include `{kept}` — got: {actions:?}"
-        );
-    }
-}
-
 /// Typed task-control tools are the model-facing background task surface.
 /// The generic `job` action union must not be advertised to the model.
 #[test]
@@ -596,9 +516,10 @@ fn typed_background_task_schema_required_fields() {
 
 // ── Plan mode surfaces ────────────────────────────────────────────────────
 //
-// Local CLI keeps `/plan` as the human entrypoint, but the model-facing local
-// tool catalog now includes client-backed enter/exit wrappers so the active
-// cloud plan lifecycle stays consistent across turns.
+// Local CLI keeps `/plan` as the human entrypoint, and the model-facing local
+// tool catalog includes enter/exit wrappers. Cloud persistence through the
+// legacy `/plans` routes is a separate compatibility path and is not a
+// current-runtime capability.
 
 #[test]
 fn local_cli_catalog_includes_plan_mode_wrappers() {
@@ -608,11 +529,11 @@ fn local_cli_catalog_includes_plan_mode_wrappers() {
         .collect();
     assert!(
         names.iter().any(|n| n == "enter_plan_mode"),
-        "local CLI catalog should expose enter_plan_mode via the client-backed wrapper"
+        "local CLI catalog should expose enter_plan_mode via the local wrapper"
     );
     assert!(
         names.iter().any(|n| n == "exit_plan_mode"),
-        "local CLI catalog should expose exit_plan_mode via the client-backed wrapper"
+        "local CLI catalog should expose exit_plan_mode via the local wrapper"
     );
 }
 
@@ -699,7 +620,7 @@ fn local_cli_catalog_includes_normalized_reflect_schema() {
 }
 
 #[test]
-fn local_cli_catalog_uses_runtime_env_surface_for_local_runtime() {
+fn local_cli_catalog_exposes_the_root_work_lifecycle() {
     let names: Vec<String> = crate::edge_tools::local_tool_schemas()
         .iter()
         .filter_map(|s| s["function"]["name"].as_str().map(ToString::to_string))
@@ -718,6 +639,16 @@ fn local_cli_catalog_uses_runtime_env_surface_for_local_runtime() {
             "local CLI runtime catalog should expose `{name}`: {names:?}"
         );
     }
+    for name in ["start_work", "run_next_work_item", "inspect_work_plan"] {
+        assert!(
+            names.iter().any(|visible| visible == name),
+            "the CLI root must expose the canonical Work lifecycle: {names:?}"
+        );
+    }
+    assert!(
+        !names.iter().any(|visible| visible == "settle_work_item"),
+        "settlement belongs only to an assigned WorkItem attempt, not the root coordinator"
+    );
 }
 
 #[test]
@@ -725,7 +656,7 @@ fn cli_runtime_catalog_includes_plan_mode_wrappers() {
     let names: Vec<String> = astra_runtime::capabilities::cli_local_tool_schemas(
         crate::edge_tools::local_tool_schemas(),
         Vec::new(),
-        &crate::edge_tools::cli_default_capabilities(false, false),
+        &crate::edge_tools::cli_default_capabilities(false, false, false),
     )
     .into_iter()
     .filter_map(|s| s["function"]["name"].as_str().map(ToString::to_string))
@@ -745,7 +676,7 @@ fn cli_runtime_catalog_hides_background_task_tools_without_registry() {
     let names: Vec<String> = astra_runtime::capabilities::cli_local_tool_schemas(
         crate::edge_tools::local_tool_schemas(),
         Vec::new(),
-        &crate::edge_tools::cli_default_capabilities(false, false),
+        &crate::edge_tools::cli_default_capabilities(false, false, false),
     )
     .into_iter()
     .filter_map(|s| s["function"]["name"].as_str().map(ToString::to_string))
@@ -764,7 +695,7 @@ fn cli_runtime_catalog_includes_background_task_tools_with_registry() {
     let names: Vec<String> = astra_runtime::capabilities::cli_local_tool_schemas(
         crate::edge_tools::local_tool_schemas(),
         Vec::new(),
-        &crate::edge_tools::cli_default_capabilities(false, true),
+        &crate::edge_tools::cli_default_capabilities(false, true, false),
     )
     .into_iter()
     .filter_map(|s| s["function"]["name"].as_str().map(ToString::to_string))

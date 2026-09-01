@@ -74,5 +74,5 @@ pub async fn run_branches_cost_estimate_http() {
         "should exceed tiny budget: {over_j}"
     );
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }

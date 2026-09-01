@@ -172,6 +172,7 @@ async fn record_artifact_retention_backlog_warning(
 ) -> Result<(), sqlx::Error> {
     let event_id = Uuid::new_v4().to_string();
     let mut tx = pool.get().begin().await?;
+    astra_services::storage::admit_session_event_write(&mut tx, "system", "system", true).await?;
     let insert_result = sqlx::query(
         "INSERT INTO agent_events
          (event_id, session_id, user_id, event_type, content, metadata, created_at)

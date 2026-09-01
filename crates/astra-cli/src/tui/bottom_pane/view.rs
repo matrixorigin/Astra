@@ -29,7 +29,6 @@ pub(crate) enum ViewResult {
     },
     Session {
         session_id: String,
-        intent: SessionSelectionIntent,
     },
     WorkspaceTrust(WorkspaceTrustChoice),
     Stats(StatsPanel),
@@ -54,12 +53,6 @@ pub(crate) enum ConfigEditDisposition {
     SaveProject,
     Discard,
     Cancel,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SessionSelectionIntent {
-    Resume,
-    Fork,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,10 +171,6 @@ pub(crate) enum BottomPaneViewAction {
     /// The request stays in the view/action boundary; the observer owns the
     /// eventual network effect and authoritative projection update.
     RefreshAgentMonitor,
-    /// Ask every canonical source behind the task board to bypass its current
-    /// observation backoff. The task board remains read-only; this only
-    /// refreshes its typed projections.
-    RefreshTaskBoard,
     StopBackgroundTask {
         task_id: String,
     },
@@ -259,13 +248,6 @@ pub(crate) trait BottomPaneView: Send {
     /// Whether an open agent transcript still needs the monitor's typed
     /// spawn/run correlation before it can accept canonical live events.
     fn has_pending_agent_transcript_identity(&self) -> bool {
-        false
-    }
-
-    fn refresh_task_board(
-        &mut self,
-        _projection: &crate::tui::task_board_observer::TaskBoardProjection,
-    ) -> bool {
         false
     }
 
@@ -453,12 +435,6 @@ pub(crate) trait BottomPaneView: Send {
     /// in explicitly without pretending to be a conversation.
     fn owns_primary_canvas(&self) -> bool {
         self.conversation_tab_id().is_some()
-    }
-
-    /// Stable workspace identity for global Task Board navigation. This is a
-    /// typed capability: callers never infer the active view from its title.
-    fn is_task_board_view(&self) -> bool {
-        false
     }
 
     /// Resize a focused conversation to own the terminal's primary canvas.

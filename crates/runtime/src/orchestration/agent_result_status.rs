@@ -42,8 +42,7 @@ pub struct AgentToolBudgetRecordProjection {
 
 pub fn project_agent_tool_record(record: &ToolCallRecord) -> AgentToolRecordProjection {
     let parsed_args = record
-        .args_full
-        .as_deref()
+        .authoritative_args_full()
         .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
     let parsed_result = record
         .result_full
@@ -127,15 +126,13 @@ pub fn summarize_agent_tool_budget_result(text: &str) -> String {
 pub fn render_agent_tool_budget_unfinished_detail(
     incomplete_reason: Option<&str>,
     control_errors: &[String],
-    cancelled_by_parent_budget: bool,
+    cancelled_by_runtime: bool,
 ) -> String {
     let mut detail = incomplete_reason
         .map(str::to_string)
         .unwrap_or_else(|| "did not finish before the turn budget was exhausted".to_string());
-    if cancelled_by_parent_budget {
-        detail.push_str(
-            "; the parent turn budget was exhausted and the parent cancelled this sub-agent",
-        );
+    if cancelled_by_runtime {
+        detail.push_str("; the runtime cancelled this sub-agent while settling its owner");
     }
     if !control_errors.is_empty() {
         detail.push_str("; ");
@@ -582,7 +579,7 @@ mod tests {
         );
         assert_eq!(
             detail,
-            "launched and has not produced a child result yet; the parent turn budget was exhausted and the parent cancelled this sub-agent; same-turn retries hit duplicate_within_turn; later retries were blocked after the tool was restricted"
+            "launched and has not produced a child result yet; the runtime cancelled this sub-agent while settling its owner; same-turn retries hit duplicate_within_turn; later retries were blocked after the tool was restricted"
         );
     }
 }

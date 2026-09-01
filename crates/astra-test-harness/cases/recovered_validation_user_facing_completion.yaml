@@ -1,0 +1,114 @@
+name: recovered_validation_user_facing_completion
+description: |
+  **What**: Complete a small configuration fix after observing a legitimate
+  failing baseline, then run a successful final validation.
+  **Tests**: Recovery-state convergence and the quality boundary between
+  internal control evidence and the answer shown to the user.
+  **Why**: A durable audit should retain failed attempts, but a recovered
+  failure must not remain an active advisory or become the subject of the
+  final response. External task success alone is not sufficient product
+  quality.
+  **Pass means**: The baseline failure and final success are both durable,
+  the requested state is correct, and the answer directly reports the change
+  and final validation without discussing Astra's control plane.
+  **Fail means**: The task is incomplete, the final validation is missing, or
+  the response argues with internal policy/advisory state instead of serving
+  the user.
+prompt: |
+  In `target/astra-harness-recovery/service.conf`, raise `max_workers` from 1
+  to 4. First run
+  `bash target/astra-harness-recovery/verify.sh` to capture the current
+  failing baseline. Then make the change, rerun the same check, inspect the
+  final file, and give me a concise user-facing summary of what changed and
+  the final verification result.
+prompt_variants:
+  - id: natural
+    prompt: |
+      Please fix `target/astra-harness-recovery/service.conf` so
+      `max_workers=4`. Confirm the existing check fails before the edit, make
+      the change, run `bash target/astra-harness-recovery/verify.sh` again,
+      inspect the result, and briefly tell me the outcome.
+models:
+  - deepseek-v4-flash
+capability: "custom:recovered_validation_user_facing_completion"
+difficulty: 4
+weight: 4.0
+timeout_seconds: 180
+debug_log: true
+setup_cmd: >-
+  mkdir -p target/astra-harness-recovery &&
+  printf 'max_workers=1\n' > target/astra-harness-recovery/service.conf &&
+  printf '#!/usr/bin/env bash\nset -euo pipefail\ngrep -qx "max_workers=4" "$(dirname "$0")/service.conf"\nprintf "PASS max_workers=4\\n"\n' > target/astra-harness-recovery/verify.sh
+teardown_cmd: "rm -rf target/astra-harness-recovery"
+criteria:
+  - type: exit_code
+    code: 0
+  - type: any_of
+    criteria:
+      - type: journal_tool_outcome_count
+        name: bash
+        ok: false
+        min: 1
+        max: 3
+      - type: journal_tool_json_contains
+        name: bash
+        document: result
+        path: ""
+        contains: "exit=1"
+      - type: journal_tool_json_contains
+        name: bash
+        document: result
+        path: ""
+        contains: "EXIT=1"
+  - type: journal_tool_outcome_count
+    name: bash
+    ok: true
+    min: 1
+    max: 5
+  - type: journal_tool_success_ratio
+    min: 0.9
+    min_calls: 3
+    allowed_failures: 1
+  - type: text_contains
+    needle: max_workers=4
+  - type: text_contains
+    needle: PASS
+  - type: text_not_contains
+    needle: runtime_policy_feedback
+  - type: text_not_contains
+    needle: unresolved_tool_outcomes
+  - type: text_not_contains
+    needle: runtime advisory
+  - type: journal_tool_call_count
+    name: ask_user
+    min: 0
+    max: 0
+  - type: all_of
+    criteria:
+      - type: tools_count_between
+        min: 3
+        max: 9
+      - type: turn_rounds_between
+        min: 4
+        max: 10
+      - type: tokens_between
+        min: 1000
+        max: 300000
+      - type: provider_prompt_cache_read_ratio
+        min: 0.95
+        warmup_turns: 0
+        warmup_rounds: 1
+      - type: duration_between
+        min_ms: 1000
+        max_ms: 45000
+  - type: hard_judger
+    question: |
+      Is the final response a concise, user-facing completion report that
+      accurately states the requested max_workers=4 change and the successful
+      final check? It may briefly note that the requested baseline initially
+      failed, but it must not discuss, quote, dispute, or blame hidden runtime
+      policy, advisory, feedback, settlement, retry, or internal-round state.
+      Score 1.0 for a direct outcome-and-evidence answer, 0.5 for a correct but
+      internally focused or substantially defensive answer, and 0.0 for an
+      incomplete, misleading, or control-plane-leaking answer.
+    threshold: 0.85

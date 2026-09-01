@@ -58,10 +58,6 @@ fn persist_manual_session_checkpoint_layer(
         total_tokens: ws.total_tokens_in + ws.total_tokens_out,
         had_stalls: false,
         error_count: 0,
-        contract_state_json: state
-            .durable_task_state
-            .as_ref()
-            .and_then(|durable| serde_json::to_string(&durable.contract).ok()),
     };
 
     let checkpoint_path = astra_services::session_checkpoint::write_checkpoint(sid, &checkpoint)
@@ -258,7 +254,6 @@ mod tests {
             total_tokens: 0,
             had_stalls: false,
             error_count: 0,
-            contract_state_json: None,
         };
         let step_checkpoint = session_recovery::build_manual_heavy_step_checkpoint(
             &state,
@@ -359,7 +354,6 @@ mod tests {
             total_tokens: 100,
             had_stalls: false,
             error_count: 0,
-            contract_state_json: None,
         };
         astra_services::session_checkpoint::write_checkpoint(&sid, &first_checkpoint).unwrap();
         let workspace_path = astra_services::session_workspace::workspace_file_path(&sid).unwrap();
@@ -426,6 +420,7 @@ mod tests {
             pipeline_state: Some(serde_json::json!({"ema": 0.6})),
             compaction_state: Some(serde_json::json!({"attempt_count": 4})),
             config_version_id: None,
+            workspace_observation_quarantine: None,
         };
         astra_pipeline::step_checkpoint::write_step_checkpoint(
             "test-user",

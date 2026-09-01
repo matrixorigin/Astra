@@ -6,8 +6,19 @@ use crate::cli::permission_manager::PermissionManager;
 use crate::cli::session::session_state::ExplainMode;
 use crate::edge_tools;
 use astra_runtime::tool_registry;
-use astra_services::session_journal::{self, JournalDirGuard, JournalEventType};
+use astra_services::session_journal::{self, JournalEventType, ProcessJournalDirGuard};
 use axum::{Json, Router, routing::post};
+
+const TEST_SSE_HEADERS: [(&str, &str); 2] = [
+    ("content-type", "text/event-stream"),
+    // Mirrors the public Server/ThinClient response contract. These tests use
+    // an in-process Axum peer and must not silently emulate a pre-contract
+    // Server now that production clients fail closed on a missing header.
+    (
+        astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER,
+        astra_server_types::AGENT_INTERACTION_API_MAJOR,
+    ),
+];
 
 // ── chat_stream (SSE agentic loop) ────────────────────────────────────
 
@@ -15,28 +26,80 @@ use axum::{Json, Router, routing::post};
 /// to sibling test modules (e.g. `resume_tests`) so they don't have to
 /// duplicate the payload literal.
 pub(super) fn sse_text_response(text: &str, session_id: &str) -> String {
+    sse_text_response_with_execution_summary(text, session_id, 0, 0, &[], 1)
+}
+
+fn sse_text_response_with_execution_summary(
+    text: &str,
+    session_id: &str,
+    tool_calls_count: u32,
+    observation_tool_calls_count: u32,
+    tools_used: &[&str],
+    llm_rounds: u32,
+) -> String {
     format!(
         "data: {{\"type\":\"session_info\",\"session_id\":\"{session_id}\",\"run_id\":\"run-{session_id}\"}}\n\n\
              data: {{\"type\":\"text_delta\",\"content\":\"{text}\"}}\n\n\
              data: {{\"type\":\"text_done\",\"full_text\":\"{text}\"}}\n\n\
              data: {{\"type\":\"usage\",\"input_tokens\":10,\"output_tokens\":5}}\n\n\
-             data: {{\"type\":\"turn_complete\",\"has_tool_calls\":false}}\n\n\
-             data: [DONE]\n\n"
+             data: {}\n\n\
+             data: [DONE]\n\n",
+        serde_json::json!({
+            "type": "turn_complete",
+            "has_tool_calls": tool_calls_count > 0,
+            "continuation_owner": "server",
+            "tool_calls_count": tool_calls_count,
+            "observation_tool_calls_count": observation_tool_calls_count,
+            "tools_used": tools_used,
+            "llm_rounds": llm_rounds,
+            "runtime_feedback": {
+                "schema_version": astra_turn_core::context_feedback::RuntimeFeedbackFrame::SCHEMA_VERSION,
+                "identity": {
+                    "session_id": session_id,
+                    "run_id": format!("run-{session_id}"),
+                    "agent_id": "root",
+                    "model_id": "mock-model",
+                    "topology": "cli_server"
+                },
+                "progress": {
+                    "session_turn": 1,
+                    "agentic_round_index": llm_rounds.saturating_sub(1),
+                    "llm_rounds_completed": llm_rounds,
+                    "slice_round_limit": 60,
+                    "slice_rounds_remaining": 60u32.saturating_sub(llm_rounds)
+                },
+                "context": { "compaction_tier": "normal" },
+                "request_usage": {
+                    "prompt": 10,
+                    "cache_read": 0,
+                    "cache_creation": 0,
+                    "completion": 5
+                },
+                "run_usage": {
+                    "prompt": 10,
+                    "cache_read": 0,
+                    "cache_creation": 0,
+                    "completion": 5
+                },
+                "was_truncated": false,
+                "policy_feedback": { "state": "not_evaluated" }
+            }
+        })
     )
 }
 
 #[tokio::test]
-async fn stream_chat_sse_cannot_turn_active_fanout_into_a_completion_claim() {
+async fn stream_chat_sse_sends_active_work_as_authoritative_server_context() {
     let captured_request = std::sync::Arc::new(std::sync::Mutex::new(None));
     let captured_request_for_route = captured_request.clone();
     let app = Router::new().route(
-        "/chat/turn",
+        "/chat/stream",
         post(move |Json(payload): Json<serde_json::Value>| {
             let captured_request = captured_request_for_route.clone();
             async move {
                 *captured_request.lock().unwrap() = Some(payload);
                 (
-                    [("content-type", "text/event-stream")],
+                    TEST_SSE_HEADERS,
                     sse_text_response(
                         "All three agents completed. Here is the consolidated report.",
                         "sess-active-fanout",
@@ -63,8 +126,6 @@ async fn stream_chat_sse_cannot_turn_active_fanout_into_a_completion_claim() {
         unified_skill_registry: &unified_skill_registry,
         agent_spawner: None,
         root_agent_id: None,
-        task_manager: None,
-        task_notify_tx: None,
         bg_task_commands: None,
         bg_task_list_cache: None,
         bash_detach_slot: None,
@@ -106,21 +167,13 @@ async fn stream_chat_sse_cannot_turn_active_fanout_into_a_completion_claim() {
             .full_text
             .contains("All three agents completed. Here is the consolidated report.")
     );
-    assert!(
-        result.full_text.contains(
-            "Runtime state (authoritative): 1 asynchronous work unit(s) remain non-terminal"
-        ),
-        "runtime must deterministically qualify a false completion claim: {}",
-        result.full_text
-    );
-    assert!(
-        result
-            .full_text
-            .contains("This response is a partial snapshot, not a completion report")
+    assert_eq!(
+        result.full_text, "All three agents completed. Here is the consolidated report.",
+        "the Edge client must not rewrite Server-owned completion text"
     );
 
     let request = captured_request.lock().unwrap().clone().unwrap();
-    let injections = request["edge_profile"]
+    let injections = request["context"]["edge_profile"]
         [astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS]
         .as_array()
         .expect("typed runtime injection lane");
@@ -145,14 +198,15 @@ fn mock_mcp_server_binary() -> std::path::PathBuf {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_id() {
+#[serial_test::serial]
+async fn stream_chat_sse_late_binds_fresh_request_then_persists_canonical_turn() {
     let temp = tempfile::tempdir().unwrap();
-    let _guard = JournalDirGuard::new(temp.path());
+    let _guard = ProcessJournalDirGuard::new(temp.path());
     let app = Router::new().route(
-        "/chat/turn",
+        "/chat/stream",
         post(|| async {
             (
-                [("content-type", "text/event-stream")],
+                TEST_SSE_HEADERS,
                 sse_text_response("Hello!", "sess-step-adopt"),
             )
         }),
@@ -162,8 +216,12 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
     let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
+    let request_lease =
+        crate::cli::session::session_execution_lease::RequestSessionExecutionLease::new(None)
+            .unwrap();
+    let turn_start = std::time::Instant::now();
 
-    let result = stream_chat_sse(ChatTurnParams {
+    let mut result = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
         auth_profile: None,
@@ -189,6 +247,7 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
         activated_deferred_tool_names: None,
         resume_restricted_tools: &[],
         tool_health_entries: &[],
+        workspace_observation_quarantine: None,
         session_lessons: &[],
         latest_skill_diagnosis: None,
         latest_turn_quality_feedback: None,
@@ -197,8 +256,10 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
         plan_subtask_id: None,
         delegation_engine: None,
         cancel_token: None,
+        execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        request_session_execution_lease: Some(request_lease.clone()),
         plan_assemble_line_release: None,
         stream_event_tx: None,
         stream_json_emitter: None,
@@ -222,8 +283,6 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
         git_commit_journal: None,
         git_worktree_journal: None,
         session_state_journal: None,
-        task_manager: None,
-        task_notify_tx: None,
         bg_task_commands: None,
         bg_task_list_cache: None,
         bash_detach_slot: None,
@@ -234,7 +293,6 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
         idempotency_cache: None,
         pre_loaded_messages: None,
         append_system_prompt: None,
-        session_memory_extractor: None,
         #[cfg(feature = "harness")]
         harness_sink: None,
         #[cfg(feature = "harness")]
@@ -246,6 +304,27 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
     .unwrap();
 
     assert_eq!(result.session_id.as_deref(), Some("sess-step-adopt"));
+    assert!(
+        astra_services::session_journal::SessionExecutionLease::try_acquire("sess-step-adopt")
+            .is_err(),
+        "the first accepted Server identity must bind before stream completion"
+    );
+    let exit_code = crate::cli::command_router::finalize_one_shot_stream_result_with_request_lease(
+        None,
+        Some("test-model"),
+        "hi",
+        &mut result,
+        turn_start,
+        request_lease.as_ref(),
+    );
+    assert_eq!(exit_code, crate::cli::exit_code::ExitCode::Success);
+    assert_eq!(result.session_persistence_error, None);
+    let restored =
+        crate::cli::session::session_continuation::load_session_messages_for_continuation(
+            "sess-step-adopt",
+        )
+        .expect("late-bound canonical continuation");
+    assert_eq!(restored.last().unwrap()["content"], "Hello!");
 
     let cli_user_id = crate::cli::cli_config::cli_utils::cli_user_id();
     let store =
@@ -258,8 +337,9 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
     assert!(
         events
             .iter()
-            .any(|e| e.step_id == "sess-step-adopt-turn-1-step-0"),
-        "expected step_id sess-step-adopt-turn-1-step-0, found: {:?}",
+            .any(|event| event.step_id.starts_with("sess-step-adopt-run-")
+                && event.step_id.ends_with("-turn-1-step-0")),
+        "expected a run-scoped first-turn step identity, found: {:?}",
         events.iter().map(|e| &e.step_id).collect::<Vec<_>>()
     );
     let ephemeral_store =
@@ -273,13 +353,8 @@ async fn stream_chat_sse_persists_first_turn_step_events_under_adopted_session_i
 #[tokio::test]
 async fn stream_chat_sse_simple_text_response() {
     let app = Router::new().route(
-        "/chat/turn",
-        post(|| async {
-            (
-                [("content-type", "text/event-stream")],
-                sse_text_response("Hello!", "sess-001"),
-            )
-        }),
+        "/chat/stream",
+        post(|| async { (TEST_SSE_HEADERS, sse_text_response("Hello!", "sess-001")) }),
     );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
@@ -312,6 +387,7 @@ async fn stream_chat_sse_simple_text_response() {
         activated_deferred_tool_names: None,
         resume_restricted_tools: &[],
         tool_health_entries: &[],
+        workspace_observation_quarantine: None,
         session_lessons: &[],
         latest_skill_diagnosis: None,
         latest_turn_quality_feedback: None,
@@ -320,8 +396,10 @@ async fn stream_chat_sse_simple_text_response() {
         plan_subtask_id: None,
         delegation_engine: None,
         cancel_token: None,
+        execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
         stream_json_emitter: None,
@@ -345,8 +423,6 @@ async fn stream_chat_sse_simple_text_response() {
         git_commit_journal: None,
         git_worktree_journal: None,
         session_state_journal: None,
-        task_manager: None,
-        task_notify_tx: None,
         bg_task_commands: None,
         bg_task_list_cache: None,
         bash_detach_slot: None,
@@ -357,7 +433,6 @@ async fn stream_chat_sse_simple_text_response() {
         idempotency_cache: None,
         pre_loaded_messages: None,
         append_system_prompt: None,
-        session_memory_extractor: None,
         #[cfg(feature = "harness")]
         harness_sink: None,
         #[cfg(feature = "harness")]
@@ -384,17 +459,14 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         turn_payloads: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
     };
     let app = Router::new().route(
-        "/chat/turn",
+        "/chat/stream",
         post({
             let state = state.clone();
             move |axum::Json(body): axum::Json<serde_json::Value>| {
                 let state = state.clone();
                 async move {
                     state.turn_payloads.lock().await.push(body);
-                    (
-                        [("content-type", "text/event-stream")],
-                        sse_text_response("Hello!", "sess-traced"),
-                    )
+                    (TEST_SSE_HEADERS, sse_text_response("Hello!", "sess-traced"))
                 }
             }
         }),
@@ -431,6 +503,7 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         activated_deferred_tool_names: None,
         resume_restricted_tools: &[],
         tool_health_entries: &[],
+        workspace_observation_quarantine: None,
         session_lessons: &[],
         latest_skill_diagnosis: None,
         latest_turn_quality_feedback: None,
@@ -439,8 +512,10 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         plan_subtask_id: None,
         delegation_engine: None,
         cancel_token: None,
+        execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
         stream_json_emitter: None,
@@ -464,8 +539,6 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         git_commit_journal: None,
         git_worktree_journal: None,
         session_state_journal: None,
-        task_manager: None,
-        task_notify_tx: None,
         bg_task_commands: None,
         bg_task_list_cache: None,
         bash_detach_slot: None,
@@ -476,7 +549,6 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
         idempotency_cache: None,
         pre_loaded_messages: None,
         append_system_prompt: None,
-        session_memory_extractor: None,
         #[cfg(feature = "harness")]
         harness_sink: None,
         #[cfg(feature = "harness")]
@@ -497,13 +569,8 @@ async fn stream_chat_sse_preserves_existing_session_id_for_server_scoped_trace()
 #[tokio::test]
 async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
     let app = Router::new().route(
-        "/chat/turn",
-        post(|| async {
-            (
-                [("content-type", "text/event-stream")],
-                sse_text_response("Hello!", "sess-001"),
-            )
-        }),
+        "/chat/stream",
+        post(|| async { (TEST_SSE_HEADERS, sse_text_response("Hello!", "sess-001")) }),
     );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
@@ -554,6 +621,7 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
             activated_deferred_tool_names: None,
             resume_restricted_tools: &[],
             tool_health_entries: &[],
+            workspace_observation_quarantine: None,
             session_lessons: &[],
             latest_skill_diagnosis: None,
             latest_turn_quality_feedback: None,
@@ -562,8 +630,10 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
             plan_subtask_id: None,
             delegation_engine: None,
             cancel_token: None,
+            execution_time_budget: None,
             run_control: None,
             incremental_state: None,
+            request_session_execution_lease: None,
             plan_assemble_line_release: None,
             stream_event_tx: None,
             stream_json_emitter: None,
@@ -587,8 +657,6 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
             git_commit_journal: None,
             git_worktree_journal: None,
             session_state_journal: None,
-            task_manager: None,
-            task_notify_tx: None,
             bg_task_commands: None,
             bg_task_list_cache: None,
             bash_detach_slot: None,
@@ -599,7 +667,6 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
             idempotency_cache: None,
             pre_loaded_messages: None,
             append_system_prompt: None,
-            session_memory_extractor: None,
             #[cfg(feature = "harness")]
             harness_sink: None,
             #[cfg(feature = "harness")]
@@ -620,13 +687,31 @@ async fn stream_chat_sse_reuses_persistent_root_mailbox_across_turns() {
 }
 
 #[tokio::test]
-async fn stream_chat_sse_executes_bound_agent_spawn_to_child_request() {
-    let mock = crate::cli::mock_llm::MockLlmServer::start(
-        crate::cli::mock_llm::MockScenario::AgentThenComplete,
-    )
-    .await
-    .expect("start scripted parent and child LLM server");
-    let api = astra_thin_client::ThinClient::new(&mock.base_url, None).unwrap();
+async fn stream_chat_sse_does_not_delegate_server_continuation_to_cli_spawner() {
+    let admissions = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let admissions_for_route = admissions.clone();
+    let app = Router::new().route(
+        "/chat/stream",
+        post(move || {
+            let admissions = admissions_for_route.clone();
+            async move {
+                admissions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (
+                    TEST_SSE_HEADERS,
+                    sse_text_response_with_execution_summary(
+                        "Server completed the turn",
+                        "sess-server-loop",
+                        3,
+                        2,
+                        &["agent", "tool_search"],
+                        4,
+                    ),
+                )
+            }
+        }),
+    );
+    let base = spawn_mock(app).await;
+    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
     let unified_skill_registry = astra_runtime::skills::empty_unified_registry().clone();
     let spawner = crate::cli::agent_runtime::build_one_shot_spawner(
         &api,
@@ -645,8 +730,8 @@ async fn stream_chat_sse_executes_bound_agent_spawn_to_child_request() {
             api: &api,
             token: "fake-token",
             auth_profile: None,
-            message: "delegate_one_child_and_keep_it_observable",
-            user_intent: "delegate_one_child_and_keep_it_observable",
+            message: "delegate this work",
+            user_intent: "delegate this work",
             input_runtime_required_texts: &[],
             input_active_system_skills: &[],
             input_runtime_volatile_texts: &[],
@@ -667,6 +752,7 @@ async fn stream_chat_sse_executes_bound_agent_spawn_to_child_request() {
             activated_deferred_tool_names: None,
             resume_restricted_tools: &[],
             tool_health_entries: &[],
+            workspace_observation_quarantine: None,
             session_lessons: &[],
             latest_skill_diagnosis: None,
             latest_turn_quality_feedback: None,
@@ -675,8 +761,10 @@ async fn stream_chat_sse_executes_bound_agent_spawn_to_child_request() {
             plan_subtask_id: None,
             delegation_engine: None,
             cancel_token: None,
+            execution_time_budget: None,
             run_control: None,
             incremental_state: None,
+            request_session_execution_lease: None,
             plan_assemble_line_release: None,
             stream_event_tx: None,
             stream_json_emitter: None,
@@ -700,8 +788,6 @@ async fn stream_chat_sse_executes_bound_agent_spawn_to_child_request() {
             git_commit_journal: None,
             git_worktree_journal: None,
             session_state_journal: None,
-            task_manager: None,
-            task_notify_tx: None,
             bg_task_commands: None,
             bg_task_list_cache: None,
             bash_detach_slot: None,
@@ -712,7 +798,6 @@ async fn stream_chat_sse_executes_bound_agent_spawn_to_child_request() {
             idempotency_cache: None,
             pre_loaded_messages: None,
             append_system_prompt: None,
-            session_memory_extractor: None,
             #[cfg(feature = "harness")]
             harness_sink: None,
             #[cfg(feature = "harness")]
@@ -725,47 +810,22 @@ async fn stream_chat_sse_executes_bound_agent_spawn_to_child_request() {
     .expect("agent spawn turn should not hang")
     .expect("agent spawn turn should complete");
 
-    assert!(
-        result
-            .full_text
-            .contains("Parent synthesized the child evidence"),
-        "parent should continue after one child result: {:?}",
-        result.full_text
+    assert_eq!(result.full_text, "Server completed the turn");
+    assert_eq!(result.tool_calls_count, 3);
+    assert_eq!(result.tools_used, ["agent", "tool_search"]);
+    assert_eq!(result.llm_rounds, Some(4));
+    assert_eq!(
+        admissions.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a configured CLI spawner must not create another model admission"
     );
-    let child_requests = mock
-        .received_requests()
-        .into_iter()
-        .filter(|request| {
-            request
-                .get("agent_type")
-                .and_then(serde_json::Value::as_str)
-                == Some("general-purpose")
-                && request
-                    .get("messages")
-                    .and_then(serde_json::Value::as_array)
-                    .and_then(|messages| {
-                        messages.iter().rev().find(|message| {
-                            message.get("role").and_then(serde_json::Value::as_str) == Some("user")
-                        })
-                    })
-                    .and_then(|message| message.get("content"))
-                    .and_then(serde_json::Value::as_str)
-                    == Some(crate::cli::mock_llm::AGENT_JOURNEY_CHILD_TASK)
-        })
-        .count();
-    assert_eq!(child_requests, 1);
 }
 
 #[tokio::test]
 async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
     let app = Router::new().route(
-        "/chat/turn",
-        post(|| async {
-            (
-                [("content-type", "text/event-stream")],
-                sse_text_response("Hello!", "sess-001"),
-            )
-        }),
+        "/chat/stream",
+        post(|| async { (TEST_SSE_HEADERS, sse_text_response("Hello!", "sess-001")) }),
     );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
@@ -806,6 +866,7 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
         activated_deferred_tool_names: None,
         resume_restricted_tools: &[],
         tool_health_entries: &[],
+        workspace_observation_quarantine: None,
         session_lessons: &[],
         latest_skill_diagnosis: None,
         latest_turn_quality_feedback: None,
@@ -814,8 +875,10 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
         plan_subtask_id: None,
         delegation_engine: None,
         cancel_token: None,
+        execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
         stream_json_emitter: None,
@@ -839,8 +902,6 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
         git_commit_journal: None,
         git_worktree_journal: None,
         session_state_journal: None,
-        task_manager: None,
-        task_notify_tx: None,
         bg_task_commands: None,
         bg_task_list_cache: None,
         bash_detach_slot: None,
@@ -851,7 +912,6 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
         idempotency_cache: None,
         pre_loaded_messages: None,
         append_system_prompt: None,
-        session_memory_extractor: None,
         #[cfg(feature = "harness")]
         harness_sink: None,
         #[cfg(feature = "harness")]
@@ -872,7 +932,7 @@ async fn stream_chat_sse_unregisters_ephemeral_root_mailbox() {
 #[tokio::test]
 async fn stream_chat_sse_api_error_propagated() {
     let app = Router::new().route(
-        "/chat/turn",
+        "/chat/stream",
         post(|| async {
             (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
@@ -911,6 +971,7 @@ async fn stream_chat_sse_api_error_propagated() {
         activated_deferred_tool_names: None,
         resume_restricted_tools: &[],
         tool_health_entries: &[],
+        workspace_observation_quarantine: None,
         session_lessons: &[],
         latest_skill_diagnosis: None,
         latest_turn_quality_feedback: None,
@@ -919,8 +980,10 @@ async fn stream_chat_sse_api_error_propagated() {
         plan_subtask_id: None,
         delegation_engine: None,
         cancel_token: None,
+        execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
         stream_json_emitter: None,
@@ -944,8 +1007,6 @@ async fn stream_chat_sse_api_error_propagated() {
         git_commit_journal: None,
         git_worktree_journal: None,
         session_state_journal: None,
-        task_manager: None,
-        task_notify_tx: None,
         bg_task_commands: None,
         bg_task_list_cache: None,
         bash_detach_slot: None,
@@ -956,7 +1017,6 @@ async fn stream_chat_sse_api_error_propagated() {
         idempotency_cache: None,
         pre_loaded_messages: None,
         append_system_prompt: None,
-        session_memory_extractor: None,
         #[cfg(feature = "harness")]
         harness_sink: None,
         #[cfg(feature = "harness")]
@@ -976,7 +1036,7 @@ async fn stream_chat_sse_with_tool_call_loop() {
     let call_count = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
     let cc = call_count.clone();
     let app = Router::new().route(
-            "/chat/turn",
+            "/chat/stream",
             post(move || {
                 let cc = cc.clone();
                 async move {
@@ -993,7 +1053,7 @@ async fn stream_chat_sse_with_tool_call_loop() {
                         sse_text_response("Done!", "sess-tc")
                     };
                     (
-                        [("content-type", "text/event-stream")],
+                        TEST_SSE_HEADERS,
                         body,
                     )
                 }
@@ -1030,6 +1090,7 @@ async fn stream_chat_sse_with_tool_call_loop() {
         activated_deferred_tool_names: None,
         resume_restricted_tools: &[],
         tool_health_entries: &[],
+        workspace_observation_quarantine: None,
         session_lessons: &[],
         latest_skill_diagnosis: None,
         latest_turn_quality_feedback: None,
@@ -1038,8 +1099,10 @@ async fn stream_chat_sse_with_tool_call_loop() {
         plan_subtask_id: None,
         delegation_engine: None,
         cancel_token: None,
+        execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
         stream_json_emitter: None,
@@ -1063,8 +1126,6 @@ async fn stream_chat_sse_with_tool_call_loop() {
         git_commit_journal: None,
         git_worktree_journal: None,
         session_state_journal: None,
-        task_manager: None,
-        task_notify_tx: None,
         bg_task_commands: None,
         bg_task_list_cache: None,
         bash_detach_slot: None,
@@ -1075,7 +1136,6 @@ async fn stream_chat_sse_with_tool_call_loop() {
         idempotency_cache: None,
         pre_loaded_messages: None,
         append_system_prompt: None,
-        session_memory_extractor: None,
         #[cfg(feature = "harness")]
         harness_sink: None,
         #[cfg(feature = "harness")]
@@ -1095,9 +1155,10 @@ async fn stream_chat_sse_with_tool_call_loop() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+#[serial_test::serial]
 async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
     let temp = tempfile::tempdir().unwrap();
-    let _guard = JournalDirGuard::new(temp.path());
+    let _guard = ProcessJournalDirGuard::new(temp.path());
     #[derive(Clone)]
     struct StreamingMockState {
         call_count: std::sync::Arc<std::sync::atomic::AtomicU32>,
@@ -1110,7 +1171,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
     };
     let app = Router::new()
         .route(
-            "/chat/turn",
+            "/chat/stream",
             post({
                 let state = state.clone();
                 move |axum::Json(request): axum::Json<serde_json::Value>| {
@@ -1134,6 +1195,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
                                     "run_id": "run-sess-tx-e2e",
                                     "turn_chain_id": turn_chain_id,
                                     "request_id": "tr-tx-1",
+                                    "schema_admitted_by_server": true,
                                     "tool": "bash",
                                     "args": {
                                         "command": "echo hi",
@@ -1145,7 +1207,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
                         } else {
                             sse_text_response("Done!", "sess-tx-e2e")
                         };
-                        ([("content-type", "text/event-stream")], body)
+                        (TEST_SSE_HEADERS, body)
                     }
                 }
             }),
@@ -1194,6 +1256,7 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         activated_deferred_tool_names: None,
         resume_restricted_tools: &[],
         tool_health_entries: &[],
+        workspace_observation_quarantine: None,
         session_lessons: &[],
         latest_skill_diagnosis: None,
         latest_turn_quality_feedback: None,
@@ -1202,8 +1265,10 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         plan_subtask_id: None,
         delegation_engine: None,
         cancel_token: None,
+        execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
         stream_json_emitter: None,
@@ -1227,8 +1292,6 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         git_commit_journal: None,
         git_worktree_journal: None,
         session_state_journal: None,
-        task_manager: None,
-        task_notify_tx: None,
         bg_task_commands: None,
         bg_task_list_cache: None,
         bash_detach_slot: None,
@@ -1239,7 +1302,6 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
         idempotency_cache: None,
         pre_loaded_messages: None,
         append_system_prompt: None,
-        session_memory_extractor: None,
         #[cfg(feature = "harness")]
         harness_sink: None,
         #[cfg(feature = "harness")]
@@ -1301,72 +1363,36 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_retries() {
+async fn stream_chat_sse_submits_one_server_owned_turn_without_client_cursor() {
     #[derive(Clone)]
     struct StreamingMockState {
         call_count: std::sync::Arc<std::sync::atomic::AtomicU32>,
         turn_payloads: std::sync::Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
-        tool_results: std::sync::Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
     }
 
     let state = StreamingMockState {
         call_count: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
         turn_payloads: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
-        tool_results: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
     };
-    let app = Router::new()
-        .route(
-            "/chat/turn",
-            post({
+    let app = Router::new().route(
+        "/chat/stream",
+        post({
+            let state = state.clone();
+            move |axum::Json(body): axum::Json<serde_json::Value>| {
                 let state = state.clone();
-                move |axum::Json(body): axum::Json<serde_json::Value>| {
-                    let state = state.clone();
-                    async move {
-                        let turn_chain_id = body
-                            .get("turn_chain_id")
-                            .and_then(serde_json::Value::as_str)
-                            .unwrap_or("chain-turn-identity")
-                            .to_string();
-                        state.turn_payloads.lock().await.push(body);
-                        let n = state
-                            .call_count
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let response = if n == 0 {
-                            format!(
-                                "data: {{\"type\":\"session_info\",\"session_id\":\"sess-turn-identity\",\"run_id\":\"run-sess-turn-identity\"}}\n\n\
-                                 data: {}\n\n\
-                                 data: [DONE]\n\n",
-                                serde_json::json!({
-                                    "type": "tool_request",
-                                    "session_id": "sess-turn-identity",
-                                    "run_id": "run-sess-turn-identity",
-                                    "turn_chain_id": turn_chain_id,
-                                    "request_id": "tr-turn-1",
-                                    "tool": "bash",
-                                    "args": {"command": "echo hi"}
-                                })
-                            )
-                        } else {
-                            sse_text_response("Done!", "sess-turn-identity")
-                        };
-                        ([("content-type", "text/event-stream")], response)
-                    }
+                async move {
+                    state.turn_payloads.lock().await.push(body);
+                    state
+                        .call_count
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (
+                        TEST_SSE_HEADERS,
+                        sse_text_response("Done!", "sess-turn-identity"),
+                    )
                 }
-            }),
-        )
-        .route(
-            "/tools/result",
-            post({
-                let state = state.clone();
-                move |axum::Json(body): axum::Json<serde_json::Value>| {
-                    let state = state.clone();
-                    async move {
-                        state.tool_results.lock().await.push(body);
-                        axum::Json(serde_json::json!({ "ok": true }))
-                    }
-                }
-            }),
-        );
+            }
+        }),
+    );
     let base = spawn_mock(app).await;
     let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
     let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
@@ -1398,6 +1424,7 @@ async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_ret
         activated_deferred_tool_names: None,
         resume_restricted_tools: &[],
         tool_health_entries: &[],
+        workspace_observation_quarantine: None,
         session_lessons: &[],
         latest_skill_diagnosis: None,
         latest_turn_quality_feedback: None,
@@ -1406,8 +1433,10 @@ async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_ret
         plan_subtask_id: None,
         delegation_engine: None,
         cancel_token: None,
+        execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
         stream_json_emitter: None,
@@ -1431,8 +1460,6 @@ async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_ret
         git_commit_journal: None,
         git_worktree_journal: None,
         session_state_journal: None,
-        task_manager: None,
-        task_notify_tx: None,
         bg_task_commands: None,
         bg_task_list_cache: None,
         bash_detach_slot: None,
@@ -1443,7 +1470,6 @@ async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_ret
         idempotency_cache: None,
         pre_loaded_messages: None,
         append_system_prompt: None,
-        session_memory_extractor: None,
         #[cfg(feature = "harness")]
         harness_sink: None,
         #[cfg(feature = "harness")]
@@ -1461,18 +1487,25 @@ async fn stream_chat_sse_reuses_authoritative_turn_identity_across_chat_turn_ret
     );
 
     let payloads = state.turn_payloads.lock().await;
-    assert_eq!(payloads.len(), 2, "expected two /chat/turn payloads");
-    assert_eq!(payloads[0]["session_turn"], serde_json::json!(1));
-    assert_eq!(payloads[1]["session_turn"], serde_json::json!(1));
-    assert_eq!(payloads[0]["turn_chain_id"], payloads[1]["turn_chain_id"]);
-    assert_eq!(
-        payloads[0]["user_query_event_id"],
-        payloads[1]["user_query_event_id"]
-    );
+    assert_eq!(payloads.len(), 1, "one user action is one Server admission");
+    let payload = &payloads[0];
+    assert_eq!(payload["message"], "review local changes");
+    for client_owned in [
+        "messages",
+        "tool_results",
+        "session_turn",
+        "turn_chain_id",
+        "user_query_event_id",
+    ] {
+        assert!(
+            payload.get(client_owned).is_none(),
+            "{client_owned} must be restored by the Server"
+        );
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn stream_chat_sse_resynchronizes_stale_bridge_session_turn_once() {
+async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_state() {
     #[derive(Clone)]
     struct StreamingMockState {
         call_count: std::sync::Arc<std::sync::atomic::AtomicU32>,
@@ -1484,7 +1517,7 @@ async fn stream_chat_sse_resynchronizes_stale_bridge_session_turn_once() {
         turn_payloads: std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new())),
     };
     let app = Router::new().route(
-        "/chat/turn",
+        "/chat/stream",
         post({
             let state = state.clone();
             move |axum::Json(body): axum::Json<serde_json::Value>| {
@@ -1499,11 +1532,11 @@ async fn stream_chat_sse_resynchronizes_stale_bridge_session_turn_once() {
                             "data: {}\n\ndata: [DONE]\n\n",
                             serde_json::json!({
                                 "type": "error",
-                                "message": "explicit bridge session_turn 1 is stale for session sess-stale; expected at least 2",
-                                "error_code": "bridge_session_turn_stale",
+                                "message": "explicit bridge session_turn 3 does not match canonical turn 2",
+                                "error_code": "bridge_session_turn_mismatch",
                                 "metadata": {
                                     "session_id": "sess-stale",
-                                    "actual_session_turn": 1,
+                                    "actual_session_turn": 3,
                                     "expected_session_turn": 2,
                                     "turn_chain_id": "root-chain",
                                     "user_query_event_id": "root-query"
@@ -1513,7 +1546,7 @@ async fn stream_chat_sse_resynchronizes_stale_bridge_session_turn_once() {
                     } else {
                         sse_text_response("Recovered!", "sess-stale")
                     };
-                    ([("content-type", "text/event-stream")], response)
+                    (TEST_SSE_HEADERS, response)
                 }
             }
         }),
@@ -1523,7 +1556,7 @@ async fn stream_chat_sse_resynchronizes_stale_bridge_session_turn_once() {
     let _registry = tool_registry::ToolRegistry::new(edge_tools::all_tool_schemas());
     let mut pm = PermissionManager::new(true);
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
-    let result = stream_chat_sse(ChatTurnParams {
+    let failure = stream_chat_sse(ChatTurnParams {
         api: &api,
         token: "fake-token",
         auth_profile: None,
@@ -1549,6 +1582,7 @@ async fn stream_chat_sse_resynchronizes_stale_bridge_session_turn_once() {
         activated_deferred_tool_names: None,
         resume_restricted_tools: &[],
         tool_health_entries: &[],
+        workspace_observation_quarantine: None,
         session_lessons: &[],
         latest_skill_diagnosis: None,
         latest_turn_quality_feedback: None,
@@ -1557,8 +1591,10 @@ async fn stream_chat_sse_resynchronizes_stale_bridge_session_turn_once() {
         plan_subtask_id: None,
         delegation_engine: None,
         cancel_token: None,
+        execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
         stream_json_emitter: None,
@@ -1582,19 +1618,16 @@ async fn stream_chat_sse_resynchronizes_stale_bridge_session_turn_once() {
         git_commit_journal: None,
         git_worktree_journal: None,
         session_state_journal: None,
-        task_manager: None,
-        task_notify_tx: None,
         bg_task_commands: None,
         bg_task_list_cache: None,
         bash_detach_slot: None,
-        turn_index: DEFAULT_TURN_INDEX,
+        turn_index: 3,
         pipeline_state: None,
         compaction_state: None,
         consecutive_context_window_errors: 0,
         idempotency_cache: None,
         pre_loaded_messages: None,
         append_system_prompt: None,
-        session_memory_extractor: None,
         #[cfg(feature = "harness")]
         harness_sink: None,
         #[cfg(feature = "harness")]
@@ -1603,19 +1636,19 @@ async fn stream_chat_sse_resynchronizes_stale_bridge_session_turn_once() {
         benchmark_profile: None,
     })
     .await
-    .unwrap();
+    .expect_err("canonical conflicts must be returned to the caller");
 
-    assert_eq!(result.full_text, "Recovered!");
+    assert!(
+        failure.error.contains("canonical turn 2"),
+        "typed Server error should be preserved: {}",
+        failure.error
+    );
 
     let payloads = state.turn_payloads.lock().await;
-    assert_eq!(payloads.len(), 2, "expected stale conflict plus one retry");
-    assert_eq!(payloads[0]["session_turn"], serde_json::json!(1));
-    assert_eq!(payloads[1]["session_turn"], serde_json::json!(2));
-    assert_eq!(payloads[0]["turn_chain_id"], payloads[1]["turn_chain_id"]);
-    assert_eq!(
-        payloads[0]["user_query_event_id"],
-        payloads[1]["user_query_event_id"]
-    );
+    assert_eq!(payloads.len(), 1, "the CLI must not manufacture a retry");
+    assert!(payloads[0].get("session_turn").is_none());
+    assert!(payloads[0].get("turn_chain_id").is_none());
+    assert!(payloads[0].get("user_query_event_id").is_none());
 }
 
 // ── Phase 3C: Chat stream MCP integration tests ──────────────────────────────
@@ -1660,7 +1693,7 @@ async fn stream_chat_sse_dispatches_mcp_tool_call() {
     let cc = call_count.clone();
     let tool_name_clone = mcp_tool_name.clone();
     let app = axum::Router::new().route(
-        "/chat/turn",
+        "/chat/stream",
         axum::routing::post(move || {
             let cc = cc.clone();
             let tn = tool_name_clone.clone();
@@ -1677,10 +1710,7 @@ async fn stream_chat_sse_dispatches_mcp_tool_call() {
                 } else {
                     sse_text_response("MCP done!", "sess-mcp")
                 };
-                (
-                    [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-                    body,
-                )
+                (TEST_SSE_HEADERS, body)
             }
         }),
     );
@@ -1717,6 +1747,7 @@ async fn stream_chat_sse_dispatches_mcp_tool_call() {
         activated_deferred_tool_names: None,
         resume_restricted_tools: &[],
         tool_health_entries: &[],
+        workspace_observation_quarantine: None,
         session_lessons: &[],
         latest_skill_diagnosis: None,
         latest_turn_quality_feedback: None,
@@ -1725,8 +1756,10 @@ async fn stream_chat_sse_dispatches_mcp_tool_call() {
         plan_subtask_id: None,
         delegation_engine: None,
         cancel_token: None,
+        execution_time_budget: None,
         run_control: None,
         incremental_state: None,
+        request_session_execution_lease: None,
         plan_assemble_line_release: None,
         stream_event_tx: None,
         stream_json_emitter: None,
@@ -1750,8 +1783,6 @@ async fn stream_chat_sse_dispatches_mcp_tool_call() {
         git_commit_journal: None,
         git_worktree_journal: None,
         session_state_journal: None,
-        task_manager: None,
-        task_notify_tx: None,
         bg_task_commands: None,
         bg_task_list_cache: None,
         bash_detach_slot: None,
@@ -1762,7 +1793,6 @@ async fn stream_chat_sse_dispatches_mcp_tool_call() {
         idempotency_cache: None,
         pre_loaded_messages: None,
         append_system_prompt: None,
-        session_memory_extractor: None,
         #[cfg(feature = "harness")]
         harness_sink: None,
         #[cfg(feature = "harness")]

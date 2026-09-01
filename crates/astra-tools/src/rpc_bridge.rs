@@ -29,8 +29,28 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio_util::sync::CancellationToken;
 
 use crate::ToolExecutor;
+
+tokio::task_local! {
+    /// Marks a tool invocation dispatched by an authenticated `run_script`
+    /// RPC request.  The marker is scoped to the dispatch future rather than
+    /// stored on a shared executor, so concurrent top-level calls cannot
+    /// inherit the parent's re-entrant writer privilege accidentally.
+    static RUN_SCRIPT_RPC_DISPATCH: ();
+}
+
+/// Whether the current tool call is executing inside `run_script`'s RPC
+/// bridge.
+///
+/// Workspace tools use this to reuse the outer script's exclusive writer
+/// generation. This is only a coordination fact: a nested Bash
+/// must still avoid minting a fingerprint receipt because its parent Python
+/// process can access the workspace concurrently.
+pub fn is_run_script_rpc_dispatch() -> bool {
+    RUN_SCRIPT_RPC_DISPATCH.try_with(|()| ()).is_ok()
+}
 
 // ─── AuthToken ────────────────────────────────────────────────────────────
 
@@ -85,15 +105,33 @@ impl AuthToken {
 #[cfg(unix)]
 pub(crate) fn kill_process_group(child: &tokio::process::Child) {
     if let Some(pid) = child.id() {
-        // SAFETY: pid > 1 (we spawned it), negative pid = send to process group.
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
-        }
+        kill_process_group_id(pid);
     }
 }
 
 #[cfg(not(unix))]
 pub(crate) fn kill_process_group(_child: &tokio::process::Child) {}
+
+/// Kill a process group when the leader has already been reaped and therefore
+/// no longer has an id available through `Child::id`. The caller must only
+/// pass a PID it created and placed in its own process group (the run-script
+/// and shell launchers use `setsid`/`process_group(0)` for that invariant).
+#[cfg(unix)]
+pub(crate) fn kill_process_group_id(pid: u32) {
+    if let Ok(pid) = i32::try_from(pid)
+        && pid > 1
+    {
+        // SAFETY: the negative PID targets the invocation-owned process
+        // group, never an arbitrary process. SIGKILL is intentional during
+        // terminal cleanup so descendants cannot outlive the tool lease.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn kill_process_group_id(_pid: u32) {}
 
 // ─── Protocol types ───────────────────────────────────────────────────────
 
@@ -232,6 +270,17 @@ pub fn truncate_head_tail(raw: &str, max_bytes: usize) -> String {
     )
 }
 
+/// Apply the non-owning RPC presentation boundary before any response window
+/// is selected.  The RPC server may receive a complete result from an agent
+/// tool, but it does not own the source bytes and therefore must not mint an
+/// edit capability.  Sanitizing first is essential: slicing a credential at
+/// the head/tail boundary can turn it into a fragment that no matcher can
+/// recognise later.
+pub(crate) fn redact_then_truncate_rpc_output(raw: &str, max_bytes: usize) -> String {
+    let (safe, _) = crate::credential_redaction::redact_credentials_for_display(raw);
+    crate::credential_redaction::truncate_redacted_head_tail(&safe, max_bytes)
+}
+
 /// Per-invocation RPC server policy. Caller constructs once per script run.
 #[derive(Debug, Clone)]
 pub(crate) struct RpcPolicy {
@@ -257,6 +306,10 @@ pub(crate) enum RpcOutcome {
     Ok,
     /// The script exceeded `max_tool_calls`. Caller should kill the child.
     ExceededCallLimit,
+    /// The parent invocation was cancelled while this connection was being
+    /// framed, dispatched, or replied to. The run-script owner must terminate
+    /// the child before releasing its writer epoch.
+    Cancelled,
     /// An unrecoverable I/O error occurred reading/writing the socket.
     /// The RPC server loop should continue accepting new connections —
     /// the child's own `recv()` returns EOF and the script fails fast.
@@ -279,6 +332,58 @@ where
             );
             RpcOutcome::IoError
         }
+    }
+}
+
+/// Cancellation-aware response path. A stalled client must not pin the
+/// run-script accept loop after its parent has cancelled. Dropping this
+/// socket write is safe; the run-script owner still owns child cleanup.
+async fn reply_with_cancel<W>(
+    w: &mut W,
+    resp: RpcResponse,
+    cancel_token: Option<&CancellationToken>,
+) -> RpcOutcome
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let Some(cancel_token) = cancel_token else {
+        return reply(w, resp).await;
+    };
+    tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(50), w.shutdown()).await;
+            RpcOutcome::Cancelled
+        }
+        result = reply_and_shutdown(w, &resp) => match result {
+            Ok(()) => RpcOutcome::Ok,
+            Err(e) => {
+                tracing::debug!(target: "astra_tools::rpc_bridge", error = %e, "reply write failed");
+                RpcOutcome::IoError
+            }
+        }
+    }
+}
+
+async fn reply_with_outcome_and_cancel<W>(
+    w: &mut W,
+    resp: RpcResponse,
+    outcome: RpcOutcome,
+    cancel_token: Option<&CancellationToken>,
+) -> RpcOutcome
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let Some(cancel_token) = cancel_token else {
+        return reply_with_outcome(w, resp, outcome).await;
+    };
+    tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(50), w.shutdown()).await;
+            RpcOutcome::Cancelled
+        }
+        _ = reply_and_shutdown(w, &resp) => outcome,
     }
 }
 
@@ -306,6 +411,7 @@ where
 /// Never hangs the script: every code path either writes a response or
 /// returns [`RpcOutcome::IoError`] (in which case the script's own socket
 /// `recv` returns EOF and the script fails fast).
+#[allow(dead_code)]
 pub(crate) async fn handle_rpc_connection(
     stream: tokio::net::UnixStream,
     tool_executor: &dyn ToolExecutor,
@@ -313,11 +419,37 @@ pub(crate) async fn handle_rpc_connection(
     policy: &RpcPolicy,
     auth_token: &AuthToken,
 ) -> RpcOutcome {
+    handle_rpc_connection_with_cancel(stream, tool_executor, call_count, policy, auth_token, None)
+        .await
+}
+
+/// Cancellation-aware variant used by `run_script`.  Keeping the legacy
+/// wrapper above preserves the ordinary RPC contract and test helpers while
+/// ensuring a cancelled parent invocation reaches the actual nested tool
+/// execution instead of merely killing the Python client after the RPC call
+/// has already started.
+pub(crate) async fn handle_rpc_connection_with_cancel(
+    stream: tokio::net::UnixStream,
+    tool_executor: &dyn ToolExecutor,
+    call_count: &AtomicUsize,
+    policy: &RpcPolicy,
+    auth_token: &AuthToken,
+    cancel_token: Option<&CancellationToken>,
+) -> RpcOutcome {
     let (reader, mut writer) = stream.into_split();
     let mut buf_reader = BufReader::new(reader.take(MAX_RPC_REQUEST_BYTES));
     let mut line = String::new();
 
-    if let Err(e) = buf_reader.read_line(&mut line).await {
+    let read_result = if let Some(cancel_token) = cancel_token {
+        tokio::select! {
+            biased;
+            _ = cancel_token.cancelled() => return RpcOutcome::Cancelled,
+            result = buf_reader.read_line(&mut line) => result,
+        }
+    } else {
+        buf_reader.read_line(&mut line).await
+    };
+    if let Err(e) = read_result {
         tracing::debug!(target: "astra_tools::rpc_bridge", error = %e, "read_line failed");
         // Shutdown so the client sees EOF promptly.
         let _ = writer.shutdown().await;
@@ -326,15 +458,21 @@ pub(crate) async fn handle_rpc_connection(
     let line = line.trim();
 
     if line.is_empty() {
-        return reply(&mut writer, RpcResponse::error("Empty request".into())).await;
+        return reply_with_cancel(
+            &mut writer,
+            RpcResponse::error("Empty request".into()),
+            cancel_token,
+        )
+        .await;
     }
 
     let request: RpcRequest = match serde_json::from_str(line) {
         Ok(r) => r,
         Err(e) => {
-            return reply(
+            return reply_with_cancel(
                 &mut writer,
                 RpcResponse::error(format!("Invalid JSON: {e}")),
+                cancel_token,
             )
             .await;
         }
@@ -347,21 +485,23 @@ pub(crate) async fn handle_rpc_connection(
             tool_name_len = request.tool.len(),
             "rejected RPC request with bad auth_token"
         );
-        return reply(
+        return reply_with_cancel(
             &mut writer,
             RpcResponse::error("RPC auth failed — invalid auth_token".into()),
+            cancel_token,
         )
         .await;
     }
 
     // Allowlist check.
     if !policy.allowed_tools.contains(&request.tool) {
-        return reply(
+        return reply_with_cancel(
             &mut writer,
             RpcResponse::error(format!(
                 "Tool '{}' is not allowed in run_script sandbox",
                 sanitize_for_message(&request.tool)
             )),
+            cancel_token,
         )
         .await;
     }
@@ -369,27 +509,29 @@ pub(crate) async fn handle_rpc_connection(
     // Call-count check (pre-increment).
     let count = call_count.fetch_add(1, Ordering::SeqCst) + 1;
     if count > policy.max_tool_calls {
-        return reply_with_outcome(
+        return reply_with_outcome_and_cancel(
             &mut writer,
             RpcResponse::error(format!(
                 "Exceeded maximum tool call limit ({})",
                 policy.max_tool_calls
             )),
             RpcOutcome::ExceededCallLimit,
+            cancel_token,
         )
         .await;
     }
 
     // Dispatch through the real executor so tool_health/dedup/compression apply.
-    let result = tool_executor.execute(&request.tool, &request.args).await;
+    let result = RUN_SCRIPT_RPC_DISPATCH
+        .scope(
+            (),
+            tool_executor.execute_with_cancel(&request.tool, &request.args, cancel_token),
+        )
+        .await;
 
     // Cap response size BEFORE serializing — prevents an unbounded tool
     // result from flooding the sandbox and triggering an OOM inside it.
-    let capped = if result.output.len() > policy.max_response_bytes {
-        truncate_head_tail(&result.output, policy.max_response_bytes)
-    } else {
-        result.output
-    };
+    let capped = redact_then_truncate_rpc_output(&result.output, policy.max_response_bytes);
 
     let response = if result.is_error {
         RpcResponse::error(capped)
@@ -397,7 +539,7 @@ pub(crate) async fn handle_rpc_connection(
         RpcResponse::success(capped)
     };
 
-    reply(&mut writer, response).await
+    reply_with_cancel(&mut writer, response, cancel_token).await
 }
 
 /// Strip newlines from a string before embedding in an error message.
@@ -491,6 +633,18 @@ mod tests {
         let input = "prefix🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉suffix";
         let r = truncate_head_tail(input, 30);
         assert!(!r.contains('\u{FFFD}'), "emoji mangled: {r}");
+    }
+
+    #[test]
+    fn rpc_redacts_before_head_tail_window() {
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let raw = format!("head {secret} tail {}", "x".repeat(128));
+        let output = redact_then_truncate_rpc_output(&raw, 32);
+        assert!(
+            !output.contains(secret),
+            "raw credential crossed RPC window: {output}"
+        );
+        assert!(output.contains("[REDACTED:AWS_ACCESS_KEY]"));
     }
 
     // ── Mock executor ────────────────────────────────────────────────────
@@ -591,6 +745,93 @@ mod tests {
         assert!(matches!(outcome, RpcOutcome::Ok));
         assert!(resp.contains("ok: read_file"), "resp: {resp}");
         assert_eq!(exec.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn authenticated_nested_writers_reuse_parent_without_minting_receipts() {
+        struct CapturingExecutor {
+            inner: crate::executor::DefaultToolExecutor,
+            metadata: std::sync::Mutex<Option<serde_json::Map<String, Value>>>,
+        }
+
+        #[async_trait]
+        impl ToolExecutor for CapturingExecutor {
+            async fn execute(&self, name: &str, args: &Value) -> ToolResult {
+                assert!(
+                    is_run_script_rpc_dispatch(),
+                    "authenticated RPC dispatch must carry recursive context"
+                );
+                let result = ToolExecutor::execute(&self.inner, name, args).await;
+                *self.metadata.lock().unwrap_or_else(|e| e.into_inner()) = result.metadata.clone();
+                result
+            }
+
+            fn tool_schemas(&self) -> Vec<Value> {
+                ToolExecutor::tool_schemas(&self.inner)
+            }
+
+            fn project_root(&self) -> &Path {
+                self.inner.project_root()
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let parent_writer = crate::workspace_observation::begin_workspace_writer_with_options(
+            temp.path(),
+            None,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("outer run_script writer barrier");
+        let executor = CapturingExecutor {
+            inner: crate::executor::DefaultToolExecutor::new(crate::ToolContext::test(temp.path())),
+            metadata: std::sync::Mutex::new(None),
+        };
+        let policy = RpcPolicy {
+            allowed_tools: ["bash", "write_file"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            max_tool_calls: 2,
+            max_response_bytes: 16 * 1024,
+        };
+        let token = AuthToken::from_str_for_test("tok");
+        let counter = AtomicUsize::new(0);
+        let request =
+            r#"{"tool":"bash","args":{"command":"printf nested > nested.txt"},"auth_token":"tok"}"#;
+
+        assert!(!is_run_script_rpc_dispatch());
+        let (response, outcome) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            rpc_roundtrip(request, &policy, &token, &executor, &counter),
+        )
+        .await
+        .expect("nested Bash must not wait on a shared-to-exclusive upgrade");
+        assert!(!is_run_script_rpc_dispatch(), "RPC context must not leak");
+        assert!(matches!(outcome, RpcOutcome::Ok), "{response}");
+        assert!(temp.path().join("nested.txt").is_file(), "{response}");
+        let typed_request = r#"{"tool":"write_file","args":{"path":"typed.txt","content":"nested typed"},"auth_token":"tok"}"#;
+        let (typed_response, typed_outcome) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            rpc_roundtrip(typed_request, &policy, &token, &executor, &counter),
+        )
+        .await
+        .expect("authenticated typed callback must reuse the parent lease");
+        assert!(matches!(typed_outcome, RpcOutcome::Ok), "{typed_response}");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("typed.txt")).unwrap(),
+            "nested typed\n"
+        );
+        let metadata = executor.metadata.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            metadata.as_ref().is_none_or(|fields| {
+                fields
+                    .get(crate::workspace_observation::RECEIPT_FIELD)
+                    .is_none()
+            }),
+            "only the parent may sign after its complete generation settles: {metadata:?}"
+        );
+        drop(parent_writer);
     }
 
     #[tokio::test]

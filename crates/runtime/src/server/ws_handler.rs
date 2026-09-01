@@ -8,7 +8,7 @@
 //!
 //! **Client → Server** (JSON text frames):
 //! ```text
-//! {"type": "auth", "token": "Bearer ..."}
+//! {"type": "auth", "token": "Bearer ...", "interaction_api_major": "3"}
 //! {"type": "message", "content": "...", "session_id": "...", "agent_id": "...", "model_selection": {"offering_id": "..."}, "skill_search": {...}, "execution_budget": {"initial_turns": 12, "hard_turn_limit": 24}, "explain": false, "interaction_mode": "auto", "plan_subtask_id": "...", "is_plan_subtask": true}
 //! {"type": "cancel_run", "run_id": "..."}
 //! {"type": "pause_run", "run_id": "..."}
@@ -19,7 +19,7 @@
 //!
 //! **Server → Client** (JSON text frames):
 //! ```text
-//! {"type": "auth_ok", "user_id": "...", "username": "..."}
+//! {"type": "auth_ok", "user_id": "...", "username": "...", "interaction_api_major": "3"}
 //! {"type": "auth_error", "message": "..."}
 //! {"type": "session_info", "session_id": "..."}
 //! {"type": "run_started", "run_id": "...", "session_id": "...", "explain": {...}}
@@ -130,6 +130,10 @@ fn should_echo_close_frame(message: Option<&Result<Message, axum::Error>>) -> bo
     matches!(message, Some(Ok(Message::Close(_))) | None)
 }
 
+fn interaction_contract_matches(actual: Option<&str>) -> bool {
+    actual == Some(astra_server_types::AGENT_INTERACTION_API_MAJOR)
+}
+
 // ─── Client Message Types ────────────────────────────────────────────────────
 
 /// WebSocket chat message payload.
@@ -174,7 +178,10 @@ pub(super) struct WsChatMessage {
 pub(super) enum WsClientMessage {
     /// Authenticate with a Bearer token (must be first message).
     #[serde(rename = "auth")]
-    Auth { token: String },
+    Auth {
+        token: String,
+        interaction_api_major: String,
+    },
 
     /// Send a chat message to the agent.
     #[serde(rename = "message")]
@@ -224,7 +231,11 @@ pub(super) enum WsClientMessage {
 pub(super) enum WsServerMessage {
     /// Authentication succeeded.
     #[serde(rename = "auth_ok")]
-    AuthOk { user_id: String, username: String },
+    AuthOk {
+        user_id: String,
+        username: String,
+        interaction_api_major: &'static str,
+    },
 
     /// Authentication failed.
     #[serde(rename = "auth_error")]
@@ -259,6 +270,10 @@ pub(super) enum WsServerMessage {
     /// Run was cancelled by client request.
     #[serde(rename = "run_cancelled")]
     RunCancelled { run_id: String },
+
+    /// Cancellation was durably accepted; the executor has not settled yet.
+    #[serde(rename = "run_cancellation_requested")]
+    RunCancellationRequested { run_id: String },
 
     /// Run was paused.
     #[serde(rename = "run_paused")]
@@ -354,19 +369,18 @@ struct WsConnection {
 
 // ─── Handler ─────────────────────────────────────────────────────────────────
 
-/// Query params for WebSocket upgrade — allows token in URL for browser compat.
+/// Query params for WebSocket upgrade. Authentication is accepted only in
+/// the typed first WebSocket frame so bearer secrets never enter URLs.
 #[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub(super) struct WsUpgradeQuery {
-    /// Optional Bearer token (alternative to sending auth message).
-    pub token: Option<String>,
     /// Optional session ID to request on the first chat turn.
     pub session_id: Option<String>,
 }
 
 /// WebSocket upgrade handler.
 ///
-/// Browser connects to `GET /chat/ws?token=...&session_id=...` or sends
-/// an `auth` message as the first frame after upgrade.
+/// The client must send an `auth` message as the first frame after upgrade.
 pub(super) async fn ws_chat_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -382,26 +396,22 @@ pub(super) async fn ws_chat_handler(
             .into_response();
     }
 
-    let token = query.token.clone();
     let session_id = query.session_id.clone();
     let forward_headers = collect_forward_headers(&headers);
 
     ws.max_message_size(MAX_MESSAGE_SIZE)
-        .on_upgrade(move |socket| {
-            ws_connection_loop(socket, state, token, session_id, forward_headers)
-        })
+        .on_upgrade(move |socket| ws_connection_loop(socket, state, session_id, forward_headers))
         .into_response()
 }
 
 /// Main WebSocket connection loop.
 ///
-/// 1. Authenticate (from query param or first message)
+/// 1. Authenticate from the typed first message
 /// 2. Enter message loop: receive client messages, stream responses
 /// 3. Handle errors and graceful close
 async fn ws_connection_loop(
     mut socket: WebSocket,
     state: AppState,
-    initial_token: Option<String>,
     initial_session_id: Option<String>,
     forward_headers: std::collections::HashMap<String, String>,
 ) {
@@ -415,15 +425,7 @@ async fn ws_connection_loop(
     let _guard = WsGuard;
 
     // Phase 1: Authenticate
-    let conn = match authenticate(
-        &mut socket,
-        &state,
-        initial_token,
-        initial_session_id,
-        forward_headers,
-    )
-    .await
-    {
+    let conn = match authenticate(&mut socket, &state, initial_session_id, forward_headers).await {
         Ok(conn) => conn,
         Err(_) => return, // Error already sent to client
     };
@@ -434,24 +436,34 @@ async fn ws_connection_loop(
 
 /// Authenticate the WebSocket connection.
 ///
-/// Tries query-param token first, then waits for an `auth` message.
+/// Waits for a typed `auth` message as the first frame.
 async fn authenticate(
     socket: &mut WebSocket,
     state: &AppState,
-    initial_token: Option<String>,
     initial_session_id: Option<String>,
     forward_headers: std::collections::HashMap<String, String>,
 ) -> Result<WsConnection, ()> {
-    // Try query-param token first
-    if let Some(token) = initial_token {
-        return authenticate_with_token(socket, state, &token, initial_session_id, forward_headers)
-            .await;
-    }
-
-    // Wait for auth message
+    // Wait for auth message.
     match timeout(AUTH_TIMEOUT, socket.recv()).await {
         Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<WsClientMessage>(&text) {
-            Ok(WsClientMessage::Auth { token }) => {
+            Ok(WsClientMessage::Auth {
+                token,
+                interaction_api_major,
+            }) => {
+                if !interaction_contract_matches(Some(&interaction_api_major)) {
+                    send_msg(
+                        socket,
+                        &WsServerMessage::AuthError {
+                            message: format!(
+                                "incompatible interaction contract: expected {}, received {}",
+                                astra_server_types::AGENT_INTERACTION_API_MAJOR,
+                                interaction_api_major,
+                            ),
+                        },
+                    )
+                    .await;
+                    return Err(());
+                }
                 authenticate_with_token(socket, state, &token, initial_session_id, forward_headers)
                     .await
             }
@@ -555,6 +567,7 @@ async fn authenticate_with_token(
                 &WsServerMessage::AuthOk {
                     user_id: principal.user.user_id.clone(),
                     username: principal.user.username.clone(),
+                    interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR,
                 },
             )
             .await;
@@ -777,6 +790,9 @@ async fn handle_chat_message(
         interaction_mode,
         plan_subtask_id,
         is_plan_subtask,
+    );
+    request.agent_binding_owner_scope = Some(
+        astra_services::AgentBindingOwnerScope::from_principal(&conn.principal),
     );
     request.forward_headers = ws_forward_headers(conn);
     let resolved = match resolve_or_create_chat_session(
@@ -1030,6 +1046,7 @@ async fn handle_shared_tool_approval(
         .resolve_run_interaction(
             run_id.to_string(),
             user_id.clone(),
+            session_id.to_string(),
             request_id.to_string(),
             astra_services::runs::DurableRunInteractionKind::Approval,
             response,
@@ -1038,6 +1055,13 @@ async fn handle_shared_tool_approval(
     {
         Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Resolved(_))
         | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Idempotent(_)) => {}
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Queued(_)) => {
+            tracing::debug!(
+                run_id,
+                request_id,
+                "approval response queued until its exact execution frontier opens"
+            );
+        }
         Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Conflict(_)) => {
             tracing::warn!(run_id, request_id, "conflicting approval response ignored");
         }
@@ -1050,6 +1074,28 @@ async fn handle_shared_tool_approval(
         }
         Ok(astra_services::runs::DurableRunInteractionResolveOutcome::NoLongerWaiting) => {
             tracing::warn!(run_id, request_id, "late approval response ignored");
+        }
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::AuthorityLost {
+            reason,
+            ..
+        }) => {
+            tracing::warn!(
+                run_id,
+                request_id,
+                ?reason,
+                "approval response was recorded but cannot resume a run whose execution authority changed"
+            );
+        }
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Superseded {
+            user_intent_event_index,
+            ..
+        }) => {
+            tracing::warn!(
+                run_id,
+                request_id,
+                user_intent_event_index,
+                "approval response was recorded but newer user guidance superseded its execution frontier"
+            );
         }
         Err((_, error)) => {
             tracing::warn!(run_id, request_id, error = %error.0.detail, "approval resolution failed");
@@ -1153,6 +1199,7 @@ async fn handle_shared_user_prompt_response(
         .resolve_run_interaction(
             run_id.to_string(),
             user_id.clone(),
+            session_id.to_string(),
             request_id.to_string(),
             astra_services::runs::DurableRunInteractionKind::AskUser,
             response,
@@ -1161,12 +1208,41 @@ async fn handle_shared_user_prompt_response(
     {
         Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Resolved(_))
         | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Idempotent(_)) => {}
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Queued(_)) => {
+            tracing::warn!(
+                run_id,
+                request_id,
+                "ask_user response unexpectedly queued without an exact prompt frontier"
+            );
+        }
         Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Conflict(_)) => {
             tracing::warn!(run_id, request_id, "conflicting ask_user response ignored");
         }
         Ok(astra_services::runs::DurableRunInteractionResolveOutcome::MissingRequest)
         | Ok(astra_services::runs::DurableRunInteractionResolveOutcome::NoLongerWaiting) => {
             tracing::warn!(run_id, request_id, "late ask_user response ignored");
+        }
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::AuthorityLost {
+            reason,
+            ..
+        }) => {
+            tracing::warn!(
+                run_id,
+                request_id,
+                ?reason,
+                "ask_user response was recorded but cannot resume a run whose execution authority changed"
+            );
+        }
+        Ok(astra_services::runs::DurableRunInteractionResolveOutcome::Superseded {
+            user_intent_event_index,
+            ..
+        }) => {
+            tracing::warn!(
+                run_id,
+                request_id,
+                user_intent_event_index,
+                "ask_user response was recorded but newer user guidance superseded its execution frontier"
+            );
         }
         Err((_, error)) => {
             tracing::warn!(run_id, request_id, error = %error.0.detail, "ask_user resolution failed");
@@ -1247,9 +1323,12 @@ fn build_ws_chat_request(
         stable_runtime_system_prompt: None,
         runtime_system_prompt: None,
         session_id,
+        work_binding: None,
+        run_start_idempotency: None,
         full_llm_capture: false,
         agent_id,
         model: None,
+        model_selection_mode: astra_services::runs::ModelSelectionMode::ExplicitOffering,
         model_selection: Some(model_selection),
         resolved_model_selection: None,
         admitted_model_execution: None,
@@ -1268,13 +1347,15 @@ fn build_ws_chat_request(
         workspace_binding: None,
         executor_binding: None,
         runtime_mcp_bindings: Vec::new(),
-        mcp_binding_ids: None,
         context: merge_plan_subtask_context(context, plan_subtask_id, is_plan_subtask),
         edge_executor_id: None,
         capabilities: Vec::new(),
         forward_headers: std::collections::HashMap::new(),
         provider_run_owner: None,
+        provider_workspace_id: None,
+        agent_binding_owner_scope: None,
         execution_budget,
+        execution_time_budget: None,
         conversation_authority: None,
         execution_policy: Default::default(),
         explain,
@@ -1287,34 +1368,6 @@ fn ws_forward_headers(conn: &WsConnection) -> std::collections::HashMap<String, 
     let mut headers = conn.forward_headers.clone();
     headers.insert("authorization".to_string(), conn.authorization.clone());
     headers
-}
-
-#[cfg(test)]
-fn build_ws_bridge_headers(
-    state: &AppState,
-    conn: &WsConnection,
-) -> Result<HeaderMap, &'static str> {
-    let mut bridge_headers = HeaderMap::new();
-    let secret_hv = HeaderValue::from_str(&state.chat_turn_bridge_secret)
-        .map_err(|_| "Invalid bridge secret for headers")?;
-    bridge_headers.insert(HeaderName::from_static("x-mo-bridge-secret"), secret_hv);
-    let user_id_hv = HeaderValue::from_str(&conn.principal.user.user_id)
-        .map_err(|_| "Invalid user_id for headers")?;
-    bridge_headers.insert(HeaderName::from_static("x-mo-user-id"), user_id_hv);
-    let authorization_hv =
-        HeaderValue::from_str(&conn.authorization).map_err(|_| "Invalid authorization header")?;
-    bridge_headers.insert(HeaderName::from_static("authorization"), authorization_hv);
-    let username_b64 = URL_SAFE.encode(conn.principal.user.username.as_bytes());
-    bridge_headers.insert(
-        HeaderName::from_static("x-mo-username-b64"),
-        HeaderValue::from_str(&username_b64)
-            .unwrap_or_else(|_| HeaderValue::from_static("unknown")),
-    );
-    bridge_headers.insert(
-        HeaderName::from_static("x-mo-bridge-capabilities"),
-        HeaderValue::from_static("state-sync-v1"),
-    );
-    Ok(bridge_headers)
 }
 
 #[cfg(test)]
@@ -1370,6 +1423,9 @@ fn ws_text_frame_exceeds_limit(text: &str) -> bool {
 
 fn cancel_run_outcome_message(record: &astra_services::runs::CancelRunRecord) -> WsServerMessage {
     match record.status.as_str() {
+        "cancellation_requested" => WsServerMessage::RunCancellationRequested {
+            run_id: record.run_id.clone(),
+        },
         STATUS_CANCELLED => WsServerMessage::RunCancelled {
             run_id: record.run_id.clone(),
         },
@@ -2129,6 +2185,7 @@ fn sync_conn_state_from_stream_event(
                 | "run_paused"
                 | "run_waiting"
                 | "run_resumed"
+                | "run_cancellation_requested"
                 | "run_cancelled"
                 | "run_finished"
         )
@@ -2337,43 +2394,6 @@ fn process_bridge_stream_event(
     }
 }
 
-/// Apply optional prepared headers to bridge request.
-#[cfg(test)]
-fn apply_prepared_headers(
-    headers: &mut HeaderMap,
-    prepared: &bridge_prep::PreparedChatTurnBridgeRequest,
-) {
-    macro_rules! set_header {
-        ($field:ident, $name:literal) => {
-            if let Some(ref val) = prepared.$field {
-                if let Ok(hv) = HeaderValue::from_str(val) {
-                    headers.insert(HeaderName::from_static($name), hv);
-                }
-            }
-        };
-    }
-    set_header!(trusted_session_id, "x-mo-session-id");
-    set_header!(session_turn, "x-mo-session-turn");
-    set_header!(turn_chain_id, "x-mo-turn-chain-id");
-    set_header!(user_query_event_id, "x-mo-user-query-event-id");
-    set_header!(user_query_b64, "x-mo-user-query-b64");
-    set_header!(routing_meta_b64, "x-mo-routing-meta-b64");
-    set_header!(execution_state_b64, "x-mo-execution-state-b64");
-    if prepared.full_llm_capture == Some(true) {
-        headers.insert(
-            HeaderName::from_static("x-mo-full-llm-capture"),
-            HeaderValue::from_static("1"),
-        );
-    }
-
-    if let Some(changed) = prepared.tools_changed {
-        headers.insert(
-            HeaderName::from_static("x-mo-tools-changed"),
-            HeaderValue::from_static(if changed { "1" } else { "0" }),
-        );
-    }
-}
-
 /// Send a typed server message as a WebSocket text frame.
 async fn send_msg(socket: &mut WebSocket, msg: &WsServerMessage) {
     if let Ok(json) = serde_json::to_string(msg) {
@@ -2524,12 +2544,32 @@ mod tests {
 
     #[test]
     fn parse_auth_message() {
-        let json = r#"{"type": "auth", "token": "Bearer abc123"}"#;
+        let json = r#"{"type":"auth","token":"Bearer abc123","interaction_api_major":"3"}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
-            WsClientMessage::Auth { token } => assert_eq!(token, "Bearer abc123"),
+            WsClientMessage::Auth {
+                token,
+                interaction_api_major,
+            } => {
+                assert_eq!(token, "Bearer abc123");
+                assert_eq!(interaction_api_major, "3");
+            }
             _ => panic!("expected Auth"),
         }
+    }
+
+    #[test]
+    fn websocket_query_auth_fails_closed_on_missing_or_stale_contract() {
+        assert!(interaction_contract_matches(Some("3")));
+        assert!(!interaction_contract_matches(Some("2")));
+        assert!(!interaction_contract_matches(None));
+    }
+
+    #[test]
+    fn auth_message_requires_the_interaction_contract() {
+        assert!(
+            serde_json::from_str::<WsClientMessage>(r#"{"type":"auth","token":"abc123"}"#).is_err()
+        );
     }
 
     #[test]
@@ -2808,27 +2848,6 @@ mod tests {
     }
 
     #[test]
-    fn ws_bridge_headers_forward_authorization() {
-        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
-            .with_chat_turn_bridge_secret("bridge-secret");
-        let conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer good-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: None,
-            pending_session_id: None,
-            active_run_id: None,
-            bridge_prepared_run_id: None,
-        };
-
-        let headers = build_ws_bridge_headers(&state, &conn).expect("headers should build");
-
-        assert_eq!(headers.get("x-mo-bridge-secret").unwrap(), "bridge-secret");
-        assert_eq!(headers.get("x-mo-user-id").unwrap(), "u1");
-        assert_eq!(headers.get("authorization").unwrap(), "Bearer good-token");
-    }
-
-    #[test]
     fn ws_forward_headers_preserve_handshake_headers() {
         let conn = WsConnection {
             principal: AuthPrincipal::internal(test_user()),
@@ -2997,6 +3016,7 @@ mod tests {
         let record = astra_services::runs::CancelRunRecord {
             run_id: "run-1".into(),
             status: STATUS_CANCELLED.into(),
+            execution_settled: true,
         };
 
         match cancel_run_outcome_message(&record) {
@@ -3010,6 +3030,7 @@ mod tests {
         let record = astra_services::runs::CancelRunRecord {
             run_id: "run-1".into(),
             status: STATUS_COMPLETED.into(),
+            execution_settled: true,
         };
 
         match cancel_run_outcome_message(&record) {
@@ -3027,24 +3048,16 @@ mod tests {
     }
 
     #[test]
-    fn cancel_run_outcome_message_reports_non_terminal_noops() {
+    fn cancel_run_outcome_message_reports_accepted_cancellation_before_convergence() {
         let record = astra_services::runs::CancelRunRecord {
             run_id: "run-1".into(),
-            status: STATUS_PAUSED.into(),
+            status: "cancellation_requested".into(),
+            execution_settled: false,
         };
 
         match cancel_run_outcome_message(&record) {
-            WsServerMessage::Error {
-                message,
-                code,
-                retryable,
-            } => {
-                assert!(message.contains("run-1"));
-                assert!(message.contains(STATUS_PAUSED));
-                assert_eq!(code, "CANCEL_NOOP");
-                assert!(!retryable);
-            }
-            other => panic!("expected Error, got {other:?}"),
+            WsServerMessage::RunCancellationRequested { run_id } => assert_eq!(run_id, "run-1"),
+            other => panic!("expected RunCancellationRequested, got {other:?}"),
         }
     }
 
@@ -3108,8 +3121,12 @@ mod tests {
             payloads[0],
             serde_json::json!({
                 "type": "usage",
-                "prompt_tokens": 7,
-                "completion_tokens": 3,
+                "input_tokens": 7,
+                "cached_input_tokens": 0,
+                "cache_creation_tokens": 0,
+                "output_tokens": 3,
+                "total_tokens": 10,
+                "usage_scope": "run_total",
                 "tool_call_count": 2,
                 "index": 5
             })
@@ -3170,8 +3187,12 @@ mod tests {
             vec![
                 serde_json::json!({
                     "type": "usage",
-                    "prompt_tokens": 7,
-                    "completion_tokens": 3,
+                    "input_tokens": 7,
+                    "cached_input_tokens": 0,
+                    "cache_creation_tokens": 0,
+                    "output_tokens": 3,
+                    "total_tokens": 10,
+                    "usage_scope": "run_total",
                     "tool_call_count": 2,
                     "index": 3
                 }),
@@ -3306,24 +3327,14 @@ mod tests {
             active_run_id: None,
             bridge_prepared_run_id: None,
         };
-        let prepared = PreparedChatTurnBridgeRequest {
-            body: Bytes::new(),
-            trusted_session_id: Some("sess-1".into()),
-            full_llm_capture: None,
-            session_turn: Some("4".into()),
-            turn_chain_id: Some("run-1".into()),
-            user_query_event_id: None,
-            tools_changed: None,
-            user_query_b64: None,
-            routing_meta_b64: None,
-            execution_state_b64: None,
-        };
+        let trusted_session_id = "sess-1";
+        let trusted_run_id = "run-1";
         let explain = bridge_run_started_explain(true);
 
         let messages = bridge_forward_error_messages(
             &mut conn,
-            prepared.trusted_session_id.as_deref(),
-            prepared.turn_chain_id.as_deref(),
+            Some(trusted_session_id),
+            Some(trusted_run_id),
             explain.as_ref(),
             StatusCode::BAD_GATEWAY,
             "Bridge error: boom".into(),
@@ -3390,23 +3401,10 @@ mod tests {
             active_run_id: None,
             bridge_prepared_run_id: None,
         };
-        let prepared = PreparedChatTurnBridgeRequest {
-            body: Bytes::new(),
-            trusted_session_id: Some("sess-1".into()),
-            full_llm_capture: None,
-            session_turn: Some("4".into()),
-            turn_chain_id: None,
-            user_query_event_id: None,
-            tools_changed: None,
-            user_query_b64: None,
-            routing_meta_b64: None,
-            execution_state_b64: None,
-        };
-
         let messages = bridge_forward_error_messages(
             &mut conn,
-            prepared.trusted_session_id.as_deref(),
-            prepared.turn_chain_id.as_deref(),
+            Some("sess-1"),
+            None,
             None,
             StatusCode::BAD_GATEWAY,
             "Bridge error: boom".into(),
@@ -3864,11 +3862,13 @@ mod tests {
         let msg = WsServerMessage::AuthOk {
             user_id: "u1".into(),
             username: "alice".into(),
+            interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""type":"auth_ok""#));
         assert!(json.contains(r#""user_id":"u1""#));
         assert!(json.contains(r#""username":"alice""#));
+        assert!(json.contains(r#""interaction_api_major":"3""#));
     }
 
     #[test]
@@ -3933,16 +3933,17 @@ mod tests {
     #[test]
     fn query_params_optional() {
         let q: WsUpgradeQuery = serde_json::from_str("{}").unwrap();
-        assert!(q.token.is_none());
         assert!(q.session_id.is_none());
     }
 
     #[test]
-    fn query_params_with_values() {
-        let q: WsUpgradeQuery =
-            serde_json::from_str(r#"{"token": "tok", "session_id": "s1"}"#).unwrap();
-        assert_eq!(q.token.as_deref(), Some("tok"));
+    fn query_params_accept_only_session_hint_and_reject_url_credentials() {
+        let q: WsUpgradeQuery = serde_json::from_str(r#"{"session_id": "s1"}"#).unwrap();
         assert_eq!(q.session_id.as_deref(), Some("s1"));
+        assert!(serde_json::from_str::<WsUpgradeQuery>(r#"{"token":"tok"}"#).is_err());
+        assert!(
+            serde_json::from_str::<WsUpgradeQuery>(r#"{"interaction_api_major":"2"}"#).is_err()
+        );
     }
 
     #[test]
@@ -4043,108 +4044,20 @@ mod tests {
         assert_eq!(result2, "Bearer abc123");
     }
 
-    // ─── apply_prepared_headers tests ────────────────────────────────────
-
-    use super::bridge_prep::PreparedChatTurnBridgeRequest;
-    use axum::body::Bytes;
-
-    fn make_prepared_all() -> PreparedChatTurnBridgeRequest {
-        PreparedChatTurnBridgeRequest {
-            body: Bytes::from("{}"),
-            trusted_session_id: Some("s1".into()),
-            full_llm_capture: Some(true),
-            session_turn: Some("4".into()),
-            turn_chain_id: Some("tc1".into()),
-            user_query_event_id: Some("uqe1".into()),
-            tools_changed: Some(true),
-            user_query_b64: Some("aGVsbG8=".into()),
-            routing_meta_b64: Some("cm91dGU=".into()),
-            execution_state_b64: Some("c3RhdGU=".into()),
-        }
-    }
-
-    fn make_prepared_none() -> PreparedChatTurnBridgeRequest {
-        PreparedChatTurnBridgeRequest {
-            body: Bytes::from("{}"),
-            trusted_session_id: None,
-            full_llm_capture: None,
-            session_turn: None,
-            turn_chain_id: None,
-            user_query_event_id: None,
-            tools_changed: None,
-            user_query_b64: None,
-            routing_meta_b64: None,
-            execution_state_b64: None,
-        }
-    }
-
-    #[test]
-    fn apply_prepared_headers_all_fields() {
-        let mut headers = HeaderMap::new();
-        let prepared = make_prepared_all();
-        apply_prepared_headers(&mut headers, &prepared);
-
-        assert_eq!(headers.get("x-mo-session-id").unwrap(), "s1");
-        assert_eq!(headers.get("x-mo-full-llm-capture").unwrap(), "1");
-        assert_eq!(headers.get("x-mo-session-turn").unwrap(), "4");
-        assert_eq!(headers.get("x-mo-turn-chain-id").unwrap(), "tc1");
-        assert_eq!(headers.get("x-mo-user-query-event-id").unwrap(), "uqe1");
-        assert_eq!(headers.get("x-mo-tools-changed").unwrap(), "1");
-        assert_eq!(headers.get("x-mo-user-query-b64").unwrap(), "aGVsbG8=");
-        assert_eq!(headers.get("x-mo-routing-meta-b64").unwrap(), "cm91dGU=");
-        assert_eq!(headers.get("x-mo-execution-state-b64").unwrap(), "c3RhdGU=");
-    }
-
-    #[test]
-    fn apply_prepared_headers_no_fields() {
-        let mut headers = HeaderMap::new();
-        let prepared = make_prepared_none();
-        apply_prepared_headers(&mut headers, &prepared);
-
-        assert!(headers.is_empty());
-    }
-
-    #[test]
-    fn apply_prepared_headers_partial_fields() {
-        let mut headers = HeaderMap::new();
-        let mut prepared = make_prepared_none();
-        prepared.trusted_session_id = Some("s1".into());
-        prepared.user_query_b64 = Some("aGVsbG8=".into());
-        apply_prepared_headers(&mut headers, &prepared);
-
-        assert_eq!(headers.len(), 2);
-        assert_eq!(headers.get("x-mo-session-id").unwrap(), "s1");
-        assert_eq!(headers.get("x-mo-user-query-b64").unwrap(), "aGVsbG8=");
-    }
-
-    #[test]
-    fn apply_prepared_headers_tools_changed_true() {
-        let mut headers = HeaderMap::new();
-        let mut prepared = make_prepared_none();
-        prepared.tools_changed = Some(true);
-        apply_prepared_headers(&mut headers, &prepared);
-
-        assert_eq!(headers.get("x-mo-tools-changed").unwrap(), "1");
-    }
-
-    #[test]
-    fn apply_prepared_headers_tools_changed_false() {
-        let mut headers = HeaderMap::new();
-        let mut prepared = make_prepared_none();
-        prepared.tools_changed = Some(false);
-        apply_prepared_headers(&mut headers, &prepared);
-
-        assert_eq!(headers.get("x-mo-tools-changed").unwrap(), "0");
-    }
-
     // ─── Additional protocol tests ──────────────────────────────────────
 
     #[test]
     fn auth_message_without_bearer_prefix() {
-        let json = r#"{"type":"auth","token":"abc123"}"#;
+        let json = r#"{"type":"auth","token":"abc123","interaction_api_major":"3"}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
-            WsClientMessage::Auth { token } => assert_eq!(token, "abc123"),
+            WsClientMessage::Auth {
+                token,
+                interaction_api_major,
+            } => {
+                assert_eq!(token, "abc123");
+                assert_eq!(interaction_api_major, "3");
+            }
             _ => panic!("expected Auth"),
         }
     }
@@ -4182,6 +4095,7 @@ mod tests {
             WsServerMessage::AuthOk {
                 user_id: "u1".into(),
                 username: "alice".into(),
+                interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR,
             },
             WsServerMessage::AuthError {
                 message: "bad".into(),
@@ -4522,6 +4436,16 @@ mod tests {
     }
 
     #[test]
+    fn serialize_run_cancellation_requested() {
+        let msg = WsServerMessage::RunCancellationRequested {
+            run_id: "r1".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""type":"run_cancellation_requested""#));
+        assert!(json.contains(r#""run_id":"r1""#));
+    }
+
+    #[test]
     fn lifecycle_poll_error_policy_retries_transient_errors() {
         for status in [
             StatusCode::SERVICE_UNAVAILABLE,
@@ -4664,6 +4588,7 @@ mod tests {
             WsServerMessage::AuthOk {
                 user_id: "u1".into(),
                 username: "alice".into(),
+                interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR,
             },
             WsServerMessage::AuthError {
                 message: "bad".into(),
@@ -4741,7 +4666,7 @@ mod tests {
     #[test]
     fn all_client_message_variants_parse() {
         let inputs = [
-            r#"{"type":"auth","token":"t1"}"#,
+            r#"{"type":"auth","token":"t1","interaction_api_major":"3"}"#,
             r#"{"type":"message","content":"hello","model_selection":{"offering_id":"offer-gpt-5.4"}}"#,
             r#"{"type":"cancel_run","run_id":"r1"}"#,
             r#"{"type":"tool_approval","request_id":"req-1","approved":true}"#,

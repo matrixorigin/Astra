@@ -23,11 +23,12 @@ fn is_plan_internal_authoring_tool(tool_name: &str, args: &Value) -> bool {
             args.get("action").and_then(Value::as_str),
             Some("recall" | "expand" | "profile" | "remember" | "update")
         ),
-        "task_board" => matches!(
-            args.get("action").and_then(Value::as_str),
-            Some("create" | "update" | "list" | "get" | "list_user" | "adopt")
-        ),
-        "task_output" | "task_list" => true,
+        "task_output"
+        | "task_list"
+        | "start_work"
+        | "propose_work_plan"
+        | "inspect_work_criteria"
+        | "propose_work_criteria" => true,
         _ => false,
     }
 }
@@ -144,12 +145,34 @@ mod tests {
             ("enter_plan_mode", json!({})),
             ("exit_plan_mode", json!({"plan": "1. inspect"})),
             (
-                "task_board",
-                json!({"action": "create", "title": "draft plan item"}),
+                "propose_work_plan",
+                json!({
+                    "context_id": "work-plan-context:basis",
+                    "additions": [{
+                        "item_id": "task-1",
+                        "kind": "task",
+                        "objective": "Draft the implementation",
+                        "expected_result": "The draft is testable"
+                    }],
+                    "dependencies": []
+                }),
             ),
-            ("task_board", json!({"action": "update", "task_id": "t1"})),
-            ("task_board", json!({"action": "list"})),
-            ("task_board", json!({"action": "get", "task_id": "t1"})),
+            ("inspect_work_criteria", json!({})),
+            (
+                "propose_work_criteria",
+                json!({
+                    "context_id": "work-plan-context:basis",
+                    "members": [{
+                        "member_kind": "new",
+                        "criterion_id": "tests-pass",
+                        "definition": {
+                            "kind": "test_check",
+                            "statement": "Relevant tests pass.",
+                            "command": "cargo test"
+                        }
+                    }]
+                }),
+            ),
             (
                 "memory",
                 json!({"action": "remember", "content": "plan context"}),
@@ -198,10 +221,6 @@ mod tests {
         assert!(is_plan_mode_blocked_tool(
             "task_stop",
             &json!({"task_id": "bg-shell-1"})
-        ));
-        assert!(is_plan_mode_blocked_tool(
-            "task_board",
-            &json!({"action": "stop", "task_id": "bg-shell-1"})
         ));
     }
 }

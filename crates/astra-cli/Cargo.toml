@@ -31,6 +31,7 @@ astra-prompts.workspace = true
 astra-services.workspace = true
 astra-runtime-env.workspace = true
 astra-runtime.workspace = true
+astra-server-types.workspace = true
 astra-sandbox.workspace = true
 astra-pipeline.workspace = true
 astra-messaging.workspace = true

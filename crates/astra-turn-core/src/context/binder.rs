@@ -142,7 +142,9 @@ fn bind_project_context(sources: &ContextSources<'_>) -> String {
     )
 }
 
-/// Bind the session-stable deferred-tools discovery block.
+/// Bind the current deferred-tools discovery block. The planner places this
+/// section after the session cache boundary because admission can change it
+/// during a user turn.
 fn bind_deferred_tools(sources: &ContextSources<'_>) -> String {
     sources.session.deferred_tools_block.clone()
 }
@@ -423,7 +425,6 @@ mod tests {
     use crate::session_latches::SessionLatches;
     use crate::token_accounting::TokenAccounting;
     use crate::working_memory::WorkingMemoryState;
-    use std::collections::HashMap;
 
     struct TestSources {
         statics: StaticSections,
@@ -484,8 +485,6 @@ mod tests {
                 tool_results: vec![],
                 tokens: TokenAccounting::default(),
                 active_skills: vec!["code_review".into()],
-                recent_file_reads: HashMap::new(),
-                remaining_turns: 10,
                 turn_index: 1,
                 recovery: RecoveryState::default(),
                 last_user_message: "hello".into(),
@@ -607,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn bind_all_keeps_project_deferred_and_skill_catalog_as_ordered_session_sections() {
+    fn bind_all_keeps_project_deferred_and_skill_catalog_as_ordered_sections() {
         let mut fixture = test_sources();
         fixture.session.project_context = "prior-session-summary-stub".to_string();
         fixture.session.deferred_tools_block = "<deferred-tools>x</deferred-tools>".to_string();
@@ -645,10 +644,10 @@ mod tests {
             kinds,
             vec![
                 SectionKind::ProjectContext,
-                SectionKind::DeferredTools,
                 SectionKind::AvailableSkills,
+                SectionKind::DeferredTools,
             ],
-            "session-stable discovery blocks must remain independently traceable and ordered"
+            "discovery blocks must remain independently traceable and ordered"
         );
         assert_eq!(
             bound.sections[0].artifact.text().unwrap(),
@@ -656,11 +655,11 @@ mod tests {
         );
         assert_eq!(
             bound.sections[1].artifact.text().unwrap(),
-            "<deferred-tools>x</deferred-tools>"
+            "<available_skills>y</available_skills>"
         );
         assert_eq!(
             bound.sections[2].artifact.text().unwrap(),
-            "<available_skills>y</available_skills>"
+            "<deferred-tools>x</deferred-tools>"
         );
     }
 

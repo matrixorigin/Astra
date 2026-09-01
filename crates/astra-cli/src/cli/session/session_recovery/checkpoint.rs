@@ -184,6 +184,17 @@ pub(crate) fn build_manual_heavy_step_checkpoint(
     let interrupted_interruption = preserve_interrupted_recovery
         .then(|| previous_heavy.and_then(|heavy| heavy.interruption.clone()))
         .flatten();
+    // Quarantine is sticky safety state, not a turn-local interruption hint.
+    // Carry the live state whenever present; for an older CLI process that did
+    // not thread the field yet, preserve it from the interrupted checkpoint.
+    let workspace_observation_quarantine =
+        state.workspace_observation_quarantine.clone().or_else(|| {
+            preserve_interrupted_recovery
+                .then(|| {
+                    previous_heavy.and_then(|heavy| heavy.workspace_observation_quarantine.clone())
+                })
+                .flatten()
+        });
     let interrupted_delegation = preserve_interrupted_recovery
         .then(|| {
             previous_heavy
@@ -231,6 +242,7 @@ pub(crate) fn build_manual_heavy_step_checkpoint(
             .then(|| state.runtime_pipeline_state.clone())
             .flatten(),
         config_version_id: state.config_version_id.clone(),
+        workspace_observation_quarantine,
     };
     StepCheckpoint::Heavy(Box::new(heavy))
 }
@@ -365,7 +377,7 @@ pub(crate) fn rollback_recovery_checkpoint(
 }
 
 /// Persist the current in-memory conversation state after a manual history mutation
-/// (`/undo`, `/redo`, `/compact`, `/session fork`) so the next resume/fork/headless
+/// (`/undo`, `/redo`, `/compact`) so the next resume/headless
 /// continuation sees the same context the user just saw.
 pub(crate) async fn sync_recovery_snapshot_after_history_edit(
     state: &mut SessionState,
@@ -374,7 +386,7 @@ pub(crate) async fn sync_recovery_snapshot_after_history_edit(
         return Ok(());
     };
 
-    super::super::session_projection::rebuild_continuation_anchor_from_live_state(state).await;
+    super::super::session_projection::rebuild_continuation_anchor_from_live_state(state);
     let user_id = recovery_user_id(state);
     let (previous_heavy, prev_state) = load_previous_recovery_state(state, &user_id, &sid).await?;
     let mut session_state = super::super::session_projection::build_full_session_state_compact(

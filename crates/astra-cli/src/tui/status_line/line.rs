@@ -23,9 +23,8 @@ pub(crate) struct StatusContext {
     /// `None` when the board has no tasks — chip hides rather than
     /// wasting space with `0/0`.
     pub task_counts: Option<(usize, usize)>,
-    /// Whether the user has Ctrl+T-expanded the task board. Controls
-    /// the chip glyph (`▼` expanded, `▶` collapsed) so the key's
-    /// target state is visible.
+    /// Whether the user has Ctrl+T-expanded the task board. The draw layer
+    /// uses this to choose compact versus detailed task content.
     pub task_board_expanded: bool,
     /// Counts of the BackgroundTaskRegistry states that need user
     /// visibility. `None` when the registry has no live/attention
@@ -355,23 +354,18 @@ impl StatusLine {
                 .push(Segment::styled(text, Style::default().fg(theme.warn)));
         }
 
-        // Task-board chip. `▶` = collapsed (Ctrl+T to expand), `▼` =
-        // expanded. The observer reports lifecycle progress while work is
-        // open and removes the chip once only terminal history remains.
+        // Task-board chip. Name the action instead of relying on an
+        // unexplained disclosure glyph: task navigation is only useful when
+        // users can discover it from the state they are looking at.
         if let Some((open, total)) = ctx.task_counts {
             if total > 0 {
-                let glyph = if ctx.task_board_expanded {
-                    "▼"
-                } else {
-                    "▶"
-                };
                 let (text, style) = if open == 0 {
                     (
-                        format!("{glyph} {total} done"),
+                        format!("Tasks {total} done · Ctrl+T"),
                         Style::default().fg(theme.success),
                     )
                 } else {
-                    (format!("{glyph} {open}/{total}"), muted)
+                    (format!("Tasks {open}/{total} · Ctrl+T"), muted)
                 };
                 out.left.push(Segment::styled(text, style));
             }
@@ -391,10 +385,12 @@ impl StatusLine {
         {
             let mut parts = background_task_count_parts(counts);
             if counts.has_local_agent_rows() {
-                parts
-                    .push(crate::tui::background_shortcut::agent_workbench_open_hint().to_string());
+                parts.push("Ctrl+T tasks".to_string());
             }
-            parts.push(crate::tui::background_shortcut::background_task_open_hint().to_string());
+            if !counts.has_local_agent_rows() {
+                parts
+                    .push(crate::tui::background_shortcut::background_task_open_hint().to_string());
+            }
             let style = if counts.failed_total() > 0 {
                 Style::default().fg(theme.error)
             } else if counts.waiting > 0 {

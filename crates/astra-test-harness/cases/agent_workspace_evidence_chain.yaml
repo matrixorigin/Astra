@@ -1,0 +1,53 @@
+name: agent_workspace_evidence_chain
+description: |
+  **What**: Delegate one repository inspection and require the child to obtain
+  concrete workspace evidence before the parent synthesizes.
+  **Tests**: Deferred agent discovery, inherited CLI+Server workspace binding,
+  child Edge tool delivery, structured child metrics, and foreground fan-in.
+  **Why**: A child that merely announces its next step can otherwise be marked
+  completed even though it never reached the workspace executor.
+  **Pass means**: The parent used one foreground `agent_fanout` call, its durable
+  result proves the child reached the requested workspace tool, and the final answer
+  reports the edition read from the repository.
+  **Fail means**: The tool surface was unavailable, the child lost the inherited
+  workspace/executor lane, the parent synthesized before evidence arrived, or
+  a zero-tool narrative was accepted as completed work.
+prompt: |
+  Use one foreground `agent_fanout(action='start')` group with target_count=1
+  and one slot to inspect the current repository. Ask that child to use
+  `read_file` exactly once on the root `Cargo.toml`, read the
+  `[workspace.package]` edition, and report only that edition with a short
+  evidence statement. Do not provide file contents to the child yourself.
+
+  After the canonical child result is terminal, report the edition and state
+  that it came from the child's workspace evidence. Do not inspect the file in
+  the parent and do not spawn replacement children.
+models:
+  - deepseek-v4-flash
+capability: delegation
+difficulty: 3
+weight: 3.0
+timeout_seconds: 240
+debug_log: true
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: agent_fanout
+  - type: journal_tool_called
+    name: agent_fanout
+  - type: journal_tool_called
+    name: read_file
+  - type: journal_child_tool_call_count
+    parent: agent_fanout
+    child: read_file
+    min: 1
+    max: 1
+  - type: session_event_count
+    event_type: ToolCallCompleted
+    min: 2
+  - type: text_contains
+    needle: "2024"
+  - type: turn_rounds_between
+    min: 2
+    max: 8

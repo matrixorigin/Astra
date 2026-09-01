@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use super::turn_cancellation::apply_user_cancelled_turn;
 use super::turn_entry::TurnContext;
-use super::turn_failure_reporting::report_turn_failure;
+use super::turn_failure_reporting::reconcile_and_report_turn_failure;
 use super::turn_success::apply_turn_success_async;
 use crate::cli::session::session_state::SessionState;
 use crate::cli::stream::streaming_types::StreamResult;
@@ -18,7 +18,7 @@ pub(crate) struct TurnDispatch<'a, 'b> {
     pub(crate) input_active_system_skills: &'a [String],
     pub(crate) input_runtime_volatile_texts: &'a [String],
     pub(crate) token: &'a str,
-    pub(crate) session_id: Option<&'a str>,
+    pub(crate) session_id: &'a str,
     pub(crate) semantic_query_override: Option<&'a str>,
     pub(crate) turn_start: Instant,
     pub(crate) ui: &'a mut dyn crate::cli::ui_adapter::ReplUiAdapter,
@@ -62,19 +62,21 @@ pub(crate) async fn settle_successful_turn(
     clear_recovery_scoped_turn_restrictions(state);
 }
 
-pub(crate) fn settle_failed_turn(
+pub(crate) async fn settle_failed_turn(
     state: &mut SessionState,
     dispatch: &mut TurnDispatch<'_, '_>,
-    failure: &crate::TurnFailure,
+    failure: &mut crate::TurnFailure,
 ) {
-    report_turn_failure(
+    reconcile_and_report_turn_failure(
         state,
+        dispatch.ctx.api,
         dispatch.ctx.profile,
         dispatch.line,
         failure,
         dispatch.turn_start,
         dispatch.ui,
-    );
+    )
+    .await;
     clear_recovery_scoped_turn_restrictions(state);
 }
 
@@ -112,7 +114,7 @@ mod tests {
             input_active_system_skills: &[],
             input_runtime_volatile_texts: &[],
             token: "token",
-            session_id: None,
+            session_id: "session-1",
             semantic_query_override: None,
             turn_start: Instant::now(),
             ui: &mut ui,
@@ -130,8 +132,8 @@ mod tests {
         assert_eq!(state.history.len(), 1);
     }
 
-    #[test]
-    fn settle_failed_turn_consumes_resume_restricted_tools() {
+    #[tokio::test]
+    async fn settle_failed_turn_consumes_resume_restricted_tools() {
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         let ctx = TurnContext {
             api: &api,
@@ -152,17 +154,17 @@ mod tests {
             input_active_system_skills: &[],
             input_runtime_volatile_texts: &[],
             token: "token",
-            session_id: None,
+            session_id: "session-1",
             semantic_query_override: None,
             turn_start: Instant::now(),
             ui: &mut ui,
         };
-        let failure = crate::TurnFailure {
+        let mut failure = crate::TurnFailure {
             error: "boom".into(),
             partial: crate::PartialTurnData::default(),
         };
 
-        settle_failed_turn(&mut state, &mut dispatch, &failure);
+        settle_failed_turn(&mut state, &mut dispatch, &mut failure).await;
 
         assert!(state.resume_restricted_tools.is_empty());
         assert_eq!(

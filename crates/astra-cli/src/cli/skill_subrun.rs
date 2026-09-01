@@ -24,8 +24,8 @@ use astra_runtime::{
     },
     turn::chat_turn_heuristics::infer_task_execution_profile,
     turn::chat_turn_payload::{
-        ChatTurnBasePayloadInput, chat_turn_base_payload, merge_edge_profile_extensions,
-        set_payload_tool_results_if_non_empty,
+        ChatTurnBasePayloadInput, attach_bridge_turn_identity, chat_turn_base_payload,
+        merge_edge_profile_extensions, set_payload_tool_results_if_non_empty,
     },
     turn::tool_schema_prune::inject_required_tool_names,
     turn::turn_guard::TurnGuard,
@@ -33,6 +33,7 @@ use astra_runtime::{
 use astra_skills::executor::isolated::{SkillSubRunExecutor, SubRunResult};
 use astra_turn_core::tool::schema::tool_names_from_schemas;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use super::effects::ChatTurnPrepLineGuard;
 use super::permission_manager::PermissionManager;
@@ -40,12 +41,6 @@ use crate::cli::chat_stream::turn_policy_from_payload_edge_tools;
 use crate::cli::cli_config::cli_utils::cli_user_id;
 use crate::cli::stream::stream_render::{EdgeSseContext, RenderPolicy, consume_turn_sse};
 use crate::edge_tools;
-
-const SUBRUN_MAX_TURNS: usize = 25;
-
-/// Cumulative token budget for skill subruns.
-/// Caps total (prompt + completion) across all rounds to prevent runaway cost.
-const SUBRUN_MAX_CUMULATIVE_TOKENS: u64 = 120_000;
 
 pub(crate) async fn resolve_subrun_model_selection(
     api: &astra_thin_client::ThinClient,
@@ -134,6 +129,17 @@ pub(crate) struct SubRunHost {
     /// already fired. The hook is called every turn; we only want
     /// to emit one event per child spawn.
     pub(crate) fork_cache_probe_state: astra_runtime::orchestration::ForkCacheProbeState,
+}
+
+/// Create a cancellation domain for one child execution.
+///
+/// Parent cancellation propagates into the child, while a child-local control
+/// failure (for example an exhausted edge callback retry) cannot cancel its
+/// parent or any sibling that happens to share the same parent token.
+pub(crate) fn child_cancellation_scope(
+    parent: Option<&std::sync::Arc<tokio_util::sync::CancellationToken>>,
+) -> std::sync::Arc<tokio_util::sync::CancellationToken> {
+    std::sync::Arc::new(parent.map(|token| token.child_token()).unwrap_or_default())
 }
 
 pub(crate) struct SubRunJournalIdentity {
@@ -322,13 +328,22 @@ pub(crate) fn persist_failed_subrun(state: &mut AgenticLoopState, error: &str) -
     let summary = state.step_recorder.summary();
     let mut blocked_tools = state.restricted_tools.iter().cloned().collect::<Vec<_>>();
     blocked_tools.sort();
-    if let Some(heavy) = state.step_recorder.build_heavy_checkpoint(
-        &state.messages,
+    let checkpoint_messages = astra_turn_core::runtime_scaffolding::sanitize_durable_message_values(
+        state.messages.clone(),
+    );
+    if let Some(mut heavy) = state.step_recorder.build_heavy_checkpoint(
+        &checkpoint_messages,
         state.max_turn_input_tokens,
         state.remaining_turns as u32,
         &blocked_tools,
         &state.recent_tools,
     ) {
+        // Failed sub-runs are still a durable recovery boundary.  Preserve
+        // the same sticky workspace safety state as the main runtime and
+        // warning-policy checkpoint writers; otherwise a later child failure
+        // could replace a quarantined checkpoint with an apparently clean one.
+        heavy.workspace_observation_quarantine =
+            state.stall.workspace_observation_quarantine.clone();
         let checkpoint = astra_pipeline::step_protocol::StepCheckpoint::Heavy(Box::new(heavy));
         let Some(user_id) = state.context_manifest_user_id.as_deref() else {
             tracing::warn!(
@@ -375,6 +390,17 @@ fn attach_runtime_volatile_injections(
 
 #[async_trait]
 impl AgenticLoopHost for SubRunHost {
+    fn continuation_authority(
+        &self,
+        result: &HostTurnResult,
+    ) -> astra_runtime::turn::agentic_loop::host::ContinuationAuthority {
+        if result.accum.server_loop_terminal {
+            astra_runtime::turn::agentic_loop::host::ContinuationAuthority::RemoteServer
+        } else {
+            astra_runtime::turn::agentic_loop::host::ContinuationAuthority::Runtime
+        }
+    }
+
     fn memory_recall_scope(&self, _state: &AgenticLoopState) -> Option<(String, String)> {
         self.executor.memory_recall_scope()
     }
@@ -485,6 +511,16 @@ impl AgenticLoopHost for SubRunHost {
 
         set_payload_tool_results_if_non_empty(&mut payload, &state.tool_results);
 
+        let _ = attach_bridge_turn_identity(
+            &mut payload,
+            // A sub-run execution is one conversational turn even when its
+            // agentic loop performs several model/tool rounds. Keep the same
+            // bridge turn identity for every round in that execution.
+            state.session_turn.max(1),
+            state.canonical_turn_chain_id.as_deref(),
+            state.root_user_query_event_id.as_deref(),
+        );
+
         // Sub-runs share the parent's session_id but have no turn_event_buffer.
         // Tell the bridge not to write llm_round events — the parent's journal
         // already records delegation results. Without this, the bridge writes
@@ -493,9 +529,12 @@ impl AgenticLoopHost for SubRunHost {
             root.insert("root_turn_journal_owned".into(), json!(true));
         }
 
+        let server_payload =
+            crate::cli::chat_stream::server_loop_admission_payload(&payload, &state.message, false)
+                .map_err(str::to_string)?;
         let resp = self
             .api
-            .post_chat_turn_retry_429(&self.token, &payload, 3, true)
+            .post_developer_loop_retry_429(&self.token, &server_payload, 3, true)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -534,6 +573,7 @@ impl AgenticLoopHost for SubRunHost {
             tool_cache: &mut self.tool_cache,
             observability_hub: None,
             incremental_state: None,
+            request_session_execution_lease: None,
         };
 
         let prep_line = ChatTurnPrepLineGuard::maybe_start(false, None);
@@ -550,11 +590,22 @@ impl AgenticLoopHost for SubRunHost {
             None,                                           // stream_json_exchange
         )
         .await;
+        let unsettled_physical_owner_run_id =
+            crate::cli::stream::streaming_types::unsettled_physical_owner_run_id(&turn.core);
+        if turn.callback_delivery_failed || unsettled_physical_owner_run_id.is_some() {
+            crate::cli::turn::turn_stream_runner::report_server_run_detach_after_internal_failure(
+                turn.callback_failure_run_id
+                    .as_deref()
+                    .or(unsettled_physical_owner_run_id.as_deref()),
+                turn.core.run_id.as_deref(),
+            );
+        }
+        let error_kind = turn.core.error_kind;
         Ok(HostTurnResult {
             accum: turn.core,
             ttft_ms: turn.ttft_ms,
             edge_tool_round: turn.edge_tool_round,
-            error_kind: None,
+            error_kind,
         })
     }
 
@@ -730,6 +781,182 @@ pub(crate) struct CliSkillSubRunExecutor {
     skill_resolver: Option<std::sync::Arc<dyn astra_runtime::turn::skill_tool::SkillResolver>>,
     /// Parent interactive session id for self-introspection persistence.
     active_session_id: Option<String>,
+    /// Parent server run identity that owns local skill-subrun evidence.
+    parent_run_id: Option<String>,
+    /// Process-local exact-once authority for outer Fork skill invocations.
+    /// The server still owns each inner Edge dispatch; this ledger prevents a
+    /// retry/rebuild within the parent CLI lifecycle from starting the whole
+    /// isolated skill a second time under a new server run.
+    invocation_ledger: Arc<CliSkillInvocationLedger>,
+}
+
+const MAX_CLI_SKILL_INVOCATIONS_PER_PARENT: usize = 1024;
+
+#[derive(Default)]
+struct CliSkillInvocationLedger {
+    entries: std::sync::Mutex<HashMap<String, CliSkillInvocationEntry>>,
+}
+
+enum CliSkillInvocationEntry {
+    Running {
+        fingerprint: String,
+        settled: tokio::sync::watch::Sender<bool>,
+    },
+    Settled {
+        fingerprint: String,
+        result: Result<SubRunResult, String>,
+    },
+    OutcomeUnknown {
+        fingerprint: String,
+    },
+}
+
+struct CliSkillInvocationGuard {
+    ledger: Arc<CliSkillInvocationLedger>,
+    invocation_id: String,
+    fingerprint: String,
+    committed: bool,
+}
+
+impl CliSkillInvocationLedger {
+    async fn admit(
+        self: &Arc<Self>,
+        invocation_id: &str,
+        fingerprint: &str,
+    ) -> Result<Result<CliSkillInvocationGuard, Result<SubRunResult, String>>, String> {
+        loop {
+            let mut wait = {
+                let mut entries = self
+                    .entries
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                match entries.get(invocation_id) {
+                    Some(CliSkillInvocationEntry::Running {
+                        fingerprint: existing,
+                        settled,
+                    }) => {
+                        if existing != fingerprint {
+                            return Err(
+                                "fork skill invocation identity was reused with different input"
+                                    .to_string(),
+                            );
+                        }
+                        Some(settled.subscribe())
+                    }
+                    Some(CliSkillInvocationEntry::Settled {
+                        fingerprint: existing,
+                        result,
+                    }) => {
+                        if existing != fingerprint {
+                            return Err(
+                                "fork skill invocation identity was reused with different input"
+                                    .to_string(),
+                            );
+                        }
+                        return Ok(Err(result.clone()));
+                    }
+                    Some(CliSkillInvocationEntry::OutcomeUnknown {
+                        fingerprint: existing,
+                    }) => {
+                        if existing != fingerprint {
+                            return Err(
+                                "fork skill invocation identity was reused with different input"
+                                    .to_string(),
+                            );
+                        }
+                        return Err("a prior fork skill attempt was interrupted after admission; its side-effect outcome is unknown and automatic retry is disabled".to_string());
+                    }
+                    None => {
+                        if entries.len() >= MAX_CLI_SKILL_INVOCATIONS_PER_PARENT {
+                            return Err("fork skill invocation capacity is exhausted for this parent lifecycle".to_string());
+                        }
+                        entries.insert(
+                            invocation_id.to_string(),
+                            CliSkillInvocationEntry::Running {
+                                fingerprint: fingerprint.to_string(),
+                                settled: tokio::sync::watch::channel(false).0,
+                            },
+                        );
+                        return Ok(Ok(CliSkillInvocationGuard {
+                            ledger: Arc::clone(self),
+                            invocation_id: invocation_id.to_string(),
+                            fingerprint: fingerprint.to_string(),
+                            committed: false,
+                        }));
+                    }
+                }
+            };
+            if let Some(wait) = wait.as_mut()
+                && !*wait.borrow()
+            {
+                let _ = wait.changed().await;
+            }
+        }
+    }
+}
+
+impl CliSkillInvocationGuard {
+    fn settle(mut self, result: Result<SubRunResult, String>) {
+        let settled = {
+            let mut entries = self
+                .ledger
+                .entries
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let settled = match entries.get(&self.invocation_id) {
+                Some(CliSkillInvocationEntry::Running { settled, .. }) => settled.clone(),
+                _ => return,
+            };
+            entries.insert(
+                self.invocation_id.clone(),
+                CliSkillInvocationEntry::Settled {
+                    fingerprint: self.fingerprint.clone(),
+                    result,
+                },
+            );
+            settled
+        };
+        self.committed = true;
+        settled.send_replace(true);
+    }
+}
+
+impl Drop for CliSkillInvocationGuard {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let settled = {
+            let mut entries = self
+                .ledger
+                .entries
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let settled = match entries.get(&self.invocation_id) {
+                Some(CliSkillInvocationEntry::Running { settled, .. }) => settled.clone(),
+                _ => return,
+            };
+            entries.insert(
+                self.invocation_id.clone(),
+                CliSkillInvocationEntry::OutcomeUnknown {
+                    fingerprint: self.fingerprint.clone(),
+                },
+            );
+            settled
+        };
+        settled.send_replace(true);
+    }
+}
+
+fn cli_skill_turn_identity(parent_run_id: &str, invocation_id: &str) -> (String, String) {
+    let identity_hash = format!(
+        "{:x}",
+        Sha256::digest(format!("{parent_run_id}\0{invocation_id}").as_bytes())
+    );
+    (
+        format!("{parent_run_id}:skill:{identity_hash}"),
+        format!("skill-invocation:{identity_hash}"),
+    )
 }
 
 impl CliSkillSubRunExecutor {
@@ -751,6 +978,8 @@ impl CliSkillSubRunExecutor {
             cancel_token,
             skill_resolver: None,
             active_session_id: None,
+            parent_run_id: None,
+            invocation_ledger: Arc::new(CliSkillInvocationLedger::default()),
         }
     }
 
@@ -767,6 +996,11 @@ impl CliSkillSubRunExecutor {
         self.active_session_id = Some(session_id.into());
         self
     }
+
+    pub fn with_parent_run_id(mut self, run_id: impl Into<String>) -> Self {
+        self.parent_run_id = Some(run_id.into());
+        self
+    }
 }
 
 #[async_trait]
@@ -781,15 +1015,60 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         parent_recursion_depth: u8,
         effort: Option<&str>,
         agent_type: Option<&str>,
+        invocation_id: Option<&str>,
+        _expected_control_epoch: Option<i64>,
+        _parent_turn_chain_id: Option<&str>,
     ) -> Result<SubRunResult, String> {
         let child_recursion_depth =
             astra_turn_core::agentic_recursion_guard::checked_child_recursion_depth(
                 parent_recursion_depth,
             )?;
+        let invocation_id = invocation_id
+            .filter(|value| !value.is_empty() && value.trim() == *value)
+            .ok_or_else(|| {
+                "CLI fork skill execution requires an exact invocation_id".to_string()
+            })?;
+        let parent_session_id = self.active_session_id.as_deref().ok_or_else(|| {
+            "CLI fork skill execution requires its parent session authority".to_string()
+        })?;
+        let parent_run_id = self.parent_run_id.as_deref().ok_or_else(|| {
+            "CLI fork skill execution requires its parent run authority".to_string()
+        })?;
+        let invocation_fingerprint = format!(
+            "{:x}",
+            Sha256::digest(
+                astra_core::canonical_json_string(&json!({
+                    "skill_name": skill_name,
+                    "instructions": instructions,
+                    "task_context": task_context,
+                    "max_tokens": max_tokens,
+                    "allowed_tools": allowed_tools,
+                    "parent_recursion_depth": parent_recursion_depth,
+                    "effort": effort,
+                    "agent_type": agent_type,
+                }))
+                .as_bytes(),
+            )
+        );
+        let invocation_guard = match self
+            .invocation_ledger
+            .admit(invocation_id, &invocation_fingerprint)
+            .await?
+        {
+            Ok(guard) => guard,
+            Err(cached) => return cached,
+        };
+        let (child_turn_chain_id, child_user_query_event_id) =
+            cli_skill_turn_identity(parent_run_id, invocation_id);
         let effective_model = self.default_model.clone();
         let model_selection =
             resolve_subrun_model_selection(&self.api, &self.token, effective_model.as_deref())
                 .await?;
+        let limits = astra_core::RuntimeLimits::global();
+        let max_turn_input_tokens = limits.require_admitted_model_input_tokens(
+            Some(&model_selection.name),
+            model_selection.context_window,
+        )?;
         let effective_model = Some(model_selection.name);
         let thinking = effective_model
             .as_deref()
@@ -803,6 +1082,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         let resolved_tool_policy = astra_config::runtime_config::RuntimeConfig::load()
             .tool_policy
             .resolve_for_model(effective_model.as_deref());
+        let child_cancel_token = child_cancellation_scope(self.cancel_token.as_ref());
 
         let all_schemas = edge_tools::local_tool_schemas();
         let valid_tool_names = tool_names_from_schemas(&all_schemas);
@@ -846,7 +1126,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             max_completion_tokens: max_tokens,
             effort: effort.map(String::from),
             agent_type: agent_type.map(String::from),
-            cancel_token: self.cancel_token.clone(),
+            cancel_token: Some(child_cancel_token.clone()),
             skill_resolver: self.skill_resolver.clone(),
             progress_tx: None,
             agent_id: String::new(),
@@ -897,24 +1177,32 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
         };
 
         let task_profile = infer_task_execution_profile(task_context);
+        let agentic_turn_budget =
+            astra_runtime::turn::chat_turn_heuristics::resolve_isolated_agentic_turn_budget(
+                task_profile,
+                limits.max_turns,
+            );
+        let initial_turns = agentic_turn_budget.initial_turns;
         let user_id = cli_user_id();
-        let step_recorder = StepRecorder::with_persistence(
+        let step_recorder = StepRecorder::with_persistence_for_run(
             &user_id,
             &subrun_session_id,
             &format!("{}-task", subrun_session_id),
+            self.parent_run_id.as_deref().unwrap_or_default(),
         );
 
         let mut state = AgenticLoopState {
-            observation_store: None,
             observation_journal: Default::default(),
+            tool_ledger_receipt: Default::default(),
             messages,
             run_transcript_capture: None,
             volatile_pending: Vec::new(),
             recent_rounds: Vec::new(),
             tool_results: Vec::new(),
             session_memory_state: Default::default(),
-            current_session_id: None,
-            current_run_id: None,
+            current_session_id: Some(parent_session_id.to_string()),
+            current_run_id: Some(parent_run_id.to_string()),
+            current_run_owner_generation: None,
             inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
             context_manifest_pool: None,
             context_manifest_user_id: Some(user_id),
@@ -936,12 +1224,10 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             last_finish_reason: None,
             total_observation_tool_calls: 0,
             has_any_usage: false,
-            max_turns: SUBRUN_MAX_TURNS,
-            remaining_turns: SUBRUN_MAX_TURNS,
-            turn_budget_hint_emitted_90: false,
-            turn_budget_hint_emitted_50: false,
-            turn_budget_hint_emitted_20: false,
-            agentic_turn_budget: task_profile.agentic_turn_budget,
+            max_turns: initial_turns,
+            remaining_turns: initial_turns,
+            agentic_turn_budget,
+            budget_is_explicit: true,
             current_round_index: 0,
             llm_rounds_completed: 0,
             last_request_message_count: None,
@@ -981,9 +1267,12 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             cancellation: CancellationState {
                 flag: None,
                 pause_flag: None,
-                token: self.cancel_token.clone(),
+                token: Some(child_cancel_token),
+                execution_lease_lost: None,
+                resolved_origin: None,
             },
             error_recovery: Default::default(),
+            provider_adaptation: Default::default(),
             run_control: None,
             pipeline_session: Some(
                 astra_turn_core::pipeline_session::PipelineSession::new_with_current_date(
@@ -1018,16 +1307,14 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             compaction_effectiveness: Default::default(),
             pinned_tool_schema_tokens: 0,
             sticky_tool_schemas: Vec::new(),
-            max_turn_input_tokens: astra_core::RuntimeLimits::global().max_turn_input_tokens,
+            max_turn_input_tokens,
             budget_wrapup_injected: false,
             context_compression_triggered: false,
             canonical_rewrite_state: Default::default(),
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,
-            max_cumulative_tokens: SUBRUN_MAX_CUMULATIVE_TOKENS,
             thinking,
-            recent_file_reads: Vec::new(),
             permission_context: Some(permission_context),
             permission_handler: None,
             tactical_adapter: None,
@@ -1043,8 +1330,8 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             confidence_trend: Default::default(),
             last_confidence_diagnosis: None,
             session_turn: 0,
-            bridge_turn_chain_id: None,
-            bridge_user_query_event_id: None,
+            canonical_turn_chain_id: Some(child_turn_chain_id),
+            root_user_query_event_id: Some(child_user_query_event_id),
             turn_event_buffer: None,
             harness: astra_runtime::turn::harness_adapter::HarnessSlot::empty(),
         };
@@ -1061,15 +1348,17 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             _ => {}
         }
 
-        let turns = (SUBRUN_MAX_TURNS - state.remaining_turns) as u32;
+        let turns = state.llm_rounds_completed;
         let tokens_used = state.provider_total_tokens().min(u32::MAX as u64) as u32;
 
-        Ok(SubRunResult {
+        let result = Ok(SubRunResult {
             output: state.final_text,
             tokens_used,
             turns,
             outcome,
-        })
+        });
+        invocation_guard.settle(result.clone());
+        result
     }
 }
 
@@ -1148,8 +1437,31 @@ fn attach_subrun_tool_surface(
     context_window_tokens: Option<u32>,
     interaction_mode: TurnInteractionMode,
 ) -> TurnInteractionPolicy {
-    let activated = executor.activated_deferred_tool_names_for_schema_injection();
     let mut surface_report = empty_surface_report_for_schemas(&schemas_to_use);
+    // A child with an explicit allowlist has no discovery authority beyond
+    // that boundary: `tool_search` itself may be intentionally excluded.
+    // Its permitted deferred tools therefore have to be materialized directly
+    // on the first request. Otherwise a valid narrow capability such as
+    // `web_fetch` is simultaneously granted by policy and impossible to call
+    // by the model, which turns least-authority into a silent task failure.
+    //
+    // This derives only from the typed permission boundary and the canonical
+    // schema catalog; task text and tool-search query text play no role.
+    if !restricted_tools.is_empty() {
+        let explicitly_allowed: Vec<&str> = all_schemas
+            .iter()
+            .filter_map(astra_turn_core::tool::schema::tool_schema_name)
+            .filter(|name| !restricted_tools.contains(*name))
+            .collect();
+        inject_required_tool_names(
+            &mut schemas_to_use,
+            &mut surface_report,
+            &explicitly_allowed,
+            all_schemas,
+        );
+    }
+
+    let activated = executor.activated_deferred_tool_names_for_schema_injection();
     if !activated.is_empty() {
         let refs: Vec<&str> = activated.iter().map(String::as_str).collect();
         inject_required_tool_names(&mut schemas_to_use, &mut surface_report, &refs, all_schemas);
@@ -1211,6 +1523,17 @@ fn attach_subrun_tool_surface(
     // Mirror exactly what the sub-run request exposes. Visible and
     // activatable names are written together so tool_search/direct-call
     // recovery never observes a mixed surface.
+    if !restricted_tools.is_empty() {
+        let mut restricted_names = restricted_tools.iter().cloned().collect::<Vec<_>>();
+        restricted_names.sort();
+        merge_edge_profile_extensions(
+            payload,
+            &json!({
+                astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_RESTRICTED_TOOL_NAMES:
+                    restricted_names,
+            }),
+        );
+    }
     executor.set_current_tool_surface(&final_visible_schemas, activatable_tool_names);
     turn_policy_from_payload_edge_tools(payload, interaction_mode)
 }
@@ -1218,16 +1541,19 @@ fn attach_subrun_tool_surface(
 #[cfg(test)]
 mod tests {
     use super::{
-        CliSkillSubRunExecutor, SUBRUN_MAX_CUMULATIVE_TOKENS, SUBRUN_MAX_TURNS, SubRunHost,
-        SubRunJournalIdentity, attach_runtime_volatile_injections, attach_subrun_tool_surface,
-        resolve_subrun_schemas,
+        CliSkillInvocationLedger, CliSkillSubRunExecutor, SubRunHost, SubRunJournalIdentity,
+        attach_runtime_volatile_injections, attach_subrun_tool_surface, child_cancellation_scope,
+        cli_skill_turn_identity, resolve_subrun_schemas,
     };
     use astra_runtime::turn::agentic_loop::host::ASK_USER_TOOL_NAME;
     use astra_runtime::turn::agentic_loop::host::{
         AgenticLoopHost, TurnInteractionMode, interaction_scoped_tool_restrictions,
     };
-    use astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES;
+    use astra_runtime::turn::chat_turn_edge_profile::{
+        EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES, EDGE_PROFILE_KEY_RESTRICTED_TOOL_NAMES,
+    };
     use astra_skills::executor::isolated::SkillSubRunExecutor;
+    use astra_skills::executor::isolated::{SubRunOutcome, SubRunResult};
     use serde_json::{Value, json};
     use std::collections::HashSet;
     use std::path::PathBuf;
@@ -1235,6 +1561,121 @@ mod tests {
     use crate::cli::chat_stream::turn_policy_from_payload_edge_tools;
     use crate::cli::permission_manager::{PermissionManager, PermissionMode};
     use crate::edge_tools;
+
+    #[tokio::test]
+    async fn cli_skill_invocation_ledger_replays_and_rejects_changed_input() {
+        let ledger = std::sync::Arc::new(CliSkillInvocationLedger::default());
+        let guard = ledger
+            .admit("outer-call-1", "fingerprint-a")
+            .await
+            .expect("admission")
+            .expect("first call owns execution");
+        let completed = SubRunResult {
+            output: "done".to_string(),
+            tokens_used: 7,
+            turns: 1,
+            outcome: SubRunOutcome::Completed,
+        };
+        guard.settle(Ok(completed.clone()));
+
+        let replay = ledger
+            .admit("outer-call-1", "fingerprint-a")
+            .await
+            .expect("same fingerprint");
+        let replay = match replay {
+            Err(cached) => cached,
+            Ok(_) => panic!("settled invocation must replay instead of executing"),
+        };
+        assert_eq!(replay.expect("cached success").output, completed.output);
+        match ledger.admit("outer-call-1", "fingerprint-b").await {
+            Err(error) => assert!(error.contains("different input")),
+            Ok(_) => panic!("changed input must fail closed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_skill_invocation_abort_becomes_outcome_unknown() {
+        let ledger = std::sync::Arc::new(CliSkillInvocationLedger::default());
+        let guard = ledger
+            .admit("outer-call-abort", "fingerprint")
+            .await
+            .unwrap()
+            .expect("first call owns execution");
+        drop(guard);
+        match ledger.admit("outer-call-abort", "fingerprint").await {
+            Err(error) => assert!(error.contains("outcome is unknown")),
+            Ok(_) => panic!("aborted owner must disable automatic retry"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_skill_invocation_concurrent_waiter_cannot_miss_settlement() {
+        let ledger = std::sync::Arc::new(CliSkillInvocationLedger::default());
+        let guard = ledger
+            .admit("outer-call-concurrent", "fingerprint")
+            .await
+            .unwrap()
+            .expect("first call owns execution");
+        let waiter_ledger = std::sync::Arc::clone(&ledger);
+        let waiter = tokio::spawn(async move {
+            waiter_ledger
+                .admit("outer-call-concurrent", "fingerprint")
+                .await
+        });
+        tokio::task::yield_now().await;
+        guard.settle(Ok(SubRunResult {
+            output: "settled".to_string(),
+            tokens_used: 1,
+            turns: 1,
+            outcome: SubRunOutcome::Completed,
+        }));
+
+        let replay = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("concurrent waiter must observe retained settlement")
+            .expect("waiter task")
+            .expect("admission result");
+        match replay {
+            Err(Ok(result)) => assert_eq!(result.output, "settled"),
+            _ => panic!("concurrent waiter must replay the settled result"),
+        }
+    }
+
+    #[test]
+    fn cli_skill_turn_identity_is_stable_and_outer_call_scoped() {
+        let first = cli_skill_turn_identity("parent-run", "outer-call-1");
+        assert_eq!(first, cli_skill_turn_identity("parent-run", "outer-call-1"));
+        assert_ne!(first, cli_skill_turn_identity("parent-run", "outer-call-2"));
+        assert_ne!(first, cli_skill_turn_identity("other-run", "outer-call-1"));
+    }
+
+    #[test]
+    fn child_cancellation_scope_is_one_way_and_sibling_isolated() {
+        let parent = std::sync::Arc::new(tokio_util::sync::CancellationToken::new());
+        let children = (0..1_024)
+            .map(|_| child_cancellation_scope(Some(&parent)))
+            .collect::<Vec<_>>();
+        let first = &children[0];
+
+        first.cancel();
+
+        assert!(first.is_cancelled());
+        assert!(!parent.is_cancelled(), "a child must not cancel its parent");
+        assert!(
+            children[1..].iter().all(|child| !child.is_cancelled()),
+            "a callback failure in one child must not cancel any sibling"
+        );
+
+        parent.cancel();
+        assert!(
+            children.iter().all(|child| child.is_cancelled()),
+            "parent cancellation must reach every child"
+        );
+        assert!(
+            child_cancellation_scope(Some(&parent)).is_cancelled(),
+            "a child created after parent cancellation starts cancelled"
+        );
+    }
 
     fn schema(name: &str) -> Value {
         json!({
@@ -1372,7 +1813,7 @@ mod tests {
         let lane = &payload["edge_profile"]
             [astra_runtime::turn::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_INJECTIONS];
         assert_eq!(lane[0]["kind"], "policy_advisory");
-        assert_eq!(lane[0]["delivery_class"], "advisory_evidence");
+        assert_eq!(lane[0]["delivery_class"], "decision_feedback");
         assert_eq!(lane[0]["payload"]["signal"], "soft subrun evidence");
         assert_eq!(lane[0]["round_index"], 2);
     }
@@ -1507,7 +1948,11 @@ mod tests {
             .finalize_agent_transcript(&state)
             .await
             .expect("assistant transcript identity");
-        let events = astra_services::session_journal::read_journal(&session_id).unwrap();
+        let events = astra_services::session_journal::read_journal_for_owner(
+            journal.owner_scope(),
+            &session_id,
+        )
+        .unwrap();
         let committed_item = events
             .iter()
             .filter_map(|event| event.transcript_item.as_ref())
@@ -1684,6 +2129,42 @@ mod tests {
     }
 
     #[test]
+    fn narrow_subrun_allowlist_materializes_permitted_deferred_tools() {
+        let root = tempfile::tempdir().unwrap();
+        let executor = edge_tools::ToolExecutor::new(root.path());
+        let mut payload = json!({"edge_profile": {}});
+        let restricted_tools = HashSet::from(["tool_search".to_string()]);
+        let all_schemas = vec![schema("tool_search"), schema("web_fetch")];
+
+        let policy = attach_subrun_tool_surface(
+            &mut payload,
+            vec![schema("tool_search")],
+            &all_schemas,
+            &restricted_tools,
+            &executor,
+            Some(200_000),
+            TurnInteractionMode::NonInteractive,
+        );
+
+        assert_eq!(
+            policy.visible_tool_names,
+            vec!["web_fetch".to_string()],
+            "an explicit capability boundary must expose its permitted deferred tool directly"
+        );
+        assert!(
+            payload["edge_profile"][EDGE_PROFILE_KEY_DEFERRED_TOOL_NAMES]
+                .as_array()
+                .is_none_or(|names| names.is_empty()),
+            "a child without tool_search must not be handed an unusable deferred manifest: {payload}"
+        );
+        assert_eq!(
+            payload["edge_profile"][EDGE_PROFILE_KEY_RESTRICTED_TOOL_NAMES],
+            json!(["tool_search"]),
+            "the server must receive the typed child deny set so it cannot re-add its own tools"
+        );
+    }
+
+    #[test]
     fn subrun_surface_clears_stale_activatable_when_no_deferred_manifest() {
         let root = tempfile::tempdir().unwrap();
         let executor = edge_tools::ToolExecutor::new(root.path());
@@ -1818,6 +2299,9 @@ mod tests {
                 astra_turn_core::agentic_recursion_guard::ABSOLUTE_MAX_AGENT_RECURSION_DEPTH,
                 None,
                 None,
+                None,
+                None,
+                None,
             )
             .await
             .unwrap_err();
@@ -1843,26 +2327,6 @@ mod tests {
             astra_runtime::orchestration::PermissionMode::Auto
         );
         assert!(executor.inherited_permissions.is_background);
-    }
-
-    // ── Phase-R10 adversarial contract guards (CLI-side constants) ───────
-    //
-    // These assert the exact values of [`SUBRUN_MAX_TURNS`] and
-    // [`SUBRUN_MAX_CUMULATIVE_TOKENS`] so silent drift (e.g. a typo
-    // bumping 25→35 or 120_000→12_000) breaks this test loudly.
-    // The server-side equivalents are covered in
-    // `crates/astra-cli/tests/phase_r10_skill_subrun_contracts.rs`
-    // via the now-`pub` constants in
-    // [`astra_runtime::server::server_skill_subrun`].
-
-    #[test]
-    fn cli_subrun_max_turns_is_exactly_25() {
-        assert_eq!(SUBRUN_MAX_TURNS, 25);
-    }
-
-    #[test]
-    fn cli_subrun_max_cumulative_tokens_is_exactly_120_000() {
-        assert_eq!(SUBRUN_MAX_CUMULATIVE_TOKENS, 120_000);
     }
 
     /// No fork inheritance → just use the live surface's always-load set.

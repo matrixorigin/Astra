@@ -69,14 +69,8 @@ pub trait ObservationProvider: Send + Sync {
 
 // ─── SessionStateProvider ────────────────────────────────────────────────────
 
-/// Session-level state: task progress, phase, and circuit breaker.
+/// Session-level state: phase, circuit breaker, and turn budget.
 pub trait SessionStateProvider: Send + Sync {
-    /// Ratio of completed tasks, 0.0–1.0.
-    ///
-    /// Returns 1.0 when no unfinished tasks remain on the board.
-    /// Returns 0.0 when the task board snapshot is unavailable or empty.
-    fn task_completion_ratio(&self) -> f64;
-
     /// Human-readable label for the current turn phase.
     fn current_phase_label(&self) -> &'static str;
 

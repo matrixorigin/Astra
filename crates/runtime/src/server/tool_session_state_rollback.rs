@@ -1,7 +1,6 @@
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use astra_tools::task_mgmt::{TaskManager, TaskManagerSnapshot};
 use serde_json::Value;
 
 use crate::server::tool_session_config::persist_config_override;
@@ -16,9 +15,6 @@ pub(crate) enum SessionStateRollbackAction {
     Compression {
         turn: u32,
         snapshot: crate::observability::ObservabilitySessionRollbackSnapshot,
-    },
-    TaskState {
-        snapshot: TaskManagerSnapshot,
     },
 }
 
@@ -36,7 +32,6 @@ pub(crate) struct SessionStateRestoreContext<'a> {
     pub(crate) session_id: &'a str,
     pub(crate) observability_session:
         Option<&'a Arc<RwLock<crate::observability::ObservabilitySession>>>,
-    pub(crate) task_manager: &'a TaskManager,
 }
 
 pub(crate) struct RollbackSessionStateContext<'a> {
@@ -104,13 +99,6 @@ impl SessionStateRollbackJournal {
         } else {
             false
         }
-    }
-
-    pub(crate) fn drop_task_state_entries(&mut self) -> usize {
-        let before = self.entries.len();
-        self.entries
-            .retain(|entry| !matches!(entry.action, SessionStateRollbackAction::TaskState { .. }));
-        before - self.entries.len()
     }
 }
 
@@ -200,17 +188,10 @@ pub(crate) fn remove_sequence(journal: &Mutex<SessionStateRollbackJournal>, sequ
     })
 }
 
-pub(crate) fn drop_task_state_entries(journal: &Mutex<SessionStateRollbackJournal>) -> usize {
-    with_journal_mut(journal, "drop_task_state_entries", |journal| {
-        journal.drop_task_state_entries()
-    })
-}
-
 pub(crate) fn action_kind(action: &SessionStateRollbackAction) -> &'static str {
     match action {
         SessionStateRollbackAction::ConfigOverride { .. } => "config_override",
         SessionStateRollbackAction::Compression { .. } => "compression",
-        SessionStateRollbackAction::TaskState { .. } => "task_state",
     }
 }
 
@@ -264,7 +245,6 @@ pub(crate) fn rollback_session_state_entry_json(entry: &SessionStateRollbackEntr
                 Value::Number(serde_json::Number::from(*turn)),
             );
         }
-        SessionStateRollbackAction::TaskState { .. } => {}
     }
     Value::Object(value)
 }
@@ -273,8 +253,6 @@ pub(crate) async fn restore_entry(
     context: &SessionStateRestoreContext<'_>,
     entry: &SessionStateRollbackEntry,
 ) -> Result<(), String> {
-    const ROLLBACK_STEP_TIMEOUT: Duration = Duration::from_secs(30);
-
     match &entry.action {
         SessionStateRollbackAction::ConfigOverride {
             path,
@@ -296,20 +274,6 @@ pub(crate) async fn restore_entry(
         SessionStateRollbackAction::Compression { snapshot, .. } => {
             restore_observability_snapshot(context.observability_session, snapshot)
         }
-        SessionStateRollbackAction::TaskState { snapshot } => {
-            match tokio::time::timeout(
-                ROLLBACK_STEP_TIMEOUT,
-                context.task_manager.restore_snapshot(snapshot),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(format!(
-                    "task_manager.restore_snapshot timed out after {}s",
-                    ROLLBACK_STEP_TIMEOUT.as_secs()
-                )),
-            }
-        }
     }
 }
 
@@ -318,6 +282,13 @@ pub(crate) async fn execute_rollback_session_state(
     args: &Value,
     publish_current_workspace: impl FnOnce() -> Result<(), String>,
 ) -> String {
+    if args.get("after_sequence").is_some() {
+        return serde_json::json!({
+            "success": false,
+            "error": "unknown field 'after_sequence'; use 'session_state_after_sequence'",
+        })
+        .to_string();
+    }
     let scope = args
         .get("scope")
         .and_then(Value::as_str)
@@ -338,7 +309,6 @@ pub(crate) async fn execute_rollback_session_state(
     };
     let checkpoint = args
         .get("session_state_after_sequence")
-        .or_else(|| args.get("after_sequence"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
 
@@ -491,23 +461,15 @@ mod tests {
         }
     }
 
-    fn task_snapshot() -> TaskManagerSnapshot {
-        TaskManagerSnapshot {
-            tasks: vec![],
-            next_task_id: 1,
-            version: 0,
-            restore_version: None,
-        }
-    }
-
     #[test]
     fn restore_plan_returns_newest_first_and_honors_checkpoint() {
         let mut journal = SessionStateRollbackJournal::default();
         journal.record(
             3,
             "before".to_string(),
-            SessionStateRollbackAction::TaskState {
-                snapshot: task_snapshot(),
+            SessionStateRollbackAction::Compression {
+                turn: 2,
+                snapshot: observability_snapshot(),
             },
         );
         let checkpoint = journal.checkpoint();
@@ -522,15 +484,17 @@ mod tests {
         journal.record(
             3,
             "second".to_string(),
-            SessionStateRollbackAction::TaskState {
-                snapshot: task_snapshot(),
+            SessionStateRollbackAction::Compression {
+                turn: 3,
+                snapshot: observability_snapshot(),
             },
         );
         journal.record(
             4,
             "wrong-turn".to_string(),
-            SessionStateRollbackAction::TaskState {
-                snapshot: task_snapshot(),
+            SessionStateRollbackAction::Compression {
+                turn: 4,
+                snapshot: observability_snapshot(),
             },
         );
 
@@ -544,15 +508,16 @@ mod tests {
     }
 
     #[test]
-    fn journal_helpers_record_list_remove_and_drop_task_state() {
+    fn journal_helpers_record_list_and_remove() {
         let journal = Mutex::new(SessionStateRollbackJournal::default());
 
         record(
             &journal,
             5,
-            "task_board".to_string(),
-            SessionStateRollbackAction::TaskState {
-                snapshot: task_snapshot(),
+            "compression-1".to_string(),
+            SessionStateRollbackAction::Compression {
+                turn: 4,
+                snapshot: observability_snapshot(),
             },
         );
         record(
@@ -571,36 +536,6 @@ mod tests {
         assert_eq!(restore_plan_for_turn(&journal, 5).len(), 2);
         assert!(remove_sequence(&journal, listed[0].sequence));
         assert_eq!(entries(&journal).len(), 1);
-        assert_eq!(drop_task_state_entries(&journal), 1);
-        assert!(entries(&journal).is_empty());
-    }
-
-    #[test]
-    fn drop_task_state_entries_preserves_store_independent_actions() {
-        let mut journal = SessionStateRollbackJournal::default();
-        journal.record(
-            1,
-            "task_board".to_string(),
-            SessionStateRollbackAction::TaskState {
-                snapshot: task_snapshot(),
-            },
-        );
-        journal.record(
-            1,
-            "compression".to_string(),
-            SessionStateRollbackAction::Compression {
-                turn: 1,
-                snapshot: observability_snapshot(),
-            },
-        );
-
-        assert_eq!(journal.drop_task_state_entries(), 1);
-        let entries = journal.list();
-        assert_eq!(entries.len(), 1);
-        assert!(matches!(
-            entries[0].action,
-            SessionStateRollbackAction::Compression { .. }
-        ));
     }
 
     #[test]
@@ -654,13 +589,10 @@ mod tests {
                 snapshot: observability_snapshot(),
             },
         };
-        let task_manager = TaskManager::in_memory();
-
         let context = SessionStateRestoreContext {
             user_id: "test-user",
             session_id: "session-1",
             observability_session: None,
-            task_manager: &task_manager,
         };
 
         let error = restore_entry(&context, &entry)
@@ -673,8 +605,6 @@ mod tests {
     #[tokio::test]
     async fn execute_rollback_session_state_requires_turn_index_for_turn_scope() {
         let journal = Mutex::new(SessionStateRollbackJournal::default());
-        let task_manager = TaskManager::in_memory();
-
         let output = execute_rollback_session_state(
             RollbackSessionStateContext {
                 journal: &journal,
@@ -683,7 +613,6 @@ mod tests {
                     user_id: "test-user",
                     session_id: "session-1",
                     observability_session: None,
-                    task_manager: &task_manager,
                 },
             },
             &serde_json::json!({"scope": "turn"}),
@@ -702,7 +631,6 @@ mod tests {
     #[tokio::test]
     async fn execute_rollback_session_state_does_not_publish_when_plan_is_empty() {
         let journal = Mutex::new(SessionStateRollbackJournal::default());
-        let task_manager = TaskManager::in_memory();
         let publish_calls = std::sync::atomic::AtomicUsize::new(0);
 
         let output = execute_rollback_session_state(
@@ -713,7 +641,6 @@ mod tests {
                     user_id: "test-user",
                     session_id: "session-1",
                     observability_session: None,
-                    task_manager: &task_manager,
                 },
             },
             &serde_json::json!({"scope": "current_turn"}),
@@ -740,12 +667,15 @@ mod tests {
         record(
             &journal,
             4,
-            "task_board".to_string(),
-            SessionStateRollbackAction::TaskState {
-                snapshot: task_snapshot(),
+            "compression".to_string(),
+            SessionStateRollbackAction::Compression {
+                turn: 4,
+                snapshot: observability_snapshot(),
             },
         );
-        let task_manager = TaskManager::in_memory();
+        let observability_session = Arc::new(RwLock::new(
+            crate::observability::ObservabilitySession::new_simple("session-1"),
+        ));
 
         let output = execute_rollback_session_state(
             RollbackSessionStateContext {
@@ -754,8 +684,7 @@ mod tests {
                 restore_context: SessionStateRestoreContext {
                     user_id: "test-user",
                     session_id: "session-1",
-                    observability_session: None,
-                    task_manager: &task_manager,
+                    observability_session: Some(&observability_session),
                 },
             },
             &serde_json::json!({"scope": "current_turn"}),

@@ -150,6 +150,18 @@ pub enum StateProjectionError {
     },
     #[error("compaction invariant failed: {id} violations={violations}")]
     CompactionInvariantFailed { id: String, violations: i64 },
+    #[error("session is not active: owner={user_id}, session={session_id}")]
+    SessionNotActive { user_id: String, session_id: String },
+    #[error(
+        "personal skill version is unavailable: owner={user_id}, skill={skill_name}, version={version_id}"
+    )]
+    PersonalSkillVersionUnavailable {
+        user_id: String,
+        skill_name: String,
+        version_id: String,
+    },
+    #[error("personal skill version is not activatable: version={version_id}, status={status}")]
+    PersonalSkillVersionNotActivatable { version_id: String, status: String },
 }
 
 #[derive(Clone, Debug)]
@@ -1109,6 +1121,73 @@ impl DatabaseStateProjectionStore {
                     entity: session_id.to_string(),
                     source,
                 })?;
+        crate::storage::admit_session_event_write(&mut tx, session_id, user_id, false)
+            .await
+            .map_err(|_| StateProjectionError::SessionNotActive {
+                user_id: user_id.to_string(),
+                session_id: session_id.to_string(),
+            })?;
+        let session_status = sqlx::query(
+            "SELECT status FROM agent_sessions
+             WHERE user_id = ? AND session_id = ? LIMIT 1 FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(session_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| StateProjectionError::Database {
+            operation: "validate_skill_activation_session",
+            entity: session_id.to_string(),
+            source,
+        })?
+        .map(|row| row.try_get::<String, _>("status"))
+        .transpose()
+        .map_err(|source| StateProjectionError::Database {
+            operation: "validate_skill_activation_session",
+            entity: session_id.to_string(),
+            source,
+        })?;
+        if session_status.as_deref() != Some("active") {
+            return Err(StateProjectionError::SessionNotActive {
+                user_id: user_id.to_string(),
+                session_id: session_id.to_string(),
+            });
+        }
+        let version_status = sqlx::query(
+            "SELECT status FROM user_skill_versions
+             WHERE owner_user_id = ? AND skill_name = ? AND version_id = ?
+             LIMIT 1 FOR UPDATE",
+        )
+        .bind(user_id)
+        .bind(skill_name)
+        .bind(version_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|source| StateProjectionError::Database {
+            operation: "validate_skill_activation_version",
+            entity: version_id.to_string(),
+            source,
+        })?
+        .map(|row| row.try_get::<String, _>("status"))
+        .transpose()
+        .map_err(|source| StateProjectionError::Database {
+            operation: "validate_skill_activation_version",
+            entity: version_id.to_string(),
+            source,
+        })?;
+        let Some(version_status) = version_status else {
+            return Err(StateProjectionError::PersonalSkillVersionUnavailable {
+                user_id: user_id.to_string(),
+                skill_name: skill_name.to_string(),
+                version_id: version_id.to_string(),
+            });
+        };
+        if version_status != "published" {
+            return Err(StateProjectionError::PersonalSkillVersionNotActivatable {
+                version_id: version_id.to_string(),
+                status: version_status,
+            });
+        }
         let insert_result = sqlx::query(
             "INSERT INTO agent_events
              (event_id, session_id, user_id, event_type, content, metadata, created_at)

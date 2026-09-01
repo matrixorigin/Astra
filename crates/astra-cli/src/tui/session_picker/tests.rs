@@ -23,7 +23,6 @@ fn entry(id: &str, cwd: &str, branch: &str, turns: u32, summary: &str) -> Sessio
         model: "sonnet-4.6".into(),
         updated_at: "2026-05-08T12:00:00Z".into(),
         checkpoints: 0,
-        plan_goal: None,
     }
 }
 

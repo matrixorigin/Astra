@@ -1,6 +1,7 @@
 use super::{
-    Diagnosis, Insight, ObservationActionHint, ObservationConfidence, ObservationEvidence,
-    ObservationFailureCluster, ObservationRecord, ReflectRequest, SessionOverview,
+    Diagnosis, Insight, InsightKind, ObservationActionHint, ObservationConfidence,
+    ObservationEvidence, ObservationFailureCluster, ObservationRecord, ReflectRecommendation,
+    ReflectRecommendationSource, ReflectRequest, SessionOverview,
 };
 use astra_core::{ObservationGraphSlice, Urn, urn_component};
 
@@ -70,7 +71,7 @@ pub(super) fn build_observation_envelope(
     overview: &SessionOverview,
     diagnoses: &[Diagnosis],
     insights: &[Insight],
-    recommendations: &[String],
+    recommendations: &[ReflectRecommendation],
     evidence_graph: Option<&ObservationGraphSlice>,
 ) -> (
     String,
@@ -83,7 +84,7 @@ pub(super) fn build_observation_envelope(
 
     let (mut observations, mut evidence, failure_clusters) =
         build_diagnosis_observations(diagnoses, session_id);
-    let (insight_obs, insight_ev) = build_insight_observations(insights, request, session_id);
+    let (insight_obs, insight_ev) = build_insight_observations(insights, session_id);
     observations.extend(insight_obs);
     evidence.extend(insight_ev);
 
@@ -95,13 +96,8 @@ pub(super) fn build_observation_envelope(
 
     evidence.extend(build_graph_evidence(evidence_graph));
 
-    let action_hints = build_action_hints_from_recommendations(
-        recommendations,
-        &observations,
-        diagnoses,
-        insights,
-        session_id,
-    );
+    let action_hints =
+        build_action_hints_from_recommendations(recommendations, &observations, session_id);
 
     (
         summary,
@@ -127,11 +123,7 @@ fn build_diagnosis_observations(
     let mut failure_clusters = Vec::new();
 
     for (idx, diagnosis) in diagnoses.iter().enumerate() {
-        let observation_ref = Urn::new("observation", "graph", "reflect")
-            .seg(session_id)
-            .seg("diagnosis")
-            .idx(idx)
-            .build();
+        let observation_ref = diagnosis_observation_ref(session_id, diagnosis);
         let mut evidence_refs = Vec::new();
         for (sample_idx, sample) in diagnosis.samples.iter().enumerate() {
             let evidence_ref = Urn::new("artifact", "cloud", "reflect")
@@ -200,18 +192,13 @@ fn build_diagnosis_observations(
 
 fn build_insight_observations(
     insights: &[Insight],
-    request: &ReflectRequest,
     session_id: &str,
 ) -> (Vec<ObservationRecord>, Vec<ObservationEvidence>) {
     let mut observations = Vec::new();
     let mut evidence = Vec::new();
 
     for (idx, insight) in insights.iter().enumerate() {
-        let observation_ref = Urn::new("observation", "graph", "reflect")
-            .seg(session_id)
-            .seg("insight")
-            .idx(idx)
-            .build();
+        let observation_ref = insight_observation_ref(session_id, &insight.kind);
         let mut evidence_refs = Vec::new();
         if !insight.evidence.trim().is_empty() {
             let evidence_ref = Urn::new("artifact", "cloud", "reflect")
@@ -230,12 +217,12 @@ fn build_insight_observations(
             });
         }
 
-        let (topic, facet) = insight_topic_facet(request, insight);
+        let (topic, facet) = insight_topic_facet(insight);
         observations.push(ObservationRecord {
             ref_id: observation_ref,
             topic,
             facet,
-            kind: format!("insight:{}", insight.category),
+            kind: format!("insight:{}", insight.kind.as_str()),
             severity: insight.severity.clone(),
             summary: insight.message.clone(),
             confidence: ObservationConfidence::complete(
@@ -313,27 +300,26 @@ fn build_graph_evidence(
 }
 
 fn build_action_hints_from_recommendations(
-    recommendations: &[String],
+    recommendations: &[ReflectRecommendation],
     observations: &[ObservationRecord],
-    diagnoses: &[Diagnosis],
-    insights: &[Insight],
     session_id: &str,
 ) -> Vec<ObservationActionHint> {
     recommendations
         .iter()
-        .filter(|rec| !rec.trim().is_empty())
+        .filter(|recommendation| !recommendation.summary.trim().is_empty())
         .take(MAX_ACTION_HINTS)
         .map(|recommendation| {
-            let observation_refs = observation_refs_for_recommendation(
-                recommendation,
-                observations,
-                diagnoses,
-                insights,
-                session_id,
-            );
+            let observation_refs = observation_ref_for_recommendation(recommendation, session_id)
+                .filter(|ref_id| {
+                    observations
+                        .iter()
+                        .any(|observation| observation.ref_id == *ref_id)
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
             ObservationActionHint {
                 target_type: "user_guidance".to_string(),
-                summary: recommendation.trim().to_string(),
+                summary: recommendation.summary.trim().to_string(),
                 confidence: ObservationConfidence::classification_evidence(
                     if observation_refs.is_empty() {
                         HINT_CLASSIFICATION_NO_OBS
@@ -356,92 +342,64 @@ fn diagnosis_topic_facet() -> (String, String) {
     ("execution".to_string(), "errors".to_string())
 }
 
-fn insight_topic_facet(request: &ReflectRequest, insight: &Insight) -> (String, String) {
-    match insight.category.as_str() {
-        "error_pattern" => ("execution".to_string(), "errors".to_string()),
-        "tool_usage" => ("execution".to_string(), "tools".to_string()),
-        "stall" => ("execution".to_string(), "stall".to_string()),
-        "performance" => ("runtime".to_string(), "performance".to_string()),
-        _ => (
-            request.topic.as_str().to_string(),
-            request.facet.as_str().to_string(),
-        ),
+fn insight_topic_facet(insight: &Insight) -> (String, String) {
+    match insight.kind {
+        InsightKind::ErrorRate => ("execution".to_string(), "errors".to_string()),
+        InsightKind::ToolFailure { .. } | InsightKind::ToolConcentration { .. } => {
+            ("execution".to_string(), "tools".to_string())
+        }
+        InsightKind::DecisionStall => ("execution".to_string(), "stall".to_string()),
+        InsightKind::ModelFanout { .. } | InsightKind::EmptySession => {
+            ("runtime".to_string(), "performance".to_string())
+        }
     }
 }
 
-fn observation_refs_for_recommendation(
-    recommendation: &str,
-    observations: &[ObservationRecord],
-    diagnoses: &[Diagnosis],
-    insights: &[Insight],
-    session_id: &str,
-) -> Vec<String> {
-    let recommendation = recommendation.trim();
-    let normalized: String = recommendation
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase();
-    let mut refs = Vec::new();
-
-    for (idx, diagnosis) in diagnoses.iter().enumerate() {
-        if !diagnosis.fix_hint.trim().is_empty()
-            && diagnosis
-                .fix_hint
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .to_lowercase()
-                == normalized
-        {
-            refs.push(
-                Urn::new("observation", "graph", "reflect")
-                    .seg(session_id)
-                    .seg("diagnosis")
-                    .idx(idx)
-                    .build(),
-            );
-        }
-    }
-
-    if refs.is_empty() {
-        for (idx, insight) in insights.iter().enumerate() {
-            if recommendation_matches_insight(recommendation, insight) {
-                refs.push(
-                    Urn::new("observation", "graph", "reflect")
-                        .seg(session_id)
-                        .seg("insight")
-                        .idx(idx)
-                        .build(),
-                );
-            }
-        }
-    }
-
-    refs.retain(|ref_id| {
-        observations
-            .iter()
-            .any(|observation| observation.ref_id == *ref_id)
-    });
-    refs.truncate(5);
-    refs
+fn diagnosis_observation_ref(session_id: &str, diagnosis: &Diagnosis) -> String {
+    Urn::new("observation", "graph", "reflect")
+        .seg(session_id)
+        .seg("diagnosis")
+        .seg(diagnosis.category.as_str())
+        .seg(&diagnosis.affected_tool)
+        .build()
 }
 
-fn recommendation_matches_insight(recommendation: &str, insight: &Insight) -> bool {
-    let norm = |s: &str| -> String {
-        s.split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ")
-            .to_lowercase()
+fn insight_observation_ref(session_id: &str, kind: &InsightKind) -> String {
+    let key = match kind {
+        InsightKind::ErrorRate => "error_rate".to_string(),
+        InsightKind::ToolFailure { tool } => format!("tool_failure:{tool}"),
+        InsightKind::ToolConcentration { tool } => format!("tool_concentration:{tool}"),
+        InsightKind::ModelFanout { decision_type } => format!("model_fanout:{decision_type}"),
+        InsightKind::EmptySession => "empty_session".to_string(),
+        InsightKind::DecisionStall => "decision_stall".to_string(),
     };
-    let recommendation = norm(recommendation);
-    let message = norm(&insight.message);
-    match insight.category.as_str() {
-        "stall" => recommendation.contains("events without decisions"),
-        "tool_usage" => {
-            message.contains("over-reliance") && recommendation.contains("diverse tools")
+    Urn::new("observation", "graph", "reflect")
+        .seg(session_id)
+        .seg("insight")
+        .seg(&key)
+        .build()
+}
+
+fn observation_ref_for_recommendation(
+    recommendation: &ReflectRecommendation,
+    session_id: &str,
+) -> Option<String> {
+    match &recommendation.source {
+        ReflectRecommendationSource::Diagnosis {
+            category,
+            affected_tool,
+        } => Some(
+            Urn::new("observation", "graph", "reflect")
+                .seg(session_id)
+                .seg("diagnosis")
+                .seg(category.as_str())
+                .seg(affected_tool)
+                .build(),
+        ),
+        ReflectRecommendationSource::Insight(kind) => {
+            Some(insight_observation_ref(session_id, kind))
         }
-        _ => false,
+        ReflectRecommendationSource::Session => None,
     }
 }
 
@@ -460,6 +418,18 @@ fn build_reflect_summary(
         })
     {
         return diagnosis.summary.clone();
+    }
+
+    // An isolated, low-severity error is still an observed diagnosis. Do not
+    // erase that evidence behind the generic "no high-confidence root cause"
+    // message: the latter describes causal certainty, not whether the error
+    // happened. Keep the wording explicit so consumers do not mistake an
+    // informational classification for a proven root cause.
+    if let Some(diagnosis) = diagnoses.first() {
+        return format!(
+            "Observed issue (causal confidence is limited): {}",
+            diagnosis.summary
+        );
     }
 
     if let Some(insight) = insights
@@ -521,4 +491,48 @@ pub(super) fn graph_event_ref(event_id: &str) -> String {
 
 pub(super) fn graph_decision_ref(decision_id: &str) -> String {
     Urn::new("decision", "cloud", decision_id).build()
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+    use crate::reflect::{Diagnosis, SessionOverview};
+
+    fn overview(error_count: i64) -> SessionOverview {
+        SessionOverview {
+            total_events: 10,
+            total_decisions: 2,
+            duration_minutes: Some(1.0),
+            unique_skills_used: 1,
+            error_count,
+            error_rate_pct: error_count as f64 * 10.0,
+            top_event_types: Vec::new(),
+            top_skills: vec![("agent_fanout".into(), 1)],
+        }
+    }
+
+    #[test]
+    fn isolated_info_diagnosis_is_not_hidden_by_generic_summary() {
+        let summary = build_reflect_summary(
+            &overview(1),
+            &[Diagnosis {
+                category: astra_core::ErrorKind::ToolInvalidArgs,
+                severity: "info".into(),
+                summary:
+                    "Tool parameter errors (agent_fanout): wrong arguments passed — 1 occurrences"
+                        .into(),
+                samples: vec!["unknown field tools".into()],
+                occurrences: 1,
+                affected_tool: "agent_fanout".into(),
+                fix_hint: "use the typed schema".into(),
+            }],
+            &[],
+        );
+        assert!(summary.contains("Observed issue"), "{summary}");
+        assert!(summary.contains("agent_fanout"), "{summary}");
+        assert!(
+            !summary.contains("no high-confidence root cause"),
+            "{summary}"
+        );
+    }
 }

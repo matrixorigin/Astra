@@ -436,22 +436,22 @@ async fn config_version_dispatch(sub: ConfigVersionCmd) -> Result<(), String> {
     match sub {
         ConfigVersionCmd::List(args) => {
             let out = format_version_list(&store, args.limit).map_err(|e| e.to_string())?;
-            print!("{out}");
+            stdout_print!("{out}");
             Ok(())
         }
         ConfigVersionCmd::Show(args) => {
             let out = format_version_show(&store, &args.id).map_err(|e| e.to_string())?;
-            print!("{out}");
+            stdout_print!("{out}");
             Ok(())
         }
         ConfigVersionCmd::Diff(args) => {
             let out = format_version_diff(&store, &args.a, &args.b).map_err(|e| e.to_string())?;
-            print!("{out}");
+            stdout_print!("{out}");
             Ok(())
         }
         ConfigVersionCmd::Current => {
             let id = format_current().map_err(|e| e.to_string())?;
-            println!("{id}");
+            stdout_println!("{id}");
             Ok(())
         }
         ConfigVersionCmd::Pull(_) => Err(
@@ -469,7 +469,7 @@ fn config_show_policy(model: Option<&str>, json: bool) -> Result<(), String> {
         astra_config::runtime_config::TrustModeSerde::Trusted => "trusted",
     };
     let rejected = cfg.tool_policy.rejected_model_match_patterns();
-    println!(
+    stdout_println!(
         "{}",
         format_policy_output(model, &policy, trust_mode, &rejected, json)
     );
@@ -540,29 +540,29 @@ fn config_list() -> Result<(), String> {
     let path = settings_path(None)?;
 
     if settings.is_empty() {
-        println!("  {}", "No settings configured.".dim());
-        println!(
+        stdout_println!("  {}", "No settings configured.".dim());
+        stdout_println!(
             "  Use {} to set a value.",
             "astra config set <key> <value>".magenta()
         );
-        println!("\n  {}:", "Available keys".bold());
+        stdout_println!("\n  {}:", "Available keys".bold());
         for (key, desc) in KNOWN_SETTINGS {
-            println!("    {}  {}", key.magenta(), desc.dim());
+            stdout_println!("    {}  {}", key.magenta(), desc.dim());
         }
         return Ok(());
     }
 
     let (hk, hv) = ("Key", "Value");
-    println!("  {:<20} {hv}", hk.bold());
-    println!("  {}", "─".repeat(50).dim());
+    stdout_println!("  {:<20} {hv}", hk.bold());
+    stdout_println!("  {}", "─".repeat(50).dim());
     for (key, value) in &settings {
         let display = match value {
             serde_json::Value::String(s) => s.clone(),
             other => other.to_string(),
         };
-        println!("  {:<20} {display}", key.as_str().magenta());
+        stdout_println!("  {:<20} {display}", key.as_str().magenta());
     }
-    println!(
+    stdout_println!(
         "\n  {} {}",
         "Config:".dim(),
         path.display().to_string().dim()
@@ -575,8 +575,8 @@ fn config_get(key: &str) -> Result<(), String> {
     match settings.get(key) {
         Some(val) => {
             match val {
-                serde_json::Value::String(s) => println!("{s}"),
-                other => println!("{other}"),
+                serde_json::Value::String(s) => stdout_println!("{s}"),
+                other => stdout_println!("{other}"),
             }
             Ok(())
         }
@@ -610,7 +610,7 @@ fn config_set(key: &str, value: &str) -> Result<(), String> {
 
     settings.insert(key.to_string(), json_value);
     write_settings(&settings)?;
-    println!("  {} Set '{}' = {}", theme::icon_ok(), key.magenta(), value);
+    stdout_println!("  {} Set '{}' = {}", theme::icon_ok(), key.magenta(), value);
     Ok(())
 }
 

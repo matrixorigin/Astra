@@ -15,7 +15,6 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::github::GitHubClient;
-use crate::task_mgmt::{InMemoryTaskStore, TaskManager, TaskStore};
 use crate::{ToolApprovalGate, ToolContext, ToolExecutor, ToolProgressCallback, ToolResult};
 
 /// Tools the server runtime may safely route straight through the shared
@@ -106,16 +105,18 @@ const MAX_TOOL_OUTPUT_BYTES: usize = 64 * 1024; // 64 KB
 /// Default tool executor with the full shared tool set.
 ///
 /// Covers file ops, shell, git (via gix), GitHub API, code intelligence,
-/// task management, and utility tools. CLI-specific tools (ask_user, MCP,
+/// and utility tools. CLI-specific tools (ask_user, MCP,
 /// LSP subprocess, interactive shell) are handled by wrapping executors.
+#[derive(Clone)]
 pub struct DefaultToolExecutor {
     ctx: ToolContext,
     approval_gate: Option<Arc<dyn ToolApprovalGate>>,
     progress_callback: Option<Arc<dyn ToolProgressCallback>>,
-    github_client: Option<GitHubClient>,
-    task_manager: Arc<TaskManager>,
+    github_client: Option<Arc<GitHubClient>>,
     bash_cache: Arc<Mutex<HashMap<BashCacheKey, BashCacheEntry>>>,
     workspace_generation: Arc<AtomicU64>,
+    convergence_tracker: crate::workspace_observation::DesiredStateConvergenceTracker,
+    convergence_authority: Arc<str>,
     bash_cache_ttl: std::time::Duration,
     /// Tracks whether the HTTP client was successfully built.
     /// When `false`, GitHub tools and other HTTP-dependent tools will report
@@ -205,28 +206,19 @@ pub fn poisoned_lock_recovery_count() -> u64 {
 
 impl DefaultToolExecutor {
     pub fn new(ctx: ToolContext) -> Self {
-        let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
-        let task_manager = Arc::new(TaskManager::new(ctx.session_id.clone(), store));
         Self {
             ctx,
             approval_gate: None,
             progress_callback: None,
             github_client: None,
-            task_manager,
             bash_cache: Arc::new(Mutex::new(HashMap::new())),
             workspace_generation: Arc::new(AtomicU64::new(0)),
+            convergence_tracker: Default::default(),
+            convergence_authority: Arc::from(uuid::Uuid::new_v4().to_string()),
             bash_cache_ttl: DEFAULT_BASH_CACHE_TTL,
             http_client_available: true,
             filesystem_write_boundary: None,
         }
-    }
-
-    /// Reuse an externally supplied task store (required for MO-backed
-    /// cross-client task visibility; keeps `Self::new` ergonomic for tests
-    /// that just want a process-local store).
-    pub fn with_task_store(mut self, store: Arc<dyn TaskStore>) -> Self {
-        self.task_manager = Arc::new(TaskManager::new(self.ctx.session_id.clone(), store));
-        self
     }
 
     /// Override the bash cache TTL. Intended for tests; production
@@ -239,8 +231,8 @@ impl DefaultToolExecutor {
 
     /// Build a ready-to-use executor from workspace parameters.
     ///
-    /// Handles the full setup recipe shared by edge and cloud:
-    /// HTTP client, `ToolContext`, sandbox, and optional GitHub integration.
+    /// Handles the local/edge setup recipe: HTTP client, `ToolContext`,
+    /// sandbox, and optional credentials discovered from this user's host.
     ///
     /// If the HTTP client cannot be built, a warning is logged and the
     /// executor is created without HTTP support (GitHub tools etc. will
@@ -251,6 +243,30 @@ impl DefaultToolExecutor {
         session_id: impl Into<String>,
         user_agent: &str,
         timeout: std::time::Duration,
+    ) -> Self {
+        Self::for_workspace_inner(workspace, user_id, session_id, user_agent, timeout, true)
+    }
+
+    /// Build a multi-tenant Server executor without reading process-level or
+    /// host CLI credentials. Credential-backed tools must be installed later
+    /// from an authenticated, owner-scoped capability binding.
+    pub fn for_server_workspace(
+        workspace: &Path,
+        user_id: impl Into<String>,
+        session_id: impl Into<String>,
+        user_agent: &str,
+        timeout: std::time::Duration,
+    ) -> Self {
+        Self::for_workspace_inner(workspace, user_id, session_id, user_agent, timeout, false)
+    }
+
+    fn for_workspace_inner(
+        workspace: &Path,
+        user_id: impl Into<String>,
+        session_id: impl Into<String>,
+        user_agent: &str,
+        timeout: std::time::Duration,
+        discover_host_credentials: bool,
     ) -> Self {
         let (http_client, http_client_available) = match reqwest::Client::builder()
             .timeout(timeout)
@@ -282,17 +298,19 @@ impl DefaultToolExecutor {
 
         let mut executor = Self::new(ctx);
         executor.http_client_available = http_client_available;
-        let tokens = crate::github::resolve_github_tokens();
-        if !tokens.is_empty() {
-            let preferred_repos = crate::github::detect_github_remote_repos(workspace);
-            let github = GitHubClient::from_tokens(http_client, tokens, preferred_repos);
-            executor = executor.with_github_client(github);
+        if discover_host_credentials {
+            let tokens = crate::github::resolve_github_tokens();
+            if !tokens.is_empty() {
+                let preferred_repos = crate::github::detect_github_remote_repos(workspace);
+                let github = GitHubClient::from_tokens(http_client, tokens, preferred_repos);
+                executor = executor.with_github_client(github);
+            }
         }
         executor
     }
 
     pub fn with_github_client(mut self, client: GitHubClient) -> Self {
-        self.github_client = Some(client);
+        self.github_client = Some(Arc::new(client));
         self
     }
     pub fn with_cancel_token(mut self, token: Option<Arc<CancellationToken>>) -> Self {
@@ -381,7 +399,7 @@ impl ToolExecutor for DefaultToolExecutor {
             .as_ref()
             .is_some_and(|t| t.is_cancelled())
         {
-            return ToolResult::error(format!("Tool '{name}' not executed: run was cancelled"));
+            return crate::cancelled_tool_result(name, false);
         }
 
         if let Some(protected) = &self.filesystem_write_boundary
@@ -392,6 +410,7 @@ impl ToolExecutor for DefaultToolExecutor {
         }
 
         if name == "bash"
+            && !crate::workspace_observation::is_explicit_workspace_verification_request(name, args)
             && !args.get("force").and_then(Value::as_bool).unwrap_or(false)
             && let Some(key) = self.bash_cache_key(args)
             && let Some(mut cached) = {
@@ -428,11 +447,98 @@ impl ToolExecutor for DefaultToolExecutor {
             return cached;
         }
 
+        // Direct workspace writers participate in the same per-root lease as
+        // Bash observation windows. This prevents a typed write in another
+        // concurrent caller from being mistaken for an opaque Bash delta.
+        let nested_run_script_callback = crate::rpc_bridge::is_run_script_rpc_dispatch();
+        if name == "run_script" && nested_run_script_callback {
+            return ToolResult::error(
+                "run_script cannot recursively start another opaque script writer".into(),
+            );
+        }
+        let targeted_observer = self.convergence_tracker.requires_snapshot_lease(
+            &self.convergence_authority,
+            name,
+            args,
+            &self.ctx.workspace_root,
+        );
+        let _workspace_mutation_lease = if name != "bash"
+            && name != "run_script"
+            && (is_workspace_mutation_tool(name, args) || targeted_observer)
+            && !nested_run_script_callback
+        {
+            // Typed writers must share the same per-workspace lease as
+            // opaque Bash observation windows.  Otherwise a direct write
+            // from another caller can land between Bash's pre/post
+            // fingerprints and be falsely attributed to Bash.  Bash is
+            // excluded because its own shell boundary acquires the lease.
+            match crate::workspace_observation::acquire_workspace_mutation_lease_with_options(
+                &self.ctx.workspace_root,
+                self.ctx.cancel_token.as_deref(),
+                std::time::Duration::from_secs(120),
+            )
+            .await
+            {
+                Some(guard) => Some(guard),
+                None => {
+                    if self
+                        .ctx
+                        .cancel_token
+                        .as_ref()
+                        .is_some_and(|token| token.is_cancelled())
+                    {
+                        self.convergence_tracker
+                            .clear_authority(&self.convergence_authority);
+                        return crate::cancelled_tool_result(name, false);
+                    }
+                    return ToolResult::error(
+                        "workspace coordination lock was cancelled, contended, or the host temporary lock namespace is not trustworthy; no tool was run. Retry after the active writer finishes or repair the host temporary-directory ownership and sticky-bit permissions"
+                            .into(),
+                    );
+                }
+            }
+        } else {
+            None
+        };
+        if self
+            .ctx
+            .cancel_token
+            .as_ref()
+            .is_some_and(|token| token.is_cancelled())
+        {
+            self.convergence_tracker
+                .clear_authority(&self.convergence_authority);
+            return crate::cancelled_tool_result(name, false);
+        }
+        let _recursive_writer_epoch = if name == "run_script" {
+            match crate::workspace_observation::begin_workspace_writer_with_options(
+                &self.ctx.workspace_root,
+                self.ctx.cancel_token.as_deref(),
+                std::time::Duration::from_secs(120),
+            )
+            .await
+            {
+                Some(guard) => Some(guard),
+                None => {
+                    return ToolResult::error(
+                        "workspace writer coordination was cancelled, contended, or the host temporary lock namespace is not trustworthy; run_script was not run. Retry after the active writer finishes or repair the host temporary-directory ownership and sticky-bit permissions"
+                            .into(),
+                    );
+                }
+            }
+        } else {
+            None
+        };
         let dispatch = self.dispatch(name, args);
-        let result = if let Some(token) = self.ctx.cancel_token.as_ref() {
+        // Bash and run_script own their child timeout/cancellation paths. Do
+        // not wrap either in the generic 60s future timeout: dropping one can
+        // abandon the post-execution workspace receipt after a partial write.
+        let mut result = if name == "bash" || name == "run_script" {
+            dispatch.await
+        } else if let Some(token) = self.ctx.cancel_token.as_ref() {
             tokio::select! {
                 _ = token.cancelled() => {
-                    ToolResult::error(format!("Tool '{name}' cancelled before completion"))
+                    crate::cancelled_tool_result(name, true)
                 }
                 result = tokio::time::timeout(TOOL_TIMEOUT, dispatch) => match result {
                     Ok(r) => r,
@@ -451,15 +557,134 @@ impl ToolExecutor for DefaultToolExecutor {
                 )),
             }
         };
+        let coordination_integrity_valid = _workspace_mutation_lease
+            .as_ref()
+            .is_none_or(crate::workspace_observation::WorkspaceObservationLease::integrity_valid)
+            && _recursive_writer_epoch
+                .as_ref()
+                .is_none_or(crate::workspace_observation::WorkspaceWriterGuard::integrity_valid);
+        if nested_run_script_callback && let Some(fields) = result.metadata.as_mut() {
+            // The callback is re-entrant under its opaque parent. It may
+            // return ordinary output to Python, but only the parent can check
+            // the binding generation after the complete script settles.
+            fields.remove("workspace_mutation_applied");
+            crate::workspace_observation::discard_workspace_desired_state_convergence_marker(
+                fields,
+            );
+            fields.remove(crate::workspace_observation::OBSERVED_FIELD);
+            fields.remove(crate::workspace_observation::SCOPE_FIELD);
+            fields.remove(crate::workspace_observation::RECEIPT_FIELD);
+        }
+        if !coordination_integrity_valid {
+            crate::workspace_observation::mark_workspace_observation_unsettled(
+                &self.ctx.workspace_root,
+            );
+            if let Some(fields) = result.metadata.as_mut() {
+                fields.remove("workspace_mutation_applied");
+                crate::workspace_observation::discard_workspace_desired_state_convergence_marker(
+                    fields,
+                );
+                fields.remove(crate::workspace_observation::OBSERVED_FIELD);
+                fields.remove(crate::workspace_observation::SCOPE_FIELD);
+                fields.remove(crate::workspace_observation::RECEIPT_FIELD);
+            }
+            result.is_error = true;
+            result.output.push_str(
+                "\n\nError: workspace binding or coordination generation changed during execution; the mutation may have applied, but no durable mutation receipt was issued. Re-bind and inspect the workspace before continuing.",
+            );
+        }
+        let desired_state =
+            match crate::workspace_observation::consume_workspace_desired_state_convergence_marker(
+                &mut result.metadata,
+                args,
+                &self.ctx.workspace_root,
+            ) {
+                Ok(desired_state) => desired_state,
+                Err(error) => {
+                    result.is_error = true;
+                    result.output.push_str(&format!(
+                        "\n\nError: {error}; no convergence authority was issued."
+                    ));
+                    None
+                }
+            };
+        // A successful structured workspace writer already crossed the
+        // owner executor's path/permission boundary. Carry that typed fact
+        // through the server/edge result ledger instead of making a remote
+        // runtime guess the target against its own filesystem. This does not
+        // satisfy final verification; it only opens the normal post-mutation
+        // observation obligation.
+        if let Some(receipt) =
+            crate::workspace_observation::typed_workspace_tool_receipt_for_applied(
+                name,
+                args,
+                &self.ctx.workspace_root,
+                result.is_error,
+                coordination_integrity_valid
+                    && !nested_run_script_callback
+                    && result
+                        .metadata
+                        .as_ref()
+                        .and_then(|fields| fields.get("workspace_mutation_applied"))
+                        .and_then(Value::as_bool)
+                        == Some(true),
+            )
+        {
+            result
+                .metadata
+                .get_or_insert_with(Default::default)
+                .extend(receipt);
+        }
+        match crate::workspace_observation::project_typed_workspace_convergence(
+            &self.convergence_tracker,
+            Some(&self.convergence_authority),
+            name,
+            args,
+            &self.ctx.workspace_root,
+            result.is_error,
+            desired_state.as_ref(),
+            coordination_integrity_valid && !nested_run_script_callback,
+            targeted_observer,
+            coordination_integrity_valid && _workspace_mutation_lease.is_some(),
+        ) {
+            Ok(projection) => {
+                if let Some(receipt) = projection.convergence_receipt {
+                    result
+                        .metadata
+                        .get_or_insert_with(Default::default)
+                        .extend(receipt);
+                }
+                if let Some(receipt) = projection.observation_receipt {
+                    result
+                        .metadata
+                        .get_or_insert_with(Default::default)
+                        .extend(receipt);
+                }
+            }
+            Err(error) => {
+                result.is_error = true;
+                result.output.push_str(&format!(
+                    "\n\nError: {error}; no completion receipt was issued. Retry inside the active turn after cancelling or finishing abandoned work."
+                ));
+            }
+        }
+
+        // This generic dispatch boundary does not establish ownership of a
+        // source file. Preserve an existing source-owned marker, but use a
+        // display-only redaction for raw output so web/env/error/tool results
+        // cannot mint a blind edit capability.
+        let result = {
+            let (output, _) =
+                crate::credential_redaction::redact_credentials_for_display(&result.output);
+            ToolResult { output, ..result }
+        };
+
         // Truncate oversized output to prevent context window overflow.
         let result = if result.output.len() > MAX_TOOL_OUTPUT_BYTES {
-            let safe_len = result.output.floor_char_boundary(MAX_TOOL_OUTPUT_BYTES);
             ToolResult {
-                output: format!(
-                    "{}\n[output truncated at {}KB — {} bytes omitted]",
-                    &result.output[..safe_len],
-                    MAX_TOOL_OUTPUT_BYTES / 1024,
-                    result.output.len() - safe_len,
+                output: crate::credential_redaction::truncate_redacted_output(
+                    result.output,
+                    MAX_TOOL_OUTPUT_BYTES,
                 ),
                 ..result
             }
@@ -468,6 +693,7 @@ impl ToolExecutor for DefaultToolExecutor {
         };
 
         if name == "bash"
+            && !crate::workspace_observation::is_explicit_workspace_verification_request(name, args)
             && !result.is_error
             && let Some(key) = self.bash_cache_key(args)
         {
@@ -482,7 +708,48 @@ impl ToolExecutor for DefaultToolExecutor {
                     },
                 );
         }
-        if is_workspace_mutation_tool(name, args) && !result.is_error {
+        // A direct writer is known from its typed tool contract; even a
+        // failed attempt invalidates cached reads because a writer can
+        // partially apply before returning an error. Opaque Bash may only be
+        // classified after the executor's bounded pre/post observation. A
+        // changed receipt likewise invalidates the generation on failure.
+        let observed_bound_workspace_mutation = name == "bash"
+            && result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get(crate::workspace_observation::OBSERVED_FIELD))
+                .and_then(Value::as_bool)
+                == Some(true)
+            && result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get(crate::workspace_observation::SCOPE_FIELD))
+                .and_then(Value::as_str)
+                == Some(crate::workspace_observation::BOUND_WORKSPACE_SCOPE)
+            && result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get(crate::workspace_observation::RECEIPT_FIELD))
+                .is_some_and(crate::workspace_observation::is_changed_receipt);
+        // `run_script` is an opaque workspace writer even when its Python
+        // body returns an error or cancellation after a partial write.  It
+        // therefore participates in cache-generation invalidation whenever
+        // execution may have started.  The one explicit exception is the
+        // capability/admission failure which carries
+        // `execution_started=false`; that path guarantees no child was
+        // spawned and must not make unrelated read caches stale.
+        let exact_desired_state_noop = !result.is_error
+            && result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get(crate::workspace_observation::RECEIPT_FIELD))
+                .is_some_and(
+                    crate::workspace_observation::is_typed_workspace_desired_state_convergence_receipt,
+                );
+        if (is_workspace_mutation_tool(name, args) && !exact_desired_state_noop)
+            || observed_bound_workspace_mutation
+            || run_script_may_have_mutated(name, &result)
+        {
             self.workspace_generation.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -494,12 +761,44 @@ impl ToolExecutor for DefaultToolExecutor {
         result
     }
 
+    async fn execute_with_cancel(
+        &self,
+        name: &str,
+        args: &Value,
+        cancel_token: Option<&CancellationToken>,
+    ) -> ToolResult {
+        let Some(cancel_token) = cancel_token else {
+            return self.execute(name, args).await;
+        };
+        if cancel_token.is_cancelled() {
+            return crate::cancelled_tool_result(name, false);
+        }
+        // Execute against a shallow clone whose context carries the caller's
+        // token.  Shared caches/generation and the GitHub client remain
+        // shared, while Bash/run_script and all generic dispatch paths now
+        // observe the actual caller-owned cancellation boundary rather than
+        // an unrelated context token (or no token at all).
+        let mut delegated = self.clone();
+        delegated.ctx.cancel_token = Some(Arc::new(cancel_token.clone()));
+        delegated.execute(name, args).await
+    }
+
     fn tool_schemas(&self) -> Vec<Value> {
-        crate::schemas::all_tool_schemas()
+        let mut schemas = crate::schemas::all_tool_schemas();
+        if !astra_sandbox::process_scope_available() {
+            schemas.retain(|schema| {
+                astra_core::tool_schema::tool_schema_name(schema) != Some("run_script")
+            });
+        }
+        schemas
     }
 
     fn project_root(&self) -> &Path {
         &self.ctx.project_root
+    }
+
+    fn workspace_root(&self) -> &Path {
+        &self.ctx.workspace_root
     }
 }
 
@@ -631,12 +930,7 @@ impl DefaultToolExecutor {
             // ── Web search ───────────────────────────────────────────
             "web_search" => {
                 let cache_scope = format!("{}:{}", self.ctx.user_id, self.ctx.session_id);
-                crate::web_search::perform_web_search(
-                    self.ctx.http_client.as_ref(),
-                    args,
-                    &cache_scope,
-                )
-                .await
+                crate::web_search::perform_web_search(args, &cache_scope).await
             }
 
             // ── Utility tools ────────────────────────────────────────
@@ -669,12 +963,7 @@ impl DefaultToolExecutor {
             // ── Web fetch (HTTP GET) ─────────────────────────────────
             "web_fetch" => {
                 let cache_scope = format!("{}:{}", self.ctx.user_id, self.ctx.session_id);
-                let output = crate::web_fetch::fetch_with_cache_scope(
-                    self.ctx.http_client.as_ref(),
-                    args,
-                    &cache_scope,
-                )
-                .await;
+                let output = crate::web_fetch::fetch_with_cache_scope(args, &cache_scope).await;
                 string_to_result(output)
             }
 
@@ -728,7 +1017,13 @@ impl DefaultToolExecutor {
                 #[cfg(unix)]
                 {
                     let config = crate::run_script::RunScriptConfig::default();
-                    crate::run_script::handle_run_script(args, self, config).await
+                    crate::run_script::handle_run_script_with_cancel(
+                        args,
+                        self,
+                        config,
+                        self.ctx.cancel_token.as_deref(),
+                    )
+                    .await
                 }
                 #[cfg(not(unix))]
                 {
@@ -832,9 +1127,46 @@ fn mark_result_cached(result: &mut ToolResult) {
     metadata.insert("cached".to_string(), Value::Bool(true));
 }
 
-fn is_workspace_mutation_tool(name: &str, args: &Value) -> bool {
+/// Whether a `run_script` result must conservatively advance the workspace
+/// cache generation.  `run_script` executes arbitrary Python, so a successful
+/// result is not the only mutation-bearing outcome: a timeout, cancellation,
+/// or child error may arrive after a partial write.  Only the explicit
+/// pre-admission contract (`execution_started=false`) proves that no process
+/// ran.  Missing or malformed metadata is intentionally treated as started;
+/// fail-closed cache invalidation is safer than serving a stale read.
+fn run_script_may_have_mutated(name: &str, result: &ToolResult) -> bool {
+    if name != "run_script" {
+        return false;
+    }
+    result
+        .metadata
+        .as_ref()
+        .and_then(|fields| fields.get("execution_started"))
+        .and_then(Value::as_bool)
+        != Some(false)
+}
+
+/// Return whether a typed tool invocation may mutate the bound workspace.
+///
+/// This is intentionally an admission/serialization predicate, not proof that
+/// a mutation happened. Callers that need completion evidence must use the
+/// executor-owned post-execution receipt (or the tool's typed success
+/// contract). Keeping the predicate shared prevents edge and server routes
+/// from acquiring different workspace observation windows.
+pub fn is_workspace_mutation_tool(name: &str, args: &Value) -> bool {
     match name {
-        "write_file" | "str_replace" | "multi_edit" | "delete_file" => true,
+        "write_file"
+        | "str_replace"
+        | "multi_edit"
+        | "edit_file"
+        | "apply_patch"
+        | "create_file"
+        | "delete_file"
+        | "notebook_edit"
+        | "rollback_file_edits"
+        | "rollback_git_worktrees"
+        | "rename_symbol" => true,
+        "lsp" => args.get("dry_run").and_then(Value::as_bool) == Some(false),
         "git" => crate::git_tool_contract::git_action_from_args(args)
             .ok()
             .is_some_and(|action| match action {
@@ -1013,6 +1345,73 @@ mod tests {
     }
 
     #[test]
+    fn run_script_schema_matches_process_scope_capability() {
+        let (_tmp, exec) = test_executor();
+        let visible = <DefaultToolExecutor as ToolExecutor>::tool_schemas(&exec)
+            .iter()
+            .any(|schema| astra_core::tool_schema::tool_schema_name(schema) == Some("run_script"));
+        assert_eq!(
+            visible,
+            astra_sandbox::process_scope_available(),
+            "run_script must not be advertised when its ownership capability is unavailable"
+        );
+    }
+
+    #[test]
+    fn run_script_generation_invalidation_is_conservative_after_dispatch() {
+        // Arbitrary Python can mutate the workspace on success, partial
+        // failure, or cancellation.  All of those outcomes must invalidate
+        // read caches once execution may have started.
+        assert!(run_script_may_have_mutated(
+            "run_script",
+            &ToolResult::text("ok".into())
+        ));
+        assert!(run_script_may_have_mutated(
+            "run_script",
+            &ToolResult::error("partial failure".into())
+        ));
+
+        let mut cancelled = crate::cancelled_tool_result("run_script", true);
+        assert!(run_script_may_have_mutated("run_script", &cancelled));
+
+        // OwnershipUnavailable is the one fail-closed admission result that
+        // proves no child was spawned, so it must not evict unrelated read
+        // caches.  Malformed metadata is not proof and remains conservative.
+        cancelled
+            .metadata
+            .get_or_insert_with(serde_json::Map::new)
+            .insert("execution_started".into(), Value::Bool(false));
+        assert!(!run_script_may_have_mutated("run_script", &cancelled));
+
+        let mut malformed = ToolResult::error("unknown execution state".into());
+        malformed
+            .metadata
+            .get_or_insert_with(serde_json::Map::new)
+            .insert("execution_started".into(), Value::String("false".into()));
+        assert!(run_script_may_have_mutated("run_script", &malformed));
+        assert!(!run_script_may_have_mutated(
+            "read_file",
+            &ToolResult::text("ok".into())
+        ));
+    }
+
+    #[test]
+    fn multi_tenant_server_executor_never_discovers_host_github_credentials() {
+        let workspace = TempDir::new().expect("temporary workspace");
+        let executor = DefaultToolExecutor::for_server_workspace(
+            workspace.path(),
+            "owner-a",
+            "session-a",
+            "astra-server-test",
+            std::time::Duration::from_secs(1),
+        );
+        assert!(
+            executor.github_client.is_none(),
+            "server construction must require a later owner-scoped credential binding"
+        );
+    }
+
+    #[test]
     fn server_direct_default_executor_tools_are_read_or_self_contained() {
         for name in SERVER_DIRECT_DEFAULT_EXECUTOR_TOOL_NAMES {
             assert!(
@@ -1025,7 +1424,6 @@ mod tests {
             "str_replace",
             "bash",
             "run_script",
-            "task_board",
             "session",
             "memory",
             "rollback_file_edits",
@@ -1171,6 +1569,99 @@ mod tests {
             .await;
         assert!(!result.is_error);
         assert!(tmp.path().join("out.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn exact_write_file_noop_emits_convergence_without_generation_or_cache_change() {
+        let (tmp, exec) = test_executor();
+        let args = serde_json::json!({"path": "answer.txt", "content": "stable\n"});
+        let changed = exec.execute("write_file", &args).await;
+        assert!(!changed.is_error, "{changed:?}");
+        assert!(changed.metadata.as_ref().is_some_and(|fields| {
+            fields
+                .get(crate::workspace_observation::RECEIPT_FIELD)
+                .is_some_and(crate::workspace_observation::is_typed_workspace_tool_receipt)
+        }));
+
+        let generation = exec.workspace_generation.load(Ordering::Relaxed);
+        let bash_args = serde_json::json!({"command": "pwd"});
+        let first_read = exec.execute("bash", &bash_args).await;
+        assert!(!first_read.is_error, "{first_read:?}");
+        let before = std::fs::metadata(tmp.path().join("answer.txt"))
+            .expect("target metadata")
+            .modified()
+            .expect("mtime");
+
+        let no_op = exec.execute("write_file", &args).await;
+        assert!(!no_op.is_error, "{no_op:?}");
+        let fields = no_op.metadata.as_ref().expect("convergence metadata");
+        let receipt = &fields[crate::workspace_observation::RECEIPT_FIELD];
+        assert!(
+            crate::workspace_observation::is_typed_workspace_desired_state_convergence_receipt(
+                receipt
+            )
+        );
+        assert!(!crate::workspace_observation::is_typed_workspace_tool_receipt(receipt));
+
+        std::fs::write(tmp.path().join("other.txt"), "other\n").expect("other target");
+        for read_args in [
+            serde_json::json!({"path": "other.txt"}),
+            serde_json::json!({"path": "answer.txt", "start_line": 1, "end_line": 1}),
+        ] {
+            let read = exec.execute("read_file", &read_args).await;
+            assert!(!read.is_error, "{read:?}");
+            let observation = read
+                .metadata
+                .as_ref()
+                .and_then(|fields| {
+                    fields.get(crate::workspace_observation::OBSERVATION_RECEIPT_FIELD)
+                })
+                .expect("generic observation receipt");
+            assert!(
+                crate::workspace_observation::typed_workspace_observation_evidence(observation)
+                    .is_none(),
+                "wrong-target and partial reads must not consume strong convergence authority"
+            );
+        }
+        let full_read = exec
+            .execute("read_file", &serde_json::json!({"path": "answer.txt"}))
+            .await;
+        assert!(!full_read.is_error, "{full_read:?}");
+        let strong_observation = full_read
+            .metadata
+            .as_ref()
+            .and_then(|fields| fields.get(crate::workspace_observation::OBSERVATION_RECEIPT_FIELD))
+            .and_then(crate::workspace_observation::typed_workspace_observation_evidence)
+            .expect("same-authority full read must carry a fresh state snapshot");
+        assert_eq!(strong_observation.target, "answer.txt");
+        assert_eq!(
+            strong_observation.observed_state,
+            crate::workspace_observation::workspace_file_state_identity(b"stable\n")
+        );
+        assert_eq!(
+            exec.workspace_generation.load(Ordering::Relaxed),
+            generation,
+            "an exact no-op must not advance the workspace generation"
+        );
+        assert_eq!(
+            std::fs::metadata(tmp.path().join("answer.txt"))
+                .expect("target metadata")
+                .modified()
+                .expect("mtime"),
+            before,
+            "an exact no-op must not rewrite the target"
+        );
+
+        let cached_read = exec.execute("bash", &bash_args).await;
+        assert_eq!(
+            cached_read
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("cached"))
+                .and_then(Value::as_bool),
+            Some(true),
+            "an exact no-op must not invalidate an existing read cache"
+        );
     }
 
     #[tokio::test]
@@ -1447,6 +1938,25 @@ mod tests {
                 .and_then(|v| v.as_bool()),
             Some(true),
             "second call must be served from cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_bash_verify_mode_is_never_served_from_cache() {
+        let (_tmp, exec) = test_executor();
+        let args = serde_json::json!({ "command": "pwd", "mode": "verify" });
+
+        let _first = exec.execute("bash", &args).await;
+        let second = exec.execute("bash", &args).await;
+
+        assert_ne!(
+            second
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "verify mode must establish a fresh observation window"
         );
     }
 
@@ -1910,6 +2420,14 @@ mod tests {
             )
             .await;
         assert!(!result.is_error);
+        assert_eq!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("workspace_mutation_applied"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
         let content = std::fs::read_to_string(tmp.path().join("f.txt")).unwrap();
         assert_eq!(content, "new text here\n");
     }
@@ -1930,6 +2448,14 @@ mod tests {
             )
             .await;
         assert!(!result.is_error, "got: {}", result.output);
+        assert_ne!(
+            result
+                .metadata
+                .as_ref()
+                .and_then(|fields| fields.get("workspace_mutation_applied"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
         assert!(
             result.output.contains("[DRY RUN]"),
             "got: {}",
@@ -1952,7 +2478,10 @@ mod tests {
     async fn dispatch_tool_search() {
         let (_tmp, exec) = test_executor();
         let result = exec
-            .execute("tool_search", &serde_json::json!({"query": "file"}))
+            .execute(
+                "tool_search",
+                &serde_json::json!({"query": "select:read_file"}),
+            )
             .await;
         assert!(!result.is_error);
     }
@@ -2396,6 +2925,11 @@ mod tests {
             "error must mention cancellation, got: {}",
             result.output
         );
+        let value: serde_json::Value = serde_json::from_str(&result.output)
+            .expect("pre-execution cancellation must be a typed result");
+        assert_eq!(value["status"], "cancelled");
+        assert_eq!(value["error_kind"], "cancelled");
+        assert_eq!(value["retryable"], false);
     }
 
     #[tokio::test]
@@ -2423,6 +2957,41 @@ mod tests {
             "error must mention cancellation, got: {}",
             result.output
         );
+        let value: serde_json::Value = serde_json::from_str(&result.output)
+            .expect("in-flight cancellation must be a typed result");
+        assert_eq!(value["status"], "cancelled");
+        assert_eq!(value["error_kind"], "cancelled");
+        assert_eq!(value["retryable"], false);
+    }
+
+    #[tokio::test]
+    async fn caller_owned_token_interrupts_without_context_token() {
+        let (_tmp, exec) = test_executor();
+        let token = Arc::new(CancellationToken::new());
+        let trigger = Arc::clone(&token);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            ToolExecutor::execute_with_cancel(
+                &exec,
+                "sleep",
+                &serde_json::json!({"seconds": 30}),
+                Some(token.as_ref()),
+            ),
+        )
+        .await
+        .expect("caller-owned cancellation should be observed");
+
+        assert!(result.is_error);
+        let value: serde_json::Value = serde_json::from_str(&result.output)
+            .expect("caller-owned cancellation must use the typed envelope");
+        assert_eq!(value["status"], "cancelled");
+        assert_eq!(value["error_kind"], "cancelled");
+        assert_eq!(value["retryable"], false);
     }
 
     // ── run_script dispatch ──────────────────────────────────────────────
@@ -2430,7 +2999,7 @@ mod tests {
     #[tokio::test]
     #[cfg_attr(not(feature = "python_tests"), ignore)]
     async fn dispatch_run_script_executes_python() {
-        if !crate::run_script::python3_available() {
+        if !crate::run_script::python3_available() || !astra_sandbox::process_scope_available() {
             return;
         }
         let (tmp, exec) = test_executor();

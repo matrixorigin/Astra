@@ -86,7 +86,49 @@ async fn build_app_keeps_core_http_and_websocket_surfaces_registered() {
         ),
     )
     .await;
-    assert_ne!(chat_turn, StatusCode::NOT_FOUND);
+    assert_eq!(
+        chat_turn,
+        StatusCode::NOT_FOUND,
+        "the removed client-owned turn adapter must not remain routable"
+    );
+
+    let local_publish = request_status(
+        build_app(build_guardrail_state()),
+        request(
+            "POST",
+            "/sessions/guardrail-session/publish",
+            &[
+                ("authorization", "Bearer test-token"),
+                ("content-type", "application/json"),
+            ],
+            Body::from("{}"),
+        ),
+    )
+    .await;
+    assert_eq!(
+        local_publish,
+        StatusCode::NOT_FOUND,
+        "local journal publication must not reintroduce a second conversation authority"
+    );
+
+    let segment_upload = request_status(
+        build_app(build_guardrail_state()),
+        request(
+            "POST",
+            "/sessions/guardrail-session/context/segments:upload",
+            &[
+                ("authorization", "Bearer test-token"),
+                ("content-type", "application/json"),
+            ],
+            Body::from("{}"),
+        ),
+    )
+    .await;
+    assert_ne!(
+        segment_upload,
+        StatusCode::NOT_FOUND,
+        "bounded immutable segment staging remains part of attach/fork hydration"
+    );
 
     let delegate = request_status(
         build_app(build_guardrail_state()),
@@ -103,24 +145,23 @@ async fn build_app_keeps_core_http_and_websocket_surfaces_registered() {
     .await;
     assert_ne!(delegate, StatusCode::NOT_FOUND);
 
-    let oversized_chat_turn = request_status(
+    let oversized_chat_stream = request_status(
         build_app(build_guardrail_state()),
         request(
             "POST",
-            "/chat/turn",
+            "/chat/stream",
             &[
                 ("authorization", "Bearer test-token"),
                 ("content-type", "application/json"),
-                ("x-mo-bridge-test-secret", "guardrail-secret"),
             ],
             Body::from(vec![b'a'; 4 * 1024 * 1024 + 1]),
         ),
     )
     .await;
     assert_eq!(
-        oversized_chat_turn,
+        oversized_chat_stream,
         StatusCode::PAYLOAD_TOO_LARGE,
-        "build_app must keep the 4 MiB request body limit on /chat/turn"
+        "build_app must keep the 4 MiB request body limit on /chat/stream"
     );
 }
 
@@ -198,20 +239,6 @@ async fn build_test_router_keeps_representative_domain_routes_registered() {
     .await;
     assert_ne!(introspection, StatusCode::NOT_FOUND);
 
-    let tasks = request_status(
-        app.clone(),
-        request("GET", "/tasks", auth_headers, Body::empty()),
-    )
-    .await;
-    assert_ne!(tasks, StatusCode::NOT_FOUND);
-
-    let plans = request_status(
-        app.clone(),
-        request("GET", "/plans", auth_headers, Body::empty()),
-    )
-    .await;
-    assert_ne!(plans, StatusCode::NOT_FOUND);
-
     let marketplace = request_status(
         app.clone(),
         request("GET", "/marketplace/search", auth_headers, Body::empty()),
@@ -225,4 +252,42 @@ async fn build_test_router_keeps_representative_domain_routes_registered() {
     )
     .await;
     assert_ne!(preferences, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn legacy_task_plan_and_todo_surfaces_are_not_routable() {
+    let app = build_test_router(build_guardrail_state());
+    let auth_headers = &[("authorization", "Bearer test-token")];
+    for (method, path) in [
+        ("GET", "/tasks"),
+        ("POST", "/tasks"),
+        ("POST", "/tasks:rpc"),
+        ("POST", "/tasks/task-1/lease/claim"),
+        // The thin client still carries these legacy paths for compatibility
+        // with older servers; they are not capabilities of this runtime.
+        ("GET", "/agent-jobs"),
+        ("POST", "/agent-jobs/task-1/lease/claim"),
+        ("GET", "/plans"),
+        ("POST", "/plans"),
+        ("POST", "/plans/plan-1/execute"),
+        ("GET", "/sessions/session-1/todos"),
+        ("POST", "/sessions/session-1/todos:execute"),
+        ("GET", "/users/me/todos"),
+    ] {
+        let status = request_status(
+            app.clone(),
+            request(method, path, auth_headers, Body::empty()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
+    }
+
+    // `/skills/{skill_id}` is a live GET route, so the legacy client's POST
+    // path is rejected by method routing rather than falling through to 404.
+    let skills_test = request_status(
+        app,
+        request("POST", "/skills/test", auth_headers, Body::empty()),
+    )
+    .await;
+    assert_eq!(skills_test, StatusCode::METHOD_NOT_ALLOWED);
 }

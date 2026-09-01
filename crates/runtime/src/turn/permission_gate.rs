@@ -1025,10 +1025,6 @@ mod tests {
             ("rollback_session_state", Some(r#"{"scope":"last_turn"}"#)),
             ("adjust_config", Some(r#"{"key":"model","value":"fast"}"#)),
             ("compress_context", Some(r#"{"target_tokens":1000}"#)),
-            (
-                "task_board",
-                Some(r#"{"action":"stop","task_id":"bg-shell-1"}"#),
-            ),
         ] {
             let result = check_tool_permission_in_plan_mode(
                 tool,

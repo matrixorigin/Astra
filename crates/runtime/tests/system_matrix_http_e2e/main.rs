@@ -2,11 +2,8 @@
 //!
 //! ## Tests in this binary (ignored tests)
 //! - **`product_matrix_api_journey_hits_multiple_tables`** — full product journey (sessions → agents →
-//!   events → tasks → `chat/turn` SSE + `agent_events` assertions → logout), including
+//!   events → server-owned `chat/stream` SSE + `agent_events` assertions → logout), including
 //!   `GET /platform/snapshot` after session activity.
-//! - **`e2e_matrix_tasks_lease_and_db_assertions`** — `POST /tasks`, `GET /tasks`, `GET /tasks/{id}`,
-//!   `GET .../progress`, edge register, lease claim / `GET` lease / renew / release, `task_leases` +
-//!   `PUT /tasks/{id}/status` + `agent_tasks`.
 //! - **`e2e_matrix_chat_run_pause_resume_http`** — `POST /chat` (background run), immediate
 //!   pause/resume + `GET /chat/runs/{run_id}` (run state is in-memory + optional engine; no Matrix
 //!   table assertion today).
@@ -19,22 +16,15 @@
 //!   malformed `/tools/result` / `/approval/respond` requests with client/auth errors instead of
 //!   accepting transport-boundary garbage.
 //! - **`e2e_matrix_duplicate_tool_result_idempotency`** — `POST /tools/result` twice for the same
-//!   `request_id` during a live handoff; assert the initial `chat/turn` SSE still emits one
-//!   `tool_request` and ends with `has_tool_calls=true`.
+//!   `request_id` during one server-owned stream; assert one request, one durable result, and one
+//!   final model round/terminal.
 //! - **`e2e_matrix_duplicate_approval_response_idempotency`** — `POST /approval/respond` twice for the
 //!   same `request_id`; assert the run event log records one terminal decision.
-//! - **`e2e_matrix_chat_turn_partial_batch_failure`** — one `chat/turn` round emits two `tool_request`
-//!   callbacks; post one success and one failure and assert the initial SSE handoff still ends with
-//!   `has_tool_calls=true`.
-//! - **`e2e_matrix_chat_turn_out_of_order_tool_results`** — one `chat/turn` round emits two
-//!   `tool_request` callbacks, then accepts the second callback result before the first while the
-//!   initial SSE handoff still ends with `has_tool_calls=true`.
-//! - **`e2e_matrix_same_session_concurrent_turns_isolated`** — two concurrent `POST /chat/turn`
-//!   requests target the same session; assert one canonical writer commits, the other receives a
-//!   typed retryable conflict, and its serial retry persists a distinct causal chain.
-//! - **`e2e_matrix_same_session_waiting_turn_overlap_isolated`** — a same-session tool-backed
-//!   handoff fences a second plain writer with a typed retryable conflict without leaking either
-//!   turn's data into the other stream.
+//! - **`e2e_matrix_server_stream_partial_batch_failure`** — one server-owned stream emits two
+//!   `tool_request` callbacks; post one success and one failure and assert the same stream reaches
+//!   its final model round and one server terminal.
+//! - **`e2e_matrix_server_stream_out_of_order_tool_results`** — one server-owned stream emits two
+//!   callbacks, accepts the second result before the first, and still reaches one final terminal.
 //! - **`e2e_matrix_auth_session_negative_paths`** — `GET /sessions` without auth (401), duplicate
 //!   register, bad login, and successful login after negative calls (replaces stub `auth_contract` /
 //!   `session_contract` negative coverage).
@@ -55,13 +45,12 @@
 //! - **`e2e_matrix_stream_failed_fanout_settles_once_without_orphaning_children`** — the same live
 //!   path with all child providers failing: causes stay inspectable, no replacement runs appear,
 //!   and the parent receives one fixed-size terminal aggregate.
-//! - **`e2e_matrix_cli_bridge_session_views_remain_consistent`** — two `POST /chat/turn` model
-//!   boundaries (one human, one runtime reconciliation) with mock LLM → cross-check MatrixOne core
-//!   rows, session/event counts, audit summary/turns, and root transcript; internal runtime text
-//!   must never become user speech.
-//! - **`e2e_matrix_cli_bridge_tool_round_preserves_causal_event_order`** — real MatrixOne plus two
-//!   mock-LLM bridge continuations assert user → tool call → tool result → final response ordering
-//!   and reject blank transcript rows from tool-only model boundaries.
+//! - **`e2e_matrix_stream_concurrent_fanout_isolates_users_sessions_and_group_ids`** — four live
+//!   fanouts reuse the same group/slot labels across two users and two sessions each; successful and
+//!   provider-deadline groups remain stream-, registry-, and MatrixOne-isolated under concurrency.
+//! - **`e2e_matrix_stream_root_cancel_settles_slow_fanout_without_late_synthesis`** — cancelling a
+//!   live root while three child providers are delayed yields one cancellation terminal per fixed
+//!   slot, a four-row cancelled tree, and no late child output or parent synthesis.
 //! - **`e2e_matrix_team_crud_and_db`** — `POST/GET/DELETE /teams`, list + detail + empty executions,
 //!   upsert second `POST`, `team_definitions` SQL assertions (`user_id`, `name`, delete removes row).
 //! - **`e2e_matrix_team_snapshots_and_db`** — `POST/GET .../snapshots`, `DELETE /teams/snapshots/{id}`,
@@ -103,13 +92,18 @@
 //! journey (not duplicated in a separate test).
 //!
 //! External dependencies remain mocked where the product already allows it:
-//! - LLM: `test_llm_rounds` + `bridge-e2e-hooks` on `/chat/turn` (no external model server).
+//! - LLM: `context.test_llm_rounds` + the legacy `bridge-e2e-hooks` mock-inference hook on
+//!   server-owned `/chat/stream` (no external model server).
+//!   `ASTRA_TEST_BRIDGE_SECRET` is test-hook configuration, not route authorization.
 //! - Memoria: [`astra_runtime::MemoriaForwarder`] stub (memory proxy routes only).
 //!
 //! ## How to run
 //! ```text
 //! ASTRA_TEST_DB_IT=1 \
 //! ASTRA_TEST_BRIDGE_SECRET=system-matrix-e2e-secret \
+//! ASTRA_BACKEND_SERVICE_KEY=test-service-key-e2e \
+//! ASTRA_LLM_RETRY_BASE_MS=10 ASTRA_DEFAULT_RETRY_AFTER_MS=10 ASTRA_BCRYPT_COST=4 \
+//! RUST_MIN_STACK=16777216 \
 //! cargo test -p astra-runtime --test system_matrix_http_e2e --features bridge-e2e-hooks -- \
 //!   --ignored --nocapture
 //! ```
@@ -123,7 +117,6 @@
 mod harness;
 mod journey_admin_smoke_matrix;
 mod journey_branches_matrix;
-mod journey_bridge_session_state;
 mod journey_context_decision_chain_matrix;
 mod journey_delegate_http_matrix;
 mod journey_evaluation_reads_matrix;
@@ -154,14 +147,7 @@ async fn product_matrix_api_journey_hits_multiple_tables() {
     require_system_e2e_env();
     let b = harness::bootstrap().await;
     journey_full::run_product_matrix_full_journey(&b.ctx, &b.auth_header, &b.refresh_token).await;
-    b.ctx.pool.close().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_tasks_lease_and_db_assertions() {
-    require_system_e2e_env();
-    journey_tasks_runs::run_tasks_lease_with_db_assertions().await;
+    b.ctx.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -169,6 +155,27 @@ async fn e2e_matrix_tasks_lease_and_db_assertions() {
 async fn e2e_matrix_chat_run_pause_resume_http() {
     require_system_e2e_env();
     journey_tasks_runs::run_chat_run_pause_resume_http().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live MatrixOne; production orphan claim x HTTP DELETE cancellation race"]
+async fn e2e_matrix_orphan_cancel_claim_race_http() {
+    require_system_e2e_env();
+    journey_tasks_runs::run_orphan_cancel_claim_race_http().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live MatrixOne + mock LLM; paused accounting generation fence"]
+async fn e2e_matrix_paused_accounting_generation_fence_http() {
+    require_system_e2e_env();
+    journey_tasks_runs::run_paused_accounting_generation_fence_http().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live MatrixOne + mock LLM; pause wins the post-loop settlement race"]
+async fn e2e_matrix_live_pause_wins_post_loop_settlement_accounting() {
+    require_system_e2e_env();
+    journey_tasks_runs::run_live_pause_wins_post_loop_settlement_accounting().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -196,6 +203,13 @@ async fn e2e_matrix_stream_session_metadata_enables_full_llm_exchange_journaling
         .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live MatrixOne + mock LLM; overlapping fixture cleanup isolation gate"]
+async fn e2e_matrix_stream_bootstrap_cleanup_preserves_live_fixture() {
+    require_system_e2e_env();
+    journey_stream_persistence::run_stream_bootstrap_cleanup_preserves_live_fixture().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
 async fn e2e_matrix_approval_respond_invalid_session_id() {
@@ -214,7 +228,7 @@ async fn e2e_matrix_edge_callback_http_boundary_failures() {
 #[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
 async fn e2e_matrix_duplicate_tool_result_idempotency() {
     require_system_e2e_env();
-    journey_extended::run_duplicate_tool_result_is_idempotent().await;
+    journey_extended::run_duplicate_tool_result_server_stream_is_idempotent().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -226,30 +240,16 @@ async fn e2e_matrix_duplicate_approval_response_idempotency() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_chat_turn_partial_batch_failure() {
+async fn e2e_matrix_server_stream_partial_batch_failure() {
     require_system_e2e_env();
-    journey_extended::run_chat_turn_partial_batch_failure().await;
+    journey_extended::run_server_stream_partial_batch_failure().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_chat_turn_out_of_order_tool_results() {
+async fn e2e_matrix_server_stream_out_of_order_tool_results() {
     require_system_e2e_env();
-    journey_extended::run_chat_turn_out_of_order_tool_results().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_same_session_concurrent_turns_isolated() {
-    require_system_e2e_env();
-    journey_extended::run_same_session_concurrent_turns_isolated().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_same_session_waiting_turn_overlap_isolated() {
-    require_system_e2e_env();
-    journey_extended::run_same_session_waiting_turn_overlap_isolated().await;
+    journey_extended::run_server_stream_out_of_order_tool_results().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -326,26 +326,44 @@ async fn e2e_matrix_stream_structured_fanout_has_one_parent_synthesis_and_durabl
         .await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "live MatrixOne + mock parent/child LLM; concurrent fanout ownership/isolation gate"]
+async fn e2e_matrix_stream_concurrent_fanout_isolates_users_sessions_and_group_ids() {
+    require_system_e2e_env();
+    journey_stream_persistence::run_stream_concurrent_fanout_isolates_users_sessions_and_group_ids(
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore = "live MatrixOne + delayed mock child LLM; root/fanout cancellation race gate"]
+async fn e2e_matrix_stream_root_cancel_settles_slow_fanout_without_late_synthesis() {
+    require_system_e2e_env();
+    journey_stream_persistence::run_stream_root_cancel_settles_slow_fanout_without_late_synthesis()
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live MatrixOne + mock parent/child LLM; canonical Work scheduler online gate"]
+async fn e2e_matrix_stream_canonical_work_scheduler_prevents_decorative_plan() {
+    require_system_e2e_env();
+    journey_stream_persistence::run_stream_canonical_work_scheduler_prevents_decorative_plan()
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live MatrixOne + mock LLM; deferred canonical Work online gate"]
+async fn e2e_matrix_stream_deferred_work_does_not_start_an_attempt() {
+    require_system_e2e_env();
+    journey_stream_persistence::run_stream_deferred_work_does_not_start_an_attempt().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "live MatrixOne + failing mock child LLM; structured fan-in unhappy-path gate"]
 async fn e2e_matrix_stream_failed_fanout_settles_once_without_orphaning_children() {
     require_system_e2e_env();
     journey_stream_persistence::run_stream_failed_fanout_settles_once_without_orphaning_children()
         .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + mock LLM; ASTRA_TEST_DB_IT=1 — CLI bridge session state contract"]
-async fn e2e_matrix_cli_bridge_session_views_remain_consistent() {
-    require_system_e2e_env();
-    journey_bridge_session_state::run_cli_bridge_session_views_remain_consistent().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + mock LLM; ASTRA_TEST_DB_IT=1 — CLI bridge tool causal order"]
-async fn e2e_matrix_cli_bridge_tool_round_preserves_causal_event_order() {
-    require_system_e2e_env();
-    journey_bridge_session_state::run_cli_bridge_tool_round_preserves_causal_event_order().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -465,79 +483,6 @@ async fn e2e_matrix_server_loop_rate_limit_failure_session_artifact_latest_and_d
 async fn e2e_matrix_server_loop_rate_limit_retry_success_session_artifact_latest_and_download() {
     require_system_e2e_env();
     journey_session_artifacts_matrix::run_server_loop_rate_limit_retry_success_session_artifact_latest_and_download_routes()
-        .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_bridge_failed_session_artifact_latest_and_download() {
-    require_system_e2e_env();
-    journey_session_artifacts_matrix::run_bridge_failed_session_artifact_latest_and_download_routes()
-        .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_bridge_sse_parse_error_session_artifact_latest_and_download() {
-    require_system_e2e_env();
-    journey_session_artifacts_matrix::run_bridge_sse_parse_error_session_artifact_latest_and_download_routes()
-        .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_bridge_tail_parse_error_artifact_preserves_partial_state() {
-    require_system_e2e_env();
-    journey_session_artifacts_matrix::run_bridge_tail_parse_error_artifact_preserves_partial_state_routes()
-        .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_bridge_transport_preserves_partial_without_replay() {
-    require_system_e2e_env();
-    journey_session_artifacts_matrix::run_bridge_transport_preserves_partial_without_replay_routes(
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_bridge_client_disconnect_session_artifact_latest_and_download() {
-    require_system_e2e_env();
-    journey_session_artifacts_matrix::run_bridge_client_disconnect_session_artifact_latest_and_download_routes()
-        .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_bridge_idle_preserves_partial_without_replay() {
-    require_system_e2e_env();
-    journey_session_artifacts_matrix::run_bridge_idle_preserves_partial_without_replay_routes()
-        .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_bridge_rate_limit_failure_session_artifact_latest_and_download() {
-    require_system_e2e_env();
-    journey_session_artifacts_matrix::run_bridge_rate_limit_failure_session_artifact_latest_and_download_routes()
-        .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_bridge_rate_limit_retry_success_session_artifact_latest_and_download() {
-    require_system_e2e_env();
-    journey_session_artifacts_matrix::run_bridge_rate_limit_retry_success_session_artifact_latest_and_download_routes()
-        .await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — see module doc"]
-async fn e2e_matrix_bridge_tool_call_parse_failure_does_not_replay_or_execute() {
-    require_system_e2e_env();
-    journey_session_artifacts_matrix::run_bridge_tool_call_parse_failure_does_not_replay_or_execute_routes()
         .await;
 }
 
@@ -676,13 +621,6 @@ async fn e2e_matrix_saas_resource_concurrent_cap_recovery() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §4.2 task lease negatives"]
-async fn e2e_matrix_saas_task_lease_negative_paths() {
-    require_system_e2e_env();
-    journey_saas_negative_matrix::run_saas_task_lease_negative_paths().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §5.1 logout/expired JWT"]
 async fn e2e_matrix_saas_auth_logout_and_expired_token() {
     require_system_e2e_env();
@@ -694,13 +632,6 @@ async fn e2e_matrix_saas_auth_logout_and_expired_token() {
 async fn e2e_matrix_saas_resource_limits_extended_fields() {
     require_system_e2e_env();
     journey_saas_negative_matrix::run_saas_resource_limits_extended_fields().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS platform §4.2 lease contested/reclaim"]
-async fn e2e_matrix_saas_task_lease_contested_and_expired_reclaim() {
-    require_system_e2e_env();
-    journey_saas_negative_matrix::run_saas_task_lease_contested_and_expired_reclaim().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -879,17 +810,17 @@ async fn e2e_matrix_saas_team_cross_user_isolation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §6.1 session replay"]
-async fn e2e_matrix_saas_session_replay_compare_smoke() {
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §6.1 replay compare guardrail"]
+async fn e2e_matrix_saas_session_replay_compare_unavailable_guardrail() {
     require_system_e2e_env();
-    journey_saas_platform_matrix::run_saas_session_replay_compare_smoke().await;
+    journey_saas_platform_matrix::run_saas_session_replay_compare_unavailable_guardrail().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §6.1 session replay POST"]
-async fn e2e_matrix_saas_session_replay_post_positive() {
+#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §6.1 replay POST guardrail"]
+async fn e2e_matrix_saas_session_replay_post_unavailable_guardrail() {
     require_system_e2e_env();
-    journey_saas_platform_matrix::run_saas_session_replay_post_positive().await;
+    journey_saas_platform_matrix::run_saas_session_replay_post_unavailable_guardrail().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -911,13 +842,6 @@ async fn e2e_matrix_saas_run_projection_smoke() {
 async fn e2e_matrix_saas_session_audit_after_chat_smoke() {
     require_system_e2e_env();
     journey_saas_platform_matrix::run_saas_session_audit_after_chat_smoke().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "live MatrixOne + full secrets; ASTRA_TEST_DB_IT=1 — SaaS §4.2 task lease renew/release"]
-async fn e2e_matrix_saas_task_lease_renew_release_positive() {
-    require_system_e2e_env();
-    journey_saas_platform_matrix::run_saas_task_lease_renew_release_positive().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

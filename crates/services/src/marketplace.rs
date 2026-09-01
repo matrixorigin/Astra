@@ -194,18 +194,6 @@ pub trait MarketplaceService: Send + Sync {
         skill_name: String,
         credential_name: String,
     ) -> Result<StatusResponse, (StatusCode, Json<ErrorResponse>)>;
-
-    async fn publish_skill(
-        &self,
-        user_id: String,
-        skill_name: String,
-    ) -> Result<StatusResponse, (StatusCode, Json<ErrorResponse>)>;
-
-    async fn deprecate_skill(
-        &self,
-        user_id: String,
-        skill_name: String,
-    ) -> Result<StatusResponse, (StatusCode, Json<ErrorResponse>)>;
 }
 
 // ── Database implementation ──────────────────────────────────────────────────
@@ -528,46 +516,6 @@ impl MarketplaceService for DatabaseMarketplaceService {
             status: "deleted".into(),
         })
     }
-
-    async fn publish_skill(
-        &self,
-        _user_id: String,
-        skill_name: String,
-    ) -> Result<StatusResponse, (StatusCode, Json<ErrorResponse>)> {
-        let pool = self.get_pool().await.map_err(internal_error)?;
-
-        query(
-            "UPDATE skills_registry SET status = 'published', is_active = 1 WHERE skill_name = ?",
-        )
-        .bind(&skill_name)
-        .execute(&pool)
-        .await
-        .map_err(internal_error)?;
-
-        Ok(StatusResponse {
-            status: "published".into(),
-        })
-    }
-
-    async fn deprecate_skill(
-        &self,
-        _user_id: String,
-        skill_name: String,
-    ) -> Result<StatusResponse, (StatusCode, Json<ErrorResponse>)> {
-        let pool = self.get_pool().await.map_err(internal_error)?;
-
-        query(
-            "UPDATE skills_registry SET status = 'deprecated', is_active = 0 WHERE skill_name = ?",
-        )
-        .bind(&skill_name)
-        .execute(&pool)
-        .await
-        .map_err(internal_error)?;
-
-        Ok(StatusResponse {
-            status: "deprecated".into(),
-        })
-    }
 }
 
 // ── Noop implementation ──────────────────────────────────────────────────────
@@ -628,30 +576,18 @@ impl MarketplaceService for UnconfiguredMarketplaceService {
     ) -> Result<StatusResponse, (StatusCode, Json<ErrorResponse>)> {
         Err(internal_error("marketplace service not configured"))
     }
-    async fn publish_skill(
-        &self,
-        _: String,
-        _: String,
-    ) -> Result<StatusResponse, (StatusCode, Json<ErrorResponse>)> {
-        Err(internal_error("marketplace service not configured"))
-    }
-    async fn deprecate_skill(
-        &self,
-        _: String,
-        _: String,
-    ) -> Result<StatusResponse, (StatusCode, Json<ErrorResponse>)> {
-        Err(internal_error("marketplace service not configured"))
-    }
 }
 
 // ── HTTP types ───────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InstallRequest {
     pub skill_name: String,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CredentialRequest {
     pub skill_name: String,
     pub credential_name: String,
@@ -659,6 +595,7 @@ pub struct CredentialRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteCredentialQuery {
     pub skill_name: String,
     pub credential_name: String,

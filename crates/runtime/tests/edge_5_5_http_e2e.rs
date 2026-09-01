@@ -211,6 +211,7 @@ impl RunLifecycleService for E2eRunLifecycle {
             workspace: None,
             executor: None,
             transport: None,
+            accounting: None,
         })
     }
 
@@ -236,11 +237,15 @@ impl RunLifecycleService for E2eRunLifecycle {
         &self,
         run_id: String,
         user_id: String,
+        expected_session_id: String,
         request_id: String,
         kind: DurableRunInteractionKind,
         response_data: serde_json::Value,
     ) -> Result<DurableRunInteractionResolveOutcome, (StatusCode, axum::Json<ErrorResponse>)> {
         if user_id != "e2e-user" || kind != DurableRunInteractionKind::Approval {
+            return Ok(DurableRunInteractionResolveOutcome::MissingRequest);
+        }
+        if self.runs.lock().unwrap().get(&run_id) != Some(&expected_session_id) {
             return Ok(DurableRunInteractionResolveOutcome::MissingRequest);
         }
         if !self
@@ -385,7 +390,7 @@ async fn post_tools_result_populates_ledger_then_take_consumes() {
     lifecycle.add_run("sess-tool", "run-tool");
     let (app, ledger) = e2e_app_with_lifecycle(lifecycle);
     let key = scoped_tool_key("sess-tool", "run-tool", "chain-tool", "tc-1");
-    expect_ledger_entry(&ledger, &key);
+    expect_ledger_entry(&ledger, &key, "edge-e2e").unwrap();
     let (st, j) = post_json(
         app.clone(),
         "/tools/result",
@@ -656,7 +661,7 @@ async fn post_tool_result_rejects_when_ledger_is_full() {
         "chain-overflow",
         "tc-overflow",
     );
-    expect_ledger_entry(&ledger, &key);
+    expect_ledger_entry(&ledger, &key, "edge-e2e").unwrap();
     let (st, _) = post_json(
         app.clone(),
         "/tools/result",

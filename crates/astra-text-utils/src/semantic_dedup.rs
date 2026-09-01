@@ -285,15 +285,15 @@ fn semantic_git_key(args: &Value) -> Option<String> {
             ))
         }
         "blame" => {
-            let file = arg_str(args, "path").or_else(|| arg_str(args, "file"))?;
-            let line_start = arg_u64(args, "line_start")
+            let file = arg_str(args, "path")?;
+            let line_start = arg_u64(args, "start_line")
                 .map(|v| v.to_string())
                 .unwrap_or_default();
-            let line_end = arg_u64(args, "line_end")
+            let line_end = arg_u64(args, "end_line")
                 .map(|v| v.to_string())
                 .unwrap_or_default();
             Some(format!(
-                "git:blame:{}:line_start={}:line_end={}",
+                "git:blame:{}:start_line={}:end_line={}",
                 normalize_path(file),
                 line_start,
                 line_end,
@@ -1215,28 +1215,25 @@ mod tests {
     fn git_action_blame_line_range_differs() {
         let k1 = semantic_call_key(
             "git",
-            &json!({"action": "blame", "path": "foo.rs", "line_start": 1, "line_end": 50}),
+            &json!({"action": "blame", "path": "foo.rs", "start_line": 1, "end_line": 50}),
         );
         let k2 = semantic_call_key(
             "git",
-            &json!({"action": "blame", "path": "foo.rs", "line_start": 100, "line_end": 150}),
+            &json!({"action": "blame", "path": "foo.rs", "start_line": 100, "end_line": 150}),
         );
         assert_ne!(k1, k2, "different blame line ranges must differ");
     }
 
     #[test]
-    fn git_action_blame_no_line_range_zero_defaults() {
+    fn git_action_blame_whole_file_differs_from_valid_line_range() {
         let k1 = semantic_call_key("git", &json!({"action": "blame", "path": "foo.rs"}));
         let k2 = semantic_call_key(
             "git",
-            &json!({"action": "blame", "path": "foo.rs", "line_start": 0, "line_end": 0}),
+            &json!({"action": "blame", "path": "foo.rs", "start_line": 1, "end_line": 1}),
         );
-        // 0 serializes as "0" but arg_u64 returns None for missing,
-        // Some(0) for explicit zero → default "" for missing, "0" for explicit.
-        // These are intentionally different: explicit 0 vs no range are distinct requests.
         assert_ne!(
             k1, k2,
-            "no line range vs explicit line_start=0 should differ (different gix-blame behaviour)"
+            "whole-file blame and a valid one-line range are distinct reads"
         );
     }
 

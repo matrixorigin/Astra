@@ -235,6 +235,13 @@ impl<'a> LocalToolExecutionLifecycle<'a> {
         call_id: &str,
         mut result: astra_tools::ToolResult,
     ) -> astra_tools::ToolResult {
+        // Progress callbacks are an earlier server event lane than runtime
+        // governance and durable recording. This lifecycle owns server-local
+        // tool execution, so it is the correct place to issue an edit-capable
+        // reference (the later central pass is only a display-only fallback).
+        let (redacted_output, _) =
+            astra_tools::credential_redaction::redact_credentials_for_display(&result.output);
+        result.output = redacted_output;
         normalize_local_tool_result_output(name, &mut result, self.aggregate_output_bytes);
         spawn_memory_recall_feedback_after_success(
             self.session_id,
@@ -379,6 +386,7 @@ mod tests {
         astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
         astra_tools::memoria::MemoriaToolGateway::record_recall_for_producer(
             &session_id,
+            Some("user-1"),
             "run-1",
             1,
             vec!["memory-1".into()],

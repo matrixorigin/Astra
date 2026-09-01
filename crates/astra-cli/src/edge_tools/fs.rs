@@ -358,11 +358,15 @@ impl ToolExecutor {
                              {total_lines} total lines)"
                     )
                 };
+                let (safe_outline_text, _) =
+                    astra_tools::credential_redaction::redact_credentials_for_display(
+                        &outline_text,
+                    );
 
                 return format!(
                     "File is large ({size} bytes, {total_lines} lines). \
                      Auto-generated outline below.\n\n\
-                     {outline_text}\n\n\
+                     {safe_outline_text}\n\n\
                      To read specific sections, use:\n\
                      • read_file(path=\"{path_str}\", start_line=1, end_line=100) — first 100 lines\n\
                      • read_file(path=\"{path_str}\", start_line=N, end_line=M) — specific range\n\
@@ -395,6 +399,10 @@ impl ToolExecutor {
                                 }
                             };
                         let total_lines = content_for_outline.lines().count();
+                        let (safe_content_for_outline, _) =
+                            astra_tools::credential_redaction::redact_credentials_in_text(
+                                &content_for_outline,
+                            );
                         self.record_read_cached(&path, true, content_for_outline.clone());
 
                         if let Some(ts_lang) = code_intel::detect_language(&path) {
@@ -402,10 +410,14 @@ impl ToolExecutor {
                                 code_intel::generate_outline(&content_for_outline, ts_lang);
                             if !outline.is_empty() {
                                 let def_count = outline.lines().count();
+                                let (safe_outline, _) =
+                                    astra_tools::credential_redaction::redact_credentials_for_display(
+                                        &outline,
+                                    );
                                 return format!(
                                     "[Auto-downgraded to outline — aggregate output budget is high \
                                      ({agg} bytes used). Use start_line/end_line to read specific sections.]\n\
-                                     # Outline ({total_lines} lines, {def_count} symbols)\n{outline}"
+                                     # Outline ({total_lines} lines, {def_count} symbols)\n{safe_outline}"
                                 );
                             }
                         }
@@ -414,16 +426,21 @@ impl ToolExecutor {
                         let lang = detect_language(ext);
                         let outline = extract_outline(&content_for_outline, lang);
                         if !outline.is_empty() {
+                            let rendered_outline = outline
+                                .iter()
+                                .map(|(line_no, sig)| format!("{line_no}: {sig}"))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            let (safe_outline, _) =
+                                astra_tools::credential_redaction::redact_credentials_for_display(
+                                    &rendered_outline,
+                                );
                             return format!(
                                 "[Auto-downgraded to outline — aggregate output budget is high \
                                  ({agg} bytes used). Use start_line/end_line to read specific sections.]\n\
                                  # Outline ({total_lines} lines, {} definitions)\n{}",
                                 outline.len(),
-                                outline
-                                    .iter()
-                                    .map(|(line_no, sig)| format!("{line_no}: {sig}"))
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
+                                safe_outline
                             );
                         }
 
@@ -436,7 +453,7 @@ impl ToolExecutor {
                         let budget = self
                             .read_file_body_output_limit()
                             .saturating_sub(marker.chars().count());
-                        let lines: Vec<&str> = content_for_outline.split('\n').collect();
+                        let lines: Vec<&str> = safe_content_for_outline.split('\n').collect();
                         let mut delivered = add_line_numbers_budgeted(&lines, 1, budget).output;
                         push_suffix_if_fits(
                             &mut delivered,
@@ -451,7 +468,7 @@ impl ToolExecutor {
 
         // Try in-memory content cache before disk I/O.
         // Cache hit when file was previously read/written and mtime is unchanged.
-        let content = if let Some(cached) = self.get_cached_content(&path) {
+        let raw_content = if let Some(cached) = self.get_cached_content(&path) {
             cached
         } else {
             match read_to_string_lossy(&path) {
@@ -482,41 +499,53 @@ impl ToolExecutor {
                 }
             }
         };
+        // This executor owns the workspace read, so it is the only boundary
+        // allowed to issue an edit-capable redaction reference.  Redact the
+        // full content before any output budget/window is applied; otherwise
+        // a credential split at the model limit becomes an unrecognisable
+        // partial secret.  Keep `raw_content` for AST parsing, line-range
+        // accounting, and the staleness cache.
+        let (safe_content, _) =
+            astra_tools::credential_redaction::redact_credentials_in_text(&raw_content);
 
         // Outline isolation: return only definition signatures with line numbers
         if has_outline {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            let total_lines = content.lines().count();
+            let total_lines = raw_content.lines().count();
 
             // Record as partial read (outline), caching full content
-            self.record_read_cached(&path, true, content.clone());
+            self.record_read_cached(&path, true, raw_content.clone());
 
             // Try tree-sitter first for accurate AST-based extraction
             if let Some(ts_lang) = code_intel::detect_language(&path) {
-                let outline = code_intel::generate_outline(&content, ts_lang);
+                let outline = code_intel::generate_outline(&raw_content, ts_lang);
                 if !outline.is_empty() {
                     let def_count = outline.lines().count();
                     return format!(
                         "# Outline ({total_lines} lines, {def_count} symbols)\n{}",
-                        outline
+                        astra_tools::credential_redaction::redact_credentials_for_display(&outline)
+                            .0
                     );
                 }
             }
 
             // Fall back to regex-based detection
             let lang = detect_language(ext);
-            let outline = extract_outline(&content, lang);
+            let outline = extract_outline(&raw_content, lang);
             if outline.is_empty() {
                 return format!("(no definitions found in {total_lines}-line file)");
             }
             return format!(
                 "# Outline ({total_lines} lines total, {} definitions)\n{}",
                 outline.len(),
-                outline
-                    .iter()
-                    .map(|(line_no, sig)| format!("{line_no}: {sig}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                astra_tools::credential_redaction::redact_credentials_for_display(
+                    &outline
+                        .iter()
+                        .map(|(line_no, sig)| format!("{line_no}: {sig}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+                .0
             );
         }
 
@@ -525,7 +554,7 @@ impl ToolExecutor {
             normalize_read_file_line_range(
                 start_raw.map(|n| n as usize),
                 end_raw.map(|n| n as usize),
-                content.lines().count(),
+                raw_content.lines().count(),
             )
         });
         // Auto-expand: promote ranged reads to full-file reads when the file
@@ -541,10 +570,17 @@ impl ToolExecutor {
         if is_ranged {
             if let Ok(meta) = fs::metadata(&path)
                 && (meta.len() as usize) <= AUTO_EXPAND_MAX_BYTES
-                && content.len() <= AUTO_EXPAND_MAX_BYTES
+                && raw_content.len() <= AUTO_EXPAND_MAX_BYTES
             {
-                let total_lines = content.lines().count();
-                let numbered = add_line_numbers(&content, 1);
+                let total_lines = raw_content.lines().count();
+                let numbered = add_line_numbers(
+                    &astra_tools::credential_redaction::redact_line_window(
+                        &raw_content,
+                        1,
+                        raw_content.lines().count(),
+                    ),
+                    1,
+                );
                 let expanded = format!(
                     "[Auto-expanded to full file ({total_lines} lines) — \
                      small enough to read entirely. Use this content for all \
@@ -552,16 +588,16 @@ impl ToolExecutor {
                      {numbered}"
                 );
                 if expanded.chars().count() <= self.read_file_model_output_limit() {
-                    self.record_read_cached(&path, false, content.clone());
+                    self.record_read_cached(&path, false, raw_content.clone());
                     return expanded;
                 }
             }
         }
 
         if !is_ranged {
-            let lines: Vec<&str> = content.split('\n').collect();
-            let total_lines = lines.len();
-            let numbered = add_line_numbers(&content, 1);
+            let lines: Vec<&str> = safe_content.split('\n').collect();
+            let total_lines = raw_content.lines().count();
+            let numbered = add_line_numbers(&safe_content, 1);
             let mut output;
             let is_partial_delivery;
 
@@ -590,7 +626,7 @@ impl ToolExecutor {
                 is_partial_delivery = true;
             }
 
-            self.record_read_cached(&path, is_partial_delivery, content.clone());
+            self.record_read_cached(&path, is_partial_delivery, raw_content.clone());
 
             let read_warning = self.read_warning_for(&path, false);
             push_suffix_if_fits(
@@ -601,7 +637,10 @@ impl ToolExecutor {
             return output;
         }
 
-        let lines: Vec<&str> = content.lines().collect();
+        // Keep range coordinates tied to the raw file.  Redaction can
+        // collapse a multi-line PEM into one marker, so slicing the already
+        // redacted view would shift user-requested line numbers.
+        let lines: Vec<&str> = raw_content.lines().collect();
         let Some(range) = normalized_range else {
             return "(internal error: ranged read without normalized range)".to_string();
         };
@@ -623,15 +662,20 @@ impl ToolExecutor {
             );
         }
         let actual_start_line = s + 1; // 1-indexed
-        let requested_lines = &lines[s..e];
-        let numbered = add_line_numbers(&requested_lines.join("\n"), actual_start_line);
+        let safe_range = astra_tools::credential_redaction::redact_line_window(
+            &raw_content,
+            actual_start_line,
+            e,
+        );
+        let numbered = add_line_numbers(&safe_range, actual_start_line);
         let mut result;
 
         if numbered.chars().count() <= self.read_file_model_output_limit() {
             result = numbered;
         } else {
+            let safe_lines: Vec<&str> = safe_range.split('\n').collect();
             let delivery = add_line_numbers_budgeted(
-                requested_lines,
+                &safe_lines,
                 actual_start_line,
                 self.read_file_body_output_limit(),
             );
@@ -656,7 +700,7 @@ impl ToolExecutor {
             };
             push_suffix_if_fits(&mut result, &marker, self.read_file_model_output_limit());
         }
-        self.record_read_cached(&path, true, content.clone());
+        self.record_read_cached(&path, true, raw_content.clone());
 
         let read_warning = self.read_warning_for(&path, true);
         push_suffix_if_fits(
@@ -687,8 +731,29 @@ impl ToolExecutor {
         }
     }
 
-    /// Returns JSON with structured result for reliable parsing
+    /// Returns JSON with structured result for reliable parsing.
     pub(crate) fn write_file(&self, args: &Value) -> String {
+        self.write_file_with_applied(args).0
+    }
+
+    /// Execute a direct file write and retain the owner-side commit fact.
+    ///
+    /// The Edge transport must not reconstruct this from the display body or
+    /// a scan of unrelated workspace contents. `applied` is true only when
+    /// the successful commit changed the target bytes.
+    pub(crate) fn write_file_with_applied(&self, args: &Value) -> (String, bool, bool) {
+        let mut applied = false;
+        let mut already_desired = false;
+        let output = self.write_file_impl(args, &mut applied, &mut already_desired);
+        (output, applied, already_desired)
+    }
+
+    fn write_file_impl(
+        &self,
+        args: &Value,
+        applied: &mut bool,
+        already_desired: &mut bool,
+    ) -> String {
         use serde_json::json;
 
         let path = match args.get("path").and_then(Value::as_str) {
@@ -699,7 +764,7 @@ impl ToolExecutor {
             None => return json!({ "success": false, "error": "missing 'path'" }).to_string(),
         };
         let content = match args.get("content").and_then(Value::as_str) {
-            Some(c) => c,
+            Some(c) => astra_tools::fs_ops::normalize_content_before_write(&path, c),
             None => return json!({ "success": false, "error": "missing 'content'" }).to_string(),
         };
 
@@ -716,6 +781,35 @@ impl ToolExecutor {
             }).to_string();
         }
 
+        // Exact full-state convergence is safe to establish before the
+        // read-before-overwrite policy: it performs no overwrite. The outer
+        // executor holds the exclusive bound-workspace lease; repeat the read
+        // and binding check immediately before returning so an uncoordinated
+        // external writer cannot lend us a stale equality result.
+        let mut prior_bytes = if path.exists() {
+            fs::read(&path).ok()
+        } else {
+            None
+        };
+        if prior_bytes.as_deref() == Some(content.as_bytes()) {
+            let binding_safe = path
+                .canonicalize()
+                .ok()
+                .is_some_and(|canonical| self.is_within_sandbox_boundary(&canonical));
+            let confirmed = binding_safe.then(|| fs::read(&path).ok()).flatten();
+            if confirmed.as_deref() == Some(content.as_bytes()) {
+                *already_desired = true;
+                return json!({
+                    "success": true,
+                    "state": "already_desired",
+                    "bytes_written": 0,
+                    "path": path.to_string_lossy().to_string(),
+                })
+                .to_string();
+            }
+            prior_bytes = confirmed;
+        }
+
         // Staleness check: if file exists, it must have been read first and not modified since
         if path.exists() {
             if let Err(e) = self.check_staleness(&path) {
@@ -727,7 +821,8 @@ impl ToolExecutor {
                     "success": false,
                     "error": format!(
                         "File was only partially read (outline or line range). Read the full file before overwriting.\n\
-                         → Action required: call read_file(\"{}\") (without start_line/end_line) first, then retry.",
+                         → Action required: call read_file(\"{}\") (without start_line/end_line) first, then retry.\n\
+                         If this file is too large for a full read, use str_replace or multi_edit with an exact old_str copied from a fresh range read; do not retry the same outline overwrite.",
                         self.project_relative_display(&path)
                     )
                 }).to_string();
@@ -743,11 +838,9 @@ impl ToolExecutor {
             })
             .to_string();
         }
-        let prior_for_diff = if path.exists() {
-            read_to_string_lossy(&path).ok()
-        } else {
-            None
-        };
+        let prior_for_diff = prior_bytes
+            .as_deref()
+            .map(|bytes| String::from_utf8_lossy(bytes).into_owned());
 
         // Defense-in-depth: re-check staleness right before writing to catch
         // race conditions between the initial validation and the actual write
@@ -783,16 +876,17 @@ impl ToolExecutor {
             journal.record_before(&path, &journal_call_id, turn_idx);
         }
 
-        match fs::write(&path, content) {
+        match fs::write(&path, &content) {
             Ok(_) => {
+                *applied = prior_bytes.as_deref() != Some(content.as_bytes());
                 // Record write state so subsequent reads/edits know the mtime
-                self.record_write_with_content(&path, content);
+                self.record_write_with_content(&path, &content);
                 // Journal: record after-state
                 if let Ok(mut journal) = self.file_journal.lock() {
                     journal.record_after(&path, &journal_call_id, content.as_bytes());
                 }
                 let old_slice = prior_for_diff.as_deref().unwrap_or("");
-                let cli_diff = cap_cli_unified_diff(unified_diff_raw(old_slice, content, &path));
+                let cli_diff = cap_cli_unified_diff(unified_diff_raw(old_slice, &content, &path));
                 let lsp_diag = self.inline_lsp_diagnostics(&path);
                 let mut obj = json!({
                     "success": true,
@@ -810,6 +904,17 @@ impl ToolExecutor {
     }
 
     pub(crate) fn str_replace(&self, args: &Value) -> String {
+        self.str_replace_with_applied(args).0
+    }
+
+    /// Execute a direct replacement and retain its owner-side commit fact.
+    pub(crate) fn str_replace_with_applied(&self, args: &Value) -> (String, bool) {
+        let mut applied = false;
+        let output = self.str_replace_impl(args, &mut applied);
+        (output, applied)
+    }
+
+    fn str_replace_impl(&self, args: &Value, applied: &mut bool) -> String {
         let path = match args.get("path").and_then(Value::as_str) {
             Some(p) => match self.resolve_checked(p) {
                 Ok(safe) => safe,
@@ -825,6 +930,11 @@ impl ToolExecutor {
             Some(s) => s,
             None => return "Error: missing 'new_str'".to_string(),
         };
+        if let Err(error) =
+            astra_tools::credential_redaction::reject_redaction_markers_in_replacement(new_str)
+        {
+            return error;
+        }
         if old_str == new_str {
             return str_replace_fail(
                 "old_str and new_str are identical — no change needed.",
@@ -847,15 +957,32 @@ impl ToolExecutor {
             return err;
         }
 
-        // Staleness check
-        if let Err(e) = self.check_staleness(&path) {
-            return format!("Error: {e}");
-        }
-
         let content = match read_to_string_lossy(&path) {
             Ok(c) => c,
             Err(e) => return format!("Error reading file: {e}"),
         };
+        let redaction_reference = match astra_tools::credential_redaction::resolve_redacted_anchor(
+            &content,
+            old_str,
+            replace_all,
+        ) {
+            Ok(reference) => reference,
+            Err(error) => return error,
+        };
+        let old_str = redaction_reference.as_deref().unwrap_or(old_str);
+        // A redaction marker is resolved against the source-owned bytes at
+        // execution time.  The resolved value can therefore equal new_str
+        // even when the opaque marker text differed from it (for example a
+        // model re-submits the placeholder it just read).  Treat that as a
+        // real no-op: do not journal, bump generation, or emit the mutation
+        // success sentinel.
+        if old_str == new_str {
+            return str_replace_fail(
+                "the resolved old_str already equals new_str — no change needed.",
+                "The anchor resolved successfully, but the file already contains the requested replacement.",
+                "Choose a different new_str or skip this edit; no bytes were changed.",
+            );
+        }
         let count = content.matches(old_str).count();
         if count == 0 {
             let norm_count = fuzzy_replacer::quote_normalized_match_count(&content, old_str);
@@ -889,6 +1016,18 @@ impl ToolExecutor {
                 } else {
                     content.replacen(actual, &replacement, 1)
                 };
+                if new_content == content {
+                    return str_replace_fail(
+                        "the resolved replacement would not change the file.",
+                        "The anchor matched, but the resulting file bytes are identical to the current content.",
+                        "Choose a different new_str or skip this edit; no bytes were changed.",
+                    );
+                }
+                // The matched anchor self-authorizes this localized edit.
+                // Keep the snapshot partial: the model did not receive the
+                // complete file, and a failed/ambiguous replace must not
+                // unlock a later full-file overwrite.
+                self.record_read_cached(&path, true, content.clone());
                 if dry_run {
                     self.record_fuzzy_match_event(
                         &path,
@@ -914,6 +1053,7 @@ impl ToolExecutor {
                 }
                 match fs::write(&path, &new_content) {
                     Ok(_) => {
+                        *applied = true;
                         self.record_write_with_content(&path, &new_content);
                         // Journal: record after-state
                         if let Ok(mut journal) = self.file_journal.lock() {
@@ -1001,6 +1141,19 @@ impl ToolExecutor {
         } else {
             content.replacen(old_str, new_str, 1)
         };
+        if new_content == content {
+            return str_replace_fail(
+                "the resolved replacement would not change the file.",
+                "The anchor matched, but the resulting file bytes are identical to the current content.",
+                "Choose a different new_str or skip this edit; no bytes were changed.",
+            );
+        }
+
+        // `old_str` is an optimistic-concurrency precondition, and this tool
+        // has just matched it against the complete current file. Snapshot the
+        // exact bytes for the pre-write hash check without claiming that the
+        // model received a full-file read.
+        self.record_read_cached(&path, true, content.clone());
 
         // Dry run: show unified diff without writing
         if dry_run {
@@ -1028,6 +1181,7 @@ impl ToolExecutor {
 
         match fs::write(&path, &new_content) {
             Ok(_) => {
+                *applied = true;
                 // Record write state for staleness tracking
                 self.record_write_with_content(&path, &new_content);
                 // Journal: record after-state
@@ -1098,6 +1252,17 @@ impl ToolExecutor {
     }
 
     pub(crate) fn delete_file(&self, args: &Value) -> String {
+        self.delete_file_with_applied(args).0
+    }
+
+    /// Execute a direct deletion and retain its owner-side commit fact.
+    pub(crate) fn delete_file_with_applied(&self, args: &Value) -> (String, bool) {
+        let mut applied = false;
+        let output = self.delete_file_impl(args, &mut applied);
+        (output, applied)
+    }
+
+    fn delete_file_impl(&self, args: &Value, applied: &mut bool) -> String {
         let path = match args.get("path").and_then(Value::as_str) {
             Some(p) => match self.resolve_checked(p) {
                 Ok(safe) => safe,
@@ -1132,6 +1297,7 @@ impl ToolExecutor {
 
         match fs::remove_file(&path) {
             Ok(_) => {
+                *applied = true;
                 self.remove_file_state(&path);
                 match self.file_journal.lock() {
                     Ok(mut journal) => {
@@ -1625,6 +1791,13 @@ impl ToolExecutor {
     }
 
     pub(crate) fn rollback_file_edits(&self, args: &Value) -> String {
+        if args.get("after_sequence").is_some() {
+            return json!({
+                "success": false,
+                "error": "unknown field 'after_sequence'; use 'file_after_sequence'",
+            })
+            .to_string();
+        }
         let scope = args
             .get("scope")
             .and_then(Value::as_str)
@@ -1638,6 +1811,51 @@ impl ToolExecutor {
             .unwrap_or("current_turn");
 
         match scope {
+            "source_receipt" => {
+                let receipt_id = match args.get("receipt_id").and_then(Value::as_str) {
+                    Some(receipt_id) if !receipt_id.trim().is_empty() => receipt_id,
+                    _ => {
+                        return json!({
+                            "success": false,
+                            "scope": "source_receipt",
+                            "error": "missing 'receipt_id' for scope=source_receipt",
+                        })
+                        .to_string();
+                    }
+                };
+                let Some(session_id) = self
+                    .active_session_id()
+                    .filter(|id| !id.trim().is_empty())
+                else {
+                    return json!({
+                        "success": false,
+                        "scope": "source_receipt",
+                        "error": "source receipt restore requires an active CLI session",
+                    })
+                    .to_string();
+                };
+                let owner_scope = format!("cli:{session_id}");
+                match astra_tools::source_preimage::restore_receipt(
+                    &self.project_root,
+                    &owner_scope,
+                    receipt_id,
+                ) {
+                    Ok(()) => json!({
+                        "success": true,
+                        "scope": "source_receipt",
+                        "receipt_id": receipt_id,
+                        "summary": "Restored the retained source preimage.",
+                    })
+                    .to_string(),
+                    Err(error) => json!({
+                        "success": false,
+                        "scope": "source_receipt",
+                        "receipt_id": receipt_id,
+                        "error": error,
+                    })
+                    .to_string(),
+                }
+            }
             "list" => {
                 let summary = match self.file_journal.lock() {
                     Ok(journal) => journal.summary(),
@@ -1753,7 +1971,6 @@ impl ToolExecutor {
                 };
                 let checkpoint = args
                     .get("file_after_sequence")
-                    .or_else(|| args.get("after_sequence"))
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
                 let result = match self.file_journal.lock() {
@@ -1811,21 +2028,25 @@ impl ToolExecutor {
             other => json!({
                 "success": false,
                 "error": format!(
-                    "invalid 'scope': {other} (expected one of current_turn, turn, file, list)"
+                    "invalid 'scope': {other} (expected one of current_turn, turn, file, list, source_receipt)"
                 ),
             })
             .to_string(),
         }
     }
 
-    pub(crate) fn str_replace_batch(&self, args: &Value) -> String {
+    /// Execute a multi-file replacement while preserving the structured
+    /// owner result.  The string-only wrapper below is kept for the older
+    /// in-process tests/callers, but the live edge dispatch must carry partial
+    /// commit metadata into the headless ledger.
+    pub(crate) fn str_replace_batch_result(&self, args: &Value) -> astra_tools::ToolResult {
         let top_path = args.get("path").and_then(Value::as_str);
         let edits = match args.get("edits").and_then(Value::as_array) {
             Some(e) => e,
-            None => return "Error: missing 'edits' array".to_string(),
+            None => return astra_tools::ToolResult::error("Error: missing 'edits' array".into()),
         };
         if edits.is_empty() {
-            return "Error: 'edits' array is empty".to_string();
+            return astra_tools::ToolResult::error("Error: 'edits' array is empty".into());
         }
 
         // Fast-path: same-file batch with top-level path and no per-edit paths
@@ -1834,12 +2055,22 @@ impl ToolExecutor {
                 .iter()
                 .all(|edit| edit.get("path").and_then(Value::as_str).is_none())
         {
-            return self.multi_edit(args);
+            let (output, applied) = self.multi_edit_with_applied(args);
+            let result = if output.starts_with("Error:") {
+                astra_tools::ToolResult::error(output)
+            } else {
+                astra_tools::ToolResult::text(output)
+            };
+            return if applied {
+                result.with_workspace_mutation_applied()
+            } else {
+                result
+            };
         }
 
         let groups = match astra_tools::fs_ops::partition_edits_by_path(edits, top_path) {
             Ok(g) => g,
-            Err(e) => return e,
+            Err(e) => return astra_tools::ToolResult::error(e),
         };
 
         // Sandbox-validate every path BEFORE touching disk.
@@ -1848,7 +2079,7 @@ impl ToolExecutor {
         // No journal checkpoint, no preimage capture, no dual rollback.
         for (path, _) in &groups {
             if let Err(error) = self.resolve_checked(path) {
-                return error;
+                return astra_tools::ToolResult::error(error);
             }
         }
 
@@ -1874,14 +2105,31 @@ impl ToolExecutor {
         let result =
             astra_tools::fs_ops::str_replace(&self.project_root, &Value::Object(delegated));
         if result.is_error {
-            result.output
+            result
         } else {
             // Append success sentinel — the core doesn't emit it.
-            success_body(&result.output)
+            astra_tools::ToolResult {
+                output: success_body(&result.output),
+                ..result
+            }
         }
     }
 
+    pub(crate) fn str_replace_batch(&self, args: &Value) -> String {
+        self.str_replace_batch_result(args).output
+    }
+
     pub(crate) fn multi_edit(&self, args: &Value) -> String {
+        self.multi_edit_with_applied(args).0
+    }
+
+    fn multi_edit_with_applied(&self, args: &Value) -> (String, bool) {
+        let mut applied = false;
+        let output = self.multi_edit_impl(args, &mut applied);
+        (output, applied)
+    }
+
+    fn multi_edit_impl(&self, args: &Value, applied: &mut bool) -> String {
         let path = match args.get("path").and_then(Value::as_str) {
             Some(p) => match self.resolve_checked(p) {
                 Ok(safe) => safe,
@@ -1944,6 +2192,19 @@ impl ToolExecutor {
                 Some(s) => s,
                 None => return format!("Error: edit[{i}] missing 'new_str'"),
             };
+            if let Err(error) =
+                astra_tools::credential_redaction::reject_redaction_markers_in_replacement(new_str)
+            {
+                return error;
+            }
+            let redaction_reference =
+                match astra_tools::credential_redaction::resolve_redacted_anchor(
+                    &working, old_str, false,
+                ) {
+                    Ok(reference) => reference,
+                    Err(error) => return error,
+                };
+            let old_str = redaction_reference.as_deref().unwrap_or(old_str);
             if old_str == new_str {
                 return str_replace_fail(
                     &format!("edit[{i}] old_str and new_str are identical — no change needed."),
@@ -2056,6 +2317,11 @@ impl ToolExecutor {
         // Apply
         match fs::write(&path, &working) {
             Ok(_) => {
+                // Owner-side commit boundary. This exact write succeeded with
+                // a buffer that validation proved differs from the preimage;
+                // transport must not reconstruct that fact from prose or a
+                // bounded whole-workspace fingerprint.
+                *applied = true;
                 self.record_write_with_content(&path, &working);
                 // Journal: record after-state
                 if let Ok(mut journal) = self.file_journal.lock() {
@@ -2958,7 +3224,15 @@ fn add_line_numbers_budgeted(
         let rendered_chars = rendered.chars().count();
         if output_chars + separator_chars + rendered_chars > max_chars {
             if complete_lines == 0 && max_chars > 0 {
-                output.push_str(char_prefix(&rendered, max_chars));
+                // A single long line may contain a complete edit-capable
+                // marker.  Do not cut that marker in half merely because the
+                // line exceeds the model budget; the shared redacted
+                // truncator drops/keeps the atomic span safely.
+                output.push_str(
+                    &astra_tools::credential_redaction::truncate_redacted_output(
+                        rendered, max_chars,
+                    ),
+                );
             }
             return NumberedReadDelivery {
                 output,
@@ -2977,13 +3251,6 @@ fn add_line_numbers_budgeted(
     NumberedReadDelivery {
         output,
         complete_lines,
-    }
-}
-
-fn char_prefix(s: &str, max_chars: usize) -> &str {
-    match s.char_indices().nth(max_chars) {
-        Some((idx, _)) => &s[..idx],
-        None => s,
     }
 }
 
@@ -3437,6 +3704,59 @@ type Handler interface {
             result2.contains("NEXT:"),
             "must include NEXT line: {result2}"
         );
+    }
+
+    #[test]
+    fn str_replace_resolves_sanitized_credential_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("settings.txt");
+        let raw = "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n";
+        std::fs::write(&file_path, raw).unwrap();
+        let (redacted, count) = astra_tools::credential_redaction::redact_credentials_in_text(raw);
+        assert_eq!(count, 1);
+        let marker = redacted
+            .split_once('=')
+            .and_then(|(_, value)| value.lines().next())
+            .expect("marker should be present");
+
+        let executor = test_executor_in(dir.path());
+        let result = executor.str_replace(&serde_json::json!({
+            "path": "settings.txt",
+            "old_str": marker,
+            "new_str": "[configured-access-key]"
+        }));
+        assert!(result.contains("Replaced successfully"), "{result}");
+        let updated = std::fs::read_to_string(file_path).unwrap();
+        assert!(updated.contains("[configured-access-key]"));
+        assert!(!updated.contains("AKIAIOSFODNN7EXAMPLE"));
+    }
+
+    #[test]
+    fn str_replace_resolved_marker_equal_to_new_text_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("settings.txt");
+        let raw = "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n";
+        std::fs::write(&file_path, raw).unwrap();
+        let (redacted, count) = astra_tools::credential_redaction::redact_credentials_in_text(raw);
+        assert_eq!(count, 1);
+        let marker = redacted
+            .split_once('=')
+            .and_then(|(_, value)| value.lines().next())
+            .expect("marker should be present");
+
+        let executor = test_executor_in(dir.path());
+        let result = executor.str_replace(&serde_json::json!({
+            "path": "settings.txt",
+            "old_str": marker,
+            "new_str": "AKIAIOSFODNN7EXAMPLE"
+        }));
+        assert!(
+            !result.contains("Replaced successfully"),
+            "resolved no-op must not report success: {result}"
+        );
+        assert!(result.contains("no change needed"), "{result}");
+        assert!(!result.contains(TOOL_SUCCESS_SENTINEL), "{result}");
+        assert_eq!(std::fs::read_to_string(file_path).unwrap(), raw);
     }
 
     #[test]
@@ -5262,9 +5582,9 @@ type Handler interface {
         );
     }
 
-    /// Same scenario but for str_replace: LLM tries to edit a file it hasn't read.
+    /// An exact str_replace anchor is itself a current-content precondition.
     #[test]
-    fn str_replace_blocked_on_unread_existing_file() {
+    fn str_replace_self_authorizes_exact_current_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let exe = test_executor_in(dir.path());
 
@@ -5278,12 +5598,40 @@ type Handler interface {
         }));
 
         assert!(
-            result.contains("has not been read yet"),
-            "should reject unread file, got: {result}"
+            result.contains("Replaced"),
+            "exact edit should succeed: {result}"
         );
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "key = \"new_value\"\n"
+        );
+    }
+
+    #[test]
+    fn failed_str_replace_does_not_unlock_full_file_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "key = \"current\"\nother = true\n").unwrap();
+
+        let replace = exe.str_replace(&json!({
+            "path": "config.toml",
+            "old_str": "key = \"stale\"",
+            "new_str": "key = \"new\""
+        }));
+        assert!(replace.contains("old_str not found"), "{replace}");
+
+        let overwrite = exe.write_file(&json!({
+            "path": "config.toml",
+            "content": "key = \"new\"\n"
+        }));
         assert!(
-            result.contains("read_file(\"config.toml\")"),
-            "error should contain actionable read_file call, got: {result}"
+            overwrite.contains("has not been read yet"),
+            "a failed localized edit cannot authorize a full overwrite: {overwrite}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "key = \"current\"\nother = true\n"
         );
     }
 
@@ -5482,9 +5830,9 @@ type Handler interface {
         );
     }
 
-    /// Scenario: external modification between read and str_replace.
+    /// An external reformat invalidates the exact replacement anchor.
     #[test]
-    fn str_replace_blocked_on_externally_modified_file() {
+    fn str_replace_rejects_anchor_invalidated_by_external_format() {
         let dir = tempfile::tempdir().unwrap();
         let exe = test_executor_in(dir.path());
 
@@ -5503,11 +5851,10 @@ type Handler interface {
             "new_str": "fn main() { println!(\"hi\"); }"
         }));
         assert!(
-            result.contains("modified since last read")
-                || result.contains("modified since")
-                || result.contains("staleness"),
-            "should detect linter modification, got: {result}"
+            result.contains("old_str not found"),
+            "should reject the invalidated anchor, got: {result}"
         );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "fn main() {\n}\n");
     }
 
     /// Scenario: partial read (outline) should NOT allow write_file overwrite.
@@ -5534,6 +5881,31 @@ type Handler interface {
         assert!(
             result.contains("read_file"),
             "error should suggest full read, got: {result}"
+        );
+    }
+
+    #[test]
+    fn large_file_outline_does_not_loop_into_impossible_full_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = test_executor_in(dir.path());
+        let path = dir.path().join("large.txt");
+        let content = "line with enough bytes to exceed the model read budget\n".repeat(600);
+        std::fs::write(&path, content).unwrap();
+
+        let preview = exe.read_file(&json!({"path": "large.txt"}));
+        assert!(preview.contains("File is large") || preview.contains("outline"));
+
+        let result = exe.write_file(&json!({
+            "path": "large.txt",
+            "content": "replacement\n"
+        }));
+        assert!(
+            result.contains("partially read"),
+            "unexpected result: {result}"
+        );
+        assert!(
+            result.contains("str_replace") && result.contains("multi_edit"),
+            "large-file guidance must offer an actionable exact-edit path: {result}"
         );
     }
 
@@ -5663,11 +6035,9 @@ type Handler interface {
         assert_eq!(on_disk, "AAA\nBBB\nccc\n");
     }
 
-    /// Scenario: defense-in-depth — external modification happens BETWEEN
-    /// the initial staleness check and the actual write. The pre-write
-    /// re-check should catch this race condition.
+    /// A stale exact anchor must never overwrite externally changed content.
     #[test]
-    fn defense_in_depth_catches_race_between_check_and_write() {
+    fn str_replace_stale_anchor_preserves_external_change() {
         let dir = tempfile::tempdir().unwrap();
         let exe = test_executor_in(dir.path());
 
@@ -5686,15 +6056,15 @@ type Handler interface {
         std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(&path, "modified by linter").unwrap();
 
-        // str_replace: the initial check_staleness catches this
+        // str_replace reads the current bytes and rejects the now-stale anchor.
         let result = exe.str_replace(&json!({
             "path": "race.txt",
             "old_str": "original",
             "new_str": "agent version"
         }));
         assert!(
-            result.contains("modified since") || result.contains("staleness"),
-            "should catch external modification, got: {result}"
+            result.contains("not found") || result.contains("No exact match"),
+            "should reject the stale anchor, got: {result}"
         );
 
         // Verify file was NOT corrupted
@@ -5815,20 +6185,15 @@ type Handler interface {
             "should contain read_file and file path, got: {r1}"
         );
 
-        // str_replace on unread file
+        // Exact str_replace does not need a redundant prior read: its anchor
+        // is checked against the full current file and snapshotted before the
+        // guarded write.
         let r2 = exe.str_replace(&json!({
             "path": "target.rs",
             "old_str": "fn main() {}",
             "new_str": "fn main() { println!(\"hi\"); }"
         }));
-        assert!(
-            r2.contains("Action required"),
-            "str_replace error should have actionable guidance, got: {r2}"
-        );
-        assert!(
-            r2.contains("read_file") && r2.contains("target.rs"),
-            "should contain read_file and file path, got: {r2}"
-        );
+        assert!(r2.contains("Replaced"), "str_replace should succeed: {r2}");
     }
 
     /// Verify that the partial-read error for write_file also contains

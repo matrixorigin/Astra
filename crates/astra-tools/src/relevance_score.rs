@@ -1,8 +1,9 @@
 //! Shared relevance scoring for keyword-based discovery.
 //!
-//! Used by `tool_search` (keyword mode) and `discover_skills` to rank
-//! items by query relevance. Weights are tuned for short tool/skill names
-//! and one-line descriptions.
+//! Used by `discover_skills` to rank user-authored skills by query relevance.
+//! Tool activation deliberately does not use this scorer: the model selects a
+//! typed deferred tool name explicitly, so description overlap cannot grant a
+//! tool capability.
 
 /// Trait for items that can be scored by keyword relevance.
 pub trait Scoreable {

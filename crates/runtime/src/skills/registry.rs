@@ -649,6 +649,21 @@ impl super::traits::SkillResolver for UnifiedSkillResolver {
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
+
+    fn execution_topology(
+        &self,
+        name: &str,
+    ) -> Option<astra_skills::manifest::SkillExecutionTopology> {
+        let lookup = name.trim().to_ascii_lowercase();
+        let manifest = self.registry.all_manifests().into_iter().find(|manifest| {
+            manifest.name.trim().eq_ignore_ascii_case(&lookup)
+                || manifest
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.trim().eq_ignore_ascii_case(&lookup))
+        })?;
+        manifest.execution_topology()
+    }
 }
 
 /// Thread-safe shared registry.

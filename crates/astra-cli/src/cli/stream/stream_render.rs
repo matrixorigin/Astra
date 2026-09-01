@@ -26,8 +26,9 @@ use futures_util::FutureExt;
 use futures_util::StreamExt;
 use futures_util::future::join_all;
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 use std::future::Future;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read};
 use std::ops::{Deref, DerefMut};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
@@ -89,8 +90,23 @@ pub(crate) fn agent_id_from_output(output: &str) -> Option<String> {
         })
 }
 
+/// Execution may create a fanout group and still lose its launch response.
+/// Such a local result or server projection is transport evidence, not a
+/// semantic terminal: the owning host reconciles the same call from the group
+/// registry and emits the single authoritative completion. Ordinary tools and
+/// usable typed fanout receipts remain immediate.
+fn tool_completion_is_authoritative(tool: &str, output: &str) -> bool {
+    tool != "agent_fanout"
+        || astra_turn_core::orchestration::agent_result_wire::agent_fanout_control_result_is_usable(
+            output,
+        )
+}
+
 pub(crate) fn tool_output_event_text(_tool: &str, output: &str) -> String {
     let parsed = serde_json::from_str::<Value>(output).ok();
+    let task_board_update = parsed
+        .as_ref()
+        .and_then(|value| value.get("task_board_update"));
     let observation = parsed
         .as_ref()
         .and_then(|value| value.get(astra_core::work_unit::WORK_UNIT_OBSERVATION_FIELD))
@@ -98,28 +114,300 @@ pub(crate) fn tool_output_event_text(_tool: &str, output: &str) -> String {
             serde_json::from_value::<astra_core::work_unit::WorkUnitObservation>(value.clone()).ok()
         })
         .filter(astra_core::work_unit::WorkUnitObservation::is_valid);
-    if let (Some(parsed), Some(observation)) = (parsed.as_ref(), observation) {
-        if output.len() <= STRUCTURED_WORK_OUTPUT_EVENT_LIMIT_BYTES {
+    // Lifecycle receipts are a typed event-plane contract. Tool outputs can
+    // also contain a full worker brief for the model, which must not force
+    // the interactive projection to carry that large payload. Preserve the
+    // receipt in a compact valid-JSON envelope; downstream consumers validate
+    // its version and schema before acting on it.
+    if let (Some(parsed), Some(task_board_update)) = (parsed.as_ref(), task_board_update) {
+        if output.len() <= DEFAULT_TOOL_OUTPUT_EVENT_LIMIT {
             return output.to_string();
         }
-        // Preserve lifecycle truth as valid JSON even when display payload is
-        // too large. Consumers can still settle the work unit and use the
-        // transcript/task surface for full output; they never have to parse a
-        // syntactically truncated JSON prefix.
+        let compact = serde_json::json!({
+            "status": parsed.get("status").cloned().unwrap_or(Value::Null),
+            "agent_id": parsed.get("agent_id").cloned().unwrap_or(Value::Null),
+            "run_id": parsed.get("run_id").cloned().unwrap_or(Value::Null),
+            "task_board_update": task_board_update,
+            "output_truncated": true,
+            "output_bytes": output.len(),
+        })
+        .to_string();
+        if compact.len() <= STRUCTURED_WORK_OUTPUT_EVENT_LIMIT_BYTES {
+            return compact;
+        }
+        // An invalid or unexpectedly huge receipt must not turn the event
+        // queue into an unbounded payload channel. The canonical observer can
+        // still reconcile durable graph truth; omit only this opportunistic
+        // immediate projection.
         return serde_json::json!({
             "status": parsed.get("status").cloned().unwrap_or(Value::Null),
             "agent_id": parsed.get("agent_id").cloned().unwrap_or(Value::Null),
             "run_id": parsed.get("run_id").cloned().unwrap_or(Value::Null),
-            "work_unit_observation": observation,
+            "task_board_update_omitted": "oversized",
             "output_truncated": true,
             "output_bytes": output.len(),
         })
         .to_string();
     }
+    if let (Some(parsed), Some(observation)) = (parsed.as_ref(), observation) {
+        if output.len() <= STRUCTURED_WORK_OUTPUT_EVENT_LIMIT_BYTES {
+            return output.to_string();
+        }
+        // Preserve lifecycle truth as valid JSON even when display payload is
+        // too large. Keep the bounded control-plane identity alongside the
+        // generic Work observation; dropping `group_id`/slot identities while
+        // retaining only status makes an accepted fanout impossible to open
+        // or control from the UI. Large deliverables remain omitted.
+        let mut compact = Map::from_iter([
+            (
+                "status".to_string(),
+                parsed.get("status").cloned().unwrap_or(Value::Null),
+            ),
+            (
+                "agent_id".to_string(),
+                parsed.get("agent_id").cloned().unwrap_or(Value::Null),
+            ),
+            (
+                "run_id".to_string(),
+                parsed.get("run_id").cloned().unwrap_or(Value::Null),
+            ),
+            ("work_unit_observation".to_string(), observation.to_value()),
+            ("output_truncated".to_string(), Value::Bool(true)),
+            ("output_bytes".to_string(), Value::from(output.len())),
+        ]);
+        for key in [
+            "group_id",
+            "title",
+            "target_count",
+            "transcript_location",
+            "parent_run_id",
+            "agents",
+            "fanout",
+        ] {
+            if let Some(value) = parsed.get(key) {
+                compact.insert(key.to_string(), value.clone());
+            }
+        }
+        let mut rendered = Value::Object(compact.clone()).to_string();
+        if rendered.len() > STRUCTURED_WORK_OUTPUT_EVENT_LIMIT_BYTES {
+            compact.remove("agents");
+            compact.remove("fanout");
+            compact.insert(
+                "control_membership_omitted".to_string(),
+                Value::String("oversized".to_string()),
+            );
+            rendered = Value::Object(compact).to_string();
+        }
+        if rendered.len() > STRUCTURED_WORK_OUTPUT_EVENT_LIMIT_BYTES {
+            // Observation extensions and externally supplied identifiers are
+            // not trusted to stay small. Keep a bounded, typed correlation
+            // envelope instead of allowing one tenant's receipt to occupy an
+            // unbounded share of the ordered UI queue.
+            let bounded_text = |key: &str| {
+                parsed
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map(|value| value.chars().take(1024).collect::<String>())
+            };
+            rendered = serde_json::json!({
+                "status": bounded_text("status"),
+                "group_id": bounded_text("group_id"),
+                "agent_id": bounded_text("agent_id"),
+                "run_id": bounded_text("run_id"),
+                "lifecycle_observation_omitted": "oversized",
+                "output_truncated": true,
+                "output_bytes": output.len(),
+            })
+            .to_string();
+        }
+        return rendered;
+    }
     output
         .chars()
         .take(DEFAULT_TOOL_OUTPUT_EVENT_LIMIT)
         .collect()
+}
+
+/// Extract a server-authored task-board projection from an accepted SSE
+/// event. The payload is validated at the TUI projection boundary; this
+/// transport step only recognizes the versioned event envelope.
+fn work_task_board_update_from_server_event(event: &Value) -> Option<Value> {
+    (event.get("type").and_then(Value::as_str)
+        == Some(astra_server_types::WORK_TASK_BOARD_UPDATE_EVENT_TYPE))
+    .then(|| event.get("task_board_update").cloned())
+    .flatten()
+}
+
+/// Extract a completed server-owned phase receipt. The event envelope is
+/// checked separately from the versioned payload so unrelated internal
+/// fields can never become Explain input merely by sharing an SSE `type`.
+fn turn_phase_receipt_from_server_event(event: &Value) -> Option<Value> {
+    if event.get("type").and_then(Value::as_str) != Some(astra_server_types::TURN_PHASE_EVENT_TYPE)
+    {
+        return None;
+    }
+    let mut payload = serde_json::Map::from_iter([
+        (
+            "schema_version".to_string(),
+            event.get("schema_version")?.clone(),
+        ),
+        ("phase".to_string(), event.get("phase")?.clone()),
+        ("round_index".to_string(), event.get("round_index")?.clone()),
+        ("outcome".to_string(), event.get("outcome")?.clone()),
+        ("duration_ms".to_string(), event.get("duration_ms")?.clone()),
+    ]);
+    if let Some(attempt_index) = event.get("attempt_index") {
+        payload.insert("attempt_index".to_string(), attempt_index.clone());
+    }
+    let receipt = serde_json::from_value::<astra_server_types::TurnPhaseReceiptV1>(
+        serde_json::Value::Object(payload),
+    )
+    .ok()?;
+    if !receipt.is_valid() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "type": astra_server_types::TURN_PHASE_EVENT_TYPE,
+        "schema_version": receipt.schema_version,
+        "phase": receipt.phase,
+        "round_index": receipt.round_index,
+        "attempt_index": receipt.attempt_index,
+        "outcome": receipt.outcome,
+        "duration_ms": receipt.duration_ms,
+    }))
+}
+
+#[derive(Debug)]
+struct ServerToolCallState {
+    name: String,
+    args: Value,
+    render_index: Option<usize>,
+    parent_tool_use_id: Option<String>,
+}
+
+fn server_tool_event_is_client_owned(event: &Value) -> bool {
+    let transport = event.get("transport").and_then(Value::as_str);
+    let executor_kind = event.pointer("/executor/kind").and_then(Value::as_str);
+    matches!(transport, Some("edge_ws" | "edge_ledger")) || executor_kind == Some("edge_agent")
+}
+
+/// A generic `tool_call` is emitted both when the model requests a tool and
+/// when the server has admitted that request to an execution route.  Only the
+/// latter is safe to project into the terminal: the former is not evidence
+/// that a tool ran and would otherwise double-render Edge calls.  The server
+/// route boundary always supplies at least one of these binding fields.
+fn server_tool_event_has_authoritative_route(event: &Value) -> bool {
+    event
+        .get("transport")
+        .and_then(Value::as_str)
+        .is_some_and(|transport| !transport.trim().is_empty())
+        || event
+            .pointer("/executor/kind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| !kind.trim().is_empty())
+}
+
+fn server_tool_start_fields(event: &Value) -> Option<(Option<String>, String, Value)> {
+    let nested = event.get("tool_call").and_then(Value::as_object);
+    let function = nested
+        .and_then(|call| call.get("function"))
+        .and_then(Value::as_object);
+    let name = function
+        .and_then(|function| function.get("name"))
+        .or_else(|| nested.and_then(|call| call.get("name")))
+        .or_else(|| event.get("tool_name"))
+        .or_else(|| event.get("tool"))
+        .or_else(|| event.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToString::to_string)?;
+    let id = nested
+        .and_then(|call| call.get("id").or_else(|| call.get("call_id")))
+        .or_else(|| event.get("call_id"))
+        .or_else(|| event.get("tool_call_id"))
+        .or_else(|| event.get("tool_use_id"))
+        .or_else(|| event.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToString::to_string);
+    let raw_args = function
+        .and_then(|function| function.get("arguments"))
+        .or_else(|| nested.and_then(|call| call.get("arguments")))
+        .or_else(|| event.get("arguments"))
+        .or_else(|| event.get("args"))
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    let args = match raw_args {
+        Value::String(raw) => serde_json::from_str(&raw).unwrap_or(Value::String(raw)),
+        other => other,
+    };
+    Some((id, name, args))
+}
+
+fn server_tool_args_are_informative(args: &Value) -> bool {
+    match args {
+        Value::Null => false,
+        Value::String(value) => !value.trim().is_empty(),
+        Value::Array(values) => !values.is_empty(),
+        Value::Object(values) => !values.is_empty(),
+        Value::Bool(_) | Value::Number(_) => true,
+    }
+}
+
+fn server_tool_completion_status(event: &Value) -> String {
+    if let Some(status) = event.get("status").and_then(Value::as_str) {
+        return match status.trim().to_ascii_lowercase().as_str() {
+            "ok" | "success" | "completed" => "completed".to_string(),
+            "skipped" => "skipped".to_string(),
+            "rejected" => "rejected".to_string(),
+            _ => "failed".to_string(),
+        };
+    }
+    if event.get("success").and_then(Value::as_bool) == Some(true) {
+        "completed".to_string()
+    } else {
+        "failed".to_string()
+    }
+}
+
+fn server_tool_completion_output(event: &Value) -> String {
+    // Some transport projections reserve `output` but leave it null while
+    // carrying the canonical receipt in `result`. Presence is not evidence:
+    // select the first meaningful payload so a null compatibility field
+    // cannot hide a typed control-plane receipt.
+    for value in [event.get("output"), event.get("error"), event.get("result")]
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.is_null())
+    {
+        if let Some(output) = value.as_str() {
+            if output.trim().is_empty() {
+                continue;
+            }
+            return output.to_string();
+        }
+        if let Some(output) = value.get("output").and_then(Value::as_str)
+            && !output.trim().is_empty()
+        {
+            return output.to_string();
+        }
+        return serde_json::to_string(value).unwrap_or_default();
+    }
+    String::new()
+}
+
+fn server_tool_completion_id(event: &Value) -> Option<String> {
+    event
+        .get("call_id")
+        .or_else(|| event.get("tool_call_id"))
+        .or_else(|| event.get("tool_use_id"))
+        .or_else(|| event.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToString::to_string)
 }
 
 // CLI formatting utilities
@@ -487,6 +775,7 @@ enum EdgeToolCacheValidation {
     FileMtime {
         path: PathBuf,
         timestamp_ms: u128,
+        content_sha256: [u8; 32],
     },
     DirectoryMtime {
         path: PathBuf,
@@ -505,13 +794,36 @@ struct EdgeToolCacheEntry {
     validation: EdgeToolCacheValidation,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EdgeProviderRoundBoundary {
+    session_turn: u32,
+    llm_rounds_completed: u32,
+    request: astra_turn_core::context_assembly_trace::ModelRequestTraceIdentity,
+}
+
+impl EdgeProviderRoundBoundary {
+    fn from_feedback(
+        frame: &astra_turn_core::context_feedback::RuntimeFeedbackFrame,
+    ) -> Option<Self> {
+        let request = frame.identity.request.as_ref()?;
+        (request.round == frame.progress.agentic_round_index).then(|| Self {
+            session_turn: frame.progress.session_turn,
+            llm_rounds_completed: frame.progress.llm_rounds_completed,
+            request: request.clone(),
+        })
+    }
+}
+
 pub(crate) struct EdgeToolCache {
     /// `dedup_signature → cached output + validity contract` for safe replay.
     output_cache: std::collections::HashMap<String, EdgeToolCacheEntry>,
-    /// `dedup_signature → count` across all turns.
+    /// `dedup_signature → count` within the current provider round.
     call_counts: std::collections::HashMap<String, u32>,
     /// Hard cap on identical calls (same tool + same args).
     max_identical_calls: u32,
+    /// Latest server-authoritative provider round observed on this SSE stream.
+    /// Repeated frames for the same round do not reset the local batch guard.
+    provider_round: Option<EdgeProviderRoundBoundary>,
 }
 
 impl EdgeToolCache {
@@ -520,7 +832,21 @@ impl EdgeToolCache {
             output_cache: std::collections::HashMap::new(),
             call_counts: std::collections::HashMap::new(),
             max_identical_calls,
+            provider_round: None,
         }
+    }
+
+    fn observe_provider_round(&mut self, next: EdgeProviderRoundBoundary) -> bool {
+        if let Some(current) = self.provider_round.as_ref() {
+            let current_key = (current.session_turn, current.llm_rounds_completed);
+            let next_key = (next.session_turn, next.llm_rounds_completed);
+            if next_key <= current_key || next.request == current.request {
+                return false;
+            }
+        }
+        self.provider_round = Some(next);
+        self.call_counts.clear();
+        true
     }
 
     fn reset_read_only_after_workspace_mutation(&mut self) {
@@ -533,14 +859,7 @@ impl EdgeToolCache {
 fn edge_tool_is_cacheable_read(tool: &str, args: &Value) -> bool {
     if matches!(
         tool,
-        "bash"
-            | "powershell"
-            | "web_search"
-            | "web_fetch"
-            | "memory"
-            | "task_board"
-            | "agent"
-            | "mo_query"
+        "bash" | "powershell" | "web_search" | "web_fetch" | "memory" | "agent" | "mo_query"
     ) {
         return false;
     }
@@ -589,11 +908,32 @@ fn path_mtime_ms(path: &Path) -> u128 {
         .unwrap_or(0)
 }
 
+fn file_content_sha256(path: &Path) -> Option<[u8; 32]> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Some(hasher.finalize().into())
+}
+
 impl EdgeToolCacheValidation {
     fn is_valid(&self) -> bool {
         match self {
-            Self::FileMtime { path, timestamp_ms }
-            | Self::DirectoryMtime { path, timestamp_ms } => path_mtime_ms(path) == *timestamp_ms,
+            Self::FileMtime {
+                path,
+                timestamp_ms,
+                content_sha256,
+            } => {
+                path_mtime_ms(path) == *timestamp_ms
+                    && file_content_sha256(path).as_ref() == Some(content_sha256)
+            }
+            Self::DirectoryMtime { path, timestamp_ms } => path_mtime_ms(path) == *timestamp_ms,
             Self::GitHeadClean {
                 project_root,
                 head_short: cached_head,
@@ -642,6 +982,11 @@ pub(crate) struct EdgeSseContext<'a> {
     /// cancellation can recover partial text, ids, usage, and tool audit data.
     pub incremental_state:
         Option<std::sync::Arc<astra_turn_core::turn_event_sink::IncrementalTurnState>>,
+    /// Fresh headless requests bind this authority from accepted SSE identity
+    /// before the first edge action. Interactive/sub-run paths leave it unset.
+    pub request_session_execution_lease: Option<
+        std::sync::Arc<crate::cli::session::session_execution_lease::RequestSessionExecutionLease>,
+    >,
 }
 
 // ─── CLI SSE stream host ─────────────────────────────────────────────────────
@@ -671,6 +1016,17 @@ struct CliSseStreamHost<'a> {
     tool_work_detected: bool,
     /// Ordered tool executions from this SSE stream.
     pub edge_tool_round: Vec<EdgeToolExecResult>,
+    /// Completed server-owned timing boundaries accepted from this SSE stream.
+    /// They are collected here, then committed to the loop telemetry once the
+    /// stream result is accepted, so terminal and TUI Explain consume one
+    /// common observation rather than separate live and final copies.
+    pub(crate) phase_receipts: Vec<Value>,
+    /// Server-owned tool calls are already executed remotely.  Keep only the
+    /// typed display identity needed to pair their start/end events; never
+    /// re-execute them in the CLI.
+    server_tool_calls: std::collections::HashMap<String, ServerToolCallState>,
+    server_tool_completed_ids: std::collections::HashSet<String>,
+    server_tool_sequence: u64,
     // ── XML tag suppression ────────────────────────────────────────────
     /// Text accumulated while inside an open `<think>`/`<reflect>` tag.
     /// Flushed (after stripping the tags) once the closing tag arrives.
@@ -683,6 +1039,12 @@ struct CliSseStreamHost<'a> {
     /// Last context-meta value forwarded to observers. The SSE accumulator is
     /// replayed on each frame, so deduplicate rather than flooding the TUI.
     last_context_system_prompt_tokens: Option<u32>,
+    /// Last Server-owned context-window policy forwarded to observers.
+    /// A CLI-local estimate is never substituted when the Server omits or
+    /// rejects this typed observation.
+    last_context_window_policy: Option<(u64, u64)>,
+    /// Last durable server run identity forwarded to active-run controls.
+    last_bound_run_id: Option<String>,
     /// Last provider-confirmed input occupancy forwarded to observers.
     last_context_window_measured: Option<u64>,
     /// Last provider-normalized request lanes forwarded to observers.
@@ -703,6 +1065,9 @@ struct CliSseStreamHost<'a> {
     /// When a `tool_request` arrives with one of these IDs, the local permission
     /// check is skipped — the user has already approved the operation.
     cloud_pre_approved: std::collections::HashSet<String>,
+    /// Per-invocation server-approved deadline token. This is separate from
+    /// parent turn cancellation so sibling tool calls cannot cancel each other.
+    active_execution_cancel: Option<tokio_util::sync::CancellationToken>,
     /// Scoped identity for tool results observed in this SSE stream.
     tool_result_identities: std::collections::HashMap<String, ToolResultIdentity>,
     /// Turn-scoped rollback checkpoints when the whole turn opts into rollback-on-failure.
@@ -734,22 +1099,61 @@ struct CliSseStreamHost<'a> {
     observability_hub: Option<std::sync::Arc<astra_runtime::observability::ObservabilityHub>>,
     /// Set when posting edge-side tool or approval results receives 401.
     auth_failure: bool,
+    /// Terminal failure to acknowledge an edge control-plane callback after
+    /// its bounded identical retry.
+    callback_failure: Option<EdgeCallbackFailure>,
+    /// Durable owner of the failed callback. This can differ from the run
+    /// whose SSE stream projected the interaction.
+    callback_failure_run_id: Option<String>,
+    /// Set only by the exact public stdout operation that terminates this SSE
+    /// host; unrelated model/tool/callback failures never synthesize it from
+    /// process-global sink state.
+    output_transport_failure: Option<crate::cli::stream::streaming_types::OutputTransportFailure>,
+    /// A model/protocol failure was already present before this host attempted
+    /// public output. Such a hard failure owns the turn even if that later
+    /// output discovers a concurrently closed consumer.
+    hard_failure_before_output: bool,
     /// Incremental turn snapshot mirrored live from SSE/tool events.
     incremental_state:
         Option<std::sync::Arc<astra_turn_core::turn_event_sink::IncrementalTurnState>>,
+    request_session_execution_lease: Option<
+        std::sync::Arc<crate::cli::session::session_execution_lease::RequestSessionExecutionLease>,
+    >,
 }
 
 fn request_token_usage_from_accum(
     accum: &ChatTurnSseAccum,
 ) -> Option<astra_turn_types::RequestTokenUsage> {
-    accum
-        .has_usage
-        .then_some(astra_turn_types::RequestTokenUsage {
-            fresh_input_tokens: accum.prompt_tokens,
-            cache_read_tokens: accum.cache_read_tokens,
-            cache_creation_tokens: accum.cache_creation_tokens,
-            output_tokens: accum.completion_tokens,
-        })
+    accum.current_request_usage.or_else(|| {
+        (accum.has_usage && !accum.usage_is_run_total).then_some(
+            astra_turn_types::RequestTokenUsage {
+                fresh_input_tokens: accum.prompt_tokens,
+                cache_read_tokens: accum.cache_read_tokens,
+                cache_creation_tokens: accum.cache_creation_tokens,
+                output_tokens: accum.completion_tokens,
+            },
+        )
+    })
+}
+
+fn terminal_output_failure_for_event(
+    hard_failure_before_output: bool,
+    output_failure: Option<crate::cli::stream::streaming_types::OutputTransportFailure>,
+) -> Option<crate::cli::stream::streaming_types::OutputTransportFailure> {
+    (!hard_failure_before_output)
+        .then_some(output_failure)
+        .flatten()
+}
+
+fn server_context_window_policy_from_accum(accum: &ChatTurnSseAccum) -> Option<(u64, u64)> {
+    let trace = accum.context_manifest_trace.as_ref()?;
+    let raw = trace
+        .pointer("/context_window_policy/raw_context_window_tokens")?
+        .as_u64()?;
+    let usable = trace
+        .pointer("/context_window_policy/usable_input_limit_tokens")?
+        .as_u64()?;
+    (raw > 0 && usable > 0 && usable <= raw).then_some((raw, usable))
 }
 
 #[derive(Clone, Debug)]
@@ -784,6 +1188,48 @@ fn is_edge_auth_failure(e: &astra_thin_client::ThinClientError) -> bool {
 fn apply_edge_auth_failure_result(accum: &mut ChatTurnSseAccum, auth_failure: bool) {
     if auth_failure {
         accum.error_message = Some(EDGE_AUTH_FAILURE_MESSAGE.to_string());
+        accum.error_kind = Some(astra_core::ErrorKind::Auth);
+    }
+}
+
+fn apply_edge_callback_failure_result(
+    accum: &mut ChatTurnSseAccum,
+    callback_failure: Option<EdgeCallbackFailure>,
+) {
+    if let Some(failure) = callback_failure {
+        accum.error_message = Some(failure.message);
+        accum.error_kind = Some(failure.kind);
+    }
+}
+
+fn apply_request_session_lease_failure_result(
+    accum: &mut ChatTurnSseAccum,
+    failure: Option<crate::cli::session::session_execution_lease::RequestSessionLeaseFailure>,
+) {
+    if let Some(failure) = failure {
+        accum.error_message = Some(failure.message);
+        accum.error_kind = Some(failure.kind);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct EdgeCallbackFailure {
+    message: String,
+    kind: astra_core::ErrorKind,
+}
+
+fn edge_callback_error_kind(error: &astra_thin_client::ThinClientError) -> astra_core::ErrorKind {
+    match error {
+        astra_thin_client::ThinClientError::Api { status, .. }
+            if *status == reqwest::StatusCode::CONFLICT =>
+        {
+            astra_core::ErrorKind::ContractViolation
+        }
+        astra_thin_client::ThinClientError::Api { status, .. } if status.is_server_error() => {
+            astra_core::ErrorKind::ServerError
+        }
+        error if error.is_transport() => astra_core::ErrorKind::StreamTransport,
+        _ => astra_core::ErrorKind::ContractViolation,
     }
 }
 
@@ -935,6 +1381,22 @@ enum PostToolResultError {
     RequestFailed(String),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PostApprovalError {
+    AuthRefreshFailed,
+    TerminalAuthFailure(String),
+    RequestFailed(String),
+}
+
+impl std::fmt::Display for PostApprovalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AuthRefreshFailed => write!(f, "approval callback authentication failed"),
+            Self::TerminalAuthFailure(error) | Self::RequestFailed(error) => f.write_str(error),
+        }
+    }
+}
+
 impl PostToolResultError {
     fn is_terminal_auth(&self) -> bool {
         matches!(self, Self::AuthRefreshFailed | Self::TerminalAuthFailure(_))
@@ -993,10 +1455,16 @@ impl<'a> CliSseStreamHost<'a> {
             render: StreamRenderState::with_term_width(term_width, render_md, suppress_reasoning),
             tool_work_detected: buffer_from_start,
             edge_tool_round: Vec::new(),
+            phase_receipts: Vec::new(),
+            server_tool_calls: std::collections::HashMap::new(),
+            server_tool_completed_ids: std::collections::HashSet::new(),
+            server_tool_sequence: 0,
             xml_tag_buffer: String::new(),
             cancel_token: ctx.cancel_token,
             stream_event_tx: ctx.stream_event_tx,
             last_context_system_prompt_tokens: None,
+            last_context_window_policy: None,
+            last_bound_run_id: None,
             last_context_window_measured: None,
             last_request_token_usage: None,
             stream_event_sink: ctx.stream_event_sink,
@@ -1006,6 +1474,7 @@ impl<'a> CliSseStreamHost<'a> {
             skill_resolver: ctx.skill_resolver,
             skills_invoked: std::collections::HashSet::new(),
             cloud_pre_approved: std::collections::HashSet::new(),
+            active_execution_cancel: None,
             tool_result_identities: std::collections::HashMap::new(),
             active_turn_rollback,
             turn_rollback_boundary_emitted: false,
@@ -1014,7 +1483,12 @@ impl<'a> CliSseStreamHost<'a> {
             streaming_tool_exec,
             observability_hub: ctx.observability_hub,
             auth_failure: false,
+            callback_failure: None,
+            callback_failure_run_id: None,
+            output_transport_failure: None,
+            hard_failure_before_output: false,
             incremental_state: ctx.incremental_state,
+            request_session_execution_lease: ctx.request_session_execution_lease,
         }
     }
 
@@ -1029,39 +1503,80 @@ impl<'a> CliSseStreamHost<'a> {
         if let Some(md) = &mut self.render.md {
             md.push(s);
         } else {
-            print!("{s}");
-            let _ = io::stdout().flush();
+            stdout_print!("{s}");
+            let _ = crate::cli::stream::output_sink::flush_stdout();
             self.render.track_output(s);
         }
     }
 
-    fn mark_edge_auth_failure(&mut self) {
+    fn mark_edge_auth_failure(&mut self, run_id: &str) {
         self.auth_failure = true;
+        if self.callback_failure_run_id.is_none() {
+            self.callback_failure_run_id = (!run_id.trim().is_empty()).then(|| run_id.to_string());
+        }
         if let Some(token) = self.cancel_token {
             token.cancel();
         }
     }
 
-    fn handle_post_tool_result_error(&mut self, e: &astra_thin_client::ThinClientError) -> bool {
+    fn mark_edge_callback_failure(
+        &mut self,
+        operation: &str,
+        run_id: &str,
+        error: &astra_thin_client::ThinClientError,
+    ) {
+        if self.callback_failure.is_none() {
+            let kind = edge_callback_error_kind(error);
+            let delivery = if error.is_transport() {
+                "after bounded transport retries"
+            } else {
+                "because the server rejected its durable lifecycle state"
+            };
+            self.callback_failure = Some(EdgeCallbackFailure {
+                message: format!(
+                    "Astra could not settle the {operation} callback {delivery}. The affected run will be cancelled fail-closed so it does not remain stuck waiting. Details: {error}"
+                ),
+                kind,
+            });
+            self.callback_failure_run_id = (!run_id.trim().is_empty()).then(|| run_id.to_string());
+        }
+        if let Some(token) = self.cancel_token {
+            token.cancel();
+        }
+    }
+
+    fn handle_post_tool_result_error(
+        &mut self,
+        run_id: &str,
+        e: &astra_thin_client::ThinClientError,
+    ) -> bool {
         if is_edge_auth_failure(e) {
-            self.mark_edge_auth_failure();
+            self.mark_edge_auth_failure(run_id);
             true
         } else if !self.render_policy.suppress_tool_ui() {
             eprintln!("{}", edge_sse_post_tool_result_fail_line(e).yellow());
+            self.mark_edge_callback_failure("tool-result", run_id, e);
             false
         } else {
+            self.mark_edge_callback_failure("tool-result", run_id, e);
             false
         }
     }
 
-    fn handle_post_approval_error(&mut self, e: &astra_thin_client::ThinClientError) -> bool {
+    fn handle_post_approval_error(
+        &mut self,
+        run_id: &str,
+        e: &astra_thin_client::ThinClientError,
+    ) -> bool {
         if is_edge_auth_failure(e) {
-            self.mark_edge_auth_failure();
+            self.mark_edge_auth_failure(run_id);
             true
         } else if !self.render_policy.suppress_tool_ui() {
             eprintln!("{}", edge_sse_post_approval_fail_line(e).yellow());
+            self.mark_edge_callback_failure("approval", run_id, e);
             false
         } else {
+            self.mark_edge_callback_failure("approval", run_id, e);
             false
         }
     }
@@ -1112,7 +1627,7 @@ impl<'a> CliSseStreamHost<'a> {
                 match retry {
                     Ok(_) => Ok(()),
                     Err(ref retry_err) => {
-                        if self.handle_post_tool_result_error(retry_err) {
+                        if self.handle_post_tool_result_error(&body.run_id, retry_err) {
                             Err(PostToolResultError::TerminalAuthFailure(
                                 retry_err.to_string(),
                             ))
@@ -1123,7 +1638,7 @@ impl<'a> CliSseStreamHost<'a> {
                 }
             }
             Err(e) => {
-                if self.handle_post_tool_result_error(&e) {
+                if self.handle_post_tool_result_error(&body.run_id, &e) {
                     Err(PostToolResultError::AuthRefreshFailed)
                 } else {
                     Err(PostToolResultError::RequestFailed(e.to_string()))
@@ -1135,25 +1650,37 @@ impl<'a> CliSseStreamHost<'a> {
     async fn post_approval_with_auth_retry(
         &mut self,
         body: &astra_thin_client::ApprovalRespondRequest,
-    ) -> bool {
+    ) -> Result<(), PostApprovalError> {
         let result = self
             .api
             .post_approval(Some(self.token.as_str()), body)
             .await;
         match result {
-            Ok(_) => false,
+            Ok(_) => Ok(()),
             Err(e) if is_edge_auth_failure(&e) && self.refresh_edge_token_after_401().await => {
                 let retry = self
                     .api
                     .post_approval(Some(self.token.as_str()), body)
                     .await;
                 if let Err(ref retry_err) = retry {
-                    self.handle_post_approval_error(retry_err)
+                    if self.handle_post_approval_error(&body.run_id, retry_err) {
+                        Err(PostApprovalError::TerminalAuthFailure(
+                            retry_err.to_string(),
+                        ))
+                    } else {
+                        Err(PostApprovalError::RequestFailed(retry_err.to_string()))
+                    }
                 } else {
-                    false
+                    Ok(())
                 }
             }
-            Err(e) => self.handle_post_approval_error(&e),
+            Err(e) => {
+                if self.handle_post_approval_error(&body.run_id, &e) {
+                    Err(PostApprovalError::AuthRefreshFailed)
+                } else {
+                    Err(PostApprovalError::RequestFailed(e.to_string()))
+                }
+            }
         }
     }
 
@@ -1177,8 +1704,12 @@ impl<'a> CliSseStreamHost<'a> {
                     .resolve_checked(args.get("path").and_then(Value::as_str)?)
                     .ok()?;
                 let timestamp_ms = path_mtime_ms(&path);
-                (timestamp_ms > 0)
-                    .then_some(EdgeToolCacheValidation::FileMtime { path, timestamp_ms })
+                let content_sha256 = file_content_sha256(&path)?;
+                (timestamp_ms > 0).then_some(EdgeToolCacheValidation::FileMtime {
+                    path,
+                    timestamp_ms,
+                    content_sha256,
+                })
             }
             "list_dir" => {
                 let path = match args.get("path").and_then(Value::as_str) {
@@ -1329,6 +1860,8 @@ impl<'a> CliSseStreamHost<'a> {
         status: String,
         duration_ms: u64,
     ) -> EdgeToolExecResult {
+        let (output, _) =
+            astra_tools::credential_redaction::redact_credentials_for_display(&output);
         if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
             let output_summary = self
                 .render
@@ -1350,21 +1883,23 @@ impl<'a> CliSseStreamHost<'a> {
                 })
                 .await;
             }
-            self.emit_stream_event(chat_stream::StreamEvent::ToolCompleted {
-                name: tool.to_string(),
-                description: tool_description,
-                status: status.clone(),
-                duration_ms,
-                output_summary: if output_summary.is_empty() {
-                    None
-                } else {
-                    Some(output_summary)
-                },
-                output: Some(tool_output_event_text(tool, &output)),
-                tool_use_id: request_id.to_string(),
-                parent_tool_use_id: None,
-            })
-            .await;
+            if tool_completion_is_authoritative(tool, &output) {
+                self.emit_stream_event(chat_stream::StreamEvent::ToolCompleted {
+                    name: tool.to_string(),
+                    description: tool_description,
+                    status: status.clone(),
+                    duration_ms,
+                    output_summary: if output_summary.is_empty() {
+                        None
+                    } else {
+                        Some(output_summary)
+                    },
+                    output: Some(tool_output_event_text(tool, &output)),
+                    tool_use_id: request_id.to_string(),
+                    parent_tool_use_id: None,
+                })
+                .await;
+            }
         }
 
         let tool_result_fields = self.tool_result_fields_with_cli_runtime(tool_result_fields);
@@ -2117,6 +2652,18 @@ impl<'a> CliSseStreamHost<'a> {
         tool_result_fields: Option<Map<String, Value>>,
     ) -> EdgeToolExecResult {
         let duration_ms = 0;
+        // Synthetic batch paths used to publish their raw transaction/error
+        // text directly to ToolCompleted, incremental state, and the cloud
+        // callback before the normal executor boundary ran.  These results
+        // are presentation projections, not source-owned reads: sanitize the
+        // output and extensible fields once before any side channel sees
+        // them.
+        let (output, _) =
+            astra_tools::credential_redaction::redact_credentials_for_display(&output);
+        let mut tool_result_fields = self.tool_result_fields_with_cli_runtime(tool_result_fields);
+        for value in tool_result_fields.values_mut() {
+            astra_tools::credential_redaction::redact_credentials_in_json(value);
+        }
 
         if self.stream_event_tx.is_some() || self.stream_event_sink.is_some() {
             let output_summary = self
@@ -2140,24 +2687,25 @@ impl<'a> CliSseStreamHost<'a> {
                 })
                 .await;
             }
-            self.emit_stream_event(chat_stream::StreamEvent::ToolCompleted {
-                name: req.tool.clone(),
-                description: tool_description,
-                status: status.to_string(),
-                duration_ms,
-                output_summary: if output_summary.is_empty() {
-                    None
-                } else {
-                    Some(output_summary)
-                },
-                output: Some(tool_output_event_text(&req.tool, &output)),
-                tool_use_id: req.request_id.clone(),
-                parent_tool_use_id: None,
-            })
-            .await;
+            if tool_completion_is_authoritative(&req.tool, &output) {
+                self.emit_stream_event(chat_stream::StreamEvent::ToolCompleted {
+                    name: req.tool.clone(),
+                    description: tool_description,
+                    status: status.to_string(),
+                    duration_ms,
+                    output_summary: if output_summary.is_empty() {
+                        None
+                    } else {
+                        Some(output_summary)
+                    },
+                    output: Some(tool_output_event_text(&req.tool, &output)),
+                    tool_use_id: req.request_id.clone(),
+                    parent_tool_use_id: None,
+                })
+                .await;
+            }
         }
 
-        let tool_result_fields = self.tool_result_fields_with_cli_runtime(tool_result_fields);
         let result = EdgeToolExecResult {
             request_id: req.request_id.clone(),
             tool: req.tool.clone(),
@@ -2425,9 +2973,7 @@ impl<'a> CliSseStreamHost<'a> {
             }
 
             let tool_args = Self::batch_tool_args(&req.args, metadata.as_ref());
-            let mut result = self
-                .execute_tool(&req.request_id, &req.tool, &tool_args)
-                .await;
+            let mut result = execute_server_budgeted(self, req, &tool_args).await;
 
             if let Some(active) = active_tx.as_ref() {
                 if metadata.as_ref().is_some_and(|meta| meta.id == active.id)
@@ -2508,6 +3054,12 @@ pub(crate) fn reusable_speculative_output(r: Option<(String, bool)>) -> Option<S
 }
 
 impl CliSseStreamHost<'_> {
+    fn effective_tool_cancel_token(&self) -> Option<tokio_util::sync::CancellationToken> {
+        self.active_execution_cancel
+            .clone()
+            .or_else(|| self.cancel_token.cloned())
+    }
+
     async fn emit_stream_event(&self, event: chat_stream::StreamEvent) {
         if let Some(tx) = &self.stream_event_tx {
             if tx.send(event.clone()).await.is_err() {
@@ -2526,6 +3078,206 @@ impl CliSseStreamHost<'_> {
         if let Some(sink) = &self.stream_event_sink {
             sink.send(event);
         }
+    }
+
+    async fn observe_server_tool_start(&mut self, event: &Value) {
+        let Some((event_id, name, args)) = server_tool_start_fields(event) else {
+            return;
+        };
+        if !server_tool_event_has_authoritative_route(event) {
+            return;
+        }
+        let id = event_id.unwrap_or_else(|| {
+            self.server_tool_sequence = self.server_tool_sequence.saturating_add(1);
+            format!("server-tool-{}", self.server_tool_sequence)
+        });
+        let parent_tool_use_id = event
+            .get("parent_tool_use_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        if server_tool_event_is_client_owned(event) {
+            self.server_tool_calls.remove(&id);
+            return;
+        }
+
+        // A replayed/partial start updates the correlation record without
+        // painting another row.  Edge starts never reach this point because
+        // the server suppresses their progress events in the preferred
+        // client-delivery topology, and the metadata guard remains defensive.
+        if self.server_tool_calls.contains_key(&id) {
+            if let Some(existing) = self.server_tool_calls.get_mut(&id) {
+                existing.name = name;
+                if server_tool_args_are_informative(&args) {
+                    existing.args = args;
+                }
+                if parent_tool_use_id.is_some() {
+                    existing.parent_tool_use_id = parent_tool_use_id;
+                }
+            }
+            return;
+        }
+
+        let render_index = if self.render_policy.suppress_tool_ui() {
+            None
+        } else {
+            Some(self.render.tool_start(&name, &args))
+        };
+        let description = self.render.format_tool_description(&name, &args);
+        if name == "agent"
+            && let Some(action) = agent_control_action(&args)
+        {
+            self.emit_stream_event(chat_stream::StreamEvent::AgentControlStarted {
+                action: action.to_string(),
+                label: agent_control_label(&args, description.clone()),
+                tool_use_id: id.clone(),
+                agent_id: agent_id_from_args(&args),
+                fanout_slot: agent_fanout_slot_from_args(&args),
+                fanout_title: agent_fanout_title_from_args(&args),
+            })
+            .await;
+        }
+        self.emit_stream_event(chat_stream::StreamEvent::ToolStarted {
+            name: name.clone(),
+            description,
+            tool_use_id: id.clone(),
+            parent_tool_use_id: parent_tool_use_id.clone(),
+        })
+        .await;
+        self.server_tool_calls.insert(
+            id,
+            ServerToolCallState {
+                name,
+                args,
+                render_index,
+                parent_tool_use_id,
+            },
+        );
+    }
+
+    async fn observe_server_tool_completion(&mut self, event: &Value) {
+        // Completion identity is a protocol fact. Inferring it from there
+        // being exactly one visible parent tool is unsafe: nested agent and
+        // fanout events share this stream, so an identityless child terminal
+        // could otherwise close the parent's only live cell as a false
+        // failure. Old/partial events remain observable in the durable stream
+        // but cannot mutate interactive lifecycle state without a call id.
+        let id = server_tool_completion_id(event);
+        let Some(id) = id else { return };
+        if !server_tool_event_has_authoritative_route(event)
+            && !self.server_tool_calls.contains_key(&id)
+        {
+            return;
+        }
+        if server_tool_event_is_client_owned(event) {
+            self.server_tool_calls.remove(&id);
+            return;
+        }
+        if !self.server_tool_completed_ids.insert(id.clone()) {
+            return;
+        }
+        let state = self.server_tool_calls.remove(&id).or_else(|| {
+            server_tool_start_fields(event).map(|(_, name, args)| ServerToolCallState {
+                name,
+                args,
+                render_index: None,
+                parent_tool_use_id: None,
+            })
+        });
+        let Some(mut state) = state else {
+            self.server_tool_completed_ids.remove(&id);
+            return;
+        };
+        if !server_tool_args_are_informative(&state.args)
+            && let Some((_, _, terminal_args)) = server_tool_start_fields(event)
+            && server_tool_args_are_informative(&terminal_args)
+        {
+            state.args = terminal_args;
+        }
+        let output = server_tool_completion_output(event);
+        // A fanout start can create children before its transport projection
+        // has a usable receipt. Keep the original call live until registry
+        // reconciliation publishes a typed result; otherwise this lossy SSE
+        // observation wins the terminal race and leaves a false red card next
+        // to successfully running/completed children.
+        if !tool_completion_is_authoritative(&state.name, &output) {
+            tracing::warn!(
+                tool_call_id = %id,
+                tool_name = %state.name,
+                "deferred receipt-less control-tool terminal projection until registry reconciliation"
+            );
+            self.server_tool_completed_ids.remove(&id);
+            self.server_tool_calls.insert(id, state);
+            return;
+        }
+        let status = if state.name == "agent_fanout"
+            && state.args.get("action").and_then(Value::as_str) == Some("start")
+        {
+            // For a control action, receipt lifecycle values such as
+            // `launched`/`running` mean the launch call succeeded. Generic
+            // server event status normalization intentionally does not know
+            // that distinction, so derive it from the typed body here.
+            cloud_tool_result_status_label(&output).to_string()
+        } else {
+            server_tool_completion_status(event)
+        };
+        let duration_ms = event
+            .get("duration_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if !self.render_policy.suppress_tool_ui() {
+            if let Some(index) = state.render_index {
+                self.render.tool_done(
+                    index,
+                    &state.name,
+                    &state.args,
+                    &status,
+                    duration_ms,
+                    &output,
+                );
+            } else {
+                self.render.tool_done_inline(
+                    &state.name,
+                    &state.args,
+                    &status,
+                    duration_ms,
+                    &output,
+                );
+            }
+        }
+        let description = self.render.format_tool_description_with_output(
+            &state.name,
+            &state.args,
+            Some(&output),
+        );
+        let output_summary = self
+            .render
+            .format_output_summary(&state.name, &output, &status)
+            .map(|summary| summary.text);
+        if state.name == "agent"
+            && let Some(action) = agent_control_action(&state.args)
+        {
+            self.emit_stream_event(chat_stream::StreamEvent::AgentControlCompleted {
+                action: action.to_string(),
+                label: agent_control_label(&state.args, description.clone()),
+                status: status.clone(),
+                duration_ms,
+                output: Some(tool_output_event_text(&state.name, &output)),
+                tool_use_id: id.clone(),
+                agent_id: agent_id_from_output(&output).or_else(|| agent_id_from_args(&state.args)),
+            })
+            .await;
+        }
+        self.emit_stream_event(chat_stream::StreamEvent::ToolCompleted {
+            name: state.name,
+            description,
+            status,
+            duration_ms,
+            output_summary,
+            output: Some(tool_output_event_text("server_tool", &output)),
+            tool_use_id: id,
+            parent_tool_use_id: state.parent_tool_use_id,
+        })
+        .await;
     }
 
     /// D-9: Harvest speculative results for the upcoming concurrent batch.
@@ -2604,6 +3356,24 @@ impl CliSseStreamHost<'_> {
         use crate::cli::chat_stream::ApprovalResponse;
         use astra_thin_client::ApprovalDecision;
 
+        // Plan review is a typed lifecycle interaction with four deliberate
+        // outcomes, not an ordinary "allow this tool once" prompt. Route the
+        // exact tool identity through the dedicated review surface and keep
+        // semantic intent classification in the model/tool protocol.
+        if tool == "exit_plan_mode" {
+            return match self.executor.resolve_remote_plan_review(detail).await {
+                Ok(true) => ApprovalDecision::Allow,
+                Ok(false) => ApprovalDecision::Deny,
+                Err(error) => {
+                    astra_core::agent_warn!(
+                        "permission",
+                        "Could not open plan review for server-owned run: {error}"
+                    );
+                    ApprovalDecision::Deny
+                }
+            };
+        }
+
         if let Some(decision) = self.perm_manager.as_mut().and_then(|pm| {
             pm.preflight_cloud_approval_decision(
                 tool,
@@ -2679,7 +3449,7 @@ impl CliSseStreamHost<'_> {
             return ApprovalDecision::Deny;
         }
 
-        let response = if let Some(token) = self.cancel_token {
+        let response = if let Some(token) = self.effective_tool_cancel_token() {
             tokio::select! {
                 biased;
                 _ = token.cancelled() => ApprovalResponse::Deny,
@@ -2749,7 +3519,7 @@ impl CliSseStreamHost<'_> {
         })
         .await;
 
-        let response = if let Some(token) = self.cancel_token {
+        let response = if let Some(token) = self.effective_tool_cancel_token() {
             tokio::select! {
                 biased;
                 _ = token.cancelled() => AskUserResponse::Cancelled,
@@ -2808,11 +3578,52 @@ fn sync_incremental_accum_state(
         incremental_state.set_run_id(run_id.to_string());
     }
     incremental_state.update_text(&accum.full_text);
-    if accum.has_usage {
-        incremental_state.set_prompt_tokens(accum.prompt_tokens);
-        incremental_state.set_completion_tokens(accum.completion_tokens);
-        incremental_state.set_cache_read_tokens(accum.cache_read_tokens);
-        incremental_state.set_cache_creation_tokens(accum.cache_creation_tokens);
+    if let Some(summary) = accum.server_execution_summary.as_ref() {
+        incremental_state.set_llm_rounds(summary.llm_rounds);
+        incremental_state.set_tool_calls_count(summary.tool_calls_count);
+        if let Some(frame) = summary.runtime_feedback.as_ref() {
+            incremental_state.record_runtime_feedback(frame);
+        }
+        // The exact terminal aggregate closes the coverage ledger only after
+        // its optional feedback has contributed run-total token usage.
+        if let Some(coverage) = summary.token_usage_coverage {
+            incremental_state.set_token_usage_coverage(coverage);
+        }
+    }
+    // A server-owned terminal aggregate (or explicit run-total usage event)
+    // must not be overwritten by the last physical request's context usage.
+    // That request is useful for context-window display, but it is not the
+    // cumulative snapshot needed by interruption recovery.
+    let has_run_total = accum.usage_is_run_total
+        || accum
+            .server_execution_summary
+            .as_ref()
+            .is_some_and(|summary| {
+                summary
+                    .runtime_feedback
+                    .as_ref()
+                    .and_then(|frame| frame.run_usage)
+                    .is_some()
+            });
+    if has_run_total {
+        // Some servers expose run-total usage as a standalone `usage` event
+        // without embedding it in runtime feedback. Preserve that aggregate
+        // while still ignoring the stale `current_request_usage` projection.
+        if accum.has_usage && accum.usage_is_run_total {
+            incremental_state.merge_token_usage_lower_bound(
+                accum.prompt_tokens,
+                accum.completion_tokens,
+                accum.cache_read_tokens,
+                accum.cache_creation_tokens,
+            );
+        }
+    } else if let Some(usage) = request_token_usage_from_accum(accum) {
+        incremental_state.merge_token_usage_lower_bound(
+            usage.fresh_input_tokens,
+            usage.output_tokens,
+            usage.cache_read_tokens,
+            usage.cache_creation_tokens,
+        );
     }
 }
 
@@ -2857,20 +3668,211 @@ fn sync_incremental_tool_result_state(
     incremental_state.add_tool_used(&result.tool);
 }
 
+async fn execute_server_budgeted(
+    host: &mut CliSseStreamHost<'_>,
+    request: &ToolBatchRequest,
+    args: &Value,
+) -> EdgeToolExecResult {
+    let now_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
+    let remaining_execution_ms = request
+        .execution_deadline_unix_ms
+        .saturating_sub(now_unix_ms)
+        .min(request.execution_timeout_ms);
+    if remaining_execution_ms == 0 {
+        let mut result = EdgeToolExecResult {
+            request_id: request.request_id.clone(),
+            tool: request.tool.clone(),
+            args: args.clone(),
+            output: "Server-issued tool execution deadline expired before execution".to_string(),
+            tool_result_fields: None,
+            status: "failed".to_string(),
+            duration_ms: 0,
+        };
+        settle_unexecuted_server_tool_result(host, &mut result).await;
+        return result;
+    }
+    let cancellation = host
+        .cancel_token
+        .map(tokio_util::sync::CancellationToken::child_token)
+        .unwrap_or_default();
+    host.active_execution_cancel = Some(cancellation.clone());
+    let result = {
+        let execution = host.execute_tool(&request.request_id, &request.tool, args);
+        tokio::pin!(execution);
+        tokio::select! {
+            result = &mut execution => result,
+            _ = tokio::time::sleep(std::time::Duration::from_millis(remaining_execution_ms)) => {
+                cancellation.cancel();
+                execution.as_mut().await
+            }
+        }
+    };
+    host.active_execution_cancel = None;
+    result
+}
+
+/// Settle an invocation that was admitted by the server but intentionally never
+/// started.  It must use the same authenticated callback path as an executed
+/// tool, otherwise the server sees a misleading transport timeout.
+async fn settle_unexecuted_server_tool_result(
+    host: &mut CliSseStreamHost<'_>,
+    result: &mut EdgeToolExecResult,
+) {
+    let fields = host.tool_result_fields_with_cli_runtime(result.tool_result_fields.take());
+    result.tool_result_fields = Some(fields.clone());
+    host.edge_tool_round.push(result.clone());
+    if let Some(body) = host.tool_result_request(
+        &result.request_id,
+        result.status.clone(),
+        result.output.clone(),
+        result.duration_ms,
+        Some(fields),
+    ) {
+        if host.post_tool_result_with_auth_retry(&body).await.is_ok() {
+            crate::cli::edge_lifecycle::record_completed_request(result.request_id.clone());
+        }
+    } else {
+        tracing::error!(request_id = %result.request_id, "cannot post expired edge tool result without scoped identity");
+    }
+}
+
 #[async_trait::async_trait]
 impl SseStreamHost for CliSseStreamHost<'_> {
     fn requires_strict_sse_json(&self) -> bool {
         self.stream_json_exchange.is_some()
     }
 
+    fn should_abort_edge_work(&self) -> bool {
+        let session_admission_failed = self
+            .request_session_execution_lease
+            .as_ref()
+            .is_some_and(|lease| lease.admit_edge_work().is_err());
+        if session_admission_failed && let Some(cancel_token) = self.cancel_token {
+            cancel_token.cancel();
+        }
+        self.auth_failure || self.callback_failure.is_some() || session_admission_failed
+    }
+
     async fn on_accepted_sse_event(&mut self, event: &Value) -> Result<(), String> {
-        match self.stream_json_exchange.as_mut() {
+        // The canonical accumulator deliberately retains the first session id
+        // when a later `session_info` conflicts. Inspect the accepted raw
+        // identity fact as a second exactness check so the request lease sees
+        // S1 -> S2 instead of validating only the retained S1 projection.
+        if event.get("type").and_then(Value::as_str) == Some("session_info")
+            && let Some(session_id) = event
+                .get("session_id")
+                .and_then(Value::as_str)
+                .filter(|session_id| !session_id.is_empty())
+            && let Some(lease) = self.request_session_execution_lease.as_ref()
+            && lease.bind(session_id).is_err()
+            && self.last_bound_run_id.is_some()
+            && let Some(cancel_token) = self.cancel_token
+        {
+            cancel_token.cancel();
+        }
+        if event.get("type").and_then(Value::as_str) == Some("runtime_feedback") {
+            let frame: astra_turn_core::context_feedback::RuntimeFeedbackFrame =
+                serde_json::from_value(
+                    event
+                        .get("runtime_feedback")
+                        .cloned()
+                        .ok_or_else(|| "runtime_feedback event omitted its frame".to_string())?,
+                )
+                .map_err(|error| format!("invalid runtime_feedback frame: {error}"))?;
+            if !frame.is_valid()
+                || self.executor.active_session_id().as_deref()
+                    != Some(frame.identity.session_id.as_str())
+                || self.last_bound_run_id.as_deref() != Some(frame.identity.run_id.as_str())
+            {
+                return Err(
+                    "runtime_feedback frame did not match the accepted stream identity".to_string(),
+                );
+            }
+            if let Some(incremental_state) = self.incremental_state.as_ref() {
+                incremental_state.record_runtime_feedback(&frame);
+            }
+            if let Some(boundary) = EdgeProviderRoundBoundary::from_feedback(&frame) {
+                self.tool_cache.observe_provider_round(boundary);
+            }
+            self.emit_stream_event(chat_stream::StreamEvent::RuntimeFeedback(Box::new(frame)))
+                .await;
+        }
+        if let Some(update) = work_task_board_update_from_server_event(event) {
+            // This is a durable lifecycle edge, so use the backpressured
+            // stream path rather than best-effort progress forwarding.
+            self.emit_stream_event(chat_stream::StreamEvent::WorkTaskBoardUpdate(update))
+                .await;
+        }
+        if let Some(receipt) = turn_phase_receipt_from_server_event(event) {
+            // Keep one accepted copy for the owning loop's telemetry. Sending
+            // it directly here as well would make TUI receive the same receipt
+            // once live and once again in the final Explain report.
+            self.phase_receipts.push(receipt);
+        }
+        // Server-owned tools are already executed by the server.  Project
+        // their lifecycle into the same terminal/stream surface as local
+        // tools, but never render edge-owned events a second time: edge
+        // execution already goes through `execute_tool` below.
+        match event.get("type").and_then(Value::as_str) {
+            Some("tool_call" | "tool_call_start") => {
+                self.observe_server_tool_start(event).await;
+            }
+            Some("tool_call_end") => {
+                self.observe_server_tool_completion(event).await;
+            }
+            _ => {}
+        }
+        // Read the process sink with cheap atomics around the optional
+        // stream-json write. A transition Open -> Closed/Failed proves this
+        // accepted event's output operation owns the failure; an already
+        // non-open state proves the earlier renderer in the same event owns
+        // it. Ordinary open events never pay an isatty syscall.
+        let stdout_before = crate::cli::stream::output_sink::stdout_state();
+        let stream_json_result = match self.stream_json_exchange.as_mut() {
             Some(exchange) => exchange.accepted_event(event),
             None => Ok(()),
+        };
+        let stdout_after = crate::cli::stream::output_sink::stdout_state();
+        let output_failure = match (stdout_before, stdout_after) {
+            (
+                crate::cli::stream::output_sink::StdoutState::Open,
+                crate::cli::stream::output_sink::StdoutState::Open,
+            ) => None,
+            (_, crate::cli::stream::output_sink::StdoutState::Closed) => {
+                Some(crate::cli::stream::streaming_types::OutputTransportFailure::Closed)
+            }
+            (_, crate::cli::stream::output_sink::StdoutState::Failed) => {
+                Some(crate::cli::stream::streaming_types::OutputTransportFailure::Failed)
+            }
+            _ => None,
+        };
+        if let Some(output_failure) = output_failure
+            && !std::io::IsTerminal::is_terminal(&std::io::stdout())
+        {
+            let Some(output_failure) = terminal_output_failure_for_event(
+                self.hard_failure_before_output,
+                Some(output_failure),
+            ) else {
+                // The accepted model/protocol event is already the terminal
+                // cause. Continue consuming its durable terminal rather than
+                // replacing it with a coincident downstream pipe closure.
+                return Ok(());
+            };
+            self.output_transport_failure = Some(output_failure);
+            return Err(output_failure.message().to_string());
         }
+        stream_json_result
     }
 
     async fn on_sse_done(&mut self, accum: &ChatTurnSseAccum) -> Result<(), String> {
+        // An incomplete/edge-owned call must not leak into the next physical
+        // SSE exchange. Completed IDs are likewise scoped to this stream.
+        self.server_tool_calls.clear();
+        self.server_tool_completed_ids.clear();
         match self.stream_json_exchange.as_mut() {
             Some(exchange) => exchange.finish(accum),
             None => Ok(()),
@@ -2901,8 +3903,20 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     }
 
     fn on_session_id(&mut self, session_id: &str) {
-        if self.executor.active_session_id().as_deref() != Some(session_id) {
+        if let Some(lease) = self.request_session_execution_lease.as_ref()
+            && lease.bind(session_id).is_err()
+        {
+            if self.last_bound_run_id.is_some()
+                && let Some(cancel_token) = self.cancel_token
+            {
+                cancel_token.cancel();
+            }
+            return;
+        }
+        let changed = self.executor.active_session_id().as_deref() != Some(session_id);
+        if changed {
             self.executor.set_active_session_id(session_id.to_string());
+            self.try_emit_stream_event(chat_stream::StreamEvent::SessionBound(session_id.into()));
         }
         if let Some(pm) = self.perm_manager.as_mut() {
             pm.set_active_session_id(session_id);
@@ -2910,7 +3924,40 @@ impl SseStreamHost for CliSseStreamHost<'_> {
     }
 
     fn on_accum_update(&mut self, accum: &ChatTurnSseAccum) {
+        self.hard_failure_before_output |= accum.error_kind.is_some();
         self.sync_incremental_accum(accum);
+        if let Some(run_id) = accum
+            .run_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|run_id| !run_id.is_empty())
+        {
+            match self.last_bound_run_id.as_deref() {
+                None => {
+                    self.last_bound_run_id = Some(run_id.to_string());
+                    self.try_emit_stream_event(chat_stream::StreamEvent::RunBound(
+                        run_id.to_string(),
+                    ));
+                }
+                Some(bound) if bound != run_id => {
+                    tracing::warn!(
+                        bound_run_id = bound,
+                        conflicting_run_id = run_id,
+                        "ignored conflicting durable run identity on one accepted stream"
+                    );
+                }
+                Some(_) => {}
+            }
+        }
+        if self
+            .request_session_execution_lease
+            .as_ref()
+            .is_some_and(|lease| lease.failure().is_some())
+            && self.last_bound_run_id.is_some()
+            && let Some(cancel_token) = self.cancel_token
+        {
+            cancel_token.cancel();
+        }
         if accum.system_prompt_tokens != self.last_context_system_prompt_tokens {
             if let Some(tokens) = accum.system_prompt_tokens {
                 self.try_emit_stream_event(chat_stream::StreamEvent::ContextSystemPromptTokens(
@@ -2920,13 +3967,23 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             self.last_context_system_prompt_tokens = accum.system_prompt_tokens;
         }
 
-        let measured = accum
-            .has_usage
-            .then(|| {
+        let server_policy = server_context_window_policy_from_accum(accum);
+        if let Some((raw_window_tokens, usable_input_tokens)) = server_policy
+            && server_policy != self.last_context_window_policy
+        {
+            self.try_emit_stream_event(chat_stream::StreamEvent::ContextWindowPolicy {
+                raw_window_tokens,
+                usable_input_tokens,
+            });
+            self.last_context_window_policy = server_policy;
+        }
+
+        let measured = request_token_usage_from_accum(accum)
+            .map(|usage| {
                 astra_turn_types::NormalizedPromptCacheUsage::new(
-                    accum.prompt_tokens,
-                    accum.cache_read_tokens,
-                    accum.cache_creation_tokens,
+                    usage.fresh_input_tokens,
+                    usage.cache_read_tokens,
+                    usage.cache_creation_tokens,
                 )
                 .total_input_tokens()
             })
@@ -2956,6 +4013,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
 
     fn on_agent_live_gap(&mut self, gap: astra_turn_core::agent_live_event::AgentLiveGap) {
         self.try_emit_stream_event(chat_stream::StreamEvent::AgentLiveGap(gap));
+    }
+
+    fn on_server_tool_surface_admission(&mut self, tool: &str) -> Result<(), String> {
+        self.executor.accept_server_tool_surface_admission(tool)
     }
 
     async fn on_render_effects(&mut self, effects: Vec<SseRenderEffect>) {
@@ -3113,13 +4174,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             if let Some(md) = &mut self.render.md {
                 md.discard_and_reset();
             } else if self.render.lines_written > 0 && io::stdout().is_terminal() {
-                execute!(
-                    io::stdout(),
-                    cursor::MoveUp(self.render.lines_written as u16),
-                    cursor::MoveToColumn(0),
-                    terminal::Clear(terminal::ClearType::FromCursorDown)
-                )
-                .ok();
+                let _ = crate::cli::stream::output_sink::write_stdout_operation(|stdout| {
+                    execute!(
+                        stdout,
+                        cursor::MoveUp(self.render.lines_written as u16),
+                        cursor::MoveToColumn(0),
+                        terminal::Clear(terminal::ClearType::FromCursorDown)
+                    )
+                });
                 self.render.lines_written = 0;
                 self.render.col = 0;
             }
@@ -3176,7 +4238,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     call_count, max_calls,
                 )
             };
-            let status = "skipped";
+            let status = "failed";
             if let Some(idx) = tool_idx {
                 self.render.tool_done(idx, tool, args, status, 0, &body);
             }
@@ -3425,7 +4487,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         },
                     ) {
                         Ok(()) => {
-                            if let Some(token) = self.cancel_token {
+                            if let Some(token) = self.effective_tool_cancel_token() {
                                 tokio::select! {
                                     biased;
                                     _ = token.cancelled() => ApprovalResponse::Deny,
@@ -3581,7 +4643,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 // of executing it again.
                 let skill_name = astra_runtime::turn::skill_tool::extract_skill_name(args);
                 let dedup_key = skill_name.unwrap_or_default().to_string();
-                if !dedup_key.is_empty() && !self.skills_invoked.insert(dedup_key.clone()) {
+                if !dedup_key.is_empty() && self.skills_invoked.contains(&dedup_key) {
                     format!(
                         "Skill '{}' was already loaded in this turn. \
                          Follow the instructions already provided.",
@@ -3592,21 +4654,28 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     if let Some(exec) = self.streaming_tool_exec.clone() {
                         exec.discard(request_id).await;
                     }
-                    let raw = astra_runtime::turn::skill_tool::execute_skill_inline(
+                    let executed = astra_runtime::turn::skill_tool::execute_skill_inline(
                         resolver.as_ref(),
                         tool,
                         args,
                     )
                     .await;
-                    // Append `<skill-loaded name="..."/>` so the LLM sees
-                    // the "do not re-invoke" signal. Without this, the
-                    // system-prompt rule "On seeing <skill-loaded/>, follow
-                    // instructions — do not re-invoke" never triggers on the
-                    // CLI edge path, and the LLM loads a second skill
-                    // (session 11825116 regression). Server-side path does
-                    // this in partition_discover_and_execute_skills:1098.
-                    append_skill_loaded_marker(&raw, &dedup_key)
+                    let (skill_output, execution_topology, loaded) =
+                        finalize_cli_skill_execution(resolver.as_ref(), &dedup_key, executed);
+                    if loaded {
+                        self.skills_invoked.insert(dedup_key.clone());
+                        if let Some(value) = execution_topology {
+                            tool_result_fields.get_or_insert_with(Map::new).insert(
+                                "astra_skill_execution_topology".to_string(),
+                                Value::String(value),
+                            );
+                        }
+                    } else {
+                        tool_execution_marked_error = true;
+                    }
+                    skill_output
                 } else {
+                    tool_execution_marked_error = true;
                     "Error: skill resolver not available".to_string()
                 }
             } else if tool == astra_runtime::turn::skill_tool::DISCOVER_SKILLS_TOOL_NAME {
@@ -3647,7 +4716,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     tool.to_string(),
                     args.clone(),
                     invocation,
-                    self.cancel_token.cloned(),
+                    self.effective_tool_cancel_token(),
                 )
                 .await;
                 // If the sandbox denied the operation, prompt the user for
@@ -3655,6 +4724,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 // boundary and retry the tool.
                 if let Some(sandbox_msg) = normalize_sandbox_denied_outcome(&mut outcome) {
                     if let Some(expand_dir) = self.sandbox_expansion_scope(args, &sandbox_msg) {
+                        let execution_cancel = self.effective_tool_cancel_token();
                         if let Some(pm) = &mut self.perm_manager {
                             let sandbox_tool_key = format!("sandbox_expand:{tool}");
                             let guard_args = serde_json::json!({
@@ -3695,7 +4765,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                                 ),
                                             ) {
                                                 Ok(()) => {
-                                                    if let Some(token) = self.cancel_token {
+                                                    if let Some(token) = execution_cancel.as_ref() {
                                                         tokio::select! {
                                                             biased;
                                                             _ = token.cancelled() => ApprovalResponse::Deny,
@@ -3838,7 +4908,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                     tool.to_string(),
                                     args.clone(),
                                     invocation,
-                                    self.cancel_token.cloned(),
+                                    self.effective_tool_cancel_token(),
                                 )
                                 .await;
                                 normalize_sandbox_denied_outcome(&mut outcome);
@@ -3866,6 +4936,12 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         } else {
             denied_output.unwrap_or_else(|| "Permission denied".to_string())
         };
+        // The stream renderer emits ToolCompleted, tool_call_end, and the
+        // callback request before the runtime's durable record pass.  Keep
+        // those earlier lanes on the same executor-owned redacted value.
+        let (sanitized_output, _) =
+            astra_tools::credential_redaction::redact_credentials_for_display(&output);
+        output = sanitized_output;
         let status = if !allowed || tool_execution_marked_error {
             "failed"
         } else {
@@ -3954,21 +5030,23 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 })
                 .await;
             }
-            self.emit_stream_event(chat_stream::StreamEvent::ToolCompleted {
-                name: tool.to_string(),
-                description: tool_description,
-                status: status.clone(),
-                duration_ms,
-                output_summary: if output_summary.is_empty() {
-                    None
-                } else {
-                    Some(output_summary)
-                },
-                output: Some(tool_output_event_text(tool, &output)),
-                tool_use_id: request_id.to_string(),
-                parent_tool_use_id: None,
-            })
-            .await;
+            if tool_completion_is_authoritative(tool, &output) {
+                self.emit_stream_event(chat_stream::StreamEvent::ToolCompleted {
+                    name: tool.to_string(),
+                    description: tool_description,
+                    status: status.clone(),
+                    duration_ms,
+                    output_summary: if output_summary.is_empty() {
+                        None
+                    } else {
+                        Some(output_summary)
+                    },
+                    output: Some(tool_output_event_text(tool, &output)),
+                    tool_use_id: request_id.to_string(),
+                    parent_tool_use_id: None,
+                })
+                .await;
+            }
         }
 
         // Update tool line to show completion.
@@ -4056,16 +5134,11 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         } else {
             astra_thin_client::ApprovalDecision::Deny
         };
-        let decision_str = match &decision {
+        let allowed = matches!(
+            &decision,
             astra_thin_client::ApprovalDecision::Allow
-            | astra_thin_client::ApprovalDecision::AllowSession => {
-                // Track this request_id so the subsequent tool_request
-                // skips the redundant local permission check.
-                self.cloud_pre_approved.insert(request_id.to_string());
-                "allow"
-            }
-            _ => "deny",
-        };
+                | astra_thin_client::ApprovalDecision::AllowSession
+        );
         let body = astra_thin_client::ApprovalRespondRequest {
             request_id: request_id.to_string(),
             decision,
@@ -4075,11 +5148,21 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             tool_name: Some(tool.to_string()),
             approval_kind: Some(approval_kind),
         };
-        let _ = self.post_approval_with_auth_retry(&body).await;
+        let post_result = self.post_approval_with_auth_retry(&body).await;
+        if allowed && post_result.is_ok() {
+            // Only an acknowledged durable approval can bypass the local
+            // permission check for a coalesced tool_request.
+            self.cloud_pre_approved.insert(request_id.to_string());
+        }
         EdgeApprovalResult {
             request_id: request_id.to_string(),
-            decision: decision_str.to_string(),
-            reason: None,
+            decision: if allowed && post_result.is_ok() {
+                "allow"
+            } else {
+                "deny"
+            }
+            .to_string(),
+            reason: post_result.err().map(|error| error.to_string()),
         }
     }
 
@@ -4136,15 +5219,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         };
 
         let mut results = Vec::with_capacity(requests.len());
+        let mut callback_delivery_open = self.callback_failure.is_none() && !self.auth_failure;
         for (request, decision) in requests.iter().zip(decisions) {
-            let decision_str = match &decision {
+            let allowed = matches!(
+                &decision,
                 astra_thin_client::ApprovalDecision::Allow
-                | astra_thin_client::ApprovalDecision::AllowSession => {
-                    self.cloud_pre_approved.insert(request.request_id.clone());
-                    "allow"
-                }
-                _ => "deny",
-            };
+                    | astra_thin_client::ApprovalDecision::AllowSession
+            );
             let body = astra_thin_client::ApprovalRespondRequest {
                 request_id: request.request_id.clone(),
                 decision,
@@ -4154,11 +5235,29 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 tool_name: Some(request.tool.clone()),
                 approval_kind: Some(request.approval_kind),
             };
-            let _ = self.post_approval_with_auth_retry(&body).await;
+            let post_result = if callback_delivery_open {
+                let result = self.post_approval_with_auth_retry(&body).await;
+                if result.is_err() || self.callback_failure.is_some() || self.auth_failure {
+                    callback_delivery_open = false;
+                }
+                result
+            } else {
+                Err(PostApprovalError::RequestFailed(
+                    "approval callback delivery stopped after an earlier failure".to_string(),
+                ))
+            };
+            if allowed && post_result.is_ok() {
+                self.cloud_pre_approved.insert(request.request_id.clone());
+            }
             results.push(EdgeApprovalResult {
                 request_id: request.request_id.clone(),
-                decision: decision_str.to_string(),
-                reason: None,
+                decision: if allowed && post_result.is_ok() {
+                    "allow"
+                } else {
+                    "deny"
+                }
+                .to_string(),
+                reason: post_result.err().map(|error| error.to_string()),
             });
         }
         results
@@ -4206,10 +5305,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             }
             let mut out = Vec::with_capacity(n);
             for req in requests {
-                out.push(
-                    self.execute_tool(&req.request_id, &req.tool, &req.args)
-                        .await,
-                );
+                out.push(execute_server_budgeted(self, &req, &req.args).await);
             }
             self.render.tool_batch_progress = None;
             return out;
@@ -4219,10 +5315,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             let mut out = Vec::with_capacity(n);
             for (i, req) in requests.iter().enumerate() {
                 self.render.tool_batch_progress = Some((i + 1, n));
-                out.push(
-                    self.execute_tool(&req.request_id, &req.tool, &req.args)
-                        .await,
-                );
+                out.push(execute_server_budgeted(self, req, &req.args).await);
             }
             self.render.tool_batch_progress = None;
             return out;
@@ -4246,10 +5339,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             let mut out = Vec::with_capacity(n);
             for (i, req) in requests.iter().enumerate() {
                 self.render.tool_batch_progress = Some((i + 1, n));
-                out.push(
-                    self.execute_tool(&req.request_id, &req.tool, &req.args)
-                        .await,
-                );
+                out.push(execute_server_budgeted(self, req, &req.args).await);
             }
             self.render.tool_batch_progress = None;
             return out;
@@ -4272,10 +5362,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 // Side-effect tools execute eagerly in original order.
                 seq_done += 1;
                 self.render.tool_batch_progress = Some((seq_done, seq_total + conc_count));
-                results[i] = Some(
-                    self.execute_tool(&req.request_id, &req.tool, &req.args)
-                        .await,
-                );
+                results[i] = Some(execute_server_budgeted(self, req, &req.args).await);
             }
         }
         // Batch-size observation: correlates the read-only batching prompt
@@ -4318,10 +5405,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         if !all_allowed {
             // Rare for read-only tools. Fall back to sequential.
             for (i, req) in conc_reqs {
-                results[i] = Some(
-                    self.execute_tool(&req.request_id, &req.tool, &req.args)
-                        .await,
-                );
+                results[i] = Some(execute_server_budgeted(self, req, &req.args).await);
             }
             return results
                 .into_iter()
@@ -4371,13 +5455,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 if let Some(md) = &mut self.render.md {
                     md.discard_and_reset();
                 } else if self.render.lines_written > 0 && io::stdout().is_terminal() {
-                    execute!(
-                        io::stdout(),
-                        cursor::MoveUp(self.render.lines_written as u16),
-                        cursor::MoveToColumn(0),
-                        terminal::Clear(terminal::ClearType::FromCursorDown)
-                    )
-                    .ok();
+                    let _ = crate::cli::stream::output_sink::write_stdout_operation(|stdout| {
+                        execute!(
+                            stdout,
+                            cursor::MoveUp(self.render.lines_written as u16),
+                            cursor::MoveToColumn(0),
+                            terminal::Clear(terminal::ClearType::FromCursorDown)
+                        )
+                    });
                     self.render.lines_written = 0;
                     self.render.col = 0;
                 }
@@ -4422,27 +5507,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         // Matching request_ids skip the normal dispatch and reuse the
         // speculative output. Journal/observability still fire exactly
         // once from the post-execution pass below.
-        let speculative_by_id = self.harvest_speculation_for_batch(&conc_reqs).await;
-        let mut preflight_errors = std::collections::HashMap::new();
-        for (_, req) in &conc_reqs {
-            if reusable_speculative_output(speculative_by_id.get(&req.request_id).cloned())
-                .is_some()
-            {
-                continue;
-            }
-            if let Err(error) = self
-                .preflight_explicit_path_sandbox_expansion(&req.tool, &req.args)
-                .await
-            {
-                astra_core::agent_warn!(
-                    "permission",
-                    "Parallel sandbox preflight for {} failed before execution: {}",
-                    req.tool,
-                    error
-                );
-                preflight_errors.insert(req.request_id.clone(), error);
-            }
-        }
+        // A server-owned `tool_request` is the authority that binds an
+        // immutable deadline. Speculation begins before that authority exists,
+        // so it must not execute this batch.
+        let speculative_by_id: std::collections::HashMap<String, (String, bool)> =
+            std::collections::HashMap::new();
+        // Explicit-path sandbox expansion may require an interactive approval.
+        // It therefore runs only through the per-invocation retry path below,
+        // after that invocation's immutable deadline has been armed.
         let outputs: Vec<(crate::edge_tools::ToolExecutionOutcome, u64)> = join_all(
             conc_reqs
                 .iter()
@@ -4450,15 +5522,50 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     let tool = req.tool.clone();
                     let args = req.args.clone();
                     let request_id = req.request_id.clone();
+                    let now_unix_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis()
+                        .min(u128::from(u64::MAX)) as u64;
+                    let execution_timeout_ms = req
+                        .execution_deadline_unix_ms
+                        .saturating_sub(now_unix_ms)
+                        .min(req.execution_timeout_ms);
+                    let expired_before_start = execution_timeout_ms == 0;
                     let sem = sem.clone();
                     let executor = std::sync::Arc::clone(&executor);
-                    let cancel_token_for_tool = self.cancel_token.cloned();
+                    let cancel_token_for_tool = self
+                        .cancel_token
+                        .map(tokio_util::sync::CancellationToken::child_token)
+                        .unwrap_or_default();
+                    let deadline_cancellation = cancel_token_for_tool.clone();
+                    if !expired_before_start {
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                execution_timeout_ms,
+                            ))
+                            .await;
+                            deadline_cancellation.cancel();
+                        });
+                    }
                     let speculative = speculative_by_id.get(&req.request_id).cloned();
-                    let preflight_error = preflight_errors.get(&req.request_id).cloned();
-                    let cancel_token = self.cancel_token.cloned();
                     async move {
-                        if let Some(error) = preflight_error {
-                            return (crate::edge_tools::ToolExecutionOutcome::error(error), 0u64);
+                        if expired_before_start {
+                            return (
+                                crate::edge_tools::ToolExecutionOutcome::error(
+                                    "Server-issued tool execution deadline expired before execution"
+                                        .to_string(),
+                                ),
+                                0u64,
+                            );
+                        }
+                        if cancel_token_for_tool.is_cancelled() {
+                            return (
+                                crate::edge_tools::ToolExecutionOutcome::error(
+                                    "Cancelled before tool execution started".to_string(),
+                                ),
+                                0u64,
+                            );
                         }
                         if let Some(output) = reusable_speculative_output(speculative) {
                             return (
@@ -4504,10 +5611,21 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                 }
                             }
                         }
-                        // Acquire a permit before executing. Semaphore is never closed
-                        // (it lives only for this batch), so acquire() won't fail; the
-                        // `ok()` fallback is defensive.
-                        let _permit = sem.acquire_owned().await.ok();
+                        // Capacity is process-wide, so another session may own every
+                        // permit for an arbitrarily long tool.  Durable cancellation
+                        // must win this wait; otherwise the SSE read-ahead observes the
+                        // terminal but cannot settle this batch until an unrelated
+                        // session releases capacity.
+                        let Some(_permit) =
+                            acquire_tool_permit_or_cancel(sem, Some(&cancel_token_for_tool)).await
+                        else {
+                            return (
+                                crate::edge_tools::ToolExecutionOutcome::error(
+                                    "Cancelled before tool execution acquired capacity".to_string(),
+                                ),
+                                0u64,
+                            );
+                        };
                         let invocation = astra_tools::tool_engine::ToolInvocationMetadata {
                             tool_call_id: Some(&request_id),
                             ..Default::default()
@@ -4518,25 +5636,18 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                                 tool.clone(),
                                 effective_args.clone(),
                                 invocation,
-                                cancel_token_for_tool,
+                                Some(cancel_token_for_tool.clone()),
                             ),
                         );
-                        let (outcome, dur) = if let Some(token) = cancel_token {
-                            tokio::select! {
-                                biased;
-                                _ = token.cancelled() => (
-                                    crate::edge_tools::ToolExecutionOutcome {
-                                        output: "Cancelled by user".to_string(),
-                                        tool_result_fields: None,
-                                        is_error: true,
-                                    },
-                                    0u64,
-                                ),
-                                result = exec => result,
-                            }
-                        } else {
-                            exec.await
-                        };
+                        // Bash owns a child process, workspace lease, and
+                        // post-execution fingerprint.  Dropping its future
+                        // on the outer cancellation branch would release
+                        // the lease while the spawn_blocking child keeps
+                        // writing, allowing the next session to attribute
+                        // that delta incorrectly.  Bash receives the same
+                        // token internally and must settle its child/post
+                        // window before this batch future is dropped.
+                        let (outcome, dur) = exec.await;
                         // ── Post-tool hooks (rewrite output if any hook requests it) ──
                         if astra_turn_core::tool_hooks::global_has_hooks().await {
                             let post_ctx = astra_turn_core::tool_hooks::ToolHookContext::post(
@@ -4604,6 +5715,32 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 continue;
             };
             let (_, req) = conc_reqs[pos];
+            let now_unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64;
+            let remaining_execution_ms = req
+                .execution_deadline_unix_ms
+                .saturating_sub(now_unix_ms)
+                .min(req.execution_timeout_ms);
+            if remaining_execution_ms == 0 {
+                outputs[pos].0 = crate::edge_tools::ToolExecutionOutcome::error(
+                    "Server-issued tool execution deadline expired before sandbox retry"
+                        .to_string(),
+                );
+                outputs[pos].1 = 0;
+                continue;
+            }
+            let retry_cancel = self
+                .cancel_token
+                .map(tokio_util::sync::CancellationToken::child_token)
+                .unwrap_or_default();
+            let retry_deadline_cancel = retry_cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(remaining_execution_ms)).await;
+                retry_deadline_cancel.cancel();
+            });
             let tool = req.tool.clone();
             let args = req.args.clone();
             let sandbox_tool_key = format!("sandbox_expand:{tool}");
@@ -4656,14 +5793,10 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             ),
                         ) {
                             Ok(()) => {
-                                if let Some(token) = self.cancel_token {
-                                    tokio::select! {
-                                        biased;
-                                        _ = token.cancelled() => ApprovalResponse::Deny,
-                                        r = resp_rx => r.unwrap_or(ApprovalResponse::Deny),
-                                    }
-                                } else {
-                                    resp_rx.await.unwrap_or(ApprovalResponse::Deny)
+                                tokio::select! {
+                                    biased;
+                                    _ = retry_cancel.cancelled() => ApprovalResponse::Deny,
+                                    r = resp_rx => r.unwrap_or(ApprovalResponse::Deny),
                                 }
                             }
                             Err(error) => {
@@ -4718,6 +5851,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             if !approved {
                 continue;
             }
+            if retry_cancel.is_cancelled() {
+                outputs[pos].0 = crate::edge_tools::ToolExecutionOutcome::error(
+                    "Server-issued tool execution deadline expired before sandbox retry"
+                        .to_string(),
+                );
+                outputs[pos].1 = 0;
+                continue;
+            }
             if let Err(e) = self.executor.expand_sandbox_path(expand_dir) {
                 astra_core::agent_warn!("sandbox", "post-approval expansion rejected: {e}");
                 continue;
@@ -4734,7 +5875,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                         tool_call_id: Some(&req.request_id),
                         ..Default::default()
                     },
-                    self.cancel_token.cloned(),
+                    Some(retry_cancel.clone()),
                 ))
                 .await;
             let mut retried = retried;
@@ -4742,7 +5883,7 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             outputs[pos] = (retried, retry_dur);
         }
 
-        let mut terminal_post_failure = false;
+        let mut callback_delivery_open = self.callback_failure.is_none() && !self.auth_failure;
         for (pos, (outcome, duration_ms)) in outputs.into_iter().enumerate() {
             let (orig_idx, req) = conc_reqs[pos];
             let status = edge_tool_outcome_status(&outcome);
@@ -4771,21 +5912,23 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     })
                     .await;
                 }
-                self.emit_stream_event(chat_stream::StreamEvent::ToolCompleted {
-                    name: req.tool.clone(),
-                    description: desc,
-                    status: status.to_string(),
-                    duration_ms,
-                    output_summary: if output_summary.is_empty() {
-                        None
-                    } else {
-                        Some(output_summary)
-                    },
-                    output: Some(tool_output_event_text(&req.tool, &output)),
-                    tool_use_id: req.request_id.clone(),
-                    parent_tool_use_id: None,
-                })
-                .await;
+                if tool_completion_is_authoritative(&req.tool, &output) {
+                    self.emit_stream_event(chat_stream::StreamEvent::ToolCompleted {
+                        name: req.tool.clone(),
+                        description: desc,
+                        status: status.to_string(),
+                        duration_ms,
+                        output_summary: if output_summary.is_empty() {
+                            None
+                        } else {
+                            Some(output_summary)
+                        },
+                        output: Some(tool_output_event_text(&req.tool, &output)),
+                        tool_use_id: req.request_id.clone(),
+                        parent_tool_use_id: None,
+                    })
+                    .await;
+                }
             }
 
             // Tool-done UI.
@@ -4828,17 +5971,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                 Some(tool_result_fields),
             ) {
                 // ── Reconnection dedup: only record when server acked the result ──
-                if !terminal_post_failure {
+                if callback_delivery_open {
                     match self.post_tool_result_with_auth_retry(&body).await {
                         Ok(()) => {
                             crate::cli::edge_lifecycle::record_completed_request(
                                 req.request_id.clone(),
                             );
                         }
-                        Err(err) if err.is_terminal_auth() => {
-                            terminal_post_failure = true;
-                        }
-                        Err(_) => {}
+                        Err(_) => callback_delivery_open = false,
                     }
                 }
             } else {
@@ -4878,12 +6018,23 @@ impl SseStreamHost for CliSseStreamHost<'_> {
         let Some(exec) = self.streaming_tool_exec.clone() else {
             return;
         };
-        let tool_name = tool_call
+        let Some(tool_name) = tool_call
             .get("function")
             .and_then(|f| f.get("name"))
             .and_then(|n| n.as_str())
-            .unwrap_or("")
-            .to_string();
+            .and_then(astra_core::canonical_names::normalize_name)
+        else {
+            return;
+        };
+        let tool_name = tool_name.to_string();
+        // Shell execution owns a workspace lease and a post-execution
+        // fingerprint.  Streaming speculation may be discarded by the
+        // renderer, which would otherwise abort the async wrapper while its
+        // blocking child keeps running.  Keep shell calls on the normal
+        // lifecycle-owned path; pure typed/read tools may still speculate.
+        if matches!(tool_name.as_str(), "bash" | "powershell") {
+            return;
+        }
         let call_id = tool_call
             .get("id")
             .and_then(|v| v.as_str())
@@ -4919,7 +6070,13 @@ impl SseStreamHost for CliSseStreamHost<'_> {
 fn build_streaming_tool_exec(
     executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
 ) -> Option<std::sync::Arc<astra_turn_core::streaming_tool_exec::StreamingToolExecutor>> {
-    if !astra_turn_core::streaming_tool_exec::streaming_tool_exec_enabled() {
+    // `tool_call` arrives before the server's durable `tool_request` lease.
+    // Executing it here would let an optional local latency optimization bypass
+    // deadline, approval, and callback authority.  Re-enable only when the
+    // speculative protocol carries the same immutable server lease.
+    if !astra_turn_core::streaming_tool_exec::streaming_tool_exec_enabled()
+        || !server_leased_speculation_supported()
+    {
         return None;
     }
     let fn_exec: astra_turn_core::parallel_tool_exec::ToolExecutorFn =
@@ -4966,7 +6123,11 @@ fn build_streaming_tool_exec(
     ))
 }
 
-// ─── Turn result from one /chat/turn SSE stream ───────────────────────────────
+fn server_leased_speculation_supported() -> bool {
+    false
+}
+
+// ─── Turn result from one /chat/stream SSE stream ───────────────────────────────
 
 /// One turn: core fields from [`ChatTurnSseAccum`] plus CLI-only edge bookkeeping and TTFT.
 pub(crate) struct TurnResult {
@@ -4977,6 +6138,19 @@ pub(crate) struct TurnResult {
     pub(crate) edge_tool_round: Vec<EdgeToolExecResult>,
     /// New access token obtained by an in-stream auth refresh, if any.
     pub(crate) refreshed_token: Option<String>,
+    /// Server-owned phase receipts accepted during this physical request.
+    pub(crate) phase_receipts: Vec<Value>,
+    /// A server-requested edge callback exhausted its bounded identical
+    /// retry. The outer turn owner must cancel the durable server run; closing
+    /// this local stream alone is not a terminal control-plane transition.
+    pub(crate) callback_delivery_failed: bool,
+    /// Exact durable callback owner when supplied by the producer. This is
+    /// authoritative over the consuming stream's run identity.
+    pub(crate) callback_failure_run_id: Option<String>,
+    /// Exact public-output operation that terminated this physical stream.
+    /// Never inferred from process-global stdout state.
+    pub(crate) output_transport_failure:
+        Option<crate::cli::stream::streaming_types::OutputTransportFailure>,
 }
 
 impl Deref for TurnResult {
@@ -5001,6 +6175,10 @@ impl TurnResult {
             ttft_ms: None,
             edge_tool_round: Vec::new(),
             refreshed_token: None,
+            phase_receipts: Vec::new(),
+            callback_delivery_failed: false,
+            callback_failure_run_id: None,
+            output_transport_failure: None,
         }
     }
 }
@@ -5329,8 +6507,8 @@ impl StreamRenderState {
             && let Some(line) = summary
         {
             if self.md.is_none() {
-                println!("{line}");
-                let _ = io::stdout().flush();
+                stdout_println!("{line}");
+                let _ = crate::cli::stream::output_sink::flush_stdout();
                 self.lines_written += 1;
                 self.col = 0;
             } else {
@@ -5343,8 +6521,8 @@ impl StreamRenderState {
     fn clear_thinking_with_summary(&mut self, mut pane: ThinkingPreviewPane, summary: &str) {
         pane.clear();
         if self.md.is_none() {
-            println!("{summary}");
-            let _ = io::stdout().flush();
+            stdout_println!("{summary}");
+            let _ = crate::cli::stream::output_sink::flush_stdout();
             self.lines_written += 1;
             self.col = 0;
         } else {
@@ -6367,6 +7545,22 @@ fn should_offload_blocking_tool(tool_name: &str) -> bool {
     }
 }
 
+async fn acquire_tool_permit_or_cancel(
+    semaphore: std::sync::Arc<tokio::sync::Semaphore>,
+    cancel_token: Option<&tokio_util::sync::CancellationToken>,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    match cancel_token {
+        Some(token) => {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => None,
+                permit = semaphore.acquire_owned() => permit.ok(),
+            }
+        }
+        None => semaphore.acquire_owned().await.ok(),
+    }
+}
+
 pub(crate) async fn execute_with_metadata_responsive(
     executor: std::sync::Arc<crate::edge_tools::ToolExecutor>,
     tool_name: String,
@@ -6392,10 +7586,27 @@ pub(crate) async fn execute_with_invocation_metadata_responsive(
 ) -> crate::edge_tools::ToolExecutionOutcome {
     if tool_name == "bash"
         && let Some(outcome) = executor
-            .bash_detachable_with_metadata(&args, cancel_token.as_ref())
+            .bash_detachable_with_metadata(&args, invocation, cancel_token.as_ref())
             .await
     {
         return outcome;
+    }
+
+    // The async Bash path owns the workspace pre/post observer and its
+    // per-root lease. Keep it on this path even when the caller is the
+    // responsive stream renderer; the shell itself is moved to a blocking
+    // worker by `bash_outcome_with_cancel_async`. The legacy synchronous
+    // helper cannot safely await that shared lease and would re-open the
+    // cross-session attribution race.
+    if tool_name == "bash" {
+        return executor
+            .execute_with_invocation_metadata_cancelable(
+                &tool_name,
+                &args,
+                invocation,
+                cancel_token.as_ref(),
+            )
+            .await;
     }
 
     if !should_offload_blocking_tool(&tool_name) {
@@ -6418,10 +7629,27 @@ pub(crate) async fn execute_with_invocation_metadata_responsive(
     let tool_for_blocking = tool_name.clone();
     let args_for_blocking = args.clone();
     let cancel_for_blocking = cancel_token.clone();
+    // `spawn_blocking` requires a `'static` closure, while invocation metadata
+    // borrows the provider/request buffers.  Own the small identity strings
+    // for the duration of the blocking call and reconstruct the borrowed
+    // envelope inside the closure.  The original envelope remains available
+    // for the defensive async fallback below.
+    let run_id_for_blocking = invocation.run_id.map(str::to_owned);
+    let turn_chain_id_for_blocking = invocation.turn_chain_id.map(str::to_owned);
+    let tool_call_id_for_blocking = invocation.tool_call_id.map(str::to_owned);
+    let admission_source_for_blocking = invocation.admission_source;
     let blocking_outcome = tokio::task::spawn_blocking(move || {
+        let invocation_for_blocking = astra_tools::tool_engine::ToolInvocationMetadata {
+            run_id: run_id_for_blocking.as_deref(),
+            turn_chain_id: turn_chain_id_for_blocking.as_deref(),
+            tool_call_id: tool_call_id_for_blocking.as_deref(),
+            admission_source: admission_source_for_blocking,
+            expected_control_epoch: None,
+        };
         executor_for_blocking.execute_blocking_shell_tool(
             &tool_for_blocking,
             &args_for_blocking,
+            invocation_for_blocking,
             cancel_for_blocking.as_ref(),
         )
     })
@@ -6457,75 +7685,6 @@ fn is_agent_control_preview(preview: &str) -> bool {
     ]
     .iter()
     .any(|prefix| preview.starts_with(prefix))
-}
-
-fn task_preview_from_args(args: &Value) -> Option<String> {
-    match args.get("action").and_then(Value::as_str).unwrap_or("list") {
-        "create" => args
-            .get("title")
-            .and_then(Value::as_str)
-            .map(|title| format!("create \"{}\"", truncate_line(title, 48))),
-        "list" => Some(
-            args.get("status_filter")
-                .and_then(Value::as_str)
-                .map(|status| format!("list {}", truncate_line(status, 24)))
-                .unwrap_or_else(|| "list".to_string()),
-        ),
-        "list_user" => Some(
-            args.get("user_status")
-                .and_then(Value::as_str)
-                .map(|status| format!("list_user {}", truncate_line(status, 24)))
-                .unwrap_or_else(|| "list_user active".to_string()),
-        ),
-        "get" | "stop" | "archive" | "adopt" => {
-            let action = args.get("action").and_then(Value::as_str).unwrap_or("get");
-            args.get("task_id")
-                .and_then(Value::as_str)
-                .map(|task_id| format!("{action} {}", truncate_line(task_id, 36)))
-        }
-        "update" => {
-            let task_id = args.get("task_id").and_then(Value::as_str);
-            let status = args.get("new_status").and_then(Value::as_str);
-            match (task_id, status) {
-                (Some(task_id), Some(status)) => Some(format!(
-                    "update {} -> {}",
-                    truncate_line(task_id, 24),
-                    truncate_line(status, 16)
-                )),
-                (Some(task_id), None) => Some(format!("update {}", truncate_line(task_id, 36))),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
-fn format_task_display_from_preview(preview: &str) -> String {
-    if let Some(rest) = preview.strip_prefix("create ") {
-        return format!("Creating task: {rest}");
-    }
-    if let Some(rest) = preview.strip_prefix("update ") {
-        return format!("Updating task: {rest}");
-    }
-    if let Some(rest) = preview.strip_prefix("stop ") {
-        return format!("Stopping task: {rest}");
-    }
-    if let Some(rest) = preview.strip_prefix("get ") {
-        return format!("Getting task: {rest}");
-    }
-    if let Some(rest) = preview.strip_prefix("archive ") {
-        return format!("Archiving task: {rest}");
-    }
-    if let Some(rest) = preview.strip_prefix("adopt ") {
-        return format!("Adopting task: {rest}");
-    }
-    if let Some(rest) = preview.strip_prefix("list ") {
-        return format!("Listing tasks: {rest}");
-    }
-    if let Some(rest) = preview.strip_prefix("list_user ") {
-        return format!("Listing cross-session tasks: {rest}");
-    }
-    "Listing tasks".to_string()
 }
 
 /// Human-friendly tool description from a `ToolCallRecord`'s name + args_preview.
@@ -6594,10 +7753,9 @@ pub(crate) fn format_tool_display_from_preview(name: &str, args_preview: Option<
         "rollback_session_state" => format!("Rollback session state: {preview}"),
         "ask_user" => format!("Asking user: \"{preview}\""),
         "sleep" => format!("Sleeping: {preview}"),
-        "tool_search" => format!("Searching tools: {preview}"),
+        "tool_search" => format!("Activating tools: {preview}"),
         "enter_plan_mode" => format!("Enter plan mode: \"{preview}\""),
         "exit_plan_mode" => "Exit plan mode".to_string(),
-        "task_board" => format_task_display_from_preview(preview),
         "mo_query" => format!("MatrixOne query: \"{preview}\""),
         // `memory` is action-aware; when we only have the preview string (not the
         // parsed args), surface it generically. Callers that have the full args
@@ -6644,8 +7802,8 @@ fn apply_sse_render_effects(
                 if let Some(md) = &mut render.md {
                     md.push(&s);
                 } else {
-                    print!("{s}");
-                    let _ = io::stdout().flush();
+                    stdout_print!("{s}");
+                    let _ = crate::cli::stream::output_sink::flush_stdout();
                     render.track_output(&s);
                 }
             }
@@ -6656,7 +7814,7 @@ fn apply_sse_render_effects(
     }
 }
 
-/// Consume one /chat/turn SSE stream, render text deltas, collect tool_calls.
+/// Consume one /chat/stream SSE stream, render text deltas, collect tool_calls.
 ///
 /// Delegates protocol parsing to runtime's [`consume_sse_stream_cancellable`]; CLI-specific
 /// rendering, tool execution, and approval prompts are handled by [`CliSseStreamHost`].
@@ -6699,8 +7857,22 @@ pub(crate) async fn consume_turn_sse(
         lines_written,
         _pending_xml_buffer,
         auth_failure,
+        callback_failure,
+        callback_failure_run_id,
+        request_session_lease_failure,
         refreshed_token,
-    ) = if let Some(ctx) = edge {
+        phase_receipts,
+        output_transport_failure,
+    ) = if let Some(mut ctx) = edge {
+        // The stream owns a child scope even when the caller supplies a
+        // reusable turn/session token. A durable terminal may cancel this
+        // physical Edge execution, but must never fan cancellation out to a
+        // sibling stream or a later user turn.
+        let physical_stream_cancel = ctx
+            .cancel_token
+            .map(tokio_util::sync::CancellationToken::child_token)
+            .unwrap_or_default();
+        ctx.cancel_token = Some(&physical_stream_cancel);
         let original_token = ctx.token.to_string();
         let mut host = CliSseStreamHost::from_edge_ctx_with_auth(
             ctx,
@@ -6713,14 +7885,30 @@ pub(crate) async fn consume_turn_sse(
         if host.render.md.is_none() {
             host.render.lines_written = pre_clear_lines;
         }
-        let (result, _abort) =
-            consume_sse_stream_cancellable(&mut byte_stream, &mut host, idle, cancel_token, None)
-                .await;
+        let (result, _abort) = consume_sse_stream_cancellable(
+            &mut byte_stream,
+            &mut host,
+            idle,
+            Some(&physical_stream_cancel),
+            None,
+        )
+        .await;
         let lw = host.render.lines_written;
         let md = host.render.md.take();
         let pending = std::mem::take(&mut host.xml_tag_buffer);
         let auth_failure = host.auth_failure;
+        let callback_failure = host.callback_failure.clone();
+        let callback_failure_run_id = host.callback_failure_run_id.clone();
+        let request_session_lease_failure =
+            host.request_session_execution_lease
+                .as_ref()
+                .and_then(|lease| {
+                    lease
+                        .validate_terminal_identity(result.accum.session_id.as_deref())
+                        .err()
+                });
         let refreshed_token = (host.token != original_token).then(|| host.token.clone());
+        let output_transport_failure = host.output_transport_failure;
         (
             result,
             host.edge_tool_round,
@@ -6728,7 +7916,12 @@ pub(crate) async fn consume_turn_sse(
             lw,
             pending,
             auth_failure,
+            callback_failure,
+            callback_failure_run_id,
+            request_session_lease_failure,
             refreshed_token,
+            host.phase_receipts,
+            output_transport_failure,
         )
     } else {
         debug_assert!(
@@ -6749,9 +7942,35 @@ pub(crate) async fn consume_turn_sse(
                 .await;
         let lw = render.lines_written;
         let md = render.md.take();
-        (result, Vec::new(), md, lw, String::new(), false, None)
+        (
+            result,
+            Vec::new(),
+            md,
+            lw,
+            String::new(),
+            false,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+        )
     };
     apply_edge_auth_failure_result(&mut sse_result.accum, auth_failure);
+    let request_session_lease_failed = request_session_lease_failure.is_some();
+    let callback_delivery_failed =
+        auth_failure || callback_failure.is_some() || request_session_lease_failed;
+    apply_edge_callback_failure_result(&mut sse_result.accum, callback_failure);
+    apply_request_session_lease_failure_result(
+        &mut sse_result.accum,
+        request_session_lease_failure,
+    );
+    let callback_failure_run_id = callback_failure_run_id.or_else(|| {
+        request_session_lease_failed
+            .then(|| sse_result.accum.run_id.clone())
+            .flatten()
+    });
     let edge_tool_round = merge_edge_tool_rounds(host_edge_tool_round, &sse_result.tool_results);
 
     let mut result = TurnResult {
@@ -6759,6 +7978,10 @@ pub(crate) async fn consume_turn_sse(
         ttft_ms: sse_result.ttft_ms,
         edge_tool_round,
         refreshed_token,
+        phase_receipts,
+        callback_delivery_failed,
+        callback_failure_run_id,
+        output_transport_failure,
     };
     sanitize_final_stream_text(&mut result);
 
@@ -6784,13 +8007,14 @@ pub(crate) async fn consume_turn_sse(
         if let Some(md) = &mut md_renderer {
             md.discard_and_reset();
         } else if lines_written > 0 && io::stdout().is_terminal() {
-            execute!(
-                io::stdout(),
-                cursor::MoveUp(lines_written as u16),
-                cursor::MoveToColumn(0),
-                terminal::Clear(terminal::ClearType::FromCursorDown)
-            )
-            .ok();
+            let _ = crate::cli::stream::output_sink::write_stdout_operation(|stdout| {
+                execute!(
+                    stdout,
+                    cursor::MoveUp(lines_written as u16),
+                    cursor::MoveToColumn(0),
+                    terminal::Clear(terminal::ClearType::FromCursorDown)
+                )
+            });
         }
     }
     // Non-tool turns: text is NOT rendered here. It will be rendered by
@@ -6866,6 +8090,33 @@ fn sanitize_final_stream_text(result: &mut TurnResult) {
 ///
 /// Mirrors the server-side logic in
 /// `runtime::turn::skill_tool::partition_discover_and_execute_skills` (line ~1098).
+fn finalize_cli_skill_execution(
+    resolver: &dyn astra_skills::traits::SkillResolver,
+    skill_name: &str,
+    executed: astra_runtime::turn::skill_tool::SkillCallResult,
+) -> (String, Option<String>, bool) {
+    let effective_success = executed
+        .verification
+        .as_ref()
+        .map(|verification| verification.all_required_passed)
+        .unwrap_or(executed.success);
+    if !effective_success {
+        return (executed.output, None, false);
+    }
+    let topology = resolver.execution_topology(skill_name).map(|topology| {
+        match topology {
+            astra_skills::manifest::SkillExecutionTopology::Primary => "primary",
+            astra_skills::manifest::SkillExecutionTopology::ParallelSubruns => "parallel_subruns",
+        }
+        .to_string()
+    });
+    (
+        append_skill_loaded_marker(&executed.output, skill_name),
+        topology,
+        true,
+    )
+}
+
 fn append_skill_loaded_marker(result: &str, skill_name: &str) -> String {
     if result.starts_with("Error:") || result.starts_with("error:") || result.trim().is_empty() {
         return result.to_string();
@@ -6907,21 +8158,29 @@ fn append_skill_loaded_marker(result: &str, skill_name: &str) -> String {
 mod tests {
     use super::{
         ApprovalMemoryAction, ChatTurnEdgePending, ChatTurnSseAccum, CliSseStreamHost,
-        DEFAULT_TOOL_OUTPUT_EVENT_LIMIT, EdgeSseContext, EdgeToolCache, EdgeToolCacheEntry,
-        EdgeToolCacheValidation, EdgeToolExecResult, PostToolResultError, RenderPolicy,
-        StreamRenderState, ToolBatchRequest, ToolOutputSummary, ToolOutputSummaryKind, TurnResult,
-        append_skill_loaded_marker, apply_edge_auth_failure_result, approval_batch_group_key,
+        DEFAULT_TOOL_OUTPUT_EVENT_LIMIT, EdgeCallbackFailure, EdgeProviderRoundBoundary,
+        EdgeSseContext, EdgeToolCache, EdgeToolCacheEntry, EdgeToolCacheValidation,
+        EdgeToolExecResult, PostToolResultError, RenderPolicy, StreamRenderState, ToolBatchRequest,
+        ToolOutputSummary, ToolOutputSummaryKind, ToolResultIdentity, TurnResult,
+        acquire_tool_permit_or_cancel, append_skill_loaded_marker, apply_edge_auth_failure_result,
+        apply_edge_callback_failure_result, approval_batch_group_key,
         approval_default_always_scope, approval_memory_action, approval_memory_preview,
         approval_scope_context_for_tool, approval_stale_revalidation_error,
-        catch_tool_execution_panic, dispatch_turn_event_block, edge_tool_is_cacheable_read,
-        edge_tool_outcome_status, execute_with_invocation_metadata_responsive,
-        execute_with_metadata_responsive, extract_cli_diff_block, format_terminal_tool_summary,
-        format_tool_display_from_preview, is_edge_auth_failure, merge_edge_tool_rounds,
-        normalize_sandbox_denied_outcome, path_mtime_ms, request_token_usage_from_accum,
-        reusable_speculative_output, sanitize_final_stream_text, style_tool_description,
-        sync_incremental_accum_state, sync_incremental_tool_result_state, task_preview_from_args,
-        theme, tool_completion_icon, tool_dedup_signature, tool_output_event_text,
-        turn_has_tool_work,
+        catch_tool_execution_panic, dispatch_turn_event_block, edge_callback_error_kind,
+        edge_tool_is_cacheable_read, edge_tool_outcome_status,
+        execute_with_invocation_metadata_responsive, execute_with_metadata_responsive,
+        extract_cli_diff_block, file_content_sha256, finalize_cli_skill_execution,
+        format_terminal_tool_summary, format_tool_display_from_preview, is_edge_auth_failure,
+        merge_edge_tool_rounds, normalize_sandbox_denied_outcome, path_mtime_ms,
+        request_token_usage_from_accum, reusable_speculative_output, sanitize_final_stream_text,
+        server_context_window_policy_from_accum, server_tool_completion_id,
+        server_tool_completion_output, server_tool_completion_status,
+        server_tool_event_is_client_owned, server_tool_start_fields, style_tool_description,
+        sync_incremental_accum_state, sync_incremental_tool_result_state,
+        terminal_output_failure_for_event, theme, tool_completion_icon,
+        tool_completion_is_authoritative, tool_dedup_signature, tool_output_event_text,
+        turn_has_tool_work, turn_phase_receipt_from_server_event,
+        work_task_board_update_from_server_event,
     };
     use crate::cli::chat_stream;
     use crate::cli::cli_config::cli_utils::{CredentialsFile, Profile, save_credentials};
@@ -6934,6 +8193,20 @@ mod tests {
     use tempfile::tempdir;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn hard_stream_failure_retains_precedence_over_concurrent_stdout_closure() {
+        use crate::cli::stream::streaming_types::OutputTransportFailure;
+
+        assert_eq!(
+            terminal_output_failure_for_event(true, Some(OutputTransportFailure::Closed)),
+            None
+        );
+        assert_eq!(
+            terminal_output_failure_for_event(false, Some(OutputTransportFailure::Closed)),
+            Some(OutputTransportFailure::Closed)
+        );
+    }
 
     fn structured_work_output(payload_bytes: usize) -> String {
         serde_json::json!({
@@ -6949,6 +8222,35 @@ mod tests {
             }
         })
         .to_string()
+    }
+
+    #[tokio::test]
+    async fn global_tool_capacity_wait_is_cancel_responsive() {
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let held = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("test semaphore is open");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let waiter = tokio::spawn({
+            let semaphore = semaphore.clone();
+            let cancel = cancel.clone();
+            async move { acquire_tool_permit_or_cancel(semaphore, Some(&cancel)).await }
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "waiter must actually be capacity-blocked"
+        );
+        cancel.cancel();
+        let permit = tokio::time::timeout(std::time::Duration::from_millis(100), waiter)
+            .await
+            .expect("cancellation must not wait for another session's permit")
+            .expect("waiter task must not panic");
+        assert!(permit.is_none());
+        drop(held);
     }
 
     #[test]
@@ -6978,6 +8280,157 @@ mod tests {
     }
 
     #[test]
+    fn context_window_policy_comes_only_from_server_manifest() {
+        let policy = server_context_window_policy_from_accum(&ChatTurnSseAccum {
+            context_manifest_trace: Some(serde_json::json!({
+                "context_window_policy": {
+                    "raw_context_window_tokens": 1_000_000,
+                    "usable_input_limit_tokens": 800_000
+                }
+            })),
+            ..Default::default()
+        });
+
+        assert_eq!(policy, Some((1_000_000, 800_000)));
+    }
+
+    #[test]
+    fn malformed_server_context_window_policy_stays_unknown() {
+        for trace in [
+            serde_json::json!({}),
+            serde_json::json!({
+                "context_window_policy": {
+                    "raw_context_window_tokens": 1_000_000
+                }
+            }),
+            serde_json::json!({
+                "context_window_policy": {
+                    "raw_context_window_tokens": 100,
+                    "usable_input_limit_tokens": 101
+                }
+            }),
+            serde_json::json!({
+                "context_window_policy": {
+                    "raw_context_window_tokens": 0,
+                    "usable_input_limit_tokens": 0
+                }
+            }),
+        ] {
+            assert_eq!(
+                server_context_window_policy_from_accum(&ChatTurnSseAccum {
+                    context_manifest_trace: Some(trace),
+                    ..Default::default()
+                }),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn server_context_window_policy_is_forwarded_once_to_observers() {
+        let api =
+            astra_thin_client::ThinClient::new("http://127.0.0.1:1", None).expect("thin client");
+        let workspace = tempdir().expect("tempdir");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
+        let mut tool_cache = EdgeToolCache::new(1);
+        let (event_tx, mut event_rx) = chat_stream::stream_event_channel();
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "token",
+                executor_id: "edge-test",
+                executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: Some(event_tx),
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+        let accum = ChatTurnSseAccum {
+            context_manifest_trace: Some(serde_json::json!({
+                "context_window_policy": {
+                    "raw_context_window_tokens": 1_000_000,
+                    "usable_input_limit_tokens": 800_000
+                }
+            })),
+            ..Default::default()
+        };
+
+        host.on_accum_update(&accum);
+        host.on_accum_update(&ChatTurnSseAccum {
+            context_manifest_trace: Some(serde_json::json!({
+                "context_window_policy": {
+                    "raw_context_window_tokens": 100,
+                    "usable_input_limit_tokens": 101
+                }
+            })),
+            ..Default::default()
+        });
+        host.on_accum_update(&accum);
+
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(chat_stream::StreamEvent::ContextWindowPolicy {
+                raw_window_tokens: 1_000_000,
+                usable_input_tokens: 800_000,
+            })
+        ));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "unknown metadata and replay must not duplicate the last confirmed server policy"
+        );
+    }
+
+    #[test]
+    fn request_token_lanes_ignore_server_run_totals_without_context_evidence() {
+        let usage = request_token_usage_from_accum(&ChatTurnSseAccum {
+            prompt_tokens: 2_127_556,
+            cache_read_tokens: 1_706_112,
+            completion_tokens: 34_000,
+            has_usage: true,
+            current_request_usage: None,
+            ..Default::default()
+        });
+        assert_eq!(
+            usage,
+            Some(astra_turn_types::RequestTokenUsage {
+                fresh_input_tokens: 2_127_556,
+                cache_read_tokens: 1_706_112,
+                cache_creation_tokens: 0,
+                output_tokens: 34_000,
+            })
+        );
+
+        let aggregate = ChatTurnSseAccum {
+            usage_is_run_total: true,
+            ..ChatTurnSseAccum {
+                prompt_tokens: 2_127_556,
+                cache_read_tokens: 1_706_112,
+                completion_tokens: 34_000,
+                has_usage: true,
+                ..Default::default()
+            }
+        };
+        assert_eq!(
+            request_token_usage_from_accum(&aggregate),
+            None,
+            "server run totals need explicit last-request evidence before driving context UI"
+        );
+    }
+
+    #[test]
     fn structured_work_output_stays_parseable_without_tool_name_special_cases() {
         let output = structured_work_output(6_000);
         let event = tool_output_event_text("future_tool_unknown_to_cli", &output);
@@ -6985,6 +8438,437 @@ mod tests {
         assert_eq!(event, output);
         let parsed: Value = serde_json::from_str(&event).expect("event must remain valid JSON");
         assert_eq!(parsed["work_unit_observation"]["status"], "completed");
+    }
+
+    #[test]
+    fn server_work_board_event_extracts_only_the_versioned_event_envelope() {
+        let event = serde_json::json!({
+            "type": astra_server_types::WORK_TASK_BOARD_UPDATE_EVENT_TYPE,
+            "task_board_update": {"schema_version": 1, "work_id": "work-1"}
+        });
+        assert_eq!(
+            work_task_board_update_from_server_event(&event),
+            Some(serde_json::json!({"schema_version": 1, "work_id": "work-1"}))
+        );
+        assert!(
+            work_task_board_update_from_server_event(&serde_json::json!({
+                "type": "tool_call_end",
+                "task_board_update": {"schema_version": 1}
+            }))
+            .is_none()
+        );
+        assert!(
+            work_task_board_update_from_server_event(&serde_json::json!({
+                "type": astra_server_types::WORK_TASK_BOARD_UPDATE_EVENT_TYPE
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn server_tool_events_have_one_display_projection_and_edge_events_are_ignored() {
+        let server_start = serde_json::json!({
+            "type": "tool_call",
+            "tool_call": {
+                "id": "call-introspect",
+                "function": {
+                    "name": "introspect",
+                    "arguments": "{\"scope\":\"current_turn\"}"
+                }
+            }
+        });
+        let (id, name, args) = server_tool_start_fields(&server_start).expect("server tool start");
+        assert_eq!(id.as_deref(), Some("call-introspect"));
+        assert_eq!(name, "introspect");
+        assert_eq!(args["scope"], "current_turn");
+        assert!(!server_tool_event_is_client_owned(&server_start));
+
+        let edge_start = serde_json::json!({
+            "type": "tool_call",
+            "transport": "edge_ws",
+            "tool_call": {
+                "id": "call-edge",
+                "function": {"name": "read_file", "arguments": "{}"}
+            }
+        });
+        assert!(server_tool_event_is_client_owned(&edge_start));
+        assert!(server_tool_start_fields(&edge_start).is_some());
+
+        let completed = serde_json::json!({
+            "type": "tool_call_end",
+            "call_id": "call-introspect",
+            "status": "ok",
+            "duration_ms": 17,
+            "result": {"snapshot": {"turn": 3}}
+        });
+        assert_eq!(
+            server_tool_completion_id(&completed).as_deref(),
+            Some("call-introspect")
+        );
+        assert_eq!(server_tool_completion_status(&completed), "completed");
+        assert_eq!(
+            server_tool_completion_output(&completed),
+            r#"{"snapshot":{"turn":3}}"#
+        );
+
+        let failed = serde_json::json!({
+            "type": "tool_transport_failed",
+            "call_id": "call-introspect",
+            "success": false,
+            "error": "permission denied"
+        });
+        assert_eq!(server_tool_completion_status(&failed), "failed");
+        assert_eq!(server_tool_completion_output(&failed), "permission denied");
+    }
+
+    #[tokio::test]
+    async fn server_tool_lifecycle_emits_once_and_edge_route_emits_nothing() {
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(server.uri().as_str(), None).expect("client");
+        let workspace = tempdir().expect("workspace");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
+        let mut tool_cache = EdgeToolCache::new(10);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let ctx = EdgeSseContext {
+            api: &api,
+            token: "test-token",
+            executor_id: "edge-test",
+            executor,
+            render_policy: RenderPolicy::Silent,
+            perm_manager: None,
+            cancel_token: None,
+            stream_event_tx: Some(tx),
+            stream_event_sink: None,
+            approval_request_tx: None,
+            ask_user_request_tx: None,
+            skill_resolver: None,
+            skill_continuation: false,
+            turn_rollback_on_failure: false,
+            tool_cache: &mut tool_cache,
+            observability_hub: None,
+            incremental_state: None,
+            request_session_execution_lease: None,
+        };
+        let mut host = CliSseStreamHost::from_edge_ctx(ctx, 80, false);
+
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "tool_call",
+            "tool_call": {
+                "id": "server-call",
+                "function": {"name": "introspect", "arguments": "{}"}
+            }
+        }))
+        .await
+        .expect("model request accepted");
+        assert!(
+            rx.try_recv().is_err(),
+            "unrouted model request is not execution evidence"
+        );
+
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "tool_call",
+            "call_id": "server-call",
+            "tool": "introspect",
+            "arguments": {"scope": "current_turn"},
+            "transport": "server_local",
+            "executor": {"kind": "server_local"}
+        }))
+        .await
+        .expect("server execution start accepted");
+        assert!(matches!(
+            rx.recv().await,
+            Some(chat_stream::StreamEvent::ToolStarted { ref name, .. }) if name == "introspect"
+        ));
+
+        // A later route/lifecycle projection may carry only identity. It may
+        // enrich the existing start, but must never erase the admitted args
+        // that drive the final user-facing description.
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "tool_call_start",
+            "call_id": "server-call",
+            "tool": "introspect",
+            "arguments": {},
+            "transport": "server_local",
+            "executor": {"kind": "server_local"}
+        }))
+        .await
+        .expect("partial replayed start accepted");
+        assert!(rx.try_recv().is_err(), "partial replay must not repaint");
+        assert_eq!(
+            host.server_tool_calls["server-call"].args["scope"], "current_turn",
+            "partial replay must preserve the admitted arguments"
+        );
+
+        // Nested agent events share the same transport. Cardinality is not
+        // identity: an incomplete child event must never close the only live
+        // parent tool cell.
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "tool_call_end",
+            "tool": "web_fetch",
+            "status": "failed",
+            "duration_ms": 1_700,
+            "transport": "server_local",
+            "executor": {"kind": "server_local"}
+        }))
+        .await
+        .expect("identityless nested completion remains observational");
+        assert!(
+            rx.try_recv().is_err(),
+            "identityless child completion must not repaint the parent"
+        );
+        assert!(
+            host.server_tool_calls.contains_key("server-call"),
+            "the exact parent call must remain live until its own terminal event"
+        );
+
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "tool_call_end",
+            "call_id": "server-call",
+            "tool": "introspect",
+            "success": true,
+            "output": "snapshot",
+            "duration_ms": 3,
+            "transport": "server_local",
+            "executor": {"kind": "server_local"}
+        }))
+        .await
+        .expect("server execution completion accepted");
+        assert!(matches!(
+            rx.recv().await,
+            Some(chat_stream::StreamEvent::ToolCompleted { ref name, .. }) if name == "introspect"
+        ));
+
+        // The server may project both transport completion and tool_call_end;
+        // only one terminal UI event is allowed for one call id.
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "tool_call_end",
+            "call_id": "server-call",
+            "tool": "introspect",
+            "success": true,
+            "result": "snapshot",
+            "transport": "server_local",
+            "executor": {"kind": "server_local"}
+        }))
+        .await
+        .expect("duplicate terminal accepted");
+        assert!(
+            rx.try_recv().is_err(),
+            "duplicate terminal must not repaint"
+        );
+
+        // A live progress gap may drop the start while the server's terminal
+        // convergence replay still arrives at settlement. The terminal event
+        // is self-contained and must close a usable card on its own.
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "tool_call_end",
+            "call_id": "server-terminal-only",
+            "tool": "reflect",
+            "arguments": {"scope": "current_run"},
+            "status": "completed",
+            "success": true,
+            "result": "reflection",
+            "duration_ms": 4,
+            "transport": "server_local",
+            "executor": {"kind": "server_local"}
+        }))
+        .await
+        .expect("terminal convergence event accepted without its lossy start");
+        assert!(matches!(
+            rx.recv().await,
+            Some(chat_stream::StreamEvent::ToolCompleted {
+                ref name,
+                ref status,
+                ref output,
+                ..
+            }) if name == "reflect"
+                && status == "completed"
+                && output.as_deref().is_some_and(|value| value.contains("reflection"))
+        ));
+
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "tool_call",
+            "call_id": "fanout-call",
+            "tool": "agent_fanout",
+            "arguments": {"action": "start", "target_count": 2, "slots": []},
+            "transport": "server_local",
+            "executor": {"kind": "server_local"}
+        }))
+        .await
+        .expect("fanout execution start accepted");
+        assert!(matches!(
+            rx.recv().await,
+            Some(chat_stream::StreamEvent::ToolStarted { ref name, .. })
+                if name == "agent_fanout"
+        ));
+
+        // Admission may have already created the children while a lossy
+        // transport projection carries no launch receipt. It is not a
+        // terminal lifecycle fact and must leave the original cell open for
+        // host/registry reconciliation.
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "tool_call_end",
+            "call_id": "fanout-call",
+            "tool": "agent_fanout",
+            "status": "failed",
+            "duration_ms": 1_100,
+            "transport": "server_local",
+            "executor": {"kind": "server_local"}
+        }))
+        .await
+        .expect("receipt-less fanout completion remains observational");
+        assert!(
+            rx.try_recv().is_err(),
+            "receipt-less fanout completion must not paint a false failure"
+        );
+        assert!(host.server_tool_calls.contains_key("fanout-call"));
+        assert!(!host.server_tool_completed_ids.contains("fanout-call"));
+
+        // Compatibility envelopes may reserve `output: null` and carry the
+        // canonical receipt in `result`. The meaningful receipt must win, and
+        // an accepted running group means the launch action completed.
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "tool_call_end",
+            "call_id": "fanout-call",
+            "tool": "agent_fanout",
+            "status": "running",
+            "output": null,
+            "result": {"status": "running", "group_id": "fanout-group"},
+            "duration_ms": 1_250,
+            "transport": "server_local",
+            "executor": {"kind": "server_local"}
+        }))
+        .await
+        .expect("typed fanout receipt accepted");
+        assert!(matches!(
+            rx.recv().await,
+            Some(chat_stream::StreamEvent::ToolCompleted {
+                ref name,
+                ref status,
+                ref output,
+                ..
+            }) if name == "agent_fanout"
+                && status == "completed"
+                && output.as_deref().is_some_and(|value| value.contains("fanout-group"))
+        ));
+        assert!(!host.server_tool_calls.contains_key("fanout-call"));
+        assert!(host.server_tool_completed_ids.contains("fanout-call"));
+
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "tool_call",
+            "call_id": "fanout-stop-call",
+            "tool": "agent_fanout",
+            "arguments": {"action": "stop_group", "group_id": "fanout-group"},
+            "transport": "server_local",
+            "executor": {"kind": "server_local"}
+        }))
+        .await
+        .expect("fanout stop start accepted");
+        assert!(matches!(
+            rx.recv().await,
+            Some(chat_stream::StreamEvent::ToolStarted { ref name, .. })
+                if name == "agent_fanout"
+        ));
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "tool_call_end",
+            "call_id": "fanout-stop-call",
+            "tool": "agent_fanout",
+            "status": "completed",
+            "result": {"status": "cancelled", "group_id": "fanout-group"},
+            "duration_ms": 2,
+            "transport": "server_local",
+            "executor": {"kind": "server_local"}
+        }))
+        .await
+        .expect("fanout stop completion accepted");
+        assert!(matches!(
+            rx.recv().await,
+            Some(chat_stream::StreamEvent::ToolCompleted { ref status, .. })
+                if status == "completed"
+        ));
+
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "tool_call",
+            "tool_call": {
+                "id": "edge-call",
+                "function": {"name": "read_file", "arguments": "{}"}
+            }
+        }))
+        .await
+        .expect("edge model request accepted");
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "tool_call",
+            "call_id": "edge-call",
+            "tool": "read_file",
+            "arguments": {},
+            "transport": "edge_ws",
+            "executor": {"kind": "edge_agent"}
+        }))
+        .await
+        .expect("edge execution start accepted");
+        host.on_accepted_sse_event(&serde_json::json!({
+            "type": "tool_call_end",
+            "call_id": "edge-call",
+            "tool": "read_file",
+            "success": true,
+            "output": "content",
+            "duration_ms": 1,
+            "transport": "edge_ws",
+            "executor": {"kind": "edge_agent"}
+        }))
+        .await
+        .expect("edge execution completion accepted");
+        assert!(
+            rx.try_recv().is_err(),
+            "edge execution is rendered by its local executor"
+        );
+    }
+
+    #[test]
+    fn server_turn_phase_receipt_rejects_extensions_and_invalid_contracts() {
+        let event = serde_json::json!({
+            "type": astra_server_types::TURN_PHASE_EVENT_TYPE,
+            "schema_version": 1,
+            "phase": "turn_intent_admission",
+            "round_index": 0,
+            "outcome": "decided",
+            "duration_ms": 5_021,
+            "internal_model": "must not cross the Explain boundary",
+        });
+        assert_eq!(
+            turn_phase_receipt_from_server_event(&event),
+            Some(serde_json::json!({
+                "type": astra_server_types::TURN_PHASE_EVENT_TYPE,
+                "schema_version": 1,
+                "phase": "turn_intent_admission",
+                "round_index": 0,
+                "attempt_index": 0,
+                "outcome": "decided",
+                "duration_ms": 5_021,
+            }))
+        );
+        assert!(
+            turn_phase_receipt_from_server_event(&serde_json::json!({
+                "type": astra_server_types::TURN_PHASE_EVENT_TYPE,
+                "schema_version": 1,
+                "phase": "unknown",
+                "round_index": 0,
+                "outcome": "decided",
+                "duration_ms": 1,
+            }))
+            .is_none()
+        );
+        assert!(
+            turn_phase_receipt_from_server_event(&serde_json::json!({
+                "type": astra_server_types::TURN_PHASE_EVENT_TYPE,
+                "schema_version": 1,
+                "phase": "model_inference",
+                "round_index": 0,
+                "outcome": "decided",
+                "duration_ms": 1,
+            }))
+            .is_none(),
+            "a syntactically valid but semantically impossible receipt is not Explain evidence"
+        );
     }
 
     #[test]
@@ -6998,6 +8882,125 @@ mod tests {
         assert_eq!(parsed["output_truncated"], true);
         assert_eq!(parsed["output_bytes"], output.len());
         assert!(event.len() < 1_000, "compact envelope was {event}");
+    }
+
+    #[test]
+    fn oversized_fanout_output_preserves_control_identity_without_deliverables() {
+        let output = serde_json::json!({
+            "status": "completed",
+            "group_id": "review-group",
+            "title": "Review",
+            "target_count": 2,
+            "results": [{"result": "x".repeat(70_000)}],
+            "fanout": {
+                "group_id": "review-group",
+                "target_count": 2,
+                "parent_run_id": "root-run",
+                "slots": [
+                    {"slot_index": 0, "agent_id": "a", "run_id": "run-a", "status": "completed"},
+                    {"slot_index": 1, "agent_id": "b", "run_id": "run-b", "status": "completed"}
+                ]
+            },
+            "work_unit_observation": {
+                "id": "review-group",
+                "kind": "agent_fanout",
+                "status": "completed",
+                "revision": 4,
+                "mode": "current",
+                "wake_policy": "none"
+            }
+        })
+        .to_string();
+
+        let event = tool_output_event_text("agent_fanout", &output);
+        let parsed: Value = serde_json::from_str(&event).expect("typed compact receipt");
+        assert_eq!(parsed["group_id"], "review-group");
+        assert_eq!(parsed["target_count"], 2);
+        assert_eq!(parsed["fanout"]["slots"].as_array().map(Vec::len), Some(2));
+        assert!(parsed.get("results").is_none());
+        assert!(event.len() < 4_000, "compact envelope was too large");
+    }
+
+    #[test]
+    fn adversarial_lifecycle_identity_cannot_expand_the_ordered_ui_queue() {
+        let huge_id = "g".repeat(100_000);
+        let output = serde_json::json!({
+            "status": "completed",
+            "group_id": huge_id.clone(),
+            "results": [{"result": "x".repeat(70_000)}],
+            "work_unit_observation": {
+                "id": huge_id,
+                "kind": "agent_fanout",
+                "status": "completed",
+                "revision": 1,
+                "mode": "current",
+                "wake_policy": "none"
+            }
+        })
+        .to_string();
+
+        let event = tool_output_event_text("agent_fanout", &output);
+        let parsed: Value = serde_json::from_str(&event).expect("bounded correlation receipt");
+        assert_eq!(parsed["lifecycle_observation_omitted"], "oversized");
+        assert!(parsed["group_id"].as_str().unwrap().len() <= 1024);
+        assert!(event.len() < 4_000, "ordered event remained oversized");
+    }
+
+    #[test]
+    fn unusable_local_fanout_result_waits_for_registry_reconciliation() {
+        assert!(!tool_completion_is_authoritative(
+            "agent_fanout",
+            "transport ended without a result"
+        ));
+        assert!(tool_completion_is_authoritative(
+            "agent_fanout",
+            r#"{"status":"completed","group_id":"review"}"#
+        ));
+        assert!(tool_completion_is_authoritative("read_file", ""));
+    }
+
+    #[test]
+    fn oversized_work_tool_output_preserves_task_board_receipt_not_a_json_prefix() {
+        let output = serde_json::json!({
+            "status": "started",
+            "objective_for_model": "x".repeat(DEFAULT_TOOL_OUTPUT_EVENT_LIMIT * 2),
+            "task_board_update": {
+                "schema_version": 1,
+                "work_id": "work-1",
+                "branch_id": "main",
+                "kind": "snapshot",
+                "goal": "deliver the safe change",
+                "graph_revision": 1,
+                "criteria_member_count": 0,
+                "tasks": []
+            }
+        })
+        .to_string();
+        let event = tool_output_event_text("future_work_tool", &output);
+        let parsed: Value = serde_json::from_str(&event)
+            .expect("a lifecycle receipt must never become a JSON prefix");
+
+        assert_eq!(parsed["status"], "started");
+        assert_eq!(parsed["task_board_update"]["work_id"], "work-1");
+        assert_eq!(parsed["output_truncated"], true);
+        assert_eq!(parsed["output_bytes"], output.len());
+        assert!(event.len() < DEFAULT_TOOL_OUTPUT_EVENT_LIMIT);
+    }
+
+    #[test]
+    fn oversized_task_board_receipt_is_omitted_without_unbounded_event_growth() {
+        let output = serde_json::json!({
+            "status": "started",
+            "task_board_update": {"payload": "x".repeat(70_000)},
+        })
+        .to_string();
+        let event = tool_output_event_text("future_work_tool", &output);
+        let parsed: Value = serde_json::from_str(&event)
+            .expect("oversized lifecycle output must remain valid JSON");
+
+        assert_eq!(parsed["task_board_update_omitted"], "oversized");
+        assert!(parsed.get("task_board_update").is_none());
+        assert!(event.len() < 1_000, "fallback envelope was {event}");
     }
 
     #[test]
@@ -7016,7 +9019,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_board_invocation_identity_stays_outside_public_schema_and_reaches_transport() {
+    async fn removed_task_board_cannot_reach_legacy_transport() {
         let server = MockServer::start().await;
         let request_keys = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let observed_keys = std::sync::Arc::clone(&request_keys);
@@ -7066,27 +9069,12 @@ mod tests {
         )
         .await;
 
-        assert!(!outcome.is_error, "{}", outcome.output);
-        assert_eq!(outcome.output, "created");
-
-        let replay = execute_with_invocation_metadata_responsive(
-            executor,
-            "task_board".to_string(),
-            public_args.clone(),
-            astra_tools::tool_engine::ToolInvocationMetadata {
-                tool_call_id: Some("call-1"),
-                ..Default::default()
-            },
-            None,
-        )
-        .await;
-
-        assert!(!replay.is_error, "{}", replay.output);
+        assert!(outcome.is_error, "{}", outcome.output);
+        assert!(outcome.output.contains("not available in this turn"));
         let keys = request_keys.lock().expect("request keys");
-        assert_eq!(keys.len(), 2, "one HTTP request per logical execution");
-        assert_eq!(
-            keys[0], keys[1],
-            "replaying the same tool-call identity must reuse its idempotency key"
+        assert!(
+            keys.is_empty(),
+            "removed tool must not reach HTTP transport"
         );
         assert!(public_args.get("_tool_call_id").is_none());
     }
@@ -7133,7 +9121,10 @@ mod tests {
             executor,
             "bash".to_string(),
             serde_json::json!({
-                "command": "printf 'before\\n'; sleep 5; printf 'after\\n'",
+                // Detach is reserved for a pure long-running builtin.  A
+                // compound shell command stays foreground so the edge
+                // executor can emit its post-workspace receipt.
+                "command": "sleep 5",
                 "timeout": 30.0,
             }),
             None,
@@ -7155,10 +9146,7 @@ mod tests {
             .await
             .expect("edge bash should hand off promptly after Ctrl+B")
             .expect("payload");
-        assert_eq!(
-            payload.command,
-            "printf 'before\\n'; sleep 5; printf 'after\\n'"
-        );
+        assert_eq!(payload.command, "sleep 5");
         payload
             .adoption_tx
             .send(Ok("bg-shell-edge".to_string()))
@@ -7248,6 +9236,7 @@ mod tests {
         let error = accum.error_message.as_deref().unwrap_or_default();
         assert!(error.contains("401 Unauthorized"));
         assert!(!error.contains("Cancelled by user"));
+        assert_eq!(accum.error_kind, Some(astra_core::ErrorKind::Auth));
 
         // without auth failure keeps existing error
         let mut accum2 = ChatTurnSseAccum {
@@ -7256,6 +9245,45 @@ mod tests {
         };
         apply_edge_auth_failure_result(&mut accum2, false);
         assert_eq!(accum2.error_message.as_deref(), Some("Cancelled by user"));
+    }
+
+    #[test]
+    fn edge_callback_failure_overrides_generic_cancellation_projection() {
+        let mut accum = ChatTurnSseAccum {
+            error_message: Some("Cancelled by user".to_string()),
+            ..Default::default()
+        };
+
+        apply_edge_callback_failure_result(
+            &mut accum,
+            Some(EdgeCallbackFailure {
+                message: "edge approval callback could not be acknowledged".to_string(),
+                kind: astra_core::ErrorKind::StreamTransport,
+            }),
+        );
+
+        assert_eq!(
+            accum.error_message.as_deref(),
+            Some("edge approval callback could not be acknowledged")
+        );
+        assert_eq!(
+            accum.error_kind,
+            Some(astra_core::ErrorKind::StreamTransport),
+            "callback delivery failure is not a user cancellation"
+        );
+    }
+
+    #[test]
+    fn approval_conflict_is_not_misclassified_as_provider_transport() {
+        let error = astra_thin_client::ThinClientError::Api {
+            status: reqwest::StatusCode::CONFLICT,
+            body: r#"{"detail":"Approval request is no longer active"}"#.into(),
+        };
+
+        assert_eq!(
+            edge_callback_error_kind(&error),
+            astra_core::ErrorKind::ContractViolation
+        );
     }
 
     #[test]
@@ -7619,6 +9647,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -7643,6 +9672,70 @@ mod tests {
         let (decision, ()) = tokio::join!(decision_fut, responder);
 
         assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn server_exit_plan_approval_uses_plan_review_and_stages_selected_mode() {
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let (plan_tx, mut plan_rx) = tokio::sync::mpsc::channel::<
+            crate::cli::chat_stream::PlanReviewRequest,
+        >(chat_stream::INTERACTIVE_REQUEST_CHANNEL_CAPACITY);
+        executor.set_plan_review_request_tx(Some(plan_tx));
+        let mut tool_cache = EdgeToolCache::new(8);
+        let mut pm =
+            crate::cli::permission_manager::PermissionManager::with_project(false, temp.path());
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor: executor.clone(),
+                render_policy: RenderPolicy::Stream,
+                perm_manager: Some(&mut pm),
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+
+        let decision_fut = host.resolve_cloud_approval_via_tui(
+            "exit_plan_mode",
+            Some("1. Verify the journey\n2. Ship"),
+            Some("Review plan"),
+            astra_thin_client::ApprovalKind::Standard,
+        );
+        let responder = async {
+            let request = plan_rx.recv().await.expect("plan review request");
+            assert_eq!(request.plan_markdown, "1. Verify the journey\n2. Ship");
+            request
+                .response_tx
+                .send(crate::cli::chat_stream::PlanReviewDecision::Approve {
+                    mode: crate::cli::permission_manager::PermissionMode::AcceptEdits,
+                })
+                .expect("send plan decision");
+        };
+        let (decision, ()) = tokio::join!(decision_fut, responder);
+
+        assert_eq!(decision, astra_thin_client::ApprovalDecision::Allow);
+        assert_eq!(
+            executor.take_pending_permission_mode_change(),
+            Some(crate::cli::permission_manager::PermissionMode::AcceptEdits)
+        );
     }
 
     #[serial_test::serial]
@@ -7686,6 +9779,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -7752,6 +9846,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -7824,6 +9919,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -7836,6 +9932,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "pf-1".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({"path": first.to_string_lossy()}),
                 },
@@ -7844,6 +9942,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "pf-2".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({"path": second.to_string_lossy()}),
                 },
@@ -7859,6 +9959,305 @@ mod tests {
                 .output
                 .contains(crate::sandbox_retry::SANDBOX_DENIED_PREFIX)
         }));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn expired_server_deadline_posts_failed_callback_without_executing_tool() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let target = temp.path().join("must-not-read.txt");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let mut tool_cache = EdgeToolCache::new(8);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+        host.tool_result_identities.insert(
+            "expired-1".to_string(),
+            ToolResultIdentity {
+                session_id: "test-session".to_string(),
+                run_id: "test-run".to_string(),
+                turn_chain_id: "test-chain".to_string(),
+                request_id: "expired-1".to_string(),
+            },
+        );
+
+        let results = host
+            .execute_tools_batch(vec![ToolBatchRequest {
+                session_id: "test-session".to_string(),
+                run_id: "test-run".to_string(),
+                turn_chain_id: "test-chain".to_string(),
+                request_id: "expired-1".to_string(),
+                execution_timeout_ms: 300_000,
+                execution_deadline_unix_ms: 1,
+                tool: "read_file".to_string(),
+                args: serde_json::json!({"path": target}),
+            }])
+            .await;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, "failed");
+        assert!(results[0].output.contains("deadline expired"));
+        assert!(
+            !target.exists(),
+            "expired request must not execute its tool"
+        );
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(
+            requests.len(),
+            1,
+            "deadline result must settle the server ledger"
+        );
+        let callback: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("json callback");
+        assert_eq!(callback["request_id"], "expired-1");
+        assert_eq!(callback["status"], "failed");
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn tool_batch_stops_callback_delivery_after_first_failure() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("callback unavailable"))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("one.txt"), "one").unwrap();
+        std::fs::write(temp.path().join("two.txt"), "two").unwrap();
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let mut tool_cache = EdgeToolCache::new(8);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: Some(&cancel),
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+
+        let results = host
+            .execute_tools_batch(vec![
+                ToolBatchRequest {
+                    session_id: "test-session".into(),
+                    run_id: "test-run".into(),
+                    turn_chain_id: "test-chain".into(),
+                    request_id: "callback-1".into(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
+                    tool: "read_file".into(),
+                    args: serde_json::json!({"path": "one.txt"}),
+                },
+                ToolBatchRequest {
+                    session_id: "test-session".into(),
+                    run_id: "test-run".into(),
+                    turn_chain_id: "test-chain".into(),
+                    request_id: "callback-2".into(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
+                    tool: "read_file".into(),
+                    args: serde_json::json!({"path": "two.txt"}),
+                },
+            ])
+            .await;
+
+        assert_eq!(results.len(), 2, "tool results remain locally observable");
+        assert!(results.iter().all(|result| result.status == "completed"));
+        assert!(host.callback_failure.is_some());
+        assert_eq!(host.callback_failure_run_id.as_deref(), Some("test-run"));
+        assert!(cancel.is_cancelled());
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            1,
+            "remaining callback posts must stop after the first failed acknowledgement"
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn changed_late_session_identity_cancels_and_flushes_no_tool_or_journal_event() {
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let server = MockServer::start().await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let output = temp.path().join("must-not-exist.txt");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let first_session = format!("late-bind-first-{}", uuid::Uuid::new_v4());
+        let second_session = format!("late-bind-second-{}", uuid::Uuid::new_v4());
+        let request_lease =
+            crate::cli::session::session_execution_lease::RequestSessionExecutionLease::new(None)
+                .unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut tool_cache = EdgeToolCache::new(8);
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: Some(&cancel),
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+                incremental_state: None,
+                request_session_execution_lease: Some(request_lease.clone()),
+            },
+            80,
+            false,
+        );
+
+        let wire = format!(
+            concat!(
+                "data: {{\"type\":\"session_info\",\"session_id\":{first:?},",
+                "\"run_id\":\"run-late-bind\"}}\n\n",
+                "data: {{\"type\":\"session_info\",\"session_id\":{second:?},",
+                "\"run_id\":\"run-late-bind\"}}\n\n",
+                "data: {{\"type\":\"tool_request\",\"session_id\":{first:?},",
+                "\"run_id\":\"run-late-bind\",\"turn_chain_id\":\"chain-late-bind\",",
+                "\"request_id\":\"tool-must-not-run\",",
+                "\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":4102444800000,\"tool\":\"write_file\",",
+                "\"args\":{{\"path\":{output:?},\"content\":\"forbidden\"}}}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            first = first_session,
+            second = second_session,
+            output = output,
+        );
+        let mut stream = futures_util::stream::iter(vec![Ok::<Vec<u8>, String>(wire.into_bytes())]);
+        let (result, _abort) = super::consume_sse_stream_cancellable(
+            &mut stream,
+            &mut host,
+            std::time::Duration::from_secs(1),
+            Some(&cancel),
+            None,
+        )
+        .await;
+
+        assert!(
+            !output.exists(),
+            "identity failure must precede tool side effects"
+        );
+        assert!(host.edge_tool_round.is_empty());
+        assert!(result.tool_results.is_empty());
+        assert!(result.approval_results.is_empty());
+        assert!(cancel.is_cancelled());
+        assert!(request_lease.failure().is_some());
+        assert!(
+            astra_services::session_journal::read_journal(&first_session)
+                .unwrap_or_default()
+                .is_empty(),
+            "identity failure must not manufacture canonical journal events"
+        );
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn approval_callback_failure_retains_exact_owner_and_closes_edge_work() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/approval/respond"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("callback unavailable"))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let temp = tempdir().expect("tempdir");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(temp.path()));
+        let mut tool_cache = EdgeToolCache::new(8);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: Some(&cancel),
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+        let body = astra_thin_client::ApprovalRespondRequest {
+            request_id: "approval-owner".to_string(),
+            decision: astra_thin_client::ApprovalDecision::Allow,
+            reason: None,
+            session_id: "owner-session".to_string(),
+            run_id: "owner-run".to_string(),
+            tool_name: Some("bash".to_string()),
+            approval_kind: Some(astra_thin_client::ApprovalKind::Explicit),
+        };
+
+        let result = host.post_approval_with_auth_retry(&body).await;
+
+        assert!(result.is_err());
+        assert_eq!(host.callback_failure_run_id.as_deref(), Some("owner-run"));
+        assert!(host.should_abort_edge_work());
+        assert!(cancel.is_cancelled());
     }
 
     #[serial_test::serial]
@@ -7890,6 +10289,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: Some(incremental_state.clone()),
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -7970,6 +10370,7 @@ mod tests {
                     tool_cache: &mut tool_cache,
                     observability_hub: None,
                     incremental_state: None,
+                    request_session_execution_lease: None,
                 },
                 80,
                 false,
@@ -8042,6 +10443,7 @@ mod tests {
                     tool_cache: &mut tool_cache,
                     observability_hub: None,
                     incremental_state: None,
+                    request_session_execution_lease: None,
                 },
                 80,
                 false,
@@ -8126,6 +10528,7 @@ mod tests {
                     tool_cache: &mut tool_cache,
                     observability_hub: None,
                     incremental_state: None,
+                    request_session_execution_lease: None,
                 },
                 80,
                 false,
@@ -8274,6 +10677,7 @@ mod tests {
             tool_cache: &mut tool_cache,
             observability_hub: None,
             incremental_state: None,
+            request_session_execution_lease: None,
         };
         let mut host = CliSseStreamHost::from_edge_ctx_with_auth(ctx, 80, false, Some("test"));
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
@@ -8356,6 +10760,7 @@ mod tests {
             tool_cache: &mut tool_cache,
             observability_hub: None,
             incremental_state: None,
+            request_session_execution_lease: None,
         };
         let mut host = CliSseStreamHost::from_edge_ctx_with_auth(ctx, 80, false, Some("test"));
         let body = astra_thin_client::ToolResultRequest::new_with_hash(
@@ -8547,7 +10952,7 @@ mod tests {
         let mut r = TurnResult::new();
         let mut s = StreamRenderState::new();
         let mut pending = Vec::new();
-        let block = "data: {\"type\":\"tool_request\",\"session_id\":\"test-session\",\"run_id\":\"test-run\",\"turn_chain_id\":\"test-chain\",\"request_id\":\"tr-1\",\"tool\":\"bash\",\"args\":{\"command\":\"echo x\"}}\n\n";
+        let block = "data: {\"type\":\"tool_request\",\"session_id\":\"test-session\",\"run_id\":\"test-run\",\"turn_chain_id\":\"test-chain\",\"request_id\":\"tr-1\",\"schema_admitted_by_server\":true,\"execution_timeout_ms\":300000,\"execution_deadline_unix_ms\":4102444800000,\"tool\":\"bash\",\"args\":{\"command\":\"echo x\"}}\n\n";
         dispatch_turn_event_block(block, &mut r, &mut s, RenderPolicy::Silent, &mut pending);
         assert_eq!(pending.len(), 1);
         match &pending[0] {
@@ -8579,7 +10984,7 @@ mod tests {
                 tool,
                 approval_kind,
                 detail,
-                display_label: _,
+                ..
             } => {
                 assert_eq!(request_id, "ap-1");
                 assert_eq!(tool, "write_file");
@@ -8891,8 +11296,8 @@ mod tests {
             "Sleeping: 1500ms (waiting for CI)"
         );
         assert_eq!(
-            format_tool_display_from_preview("tool_search", Some("\"git\"")),
-            "Searching tools: \"git\""
+            format_tool_display_from_preview("tool_search", Some("\"select:git\"")),
+            "Activating tools: \"select:git\""
         );
         // meta / agent
         assert_eq!(
@@ -8987,37 +11392,6 @@ mod tests {
         assert_eq!(
             format_tool_display_from_preview("rollback_database_snapshots", Some("snap_123")),
             "Revert DB snapshots: snap_123"
-        );
-        // task board
-        assert_eq!(
-            format_tool_display_from_preview("task_board", Some("create \"Fix renderer drift\"")),
-            "Creating task: \"Fix renderer drift\""
-        );
-        assert_eq!(
-            format_tool_display_from_preview(
-                "task_board",
-                Some("update render-pass -> in_progress")
-            ),
-            "Updating task: render-pass -> in_progress"
-        );
-        assert_eq!(
-            format_tool_display_from_preview("task_board", Some("list active")),
-            "Listing tasks: active"
-        );
-        assert_eq!(
-            format_tool_display_from_preview("task_board", Some("list_user paused")),
-            "Listing cross-session tasks: paused"
-        );
-        assert_eq!(
-            task_preview_from_args(&serde_json::json!({"action": "list_user"})).as_deref(),
-            Some("list_user active")
-        );
-        assert_eq!(
-            task_preview_from_args(
-                &serde_json::json!({"action": "list_user", "user_status": "paused"})
-            )
-            .as_deref(),
-            Some("list_user paused")
         );
     }
 
@@ -9478,6 +11852,63 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failed_cli_skill_grants_neither_marker_nor_parallel_topology() {
+        struct ParallelResolver;
+
+        impl astra_skills::traits::SkillResolver for ParallelResolver {
+            fn resolve(
+                &self,
+                name: &str,
+            ) -> Result<astra_skills::traits::ResolvedSkill, astra_skills::SkillError> {
+                Err(astra_skills::SkillError::NotFound(name.to_string()))
+            }
+
+            fn available_skills(&self) -> Vec<astra_skills::traits::SkillToolInfo> {
+                Vec::new()
+            }
+
+            fn execution_topology(
+                &self,
+                _name: &str,
+            ) -> Option<astra_skills::manifest::SkillExecutionTopology> {
+                Some(astra_skills::manifest::SkillExecutionTopology::ParallelSubruns)
+            }
+        }
+
+        let (output, topology, loaded) = finalize_cli_skill_execution(
+            &ParallelResolver,
+            "parallel-review",
+            astra_runtime::turn::skill_tool::SkillCallResult {
+                output: "execution completed but verification failed".to_string(),
+                success: true,
+                activation: None,
+                verification: Some(astra_runtime::turn::skill_tool::SkillVerificationOutcome {
+                    all_required_passed: false,
+                }),
+            },
+        );
+
+        assert_eq!(output, "execution completed but verification failed");
+        assert!(!loaded);
+        assert_eq!(topology, None);
+        assert!(!output.contains("<skill-loaded"));
+
+        let (output, topology, loaded) = finalize_cli_skill_execution(
+            &ParallelResolver,
+            "parallel-review",
+            astra_runtime::turn::skill_tool::SkillCallResult {
+                output: "input validation failed".to_string(),
+                success: false,
+                activation: None,
+                verification: None,
+            },
+        );
+        assert_eq!(output, "input validation failed");
+        assert!(!loaded);
+        assert_eq!(topology, None);
+    }
+
     // ── EdgeToolCache unit tests ─────────────────────────────────────────
 
     #[test]
@@ -9487,6 +11918,7 @@ mod tests {
         assert_eq!(cache.max_identical_calls, 5);
         assert!(cache.output_cache.is_empty());
         assert!(cache.call_counts.is_empty());
+        assert_eq!(cache.provider_round, None);
 
         // stores and retrieves
         let mut cache = EdgeToolCache::new(3);
@@ -9499,6 +11931,7 @@ mod tests {
                 validation: EdgeToolCacheValidation::FileMtime {
                     path: PathBuf::from("/tmp/foo"),
                     timestamp_ms: 1,
+                    content_sha256: [0; 32],
                 },
             },
         );
@@ -9524,6 +11957,237 @@ mod tests {
         assert!(*cache2.call_counts.get(&sig3).unwrap() <= cache2.max_identical_calls);
         *cache2.call_counts.get_mut(&sig3).unwrap() += 1;
         assert!(*cache2.call_counts.get(&sig3).unwrap() > cache2.max_identical_calls);
+    }
+
+    #[test]
+    fn edge_tool_call_limit_resets_only_when_authoritative_provider_round_advances() {
+        let mut cache = EdgeToolCache::new(2);
+        let signature = "write_file:{\"path\":\"src/output.txt\"}".to_string();
+        let request =
+            |round, id: &str| astra_turn_core::context_assembly_trace::ModelRequestTraceIdentity {
+                request_id: id.to_string(),
+                request_hash: format!("hash-{id}"),
+                round,
+                attempt: 0,
+                provider_response_id: None,
+            };
+        let round = EdgeProviderRoundBoundary {
+            session_turn: 1,
+            llm_rounds_completed: 7,
+            request: request(6, "request-round-7"),
+        };
+
+        assert!(cache.observe_provider_round(round.clone()));
+        cache.call_counts.insert(signature.clone(), 2);
+        assert!(!cache.observe_provider_round(round.clone()));
+        assert_eq!(cache.call_counts.get(&signature), Some(&2));
+
+        // Replayed or out-of-order feedback cannot reopen the same batch.
+        let stale = EdgeProviderRoundBoundary {
+            session_turn: 1,
+            llm_rounds_completed: 6,
+            request: request(5, "request-round-6"),
+        };
+        assert!(!cache.observe_provider_round(stale));
+        assert_eq!(cache.call_counts.get(&signature), Some(&2));
+
+        // A later server-authoritative provider boundary permits a fresh
+        // attempt while leaving the independently validated output cache intact.
+        let next = EdgeProviderRoundBoundary {
+            session_turn: 1,
+            llm_rounds_completed: 8,
+            request: request(7, "request-next-round"),
+        };
+        assert!(cache.observe_provider_round(next.clone()));
+        assert!(cache.call_counts.is_empty());
+        assert_eq!(
+            cache
+                .provider_round
+                .as_ref()
+                .map(|boundary| boundary.llm_rounds_completed),
+            Some(8)
+        );
+
+        cache.call_counts.insert(signature.clone(), 2);
+        let mut conflicting = next.clone();
+        conflicting.request = request(7, "conflict");
+        assert!(!cache.observe_provider_round(conflicting));
+        assert_eq!(cache.call_counts.get(&signature), Some(&2));
+
+        // A repeated request identity cannot claim a later provider boundary.
+        let replayed_request = EdgeProviderRoundBoundary {
+            session_turn: 1,
+            llm_rounds_completed: 9,
+            request: next.request,
+        };
+        assert!(!cache.observe_provider_round(replayed_request));
+        assert_eq!(cache.call_counts.get(&signature), Some(&2));
+    }
+
+    fn provider_round_feedback_event(
+        session_id: &str,
+        run_id: &str,
+        completed: u32,
+        request_id: Option<&str>,
+    ) -> Value {
+        let agentic_round_index = completed.saturating_sub(1);
+        serde_json::json!({
+            "type": "runtime_feedback",
+            "runtime_feedback": {
+                "schema_version": 4,
+                "identity": {
+                    "session_id": session_id,
+                    "run_id": run_id,
+                    "agent_id": "orchestrator",
+                    "model_id": "test-model",
+                    "topology": "cli_server",
+                    "request": request_id.map(|request_id| serde_json::json!({
+                        "request_id": request_id,
+                        "request_hash": format!("hash-{request_id}"),
+                        "round": agentic_round_index,
+                        "attempt": 0
+                    }))
+                },
+                "progress": {
+                    "session_turn": 1,
+                    "agentic_round_index": agentic_round_index,
+                    "llm_rounds_completed": completed,
+                    "slice_round_limit": 8,
+                    "slice_rounds_remaining": 8_u32.saturating_sub(completed),
+                    "absolute_round_ceiling": 16
+                },
+                "context": {
+                    "compaction_tier": "normal"
+                },
+                "was_truncated": false,
+                "policy_feedback": {"state": "not_evaluated"}
+            }
+        })
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn accepted_provider_feedback_scopes_edge_writer_limit_to_one_round() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tools/result"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("thin client");
+        let workspace = tempdir().expect("workspace");
+        let cached_path = workspace.path().join("cached.txt");
+        std::fs::write(&cached_path, "cached\n").expect("seed cache source");
+        let executor = std::sync::Arc::new(crate::edge_tools::ToolExecutor::new(workspace.path()));
+        executor.set_active_session_id("session-1".to_string());
+        let mut tool_cache = EdgeToolCache::new(2);
+        tool_cache.output_cache.insert(
+            "read_file:cached".to_string(),
+            EdgeToolCacheEntry {
+                output: "cached\n".to_string(),
+                status: "completed".to_string(),
+                validation: EdgeToolCacheValidation::FileMtime {
+                    path: cached_path,
+                    timestamp_ms: 1,
+                    content_sha256: [0; 32],
+                },
+            },
+        );
+        let mut host = CliSseStreamHost::from_edge_ctx(
+            EdgeSseContext {
+                api: &api,
+                token: "tok",
+                executor_id: "edge-test",
+                executor,
+                render_policy: RenderPolicy::Silent,
+                perm_manager: None,
+                cancel_token: None,
+                stream_event_tx: None,
+                stream_event_sink: None,
+                approval_request_tx: None,
+                ask_user_request_tx: None,
+                skill_resolver: None,
+                skill_continuation: false,
+                turn_rollback_on_failure: false,
+                tool_cache: &mut tool_cache,
+                observability_hub: None,
+                incremental_state: None,
+                request_session_execution_lease: None,
+            },
+            80,
+            false,
+        );
+        host.last_bound_run_id = Some("run-1".to_string());
+
+        let round_one = provider_round_feedback_event("session-1", "run-1", 1, Some("request-1"));
+        host.on_accepted_sse_event(&round_one)
+            .await
+            .expect("round one feedback");
+        assert!(
+            host.tool_cache
+                .output_cache
+                .contains_key("read_file:cached")
+        );
+
+        let args = serde_json::json!({"path": "output.txt", "content": "same bytes\n"});
+        let first = host.execute_tool("write-1", "write_file", &args).await;
+        let second = host.execute_tool("write-2", "write_file", &args).await;
+        let third = host.execute_tool("write-3", "write_file", &args).await;
+        assert_eq!(first.status, "completed");
+        assert_eq!(second.status, "completed");
+        assert_eq!(third.status, "failed");
+        assert!(third.output.contains("Duplicate call skipped"));
+
+        host.tool_cache.output_cache.insert(
+            "read_file:cached".to_string(),
+            EdgeToolCacheEntry {
+                output: "cached\n".to_string(),
+                status: "completed".to_string(),
+                validation: EdgeToolCacheValidation::FileMtime {
+                    path: workspace.path().join("cached.txt"),
+                    timestamp_ms: 1,
+                    content_sha256: [0; 32],
+                },
+            },
+        );
+        let round_two = provider_round_feedback_event("session-1", "run-1", 2, Some("request-2"));
+        host.on_accepted_sse_event(&round_two)
+            .await
+            .expect("round two feedback");
+        assert!(
+            host.tool_cache
+                .output_cache
+                .contains_key("read_file:cached")
+        );
+        let next = host.execute_tool("write-4", "write_file", &args).await;
+        assert_eq!(
+            next.status, "completed",
+            "new provider round must reopen the call"
+        );
+        host.on_accepted_sse_event(&round_two)
+            .await
+            .expect("same feedback replay");
+        let same_round_second = host.execute_tool("write-5", "write_file", &args).await;
+        assert_eq!(same_round_second.status, "completed");
+        host.on_accepted_sse_event(&round_one)
+            .await
+            .expect("stale feedback replay");
+        let same_round_third = host.execute_tool("write-6", "write_file", &args).await;
+        assert_eq!(same_round_third.status, "failed");
+
+        let missing_request = provider_round_feedback_event("session-1", "run-1", 3, None);
+        host.on_accepted_sse_event(&missing_request)
+            .await
+            .expect("request-less feedback remains presentation evidence only");
+        let after_missing = host.execute_tool("write-7", "write_file", &args).await;
+        assert_eq!(after_missing.status, "failed");
+
+        let mismatched =
+            provider_round_feedback_event("other-session", "run-1", 3, Some("request-3"));
+        assert!(host.on_accepted_sse_event(&mismatched).await.is_err());
+        let after_mismatch = host.execute_tool("write-8", "write_file", &args).await;
+        assert_eq!(after_mismatch.status, "failed");
     }
 
     #[test]
@@ -9635,6 +12299,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -9647,6 +12312,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-1".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
                         "path": "txn.txt",
@@ -9660,6 +12327,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-2".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
                         "path": "missing.txt",
@@ -9737,6 +12406,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -9749,6 +12419,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-1".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
                         "path": "txn.txt",
@@ -9762,6 +12434,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-2".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
                         "path": "missing.txt",
@@ -9837,6 +12511,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -9849,6 +12524,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-1".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "notebook_edit".to_string(),
                     args: serde_json::json!({
                         "notebook_path": "analysis.ipynb",
@@ -9864,6 +12541,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-2".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
                         "path": "missing.txt",
@@ -9939,6 +12618,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -9951,6 +12631,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-1".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "git".to_string(),
                     args: serde_json::json!({
                         "action": "stash",
@@ -9965,6 +12647,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-2".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
                         "path": "missing.txt",
@@ -10035,6 +12719,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -10047,6 +12732,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-1".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "git".to_string(),
                     args: serde_json::json!({
                         "action": "commit",
@@ -10060,6 +12747,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-2".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
                         "path": "missing.txt",
@@ -10129,6 +12818,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -10141,6 +12831,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-1".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
                         "path": "txn.txt",
@@ -10154,6 +12846,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-2".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
                         "path": "missing.txt",
@@ -10166,6 +12860,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tr-3".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
                         "path": "other.txt",
@@ -10235,6 +12931,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -10246,6 +12943,8 @@ mod tests {
                 run_id: "test-run".to_string(),
                 turn_chain_id: "test-chain".to_string(),
                 request_id: "tx-boundary-1".to_string(),
+                execution_timeout_ms: 300_000,
+                execution_deadline_unix_ms: 4_102_444_800_000,
                 tool: "write_file".to_string(),
                 args: serde_json::json!({
                     "path": "txn.txt",
@@ -10320,6 +13019,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -10332,6 +13032,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tx-boundary-1".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
                         "path": "txn.txt",
@@ -10345,6 +13047,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tx-boundary-2".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
                         "path": "missing.txt",
@@ -10428,6 +13132,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -10440,6 +13145,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-1".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
                         "path": "turn.txt",
@@ -10451,6 +13158,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-2".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "bash".to_string(),
                     args: serde_json::json!({
                         "command": "exit 1",
@@ -10526,6 +13235,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -10540,6 +13250,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-1".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
                         "path": "turn.txt",
@@ -10551,6 +13263,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-2".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "bash".to_string(),
                     args: serde_json::json!({
                         "command": "exit 1",
@@ -10561,6 +13275,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-3".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
                         "path": "other.txt",
@@ -10635,6 +13351,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -10649,8 +13366,33 @@ mod tests {
             .await;
         assert!(first.output.contains("v1"), "{}", first.output);
 
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        let original_mtime = std::fs::metadata(&file)
+            .and_then(|metadata| metadata.modified())
+            .expect("original mtime");
         std::fs::write(&file, "v2\n").expect("update");
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .and_then(|file| file.set_modified(original_mtime))
+            .expect("restore mtime to exercise content validation");
+        let cached_timestamp = match &host
+            .tool_cache
+            .output_cache
+            .get(&tool_dedup_signature(
+                "read_file",
+                &serde_json::json!({"path": "cached.txt"}),
+            ))
+            .expect("cached read")
+            .validation
+        {
+            EdgeToolCacheValidation::FileMtime { timestamp_ms, .. } => *timestamp_ms,
+            _ => panic!("read_file must use file validation"),
+        };
+        assert_eq!(
+            path_mtime_ms(&file),
+            cached_timestamp,
+            "test setup must keep metadata validation unchanged"
+        );
 
         let second = host
             .execute_tool(
@@ -10693,6 +13435,7 @@ mod tests {
                 validation: EdgeToolCacheValidation::FileMtime {
                     path: file.clone(),
                     timestamp_ms: path_mtime_ms(&file),
+                    content_sha256: file_content_sha256(&file).expect("file digest"),
                 },
             },
         );
@@ -10717,6 +13460,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -10796,6 +13540,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -10820,6 +13565,7 @@ mod tests {
                 validation: EdgeToolCacheValidation::FileMtime {
                     path: file.clone(),
                     timestamp_ms,
+                    content_sha256: file_content_sha256(&file).expect("file digest"),
                 },
             },
         );
@@ -10890,6 +13636,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -10918,6 +13665,7 @@ mod tests {
                 validation: EdgeToolCacheValidation::FileMtime {
                     path: file.clone(),
                     timestamp_ms,
+                    content_sha256: file_content_sha256(&file).expect("file digest"),
                 },
             },
         );
@@ -10990,6 +13738,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -11052,6 +13801,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -11123,6 +13873,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -11139,6 +13890,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-bash-0".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
                         "path": "turn.txt",
@@ -11150,6 +13903,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-bash-1".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "bash".to_string(),
                     args: serde_json::json!({
                         "command": "mkdir -p subdir",
@@ -11160,6 +13915,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-bash-2".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "bash".to_string(),
                     args: serde_json::json!({
                         "command": "exit 1",
@@ -11226,6 +13983,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -11256,7 +14014,7 @@ mod tests {
         let advertisement: astra_runtime_env::RuntimeEnvironmentAdvertisement =
             serde_json::from_value(runtime_environment.clone())
                 .expect("runtime advertisement should deserialize");
-        assert!(advertisement.binding.tool_surface.contains("task_board"));
+        assert!(!advertisement.binding.tool_surface.contains("task_board"));
         assert!(
             astra_runtime_env::CapabilityResolver
                 .check_tool_call_for_surface(
@@ -11266,8 +14024,8 @@ mod tests {
                     &advertisement.binding.capabilities,
                     &advertisement.binding.tool_surface,
                 )
-                .is_ok(),
-            "CLI task results must not be rejected as control_plane_required"
+                .is_err(),
+            "the removed checklist tool must not re-enter through runtime advertisement"
         );
         assert!(
             result
@@ -11312,6 +14070,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -11409,6 +14168,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -11424,6 +14184,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "ro-1".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
                         "path": "new.txt",
@@ -11435,6 +14197,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "ro-2".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
                         "path": "missing.txt",
@@ -11445,6 +14209,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "ro-3".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "read_file".to_string(),
                     args: serde_json::json!({
                         "path": "keep.txt",
@@ -11517,6 +14283,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -11528,6 +14295,8 @@ mod tests {
                 run_id: "test-run".to_string(),
                 turn_chain_id: "test-chain".to_string(),
                 request_id: "turn-boundary-1".to_string(),
+                execution_timeout_ms: 300_000,
+                execution_deadline_unix_ms: 4_102_444_800_000,
                 tool: "read_file".to_string(),
                 args: serde_json::json!({
                     "path": "ok.txt",
@@ -11599,6 +14368,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -11611,6 +14381,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-boundary-1".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
                         "path": "turn.txt",
@@ -11622,6 +14394,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "turn-boundary-2".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "bash".to_string(),
                     args: serde_json::json!({
                         "command": "exit 1",
@@ -11702,6 +14476,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -11714,6 +14489,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tx-bash-1".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "write_file".to_string(),
                     args: serde_json::json!({
                         "path": "txn.txt",
@@ -11727,6 +14504,8 @@ mod tests {
                     run_id: "test-run".to_string(),
                     turn_chain_id: "test-chain".to_string(),
                     request_id: "tx-bash-2".to_string(),
+                    execution_timeout_ms: 300_000,
+                    execution_deadline_unix_ms: 4_102_444_800_000,
                     tool: "bash".to_string(),
                     args: serde_json::json!({
                         "command": "mkdir unsafe-dir",
@@ -11799,6 +14578,7 @@ mod tests {
                 tool_cache: &mut tool_cache,
                 observability_hub: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
             },
             80,
             false,
@@ -11810,6 +14590,8 @@ mod tests {
                 run_id: "test-run".to_string(),
                 turn_chain_id: "test-chain".to_string(),
                 request_id: "tx-bash-ro".to_string(),
+                execution_timeout_ms: 300_000,
+                execution_deadline_unix_ms: 4_102_444_800_000,
                 tool: "bash".to_string(),
                 args: serde_json::json!({
                     "command": "pwd",
@@ -11935,6 +14717,68 @@ mod tests {
         assert_eq!(snap.completion_tokens, 200);
         assert_eq!(snap.cache_read_tokens, 50);
         assert_eq!(snap.cache_creation_tokens, 0);
+
+        // A server-owned terminal aggregate must remain cumulative even when
+        // the accumulator still carries the last physical request usage.
+        let state = IncrementalTurnState::default();
+        let mut accum = toy_accum("data");
+        accum.usage_is_run_total = true;
+        accum.has_usage = true;
+        accum.prompt_tokens = 42_000;
+        accum.completion_tokens = 12_000;
+        accum.cache_read_tokens = 95_000;
+        accum.cache_creation_tokens = 8_000;
+        accum.current_request_usage = Some(astra_turn_types::RequestTokenUsage {
+            fresh_input_tokens: 1,
+            cache_read_tokens: 2,
+            cache_creation_tokens: 3,
+            output_tokens: 4,
+        });
+        accum.server_execution_summary = Some(
+            astra_turn_core::chat_turn_sse_dispatch::ServerLoopExecutionSummary {
+                tool_calls_count: 9,
+                observation_tool_calls_count: 0,
+                tools_used: vec!["bash".to_string()],
+                llm_rounds: 3,
+                tool_ledger_receipt: Default::default(),
+                token_usage_coverage: Some(
+                    astra_turn_core::chat_turn_sse_dispatch::TokenUsageCoverage {
+                        attempts: 3,
+                        provider_reported: 2,
+                        unavailable: 1,
+                    },
+                ),
+                runtime_feedback: None,
+            },
+        );
+        sync_incremental_accum_state(&state, &accum);
+        let snap = state.snapshot();
+        assert_eq!(snap.prompt_tokens, 42_000);
+        assert_eq!(snap.completion_tokens, 12_000);
+        assert_eq!(snap.tool_calls_count, 9);
+        assert_eq!(snap.llm_rounds, Some(3));
+        assert_eq!(snap.token_usage_coverage.provider_reported, 2);
+
+        // A later ordinary accumulator replay must not lower the already
+        // captured run-total lower bound.
+        let mut stale = toy_accum("data");
+        stale.has_usage = true;
+        stale.prompt_tokens = 1;
+        stale.completion_tokens = 2;
+        stale.cache_read_tokens = 3;
+        stale.cache_creation_tokens = 4;
+        stale.current_request_usage = Some(astra_turn_types::RequestTokenUsage {
+            fresh_input_tokens: 1,
+            cache_read_tokens: 3,
+            cache_creation_tokens: 4,
+            output_tokens: 2,
+        });
+        sync_incremental_accum_state(&state, &stale);
+        let snap = state.snapshot();
+        assert_eq!(snap.prompt_tokens, 42_000);
+        assert_eq!(snap.completion_tokens, 12_000);
+        assert_eq!(snap.cache_read_tokens, 95_000);
+        assert_eq!(snap.cache_creation_tokens, 8_000);
     }
 
     #[test]

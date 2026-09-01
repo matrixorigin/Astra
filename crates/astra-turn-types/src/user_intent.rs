@@ -221,6 +221,10 @@ pub enum UserIntentStatus {
     AcceptedLocal,
     AcceptedRemote,
     Applied,
+    /// The run reached a terminal boundary before applying the intent. The
+    /// server has durably relinquished delivery ownership; interactive
+    /// clients may restore the exact input as an unsent draft.
+    Returned,
 }
 
 #[cfg(test)]
@@ -236,6 +240,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(UserIntentStatus::AcceptedRemote).unwrap(),
             serde_json::json!("accepted_remote")
+        );
+        assert_eq!(
+            serde_json::to_value(UserIntentStatus::Returned).unwrap(),
+            serde_json::json!("returned")
         );
     }
 

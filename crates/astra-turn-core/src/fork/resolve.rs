@@ -55,6 +55,10 @@ use crate::orchestration_spawn_tool::InheritPrefixSpec;
 /// level (Failed vs Fallback wrapping the same `ResolveFailure`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResolveFailure {
+    /// The caller requested inheritance but the host did not install the
+    /// resolver dependencies needed to honor it. Optional inheritance may
+    /// fall back; required inheritance must fail explicitly.
+    Unavailable { reason: String },
     /// No prefix captured for `run_id`. Either the parent never
     /// captured (skill-level choice), the capture was Skipped
     /// (microcompact, empty, oversized — see [`crate::fork_capture::SkipReason`]),

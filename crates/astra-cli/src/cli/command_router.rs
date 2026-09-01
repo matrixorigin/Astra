@@ -1,7 +1,7 @@
 use crate::cli::arg_render::{
-    apply_system_prompt, join_words, render_agent_args, render_bug_args, render_debug_args,
-    render_diff_args, render_grep_args, render_memory_args, render_messaging_args,
-    render_permissions_args, render_review_args, render_task_args, render_team_args,
+    apply_system_prompt, render_agent_args, render_bug_args, render_debug_args, render_diff_args,
+    render_grep_args, render_memory_args, render_messaging_args, render_permissions_args,
+    render_review_args, render_team_args,
 };
 use crate::cli::auth_flow::{
     clear_profile_auth, do_login, do_register, is_auth_error, parse_auth_tokens,
@@ -9,13 +9,12 @@ use crate::cli::auth_flow::{
 };
 use crate::cli::cli_config::cli_args::{
     AuditCmd, Cli, Command, JournalCmd, ModelCmd, SessionCaptureCmd, SessionCmd, SkillCmd,
-    TaskRunArgs, TaskSubcommand, TaskWorkerArgs,
 };
 use crate::cli::cli_config::cli_utils;
 use crate::cli::cli_config::cli_utils::{
-    clear_profile_last_session_if_matches_or_warn, cli_user_id, get_profile_and_token,
-    load_credentials, map_thin_err, persist_profile_last_session, prefix_chars, print_json_or_raw,
-    profile_name, prompt_or, prompt_password_masked, validate_cli_session_id,
+    clear_profile_last_session_if_matches_or_warn, get_profile_and_token, load_credentials,
+    map_thin_err, persist_profile_last_session, print_json_or_raw, profile_name, prompt_or,
+    prompt_password_masked, validate_cli_session_id,
 };
 use crate::cli::config_manager::{
     execute_config_command, latest_artifact_id, resolve_download_output_path,
@@ -24,9 +23,7 @@ use crate::cli::config_manager::{
 use crate::cli::exit_code::ExitCode;
 use crate::cli::interactive_chat::run_interactive_chat;
 use crate::cli::mcp_config::execute_mcp_command;
-use crate::cli::one_shot_session_routing::{
-    OneShotSessionRouting, resolve_one_shot_session_routing,
-};
+use crate::cli::one_shot_session_routing::resolve_one_shot_session_routing;
 use crate::cli::permission_command::handle_permission_command;
 use crate::cli::permission_manager::{PermissionManager, PermissionMode};
 use crate::cli::project_instructions::discover_project_instructions;
@@ -46,15 +43,9 @@ use crate::cli::slash::slash_debug::handle_debug_command;
 use crate::cli::slash::slash_info::handle_info_command;
 use crate::cli::slash::slash_memory::handle_memory_domain_command;
 use crate::cli::slash::slash_messaging::handle_messaging_command;
-use crate::cli::slash::{slash_agent, slash_router, slash_task, slash_team, slash_telemetry};
-use crate::cli::stream::streaming_types::{StreamResult, format_background_agent_results};
-use crate::cli::surface::task_checkpoint_surface::encode_task_failure_message;
-use crate::cli::task::task_command_utils::task_run_title;
-use crate::cli::task::task_result_artifact::write_task_output;
-use crate::cli::task::task_result_projection::stream_result_exit_code;
-use crate::cli::task::task_worker_support::{
-    ClaimedTaskLeaseGuard, WorkerClaim, claim_task_for_worker, default_task_agent_id,
-    get_claimed_task_or_release, revert_interrupted_task_to_pending_if_still_owned,
+use crate::cli::slash::{slash_agent, slash_team, slash_telemetry};
+use crate::cli::stream::streaming_types::{
+    StreamResult, format_background_agent_results, stream_result_from_resumable_turn_failure,
 };
 use crate::cli::{
     agent_loader, delegate_subrun, diff_presenter, journal_diff, journal_digest, journal_tree,
@@ -64,6 +55,27 @@ use astra_thin_client::paths;
 use clap::CommandFactory;
 use crossterm::{style::Stylize, terminal};
 use std::io::Read;
+
+/// A wall deadline has already stopped useful new work.  The rest of its
+/// reserve belongs to proving the server-side run reached a terminal state,
+/// not to returning a local partial while an owned provider call is still
+/// live.  Keep a small serialization margin for the caller/supervisor.
+const WALL_DEADLINE_SERVER_TERMINAL_SETTLE_MARGIN: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+/// Time deliberately held back from a bounded one-shot turn for cancellation,
+/// durable settlement, and final serialization. The model must plan against
+/// the execution slice, not the supervisor-facing wall limit.
+const WALL_DEADLINE_TERMINAL_RESERVE: std::time::Duration = std::time::Duration::from_secs(70);
+
+/// Additional client-side allowance for payload construction, transport, and
+/// request admission. This is deducted in addition to the terminal reserve so
+/// the Server never receives a rounded-up execution slice.
+const WALL_BUDGET_REQUEST_SAFETY_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn durable_run_is_terminal(status: Option<&str>) -> bool {
+    matches!(status, Some("completed" | "failed" | "cancelled"))
+}
 
 async fn start_http_server(host: &str, port: u16) -> Result<(), String> {
     let addr: std::net::SocketAddr = format!("{host}:{port}")
@@ -94,7 +106,7 @@ async fn fresh_access_token_or_error(
 fn repl_bridge_command_requires_access_token(slash_cmd: &str) -> bool {
     matches!(
         slash_cmd,
-        "/team" | "/task" | "/memory" | "/plan" | "/review" | "/grep"
+        "/team" | "/memory" | "/plan" | "/review" | "/grep"
     )
 }
 
@@ -154,155 +166,6 @@ fn maybe_wire_delegation_engine(
     state.delegation_engine = Some(std::sync::Arc::new(engine));
 }
 
-fn emit_task_event(enabled: bool, value: serde_json::Value) {
-    if enabled {
-        if let Ok(line) = serde_json::to_string(&value) {
-            eprintln!("{line}");
-        }
-    }
-}
-
-pub(crate) fn exit_code_for_error_kind(error_kind: &str) -> Option<ExitCode> {
-    match error_kind {
-        "tool_failure" => Some(ExitCode::ToolFailure),
-        "cancelled" => Some(ExitCode::Cancelled),
-        "api_error" => Some(ExitCode::ApiError),
-        "persistence_error" => Some(ExitCode::PersistenceError),
-        "partial" => Some(ExitCode::Partial),
-        "unfinished" => Some(ExitCode::Unfinished),
-        _ => None,
-    }
-}
-
-pub(crate) fn error_kind_for_exit_code(exit_code: ExitCode) -> Option<&'static str> {
-    match exit_code {
-        ExitCode::Success => None,
-        ExitCode::ToolFailure => Some("tool_failure"),
-        ExitCode::Cancelled => Some("cancelled"),
-        ExitCode::ApiError => Some("api_error"),
-        ExitCode::PersistenceError => Some("persistence_error"),
-        ExitCode::Partial => Some("partial"),
-        ExitCode::Unfinished => Some("unfinished"),
-    }
-}
-
-fn task_status_for_exit_code(exit_code: ExitCode) -> &'static str {
-    match exit_code {
-        ExitCode::Success => "completed",
-        ExitCode::Partial => "partial",
-        ExitCode::Unfinished => "unfinished",
-        ExitCode::PersistenceError => "persistence_error",
-        ExitCode::Cancelled => "cancelled",
-        ExitCode::ToolFailure | ExitCode::ApiError => "failed",
-    }
-}
-
-fn task_notification_payload(
-    task_id: &str,
-    sr: &StreamResult,
-    output_path: Option<&str>,
-    exit_code: ExitCode,
-) -> serde_json::Value {
-    let mut payload = serde_json::Map::new();
-    payload.insert(
-        "type".to_string(),
-        serde_json::json!("background_task_notification"),
-    );
-    payload.insert("task_id".to_string(), serde_json::json!(task_id));
-    payload.insert(
-        "status".to_string(),
-        serde_json::json!(task_status_for_exit_code(exit_code)),
-    );
-    payload.insert(
-        "success".to_string(),
-        serde_json::json!(exit_code == ExitCode::Success),
-    );
-    payload.insert(
-        "exit_code".to_string(),
-        serde_json::json!(i32::from(exit_code)),
-    );
-    if let Some(output_path) = output_path {
-        payload.insert("output_file".to_string(), serde_json::json!(output_path));
-    }
-    payload.insert(
-        "summary".to_string(),
-        serde_json::json!(sr.full_text.chars().take(200).collect::<String>()),
-    );
-    payload.insert("final_state".to_string(), serde_json::json!(sr.final_state));
-    payload.insert(
-        "interruption_kind".to_string(),
-        serde_json::json!(sr.interruption_kind),
-    );
-    if let Some(error_kind) = error_kind_for_exit_code(exit_code) {
-        payload.insert("error_kind".to_string(), serde_json::json!(error_kind));
-    }
-    if let Some(error) = sr.session_persistence_error.as_deref() {
-        payload.insert("persistence_error".to_string(), serde_json::json!(error));
-    }
-    serde_json::Value::Object(payload)
-}
-
-fn failed_task_notification_payload(
-    task_id: &str,
-    summary: &str,
-    error_kind: &str,
-    output_path: Option<&str>,
-    persistence_error: Option<&str>,
-) -> serde_json::Value {
-    let mut payload = serde_json::Map::new();
-    payload.insert(
-        "type".to_string(),
-        serde_json::json!("background_task_notification"),
-    );
-    payload.insert("task_id".to_string(), serde_json::json!(task_id));
-    let status = if error_kind == "persistence_error" {
-        "persistence_error"
-    } else {
-        "failed"
-    };
-    payload.insert("status".to_string(), serde_json::json!(status));
-    payload.insert("success".to_string(), serde_json::json!(false));
-    payload.insert("summary".to_string(), serde_json::json!(summary));
-    payload.insert("error_kind".to_string(), serde_json::json!(error_kind));
-    if let Some(path) = output_path {
-        payload.insert("output_file".to_string(), serde_json::json!(path));
-    }
-    if let Some(error) = persistence_error {
-        payload.insert("persistence_error".to_string(), serde_json::json!(error));
-    }
-    serde_json::Value::Object(payload)
-}
-
-fn task_terminal_summary_line(
-    task_id: &str,
-    output_path: Option<&str>,
-    exit_code: ExitCode,
-) -> String {
-    let (icon, outcome) = match exit_code {
-        ExitCode::Success => (theme::icon_ok(), "finished"),
-        ExitCode::Partial => (theme::icon_warn(), "finished partially"),
-        ExitCode::Unfinished => (theme::icon_warn(), "unfinished"),
-        ExitCode::PersistenceError => (theme::icon_warn(), "finished with persistence degradation"),
-        ExitCode::Cancelled => (theme::icon_warn(), "cancelled"),
-        ExitCode::ToolFailure | ExitCode::ApiError => (theme::icon_err(), "failed"),
-    };
-    match output_path {
-        Some(output_path) => format!(
-            "\n  {} Task {} {}; output saved to {}",
-            icon,
-            prefix_chars(task_id, 8).cyan(),
-            outcome,
-            output_path.dim(),
-        ),
-        None => format!(
-            "\n  {} Task {} {}; output file unavailable",
-            icon,
-            prefix_chars(task_id, 8).cyan(),
-            outcome,
-        ),
-    }
-}
-
 fn record_stream_persistence_error(sr: &mut StreamResult, detail: impl Into<String>) {
     let detail = detail.into();
     match sr.session_persistence_error.as_deref() {
@@ -314,24 +177,58 @@ fn record_stream_persistence_error(sr: &mut StreamResult, detail: impl Into<Stri
     }
 }
 
+/// Durable settlement authority for a headless turn.
+///
+/// A canonical journal commit is irreversible business-turn progress. Derived
+/// CSL/profile projections may still fail afterwards; callers must repair
+/// those projections instead of retrying the already-committed turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HeadlessCanonicalCommitStatus {
+    NotRequested,
+    Committed,
+    NotCommitted,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HeadlessSessionSettlement {
+    pub(crate) canonical_session_id: Option<String>,
+    pub(crate) commit_status: HeadlessCanonicalCommitStatus,
+    pub(crate) projection_repair_required: bool,
+    pub(crate) persistence_error: Option<String>,
+}
+
 pub(crate) fn persist_headless_session_state(
     profile: Option<&str>,
     model: Option<&str>,
     line: &str,
     sr: &mut StreamResult,
     turn_start: std::time::Instant,
-) {
-    let persisted_turn = match session_side_effects::append_one_shot_journal_events(
+    execution_lease: Option<&astra_services::session_journal::SessionExecutionLease>,
+) -> HeadlessSessionSettlement {
+    let requested_session_id = sr.session_id.clone();
+    let (commit_status, persisted_turn) = match session_side_effects::append_one_shot_journal_events(
         sr.session_id.as_deref(),
         model,
         line,
         sr,
         turn_start,
+        execution_lease,
     ) {
-        Ok(turn) => turn,
-        Err(error) => {
+        Ok(Some(turn)) => {
+            if let Some(error) = turn.persistence_error.as_ref() {
+                record_stream_persistence_error(sr, error.clone());
+            }
+            (HeadlessCanonicalCommitStatus::Committed, Some(turn))
+        }
+        Ok(None) => (HeadlessCanonicalCommitStatus::NotRequested, None),
+        Err(session_side_effects::OneShotJournalCommitError::NotCommitted(error)) => {
             record_stream_persistence_error(sr, error);
-            None
+            (HeadlessCanonicalCommitStatus::NotCommitted, None)
+        }
+        Err(session_side_effects::OneShotJournalCommitError::CommitUnknown(error)) => {
+            record_stream_persistence_error(sr, error);
+            (HeadlessCanonicalCommitStatus::Unknown, None)
         }
     };
 
@@ -339,31 +236,39 @@ pub(crate) fn persist_headless_session_state(
     // already reported by the remote session. The local journal turn supplies
     // the sequence number and remains a lower-fidelity recovery fallback when
     // the richer CSL snapshot cannot be written.
-    let local_recovery_persisted = persisted_turn.is_some();
-    if let (Some(session_id), Some(turn)) = (sr.session_id.clone(), persisted_turn)
-        && !sr.final_messages.is_empty()
-    {
-        let csl_state = astra_turn_core::conversation_log::SessionStateCompact {
-            recent_tools: sr.tools_used.clone(),
-            activated_deferred_tool_names: sr.activated_deferred_tool_names.clone(),
-            ..Default::default()
-        };
-        if let Err(error) =
-            crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
-                &session_id,
-                turn,
-                &sr.final_messages,
-                &csl_state,
-            )
-        {
+    let canonical_committed = commit_status == HeadlessCanonicalCommitStatus::Committed;
+    let mut canonical_recovery_persisted = false;
+    if let (Some(session_id), Some(persisted)) = (sr.session_id.clone(), persisted_turn) {
+        if sr.final_messages.is_empty() {
             record_stream_persistence_error(
                 sr,
-                format!("failed to persist one-shot canonical continuation: {error}"),
+                "failed to persist one-shot canonical continuation: canonical messages are empty",
             );
+        } else {
+            let csl_state = astra_turn_core::conversation_log::SessionStateCompact {
+                source_cursor: Some(persisted.cursor),
+                recent_tools: sr.tools_used.clone(),
+                activated_deferred_tool_names: sr.activated_deferred_tool_names.clone(),
+                ..Default::default()
+            };
+            match crate::cli::session::session_recovery::csl::write_full_csl_snapshot_atomic(
+                &session_id,
+                persisted.turn,
+                &sr.final_messages,
+                &csl_state,
+            ) {
+                Ok(()) => canonical_recovery_persisted = true,
+                Err(error) => record_stream_persistence_error(
+                    sr,
+                    format!("failed to persist one-shot canonical continuation: {error}"),
+                ),
+            }
         }
     }
 
-    if local_recovery_persisted
+    if canonical_committed
+        && canonical_recovery_persisted
+        && sr.session_persistence_error.is_none()
         && let Some(sid) = sr.session_id.as_deref()
         && let Err(error) = persist_profile_last_session(profile, sid)
     {
@@ -371,6 +276,15 @@ pub(crate) fn persist_headless_session_state(
             sr,
             format!("failed to persist last session pointer: {error}"),
         );
+    }
+
+    HeadlessSessionSettlement {
+        canonical_session_id: canonical_committed
+            .then_some(requested_session_id)
+            .flatten(),
+        commit_status,
+        projection_repair_required: canonical_committed && sr.session_persistence_error.is_some(),
+        persistence_error: sr.session_persistence_error.clone(),
     }
 }
 
@@ -380,9 +294,37 @@ fn finalize_one_shot_stream_result(
     line: &str,
     sr: &mut StreamResult,
     turn_start: std::time::Instant,
+    execution_lease: Option<&astra_services::session_journal::SessionExecutionLease>,
 ) -> ExitCode {
-    persist_headless_session_state(profile, model, line, sr, turn_start);
+    retain_interrupted_partial_canonical_messages(sr, line);
+    let _settlement =
+        persist_headless_session_state(profile, model, line, sr, turn_start, execution_lease);
     compute_exit_code(sr)
+}
+
+pub(crate) fn finalize_one_shot_stream_result_with_request_lease(
+    profile: Option<&str>,
+    model: Option<&str>,
+    line: &str,
+    sr: &mut StreamResult,
+    turn_start: std::time::Instant,
+    request_lease: &crate::cli::session::session_execution_lease::RequestSessionExecutionLease,
+) -> ExitCode {
+    let session_id = sr.session_id.clone();
+    match request_lease.with_matching_lease(session_id.as_deref(), |lease| {
+        finalize_one_shot_stream_result(profile, model, line, sr, turn_start, Some(lease))
+    }) {
+        Ok(exit_code) => exit_code,
+        Err(failure) => {
+            // Identity/lease admission precedes persistence. Once persistence
+            // itself has reported a durability error, retain that exact cause
+            // instead of replacing it with a secondary wrapper failure.
+            if sr.session_persistence_error.is_none() {
+                record_stream_persistence_error(sr, failure.message);
+            }
+            compute_exit_code(sr)
+        }
+    }
 }
 
 fn effective_one_shot_model<'a>(
@@ -426,33 +368,57 @@ async fn resolve_one_shot_model(
             offering_id: None,
         });
     };
-    let body = api
-        .get_models_text(token)
+    let selection = session_runtime::resolve_server_model_selection(api, token, &model)
         .await
-        .map_err(|err| format!("failed to list models for selected model '{model}': {err}"))?;
-    let catalog: Vec<slash_router::ModelCatalogEntry> = serde_json::from_str(&body)
-        .map_err(|err| format!("failed to parse model list response: {err}"))?;
-    resolve_one_shot_model_from_catalog(&model, &catalog)
+        .map_err(|error| format!("failed to resolve selected model '{model}': {error}"))?;
+    Ok(ResolvedOneShotModel {
+        // Preserve the caller's thinking suffix and spelling in the turn
+        // payload; the shared resolver owns the canonical Offering identity.
+        model: Some(model),
+        offering_id: Some(selection.offering_id),
+    })
 }
 
-fn resolve_one_shot_model_from_catalog(
-    model: &str,
-    catalog: &[slash_router::ModelCatalogEntry],
-) -> Result<ResolvedOneShotModel, String> {
-    let entry = slash_router::find_model_entry_by_name(catalog, model)
-        .ok_or_else(|| format!("selected model '{model}' was not returned by /models"))?;
-    if !slash_router::entry_model_is_active(entry) {
-        return Err(format!("selected model '{model}' is inactive"));
-    }
-    let offering_id = slash_router::entry_offering_id(entry).to_string();
-    let model_name = slash_router::entry_model_name(entry)
-        .unwrap_or(model)
-        .to_string();
+#[cfg(test)]
+mod exact_model_resolution_tests {
+    use super::resolve_one_shot_model;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    Ok(ResolvedOneShotModel {
-        model: Some(model_name),
-        offering_id: Some(offering_id),
-    })
+    #[tokio::test]
+    async fn async_resolution_rejects_model_missing_from_authoritative_catalog() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [{
+                    "offering_id": "offer-1",
+                    "access_id": "self-hosted",
+                    "access_kind": "self_hosted",
+                    "access_label": "Self-hosted",
+                    "execution_placement": "server",
+                    "name": "listed-model",
+                    "provider": "openai",
+                    "description": null,
+                    "is_active": true,
+                    "context_window": 128000,
+                    "max_completion_tokens": null,
+                    "architecture": null,
+                    "thinking_capability": null
+                }],
+                "next_cursor": null,
+                "limit": 50,
+                "total": 1,
+                "catalog_revision": "sha256:test"
+            })))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("client");
+        let error = resolve_one_shot_model(&api, "token", Some("overflow-model"), None, None)
+            .await
+            .expect_err("missing Offering must fail closed");
+        assert!(error.contains("authoritative catalog"), "{error}");
+    }
 }
 
 fn effective_one_shot_permission_mode(
@@ -506,634 +472,16 @@ fn print_one_shot_completion_warning(sr: &StreamResult, exit_code: ExitCode, jso
     }
 }
 
-struct HeadlessTaskInput {
-    user_id: std::sync::Arc<String>,
-    task_id: std::sync::Arc<String>,
-    task_session_id: std::sync::Arc<String>,
-    prompt: String,
-    svc: std::sync::Arc<dyn astra_services::TaskService>,
-    session_routing: OneShotSessionRouting,
+fn write_headless_stdout(bytes: &[u8]) -> Result<(), String> {
+    crate::cli::stream::output_sink::write_stdout(bytes)
+        .map(|_| ())
+        .map_err(|error| format!("failed to write command output: {error}"))
 }
 
-#[derive(Debug, Clone, Copy)]
-struct HeadlessTaskOptions {
-    json: bool,
-    quiet: bool,
-    stream_events: bool,
-    print_started: bool,
-}
-
-const NON_CANONICAL_TASK_SCOPE: &str = "no-session";
-
-async fn mark_headless_task_failed(
-    svc: &dyn astra_services::TaskService,
-    user_id: &str,
-    task_id: &str,
-    stored_error: &str,
-    returned_error: String,
-) -> String {
-    match svc.fail_task(user_id, task_id, stored_error).await {
-        Ok(()) => returned_error,
-        Err(fail_error) => {
-            format!("{returned_error}; additionally failed to persist failed status: {fail_error}")
-        }
-    }
-}
-
-async fn build_one_shot_task_manager(
-    profile: Option<&str>,
-    api_origin: &str,
-    session_id: Option<&str>,
-) -> std::sync::Arc<crate::edge_tools::TaskManager> {
-    if let Some(session_id) = session_id {
-        let task_store =
-            crate::cli::session::session_runtime::resolve_task_store(profile, Some(api_origin))
-                .await
-                .0;
-        std::sync::Arc::new(crate::edge_tools::TaskManager::new(
-            session_id.to_string(),
-            task_store,
-        ))
-    } else {
-        std::sync::Arc::new(crate::edge_tools::TaskManager::new(
-            NON_CANONICAL_TASK_SCOPE.to_string(),
-            std::sync::Arc::new(astra_tools::task_mgmt::InMemoryTaskStore::new().with_validation()),
-        ))
-    }
-}
-
-async fn execute_headless_task_body(
-    input: HeadlessTaskInput,
-    options: HeadlessTaskOptions,
-    profile: Option<&str>,
-    global_model: Option<&str>,
-    api: &astra_thin_client::ThinClient,
-    cli_context: &crate::cli::cli_config::cli_context::CliContext,
-) -> Result<ExitCode, String> {
-    let HeadlessTaskInput {
-        user_id,
-        task_id,
-        task_session_id,
-        prompt,
-        svc,
-        mut session_routing,
-    } = input;
-    use astra_services::TaskStatus;
-    let (_creds, profile_name, _, _token) = get_profile_and_token(profile)?;
-    let token = fresh_access_token_or_error(api, profile).await?;
-    let session_id = session_routing.server_session_id.clone();
-    let resolved_model = resolve_one_shot_model(
-        api,
-        &token,
-        None,
-        session_routing.restored_model(),
-        global_model,
-    )
-    .await?;
-    let effective_model = resolved_model.model;
-    let effective_offering_id = resolved_model.offering_id;
-    let effective_permission_mode = effective_one_shot_permission_mode(
-        None,
-        false,
-        session_routing.restored_permission_mode(),
-        true,
-    )?;
-    let (mut continuation_messages, activated_deferred_tool_names) =
-        session_routing.continuation_turn_inputs()?;
-
-    emit_task_event(
-        options.stream_events,
-        serde_json::json!({
-            "type": "background_task_started",
-            "task_id": task_id.as_str(),
-            "task_kind": "local_agent",
-            "description": prompt,
-        }),
-    );
-
-    if options.print_started && !options.quiet && !options.json {
-        eprintln!(
-            "  {} Task started: {} ({})",
-            "▶".cyan(),
-            prompt.chars().take(50).collect::<String>(),
-            prefix_chars(task_id.as_str(), 8).dim()
-        );
-    }
-
-    svc.update_status(user_id.as_str(), task_id.as_str(), TaskStatus::InProgress)
-        .await?;
-
-    let pipeline_modules = session_runtime::create_pipeline_modules_quiet(api, profile);
-    let project_root = std::env::current_dir().unwrap_or_default();
-    let mut pm = PermissionManager::with_load_policy(
-        effective_permission_mode,
-        &project_root,
-        &crate::cli::permission_manager::PermissionLoadPolicy::HeadlessSafe,
-    );
-    let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
-    let root_agent_id = format!("task-{}", task_id.as_str());
-    let spawner = super::agent_runtime::build_one_shot_spawner(
-        api,
-        token.clone(),
-        pipeline_modules.unified_skill_registry.clone(),
-        session_id.clone(),
-        effective_model.clone(),
-    )
-    .await;
-    let spawner_handle_for_drain = spawner.clone();
-
-    let (stream_event_tx, stream_event_writer) = if options.stream_events {
-        let (tx, rx) = crate::cli::chat_stream::stream_event_channel();
-        let handle = crate::cli::stream::stream_events_writer::spawn_stderr_writer(rx);
-        (Some(tx), Some(handle))
-    } else {
-        (None, None)
-    };
-
-    let render_policy = if options.quiet || options.json {
-        crate::cli::stream::stream_render::RenderPolicy::Silent
-    } else {
-        crate::cli::stream::stream_render::RenderPolicy::Stream
-    };
-    // Headless single-shot path: use the MO-backed task store when available
-    // so session_todos is authoritative here the same way it is in the REPL.
-    let task_manager = build_one_shot_task_manager(
-        profile,
-        &api.api_origin(),
-        session_routing.task_scope_session_id(),
-    )
-    .await;
-
-    let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
-        api,
-        auth_profile: profile,
-        message: &prompt,
-        model: effective_model.as_deref(),
-        offering_id: effective_offering_id.as_deref(),
-        provider: None,
-        explain: ExplainMode::Off,
-        render_md: terminal::size().is_ok() && !options.quiet && !options.json,
-        verbose_mode: !options.quiet && !options.json,
-        render_policy,
-        cli_context: Some(cli_context),
-        unified_skill_registry: &pipeline_modules.unified_skill_registry,
-        agent_spawner: Some(spawner),
-        root_agent_id: Some(&root_agent_id),
-        task_manager: Some(task_manager),
-        task_notify_tx: None,
-        bg_task_commands: None,
-        bg_task_list_cache: None,
-        bash_detach_slot: None,
-        stream_event_tx,
-        stream_json_emitter: None,
-        #[cfg(feature = "harness")]
-        harness_sink: Some(astra_harness::InMemorySnapshotSink::arc()),
-        #[cfg(feature = "harness")]
-        harness_trace: Some(std::sync::Arc::new(std::sync::RwLock::new(
-            astra_harness::SessionTrace::new(None),
-        ))),
-        #[cfg(feature = "harness")]
-        benchmark_profile: None,
-    };
-
-    let turn_start = std::time::Instant::now();
-    let turn_options = crate::cli::turn::turn_facade::BasicCliTurnOptions {
-        pre_loaded_messages: continuation_messages.take(),
-        activated_deferred_tool_names,
-        turn_index: Some(session_routing.next_server_turn_index()),
-        ..Default::default()
-    };
-    let turn_result = crate::cli::turn::execute_basic_cli_turn(
-        &chat_ctx,
-        &token,
-        session_id.as_deref(),
-        None,
-        &mut pm,
-        &mut skill_qt,
-        turn_options,
-    )
-    .await;
-    let background_agent_results = spawner_handle_for_drain
-        .shutdown_and_wait(std::time::Duration::from_secs(30))
-        .await;
-
-    // Keep child progress/approval channels alive through the drain, then
-    // flush the event stream before publishing either success or failure.
-    drop(chat_ctx);
-    if let Some(handle) = stream_event_writer {
-        let _ = handle.await;
-    }
-
-    let mut sr = match turn_result {
-        Ok(sr) => sr,
-        Err(e) => {
-            let mut error = e.error;
-            if let Some(section) = format_background_agent_results(&background_agent_results) {
-                error.push_str("\n\n");
-                error.push_str(&section);
-            }
-            let returned_error = mark_headless_task_failed(
-                svc.as_ref(),
-                user_id.as_str(),
-                task_id.as_str(),
-                &error,
-                error.clone(),
-            )
-            .await;
-            emit_task_event(
-                options.stream_events,
-                failed_task_notification_payload(
-                    task_id.as_str(),
-                    &returned_error,
-                    "turn_error",
-                    None,
-                    None,
-                ),
-            );
-            return Err(returned_error);
-        }
-    };
-
-    sr.background_agent_results = background_agent_results;
-    sr.integrate_background_agent_results();
-
-    persist_headless_session_state(
-        Some(&profile_name),
-        effective_model.as_deref(),
-        &prompt,
-        &mut sr,
-        turn_start,
-    );
-
-    let output_path_result = write_task_output(task_id.as_str(), &sr.full_text);
-    let output_path_string = match output_path_result.as_ref() {
-        Ok(path) => Some(path.to_string_lossy().to_string()),
-        Err(error) => {
-            record_stream_persistence_error(&mut sr, error.clone());
-            None
-        }
-    };
-    let exit_code = match crate::cli::task::task_result_command::finalize_headless_task_result(
-        svc.as_ref(),
-        user_id.as_str(),
-        task_id.as_str(),
-        &sr,
-        Some(task_session_id.as_str()),
-        output_path_string.as_deref(),
-    )
-    .await
-    {
-        Ok(code) => code,
-        Err(e) => {
-            let stored_error = encode_task_failure_message("persistence_error", &e);
-            let returned_error = mark_headless_task_failed(
-                svc.as_ref(),
-                user_id.as_str(),
-                task_id.as_str(),
-                &stored_error,
-                e,
-            )
-            .await;
-            emit_task_event(
-                options.stream_events,
-                failed_task_notification_payload(
-                    task_id.as_str(),
-                    &returned_error,
-                    "task_record_error",
-                    output_path_string.as_deref(),
-                    sr.session_persistence_error.as_deref(),
-                ),
-            );
-            return Err(returned_error);
-        }
-    };
-
-    emit_task_event(
-        options.stream_events,
-        task_notification_payload(
-            task_id.as_str(),
-            &sr,
-            output_path_string.as_deref(),
-            exit_code,
-        ),
-    );
-
-    if options.json {
-        let mut json_output = final_json_output(&sr, exit_code);
-        if let Some(obj) = json_output.as_object_mut() {
-            obj.insert("task_id".to_string(), serde_json::json!(task_id.as_str()));
-            obj.insert(
-                "task_status".to_string(),
-                serde_json::json!(task_status_for_exit_code(exit_code)),
-            );
-            obj.insert(
-                "output_file".to_string(),
-                serde_json::json!(output_path_string),
-            );
-            obj.insert(
-                "background_agent_results".to_string(),
-                serde_json::json!(
-                    sr.background_agent_results
-                        .iter()
-                        .map(|(id, text)| serde_json::json!({"agent_id": id, "result": text}))
-                        .collect::<Vec<_>>()
-                ),
-            );
-        }
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json_output).unwrap_or_default()
-        );
-    } else if options.quiet {
-        println!("{}", sr.full_text);
-    } else {
-        eprintln!(
-            "{}",
-            task_terminal_summary_line(task_id.as_str(), output_path_string.as_deref(), exit_code)
-        );
-    }
-
-    print_one_shot_completion_warning(&sr, exit_code, options.json);
-
-    Ok(exit_code)
-}
-
-async fn execute_headless_task_run(
-    args: TaskRunArgs,
-    profile: Option<&str>,
-    global_model: Option<&str>,
-    api: &astra_thin_client::ThinClient,
-    cli_context: &crate::cli::cli_config::cli_context::CliContext,
-) -> Result<ExitCode, String> {
-    use astra_services::TaskCreateRequest;
-
-    let prompt = join_words(&args.text);
-    if prompt.trim().is_empty() {
-        return Err("task prompt cannot be empty".to_string());
-    }
-
-    let session_routing =
-        resolve_one_shot_session_routing(api, profile, cli_context.session_id.clone(), true)
-            .await?;
-    let user_id = cli_user_id();
-    let task_session_id = session_routing
-        .task_scope_session_id()
-        .unwrap_or(NON_CANONICAL_TASK_SCOPE)
-        .to_string();
-    let svc = session_runtime::resolve_task_service(profile).await;
-    let task_id = svc
-        .create_task(
-            &user_id,
-            &task_session_id,
-            TaskCreateRequest {
-                title: task_run_title(&prompt),
-                description: Some(prompt.clone()),
-                plan: None,
-                parent_task_id: None,
-                project_type: None,
-                goal_pattern: None,
-            },
-        )
-        .await?;
-
-    execute_headless_task_body(
-        HeadlessTaskInput {
-            user_id: std::sync::Arc::new(user_id),
-            task_id: std::sync::Arc::new(task_id),
-            task_session_id: std::sync::Arc::new(task_session_id),
-            prompt,
-            svc,
-            session_routing,
-        },
-        HeadlessTaskOptions {
-            json: args.json,
-            quiet: args.quiet,
-            stream_events: args.stream_events,
-            print_started: true,
-        },
-        profile,
-        global_model,
-        api,
-        cli_context,
-    )
-    .await
-}
-
-/// Outcome of a single worker poll. `Interrupted` lets the outer
-/// `--loop` driver tell a user-initiated Ctrl+C apart from a normal
-/// "task done" cycle, so the loop exits promptly instead of requiring
-/// a second Ctrl+C during the poll-interval sleep.
-enum WorkerOutcome {
-    Completed(ExitCode),
-    Interrupted,
-}
-
-async fn execute_task_worker_once(
-    args: &TaskWorkerArgs,
-    profile: Option<&str>,
-    global_model: Option<&str>,
-    api: &astra_thin_client::ThinClient,
-    cli_context: &crate::cli::cli_config::cli_context::CliContext,
-) -> Result<WorkerOutcome, String> {
-    let (svc, lease_svc) = session_runtime::resolve_cloud_task_runtime(profile).await?;
-    let user_id = cli_user_id();
-    let agent_id = args.agent_id.clone().unwrap_or_else(default_task_agent_id);
-    let edge_id = std::env::var("ASTRA_EDGE_ID").unwrap_or_else(|_| agent_id.clone());
-    let claimed_task_id =
-        match claim_task_for_worker(&*lease_svc, &user_id, &agent_id, &edge_id, args.ttl_seconds)
-            .await?
-        {
-            WorkerClaim::Granted(grant) => {
-                if args.json {
-                    eprintln!(
-                        "{}",
-                        serde_json::json!({
-                            "claimed": true,
-                            "task_id": grant.task_id,
-                            "agent_id": agent_id,
-                            "lease_version": grant.lease_version,
-                            "expires_at": grant.expires_at,
-                        })
-                    );
-                } else if !args.quiet {
-                    eprintln!(
-                        "  {} Claimed cloud task {} as {}",
-                        "▶".cyan(),
-                        prefix_chars(&grant.task_id, 8).dim(),
-                        agent_id.as_str().cyan()
-                    );
-                }
-                grant.task_id
-            }
-            WorkerClaim::Idle(reason) => {
-                if args.json {
-                    println!(
-                        "{}",
-                        serde_json::json!({"claimed": false, "reason": reason.json_reason()})
-                    );
-                } else if !args.quiet {
-                    eprintln!("  {}", reason.human_message().dim());
-                }
-                return Ok(WorkerOutcome::Completed(ExitCode::Success));
-            }
-        };
-
-    let task =
-        get_claimed_task_or_release(&*svc, &*lease_svc, &user_id, &claimed_task_id, &agent_id)
-            .await?;
-    let astra_services::TaskRecord {
-        task_id,
-        session_id,
-        title,
-        description,
-        ..
-    } = task;
-    let prompt = description
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or(title);
-    let task_session_id = std::sync::Arc::new(
-        session_id
-            .clone()
-            .unwrap_or_else(|| NON_CANONICAL_TASK_SCOPE.to_string()),
-    );
-    let user_id = std::sync::Arc::new(user_id);
-    let task_id = std::sync::Arc::new(task_id);
-    let agent_id = std::sync::Arc::new(agent_id);
-    let edge_id = std::sync::Arc::new(edge_id);
-
-    let lease_guard = ClaimedTaskLeaseGuard::new(
-        lease_svc.clone(),
-        user_id.clone(),
-        task_id.clone(),
-        agent_id.clone(),
-    );
-    let mut renewal_task =
-        astra_services::LeaseRenewalTask::spawn(astra_services::LeaseRenewalConfig {
-            lease_svc: lease_svc.clone(),
-            user_id: user_id.clone(),
-            task_id: task_id.clone(),
-            agent_id: agent_id.clone(),
-            edge_id: edge_id.clone(),
-            ttl_sec: args.ttl_seconds,
-            metrics: None,
-        });
-
-    // Honour Ctrl+C during long-running task execution. Without this the
-    // worker has to wait for the task body to finish, which can be
-    // minutes; users expect interrupt to be prompt. On Ctrl+C we fall
-    // through to release_lease so the task is freed for another worker.
-    // `interrupted` lets the outer --loop driver exit cleanly instead
-    // of requiring a second Ctrl+C during the poll-interval sleep.
-    let (body_result, interrupted): (Result<ExitCode, String>, bool) = tokio::select! {
-        res = async {
-            let session_routing = resolve_one_shot_session_routing(
-                api,
-                profile,
-                session_id,
-                true,
-            ).await?;
-            execute_headless_task_body(
-                HeadlessTaskInput {
-                    user_id: user_id.clone(),
-                    task_id: task_id.clone(),
-                    task_session_id: task_session_id.clone(),
-                    prompt,
-                    svc: svc.clone(),
-                    session_routing,
-                },
-                HeadlessTaskOptions {
-                    json: args.json,
-                    quiet: args.quiet,
-                    stream_events: args.stream_events,
-                    print_started: false,
-                },
-                profile,
-                global_model,
-                api,
-                cli_context,
-            ).await
-        } => (res, false),
-        _ = tokio::signal::ctrl_c() => {
-            if !args.quiet && !args.json {
-                eprintln!("  {}", "Task interrupted — releasing lease.".dim());
-            }
-            (Ok(ExitCode::Success), true)
-        }
-    };
-
-    if let Err(error) = renewal_task.cancel_and_wait().await {
-        tracing::error!(
-            task_id = %task_id,
-            %error,
-            "lease renewal task failed while stopping"
-        );
-    }
-
-    if interrupted {
-        use std::time::Duration;
-        revert_interrupted_task_to_pending_if_still_owned(
-            &*svc,
-            &*lease_svc,
-            user_id.as_str(),
-            task_id.as_str(),
-            agent_id.as_str(),
-            Duration::from_secs(5),
-        )
-        .await;
-    }
-
-    lease_guard.release_and_disarm().await?;
-    body_result.map(|code| {
-        if interrupted {
-            WorkerOutcome::Interrupted
-        } else {
-            WorkerOutcome::Completed(code)
-        }
-    })
-}
-
-async fn execute_task_worker(
-    args: TaskWorkerArgs,
-    profile: Option<&str>,
-    global_model: Option<&str>,
-    api: &astra_thin_client::ThinClient,
-    cli_context: &crate::cli::cli_config::cli_context::CliContext,
-) -> Result<ExitCode, String> {
-    if !args.once && !args.loop_mode {
-        return Err("choose --once or --loop for task worker".to_string());
-    }
-    if args.once {
-        return match execute_task_worker_once(&args, profile, global_model, api, cli_context)
-            .await?
-        {
-            WorkerOutcome::Completed(code) => Ok(code),
-            WorkerOutcome::Interrupted => Ok(ExitCode::Success),
-        };
-    }
-    loop {
-        match execute_task_worker_once(&args, profile, global_model, api, cli_context).await? {
-            WorkerOutcome::Completed(code) if code != ExitCode::Success => return Ok(code),
-            WorkerOutcome::Completed(_) => {}
-            // User Ctrl+C'd mid-task — exit the loop now so they don't
-            // have to hit Ctrl+C again during the poll-interval sleep.
-            WorkerOutcome::Interrupted => {
-                if !args.quiet && !args.json {
-                    eprintln!("  {}", "Worker interrupted.".dim());
-                }
-                return Ok(ExitCode::Success);
-            }
-        }
-        let sleep = tokio::time::sleep(std::time::Duration::from_secs(args.poll_seconds.max(1)));
-        tokio::select! {
-            _ = sleep => {}
-            _ = tokio::signal::ctrl_c() => {
-                if !args.quiet && !args.json {
-                    eprintln!("  {}", "Worker interrupted.".dim());
-                }
-                return Ok(ExitCode::Success);
-            }
-        }
-    }
+fn write_headless_stdout_line(text: &str) -> Result<(), String> {
+    crate::cli::stream::output_sink::write_stdout_line(text)
+        .map(|_| ())
+        .map_err(|error| format!("failed to write command output: {error}"))
 }
 
 fn execute_repl_bridge_command<'a>(
@@ -1166,15 +514,9 @@ async fn execute_repl_bridge_command_impl(
 
     let mut state = initialize_session_state(profile, global_model, cli_context);
     if slash_cmd == "/messaging" {
-        handle_messaging_command(arg, &state);
+        handle_messaging_command(arg, &state).await;
         return Ok(ExitCode::Success);
     }
-    let task_service = session_runtime::resolve_task_service(profile).await;
-    session_runtime::install_task_service(&mut state, task_service);
-    let (task_store, task_notify_tx) =
-        session_runtime::resolve_task_store(profile, Some(&api.api_origin())).await;
-    session_runtime::install_task_store(&mut state, task_store);
-    state.task_notify_tx = task_notify_tx;
     maybe_load_project_instructions(&mut state);
 
     let pipeline_modules = create_pipeline_modules(api, profile);
@@ -1189,9 +531,6 @@ async fn execute_repl_bridge_command_impl(
     match slash_cmd {
         "/team" => slash_team::handle_team_command(arg, api, profile, &mut state).await,
         "/telemetry" => slash_telemetry::handle_telemetry_command(arg, &state),
-        "/task" => {
-            slash_task::handle_task_command(arg, &mut state, api, profile, token.as_deref()).await
-        }
         "/memory" => {
             handle_memory_domain_command("/memory", arg, api, &mut state, token.as_deref()).await?
         }
@@ -1224,7 +563,7 @@ async fn execute_repl_bridge_command_impl(
             };
             slash_agent::handle_agent_command(arg, &ctx).await;
         }
-        "/messaging" => handle_messaging_command(arg, &state),
+        "/messaging" => handle_messaging_command(arg, &state).await,
         _ => return Err(format!("unsupported bridged command: {slash_cmd}")),
     }
 
@@ -1277,7 +616,14 @@ mod permission_mode_display_tests {
 
 #[cfg(test)]
 mod token_refresh_error_tests {
-    use super::{repl_bridge_access_token, repl_bridge_command_requires_access_token};
+    use super::{
+        execute_cli_command, repl_bridge_access_token, repl_bridge_command_requires_access_token,
+    };
+    use crate::cli::cli_config::cli_args::Cli;
+    use crate::cli::cli_config::cli_context::CliContext;
+    use clap::Parser;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     struct EnvVarGuard {
         key: &'static str,
@@ -1285,6 +631,13 @@ mod token_refresh_error_tests {
     }
 
     impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: callers use `#[serial]` to isolate process env mutation.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+
         fn remove(key: &'static str) -> Self {
             let previous = std::env::var(key).ok();
             // SAFETY: callers use `#[serial]` to isolate process env mutation.
@@ -1310,7 +663,7 @@ mod token_refresh_error_tests {
 
     #[test]
     fn repl_bridge_auth_policy_matches_command_capabilities() {
-        for command in ["/team", "/task", "/memory", "/plan", "/review", "/grep"] {
+        for command in ["/team", "/memory", "/plan", "/review", "/grep"] {
             assert!(
                 repl_bridge_command_requires_access_token(command),
                 "{command} needs cloud auth or delegation wiring and must fail fast"
@@ -1332,7 +685,7 @@ mod token_refresh_error_tests {
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
         let missing_profile = Some("__missing_repl_bridge_auth_test_profile__");
 
-        let err = repl_bridge_access_token("/task", &api, missing_profile)
+        let err = repl_bridge_access_token("/memory", &api, missing_profile)
             .await
             .unwrap_err();
         assert!(
@@ -1345,6 +698,54 @@ mod token_refresh_error_tests {
             .expect("local slash command auth lookup should be best-effort");
         assert_eq!(local_token, None);
     }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn headless_chat_accepts_gateway_token_without_a_local_profile() {
+        let _env = EnvVarGuard::set("ASTRA_ACCESS_TOKEN", "gateway-token");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "items": [],
+                "next_cursor": null,
+                "limit": 50,
+                "total": 0,
+                "catalog_revision": "sha256:test"
+            })))
+            .mount(&server)
+            .await;
+
+        let parsed = Cli::try_parse_from([
+            "astra",
+            "chat",
+            "--no-resume",
+            "--model",
+            "missing-model",
+            "--message",
+            "hello",
+        ])
+        .expect("headless chat arguments");
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).expect("client");
+        let error = execute_cli_command(
+            parsed.command,
+            Some("__missing_gateway_profile__".to_string()),
+            None,
+            false,
+            None,
+            &api,
+            true,
+            &CliContext::default(),
+        )
+        .await
+        .expect_err("the deliberately missing model should stop the request");
+
+        assert!(
+            error.contains("failed to resolve selected model 'missing-model'"),
+            "gateway auth must advance past local-profile admission: {error}"
+        );
+        assert!(!error.contains("no profile"), "{error}");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1356,7 +757,6 @@ pub(crate) fn execute_cli_command<'a>(
     system_prompt: Option<String>,
     api: &'a astra_thin_client::ThinClient,
     no_instructions: bool,
-    max_budget: f64,
     cli_context: &'a crate::cli::cli_config::cli_context::CliContext,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExitCode, String>> + 'a>> {
     // Erase the large command-dispatch future at the API boundary. Keeping this
@@ -1371,7 +771,6 @@ pub(crate) fn execute_cli_command<'a>(
         system_prompt,
         api,
         no_instructions,
-        max_budget,
         cli_context,
     ))
 }
@@ -1385,7 +784,6 @@ async fn execute_cli_command_impl(
     system_prompt: Option<String>,
     api: &astra_thin_client::ThinClient,
     no_instructions: bool,
-    max_budget: f64,
     cli_context: &crate::cli::cli_config::cli_context::CliContext,
 ) -> Result<ExitCode, String> {
     match command {
@@ -1399,7 +797,6 @@ async fn execute_cli_command_impl(
                 global_model.as_deref(),
                 resume_session_id.as_deref(),
                 no_instructions,
-                max_budget,
                 &interactive_context,
             )
             .await?;
@@ -1439,7 +836,6 @@ async fn execute_cli_command_impl(
         Some(Command::Message(words)) => {
             let raw_message = words.join(" ");
             let message = apply_system_prompt(&raw_message, system_prompt.as_deref());
-            let (_, _, _, _token) = get_profile_and_token(profile.as_deref())?;
             let token = fresh_access_token_or_error(api, profile.as_deref()).await?;
             let mut session_routing = resolve_one_shot_session_routing(
                 api,
@@ -1448,6 +844,24 @@ async fn execute_cli_command_impl(
                 true,
             )
             .await?;
+            let admitted_session_id = session_routing.server_session_id.clone();
+            let request_session_execution_lease =
+                crate::cli::session::session_execution_lease::RequestSessionExecutionLease::new(
+                    admitted_session_id.as_deref(),
+                )
+                .map_err(|failure| failure.message)?;
+            if let Some(session_id) = admitted_session_id.as_deref() {
+                session_routing = resolve_one_shot_session_routing(
+                    api,
+                    profile.as_deref(),
+                    Some(session_id.to_string()),
+                    true,
+                )
+                .await?;
+                if session_routing.server_session_id.as_deref() != Some(session_id) {
+                    return Err("session routing changed after execution admission".to_string());
+                }
+            }
             let session_id = session_routing.server_session_id.clone();
             let resolved_model = resolve_one_shot_model(
                 api,
@@ -1489,8 +903,6 @@ async fn execute_cli_command_impl(
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 agent_spawner: None,
                 root_agent_id: None,
-                task_manager: None,
-                task_notify_tx: None,
                 bg_task_commands: None,
                 bg_task_list_cache: None,
                 bash_detach_slot: None,
@@ -1509,6 +921,7 @@ async fn execute_cli_command_impl(
                 pre_loaded_messages: continuation_messages.take(),
                 activated_deferred_tool_names,
                 turn_index: Some(session_routing.next_server_turn_index()),
+                request_session_execution_lease: Some(request_session_execution_lease.clone()),
                 ..Default::default()
             };
             let turn_start = std::time::Instant::now();
@@ -1524,6 +937,9 @@ async fn execute_cli_command_impl(
             .await
             {
                 Ok(sr) => sr,
+                Err(e) if crate::cli::turn::turn_facade::is_settled_stdout_closure(&e) => {
+                    return Ok(ExitCode::Success);
+                }
                 Err(e) if is_auth_error(&e.error) => {
                     if session_runtime::attempt_token_refresh(api, profile.as_deref()).await {
                         if let Some(new_token) =
@@ -1533,7 +949,7 @@ async fn execute_cli_command_impl(
                                 "  {} Token refreshed, retrying…",
                                 crate::cli::theme::icon_ok()
                             );
-                            crate::cli::turn::execute_basic_cli_turn(
+                            match crate::cli::turn::execute_basic_cli_turn(
                                 &chat_ctx,
                                 &new_token,
                                 session_id.as_deref(),
@@ -1543,7 +959,17 @@ async fn execute_cli_command_impl(
                                 turn_options.clone(),
                             )
                             .await
-                            .map_err(|f| f.error)?
+                            {
+                                Ok(sr) => sr,
+                                Err(failure)
+                                    if crate::cli::turn::turn_facade::is_settled_stdout_closure(
+                                        &failure,
+                                    ) =>
+                                {
+                                    return Ok(ExitCode::Success);
+                                }
+                                Err(failure) => return Err(failure.error),
+                            }
                         } else {
                             return Err(e.error);
                         }
@@ -1553,12 +979,13 @@ async fn execute_cli_command_impl(
                 }
                 Err(e) => return Err(e.error),
             };
-            let exit_code = finalize_one_shot_stream_result(
+            let exit_code = finalize_one_shot_stream_result_with_request_lease(
                 profile.as_deref(),
                 effective_model.as_deref(),
                 &message,
                 &mut sr,
                 turn_start,
+                request_session_execution_lease.as_ref(),
             );
             print_one_shot_completion_warning(&sr, exit_code, false);
             Ok(exit_code)
@@ -1623,7 +1050,7 @@ async fn execute_cli_command_impl(
                 .map_err(map_thin_err)?;
             let tokens = parse_auth_tokens(&body)?;
             save_refreshed_profile_tokens(profile.as_deref(), &tokens)?;
-            println!("  {} {}", theme::icon_ok(), "Token refreshed".green());
+            stdout_println!("  {} {}", theme::icon_ok(), "Token refreshed".green());
             Ok(ExitCode::Success)
         }
 
@@ -1665,46 +1092,10 @@ async fn execute_cli_command_impl(
             .await
         }
 
-        Some(Command::Task(mut args)) => match args.command.take() {
-            Some(TaskSubcommand::Run(run_args)) => {
-                execute_headless_task_run(
-                    run_args,
-                    profile.as_deref(),
-                    global_model.as_deref(),
-                    api,
-                    cli_context,
-                )
-                .await
-            }
-            Some(TaskSubcommand::Queue(queue_args)) => {
-                crate::cli::task::task_queue_command::execute_task_queue(queue_args, cli_context)
-                    .await
-            }
-            Some(TaskSubcommand::Worker(worker_args)) => {
-                execute_task_worker(
-                    worker_args,
-                    profile.as_deref(),
-                    global_model.as_deref(),
-                    api,
-                    cli_context,
-                )
-                .await
-            }
-            Some(TaskSubcommand::Result(result_args)) => {
-                crate::cli::task::task_result_command::execute_task_result(result_args).await
-            }
-            _ => {
-                execute_repl_bridge_command(
-                    "/task",
-                    &render_task_args(&args),
-                    profile.as_deref(),
-                    global_model.as_deref(),
-                    api,
-                    cli_context,
-                )
-                .await
-            }
-        },
+        Some(Command::Work(command)) => {
+            let token = fresh_access_token_or_error(api, profile.as_deref()).await?;
+            crate::cli::work_command::execute_work_command(command, &token, api).await
+        }
 
         Some(Command::Memory(args)) => {
             execute_repl_bridge_command(
@@ -1848,7 +1239,7 @@ async fn execute_cli_command_impl(
                             args.output.as_deref(),
                         ) {
                             Ok(p) => {
-                                println!("Context snapshot written to {}", p.display());
+                                stdout_println!("Context snapshot written to {}", p.display());
                                 Ok(ExitCode::Success)
                             }
                             Err(e) => {
@@ -1862,6 +1253,18 @@ async fn execute_cli_command_impl(
         }
 
         Some(Command::Chat(args)) => {
+            // Anchor before any token/session/model/spawner await so the
+            // process-level deadline covers the complete one-shot lifecycle.
+            let one_shot_terminal_deadline = args.max_wall_time_seconds.map(|seconds| {
+                tokio::time::Instant::now() + std::time::Duration::from_secs(seconds)
+            });
+            let one_shot_execution_time_budget = one_shot_terminal_deadline.map(|deadline| {
+                crate::cli::chat_stream::ExecutionTimeBudgetClock::new(
+                    deadline,
+                    WALL_DEADLINE_TERMINAL_RESERVE,
+                    WALL_BUDGET_REQUEST_SAFETY_MARGIN,
+                )
+            });
             // Handle --no-color or non-terminal stderr: disable ANSI colors via NO_COLOR env.
             // crossterm checks NO_COLOR to suppress escape sequences globally.
             if args.no_color
@@ -1911,17 +1314,24 @@ async fn execute_cli_command_impl(
                     model,
                     resume_session_id.as_deref(),
                     no_instructions,
-                    max_budget,
                     &interactive_context,
                 )
                 .await?;
                 return Ok(ExitCode::Success);
             };
 
-            let (_, _, _, _token) = get_profile_and_token(profile.as_deref())?;
-            let token = fresh_access_token_or_error(api, profile.as_deref()).await?;
+            let token = if let Some(deadline) = one_shot_terminal_deadline {
+                tokio::time::timeout_at(
+                    deadline,
+                    fresh_access_token_or_error(api, profile.as_deref()),
+                )
+                .await
+                .map_err(|_| "request wall deadline expired during authentication".to_string())??
+            } else {
+                fresh_access_token_or_error(api, profile.as_deref()).await?
+            };
             let explicit_session_id = args.session_id.clone();
-            let mut session_routing = resolve_one_shot_session_routing(
+            let session_routing_future = resolve_one_shot_session_routing(
                 api,
                 profile.as_deref(),
                 match explicit_session_id {
@@ -1929,17 +1339,60 @@ async fn execute_cli_command_impl(
                     None => cli_context.session_id.clone(),
                 },
                 !args.no_resume,
-            )
-            .await?;
+            );
+            let mut session_routing = if let Some(deadline) = one_shot_terminal_deadline {
+                tokio::time::timeout_at(deadline, session_routing_future)
+                    .await
+                    .map_err(|_| {
+                        "request wall deadline expired during session routing".to_string()
+                    })??
+            } else {
+                session_routing_future.await?
+            };
+            let admitted_session_id = session_routing.server_session_id.clone();
+            let request_session_execution_lease =
+                crate::cli::session::session_execution_lease::RequestSessionExecutionLease::new(
+                    admitted_session_id.as_deref(),
+                )
+                .map_err(|failure| failure.message)?;
+            if let Some(session_id) = admitted_session_id.as_deref() {
+                let refresh_future = resolve_one_shot_session_routing(
+                    api,
+                    profile.as_deref(),
+                    Some(session_id.to_string()),
+                    !args.no_resume,
+                );
+                session_routing = if let Some(deadline) = one_shot_terminal_deadline {
+                    tokio::time::timeout_at(deadline, refresh_future)
+                        .await
+                        .map_err(|_| {
+                            "request wall deadline expired while refreshing admitted session"
+                                .to_string()
+                        })??
+                } else {
+                    refresh_future.await?
+                };
+                if session_routing.server_session_id.as_deref() != Some(session_id) {
+                    return Err("session routing changed after execution admission".to_string());
+                }
+            }
             let session_id = session_routing.server_session_id.clone();
-            let resolved_model = resolve_one_shot_model(
+            let model_future = resolve_one_shot_model(
                 api,
                 &token,
                 args.model.as_deref(),
                 session_routing.restored_model(),
                 global_model.as_deref(),
-            )
-            .await?;
+            );
+            let resolved_model = if let Some(deadline) = one_shot_terminal_deadline {
+                tokio::time::timeout_at(deadline, model_future)
+                    .await
+                    .map_err(|_| {
+                        "request wall deadline expired during model resolution".to_string()
+                    })??
+            } else {
+                model_future.await?
+            };
             let effective_model = resolved_model.model;
             let effective_offering_id = resolved_model.offering_id;
             let effective_permission_mode = effective_one_shot_permission_mode(
@@ -1977,14 +1430,20 @@ async fn execute_cli_command_impl(
             // One-shot chat uses the same local agent spawner wiring as the
             // REPL so agent(action='spawn', ...) has the same behavior.
             let root_agent_id = format!("root-{}", uuid::Uuid::new_v4());
-            let one_shot_spawner = super::agent_runtime::build_one_shot_spawner(
+            let spawner_future = super::agent_runtime::build_one_shot_spawner(
                 api,
                 token.clone(),
                 astra_runtime::skills::default_unified_registry().clone(),
                 session_id.clone(),
                 effective_model.clone(),
-            )
-            .await;
+            );
+            let one_shot_spawner = if let Some(deadline) = one_shot_terminal_deadline {
+                tokio::time::timeout_at(deadline, spawner_future)
+                    .await
+                    .map_err(|_| "request wall deadline expired during agent setup".to_string())?
+            } else {
+                spawner_future.await
+            };
 
             // Keep a clone of the Arc so we can drain background
             // spawned children before process exit — otherwise
@@ -1993,9 +1452,17 @@ async fn execute_cli_command_impl(
             // ForkCacheEvent / child telemetry they would have
             // emitted on their first response.
             let spawner_handle_for_drain = one_shot_spawner.clone();
-            let (stream_event_tx, _stream_event_writer) = if args.stream_events {
+            let (stream_event_tx, stream_event_writer) = if let Some(path) =
+                args.stream_events.as_deref()
+            {
                 let (tx, rx) = crate::cli::chat_stream::stream_event_channel();
-                let handle = crate::cli::stream::stream_events_writer::spawn_stderr_writer(rx);
+                let handle = crate::cli::stream::stream_events_writer::spawn_file_writer(rx, path)
+                    .map_err(|error| {
+                        format!(
+                            "failed to open stream-event file {}: {error}",
+                            path.display()
+                        )
+                    })?;
                 (Some(tx), Some(handle))
             } else {
                 (None, None)
@@ -2006,17 +1473,6 @@ async fn execute_cli_command_impl(
             let harness_trace = std::sync::Arc::new(std::sync::RwLock::new(
                 astra_harness::SessionTrace::new(None),
             ));
-            // Wire the MO-backed task store for `astra chat -m` single-shot
-            // runs so unified `task_board(action=...)` calls in this path write
-            // through to `session_todos`. Without this the tool runs against
-            // a throwaway in-memory manager and the Tier 1 board is invisible
-            // across edge/cloud boundaries.
-            let chat_task_manager = build_one_shot_task_manager(
-                profile.as_deref(),
-                &api.api_origin(),
-                session_id.as_deref(),
-            )
-            .await;
             let chat_ctx = crate::cli::chat_stream::BasicCliChatContext {
                 api,
                 auth_profile: profile.as_deref(),
@@ -2032,8 +1488,6 @@ async fn execute_cli_command_impl(
                 unified_skill_registry: astra_runtime::skills::default_unified_registry(),
                 agent_spawner: Some(one_shot_spawner),
                 root_agent_id: Some(&root_agent_id),
-                task_manager: Some(chat_task_manager),
-                task_notify_tx: None,
                 bg_task_commands: None,
                 bg_task_list_cache: None,
                 bash_detach_slot: None,
@@ -2046,25 +1500,169 @@ async fn execute_cli_command_impl(
                 #[cfg(feature = "harness")]
                 benchmark_profile: args.benchmark_profile,
             };
+            let wall_deadline_cancel_token = args
+                .max_wall_time_seconds
+                .map(|_| std::sync::Arc::new(tokio_util::sync::CancellationToken::new()));
+            let wall_deadline_incremental_state = args.max_wall_time_seconds.map(|_| {
+                std::sync::Arc::new(
+                    astra_turn_core::turn_event_sink::IncrementalTurnState::default(),
+                )
+            });
             let turn_options = crate::cli::turn::turn_facade::BasicCliTurnOptions {
                 pre_loaded_messages: continuation_messages.take(),
                 activated_deferred_tool_names,
                 append_system_prompt: args.append_system_prompt.clone(),
+                execution_time_budget: one_shot_execution_time_budget,
                 disable_session_not_found_retry: args.no_resume || args.session_id.is_some(),
                 turn_index: Some(session_routing.next_server_turn_index()),
+                cancel_token: wall_deadline_cancel_token.clone(),
+                incremental_state: wall_deadline_incremental_state.clone(),
+                request_session_execution_lease: Some(request_session_execution_lease.clone()),
                 ..Default::default()
             };
             let turn_start = std::time::Instant::now();
-            let turn_result = crate::cli::turn::execute_basic_cli_turn(
-                &chat_ctx,
-                &token,
-                session_id.as_deref(),
-                profile.as_deref(),
-                &mut pm,
-                &mut skill_qt,
-                turn_options,
-            )
-            .await;
+            let terminal_deadline = one_shot_terminal_deadline;
+            let execution_deadline =
+                terminal_deadline.map(|deadline| deadline - WALL_DEADLINE_TERMINAL_RESERVE);
+            let mut wall_deadline_reached = false;
+            let mut wall_deadline_root_settled = false;
+            let mut wall_deadline_server_terminal_settled = false;
+            let turn_result = {
+                let turn_future = crate::cli::turn::execute_basic_cli_turn(
+                    &chat_ctx,
+                    &token,
+                    session_id.as_deref(),
+                    profile.as_deref(),
+                    &mut pm,
+                    &mut skill_qt,
+                    turn_options,
+                );
+                tokio::pin!(turn_future);
+                if let Some(deadline) = execution_deadline {
+                    tokio::select! {
+                        result = &mut turn_future => result,
+                        _ = tokio::time::sleep_until(deadline) => {
+                            wall_deadline_reached = true;
+                            if let Some(cancel_token) = wall_deadline_cancel_token.as_ref() {
+                                cancel_token.cancel();
+                            }
+                            let snapshot = wall_deadline_incremental_state
+                                .as_ref()
+                                .map(|state| state.snapshot())
+                                .unwrap_or_default();
+                            async {
+                                let run_id = snapshot.run_id.clone().ok_or_else(|| crate::TurnFailure {
+                                    error: "request wall deadline reached before an authoritative run id was observed".to_string(),
+                                    partial: Default::default(),
+                                })?;
+                                let terminal = terminal_deadline.expect("deadline pair is constructed together");
+                                let terminal_settle_deadline = terminal
+                                    .checked_sub(WALL_DEADLINE_SERVER_TERMINAL_SETTLE_MARGIN)
+                                    .unwrap_or(terminal);
+                                let cancel_deadline = terminal_settle_deadline;
+                                let mut cancellation_accepted = false;
+                                loop {
+                                    let remaining = cancel_deadline
+                                        .saturating_duration_since(tokio::time::Instant::now());
+                                    if remaining.is_zero() {
+                                        return Err(crate::TurnFailure {
+                                            error: format!("request wall deadline cancellation did not settle run {run_id}"),
+                                            partial: Default::default(),
+                                        });
+                                    }
+                                    if !cancellation_accepted {
+                                        match tokio::time::timeout(
+                                            remaining,
+                                            api.cancel_run(Some(&token), &run_id),
+                                        ).await {
+                                            Ok(Ok(response)) if response
+                                                .get("execution_settled")
+                                                .and_then(serde_json::Value::as_bool)
+                                            == Some(true) => {
+                                                wall_deadline_server_terminal_settled = true;
+                                                break;
+                                            }
+                                            Ok(Ok(response)) if response
+                                                .get("status")
+                                                .and_then(serde_json::Value::as_str)
+                                                == Some("cancellation_requested") => {
+                                                    cancellation_accepted = true;
+                                                }
+                                            Ok(Ok(response)) if durable_run_is_terminal(
+                                                response.get("status").and_then(serde_json::Value::as_str),
+                                            ) => {
+                                                wall_deadline_server_terminal_settled = true;
+                                                break;
+                                            }
+                                            Ok(Ok(_)) => {}
+                                            Ok(Err(error)) => return Err(crate::TurnFailure {
+                                                error: format!("request wall deadline could not cancel run {run_id}: {error}"),
+                                                partial: Default::default(),
+                                            }),
+                                            Err(_) => return Err(crate::TurnFailure {
+                                                error: format!("request wall deadline cancellation timed out for run {run_id}"),
+                                                partial: Default::default(),
+                                            }),
+                                        }
+                                    } else {
+                                        match tokio::time::timeout(
+                                            remaining,
+                                            api.get_run(Some(&token), &run_id),
+                                        ).await {
+                                            Ok(Ok(run)) if durable_run_is_terminal(
+                                                run.get("status").and_then(serde_json::Value::as_str),
+                                            ) => {
+                                                wall_deadline_server_terminal_settled = true;
+                                                break;
+                                            }
+                                            Ok(Ok(_)) => {}
+                                            Ok(Err(error)) => return Err(crate::TurnFailure {
+                                                error: format!("request wall deadline could not verify run {run_id} cancellation: {error}"),
+                                                partial: Default::default(),
+                                            }),
+                                            Err(_) => return Err(crate::TurnFailure {
+                                                error: format!("request wall deadline cancellation status check timed out for run {run_id}"),
+                                                partial: Default::default(),
+                                            }),
+                                        }
+                                    }
+                                    tokio::time::sleep(
+                                        remaining.min(std::time::Duration::from_millis(100)),
+                                    ).await;
+                                }
+                                let drain_budget = terminal
+                                    .saturating_duration_since(tokio::time::Instant::now())
+                                    .min(std::time::Duration::from_secs(20));
+                                match tokio::time::timeout(
+                                    drain_budget,
+                                    &mut turn_future,
+                                )
+                                .await
+                                {
+                                    Ok(result) => {
+                                        wall_deadline_root_settled = true;
+                                        match result {
+                                            Ok(result) => Ok(result),
+                                            Err(_) => Ok(stream_result_from_incremental_snapshot(
+                                                wall_deadline_incremental_state
+                                                    .as_ref()
+                                                    .map(|state| state.snapshot())
+                                                    .unwrap_or(snapshot),
+                                            )),
+                                        }
+                                    }
+                                    Err(_) => Err(crate::TurnFailure {
+                                        error: format!("request wall deadline root drain timed out for run {run_id}"),
+                                        partial: Default::default(),
+                                    }),
+                                }
+                            }.await
+                        }
+                    }
+                } else {
+                    turn_future.as_mut().await
+                }
+            };
 
             // Drain any background-spawned child agents before
             // returning. Without this, background tasks (the
@@ -2078,20 +1676,117 @@ async fn execute_cli_command_impl(
             // [fork-cache] stderr lines (if any) appear before the
             // JSON/text result — operators grepping stderr don't
             // see the order swap.
-            let background_agent_results = spawner_handle_for_drain
-                .shutdown_and_wait(std::time::Duration::from_secs(30))
-                .await;
+            let mut terminal_settlement_error = None;
+            let background_agent_results = if wall_deadline_reached
+                && spawner_handle_for_drain.background_task_count() > 0
+            {
+                terminal_settlement_error = Some(
+                    "request wall deadline reached with background agents still active".to_string(),
+                );
+                Vec::new()
+            } else if wall_deadline_reached {
+                // No task owns a background execution resource, so there is
+                // nothing to drain and no unbounded cancellation tail.
+                Vec::new()
+            } else {
+                spawner_handle_for_drain
+                    .shutdown_and_wait(std::time::Duration::from_secs(30))
+                    .await
+            };
 
             // Child progress shares the root stream. Close and flush it only
             // after every terminal child event has had a chance to arrive.
             drop(chat_ctx);
-            if let Some(handle) = _stream_event_writer {
-                let _ = handle.await;
+            if let Some(mut handle) = stream_event_writer {
+                if let Some(deadline) = terminal_deadline {
+                    let writer_budget = deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .min(std::time::Duration::from_secs(5));
+                    match tokio::time::timeout(writer_budget, &mut handle).await {
+                        Err(_) => {
+                            handle.abort();
+                            terminal_settlement_error = Some(
+                                "request wall deadline stream-event writer did not settle"
+                                    .to_string(),
+                            );
+                        }
+                        Ok(Err(error)) => {
+                            terminal_settlement_error =
+                                Some(format!("stream-event writer task failed: {error}"));
+                        }
+                        Ok(Ok(Err(error))) => {
+                            terminal_settlement_error =
+                                Some(format!("stream-event file write failed: {error}"));
+                        }
+                        Ok(Ok(Ok(()))) => {}
+                    }
+                } else {
+                    match handle.await {
+                        Err(error) => {
+                            terminal_settlement_error =
+                                Some(format!("stream-event writer task failed: {error}"));
+                        }
+                        Ok(Err(error)) => {
+                            terminal_settlement_error =
+                                Some(format!("stream-event file write failed: {error}"));
+                        }
+                        Ok(Ok(())) => {}
+                    }
+                }
             }
 
             let mut sr = match turn_result {
                 Ok(sr) => sr,
+                Err(e) if crate::cli::turn::turn_facade::is_settled_stdout_closure(&e) => {
+                    return Ok(ExitCode::Success);
+                }
                 Err(e) => {
+                    if let Some(mut sr) = stream_result_from_resumable_turn_failure(&e) {
+                        sr.background_agent_results = background_agent_results.clone();
+                        let background_agent_section = sr.integrate_background_agent_results();
+                        let exit_code = finalize_one_shot_stream_result_with_request_lease(
+                            profile.as_deref(),
+                            effective_model.as_deref(),
+                            &message,
+                            &mut sr,
+                            turn_start,
+                            request_session_execution_lease.as_ref(),
+                        );
+
+                        if args.json {
+                            let mut json_output = final_json_output(&sr, exit_code);
+                            if let Some(obj) = json_output.as_object_mut() {
+                                obj.insert("ttft_ms".to_string(), serde_json::json!(sr.ttft_ms));
+                                obj.insert(
+                                    "context_ms".to_string(),
+                                    serde_json::json!(sr.context_ms),
+                                );
+                                obj.insert(
+                                    "background_agent_results".to_string(),
+                                    serde_json::json!(
+                                        sr.background_agent_results
+                                            .iter()
+                                            .map(|(id, text)| serde_json::json!({
+                                                "agent_id": id,
+                                                "result": text
+                                            }))
+                                            .collect::<Vec<_>>()
+                                    ),
+                                );
+                            }
+                            write_headless_stdout_line(
+                                &serde_json::to_string_pretty(&json_output).unwrap_or_default(),
+                            )?;
+                            return Ok(exit_code);
+                        }
+                        if quiet {
+                            write_headless_stdout_line(&sr.full_text)?;
+                        } else if let Some(section) = background_agent_section {
+                            write_headless_stdout_line(&format!("\n\n{section}"))?;
+                        }
+                        print_one_shot_completion_warning(&sr, exit_code, args.json);
+                        return Ok(exit_code);
+                    }
                     let mut error = e.error;
                     if let Some(section) =
                         format_background_agent_results(&background_agent_results)
@@ -2102,15 +1797,28 @@ async fn execute_cli_command_impl(
                     return Err(error);
                 }
             };
+            if wall_deadline_reached {
+                if !wall_deadline_root_settled {
+                    return Err(
+                        "request wall deadline ended without root execution settlement".to_string(),
+                    );
+                }
+                if let Some(error) = terminal_settlement_error {
+                    return Err(error);
+                }
+                apply_wall_deadline_interruption(&mut sr, wall_deadline_server_terminal_settled);
+                retain_wall_deadline_partial_canonical_messages(&mut sr, &message);
+            }
             sr.background_agent_results = background_agent_results;
             let background_agent_section = sr.integrate_background_agent_results();
 
-            let exit_code = finalize_one_shot_stream_result(
+            let exit_code = finalize_one_shot_stream_result_with_request_lease(
                 profile.as_deref(),
                 effective_model.as_deref(),
                 &message,
                 &mut sr,
                 turn_start,
+                request_session_execution_lease.as_ref(),
             );
 
             // Output result
@@ -2132,18 +1840,17 @@ async fn execute_cli_command_impl(
                         ),
                     );
                 }
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json_output).unwrap_or_default()
-                );
+                write_headless_stdout_line(
+                    &serde_json::to_string_pretty(&json_output).unwrap_or_default(),
+                )?;
                 return Ok(exit_code);
             } else if quiet {
                 // Quiet mode: just print the text without formatting
-                println!("{}", sr.full_text);
+                write_headless_stdout_line(&sr.full_text)?;
             } else if let Some(section) = background_agent_section {
                 // The primary assistant response was already streamed. Surface
                 // only the newly reconciled child section here.
-                println!("\n\n{section}");
+                write_headless_stdout_line(&format!("\n\n{section}"))?;
             }
             // Normal mode output is already handled by stream_chat_sse
 
@@ -2224,6 +1931,22 @@ async fn execute_cli_command_impl(
             Ok(ExitCode::Success)
         }
 
+        Some(Command::Session(SessionCmd::Cancel(args))) => {
+            let session_id = validated_cli_session_arg(&args.session_id)?;
+            let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
+            let body = api
+                .post_session_cancel_text(&token, session_id)
+                .await
+                .map_err(map_thin_err)?;
+            clear_profile_last_session_if_matches_or_warn(
+                profile.as_deref(),
+                session_id,
+                "command_router:session_cancel",
+            );
+            print_json_or_raw(&body);
+            Ok(ExitCode::Success)
+        }
+
         Some(Command::Session(SessionCmd::Delete(args))) => {
             let session_id = validated_cli_session_arg(&args.session_id)?;
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
@@ -2237,7 +1960,7 @@ async fn execute_cli_command_impl(
                 "command_router:session_delete",
             );
             if body.is_empty() {
-                println!("  {} {}", theme::icon_ok(), "Deleted".green());
+                stdout_println!("  {} {}", theme::icon_ok(), "Deleted".green());
             } else {
                 print_json_or_raw(&body);
             }
@@ -2277,7 +2000,7 @@ async fn execute_cli_command_impl(
                 suggested_name.as_deref().unwrap_or(&fallback_name),
             );
             write_downloaded_capture(&output_path, &bytes)?;
-            println!(
+            stdout_println!(
                 "{} Saved latest {} for session {} to {}",
                 theme::icon_ok(),
                 args.artifact_kind,
@@ -2296,7 +2019,9 @@ async fn execute_cli_command_impl(
 
         Some(Command::Model(ModelCmd::List)) => {
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let body = api.get_models_text(&token).await.map_err(map_thin_err)?;
+            let body = session_runtime::load_server_model_catalog_json(api, &token)
+                .await
+                .map_err(|error| error.to_string())?;
             print_json_or_raw(&body);
             Ok(ExitCode::Success)
         }
@@ -2477,7 +2202,9 @@ async fn execute_cli_command_impl(
         // ── Shell completion script generation ──────────────────────────
         Some(Command::Completion(args)) => {
             let mut cmd = Cli::command();
-            clap_complete::generate(args.shell, &mut cmd, "astra", &mut std::io::stdout());
+            let mut completion = Vec::new();
+            clap_complete::generate(args.shell, &mut cmd, "astra", &mut completion);
+            write_headless_stdout(&completion)?;
             Ok(ExitCode::Success)
         }
 
@@ -2504,8 +2231,161 @@ async fn execute_cli_command_impl(
 /// that field to avoid treating those as tool failures — a grep that
 /// finds nothing or a diff that reports differences is a successful tool
 /// execution, not an error the agent needs to recover from.
+fn apply_wall_deadline_interruption(sr: &mut StreamResult, server_terminal_verified: bool) {
+    sr.final_state = "interrupted".to_string();
+    sr.interruption_kind = Some("execution_incomplete".to_string());
+    sr.interruption = Some(serde_json::json!({
+        "kind": "execution_incomplete",
+        "reason": "request_wall_deadline_reached",
+        "resumable": true,
+    }));
+    sr.server_terminal_unverified = !server_terminal_verified;
+    if sr.full_text.trim().is_empty() {
+        sr.full_text = "Execution stopped at the request wall-time boundary before all work could be verified.".to_string();
+    }
+}
+
+fn retain_interrupted_partial_canonical_messages(sr: &mut StreamResult, user_message: &str) {
+    if !sr.final_messages.is_empty()
+        || sr.full_text.trim().is_empty()
+        || sr.final_state != "interrupted"
+    {
+        return;
+    }
+    // Any interrupted transport can return only the live incremental
+    // snapshot. Preserve the exact user input and already-observed assistant
+    // bytes as a resumable canonical partial; never turn this into a completed
+    // turn or discard progress merely because the richer transcript did not
+    // finish materializing.  Tool provenance remains separately fail-closed.
+    sr.final_messages = vec![
+        serde_json::json!({"role": "user", "content": user_message}),
+        serde_json::json!({"role": "assistant", "content": sr.full_text}),
+    ];
+}
+
+fn retain_wall_deadline_partial_canonical_messages(sr: &mut StreamResult, user_message: &str) {
+    retain_interrupted_partial_canonical_messages(sr, user_message);
+}
+
+fn stream_result_from_incremental_snapshot(
+    snapshot: astra_turn_core::turn_event_sink::TurnIncrementalSnapshot,
+) -> StreamResult {
+    StreamResult {
+        session_id: snapshot.session_id,
+        run_id: snapshot.run_id,
+        full_text: snapshot.partial_text,
+        prompt_tokens: snapshot.prompt_tokens,
+        completion_tokens: snapshot.completion_tokens,
+        cache_read_tokens: snapshot.cache_read_tokens,
+        cache_creation_tokens: snapshot.cache_creation_tokens,
+        // The retained record window is intentionally capped. Use the
+        // monotonic logical counter for the aggregate and keep the window
+        // separately as partial audit evidence.
+        tool_calls_count: snapshot.tool_calls_count,
+        tools_used: snapshot.tools_used,
+        tool_call_records: snapshot.tool_call_records,
+        llm_rounds: snapshot.llm_rounds,
+        token_usage_coverage: snapshot.token_usage_coverage,
+        tool_record_coverage_partial: true,
+        ..StreamResult::default()
+    }
+}
+
 fn compute_exit_code(sr: &StreamResult) -> ExitCode {
-    stream_result_exit_code(sr)
+    let is_error = |record: &astra_services::session_journal::ToolCallRecord| {
+        if record.effective_disposition()
+            != astra_services::session_journal::ToolCallDisposition::Executed
+        {
+            return false;
+        }
+        match record.exit_semantics.as_deref().and_then(|tag| {
+            serde_json::from_value::<astra_tools::exit_semantics::ExitSemantics>(
+                serde_json::Value::String(tag.to_string()),
+            )
+            .ok()
+        }) {
+            Some(
+                astra_tools::exit_semantics::ExitSemantics::Success
+                | astra_tools::exit_semantics::ExitSemantics::EmptyResult
+                | astra_tools::exit_semantics::ExitSemantics::DomainNegative
+                | astra_tools::exit_semantics::ExitSemantics::PipelineTruncated,
+            ) => false,
+            None => !record.ok,
+            Some(
+                astra_tools::exit_semantics::ExitSemantics::TimedOut
+                | astra_tools::exit_semantics::ExitSemantics::Cancelled
+                | astra_tools::exit_semantics::ExitSemantics::Signaled
+                | astra_tools::exit_semantics::ExitSemantics::ExecutionError,
+            ) => true,
+        }
+    };
+
+    if sr.session_persistence_error.is_some() {
+        return ExitCode::PersistenceError;
+    }
+    // A typed interruption is the terminal lifecycle authority once the
+    // request owner has confirmed execution settlement.  Its partial ledger
+    // commonly ends in the tool cancellation that made settlement possible;
+    // that cancellation must not demote the resumable outcome to an ordinary
+    // tool failure (exit 1), which benchmark/process callers cannot
+    // distinguish from an unstructured crash.  Durability failure remains a
+    // harder error and is intentionally checked first.
+    if sr.final_state == "interrupted" {
+        return ExitCode::Partial;
+    }
+    if !sr.server_terminal_authoritative
+        && sr.tool_call_records.iter().any(&is_error)
+        && sr
+            .tool_call_records
+            .last()
+            .is_none_or(|record| is_error(record))
+    {
+        return ExitCode::ToolFailure;
+    }
+    ExitCode::Success
+}
+
+/// Classify the user-visible terminal contract without turning advisory
+/// evidence into another execution/retry authority. A natural-language stop
+/// can still be useful output, but an active exact-argument failure or
+/// rejection means Astra cannot honestly label the result verified.
+fn completion_disposition(sr: &StreamResult, exit_code: ExitCode) -> &'static str {
+    if exit_code != ExitCode::Success {
+        return if sr.final_state == "interrupted" {
+            "interrupted"
+        } else {
+            "failed"
+        };
+    }
+    if sr.server_terminal_unverified {
+        return "responded_unverified";
+    }
+    if sr.server_terminal_authoritative {
+        return "completed";
+    }
+    let unresolved = !astra_turn_core::evaluation::active_execution_failure_operation_keys(
+        &sr.tool_call_records,
+    )
+    .is_empty()
+        || !astra_turn_core::evaluation::active_rejected_operation_keys(&sr.tool_call_records)
+            .is_empty();
+    if unresolved {
+        "responded_unverified"
+    } else {
+        "completed"
+    }
+}
+
+fn error_kind_for_exit_code(exit_code: ExitCode) -> Option<&'static str> {
+    match exit_code {
+        ExitCode::Success => None,
+        ExitCode::ToolFailure => Some("tool_failure"),
+        ExitCode::Cancelled => Some("cancelled"),
+        ExitCode::ApiError => Some("api_error"),
+        ExitCode::PersistenceError => Some("persistence_error"),
+        ExitCode::Partial => Some("partial"),
+        ExitCode::Unfinished => Some("unfinished"),
+    }
 }
 
 fn gateway_env_context() -> (Option<String>, Option<String>) {
@@ -2544,19 +2424,9 @@ fn final_json_output_with_context(
         sr.cache_creation_tokens,
     )
     .total_input_tokens();
-    let mut tool_result_class_counts = serde_json::Map::new();
-    for class in sr
-        .tool_call_records
-        .iter()
-        .filter_map(|record| record.result_class.as_deref())
-    {
-        let next = tool_result_class_counts
-            .get(class)
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0)
-            + 1;
-        tool_result_class_counts.insert(class.to_string(), serde_json::json!(next));
-    }
+    let tool_result_class_counts = serde_json::to_value(sr.tool_ledger_aggregate.result_classes)
+        .expect("fixed tool result-class aggregate must serialize");
+    let disposition = completion_disposition(sr, exit_code);
     serde_json::json!({
         "trace_id": trace_id,
         "request_id": request_id,
@@ -2565,6 +2435,13 @@ fn final_json_output_with_context(
         "text": sr.full_text,
         "final_state": sr.final_state,
         "interruption_kind": sr.interruption_kind,
+        "server_terminal_unverified": sr.server_terminal_unverified,
+        "server_terminal_authoritative": sr.server_terminal_authoritative,
+        "tool_record_coverage": if sr.tool_record_coverage_partial {
+            "partial"
+        } else {
+            "complete"
+        },
         "tool_result_class_counts": tool_result_class_counts,
         "prompt_tokens": total_prompt_tokens,
         "fresh_prompt_tokens": sr.prompt_tokens,
@@ -2574,11 +2451,20 @@ fn final_json_output_with_context(
             "creation_tokens": sr.cache_creation_tokens,
         },
         "completion_tokens": sr.completion_tokens,
+        "token_usage_coverage": {
+            "scope": "logical_provider_calls",
+            "attempts": sr.token_usage_coverage.attempts,
+            "provider_reported": sr.token_usage_coverage.provider_reported,
+            "unavailable": sr.token_usage_coverage.unavailable,
+            "status": sr.token_usage_coverage.status(),
+        },
+        "llm_rounds": sr.llm_rounds,
         "tool_calls_count": sr.tool_calls_count,
         "tools_used": sr.tools_used,
         "persistence_error": sr.session_persistence_error,
         "exit_code": i32::from(exit_code),
-        "success": exit_code == ExitCode::Success,
+        "success": exit_code == ExitCode::Success && disposition == "completed",
+        "completion_disposition": disposition,
         "error_kind": error_kind_for_exit_code(exit_code),
     })
 }
@@ -2615,11 +2501,24 @@ pub(crate) async fn run_print_mode(
     };
     let message = apply_system_prompt(&raw_message, system_prompt);
 
-    let (_, _, _, _token) = get_profile_and_token(profile)?;
     let token = fresh_access_token_or_error(api, profile).await?;
     let mut session_routing =
         resolve_one_shot_session_routing(api, profile, cli_context.session_id.clone(), true)
             .await?;
+    let admitted_session_id = session_routing.server_session_id.clone();
+    let request_session_execution_lease =
+        crate::cli::session::session_execution_lease::RequestSessionExecutionLease::new(
+            admitted_session_id.as_deref(),
+        )
+        .map_err(|failure| failure.message)?;
+    if let Some(session_id) = admitted_session_id.as_deref() {
+        session_routing =
+            resolve_one_shot_session_routing(api, profile, Some(session_id.to_string()), true)
+                .await?;
+        if session_routing.server_session_id.as_deref() != Some(session_id) {
+            return Err("session routing changed after execution admission".to_string());
+        }
+    }
     let session_id = session_routing.server_session_id.clone();
     let resolved_model =
         resolve_one_shot_model(api, &token, None, session_routing.restored_model(), model).await?;
@@ -2657,17 +2556,6 @@ pub(crate) async fn run_print_mode(
     }
     let mut skill_qt = astra_skills::quality::SkillQualityTracker::new();
 
-    // Print mode wires an MO-backed TaskManager when available so that the
-    // `task_board` tool's writes land in `session_todos` the same way the REPL
-    // path handles them. Without this, single-shot runs silently drop to
-    // in-memory scratchpad and the Tier 1 board is invisible across turns
-    // that reuse the same `session_id`.
-    let print_task_manager = build_one_shot_task_manager(
-        profile,
-        &api.api_origin(),
-        session_routing.task_scope_session_id(),
-    )
-    .await;
     let session_turn = session_routing.next_server_turn_index();
     let stream_json_emitter = if output_format == "stream-json" {
         Some(crate::cli::stream::stream_json::StreamJsonEmitter::stdout(
@@ -2692,8 +2580,6 @@ pub(crate) async fn run_print_mode(
         unified_skill_registry: astra_runtime::skills::default_unified_registry(),
         agent_spawner: None,
         root_agent_id: None,
-        task_manager: Some(print_task_manager),
-        task_notify_tx: None,
         bg_task_commands: None,
         bg_task_list_cache: None,
         bash_detach_slot: None,
@@ -2713,6 +2599,7 @@ pub(crate) async fn run_print_mode(
         pre_loaded_messages: continuation_messages.take(),
         activated_deferred_tool_names,
         turn_index: Some(session_turn),
+        request_session_execution_lease: Some(request_session_execution_lease.clone()),
         ..Default::default()
     };
     let turn_start = std::time::Instant::now();
@@ -2728,6 +2615,9 @@ pub(crate) async fn run_print_mode(
     .await
     {
         Ok(sr) => sr,
+        Err(e) if crate::cli::turn::turn_facade::is_settled_stdout_closure(&e) => {
+            return Ok(ExitCode::Success);
+        }
         Err(e) => {
             let error = e.error;
             let partial = e.partial;
@@ -2771,21 +2661,21 @@ pub(crate) async fn run_print_mode(
         }
     };
 
-    let exit_code = finalize_one_shot_stream_result(
+    let exit_code = finalize_one_shot_stream_result_with_request_lease(
         profile,
         effective_model.as_deref(),
         &message,
         &mut sr,
         turn_start,
+        request_session_execution_lease.as_ref(),
     );
 
     match output_format {
         "json" => {
             let json_output = final_json_output(&sr, exit_code);
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json_output).unwrap_or_default()
-            );
+            write_headless_stdout_line(
+                &serde_json::to_string_pretty(&json_output).unwrap_or_default(),
+            )?;
         }
         "stream-json" => {
             let emitter = stream_json_emitter.as_ref().ok_or_else(|| {
@@ -2798,7 +2688,7 @@ pub(crate) async fn run_print_mode(
         }
         _ => {
             // text mode: just the response
-            print!("{}", sr.full_text);
+            write_headless_stdout(sr.full_text.as_bytes())?;
         }
     }
 
@@ -2814,35 +2704,35 @@ pub(crate) async fn run_print_mode(
 // ═══════════════════════════════════════════════════════ Doctor ═══════════
 
 async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) {
-    println!("\n{}", "Astra Doctor".bold());
-    println!("{}\n", "═".repeat(50).dim());
+    stdout_println!("\n{}", "Astra Doctor".bold());
+    stdout_println!("{}\n", "═".repeat(50).dim());
     let mut issues: Vec<String> = Vec::new();
 
     // 1. Version
     let version = env!("CARGO_PKG_VERSION");
-    println!("{}", "Version".bold().magenta());
-    println!("  {} {}", "Binary:".dim(), version);
-    println!(
+    stdout_println!("{}", "Version".bold().magenta());
+    stdout_println!("  {} {}", "Binary:".dim(), version);
+    stdout_println!(
         "  {} {}",
         "Executable:".dim(),
         std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "unknown".into())
     );
-    println!();
+    stdout_println!();
 
     // 2. API server connectivity
-    println!("{}", "API Server".bold().magenta());
-    println!("  {} {}", "URL:".dim(), api.api_origin());
+    stdout_println!("{}", "API Server".bold().magenta());
+    stdout_println!("  {} {}", "URL:".dim(), api.api_origin());
     match api.get_health_text().await {
-        Ok(body) => println!(
+        Ok(body) => stdout_println!(
             "  {} {} {}",
             "Status:".dim(),
             theme::icon_ok(),
             format!("Healthy ({})", body.trim()).green()
         ),
         Err(e) => {
-            println!(
+            stdout_println!(
                 "  {} {} {}",
                 "Status:".dim(),
                 "✗".red(),
@@ -2851,13 +2741,13 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
             issues.push(format!("API server unreachable: {e}"));
         }
     }
-    println!();
+    stdout_println!();
 
     // 3. Authentication
-    println!("{}", "Authentication".bold().magenta());
+    stdout_println!("{}", "Authentication".bold().magenta());
     let creds = load_credentials();
     let name = profile_name(profile, &creds);
-    println!("  {} {}", "Profile:".dim(), name);
+    stdout_println!("  {} {}", "Profile:".dim(), name);
     match get_profile_and_token(profile) {
         Ok((_, _, _, token)) => {
             match api.get_auth_me_text(&token).await {
@@ -2869,14 +2759,14 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
                             .or_else(|| val.get("name"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("authenticated");
-                        println!(
+                        stdout_println!(
                             "  {} {} {}",
                             "Status:".dim(),
                             theme::icon_ok(),
                             format!("Logged in as {user}").green()
                         );
                     } else {
-                        println!(
+                        stdout_println!(
                             "  {} {} {}",
                             "Status:".dim(),
                             theme::icon_ok(),
@@ -2885,7 +2775,7 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
                     }
                 }
                 Err(_) => {
-                    println!(
+                    stdout_println!(
                         "  {} {} {}",
                         "Status:".dim(),
                         theme::icon_warn(),
@@ -2898,7 +2788,7 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
             }
         }
         Err(e) => {
-            println!(
+            stdout_println!(
                 "  {} {} {}",
                 "Status:".dim(),
                 "✗".red(),
@@ -2907,27 +2797,27 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
             issues.push(format!("Not authenticated: {e}"));
         }
     }
-    println!();
+    stdout_println!();
 
     // 4. Project config
-    println!("{}", "Project Configuration".bold().magenta());
+    stdout_println!("{}", "Project Configuration".bold().magenta());
     let cwd = std::env::current_dir().unwrap_or_default();
     let astra_dir = cwd.join(".astra");
     if astra_dir.is_dir() {
-        println!(
+        stdout_println!(
             "  {} {} {}",
             ".astra/:".dim(),
             theme::icon_ok(),
             "Found".green()
         );
     } else {
-        println!("  {} {}", ".astra/:".dim(), "Not found (optional)".dim());
+        stdout_println!("  {} {}", ".astra/:".dim(), "Not found (optional)".dim());
     }
-    println!("  {} {}", "Working dir:".dim(), cwd.display());
-    println!();
+    stdout_println!("  {} {}", "Working dir:".dim(), cwd.display());
+    stdout_println!();
 
     // 5. MCP configuration
-    println!("{}", "MCP Configuration".bold().magenta());
+    stdout_println!("{}", "MCP Configuration".bold().magenta());
     for (scope, path_fn) in &[
         (
             "project",
@@ -2948,7 +2838,7 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
                                 .and_then(|v| v.as_object())
                                 .map(|m| m.len())
                                 .unwrap_or(0);
-                            println!(
+                            stdout_println!(
                                 "  {} {} {} in {}",
                                 scope,
                                 theme::icon_ok(),
@@ -2957,7 +2847,7 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
                             );
                         }
                         Err(e) => {
-                            println!(
+                            stdout_println!(
                                 "  {} {} {}",
                                 scope,
                                 "✗".red(),
@@ -2967,7 +2857,7 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
                         }
                     },
                     Err(e) => {
-                        println!(
+                        stdout_println!(
                             "  {} {} {}",
                             scope,
                             "✗".red(),
@@ -2977,42 +2867,46 @@ async fn run_doctor(api: &astra_thin_client::ThinClient, profile: Option<&str>) 
                     }
                 }
             } else {
-                println!("  {} {}", scope, "No config file".dim());
+                stdout_println!("  {} {}", scope, "No config file".dim());
             }
         }
     }
-    println!();
+    stdout_println!();
 
     // 6. Environment
-    println!("{}", "Environment".bold().magenta());
-    println!("  {} {}", "OS:".dim(), std::env::consts::OS);
-    println!("  {} {}", "Arch:".dim(), std::env::consts::ARCH);
+    stdout_println!("{}", "Environment".bold().magenta());
+    stdout_println!("  {} {}", "OS:".dim(), std::env::consts::OS);
+    stdout_println!("  {} {}", "Arch:".dim(), std::env::consts::ARCH);
     if let Ok(shell) = std::env::var("SHELL") {
-        println!("  {} {shell}", "Shell:".dim());
+        stdout_println!("  {} {shell}", "Shell:".dim());
     }
     if let Ok(term) = std::env::var("TERM") {
-        println!("  {} {term}", "Terminal:".dim());
+        stdout_println!("  {} {term}", "Terminal:".dim());
     }
-    println!();
+    stdout_println!();
 
     // Summary
     if issues.is_empty() {
-        println!("{} {}", theme::icon_ok().bold(), "No issues found".green());
+        stdout_println!("{} {}", theme::icon_ok().bold(), "No issues found".green());
     } else {
-        println!(
+        stdout_println!(
             "{} {}:",
             "Found".yellow(),
             format!("{} issue(s)", issues.len()).yellow().bold()
         );
         for issue in &issues {
-            println!("  {} {}", theme::icon_warn(), issue);
+            stdout_println!("  {} {}", theme::icon_warn(), issue);
         }
     }
 }
 
 #[cfg(test)]
 mod exit_code_tests {
-    use super::{ExitCode, StreamResult, compute_exit_code};
+    use super::{
+        ExitCode, StreamResult, WALL_BUDGET_REQUEST_SAFETY_MARGIN,
+        WALL_DEADLINE_SERVER_TERMINAL_SETTLE_MARGIN, apply_wall_deadline_interruption,
+        compute_exit_code, durable_run_is_terminal, stream_result_from_incremental_snapshot,
+    };
     use crate::cli::stream::streaming_types::VerdictEvent;
 
     fn empty_stream_result() -> StreamResult {
@@ -3023,6 +2917,140 @@ mod exit_code_tests {
     fn exit_code_success_on_empty_result() {
         let sr = empty_stream_result();
         assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+    }
+
+    #[test]
+    fn wall_deadline_is_a_typed_partial_even_with_no_terminal_server_frame() {
+        let mut sr = empty_stream_result();
+        apply_wall_deadline_interruption(&mut sr, false);
+
+        assert_eq!(sr.final_state, "interrupted");
+        assert_eq!(
+            sr.interruption_kind.as_deref(),
+            Some("execution_incomplete")
+        );
+        assert!(sr.server_terminal_unverified);
+        assert!(!sr.full_text.is_empty());
+        assert_eq!(compute_exit_code(&sr), ExitCode::Partial);
+        assert_eq!(
+            sr.interruption
+                .as_ref()
+                .and_then(|value| value.get("reason"))
+                .and_then(serde_json::Value::as_str),
+            Some("request_wall_deadline_reached")
+        );
+    }
+
+    #[test]
+    fn cancellation_requested_is_not_a_terminal_durable_run_state() {
+        assert!(!durable_run_is_terminal(Some("cancellation_requested")));
+        assert!(!durable_run_is_terminal(Some("running")));
+        assert!(!durable_run_is_terminal(None));
+        assert!(durable_run_is_terminal(Some("completed")));
+        assert!(durable_run_is_terminal(Some("failed")));
+        assert!(durable_run_is_terminal(Some("cancelled")));
+    }
+
+    #[test]
+    fn wall_deadline_keeps_a_small_terminal_serialization_margin() {
+        assert_eq!(
+            WALL_DEADLINE_SERVER_TERMINAL_SETTLE_MARGIN,
+            std::time::Duration::from_secs(5)
+        );
+        assert!(
+            WALL_DEADLINE_SERVER_TERMINAL_SETTLE_MARGIN < std::time::Duration::from_secs(70),
+            "terminal settlement must leave time for final CLI serialization"
+        );
+        assert_eq!(
+            WALL_BUDGET_REQUEST_SAFETY_MARGIN,
+            std::time::Duration::from_secs(2),
+            "request admission needs a small margin beyond terminal settlement"
+        );
+    }
+
+    #[test]
+    fn wall_deadline_preserves_a_verified_server_terminal_state() {
+        let mut sr = empty_stream_result();
+
+        apply_wall_deadline_interruption(&mut sr, true);
+
+        assert_eq!(sr.final_state, "interrupted");
+        assert!(!sr.server_terminal_unverified);
+    }
+
+    #[test]
+    fn wall_deadline_remains_partial_when_settlement_cancelled_the_last_tool() {
+        let mut sr = empty_stream_result();
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                ok: false,
+                exit_semantics: Some("cancelled".to_string()),
+                disposition: Some(astra_services::session_journal::ToolCallDisposition::Executed),
+                ..Default::default()
+            });
+
+        apply_wall_deadline_interruption(&mut sr, false);
+
+        assert_eq!(compute_exit_code(&sr), ExitCode::Partial);
+    }
+
+    #[test]
+    fn wall_deadline_snapshot_preserves_run_usage_text_and_partial_coverage() {
+        let snapshot = astra_turn_core::turn_event_sink::TurnIncrementalSnapshot {
+            prompt_tokens: 123,
+            completion_tokens: 45,
+            cache_read_tokens: 67,
+            cache_creation_tokens: 8,
+            llm_rounds: Some(4),
+            tool_calls_count: 201,
+            token_usage_coverage: astra_turn_core::chat_turn_sse_dispatch::TokenUsageCoverage {
+                attempts: 4,
+                provider_reported: 3,
+                unavailable: 1,
+            },
+            partial_text: "partial answer".to_string(),
+            tool_call_records: vec![Default::default()],
+            tools_used: vec!["bash".to_string()],
+            session_id: Some("session-1".to_string()),
+            run_id: Some("run-1".to_string()),
+        };
+
+        let sr = stream_result_from_incremental_snapshot(snapshot);
+        assert_eq!(sr.session_id.as_deref(), Some("session-1"));
+        assert_eq!(sr.run_id.as_deref(), Some("run-1"));
+        assert_eq!(sr.prompt_tokens, 123);
+        assert_eq!(sr.completion_tokens, 45);
+        assert_eq!(sr.full_text, "partial answer");
+        assert_eq!(sr.tool_calls_count, 201);
+        assert_eq!(sr.llm_rounds, Some(4));
+        assert_eq!(sr.token_usage_coverage.attempts, 4);
+        assert_eq!(sr.token_usage_coverage.provider_reported, 3);
+        assert!(sr.tool_record_coverage_partial);
+    }
+
+    #[test]
+    fn server_terminal_authority_overrides_stale_local_failure() {
+        let mut sr = empty_stream_result();
+        sr.server_terminal_authoritative = true;
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "bash".to_string(),
+                ok: false,
+                result_class: Some("execution_error".to_string()),
+                ..Default::default()
+            });
+
+        assert_eq!(compute_exit_code(&sr), ExitCode::Success);
+        assert_eq!(
+            super::completion_disposition(&sr, ExitCode::Success),
+            "completed"
+        );
+
+        sr.server_terminal_unverified = true;
+        assert_eq!(
+            super::completion_disposition(&sr, ExitCode::Success),
+            "responded_unverified"
+        );
     }
 
     #[test]
@@ -3050,8 +3078,10 @@ mod exit_code_tests {
     }
 
     #[test]
-    fn exit_code_tool_failure_takes_precedence_over_persistence_error() {
+    fn exit_code_persistence_error_overrides_interrupted_tool_failure() {
         let mut sr = empty_stream_result();
+        sr.final_state = "interrupted".into();
+        sr.interruption_kind = Some("execution_incomplete".into());
         sr.session_persistence_error = Some("failed to append one-shot journal events".into());
         sr.tool_call_records
             .push(astra_services::session_journal::ToolCallRecord {
@@ -3061,7 +3091,7 @@ mod exit_code_tests {
                 error: Some("exit code 1".to_string()),
                 ..Default::default()
             });
-        assert_eq!(compute_exit_code(&sr), ExitCode::ToolFailure);
+        assert_eq!(compute_exit_code(&sr), ExitCode::PersistenceError);
     }
 
     #[test]
@@ -3348,7 +3378,25 @@ mod final_json_output_tests {
             cache_read_tokens: 2,
             cache_creation_tokens: 1,
             tool_calls_count: 2,
+            tool_ledger_aggregate:
+                astra_turn_core::tool_ledger_receipt::ToolLedgerCanonicalAggregate {
+                    attempted: 2,
+                    terminal: 2,
+                    unresolved: 0,
+                    result_classes:
+                        astra_turn_core::tool_ledger_receipt::ToolLedgerResultClassCounts {
+                            succeeded: 2,
+                            ..Default::default()
+                        },
+                    consistent: true,
+                },
             tools_used: vec!["bash".to_string(), "read_file".to_string()],
+            llm_rounds: Some(3),
+            token_usage_coverage: astra_turn_core::chat_turn_sse_dispatch::TokenUsageCoverage {
+                attempts: 3,
+                provider_reported: 2,
+                unavailable: 1,
+            },
             ..Default::default()
         }
     }
@@ -3370,7 +3418,16 @@ mod final_json_output_tests {
         assert_eq!(output["text"], "hello");
         assert_eq!(output["final_state"], "completed");
         assert!(output["interruption_kind"].is_null());
-        assert_eq!(output["tool_result_class_counts"], serde_json::json!({}));
+        assert_eq!(
+            output["tool_result_class_counts"],
+            serde_json::json!({
+                "succeeded": 2,
+                "failed": 0,
+                "rejected": 0,
+                "reused": 0,
+                "suppressed": 0,
+            })
+        );
         assert_eq!(output["prompt_tokens"], 13);
         assert_eq!(output["fresh_prompt_tokens"], 10);
         assert!(output.get("cached_input_tokens").is_none());
@@ -3379,13 +3436,20 @@ mod final_json_output_tests {
         assert_eq!(output["cache"]["read_tokens"], 2);
         assert_eq!(output["cache"]["creation_tokens"], 1);
         assert_eq!(output["completion_tokens"], 3);
+        assert_eq!(output["token_usage_coverage"]["status"], "partial");
+        assert_eq!(output["token_usage_coverage"]["attempts"], 3);
+        assert_eq!(output["token_usage_coverage"]["provider_reported"], 2);
+        assert_eq!(output["token_usage_coverage"]["unavailable"], 1);
+        assert_eq!(output["llm_rounds"], 3);
         assert_eq!(output["tool_calls_count"], 2);
+        assert_eq!(output["tool_record_coverage"], "complete");
         assert_eq!(
             output["tools_used"],
             serde_json::json!(["bash", "read_file"])
         );
         assert_eq!(output["exit_code"], 0);
         assert_eq!(output["success"], true);
+        assert_eq!(output["completion_disposition"], "completed");
         assert!(output["error_kind"].is_null());
 
         for field in [
@@ -3401,14 +3465,87 @@ mod final_json_output_tests {
             "fresh_prompt_tokens",
             "cache",
             "completion_tokens",
+            "token_usage_coverage",
+            "llm_rounds",
             "tool_calls_count",
             "tools_used",
             "exit_code",
             "success",
+            "completion_disposition",
             "error_kind",
         ] {
             assert!(output.get(field).is_some(), "missing {field}");
         }
+    }
+
+    #[test]
+    fn final_json_marks_partial_tool_coverage_independently_of_terminal_authority() {
+        let mut sr = stream_result_for_json();
+        sr.tool_record_coverage_partial = true;
+        sr.server_terminal_authoritative = false;
+
+        let output = final_json_output_with_context(&sr, ExitCode::Success, None, None);
+
+        assert_eq!(output["tool_record_coverage"], "partial");
+        assert_eq!(output["server_terminal_authoritative"], false);
+    }
+
+    #[test]
+    fn final_json_preserves_authoritative_terminal_with_partial_local_coverage() {
+        let mut sr = stream_result_for_json();
+        // The remote server owns the complete execution ledger; this flag
+        // only describes the thin client's local per-call projection.
+        sr.tool_record_coverage_partial = true;
+        sr.server_terminal_authoritative = true;
+
+        let completed = final_json_output_with_context(&sr, ExitCode::Success, None, None);
+        assert_eq!(completed["tool_record_coverage"], "partial");
+        assert_eq!(completed["completion_disposition"], "completed");
+        assert_eq!(completed["success"], true);
+
+        sr.server_terminal_unverified = true;
+        let unverified = final_json_output_with_context(&sr, ExitCode::Success, None, None);
+        assert_eq!(unverified["completion_disposition"], "responded_unverified");
+        assert_eq!(unverified["success"], false);
+    }
+
+    #[test]
+    fn final_json_uses_canonical_result_classes_without_local_record_inference() {
+        let mut sr = stream_result_for_json();
+        sr.tool_call_records.clear();
+        sr.tool_ledger_aggregate.result_classes =
+            astra_turn_core::tool_ledger_receipt::ToolLedgerResultClassCounts {
+                succeeded: 1,
+                failed: 1,
+                ..Default::default()
+            };
+
+        let output = final_json_output_with_context(&sr, ExitCode::Success, None, None);
+
+        assert_eq!(output["tool_result_class_counts"]["succeeded"], 1);
+        assert_eq!(output["tool_result_class_counts"]["failed"], 1);
+        assert_eq!(output["tool_calls_count"], 2);
+    }
+
+    #[test]
+    fn execution_incomplete_receipt_can_never_serialize_as_success() {
+        let mut sr = stream_result_for_json();
+        sr.final_state = "interrupted".into();
+        sr.interruption_kind = Some("execution_incomplete".into());
+        sr.interruption = Some(serde_json::json!({
+            "kind": "execution_incomplete",
+            "reason": "remote_tool_receipt_unresolved",
+            "resumable": true,
+        }));
+        sr.server_terminal_authoritative = false;
+        sr.server_terminal_unverified = true;
+
+        let output = final_json_output_with_context(&sr, ExitCode::Partial, None, None);
+
+        assert_eq!(output["final_state"], "interrupted");
+        assert_eq!(output["completion_disposition"], "interrupted");
+        assert_eq!(output["success"], false);
+        assert_eq!(output["exit_code"], 5);
     }
 
     #[test]
@@ -3439,6 +3576,63 @@ mod final_json_output_tests {
             output["persistence_error"],
             "failed to append one-shot journal events"
         );
+    }
+
+    #[test]
+    fn final_json_output_marks_active_exact_failure_as_unverified() {
+        let mut sr = stream_result_for_json();
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "bash".to_string(),
+                ok: false,
+                args_full: Some(serde_json::json!({"command": "cargo test"}).to_string()),
+                result_class: Some("execution_error".to_string()),
+                error: Some("command failed".to_string()),
+                ..Default::default()
+            });
+        let output = final_json_output_with_context(&sr, ExitCode::Success, None, None);
+
+        assert_eq!(output["completion_disposition"], "responded_unverified");
+        assert_eq!(output["success"], false);
+        assert_eq!(output["exit_code"], 0);
+    }
+
+    #[test]
+    fn final_json_output_marks_exact_failure_recovery_completed() {
+        let mut sr = stream_result_for_json();
+        let args = serde_json::json!({"command": "cargo test"}).to_string();
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "bash".to_string(),
+                ok: false,
+                args_full: Some(args.clone()),
+                result_class: Some("execution_error".to_string()),
+                ..Default::default()
+            });
+        sr.tool_call_records
+            .push(astra_services::session_journal::ToolCallRecord {
+                name: "bash".to_string(),
+                ok: true,
+                args_full: Some(args),
+                result_class: Some("success".to_string()),
+                ..Default::default()
+            });
+        let output = final_json_output_with_context(&sr, ExitCode::Success, None, None);
+
+        assert_eq!(output["completion_disposition"], "completed");
+        assert_eq!(output["success"], true);
+    }
+
+    #[test]
+    fn final_json_output_preserves_server_owned_unverified_fact() {
+        let mut sr = stream_result_for_json();
+        sr.server_terminal_unverified = true;
+        let output = final_json_output_with_context(&sr, ExitCode::Success, None, None);
+
+        assert_eq!(output["completion_disposition"], "responded_unverified");
+        assert_eq!(output["server_terminal_unverified"], true);
+        assert_eq!(output["success"], false);
+        assert_eq!(output["exit_code"], 0);
     }
 
     #[test]
@@ -3502,17 +3696,25 @@ mod one_shot_effective_settings_tests {
 #[cfg(test)]
 mod one_shot_persistence_tests {
     use super::{
-        ExitCode, StreamResult, finalize_one_shot_stream_result, persist_headless_session_state,
+        ExitCode, HeadlessCanonicalCommitStatus, StreamResult, apply_wall_deadline_interruption,
+        finalize_one_shot_stream_result, finalize_one_shot_stream_result_with_request_lease,
+        persist_headless_session_state, retain_wall_deadline_partial_canonical_messages,
+        stream_result_from_incremental_snapshot,
     };
 
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    fn execution_lease(session_id: &str) -> astra_services::session_journal::SessionExecutionLease {
+        astra_services::session_journal::SessionExecutionLease::try_acquire(session_id).unwrap()
+    }
 
     #[test]
     #[serial_test::serial]
     fn one_shot_settlement_persists_canonical_tool_evidence_for_next_process() {
         let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("one-shot-csl-tools-{}", uuid::Uuid::new_v4());
+        let lease = execution_lease(&sid);
         let mut result = crate::tests::stub_stream_result("manifest inspected");
         result.session_id = Some(sid.clone());
         result.tools_used = vec!["read_file".to_string()];
@@ -3539,15 +3741,26 @@ mod one_shot_persistence_tests {
             serde_json::json!({"role": "assistant", "content": "manifest inspected"}),
         ];
 
-        persist_headless_session_state(
+        let settlement = persist_headless_session_state(
             None,
             Some("test-model"),
             "inspect Cargo.toml",
             &mut result,
             std::time::Instant::now(),
+            Some(&lease),
         );
 
         assert_eq!(result.session_persistence_error, None);
+        assert_eq!(
+            settlement.commit_status,
+            HeadlessCanonicalCommitStatus::Committed
+        );
+        assert!(!settlement.projection_repair_required);
+        assert_eq!(
+            settlement.canonical_session_id.as_deref(),
+            Some(sid.as_str())
+        );
+        assert_eq!(settlement.persistence_error, None);
         let restored =
             crate::cli::session::session_continuation::load_session_messages_for_continuation(&sid)
                 .expect("one-shot canonical continuation");
@@ -3574,13 +3787,97 @@ mod one_shot_persistence_tests {
 
     #[test]
     #[serial_test::serial]
-    fn remote_persistence_degradation_keeps_successful_local_recovery_discoverable() {
+    fn fresh_wall_deadline_partial_commits_and_restores_partial_canonical_output() {
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let sid = format!("fresh-wall-partial-{}", uuid::Uuid::new_v4());
+        let request_lease =
+            crate::cli::session::session_execution_lease::RequestSessionExecutionLease::new(None)
+                .unwrap();
+        request_lease.bind(&sid).unwrap();
+        let mut result = stream_result_from_incremental_snapshot(
+            astra_turn_core::turn_event_sink::TurnIncrementalSnapshot {
+                session_id: Some(sid.clone()),
+                run_id: Some("run-fresh-wall-partial".to_string()),
+                partial_text: "partial answer before deadline".to_string(),
+                ..Default::default()
+            },
+        );
+        apply_wall_deadline_interruption(&mut result, false);
+        retain_wall_deadline_partial_canonical_messages(&mut result, "perform bounded work");
+
+        let exit_code = finalize_one_shot_stream_result_with_request_lease(
+            None,
+            Some("test-model"),
+            "perform bounded work",
+            &mut result,
+            std::time::Instant::now(),
+            request_lease.as_ref(),
+        );
+
+        assert_eq!(exit_code, ExitCode::Partial);
+        assert_eq!(result.session_persistence_error, None);
+        let restored =
+            crate::cli::session::session_continuation::load_session_messages_for_continuation(&sid)
+                .expect("fresh partial canonical continuation");
+        assert_eq!(
+            restored
+                .last()
+                .and_then(|message| message["content"].as_str()),
+            Some("partial answer before deadline")
+        );
+        assert!(
+            astra_services::session_journal::SessionExecutionLease::try_acquire(&sid).is_err(),
+            "request authority remains held after canonical commit until request teardown"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn interrupted_transport_partial_commits_resumable_canonical_output() {
+        let (_sessions, _sessions_guard) = crate::tests::isolated_sessions_dir();
+        let sid = format!("transport-partial-{}", uuid::Uuid::new_v4());
+        let lease = execution_lease(&sid);
+        let mut result =
+            crate::tests::stub_stream_result("partial reasoning before transport loss");
+        result.session_id = Some(sid.clone());
+        result.final_state = "interrupted".to_string();
+        result.interruption_kind = Some("stream_transport".to_string());
+        result.server_terminal_unverified = true;
+
+        let exit_code = finalize_one_shot_stream_result(
+            None,
+            Some("test-model"),
+            "continue the workspace task",
+            &mut result,
+            std::time::Instant::now(),
+            Some(&lease),
+        );
+
+        assert_eq!(exit_code, ExitCode::Partial);
+        assert_eq!(result.session_persistence_error, None);
+        assert!(result.server_terminal_unverified);
+        let restored =
+            crate::cli::session::session_continuation::load_session_messages_for_continuation(&sid)
+                .expect("transport continuation");
+        assert_eq!(restored[0]["content"], "continue the workspace task");
+        assert_eq!(
+            restored
+                .last()
+                .and_then(|message| message["content"].as_str()),
+            Some("partial reasoning before transport loss")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn remote_persistence_degradation_withholds_durable_session_pointer() {
         let _home = crate::tests::HomeGuard::temp();
         let sessions = dirs::home_dir().unwrap().join(".astra").join("sessions");
         std::fs::create_dir_all(&sessions).unwrap();
         let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions);
 
         let sid = format!("one-shot-local-recovery-{}", uuid::Uuid::new_v4());
+        let lease = execution_lease(&sid);
         let mut result = crate::tests::stub_stream_result("locally recoverable answer");
         result.session_id = Some(sid.clone());
         result.session_persistence_error = Some("remote journal returned 503".into());
@@ -3589,14 +3886,28 @@ mod one_shot_persistence_tests {
             serde_json::json!({"role": "assistant", "content": "locally recoverable answer"}),
         ];
 
-        persist_headless_session_state(
+        let settlement = persist_headless_session_state(
             Some("default"),
             Some("test-model"),
             "keep this turn",
             &mut result,
             std::time::Instant::now(),
+            Some(&lease),
         );
 
+        assert_eq!(
+            settlement.commit_status,
+            HeadlessCanonicalCommitStatus::Committed
+        );
+        assert!(settlement.projection_repair_required);
+        assert_eq!(
+            settlement.canonical_session_id.as_deref(),
+            Some(sid.as_str())
+        );
+        assert_eq!(
+            settlement.persistence_error.as_deref(),
+            Some("remote journal returned 503")
+        );
         assert_eq!(
             result.session_persistence_error.as_deref(),
             Some("remote journal returned 503"),
@@ -3608,8 +3919,8 @@ mod one_shot_persistence_tests {
                 .profiles
                 .get("default")
                 .and_then(|profile| profile.last_session_id.as_deref()),
-            Some(sid.as_str()),
-            "a successfully persisted local recovery must remain discoverable"
+            None,
+            "a degraded settlement must not publish a session pointer as fully durable"
         );
         let restored =
             crate::cli::session::session_continuation::load_session_messages_for_continuation(&sid)
@@ -3617,6 +3928,61 @@ mod one_shot_persistence_tests {
         assert_eq!(
             restored.last().unwrap()["content"],
             "locally recoverable answer"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn missing_canonical_messages_withhold_durable_session_pointer() {
+        let _home = crate::tests::HomeGuard::temp();
+        let sessions = dirs::home_dir().unwrap().join(".astra").join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions);
+
+        let sid = format!("one-shot-no-canonical-messages-{}", uuid::Uuid::new_v4());
+        let lease = execution_lease(&sid);
+        let mut result = crate::tests::stub_stream_result("answer missing canonical history");
+        result.session_id = Some(sid.clone());
+
+        let settlement = persist_headless_session_state(
+            Some("default"),
+            Some("test-model"),
+            "keep this turn",
+            &mut result,
+            std::time::Instant::now(),
+            Some(&lease),
+        );
+
+        assert_eq!(
+            settlement.commit_status,
+            HeadlessCanonicalCommitStatus::Committed
+        );
+        assert!(settlement.projection_repair_required);
+        assert_eq!(
+            settlement.canonical_session_id.as_deref(),
+            Some(sid.as_str())
+        );
+        assert!(
+            result
+                .session_persistence_error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("canonical messages are empty")
+        );
+        assert!(
+            astra_services::session_journal::read_journal(&sid)
+                .unwrap()
+                .iter()
+                .any(|event| event.event_type
+                    == astra_services::session_journal::JournalEventType::Turn),
+            "journal success must not be mistaken for complete canonical recovery"
+        );
+        assert_eq!(
+            crate::cli::cli_config::cli_utils::load_credentials()
+                .profiles
+                .get("default")
+                .and_then(|profile| profile.last_session_id.as_deref()),
+            None
         );
     }
 
@@ -3631,6 +3997,7 @@ mod one_shot_persistence_tests {
         let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions);
 
         let sid = format!("one-shot-persist-{}", uuid::Uuid::new_v4());
+        let lease = execution_lease(&sid);
         let writer = astra_services::session_journal::JournalWriter::new(&sid).unwrap();
         writer
             .append(
@@ -3683,6 +4050,7 @@ mod one_shot_persistence_tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             tool_calls_count: 0,
+            tool_ledger_aggregate: Default::default(),
             visible_tools: Vec::new(),
             selected_skills: Vec::new(),
             tools_used: Vec::new(),
@@ -3703,28 +4071,39 @@ mod one_shot_persistence_tests {
             pending_context_assembly_trace: None,
             turn_observability_events: Vec::new(),
             llm_rounds: None,
+            token_usage_coverage: Default::default(),
             interruption: None,
             final_state: "completed".into(),
             interruption_kind: None,
+            server_terminal_unverified: false,
+            server_terminal_authoritative: false,
+            tool_record_coverage_partial: false,
             final_messages: Vec::new(),
             run_transcript_messages: Vec::new(),
             applied_user_intents: Vec::new(),
             background_agent_results: Vec::new(),
         };
 
-        persist_headless_session_state(
+        let settlement = persist_headless_session_state(
             Some("default"),
             Some("test-model"),
             "continue",
             &mut sr,
             std::time::Instant::now(),
+            Some(&lease),
         );
 
+        assert_eq!(
+            settlement.commit_status,
+            HeadlessCanonicalCommitStatus::Unknown
+        );
+        assert!(!settlement.projection_repair_required);
+        assert_eq!(settlement.canonical_session_id, None);
         assert!(
             sr.session_persistence_error
                 .as_deref()
                 .unwrap_or_default()
-                .contains("failed to append one-shot journal events")
+                .contains("canonical journal commit")
         );
         let creds = crate::cli::cli_config::cli_utils::load_credentials();
         assert_eq!(
@@ -3748,6 +4127,11 @@ mod one_shot_persistence_tests {
         let _guard = astra_services::session_journal::JournalDirGuard::new(&sessions);
 
         let sid = format!("one-shot-exit-{}", uuid::Uuid::new_v4());
+        let request_lease =
+            crate::cli::session::session_execution_lease::RequestSessionExecutionLease::new(Some(
+                &sid,
+            ))
+            .unwrap();
         let writer = astra_services::session_journal::JournalWriter::new(&sid).unwrap();
         writer
             .append(
@@ -3799,6 +4183,7 @@ mod one_shot_persistence_tests {
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
             tool_calls_count: 0,
+            tool_ledger_aggregate: Default::default(),
             visible_tools: Vec::new(),
             selected_skills: Vec::new(),
             tools_used: Vec::new(),
@@ -3819,21 +4204,26 @@ mod one_shot_persistence_tests {
             pending_context_assembly_trace: None,
             turn_observability_events: Vec::new(),
             llm_rounds: None,
+            token_usage_coverage: Default::default(),
             interruption: None,
             final_state: "completed".into(),
             interruption_kind: None,
+            server_terminal_unverified: false,
+            server_terminal_authoritative: false,
+            tool_record_coverage_partial: false,
             final_messages: Vec::new(),
             run_transcript_messages: Vec::new(),
             applied_user_intents: Vec::new(),
             background_agent_results: Vec::new(),
         };
 
-        let exit_code = finalize_one_shot_stream_result(
+        let exit_code = finalize_one_shot_stream_result_with_request_lease(
             Some("default"),
             Some("test-model"),
             "continue",
             &mut sr,
             std::time::Instant::now(),
+            request_lease.as_ref(),
         );
 
         assert_eq!(exit_code, ExitCode::PersistenceError);
@@ -3841,264 +4231,10 @@ mod one_shot_persistence_tests {
             sr.session_persistence_error
                 .as_deref()
                 .unwrap_or_default()
-                .contains("failed to append one-shot journal events")
+                .contains("canonical journal commit")
         );
 
         std::fs::set_permissions(&journal_path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    }
-}
-
-#[cfg(test)]
-mod task_run_projection_tests {
-    use super::{
-        ExitCode, NON_CANONICAL_TASK_SCOPE, StreamResult, build_one_shot_task_manager,
-        failed_task_notification_payload, one_shot_completion_warning, task_notification_payload,
-        task_terminal_summary_line,
-    };
-    use crate::cli::task::task_result_projection::{
-        stream_result_failure_reason, task_checkpoint_state_from_result,
-    };
-
-    fn stream_result_for_task_checkpoint() -> StreamResult {
-        StreamResult {
-            session_id: Some("session-1".to_string()),
-            run_id: Some("run-1".to_string()),
-            session_persistence_error: Some("failed to append one-shot journal events".into()),
-            full_text: "hello".to_string(),
-            prompt_tokens: 10,
-            completion_tokens: 3,
-            cache_read_tokens: 2,
-            cache_creation_tokens: 1,
-            tool_calls_count: 2,
-            tools_used: vec!["bash".to_string()],
-            background_agent_results: vec![("agent-1".into(), "done".into())],
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn task_checkpoint_state_includes_persistence_error() {
-        let sr = stream_result_for_task_checkpoint();
-        let state = task_checkpoint_state_from_result(
-            &sr,
-            Some("/tmp/out.txt"),
-            ExitCode::PersistenceError,
-        );
-
-        assert_eq!(
-            state.get("full_text").and_then(|v| v.as_str()),
-            Some("hello")
-        );
-        assert_eq!(
-            state.get("output_file").and_then(|v| v.as_str()),
-            Some("/tmp/out.txt")
-        );
-        assert_eq!(
-            state.get("persistence_error").and_then(|v| v.as_str()),
-            Some("failed to append one-shot journal events")
-        );
-        assert_eq!(
-            state["background_agent_results"],
-            serde_json::json!([{"agent_id":"agent-1","result":"done"}])
-        );
-        assert_eq!(state["exit_code"], 4);
-        assert_eq!(state["error_kind"], "persistence_error");
-        assert_eq!(state["final_state"], "completed");
-        assert!(state["interruption_kind"].is_null());
-    }
-
-    #[test]
-    fn task_status_label_marks_partial_completed_tasks() {
-        assert_eq!(
-            crate::cli::surface::task_checkpoint_surface::task_status_label(
-                astra_services::TaskStatus::Completed,
-                Some(astra_services::TaskOutcome::Partial),
-            ),
-            "partial"
-        );
-        assert_eq!(
-            crate::cli::surface::task_checkpoint_surface::task_status_label(
-                astra_services::TaskStatus::Completed,
-                Some(astra_services::TaskOutcome::Success),
-            ),
-            "completed"
-        );
-        assert_eq!(
-            crate::cli::surface::task_checkpoint_surface::task_status_label(
-                astra_services::TaskStatus::Failed,
-                None,
-            ),
-            "failed"
-        );
-    }
-
-    #[test]
-    fn stream_result_failure_reason_prefers_persistence_detail() {
-        let sr = stream_result_for_task_checkpoint();
-        assert_eq!(
-            stream_result_failure_reason(ExitCode::PersistenceError, &sr),
-            "failed to append one-shot journal events"
-        );
-        assert_eq!(
-            stream_result_failure_reason(ExitCode::ToolFailure, &sr),
-            "tool_failure"
-        );
-    }
-
-    #[test]
-    fn task_notification_payload_includes_exit_semantics_for_persistence_error() {
-        let sr = stream_result_for_task_checkpoint();
-        let payload = task_notification_payload(
-            "task-12345678",
-            &sr,
-            Some("/tmp/out.txt"),
-            ExitCode::PersistenceError,
-        );
-
-        assert_eq!(payload["type"], "background_task_notification");
-        assert_eq!(payload["task_id"], "task-12345678");
-        assert_eq!(payload["status"], "persistence_error");
-        assert_eq!(payload["success"], false);
-        assert_eq!(payload["exit_code"], 4);
-        assert_eq!(payload["error_kind"], "persistence_error");
-        assert_eq!(payload["output_file"], "/tmp/out.txt");
-        assert_eq!(payload["final_state"], "completed");
-        assert!(payload["interruption_kind"].is_null());
-        assert_eq!(
-            payload["persistence_error"],
-            "failed to append one-shot journal events"
-        );
-        assert_eq!(payload["summary"], "hello");
-    }
-
-    #[test]
-    fn task_notification_payload_marks_partial_outcome() {
-        let mut sr = stream_result_for_task_checkpoint();
-        sr.session_persistence_error = None;
-        sr.final_state = "interrupted".into();
-        sr.interruption_kind = Some("budget_exhausted".into());
-
-        let payload = task_notification_payload(
-            "task-12345678",
-            &sr,
-            Some("/tmp/out.txt"),
-            ExitCode::Partial,
-        );
-
-        assert_eq!(payload["status"], "partial");
-        assert_eq!(payload["success"], false);
-        assert_eq!(payload["exit_code"], 5);
-        assert_eq!(payload["error_kind"], "partial");
-        assert_eq!(payload["final_state"], "interrupted");
-        assert_eq!(payload["interruption_kind"], "budget_exhausted");
-    }
-
-    #[test]
-    fn failed_task_notification_payload_carries_failure_detail() {
-        let payload = failed_task_notification_payload(
-            "task-12345678",
-            "write task output: permission denied",
-            "persistence_error",
-            None,
-            Some("write task output: permission denied"),
-        );
-
-        assert_eq!(payload["type"], "background_task_notification");
-        assert_eq!(payload["task_id"], "task-12345678");
-        assert_eq!(payload["status"], "persistence_error");
-        assert_eq!(payload["success"], false);
-        assert_eq!(payload["error_kind"], "persistence_error");
-        assert_eq!(payload["summary"], "write task output: permission denied");
-        assert_eq!(
-            payload["persistence_error"],
-            "write task output: permission denied"
-        );
-        assert!(payload.get("output_file").is_none());
-    }
-
-    #[test]
-    fn task_terminal_summary_line_distinguishes_success_and_persistence_failure() {
-        let success =
-            task_terminal_summary_line("task-12345678", Some("/tmp/out.txt"), ExitCode::Success);
-        assert!(success.contains("finished; output saved to"));
-        assert!(!success.contains("persistence degradation"));
-
-        let partial =
-            task_terminal_summary_line("task-12345678", Some("/tmp/out.txt"), ExitCode::Partial);
-        assert!(partial.contains("finished partially; output saved to"));
-
-        let degraded = task_terminal_summary_line(
-            "task-12345678",
-            Some("/tmp/out.txt"),
-            ExitCode::PersistenceError,
-        );
-        assert!(degraded.contains("finished with persistence degradation; output saved to"));
-
-        let tool_failure = task_terminal_summary_line(
-            "task-12345678",
-            Some("/tmp/out.txt"),
-            ExitCode::ToolFailure,
-        );
-        assert!(tool_failure.contains("failed; output saved to"));
-
-        let unfinished =
-            task_terminal_summary_line("task-12345678", Some("/tmp/out.txt"), ExitCode::Unfinished);
-        assert!(unfinished.contains("unfinished; output saved to"));
-    }
-
-    #[test]
-    fn task_terminal_summary_line_handles_missing_output_file() {
-        let degraded =
-            task_terminal_summary_line("task-12345678", None, ExitCode::PersistenceError);
-        assert!(degraded.contains("output file unavailable"));
-    }
-
-    #[test]
-    fn one_shot_completion_warning_prefers_persistence_error_over_partial() {
-        let mut sr = stream_result_for_task_checkpoint();
-        sr.final_state = "interrupted".into();
-        sr.interruption_kind = Some("budget_exhausted".into());
-
-        assert_eq!(
-            one_shot_completion_warning(&sr, ExitCode::PersistenceError).as_deref(),
-            Some("Session persistence degraded: failed to append one-shot journal events")
-        );
-    }
-
-    #[test]
-    fn one_shot_completion_warning_surfaces_partial_reason() {
-        let mut sr = stream_result_for_task_checkpoint();
-        sr.session_persistence_error = None;
-        sr.final_state = "interrupted".into();
-        sr.interruption_kind = Some("budget_exhausted".into());
-
-        assert_eq!(
-            one_shot_completion_warning(&sr, ExitCode::Partial).as_deref(),
-            Some(
-                "Turn finished partially (budget_exhausted). Inspect partial output before continuing."
-            )
-        );
-    }
-
-    #[tokio::test]
-    async fn build_one_shot_task_manager_without_canonical_session_uses_ephemeral_store() {
-        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
-
-        let first = build_one_shot_task_manager(None, &api.api_origin(), None).await;
-        let second = build_one_shot_task_manager(None, &api.api_origin(), None).await;
-
-        assert_eq!(first.session_id(), NON_CANONICAL_TASK_SCOPE);
-        assert_eq!(second.session_id(), NON_CANONICAL_TASK_SCOPE);
-
-        let created = first
-            .create(&serde_json::json!({ "title": "ephemeral" }))
-            .await;
-        assert!(created.contains("ephemeral"));
-        assert_eq!(first.snapshot().await.unwrap().len(), 1);
-        assert!(
-            second.snapshot().await.unwrap().is_empty(),
-            "non-canonical one-shot managers must not share a durable session store"
-        );
     }
 }
 

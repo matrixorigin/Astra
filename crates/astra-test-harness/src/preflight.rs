@@ -10,6 +10,9 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::process::Command;
 
+use crate::runner::parse_strict_cli_outcome;
+use crate::session_identity::cancel_server_session;
+
 /// Errors surfaced by pre-flight checks.
 #[derive(Debug, Error)]
 pub enum PreflightError {
@@ -19,6 +22,8 @@ pub enum PreflightError {
     BinaryNotExecutable,
     #[error("server unreachable: {detail}")]
     ServerUnreachable { detail: String },
+    #[error("server is reachable but not ready: {detail}")]
+    ServerUnready { detail: String },
     #[error("authentication failed: {detail}")]
     AuthFailed { detail: String },
     #[error("model `{model}` unavailable: {detail}")]
@@ -29,11 +34,91 @@ fn stderr_indicates_cli_auth_failure(stderr: &str) -> bool {
     stderr.contains("Could not validate credentials")
         || stderr.contains("Session expired")
         || stderr.contains("try /login")
+        || stderr.contains("401 Unauthorized")
+        || stderr.contains("status 401")
 }
 
 fn stderr_indicates_model_inactive(stderr: &str, model: &str) -> bool {
     stderr.contains(&format!("Model '{model}' is inactive"))
         || stderr.contains("is inactive (connectivity failed or disabled)")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServerReadiness {
+    degraded: bool,
+    unavailable_components: Vec<String>,
+    interaction_api_major: String,
+    build_git_sha: String,
+}
+
+fn parse_server_readiness(stdout: &[u8]) -> Result<ServerReadiness, String> {
+    let value: serde_json::Value = serde_json::from_slice(stdout)
+        .map_err(|error| format!("health response is not valid JSON: {error}"))?;
+    let status = value
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("health response omitted status: {value}"))?;
+    if !matches!(status, "healthy" | "degraded") {
+        return Err(format!("server status is {status}: {value}"));
+    }
+    if value.get("database").and_then(serde_json::Value::as_str) != Some("connected") {
+        return Err(format!("server database is not connected: {value}"));
+    }
+    let interaction_api_major = value
+        .get("interaction_api_major")
+        .and_then(serde_json::Value::as_str)
+        .filter(|major| !major.trim().is_empty())
+        .ok_or_else(|| format!("health response omitted interaction_api_major: {value}"))?;
+    if interaction_api_major != astra_server_types::AGENT_INTERACTION_API_MAJOR {
+        return Err(format!(
+            "unsupported interaction_api_major={interaction_api_major}; expected {}: {value}",
+            astra_server_types::AGENT_INTERACTION_API_MAJOR,
+        ));
+    }
+    let build_git_sha = value
+        .get("build_git_sha")
+        .and_then(serde_json::Value::as_str)
+        .filter(|sha| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| format!("health response omitted a valid build_git_sha: {value}"))?;
+    let unavailable_components = value
+        .as_object()
+        .into_iter()
+        .flat_map(|object| object.iter())
+        .filter_map(|(name, state)| (state.as_str() == Some("unavailable")).then_some(name.clone()))
+        .collect();
+    Ok(ServerReadiness {
+        degraded: status == "degraded",
+        unavailable_components,
+        interaction_api_major: interaction_api_major.to_string(),
+        build_git_sha: build_git_sha.to_string(),
+    })
+}
+
+/// Validate the complete terminal evidence emitted by a successful model
+/// probe.  A process that exits successfully is not sufficient evidence: the
+/// typed envelope must agree with the process status and must itself describe
+/// a successful run.  Keeping this at the preflight boundary prevents both
+/// the initial probe and the auto-register retry from accepting a typed
+/// failure envelope printed by a process that exits 0.
+fn validate_successful_model_probe(
+    stdout: &[u8],
+    model: &str,
+    process_exit: i32,
+) -> Result<(), String> {
+    let outcome = parse_strict_cli_outcome(&String::from_utf8_lossy(stdout), model)?;
+    if outcome.exit_code != process_exit {
+        return Err(format!(
+            "terminal evidence exit_code {} disagrees with process exit {}",
+            outcome.exit_code, process_exit
+        ));
+    }
+    if process_exit != 0 {
+        return Err(format!(
+            "model probe reported failure (exit_code={})",
+            outcome.exit_code
+        ));
+    }
+    Ok(())
 }
 
 /// Run all pre-flight checks in order. Validates binary, server, and
@@ -89,11 +174,22 @@ async fn check_server(astra_bin: &Path) -> Result<(), PreflightError> {
         });
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if !stdout.contains("\"status\"") || !stdout.contains("healthy") {
-        return Err(PreflightError::ServerUnreachable {
-            detail: format!("unexpected health response: {}", stdout.trim()),
-        });
+    let readiness = parse_server_readiness(&output.stdout)
+        .map_err(|detail| PreflightError::ServerUnready { detail })?;
+    eprintln!(
+        "[astra-test] preflight: Server contract={} build={}",
+        readiness.interaction_api_major,
+        &readiness.build_git_sha[..12],
+    );
+    if readiness.degraded {
+        eprintln!(
+            "[astra-test] preflight: core Server is ready; degraded components: {}",
+            if readiness.unavailable_components.is_empty() {
+                "unspecified".to_string()
+            } else {
+                readiness.unavailable_components.join(", ")
+            }
+        );
     }
     Ok(())
 }
@@ -104,6 +200,17 @@ fn astra_command(astra_bin: &Path, profile: Option<&str>) -> Command {
         command.arg("--profile").arg(profile);
     }
     command
+}
+
+async fn release_model_probe_session(
+    astra_bin: &Path,
+    profile: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<(), String> {
+    let Some(session_id) = session_id else {
+        return Ok(());
+    };
+    cancel_server_session(astra_bin, profile, session_id).await
 }
 
 async fn check_model(
@@ -186,13 +293,48 @@ async fn check_model(
                 )
                 .await;
                 match retry {
-                    Ok(Ok(o)) if o.status.success() => {
-                        eprintln!(
-                            "[astra-test] preflight: profile `{auto_profile}` authenticated, model `{model}` OK"
-                        );
-                        return Ok(Some(auto_profile.to_string()));
-                    }
                     Ok(Ok(o)) => {
+                        if o.status.success() {
+                            match validate_successful_model_probe(
+                                &o.stdout,
+                                model,
+                                o.status.code().unwrap_or(-1),
+                            ) {
+                                Ok(_) => {
+                                    let outcome = parse_strict_cli_outcome(
+                                        &String::from_utf8_lossy(&o.stdout),
+                                        model,
+                                    )
+                                    .expect("successful model probe was already validated");
+                                    if let Err(error) = release_model_probe_session(
+                                        astra_bin,
+                                        Some(auto_profile),
+                                        outcome.session_id.as_deref(),
+                                    )
+                                    .await
+                                    {
+                                        return Err(PreflightError::ModelUnavailable {
+                                            model: model.to_string(),
+                                            detail: format!(
+                                                "model probe session cleanup failed: {error}"
+                                            ),
+                                        });
+                                    }
+                                    eprintln!(
+                                        "[astra-test] preflight: profile `{auto_profile}` authenticated, model `{model}` OK"
+                                    );
+                                    return Ok(Some(auto_profile.to_string()));
+                                }
+                                Err(error) => {
+                                    return Err(PreflightError::ModelUnavailable {
+                                        model: model.to_string(),
+                                        detail: format!(
+                                            "profile `{auto_profile}` authenticated, but model probe returned invalid terminal evidence: {error}"
+                                        ),
+                                    });
+                                }
+                            }
+                        }
                         let retry_stderr = String::from_utf8_lossy(&o.stderr);
                         return Err(PreflightError::ModelUnavailable {
                             model: model.to_string(),
@@ -235,6 +377,26 @@ async fn check_model(
                 output.status.code().unwrap_or(-1),
                 stderr.trim()
             ),
+        });
+    }
+
+    if let Err(error) =
+        validate_successful_model_probe(&output.stdout, model, output.status.code().unwrap_or(-1))
+    {
+        return Err(PreflightError::ModelUnavailable {
+            model: model.to_string(),
+            detail: format!("model probe returned invalid terminal evidence: {error}"),
+        });
+    }
+
+    let outcome = parse_strict_cli_outcome(&String::from_utf8_lossy(&output.stdout), model)
+        .expect("successful model probe was already validated");
+    if let Err(error) =
+        release_model_probe_session(astra_bin, profile, outcome.session_id.as_deref()).await
+    {
+        return Err(PreflightError::ModelUnavailable {
+            model: model.to_string(),
+            detail: format!("model probe session cleanup failed: {error}"),
         });
     }
 
@@ -342,7 +504,19 @@ mod tests {
         let bin = dir.path().join("astra-shim");
         write_executable_shim(
             &bin,
-            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", log.display()),
+            format!(
+                concat!(
+                    "#!/bin/sh\n",
+                    "printf '%s\\n' \"$@\" >> '{}'\n",
+                    "if [ \"$3\" = session ] && [ \"$4\" = cancel ] && [ \"$5\" = 550e8400-e29b-41d4-a716-446655440000 ]; then\n",
+                    "  printf '%s\\n' '{{\"status\":\"cancelled\"}}'\n",
+                    "  exit 0\n",
+                    "fi\n",
+                    "printf '%s\\n' '{{\"trace_id\":null,\"request_id\":null,\"run_id\":\"run-1\",\"session_id\":\"550e8400-e29b-41d4-a716-446655440000\",\"text\":\"pong\",\"final_state\":\"completed\",\"interruption_kind\":null,\"tool_result_class_counts\":{{}},\"prompt_tokens\":0,\"fresh_prompt_tokens\":0,\"cache\":{{\"hit\":false,\"read_tokens\":0,\"creation_tokens\":0}},\"completion_tokens\":0,\"llm_rounds\":0,\"tool_calls_count\":0,\"tools_used\":[],\"persistence_error\":null,\"exit_code\":0,\"success\":true,\"error_kind\":null}}'\n",
+                    "exit 0\n",
+                ),
+                log.display()
+            ),
         )
         .unwrap();
 
@@ -353,6 +527,10 @@ mod tests {
         let args = fs::read_to_string(log).unwrap();
         assert!(args.contains("--profile\nisolated-harness\n"), "{args}");
         assert!(args.contains("--no-resume\n"), "{args}");
+        assert!(
+            args.contains("session\ncancel\n550e8400-e29b-41d4-a716-446655440000\n"),
+            "successful model probes must cancel their exact server session: {args}"
+        );
     }
 
     #[test]
@@ -378,6 +556,71 @@ mod tests {
             "Error: Could not validate credentials",
             "foo"
         ));
+    }
+
+    #[test]
+    fn explicit_http_unauthorized_is_auth_failure_not_model_unavailability() {
+        assert!(stderr_indicates_cli_auth_failure(
+            "server model registry request failed with status 401 Unauthorized"
+        ));
+        assert!(stderr_indicates_cli_auth_failure(
+            "request failed with status 401"
+        ));
+        assert!(!stderr_indicates_cli_auth_failure(
+            "request failed with status 403 Forbidden"
+        ));
+    }
+
+    #[test]
+    fn health_probe_distinguishes_core_readiness_from_optional_degradation() {
+        let healthy = parse_server_readiness(
+            br#"{"status":"healthy","database":"connected","interaction_api_major":"3","build_git_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","memoria":"available"}"#,
+        )
+        .unwrap();
+        assert!(!healthy.degraded);
+        assert!(healthy.unavailable_components.is_empty());
+        assert_eq!(healthy.interaction_api_major, "3");
+        assert_eq!(healthy.build_git_sha.len(), 40);
+
+        let degraded = parse_server_readiness(
+            br#"{"status":"degraded","database":"connected","interaction_api_major":"3","build_git_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","memoria":"unavailable"}"#,
+        )
+        .unwrap();
+        assert!(degraded.degraded);
+        assert_eq!(degraded.unavailable_components, ["memoria"]);
+
+        assert!(
+            parse_server_readiness(
+                br#"{"status":"degraded","database":"unavailable","interaction_api_major":"3","build_git_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#
+            )
+            .is_err()
+        );
+        assert!(
+            parse_server_readiness(
+                br#"{"status":"unhealthy","database":"connected","interaction_api_major":"3","build_git_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#
+            )
+            .is_err()
+        );
+        let stale = parse_server_readiness(
+                br#"{"status":"healthy","database":"connected","interaction_api_major":"2","build_git_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#,
+        )
+        .unwrap_err();
+        assert!(stale.contains("expected 3"), "{stale}");
+        assert!(
+            parse_server_readiness(
+                br#"{"status":"healthy","database":"connected","interaction_api_major":"3"}"#
+            )
+            .unwrap_err()
+            .contains("build_git_sha")
+        );
+        assert!(parse_server_readiness(br#"healthy"#).is_err());
+    }
+
+    #[test]
+    fn model_probe_rejects_typed_failure_when_process_exits_successfully() {
+        let failure = br#"{"trace_id":null,"request_id":null,"run_id":"run-1","session_id":"550e8400-e29b-41d4-a716-446655440000","text":"","final_state":"interrupted","interruption_kind":"error","tool_result_class_counts":{},"prompt_tokens":0,"fresh_prompt_tokens":0,"cache":{"hit":false,"read_tokens":0,"creation_tokens":0},"completion_tokens":0,"llm_rounds":0,"tool_calls_count":0,"tools_used":[],"persistence_error":null,"exit_code":3,"success":false,"error_kind":"api_error"}"#;
+        let error = validate_successful_model_probe(failure, "deepseek", 0).unwrap_err();
+        assert!(error.contains("disagrees with process exit"), "{error}");
     }
 
     #[cfg(unix)]

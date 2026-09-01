@@ -36,9 +36,6 @@ pub struct Checkpoint {
     pub had_stalls: bool,
     /// Number of errors since last checkpoint.
     pub error_count: u32,
-    /// Serialized durable task contract state (JSON) — enables verification
-    /// context to survive session interruption and cloud-based restore.
-    pub contract_state_json: Option<String>,
 }
 
 impl Checkpoint {
@@ -316,7 +313,6 @@ mod tests {
             total_tokens: 5000,
             had_stalls: false,
             error_count: 0,
-            contract_state_json: None,
         };
         let md = cp.to_markdown();
         assert!(md.contains("# Checkpoint 1 — Turn 5"));
@@ -343,7 +339,6 @@ mod tests {
             total_tokens: 5000,
             had_stalls: false,
             error_count: 0,
-            contract_state_json: None,
         };
 
         let md = cp.to_markdown();
@@ -363,7 +358,6 @@ mod tests {
             total_tokens: 10000,
             had_stalls: true,
             error_count: 3,
-            contract_state_json: None,
         };
         let md = cp.to_markdown();
         assert!(md.contains("⚠ Stalls detected"));
@@ -391,7 +385,6 @@ mod tests {
             total_tokens: 1000,
             had_stalls: false,
             error_count: 0,
-            contract_state_json: None,
         };
 
         // Write checkpoint directly to temp dir
@@ -421,7 +414,6 @@ mod tests {
             total_tokens: 1000,
             had_stalls: false,
             error_count: 0,
-            contract_state_json: None,
         };
 
         let path = write_checkpoint(&session_id, &cp).unwrap();
@@ -452,7 +444,6 @@ mod tests {
             total_tokens: 1000,
             had_stalls: false,
             error_count: 0,
-            contract_state_json: None,
         };
 
         write_checkpoint(&session_id, &cp).unwrap();
@@ -479,7 +470,6 @@ mod tests {
             total_tokens: 1000,
             had_stalls: false,
             error_count: 0,
-            contract_state_json: None,
         };
         let path = dir.join("001-first-checkpoint.md");
 
@@ -509,7 +499,6 @@ mod tests {
             total_tokens: 1000,
             had_stalls: false,
             error_count: 0,
-            contract_state_json: None,
         };
         std::fs::write(
             dir.join("index.md"),
@@ -540,7 +529,6 @@ mod tests {
             total_tokens: 0,
             had_stalls: false,
             error_count: 0,
-            contract_state_json: None,
         };
 
         remove_checkpoint(&session_id, &cp).unwrap();
@@ -573,7 +561,6 @@ mod tests {
             total_tokens: 0,
             had_stalls: false,
             error_count: 0,
-            contract_state_json: None,
         };
         let escaped_path = outside.join("001-escaped-checkpoint.md");
         std::fs::write(&escaped_path, cp.to_markdown()).unwrap();
@@ -607,7 +594,6 @@ mod tests {
             total_tokens: 1000,
             had_stalls: false,
             error_count: 0,
-            contract_state_json: None,
         };
         let path = dir.join("001-first-checkpoint.md");
         std::fs::write(&path, cp.to_markdown()).unwrap();
@@ -636,7 +622,6 @@ mod tests {
             total_tokens: 500,
             had_stalls: false,
             error_count: 0,
-            contract_state_json: None,
         };
         let md = cp.to_markdown();
         assert!(md.contains("Tools used: none"));

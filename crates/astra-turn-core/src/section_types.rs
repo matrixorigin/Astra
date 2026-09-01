@@ -150,7 +150,11 @@ pub enum SectionKind {
     SelfModel,
     /// §3 — workspace rules, conventions.
     ProjectContext,
-    /// Session-stable deferred tool discovery manifest.
+    /// Turn-visible deferred tool discovery manifest.
+    ///
+    /// The names are selected from the current wire surface and runtime
+    /// admission state, so this section belongs after the session cache
+    /// boundary even though its rendering is deterministic.
     DeferredTools,
     /// Session-stable available skill catalog.
     AvailableSkills,
@@ -252,7 +256,11 @@ impl SectionKind {
             Self::Identity | Self::Constraints => 0,
             Self::SelfModel => 1,
             Self::ProjectContext => 2,
-            Self::DeferredTools => 3,
+            // Deferred names follow the admitted wire surface and may change
+            // within a user turn. Keep them after the turn-volatile runtime
+            // lane in the volatility ordering as well as in the planner's
+            // explicit manifest order.
+            Self::DeferredTools => 11,
             Self::AvailableSkills => 4,
             Self::Skills => 5,
             Self::RuntimeIdentity => 6, // session-stable; sits with Session blocks
@@ -286,7 +294,6 @@ impl SectionKind {
             | Self::Constraints
             | Self::SelfModel
             | Self::ProjectContext
-            | Self::DeferredTools
             | Self::AvailableSkills
             | Self::Skills
             | Self::RuntimeIdentity => false,
@@ -297,7 +304,8 @@ impl SectionKind {
             | Self::RuntimeVolatile
             | Self::EmergentSkills
             | Self::EmergentMemory
-            | Self::EmergentSummary => true,
+            | Self::EmergentSummary
+            | Self::DeferredTools => true,
         }
     }
 }

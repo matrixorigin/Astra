@@ -1,0 +1,51 @@
+name: task_agent_profile_callable
+description: |
+  **What**: Use the canonical `agent` surface with the task execution profile.
+  **Tests**: The product distinguishes an agent profile from a tool name and
+  still makes the selected profile callable through the visible agent tool.
+  **Pass means**: One foreground task-profile child is accepted, reaches a
+  terminal completed state, and its result is delivered to the parent.
+  **Fail means**: The model is pushed toward a nonexistent `task(...)` tool,
+  the task profile is rejected despite being advertised, or completion is
+  claimed without a terminal child result.
+prompt: |
+  Use the visible `agent` tool with action `spawn` and `agent_type: "task"` to
+  start exactly one foreground child. Ask it to reply with the exact marker
+  "task-profile-callable" without using tools. Surface that exact child result
+  in your final answer. Do not call a generic `task` tool.
+models:
+  - deepseek-v4-flash
+capability: delegation
+difficulty: 2
+weight: 1.0
+timeout_seconds: 120
+debug_log: true
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: agent
+  - type: journal_tool_call_count
+    name: agent
+    min: 1
+    max: 1
+    document: arguments
+    path: /action
+    equals: spawn
+  - type: journal_tool_json
+    name: agent
+    document: arguments
+    path: /agent_type
+    equals: task
+  - type: journal_tool_json
+    name: agent
+    document: result
+    path: /status
+    equals: completed
+  - type: journal_tool_json_contains
+    name: agent
+    document: result
+    path: /result
+    contains: task-profile-callable
+  - type: text_contains
+    needle: task-profile-callable

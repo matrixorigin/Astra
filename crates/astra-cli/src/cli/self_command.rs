@@ -1230,6 +1230,8 @@ fn event_type_name(event_type: &JournalEventType) -> String {
         JournalEventType::LlmRequestFull => "llm_request_full",
         JournalEventType::LlmResponseFull => "llm_response_full",
         JournalEventType::SessionMemoryExtraction => "session_memory_extraction",
+        JournalEventType::SubsystemDiagnostic => "subsystem_diagnostic",
+        JournalEventType::SubsystemSettled => "subsystem_settled",
         JournalEventType::PipelineFeedback => "pipeline_feedback",
         JournalEventType::PipelineAlert => "pipeline_alert",
         JournalEventType::PipelineCompactionAudit => "pipeline_compaction_audit",
@@ -1760,7 +1762,6 @@ mod tests {
         let _guard = JournalDirGuard::new(temp.path());
         let session_id = "self-snapshot-session";
         let mut ws = WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/repo", Some("main"));
-        ws.plan_goal = Some("finish the engine".to_string());
         ws.discovered_skills = vec!["goal-driven-evolution".to_string()];
         ws.active_experiment_id = Some("exp-42".to_string());
         ws.last_context_trace = Some(ContextTraceSignal {
@@ -1862,7 +1863,7 @@ mod tests {
 
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["run"]["session_id"], session_id);
-        assert_eq!(value["run"]["goal"], "finish the engine");
+        assert!(value["run"]["goal"].is_null());
         assert_eq!(value["recent_steps"][0]["event_type"], "turn");
         assert!(
             value["environment"]["last_context_trace_preview"]
@@ -2108,7 +2109,6 @@ mod tests {
 
         let mut workspace =
             WorkspaceMetadata::with_context(session_id, "gpt-5.4", "/srv/cloud-repo", Some("main"));
-        workspace.plan_goal = Some("ship cloud restore".to_string());
         workspace.discovered_skills = vec!["session-recovery".to_string()];
         let restored = astra_services::session_restore::RestoredSession {
             session_id: session_id.to_string(),
@@ -2138,7 +2138,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["run"]["session_id"], session_id);
         assert_eq!(value["run"]["turn_count"], 3);
-        assert_eq!(value["run"]["goal"], "ship cloud restore");
+        assert!(value["run"]["goal"].is_null());
         assert_eq!(value["environment"]["cwd"], "/srv/cloud-repo");
         assert_eq!(value["environment"]["model"], "gpt-5.4");
         assert_eq!(

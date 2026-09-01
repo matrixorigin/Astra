@@ -1,10 +1,11 @@
 name: hello_text_contains
 description: |
   **What**: Send a trivial prompt and verify the response contains a specific word.
-  **Tests**: Basic model responsiveness, instruction following, efficiency bounds, and
-  criteria plumbing (text_contains, tokens_between, duration_between, turn_rounds_between, judger).
+  **Tests**: Basic model responsiveness, instruction following, and criteria plumbing
+  (text_contains, duration_between, turn_rounds_between, judger).
   **Why**: Smoke test — if this fails, nothing else will work (auth, routing, model access).
-  Also serves as the harness criteria self-test (all criterion types exercised on one case).
+  Token accounting is exercised by the dedicated context/cache cases; this smoke case
+  must not encode a model-specific system-prompt size.
   **Pass means**: The model is reachable, follows instructions, and all criteria types evaluate correctly.
   **Fail means**: Infrastructure issue (auth expired, model unavailable) or harness criteria bug.
 prompt: |
@@ -16,9 +17,6 @@ criteria:
     code: 0
   - type: text_contains
     needle: astra-harness-ok
-  - type: tokens_between
-    min: 1
-    max: 15000
   - type: duration_between
     min_ms: 0
     max_ms: 30000

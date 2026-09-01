@@ -58,7 +58,12 @@ fn safe_filename_stem(tool_call_id: &str) -> String {
 pub const PERSIST_THRESHOLD_CHARS: usize = 30_000;
 
 /// Number of chars to include as a preview in the replacement message.
-const PREVIEW_CHARS: usize = 2_000;
+///
+/// The preview is the model's first bounded view of an artifact.  Keeping it
+/// at roughly one token-cache block avoids forcing a second/third introspect
+/// round for ordinary source/config windows, while the complete result remains
+/// durable and pageable through the artifact handle.
+const PREVIEW_CHARS: usize = 4_000;
 
 /// XML-style tag that wraps the persisted-output reference.
 const PERSISTED_TAG_OPEN: &str = "<persisted-output>";
@@ -138,6 +143,22 @@ pub fn maybe_persist_tool_result(
         return None;
     }
 
+    persist_tool_result_with_replacement(session_dir, tool_call_id, tool_name, content)
+}
+
+/// Persist a tool result and return the standard bounded model-facing
+/// replacement, regardless of the result's size.
+///
+/// Callers use this when an earlier presentation boundary has already made
+/// the inline result lossy. In that situation the persistence threshold is
+/// irrelevant: the omitted evidence must remain recoverable even when the
+/// original result happens to be smaller than [`PERSIST_THRESHOLD_CHARS`].
+pub fn persist_tool_result_with_replacement(
+    session_dir: &Path,
+    tool_call_id: &str,
+    tool_name: &str,
+    content: &str,
+) -> Option<String> {
     let dir = session_dir.join(TOOL_RESULTS_SUBDIR);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         tracing::warn!(
@@ -283,6 +304,15 @@ pub fn read_persisted_result_window(
 
     let mut file = std::fs::File::open(&file_path)
         .map_err(|error| format!("failed to open persisted result: {error}"))?;
+
+    // Models occasionally retain an offset copied from a bounded preview
+    // instead of the previous window's `next_offset`.  Treat that as a
+    // recoverable cursor defect, not as a tool failure: seek back to the
+    // beginning of the scalar containing the requested byte.  Flooring is
+    // deliberate — it may repeat a few bytes, but it can never silently lose
+    // evidence.  The returned `next_offset` is a canonical cursor for the
+    // next request.
+    let offset = floor_persisted_utf8_boundary(&mut file, offset)?;
     file.seek(SeekFrom::Start(offset as u64))
         .map_err(|error| format!("failed to seek persisted result: {error}"))?;
 
@@ -293,12 +323,6 @@ pub fn read_persisted_result_window(
     let mut bytes = vec![0_u8; read_len];
     file.read_exact(&mut bytes)
         .map_err(|error| format!("failed to read persisted result: {error}"))?;
-
-    if offset > 0 && bytes[0] & 0b1100_0000 == 0b1000_0000 {
-        return Err(format!(
-            "offset {offset} is not a UTF-8 boundary; continue with the next_offset returned by the prior window"
-        ));
-    }
 
     let budget = available.min(max_bytes);
     let mut consumed = match std::str::from_utf8(&bytes[..budget]) {
@@ -331,6 +355,37 @@ pub fn read_persisted_result_window(
         next_offset: offset.saturating_add(consumed),
         total_bytes,
     }))
+}
+
+/// Return the greatest UTF-8 boundary at or before `offset` without loading
+/// the whole artifact.  A UTF-8 scalar is at most four bytes, so at most three
+/// one-byte probes are required.  The caller has already checked that
+/// `offset <= total_bytes`.
+fn floor_persisted_utf8_boundary(file: &mut std::fs::File, offset: usize) -> Result<usize, String> {
+    if offset == 0 {
+        return Ok(0);
+    }
+
+    let mut candidate = offset;
+    for _ in 0..3 {
+        file.seek(SeekFrom::Start(candidate as u64))
+            .map_err(|error| format!("failed to inspect UTF-8 boundary: {error}"))?;
+        let mut byte = [0_u8; 1];
+        file.read_exact(&mut byte)
+            .map_err(|error| format!("failed to inspect UTF-8 boundary: {error}"))?;
+        if byte[0] & 0b1100_0000 != 0b1000_0000 {
+            return Ok(candidate);
+        }
+        candidate = candidate.saturating_sub(1);
+        if candidate == 0 {
+            return Ok(0);
+        }
+    }
+
+    // A valid UTF-8 scalar cannot have more than three continuation bytes.
+    // Returning the conservative floor lets the normal UTF-8 validation below
+    // produce the authoritative corruption error if the artifact is invalid.
+    Ok(candidate)
 }
 
 /// Resolve the model-facing artifact fields accepted by `introspect`.
@@ -456,7 +511,7 @@ fn build_replacement(
 ) -> String {
     let total_chars = original_content.chars().count();
     let stored_chars = persisted.text.chars().count();
-    let preview: String = persisted.text.chars().take(PREVIEW_CHARS).collect();
+    let preview = model_preview(&persisted.text, PREVIEW_CHARS);
 
     // Try to cut at a newline for cleaner preview
     let preview = if let Some(nl_pos) = preview.rfind('\n') {
@@ -481,17 +536,98 @@ fn build_replacement(
          Tool result id: {tool_call_id}\n\
          Artifact handle: {artifact_uri}\n\
          Storage: session tool-result artifact.\n\
-         Read bounded windows with introspect(artifact=\"{artifact_uri}\", offset=0, max_bytes={DEFAULT_TOOL_RESULT_WINDOW_BYTES}); \
-         continue with the returned next_offset. Do not search, copy, or read physical local session paths.\n\
+         If the preview is insufficient, read a bounded window with introspect(artifact=\"{artifact_uri}\", offset=0, max_bytes={DEFAULT_TOOL_RESULT_WINDOW_BYTES}); \
+         continue with the returned next_offset only when more evidence is required. Do not search, copy, or read physical local session paths.\n\
          {format_note}\
          \n\
-         Preview (first ~{prev_len} chars):\n\
+         Preview (~{prev_len} chars; structured head/tail when available):\n\
          {preview}\n\
          ...[truncated — full output is available through the session tool-result artifact, not workspace filesystem tools]\n\
          {PERSISTED_TAG_CLOSE}",
         prev_len = preview.len(),
         artifact_uri = session_tool_result_artifact_uri(tool_call_id),
     )
+}
+
+/// Produce a useful first view of a persisted result without loading the
+/// complete artifact into the next model request. Structured content results
+/// put their most useful navigation links after a large page-content field;
+/// taking the first bytes alone therefore turns a recoverable result into an
+/// avoidable extra `introspect` round. Keep this projection structural and
+/// bounded: it does not inspect user prose or infer a task-specific answer.
+fn model_preview(persisted: &str, budget: usize) -> String {
+    if let Ok(Value::Object(object)) = serde_json::from_str::<Value>(persisted)
+        && object.get("content").and_then(Value::as_str).is_some()
+        && object.get("links").and_then(Value::as_array).is_some()
+    {
+        let mut projection = serde_json::Map::new();
+        for key in [
+            "url",
+            "final_url",
+            "status",
+            "content_type",
+            "metadata",
+            "content_length",
+            "truncated",
+            "cached",
+            "elapsed_ms",
+        ] {
+            if let Some(value) = object.get(key) {
+                projection.insert(key.to_string(), value.clone());
+            }
+        }
+        if let Some(links) = object.get("links").and_then(Value::as_array) {
+            let link_budget = 6usize;
+            let mut selected = Vec::with_capacity(link_budget.min(links.len()));
+            selected.extend(links.iter().take(link_budget / 2).cloned());
+            if links.len() > link_budget / 2 {
+                selected.extend(links.iter().skip(links.len() - link_budget / 2).cloned());
+            }
+            projection.insert("links".to_string(), Value::Array(selected));
+            if links.len() > link_budget {
+                projection.insert(
+                    "links_omitted".to_string(),
+                    Value::from(links.len() - link_budget),
+                );
+            }
+        }
+        if let Some(content) = object.get("content").and_then(Value::as_str) {
+            projection.insert(
+                "content".to_string(),
+                Value::String(head_tail_preview(content, budget / 3, budget / 3)),
+            );
+        }
+        if let Ok(pretty) = serde_json::to_string_pretty(&Value::Object(projection)) {
+            return truncate_preview(&pretty, budget);
+        }
+    }
+
+    truncate_preview(persisted, budget)
+}
+
+fn truncate_preview(text: &str, budget: usize) -> String {
+    let preview: String = text.chars().take(budget).collect();
+    if preview.len() < text.len() {
+        preview
+    } else {
+        text.to_string()
+    }
+}
+
+fn head_tail_preview(text: &str, head_budget: usize, tail_budget: usize) -> String {
+    if text.chars().count() <= head_budget.saturating_add(tail_budget) {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(head_budget).collect();
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(tail_budget)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{head}\n[… preview middle omitted …]\n{tail}")
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +694,33 @@ mod tests {
         assert!(replacement.len() < content.len() / 5);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn web_fetch_preview_preserves_structured_links_and_content_tail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let content = format!(
+            "page head\n{}\npage tail marker",
+            "body ".repeat(PERSIST_THRESHOLD_CHARS)
+        );
+        let value = serde_json::json!({
+            "url": "https://example.test/news",
+            "content": content,
+            "links": [
+                {"href": "https://example.test/article", "text": "Article"},
+                {"href": "https://example.test/other", "text": "Other"}
+            ],
+            "status": 200,
+            "truncated": true
+        });
+        let raw = serde_json::to_string(&value).unwrap();
+        let replacement = maybe_persist_tool_result(dir.path(), "structured-call", "reader", &raw)
+            .expect("large web result should be persisted");
+
+        assert!(replacement.contains("https://example.test/article"));
+        assert!(replacement.contains("page tail marker"));
+        assert!(replacement.contains("structured head/tail"));
     }
 
     #[test]
@@ -699,7 +862,7 @@ mod tests {
     }
 
     #[test]
-    fn artifact_windows_reject_non_boundary_and_cross_session_lookup() {
+    fn artifact_windows_normalize_non_boundary_and_preserve_cross_session_lookup() {
         let owner = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
         let content = "évidence\n".repeat(6_000);
@@ -707,9 +870,14 @@ mod tests {
             maybe_persist_tool_result(owner.path(), "call-boundary", "grep", &content).is_some()
         );
 
-        let boundary_error = read_persisted_result_window(owner.path(), "call-boundary", 1, 32)
-            .expect_err("middle of a UTF-8 scalar must not be accepted");
-        assert!(boundary_error.contains("not a UTF-8 boundary"));
+        let window = read_persisted_result_window(owner.path(), "call-boundary", 1, 32)
+            .expect("a stale cursor should be normalized to a safe boundary")
+            .expect("persisted result exists");
+        assert_eq!(
+            window.offset, 0,
+            "the cursor must floor to the scalar start"
+        );
+        assert!(window.content.starts_with('é'));
         assert!(
             read_persisted_result_window(other.path(), "call-boundary", 0, 32)
                 .unwrap()

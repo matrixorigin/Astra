@@ -1,6 +1,7 @@
 //! Pipeline session analysis — extracts context pipeline health from journal events.
 //!
-//! Reads PipelineFeedback/PipelineAlert/PipelineCompactionAudit events from a
+//! Reads canonical `pipeline_feedback` / `pipeline_alert` /
+//! `pipeline_compaction_audit` journal events and `CompactionFired` step events from a
 //! SessionCapture and produces structured diagnostics: cache trend, compaction
 //! frequency, pressure evolution, and alert timeline.
 
@@ -30,6 +31,10 @@ pub struct PipelineHealthReport {
     pub cascade_detected: bool,
     /// Number of turns with pipeline feedback.
     pub turns_with_feedback: u32,
+    /// Number of pipeline events with invalid typed payloads. Any non-zero
+    /// value means the measured health report is incomplete and cannot certify
+    /// cache/alert criteria.
+    pub invalid_events: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,19 +54,43 @@ pub fn analyze_pipeline_health(capture: &SessionCapture) -> PipelineHealthReport
         let metadata = event.raw.get("metadata");
 
         match event.event_type.as_str() {
-            "PipelineFeedback" => {
-                if let Some(meta) = metadata
-                    && let Some(ratio) = meta.get("cache_hit_ratio").and_then(|v| v.as_f64())
+            "pipeline_feedback" => {
+                let Some(metadata) = metadata else {
+                    report.invalid_events = report.invalid_events.saturating_add(1);
+                    continue;
+                };
+                let Ok(feedback_event) = serde_json::from_value::<
+                    astra_turn_core::pipeline_journal::PipelineJournalEvent,
+                >(metadata.clone()) else {
+                    report.invalid_events = report.invalid_events.saturating_add(1);
+                    continue;
+                };
+                let Some(frame) = feedback_event.runtime_feedback else {
+                    report.invalid_events = report.invalid_events.saturating_add(1);
+                    continue;
+                };
+                let event_turn = event.raw.get("turn").and_then(Value::as_u64);
+                if feedback_event.kind
+                    != astra_turn_core::pipeline_journal::PipelineEventKind::Feedback
+                    || feedback_event.turn != frame.progress.session_turn
+                    || event_turn != Some(u64::from(frame.progress.session_turn))
+                    || !frame.is_valid()
                 {
-                    feedback_ratios.push(ratio);
+                    report.invalid_events = report.invalid_events.saturating_add(1);
+                    continue;
                 }
+                let Some(ratio) = frame.cache_hit_ratio() else {
+                    report.invalid_events = report.invalid_events.saturating_add(1);
+                    continue;
+                };
+                feedback_ratios.push(ratio);
             }
             "llm_response_full" => {
                 if let Some(ratio) = raw_llm_response_cache_hit_ratio(event) {
                     raw_usage_ratios.push(ratio);
                 }
             }
-            "PipelineCompactionAudit" => {
+            "pipeline_compaction_audit" => {
                 if let Some(meta) = metadata {
                     report.compaction_count += 1;
                     if let Some(freed) = meta.get("tokens_freed").and_then(|v| v.as_u64()) {
@@ -69,7 +98,15 @@ pub fn analyze_pipeline_health(capture: &SessionCapture) -> PipelineHealthReport
                     }
                 }
             }
-            "PipelineAlert" => {
+            "CompactionFired" => {
+                if let Some(payload) = event.raw.get("payload") {
+                    report.compaction_count += 1;
+                    if let Some(saved) = payload.get("tokens_saved").and_then(Value::as_u64) {
+                        report.total_tokens_freed += saved;
+                    }
+                }
+            }
+            "pipeline_alert" => {
                 if let Some(meta) = metadata {
                     let rule = meta
                         .get("alert_rule")
@@ -279,6 +316,12 @@ pub fn render_pipeline_health(report: &PipelineHealthReport) -> String {
     out.push_str("── Pipeline Health ──\n");
 
     if report.turns_with_feedback == 0 {
+        if report.invalid_events > 0 {
+            out.push_str(&format!(
+                "  ⚠ Invalid pipeline event payloads: {} (evidence incomplete)\n",
+                report.invalid_events
+            ));
+        }
         out.push_str("  No pipeline feedback events found.\n");
         return out;
     }
@@ -291,6 +334,12 @@ pub fn render_pipeline_health(report: &PipelineHealthReport) -> String {
         "  Avg cache hit ratio: {:.1}%\n",
         report.avg_cache_hit_ratio * 100.0
     ));
+    if report.invalid_events > 0 {
+        out.push_str(&format!(
+            "  ⚠ Invalid pipeline event payloads: {} (evidence incomplete)\n",
+            report.invalid_events
+        ));
+    }
 
     if !report.cache_hit_ratios.is_empty() {
         let first = report.cache_hit_ratios.first().unwrap_or(&0.0);
@@ -346,16 +395,51 @@ mod tests {
     use crate::session_capture::JournalEvent;
 
     fn make_feedback_event(turn: u32, cache_hit_ratio: f64) -> JournalEvent {
+        let cache_read = (cache_hit_ratio * 1_000.0).round() as u64;
+        let fresh = 1_000u64.saturating_sub(cache_read);
         JournalEvent {
-            event_type: "PipelineFeedback".into(),
+            event_type: "pipeline_feedback".into(),
             raw: serde_json::json!({
-                "type": "PipelineFeedback",
+                "type": "pipeline_feedback",
                 "turn": turn,
                 "metadata": {
                     "kind": "Feedback",
                     "turn": turn,
-                    "cache_hit_ratio": cache_hit_ratio,
-                    "completion_tokens": 300,
+                    "runtime_feedback": {
+                        "schema_version": astra_turn_core::context_feedback::RuntimeFeedbackFrame::SCHEMA_VERSION,
+                        "identity": {
+                            "session_id": "session-1",
+                            "run_id": format!("run-{turn}"),
+                            "agent_id": "agent-1",
+                            "model_id": "deepseek-v4-flash",
+                            "topology": "server_only"
+                        },
+                        "progress": {
+                            "session_turn": turn,
+                            "agentic_round_index": 0,
+                            "llm_rounds_completed": 1,
+                            "slice_round_limit": 10,
+                            "slice_rounds_remaining": 9
+                        },
+                        "context": {
+                            "token_pressure": 0.1,
+                            "compaction_tier": "normal"
+                        },
+                        "request_usage": {
+                            "prompt": fresh,
+                            "cache_read": cache_read,
+                            "cache_creation": 0,
+                            "completion": 300
+                        },
+                        "run_usage": {
+                            "prompt": fresh,
+                            "cache_read": cache_read,
+                            "cache_creation": 0,
+                            "completion": 300
+                        },
+                        "policy_feedback": { "state": "not_evaluated" },
+                        "was_truncated": false
+                    }
                 }
             }),
         }
@@ -363,9 +447,9 @@ mod tests {
 
     fn make_compaction_event(turn: u32, tokens_freed: u64) -> JournalEvent {
         JournalEvent {
-            event_type: "PipelineCompactionAudit".into(),
+            event_type: "pipeline_compaction_audit".into(),
             raw: serde_json::json!({
-                "type": "PipelineCompactionAudit",
+                "type": "pipeline_compaction_audit",
                 "turn": turn,
                 "metadata": {
                     "kind": "CompactionAudit",
@@ -377,11 +461,25 @@ mod tests {
         }
     }
 
+    fn make_step_compaction_event(turn: u32, tokens_saved: u64) -> JournalEvent {
+        JournalEvent {
+            event_type: "CompactionFired".into(),
+            raw: serde_json::json!({
+                "event_type": "CompactionFired",
+                "payload": {
+                    "kind": "resume",
+                    "tokens_saved": tokens_saved,
+                    "trace_context": { "visible_turn": turn },
+                }
+            }),
+        }
+    }
+
     fn make_alert_event(turn: u32, rule: &str, severity: &str) -> JournalEvent {
         JournalEvent {
-            event_type: "PipelineAlert".into(),
+            event_type: "pipeline_alert".into(),
             raw: serde_json::json!({
-                "type": "PipelineAlert",
+                "type": "pipeline_alert",
                 "turn": turn,
                 "metadata": {
                     "kind": "Alert",
@@ -400,6 +498,7 @@ mod tests {
             events,
             skipped_lines: 0,
             dropped_lines: 0,
+            integrity_errors: 0,
         }
     }
 
@@ -478,6 +577,29 @@ mod tests {
         assert_eq!(report.turns_with_feedback, 4);
         assert_eq!(report.cache_hit_ratios.len(), 4);
         assert!(report.avg_cache_hit_ratio > 0.5);
+    }
+
+    #[test]
+    fn negative_feedback_pressure_marks_health_evidence_incomplete() {
+        let mut event = make_feedback_event(1, 0.5);
+        event.raw["metadata"]["runtime_feedback"]["context"]["token_pressure"] =
+            serde_json::json!(-0.1);
+        let capture = make_capture(vec![event]);
+        let report = analyze_pipeline_health(&capture);
+        assert_eq!(report.turns_with_feedback, 0);
+        assert_eq!(report.invalid_events, 1);
+    }
+
+    #[test]
+    fn feedback_without_required_policy_projection_is_incomplete() {
+        let mut event = make_feedback_event(1, 0.5);
+        event.raw["metadata"]["runtime_feedback"]
+            .as_object_mut()
+            .expect("runtime feedback object")
+            .remove("policy_feedback");
+        let report = analyze_pipeline_health(&make_capture(vec![event]));
+        assert_eq!(report.turns_with_feedback, 0);
+        assert_eq!(report.invalid_events, 1);
     }
 
     #[test]
@@ -578,7 +700,7 @@ mod tests {
     fn compaction_events_accumulate() {
         let capture = make_capture(vec![
             make_compaction_event(3, 2000),
-            make_compaction_event(5, 3000),
+            make_step_compaction_event(5, 3000),
         ]);
         let report = analyze_pipeline_health(&capture);
         assert_eq!(report.compaction_count, 2);

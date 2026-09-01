@@ -42,7 +42,18 @@ pub(super) fn sse_json_response(events: Vec<serde_json::Value>) -> Response {
         })
         .collect::<String>();
 
-    bridge::sse_stream_response(StatusCode::OK, Body::from(body))
+    with_interaction_protocol(bridge::sse_stream_response(
+        StatusCode::OK,
+        Body::from(body),
+    ))
+}
+
+fn with_interaction_protocol(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static(astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER),
+        axum::http::HeaderValue::from_static(astra_server_types::AGENT_INTERACTION_API_MAJOR),
+    );
+    response
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -212,25 +223,52 @@ pub(super) fn sse_streaming_response(
     session_id: String,
     run_id: String,
     request_id: Option<String>,
-    mut event_rx: tokio::sync::mpsc::Receiver<serde_json::Value>,
+    event_rx: tokio::sync::mpsc::Receiver<serde_json::Value>,
 ) -> Response {
-    // Build an async stream that yields SSE frames from the channel.
-    let stream = async_stream::stream! {
-        // First frame: session info.
-        let session_info = serde_json::json!({
+    sse_projected_streaming_response(
+        serde_json::json!({
             "type": "session_info",
             "session_id": session_id,
             "run_id": run_id,
-        });
+        }),
+        session_id,
+        run_id,
+        request_id,
+        event_rx,
+        handlers::transform_stream_run_events_for_client_with_pending,
+    )
+}
+
+pub(super) type SseStreamEventProjector =
+    fn(&str, Vec<serde_json::Value>, &mut Option<String>) -> Vec<serde_json::Value>;
+
+const SSE_DURABLE_TERMINAL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Shared SSE transport framing. Product boundaries provide their own first
+/// event and structural event projector, so opaque internal identities never
+/// have to cross a public protocol merely to reuse heartbeat/backpressure.
+pub(super) fn sse_projected_streaming_response(
+    initial_event: serde_json::Value,
+    session_id: String,
+    run_id: String,
+    request_id: Option<String>,
+    mut event_rx: tokio::sync::mpsc::Receiver<serde_json::Value>,
+    project_events: SseStreamEventProjector,
+) -> Response {
+    // Build an async stream that yields SSE frames from the channel.
+    let stream = async_stream::stream! {
         yield Ok::<_, std::convert::Infallible>(format!(
             "data: {}\n\n",
-            serde_json::to_string(&session_info).unwrap_or_default()
+            serde_json::to_string(&initial_event).unwrap_or_default()
         ));
 
         // Stream events as they arrive from the background loop.
         let mut pending_run_error = None;
         let mut pending_terminal_error = None;
+        let mut pending_terminal_deadline = None;
         let mut saw_terminal = false;
+        let mut requires_authoritative_completion = false;
+        let mut saw_authoritative_completion = false;
         let heartbeat_interval = std::time::Duration::from_secs(SSE_HEARTBEAT_INTERVAL_SECS);
         let mut heartbeat = tokio::time::interval_at(
             tokio::time::Instant::now() + heartbeat_interval,
@@ -257,20 +295,57 @@ pub(super) fn sse_streaming_response(
                     ));
                     continue;
                 }
+                _ = tokio::time::sleep_until(
+                    pending_terminal_deadline.unwrap_or_else(tokio::time::Instant::now)
+                ), if pending_terminal_deadline.is_some() => {
+                    if saw_terminal {
+                        // The durable owner terminal is already on the wire.
+                        // Exit the receive loop; the post-loop contract gate
+                        // emits a typed protocol error if its required client
+                        // completion projection never arrived.
+                        break;
+                    }
+                    let error = pending_terminal_error
+                        .take()
+                        .unwrap_or_else(|| "durable lifecycle terminal was not published".to_string());
+                    saw_terminal = true;
+                    let synthetic_terminal = serde_json::json!({
+                        "type": "run_finished",
+                        "run_id": run_id,
+                        "status": "failed",
+                        "error": error,
+                    });
+                    yield Ok::<_, std::convert::Infallible>(format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&synthetic_terminal).unwrap_or_default()
+                    ));
+                    break;
+                }
             };
-            let incoming_client_error =
-                event.get("type").and_then(serde_json::Value::as_str) == Some("error");
-            if event
+            let raw_event_type = event
                 .get("event_type")
-                .and_then(serde_json::Value::as_str)
-                == Some("run_error")
+                .and_then(serde_json::Value::as_str);
+            let client_event_type = event.get("type").and_then(serde_json::Value::as_str);
+            let producer_run_id = event
+                .get("run_id")
+                .or_else(|| event.get("data").and_then(|data| data.get("run_id")))
+                .and_then(serde_json::Value::as_str);
+            let event_belongs_to_root = producer_run_id
+                .is_none_or(|producer_run_id| producer_run_id == run_id);
+            if (raw_event_type == Some("run_error") || client_event_type == Some("run_error"))
+                && event_belongs_to_root
             {
                 pending_terminal_error = event
                     .get("data")
                     .and_then(serde_json::Value::as_object)
                     .and_then(|data| data.get("error"))
                     .and_then(serde_json::Value::as_str)
+                    .or_else(|| event.get("error").and_then(serde_json::Value::as_str))
+                    .or_else(|| event.get("message").and_then(serde_json::Value::as_str))
                     .map(ToOwned::to_owned);
+                pending_terminal_deadline = Some(
+                    tokio::time::Instant::now() + SSE_DURABLE_TERMINAL_GRACE
+                );
                 tracing::warn!(
                     target: "astra_runtime::sse",
                     request_id = request_id.as_deref().unwrap_or(""),
@@ -288,6 +363,9 @@ pub(super) fn sse_streaming_response(
                     .get("message")
                     .and_then(serde_json::Value::as_str)
                     .map(ToOwned::to_owned);
+                pending_terminal_deadline = Some(
+                    tokio::time::Instant::now() + SSE_DURABLE_TERMINAL_GRACE
+                );
                 tracing::warn!(
                     target: "astra_runtime::sse",
                     request_id = request_id.as_deref().unwrap_or(""),
@@ -323,15 +401,43 @@ pub(super) fn sse_streaming_response(
                 );
             }
 
-            let events = handlers::transform_stream_run_events_for_client_with_pending(
+            let events = project_events(
                 &run_id,
                 vec![event],
                 &mut pending_run_error,
             );
+            let mut close_after_projection = false;
             for event in events {
-                if event.get("type").and_then(serde_json::Value::as_str) == Some("run_finished") {
+                let event_type = event.get("type").and_then(serde_json::Value::as_str);
+                let is_root_terminal = event_type == Some("run_finished")
+                    && event.get("run_id").and_then(serde_json::Value::as_str)
+                        == Some(run_id.as_str());
+                if is_root_terminal {
                     saw_terminal = true;
                     pending_terminal_error = None;
+                    let status = event.get("status").and_then(serde_json::Value::as_str);
+                    requires_authoritative_completion =
+                        matches!(status, Some("completed" | "paused"));
+                    if requires_authoritative_completion {
+                        // A completed/paused Server-owned loop still owes the
+                        // client-only authoritative `turn_complete`. Bound
+                        // that settlement without confusing descendant
+                        // terminals for physical stream completion.
+                        pending_terminal_deadline = Some(
+                            tokio::time::Instant::now() + SSE_DURABLE_TERMINAL_GRACE
+                        );
+                    } else {
+                        pending_terminal_deadline = None;
+                        close_after_projection = true;
+                    }
+                } else if event_type == Some("turn_complete")
+                    && event.get("continuation_owner").and_then(serde_json::Value::as_str)
+                        == Some("server")
+                {
+                    saw_authoritative_completion = true;
+                    pending_terminal_error = None;
+                    pending_terminal_deadline = None;
+                    close_after_projection = true;
                 }
                 let line = match serde_json::to_string(&event) {
                     Ok(json) => format!("data: {json}\n\n"),
@@ -354,26 +460,33 @@ pub(super) fn sse_streaming_response(
                 };
                 yield Ok::<_, std::convert::Infallible>(line);
             }
-            if incoming_client_error
-                && let Some(error) = pending_terminal_error.take()
-            {
-                saw_terminal = true;
-                let synthetic_terminal = serde_json::json!({
-                    "type": "run_finished",
-                    "run_id": run_id,
-                    "status": "failed",
-                    "error": error,
-                });
-                yield Ok::<_, std::convert::Infallible>(format!(
-                    "data: {}\n\n",
-                    serde_json::to_string(&synthetic_terminal).unwrap_or_default()
-                ));
+            if close_after_projection {
                 break;
             }
+            // A client-shaped error is evidence about the current attempt,
+            // not authority to terminate the durable run.  The lifecycle
+            // owner may still commit a more precise paused/cancelled/failed
+            // terminal after settling provider and persistence state.  Keep
+            // the transport open and only synthesize a fallback if the owner
+            // channel actually closes without a typed run terminal.
         }
-        if !saw_terminal
-            && let Some(error) = pending_terminal_error.take()
-        {
+        if requires_authoritative_completion && !saw_authoritative_completion {
+            let protocol_error = serde_json::json!({
+                "type": "error",
+                "run_id": run_id,
+                "message": "durable run terminal omitted authoritative turn_complete",
+                "error_kind": "contract_violation",
+                "retryable": false,
+            });
+            yield Ok::<_, std::convert::Infallible>(format!(
+                "data: {}\n\n",
+                serde_json::to_string(&protocol_error).unwrap_or_default()
+            ));
+        }
+        if !saw_terminal {
+            let error = pending_terminal_error
+                .take()
+                .unwrap_or_else(|| "stream closed before run_finished".to_string());
             let synthetic_terminal = serde_json::json!({
                 "type": "run_finished",
                 "run_id": run_id,
@@ -385,10 +498,15 @@ pub(super) fn sse_streaming_response(
                 serde_json::to_string(&synthetic_terminal).unwrap_or_default()
             ));
         }
+        // `[DONE]` is the one transport-level completion marker. It follows
+        // every projected or synthesized typed terminal and never replaces
+        // that outcome. Owning it here gives CLI, Web, Edge, and Desktop the
+        // same exact-once framing contract.
+        yield Ok::<_, std::convert::Infallible>("data: [DONE]\n\n".to_string());
     };
 
     let body = Body::from_stream(stream);
-    bridge::sse_stream_response(StatusCode::OK, body)
+    with_interaction_protocol(bridge::sse_stream_response(StatusCode::OK, body))
 }
 
 fn sse_stream_event_string_field<'a>(event: &'a serde_json::Value, field: &str) -> Option<&'a str> {
@@ -495,6 +613,13 @@ mod tests {
     #[tokio::test]
     async fn sse_retry_override_is_scoped_to_the_call_site() {
         let response = sse_error_response_with_retryable(StatusCode::CONFLICT, "busy", true);
+        assert_eq!(
+            response
+                .headers()
+                .get(astra_server_types::AGENT_INTERACTION_API_MAJOR_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some(astra_server_types::AGENT_INTERACTION_API_MAJOR),
+        );
         let body = body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .expect("body");
@@ -564,7 +689,7 @@ mod tests {
     #[tokio::test]
     async fn sse_error_response_from_error_preserves_machine_fields() {
         let error = ErrorResponse::new("stale")
-            .with_error_code("bridge_session_turn_stale")
+            .with_error_code("bridge_session_turn_mismatch")
             .with_request_id("req-1")
             .with_metadata(serde_json::json!({"expected_session_turn": 2}));
         let response = sse_error_response_from_error_with_context(
@@ -583,7 +708,7 @@ mod tests {
         let event: serde_json::Value = serde_json::from_str(data).expect("json");
         assert_eq!(event["type"], "error");
         assert_eq!(event["message"], "stale");
-        assert_eq!(event["error_code"], "bridge_session_turn_stale");
+        assert_eq!(event["error_code"], "bridge_session_turn_mismatch");
         assert_eq!(event["request_id"], "req-1");
         assert_eq!(event["metadata"]["expected_session_turn"], 2);
     }
@@ -726,10 +851,12 @@ mod tests {
             text.contains("\"error\":\"stream transport failed; non-stream recovery failed\""),
             "synthetic terminal should carry the error text: {text}"
         );
+        assert_eq!(text.matches("data: [DONE]\n\n").count(), 1);
+        assert!(text.ends_with("data: [DONE]\n\n"));
     }
 
     #[tokio::test]
-    async fn streaming_response_stops_after_client_error_without_waiting_for_sender_drop() {
+    async fn streaming_response_waits_for_durable_terminal_after_client_error() {
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         tx.send(serde_json::json!({
             "type": "error",
@@ -739,6 +866,33 @@ mod tests {
         }))
         .await
         .expect("queue error");
+
+        tx.send(serde_json::json!({
+            "event_type": "run_interrupted",
+            "data": {"kind": "budget_exhausted"}
+        }))
+        .await
+        .expect("queue interruption");
+        tx.send(serde_json::json!({
+            "event_type": "run_finished",
+            "data": {
+                "interrupted": true,
+                "interruption_kind": "budget_exhausted"
+            }
+        }))
+        .await
+        .expect("queue durable terminal");
+        tx.send(serde_json::json!({
+            "type": "turn_complete",
+            "continuation_owner": "server",
+            "execution_state": {
+                "status": "interrupted",
+                "interruption_kind": "budget_exhausted"
+            }
+        }))
+        .await
+        .expect("queue authoritative completion");
+        drop(tx);
 
         let response = sse_streaming_response(
             "session-2".to_string(),
@@ -751,7 +905,7 @@ mod tests {
             body::to_bytes(response.into_body(), 1024 * 1024),
         )
         .await
-        .expect("stream should terminate without waiting for sender drop")
+        .expect("stream should terminate after the durable owner closes")
         .expect("body");
         let text = String::from_utf8(body.to_vec()).expect("utf8");
         assert!(
@@ -760,8 +914,205 @@ mod tests {
         );
         assert!(
             text.contains("\"type\":\"run_finished\""),
-            "client-shaped error should force an immediate failed terminal event: {text}"
+            "durable lifecycle owner should publish the terminal event: {text}"
         );
+        assert!(text.contains("\"status\":\"paused\""), "{text}");
+        assert!(text.contains("\"type\":\"turn_complete\""), "{text}");
+        assert!(text.contains("\"continuation_owner\":\"server\""), "{text}");
+        assert!(!text.contains("\"status\":\"failed\""), "{text}");
+        assert_eq!(text.matches("data: [DONE]\n\n").count(), 1);
+        assert!(text.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn streaming_response_bounds_missing_terminal_after_client_error() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(serde_json::json!({
+            "type": "error",
+            "message": "owner disappeared",
+            "code": "stream_transport"
+        }))
+        .await
+        .unwrap();
+
+        let response =
+            sse_streaming_response("session-timeout".into(), "run-timeout".into(), None, rx);
+        let body = tokio::spawn(body::to_bytes(response.into_body(), 1024 * 1024));
+        tokio::task::yield_now().await;
+        tokio::time::advance(SSE_DURABLE_TERMINAL_GRACE).await;
+        let body = body.await.unwrap().unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(text.contains("\"status\":\"failed\""), "{text}");
+        assert!(text.contains("owner disappeared"), "{text}");
+        assert_eq!(text.matches("data: [DONE]\n\n").count(), 1);
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn streaming_response_fails_closed_when_channel_ends_without_terminal() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(tx);
+
+        let response = sse_streaming_response("session-gap".into(), "run-gap".into(), None, rx);
+        let body = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("SSE body");
+        let text = String::from_utf8(body.to_vec()).expect("utf8 SSE");
+
+        assert!(text.contains("\"type\":\"run_finished\""));
+        assert!(text.contains("\"status\":\"failed\""));
+        assert!(text.contains("\"error\":\"stream closed before run_finished\""));
+        assert_eq!(text.matches("data: [DONE]\n\n").count(), 1);
+        assert!(text.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[tokio::test]
+    async fn descendant_terminal_does_not_settle_physical_root_stream() {
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tx.send(serde_json::json!({
+            "event_type": "run_finished",
+            "run_id": "child-run",
+            "data": {"prompt_tokens": 1, "completion_tokens": 1}
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let response = sse_streaming_response("session-root".into(), "root-run".into(), None, rx);
+        let body = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(text.contains("\"run_id\":\"child-run\""), "{text}");
+        assert!(text.contains("\"run_id\":\"root-run\""), "{text}");
+        assert!(text.contains("stream closed before run_finished"), "{text}");
+        assert!(!text.contains("\"type\":\"usage\""), "{text}");
+        assert!(!text.contains("\"type\":\"context_usage\""), "{text}");
+        assert_eq!(text.matches("data: [DONE]\n\n").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn paused_root_without_authoritative_completion_fails_closed() {
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tx.send(serde_json::json!({
+            "event_type": "run_finished",
+            "run_id": "root-run",
+            "data": {"interrupted": true}
+        }))
+        .await
+        .unwrap();
+        drop(tx);
+
+        let response = sse_streaming_response("session-root".into(), "root-run".into(), None, rx);
+        let body = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(text.contains("\"status\":\"paused\""), "{text}");
+        assert!(
+            text.contains("\"error_kind\":\"contract_violation\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("omitted authoritative turn_complete"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_root_terminal_does_not_wait_for_sender_drop() {
+        let (tx, rx) = tokio::sync::mpsc::channel(2);
+        tx.send(serde_json::json!({
+            "event_type": "run_error",
+            "data": {"error": "failed"}
+        }))
+        .await
+        .unwrap();
+        tx.send(serde_json::json!({
+            "event_type": "run_finished",
+            "run_id": "root-run",
+            "data": {}
+        }))
+        .await
+        .unwrap();
+
+        let response = sse_streaming_response("session-root".into(), "root-run".into(), None, rx);
+        let body = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            body::to_bytes(response.into_body(), 1024 * 1024),
+        )
+        .await
+        .expect("failed terminal must close the physical stream")
+        .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("\"status\":\"failed\""), "{text}");
+        assert!(!text.contains("contract_violation"), "{text}");
+        drop(tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn descendant_run_error_does_not_start_root_terminal_deadline() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(serde_json::json!({
+            "type": "run_error",
+            "run_id": "child-run",
+            "message": "child failed"
+        }))
+        .await
+        .unwrap();
+
+        let response = sse_streaming_response("session-root".into(), "root-run".into(), None, rx);
+        let body = tokio::spawn(body::to_bytes(response.into_body(), 1024 * 1024));
+        tokio::task::yield_now().await;
+        tokio::time::advance(SSE_DURABLE_TERMINAL_GRACE).await;
+        assert!(
+            !body.is_finished(),
+            "a descendant error must not terminate the physical root stream"
+        );
+
+        tx.send(serde_json::json!({
+            "event_type": "run_finished",
+            "run_id": "root-run",
+            "data": {}
+        }))
+        .await
+        .unwrap();
+        tx.send(serde_json::json!({
+            "type": "turn_complete",
+            "continuation_owner": "server"
+        }))
+        .await
+        .unwrap();
+        let text = String::from_utf8(body.await.unwrap().unwrap().to_vec()).unwrap();
+        assert!(text.contains("\"run_id\":\"child-run\""), "{text}");
+        assert!(!text.contains("\"status\":\"failed\""), "{text}");
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn authoritative_completion_cannot_replace_durable_root_terminal() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tx.send(serde_json::json!({
+            "type": "turn_complete",
+            "continuation_owner": "server"
+        }))
+        .await
+        .unwrap();
+
+        let response = sse_streaming_response("session-root".into(), "root-run".into(), None, rx);
+        let body = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(text.contains("\"type\":\"turn_complete\""), "{text}");
+        assert!(text.contains("\"status\":\"failed\""), "{text}");
+        assert!(text.contains("stream closed before run_finished"), "{text}");
+        assert_eq!(text.matches("data: [DONE]\n\n").count(), 1);
+        drop(tx);
     }
 
     #[tokio::test]
@@ -812,5 +1163,48 @@ mod tests {
         assert!(!text.contains("structuredContent"));
         assert!(text.contains("\"type\":\"run_finished\""));
         assert!(text.contains("\"status\":\"completed\""));
+        assert_eq!(text.matches("data: [DONE]\n\n").count(), 1);
+        assert!(text.ends_with("data: [DONE]\n\n"));
+    }
+
+    #[tokio::test]
+    async fn streaming_response_projects_runtime_feedback_before_exactly_one_done_marker() {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let frame = serde_json::json!({
+            "schema_version": 4,
+            "identity": {
+                "session_id": "session-feedback",
+                "run_id": "run-feedback",
+                "topology": "cli_server"
+            }
+        });
+        tx.send(serde_json::json!({
+            "type": "runtime_feedback",
+            "runtime_feedback": frame,
+            "internal_diagnostic": "must not cross the public boundary",
+        }))
+        .await
+        .expect("queue feedback");
+        tx.send(serde_json::json!({
+            "event_type": "run_finished",
+            "index": 2,
+            "data": {"status": "completed"}
+        }))
+        .await
+        .expect("queue terminal");
+        drop(tx);
+
+        let response =
+            sse_streaming_response("session-feedback".into(), "run-feedback".into(), None, rx);
+        let body = body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("SSE body");
+        let text = String::from_utf8(body.to_vec()).expect("utf8 SSE");
+
+        assert!(text.contains("\"type\":\"runtime_feedback\""));
+        assert!(text.contains("\"run_id\":\"run-feedback\""));
+        assert!(!text.contains("internal_diagnostic"));
+        assert_eq!(text.matches("data: [DONE]\n\n").count(), 1);
+        assert!(text.ends_with("data: [DONE]\n\n"));
     }
 }

@@ -4,6 +4,8 @@ import type {
   ExecutorBinding,
   ToolStatus,
   ToolTerminalStatusEvent,
+  WorkSessionBindingV1,
+  WorkTaskGraphPageV2,
 } from "@astra/sdk";
 import { toolEventIsCancelled, toolTerminalStatus } from "@astra/sdk";
 import {
@@ -18,7 +20,6 @@ const MAX_SURFACE_TOOLS = 40;
 const MAX_SURFACE_AGENTS = 60;
 
 const LIVE_WORK_SURFACE_EVENT_TYPES = [
-  "task_board_snapshot",
   "run_started",
   "run_input_queued",
   "run_paused",
@@ -107,31 +108,6 @@ export function parseWorkSurfaceEvent(value: unknown): WorkSurfaceEvent | null {
     : null;
 }
 
-export type SessionSubtask = {
-  id: string;
-  title: string;
-  description?: string | null;
-  status: string;
-  owner?: string | null;
-  depends_on?: string[];
-};
-
-export type SessionTask = {
-  id: string;
-  title: string;
-  description?: string | null;
-  active_form?: string | null;
-  status: string;
-  owner?: string | null;
-  metadata?: Record<string, unknown> | null;
-  blocks?: string[];
-  blocked_by?: string[];
-  subtasks?: SessionSubtask[];
-  created_at: string;
-  updated_at: string;
-  archived_at?: string | null;
-};
-
 export type ToolSurfaceItem = {
   callId: string;
   tool: string;
@@ -204,7 +180,8 @@ export type WorkSurfaceState = {
   runStatus: string | null;
   workspace?: WorkspaceBinding;
   executor?: ExecutorBinding;
-  tasks: SessionTask[];
+  workBinding: WorkSessionBindingV1 | null;
+  taskGraph: WorkTaskGraphPageV2 | null;
   tools: ToolSurfaceItem[];
   agents: AgentSurfaceItem[];
   blocked: RunBlockedState | null;
@@ -236,7 +213,8 @@ export type WorkSurfaceResponse = {
   executor?: ExecutorBinding | null;
   transport?: string | null;
   fallbackPolicy?: string | null;
-  tasks: SessionTask[];
+  workBinding?: WorkSessionBindingV1 | null;
+  taskGraph?: WorkTaskGraphPageV2 | null;
   events?: unknown[];
   generatedAt?: string;
   warnings?: string[];
@@ -252,7 +230,8 @@ export function createEmptyWorkSurface(
     runStatus: null,
     workspace: undefined,
     executor: undefined,
-    tasks: [],
+    workBinding: null,
+    taskGraph: null,
     tools: [],
     agents: [],
     blocked: null,
@@ -330,7 +309,8 @@ export function hydrateWorkSurface(
     runStatus: response.status ?? null,
     workspace: response.workspace ?? undefined,
     executor: response.executor ?? undefined,
-    tasks: response.tasks,
+    workBinding: response.workBinding ?? null,
+    taskGraph: response.taskGraph ?? null,
     tools: [],
     agents: [],
     blocked: null,
@@ -364,8 +344,6 @@ export function applyWorkSurfaceEvent(
     return applyRunBlockedEvent(state, event);
   }
   switch (type) {
-    case "task_board_snapshot":
-      return applyTaskBoardSnapshot(state, event);
     case "run_started":
       return applyRunStarted(state, event);
     case "binding_projection":
@@ -552,30 +530,6 @@ function applyRunInterrupted(
       stringField(event, "kind") ??
       "interrupted",
   });
-}
-
-function applyTaskBoardSnapshot(
-  state: WorkSurfaceState,
-  event: Record<string, unknown>,
-): WorkSurfaceState {
-  const tasks = Array.isArray(event.tasks)
-    ? (event.tasks.filter(isTaskLike) as SessionTask[])
-    : state.tasks;
-  const workspace = workspaceBindingFromEvent(event);
-  const executor = executorBindingFromEvent(event);
-  return {
-    ...state,
-    sessionId:
-      typeof event.session_id === "string" ? event.session_id : state.sessionId,
-    runId: stringField(event, "run_id") ?? state.runId,
-    workspace: workspace ?? state.workspace,
-    executor: executor ?? state.executor,
-    tasks,
-    hydrated: true,
-    loading: false,
-    error: null,
-    updatedAt: new Date().toISOString(),
-  };
 }
 
 function applyWorkspaceBinding(
@@ -787,8 +741,8 @@ function finishToolCall(
     upsertList(state.tools, callId, "callId", (existing) => ({
       callId,
       tool: stringField(event, "tool") ?? existing?.tool ?? "tool",
-      arguments: existing?.arguments,
-      result,
+      arguments: stringifyMaybe(event.arguments) ?? existing?.arguments,
+      result: result ?? existing?.result,
       status,
       errorKind: stringField(event, "error_kind") ?? existing?.errorKind,
       blocked: booleanField(event, "blocked") ?? existing?.blocked,
@@ -1214,11 +1168,6 @@ const CANONICAL_AGENT_INTERRUPTION_PRESENTATIONS: Record<
   token_budget_exceeded: {
     label: "Needs continuation",
     detail: "The subagent exceeded its input token budget.",
-    tone: "warning",
-  },
-  cumulative_budget_exceeded: {
-    label: "Needs continuation",
-    detail: "The subagent reached its cumulative token budget.",
     tone: "warning",
   },
   rate_limited: {
@@ -1797,14 +1746,4 @@ function stringifyMaybe(value: unknown) {
 
 function statusLabel(status: string) {
   return status.replace(/[_-]+/g, " ");
-}
-
-function isTaskLike(value: unknown): value is SessionTask {
-  if (!value || typeof value !== "object") return false;
-  const task = value as Record<string, unknown>;
-  return (
-    typeof task.id === "string" &&
-    typeof task.title === "string" &&
-    typeof task.status === "string"
-  );
 }

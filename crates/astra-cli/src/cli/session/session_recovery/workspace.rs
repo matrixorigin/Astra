@@ -1,27 +1,6 @@
 //! Workspace metadata: build, sync plan/session/context-trace fields, snapshot.
 use crate::cli::session::session_state::SessionState;
 
-pub(crate) fn sync_plan_fields_to_workspace(
-    state: &SessionState,
-    ws: &mut astra_services::session_workspace::WorkspaceMetadata,
-) {
-    ws.executing_plan_json = state
-        .executing_plan
-        .as_ref()
-        .and_then(|p| serde_json::to_string(p).ok());
-    ws.plan_goal = state.executing_plan_goal.clone();
-    ws.plan_config_json = state
-        .plan_execution_config
-        .as_ref()
-        .and_then(|c| serde_json::to_string(c).ok());
-    ws.plan_execution_rounds = state.plan_execution_rounds;
-    ws.contract_json = state
-        .durable_task_state
-        .as_ref()
-        .and_then(|d| serde_json::to_string(&d.contract).ok());
-    ws.plan_corrections = state.plan_execution_corrections.clone();
-}
-
 /// Sync session state fields to workspace for resume capability.
 pub(crate) fn sync_session_state_to_workspace(
     state: &SessionState,
@@ -60,21 +39,23 @@ pub(crate) fn context_trace_signal_from_trace(
         );
     let memory = (!trace.memory.query.trim().is_empty()
         || !trace.memory.memories_selected.is_empty()
-        || trace.memory.candidates_considered > 0)
-        .then(
-            || astra_services::session_workspace::ContextTraceMemorySignal {
-                query: trace.memory.query.trim().chars().take(160).collect(),
-                candidates_considered: trace.memory.candidates_considered,
-                selected_memory_ids: trace
-                    .memory
-                    .memories_selected
-                    .iter()
-                    .map(|memory| memory.memory_id.clone())
-                    .collect(),
-                total_tokens: trace.memory.total_tokens,
-                latency_ms: trace.memory.retrieval_latency_ms,
-            },
-        );
+        || trace.memory.candidates_considered > 0
+        || trace.memory.outcome.was_attempted())
+    .then(
+        || astra_services::session_workspace::ContextTraceMemorySignal {
+            outcome: trace.memory.outcome,
+            query: trace.memory.query.trim().chars().take(160).collect(),
+            candidates_considered: trace.memory.candidates_considered,
+            selected_memory_ids: trace
+                .memory
+                .memories_selected
+                .iter()
+                .map(|memory| memory.memory_id.clone())
+                .collect(),
+            total_tokens: trace.memory.total_tokens,
+            latency_ms: trace.memory.retrieval_latency_ms,
+        },
+    );
     let history = (trace.history.total_turns_available > 0
         || !trace.history.turns_retained.is_empty()
         || !trace.history.turns_compressed.is_empty()
@@ -251,7 +232,6 @@ fn sync_live_state_into_workspace(
             );
         }
     }
-    sync_plan_fields_to_workspace(state, ws);
     sync_context_trace_to_workspace(state, ws);
     sync_session_state_to_workspace(state, ws);
 }

@@ -16,7 +16,6 @@ pub(crate) mod plan_review_view;
 pub(crate) mod root_transcript_view;
 pub(crate) mod session_picker_view;
 pub(crate) mod skill_popup;
-pub(crate) mod task_board_view;
 pub(crate) mod task_detail_view;
 pub(crate) mod textarea;
 pub(crate) mod timeline_view;
@@ -105,7 +104,7 @@ pub(crate) struct BottomPane {
     /// itself once a later receipt supplies its durable history location.
     projection_actions: std::collections::VecDeque<BottomPaneViewAction>,
     /// True when the user pressed Esc/Ctrl+C to interrupt the current
-    /// run and the cancel RPC is in flight. The queue panel reflects
+    /// run and terminal settlement is pending. The queue panel reflects
     /// this intermediate state so the user isn't stuck wondering why
     /// "Esc sends now" isn't taking effect immediately.
     pub(crate) interrupt_pending: bool,
@@ -132,6 +131,18 @@ pub(crate) struct PendingUserIntent {
     pub(crate) status: astra_turn_types::UserIntentStatus,
     pub(crate) text: String,
     pub(crate) target: PendingUserIntentTarget,
+    custody: PendingUserIntentCustody,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingUserIntentCustody {
+    /// No request can have committed; the client may safely recover the text.
+    Client,
+    /// A request crossed the transport boundary but no authoritative receipt
+    /// arrived. Keep its stable identity visible and never auto-replay it.
+    Unconfirmed,
+    /// The durable run acknowledged ownership.
+    Run,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,6 +152,11 @@ pub(crate) enum PendingUserIntentTarget {
 }
 
 fn pending_user_intent_title(intent: &PendingUserIntent, task_status: &TaskStatus) -> String {
+    if matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+        && intent.custody == PendingUserIntentCustody::Unconfirmed
+    {
+        return "Guidance delivery uncertain · stable identity retained".to_string();
+    }
     match (&intent.target, intent.status) {
         (
             PendingUserIntentTarget::AgentRun { agent_name, .. },
@@ -149,35 +165,51 @@ fn pending_user_intent_title(intent: &PendingUserIntent, task_status: &TaskStatu
         (
             PendingUserIntentTarget::AgentRun { agent_name, .. },
             astra_turn_types::UserIntentStatus::AcceptedRemote,
-        ) => format!("Guidance delivered to {agent_name} · awaiting application"),
+        ) => format!("Guidance accepted by {agent_name} · awaiting application"),
         (
             PendingUserIntentTarget::AgentRun { agent_name, .. },
             astra_turn_types::UserIntentStatus::Applied,
         ) => format!("Guidance applied by {agent_name}"),
         (
+            PendingUserIntentTarget::AgentRun { agent_name, .. },
+            astra_turn_types::UserIntentStatus::Returned,
+        ) => format!("Guidance returned by {agent_name}"),
+        (PendingUserIntentTarget::ActiveRun, astra_turn_types::UserIntentStatus::AcceptedLocal) => {
+            "Sending guidance · awaiting server acceptance".to_string()
+        }
+        (
             PendingUserIntentTarget::ActiveRun,
-            astra_turn_types::UserIntentStatus::AcceptedLocal
-            | astra_turn_types::UserIntentStatus::AcceptedRemote,
+            astra_turn_types::UserIntentStatus::AcceptedRemote,
         ) => match task_status {
             TaskStatus::ToolExecuting { .. } => {
-                "Queued for current run · applies after current tool".to_string()
+                "Guidance accepted · before next unstarted action · Ctrl+C requests stop (cooperative)"
+                    .to_string()
             }
             TaskStatus::WaitingApproval { .. } => {
-                "Queued for current run · applies after approval".to_string()
+                "Guidance accepted by run · superseding the pending approval · Ctrl+C requests stop"
+                    .to_string()
             }
             TaskStatus::WaitingModel => {
-                "Queued for current run · applies when model resumes".to_string()
+                "Guidance accepted by run · applying at the next model boundary · Ctrl+C requests stop"
+                    .to_string()
             }
             TaskStatus::Cancelling => {
                 "Stopping current run · guidance returns to composer".to_string()
             }
             TaskStatus::Exiting => "Stopping · saving session before exit".to_string(),
-            TaskStatus::Idle | TaskStatus::Dispatching | TaskStatus::TurnRunning { .. } => {
-                "Queued for current run · applies at next model boundary".to_string()
+            TaskStatus::Idle => {
+                "Guidance delivery is being reconciled with the finished run".to_string()
+            }
+            TaskStatus::Dispatching | TaskStatus::TurnRunning { .. } => {
+                "Guidance accepted by run · applying at the next action boundary · Ctrl+C requests stop"
+                    .to_string()
             }
         },
         (PendingUserIntentTarget::ActiveRun, astra_turn_types::UserIntentStatus::Applied) => {
             "Guidance applied to current run".to_string()
+        }
+        (PendingUserIntentTarget::ActiveRun, astra_turn_types::UserIntentStatus::Returned) => {
+            "Guidance returned to composer".to_string()
         }
     }
 }
@@ -351,6 +383,11 @@ impl BottomPane {
             status,
             text,
             target,
+            custody: if status == astra_turn_types::UserIntentStatus::AcceptedRemote {
+                PendingUserIntentCustody::Run
+            } else {
+                PendingUserIntentCustody::Client
+            },
         });
         true
     }
@@ -363,7 +400,57 @@ impl BottomPane {
             return false;
         };
         intent.status = astra_turn_types::UserIntentStatus::AcceptedRemote;
+        intent.custody = PendingUserIntentCustody::Run;
         true
+    }
+
+    /// Record an ownership ambiguity after the request crossed the transport
+    /// boundary. It is neither safe to claim remote acceptance nor safe to
+    /// replay the content as a new turn.
+    pub fn mark_user_intent_unconfirmed(&mut self, intent_id: &str) -> bool {
+        let Some(intent) = self.pending_user_intents.iter_mut().find(|intent| {
+            intent.intent_id == intent_id
+                && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                && matches!(
+                    intent.custody,
+                    PendingUserIntentCustody::Client | PendingUserIntentCustody::Run
+                )
+        }) else {
+            return false;
+        };
+        intent.custody = PendingUserIntentCustody::Unconfirmed;
+        true
+    }
+
+    /// Transfer an active-run intent from local custody to the durable run.
+    ///
+    /// The local entry is created before the HTTP submission starts so a
+    /// lost acknowledgement cannot turn the same bytes back into an
+    /// apparently unsent draft. A matching durable Applied/Returned event can
+    /// therefore settle the identity even when the POST response is lost.
+    pub fn promote_user_intent_accepted(&mut self, intent_id: &str) -> bool {
+        let Some(intent) = self.pending_user_intents.iter_mut().find(|intent| {
+            intent.intent_id == intent_id
+                && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                && intent.custody == PendingUserIntentCustody::Client
+        }) else {
+            return false;
+        };
+        intent.status = astra_turn_types::UserIntentStatus::AcceptedRemote;
+        intent.custody = PendingUserIntentCustody::Run;
+        true
+    }
+
+    /// Remove a locally-owned active-run intent after a definitive rejection.
+    /// Ambiguous transport failures deliberately do not use this path: the
+    /// run may already own the idempotent intent.
+    pub fn remove_local_user_intent(&mut self, intent_id: &str) -> Option<PendingUserIntent> {
+        let index = self.pending_user_intents.iter().position(|intent| {
+            intent.intent_id == intent_id
+                && matches!(intent.target, PendingUserIntentTarget::ActiveRun)
+                && intent.custody == PendingUserIntentCustody::Client
+        })?;
+        self.pending_user_intents.remove(index)
     }
 
     pub fn remove_agent_guide(&mut self, intent_id: &str) -> Option<PendingUserIntent> {
@@ -414,7 +501,35 @@ impl BottomPane {
             status,
             text: runtime_content.to_string(),
             target,
+            custody: PendingUserIntentCustody::Run,
         })
+    }
+
+    /// Consume a durable ownership return. Only the client that still owns a
+    /// matching pending identity restores the content; other attached clients
+    /// must not duplicate it into their composer.
+    pub fn return_user_intent(
+        &mut self,
+        intent_id: &str,
+        status: astra_turn_types::UserIntentStatus,
+        runtime_content: &str,
+    ) -> bool {
+        if intent_id.trim().is_empty()
+            || status != astra_turn_types::UserIntentStatus::Returned
+            || self.applied_user_intent_ids.contains(intent_id)
+        {
+            return false;
+        }
+        let Some(index) = self.pending_user_intents.iter().position(|pending| {
+            pending.intent_id == intent_id
+                && matches!(pending.target, PendingUserIntentTarget::ActiveRun)
+        }) else {
+            return false;
+        };
+        self.pending_user_intents.remove(index);
+        self.applied_user_intent_ids.insert(intent_id.to_string());
+        self.restore_into_composer(runtime_content);
+        true
     }
 
     /// Restore queued-but-unapplied input into the composer at run end,
@@ -433,19 +548,56 @@ impl BottomPane {
         }
     }
 
-    pub fn take_unapplied_user_intents(&mut self) -> Vec<PendingUserIntent> {
+    /// Drain active-run intents when the run settles.
+    ///
+    /// Only locally accepted intents are returned to the caller for recovery.
+    /// An `AcceptedRemote` acknowledgement transfers delivery ownership to the
+    /// server; replaying it as a new turn merely because the local `Applied`
+    /// projection raced with run settlement violates exactly-once user intent.
+    pub fn take_client_recoverable_user_intents(&mut self) -> Vec<PendingUserIntent> {
         self.applied_user_intent_ids.clear();
-        let mut active_run = Vec::new();
+        let mut locally_owned = Vec::new();
         let mut retained = std::collections::VecDeque::new();
         while let Some(intent) = self.pending_user_intents.pop_front() {
-            if intent.target == PendingUserIntentTarget::ActiveRun {
-                active_run.push(intent);
-            } else {
-                retained.push_back(intent);
+            match (&intent.target, intent.custody, intent.status) {
+                (
+                    PendingUserIntentTarget::ActiveRun,
+                    PendingUserIntentCustody::Client,
+                    astra_turn_types::UserIntentStatus::AcceptedLocal,
+                ) => locally_owned.push(intent),
+                (
+                    PendingUserIntentTarget::ActiveRun,
+                    PendingUserIntentCustody::Run | PendingUserIntentCustody::Unconfirmed,
+                    astra_turn_types::UserIntentStatus::AcceptedRemote,
+                )
+                | (
+                    PendingUserIntentTarget::ActiveRun,
+                    PendingUserIntentCustody::Unconfirmed,
+                    astra_turn_types::UserIntentStatus::AcceptedLocal,
+                ) => {
+                    // The remote run owns delivery, but terminal cancellation
+                    // can beat its Applied acknowledgement. Retain the stable
+                    // identity as visible unresolved state; never turn it into
+                    // a second canonical submission automatically.
+                    retained.push_back(intent);
+                }
+                (
+                    PendingUserIntentTarget::ActiveRun,
+                    _,
+                    astra_turn_types::UserIntentStatus::Applied,
+                ) => {}
+                (
+                    PendingUserIntentTarget::ActiveRun,
+                    _,
+                    astra_turn_types::UserIntentStatus::Returned,
+                ) => {}
+                (PendingUserIntentTarget::AgentRun { .. }, _, _) => retained.push_back(intent),
+                // Construction rejects every other status/custody pairing.
+                (PendingUserIntentTarget::ActiveRun, _, _) => retained.push_back(intent),
             }
         }
         self.pending_user_intents = retained;
-        active_run
+        locally_owned
     }
 
     /// Accept a message for the next turn once the current answer is visible.
@@ -600,17 +752,6 @@ impl BottomPane {
     /// as a user-triggered view action.
     pub(crate) fn take_projection_action(&mut self) -> Option<BottomPaneViewAction> {
         self.projection_actions.pop_front()
-    }
-
-    pub(crate) fn refresh_task_board(
-        &mut self,
-        projection: &crate::tui::task_board_observer::TaskBoardProjection,
-    ) -> bool {
-        let mut refreshed = false;
-        for view in self.view_stack.iter_mut().rev() {
-            refreshed |= view.refresh_task_board(projection);
-        }
-        refreshed
     }
 
     pub(crate) fn refresh_agent_transcript(
@@ -769,26 +910,6 @@ impl BottomPane {
     pub(crate) fn primary_workspace_is_open(&self) -> bool {
         self.active_view()
             .is_some_and(|view| view.owns_primary_canvas())
-    }
-
-    pub(crate) fn task_board_is_open(&self) -> bool {
-        self.active_view()
-            .is_some_and(BottomPaneView::is_task_board_view)
-    }
-
-    /// Reactivate the retained Task Board workspace instead of stacking a
-    /// duplicate. This preserves the board's stable focus and scroll state.
-    pub(crate) fn activate_task_board(&mut self) -> bool {
-        let Some(index) = self
-            .view_stack
-            .iter()
-            .rposition(|view| view.is_task_board_view())
-        else {
-            return false;
-        };
-        let view = self.view_stack.remove(index);
-        self.view_stack.push(view);
-        true
     }
 
     /// A focused root or delegated transcript owns the primary terminal
@@ -2025,12 +2146,10 @@ impl BottomPane {
         {
             // Truncate by the actual column budget, not a hard-coded 100.
             let status = match pending.status {
-                astra_turn_types::UserIntentStatus::AcceptedLocal => match &pending.target {
-                    PendingUserIntentTarget::ActiveRun => "queued",
-                    PendingUserIntentTarget::AgentRun { .. } => "sending",
-                },
-                astra_turn_types::UserIntentStatus::AcceptedRemote => "delivered to run",
+                astra_turn_types::UserIntentStatus::AcceptedLocal => "sending",
+                astra_turn_types::UserIntentStatus::AcceptedRemote => "accepted by run",
                 astra_turn_types::UserIntentStatus::Applied => "applied",
+                astra_turn_types::UserIntentStatus::Returned => "returned",
             };
             let prefix = format!("{}  {status} · ", idx + 1);
             let budget = area.width.saturating_sub(prefix.width() as u16) as usize;

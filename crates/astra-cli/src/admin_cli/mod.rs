@@ -7,6 +7,7 @@ use crate::cli::cli_config::cli_utils::{
     bound_profile_access_token, credential_store, get_profile_and_token, load_credentials,
     profile_name,
 };
+use crate::cli::session::session_runtime;
 use astra_thin_client::ThinClient;
 use astra_thin_client::paths;
 use clap::Parser;
@@ -27,28 +28,30 @@ use interactive::run_interactive;
 /// Parse `POST /models` or `PUT /models/{name}` JSON and print `is_active` / `connectivity`.
 fn print_model_load_server_result(body: &str, model_name: &str) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
-        println!("  (non-JSON response, len {} bytes)", body.len());
+        stdout_println!("  (non-JSON response, len {} bytes)", body.len());
         return;
     };
     let active = value
         .get("is_active")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true); // fail-open: treat missing/invalid as active so user proceeds
-    println!("  is_active: {active}");
+    stdout_println!("  is_active: {active}");
     if let Some(c) = value
         .get("connectivity")
         .and_then(serde_json::Value::as_str)
     {
-        println!("  connectivity: {c}");
+        stdout_println!("  connectivity: {c}");
     } else if !active {
-        println!("  connectivity: (not in response; run: astra admin model check {model_name})");
+        stdout_println!(
+            "  connectivity: (not in response; run: astra admin model check {model_name})"
+        );
     }
     if let Some(context_window) = value
         .get("context_window")
         .and_then(serde_json::Value::as_i64)
         .filter(|value| *value > 0)
     {
-        println!("  context_window: {context_window}");
+        stdout_println!("  context_window: {context_window}");
     } else {
         eprintln!("  warning: response did not include a positive context_window");
     }
@@ -57,11 +60,11 @@ fn print_model_load_server_result(body: &str, model_name: &str) {
         .and_then(serde_json::Value::as_str);
     if let Some(cap) = thinking_cap {
         match cap {
-            "both" => println!("  thinking: both (Normal/Thinking picker enabled) ✓"),
-            "effort_only" => println!("  thinking: effort_only (Low/High effort) ✓"),
-            "native_only" => println!("  thinking: native_only (model always thinks)"),
-            "none" => println!("  thinking: none"),
-            other => println!("  thinking: {other}"),
+            "both" => stdout_println!("  thinking: both (Normal/Thinking picker enabled) ✓"),
+            "effort_only" => stdout_println!("  thinking: effort_only (Low/High/Max effort) ✓"),
+            "native_only" => stdout_println!("  thinking: native_only (model always thinks)"),
+            "none" => stdout_println!("  thinking: none"),
+            other => stdout_println!("  thinking: {other}"),
         }
     }
     if !active {
@@ -291,7 +294,7 @@ pub async fn run(
                 .map_err(map_thin_err)?;
             let tokens = parse_auth_tokens(&body)?;
             save_profile_auth_tokens(profile.as_deref(), &username, &tokens)?;
-            println!("logged in");
+            stdout_println!("logged in");
             Ok(())
         }
         Command::Register(args) => {
@@ -331,9 +334,9 @@ pub async fn run(
             }
             save_profile_auth_tokens(profile.as_deref(), &username, &tokens)?;
             if had_existing_token {
-                println!("registered and logged in (admin)");
+                stdout_println!("registered and logged in (admin)");
             } else {
-                println!("registered and logged in (initial admin)");
+                stdout_println!("registered and logged in (initial admin)");
             }
             Ok(())
         }
@@ -360,7 +363,7 @@ pub async fn run(
                 .map_err(map_thin_err)?;
             let tokens = parse_auth_tokens(&body)?;
             save_refreshed_profile_tokens(profile.as_deref(), &tokens)?;
-            println!("token refreshed");
+            stdout_println!("token refreshed");
             Ok(())
         }
         Command::Logout => {
@@ -450,7 +453,9 @@ pub async fn run(
         }
         Command::Model(ModelCmd::List) => {
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
-            let body = api.get_models_text(&token).await.map_err(map_thin_err)?;
+            let body = session_runtime::load_server_model_catalog_json(&api, &token)
+                .await
+                .map_err(|error| error.to_string())?;
             print_json_or_raw(&body);
             Ok(())
         }
@@ -490,7 +495,7 @@ pub async fn run(
                 .await
                 .map_err(map_thin_err)?;
             if body.is_empty() {
-                println!("deleted");
+                stdout_println!("deleted");
             } else {
                 print_json_or_raw(&body);
             }
@@ -544,7 +549,7 @@ pub async fn run(
                         .put_bearer_path_json_text(&token, &paths::model(model_name), &upd)
                         .await
                         .map_err(map_thin_err)?;
-                    println!("re-synced existing model metadata: {model_name}");
+                    stdout_println!("re-synced existing model metadata: {model_name}");
                     print_model_load_server_result(&body, model_name);
                     true
                 } else {
@@ -563,7 +568,7 @@ pub async fn run(
                         .await
                     {
                         Ok(body) => {
-                            println!("loaded model: {model_name}");
+                            stdout_println!("loaded model: {model_name}");
                             print_model_load_server_result(&body, model_name);
                             true
                         }
@@ -585,11 +590,11 @@ pub async fn run(
                                     )
                                     .await
                                     .map_err(map_thin_err)?;
-                                println!("re-synced existing model: {model_name}");
+                                stdout_println!("re-synced existing model: {model_name}");
                                 print_model_load_server_result(&body, model_name);
                                 true
                             } else {
-                                println!(
+                                stdout_println!(
                                     "skipped (already exists): {model_name} — use `astra admin model load {} --update-existing` to push YAML credentials and re-run connectivity",
                                     args.path
                                 );
@@ -612,17 +617,19 @@ pub async fn run(
                                 });
                             match cap.as_deref() {
                                 Some("both") => {
-                                    println!("  thinking: both (Normal/Thinking picker) ✓")
+                                    stdout_println!("  thinking: both (Normal/Thinking picker) ✓")
                                 }
                                 Some("effort_only") => {
-                                    println!("  thinking: effort_only (Low/High effort) ✓")
+                                    stdout_println!(
+                                        "  thinking: effort_only (Low/High/Max effort) ✓"
+                                    )
                                 }
                                 Some("native_only") => {
-                                    println!("  thinking: native_only (always thinks)")
+                                    stdout_println!("  thinking: native_only (always thinks)")
                                 }
-                                Some("none") => println!("  thinking: none"),
-                                Some(other) => println!("  thinking: {other}"),
-                                None => println!("  thinking: probe returned no capability"),
+                                Some("none") => stdout_println!("  thinking: none"),
+                                Some(other) => stdout_println!("  thinking: {other}"),
+                                None => stdout_println!("  thinking: probe returned no capability"),
                             }
                         }
                         Err(e) => {

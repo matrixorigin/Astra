@@ -106,7 +106,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         )
         .route("/chat", post(chat_handlers::chat_handler))
         .route("/chat/stream", post(chat_handlers::chat_stream_handler))
-        .route("/chat/turn", post(chat_handlers::chat_turn_handler))
         .route(
             "/runtime/capabilities",
             get(capability_handlers::runtime_capabilities_handler),

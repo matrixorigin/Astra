@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use astra_core::SubRunState;
-use astra_services::coordination::{DelegationRequest, DelegationResult};
+use astra_services::coordination::{AgentProfileRegistry, DelegationRequest, DelegationResult};
 
 // ─── Types that must live here for trait signatures ─────────────────────
 
@@ -58,6 +58,7 @@ pub trait DelegationExecutor: Send + Sync {
         &self,
         request: DelegationRequest,
         source_agent_id: &str,
+        profile_snapshot: AgentProfileRegistry,
         cancel_token: Option<Arc<tokio_util::sync::CancellationToken>>,
     ) -> Result<DelegationResult, String>;
 
@@ -107,6 +108,7 @@ pub trait RunPersistence: Send + Sync {
     async fn persist_status_if_current(
         &self,
         user_id: &str,
+        expected_session_id: &str,
         run_id: &str,
         expected_statuses: &[&str],
         status: &str,
@@ -118,6 +120,7 @@ pub trait RunPersistence: Send + Sync {
     async fn persist_usage(
         &self,
         user_id: &str,
+        expected_session_id: &str,
         run_id: &str,
         prompt_tokens: u64,
         completion_tokens: u64,
@@ -128,10 +131,17 @@ pub trait RunPersistence: Send + Sync {
     async fn persist_checkpoint(
         &self,
         user_id: &str,
+        expected_session_id: &str,
         run_id: &str,
         checkpoint_json: &str,
     ) -> Result<bool, String>;
 
     /// Append an event to the durable event log.
-    async fn append_event(&self, user_id: &str, run_id: &str, event: Value) -> Result<(), String>;
+    async fn append_event(
+        &self,
+        user_id: &str,
+        expected_session_id: &str,
+        run_id: &str,
+        event: Value,
+    ) -> Result<(), String>;
 }

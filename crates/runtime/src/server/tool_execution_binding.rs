@@ -218,6 +218,11 @@ pub struct ToolPolicySnapshot {
     /// route execution, preventing policy TOCTOU within one invocation.
     #[serde(skip)]
     pub admission_snapshot: Option<ToolExecutionAdmissionSnapshot>,
+    /// Trusted control epoch returned by durable action admission for this
+    /// exact dispatch. It is installed only after the ledger grants Execute,
+    /// never serialized to an external executor or accepted from tool args.
+    #[serde(skip)]
+    pub expected_control_epoch: Option<i64>,
     /// Concrete, trusted revision facts for one semantic pure-read decision.
     /// Eligibility in the provider descriptor is insufficient without this.
     #[serde(skip)]
@@ -553,6 +558,23 @@ fn string_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn durable_control_epoch_is_not_a_provider_wire_field() {
+        let mut policy = ToolPolicySnapshot {
+            expected_control_epoch: Some(7),
+            ..ToolPolicySnapshot::default()
+        };
+        let mut wire = serde_json::to_value(&policy).expect("serialize policy wire");
+        assert!(wire.get("expected_control_epoch").is_none());
+
+        wire["expected_control_epoch"] = json!(99);
+        policy = serde_json::from_value(wire).expect("decode provider-shaped policy");
+        assert_eq!(
+            policy.expected_control_epoch, None,
+            "external/provider bytes cannot manufacture action-admission authority"
+        );
+    }
 
     fn workspace_record() -> astra_runtime_env::WorkspaceRecord {
         astra_runtime_env::WorkspaceRecord {

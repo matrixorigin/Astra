@@ -133,7 +133,56 @@ pub fn build_recovery_message_with_evidence(
     evidence: Option<&astra_core::ToolFailureEvidence>,
 ) -> String {
     if let Some(evidence) = evidence {
+        if tool_name == "bash"
+            && evidence.cause == astra_core::ToolFailureCause::ScopeTooBroad
+            && !evidence.retryable
+            && evidence
+                .recovery_actions
+                .contains(&astra_core::ToolRecoveryAction::SelectAvailableCapability)
+        {
+            return "⚠ Bash workspace verification is unavailable for this workspace generation. Do NOT retry bash mode=verify or merely change its command: use a typed observer such as read_file, list_dir, or git_diff for the changed artifact instead.".to_string();
+        }
         match evidence.cause {
+            astra_core::ToolFailureCause::InvalidArguments => {
+                return format!(
+                    "⚠ {tool_name} rejected the structured arguments. Correct the named fields and make one new call; do not repeat the identical request."
+                );
+            }
+            astra_core::ToolFailureCause::PermissionBoundary => {
+                return format!(
+                    "⚠ {tool_name} was denied by the active permission policy. Do NOT retry the identical call; remove the restricted effect or use a capability that is explicitly available."
+                );
+            }
+            astra_core::ToolFailureCause::CapabilityUnavailable => {
+                return format!(
+                    "⚠ {tool_name} has no available executor/provider for this turn. Do NOT retry the identical call; reconnect or select an explicitly bound capability."
+                );
+            }
+            astra_core::ToolFailureCause::ResourceMissing => {
+                return format!(
+                    "⚠ {tool_name} could not find the requested resource. Verify the structured path/name before making one corrected call."
+                );
+            }
+            astra_core::ToolFailureCause::ResourceExhausted => {
+                return format!(
+                    "⚠ {tool_name} hit a system resource limit. Reduce scope or resource pressure before trying again; do not repeat the identical call."
+                );
+            }
+            astra_core::ToolFailureCause::TransientTransport => {
+                if evidence.retryable {
+                    return format!(
+                        "⚠ {tool_name} encountered a retryable transport failure. Wait for the provider/edge route to recover, then make at most one new call."
+                    );
+                }
+                return format!(
+                    "⚠ {tool_name} encountered a terminal transport failure for this turn. No automatic retry is permitted; select another bound route or report the degraded capability."
+                );
+            }
+            astra_core::ToolFailureCause::CommandFailed => {
+                return format!(
+                    "⚠ {tool_name} ran but its command exited unsuccessfully. This is not a tool-schema or credential error. Inspect the command's exit code and captured output, then correct the command, path, or operation before making one new call; do not repeat the identical command."
+                );
+            }
             astra_core::ToolFailureCause::InputTooLarge => {
                 return format!(
                     "⚠ {tool_name} rejected an oversized input. Use a targeted line/range read, narrow the path or query, or search for the relevant location before reading full content. This is structured recovery evidence; do not repeat the identical call."
@@ -162,12 +211,6 @@ pub fn build_recovery_message_with_evidence(
         category,
         ErrorCategory::ToolInvalidArgs | ErrorCategory::InvalidRequest
     );
-    let task_board_invalid_args = tool_name == "task_board"
-        && matches!(
-            category,
-            ErrorCategory::ToolInvalidArgs | ErrorCategory::InvalidRequest
-        );
-
     let mut msg = match category {
         ErrorCategory::Network
         | ErrorCategory::RateLimit
@@ -193,8 +236,6 @@ pub fn build_recovery_message_with_evidence(
                 "⚠ ask_user failed: invalid questionnaire arguments. You chose ask_user because user clarification is required. Retry the SAME ask_user tool immediately with corrected questionnaire args. Do NOT continue implementation, guess defaults, or act as if the user already answered. Use a top-level `questions` array, for example: {\"questions\":[{\"header\":\"Scope\",\"question\":\"Which scope should we ship first?\",\"options\":[\"Core flow\",\"Full workflow\"],\"allow_freeform\":true}]}.".to_string()
             } else if write_file_invalid_args {
                 "⚠ write_file failed: invalid arguments or workspace safety precondition. Retry the same tool with both `path` and `content` for writes, or `path` + `delete=true` for deletes. For existing files, call read_file on the exact path in this session before editing it. Do NOT switch to bash or python just to write or delete this file.".to_string()
-            } else if task_board_invalid_args {
-                astra_tools::task_tool_contract::task_invalid_args_recovery_message()
             } else if file_edit_invalid_args {
                 format!(
                     "⚠ {} failed: invalid file-edit arguments or workspace safety precondition. \
@@ -718,6 +759,102 @@ mod tests {
     }
 
     #[test]
+    fn command_failure_evidence_never_becomes_a_tool_argument_or_auth_diagnosis() {
+        let evidence = astra_core::ToolFailureEvidence::new(
+            ErrorCategory::Unknown,
+            astra_core::ToolFailureCause::CommandFailed,
+            false,
+            vec![astra_core::ToolRecoveryAction::InspectStructuredFailure],
+        );
+        let message = build_recovery_message_with_evidence(
+            "bash",
+            "Error: bash execution failed (exit code 2)",
+            ErrorCategory::ToolInvalidArgs,
+            &[],
+            Some(&evidence),
+        );
+        assert!(
+            message.contains("command exited unsuccessfully"),
+            "{message}"
+        );
+        assert!(!message.contains("invalid arguments"), "{message}");
+        assert!(
+            message.contains("not a tool-schema or credential error"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn structured_capability_failure_does_not_invent_network_retry() {
+        let evidence = astra_core::ToolFailureEvidence::new(
+            ErrorCategory::ToolUnavailable,
+            astra_core::ToolFailureCause::CapabilityUnavailable,
+            false,
+            vec![astra_core::ToolRecoveryAction::SelectAvailableCapability],
+        );
+        let message = build_recovery_message_with_evidence(
+            "web_fetch",
+            "edge route unavailable",
+            ErrorCategory::Network,
+            &[],
+            Some(&evidence),
+        );
+        assert!(
+            message.contains("no available executor/provider"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("system retried automatically"),
+            "{message}"
+        );
+        assert!(message.contains("Do NOT retry"), "{message}");
+    }
+
+    #[test]
+    fn non_retryable_bash_scope_capability_directs_to_typed_observer() {
+        let evidence = astra_core::ToolFailureEvidence::new(
+            ErrorCategory::ToolUnavailable,
+            astra_core::ToolFailureCause::ScopeTooBroad,
+            false,
+            vec![astra_core::ToolRecoveryAction::SelectAvailableCapability],
+        );
+        let message = build_recovery_message_with_evidence(
+            "bash",
+            "verify unavailable",
+            ErrorCategory::ToolUnavailable,
+            &[],
+            Some(&evidence),
+        );
+        assert!(
+            message.contains("Do NOT retry bash mode=verify"),
+            "{message}"
+        );
+        assert!(message.contains("typed observer"), "{message}");
+    }
+
+    #[test]
+    fn structured_non_retryable_timeout_is_not_presented_as_an_automatic_retry() {
+        let evidence = astra_core::ToolFailureEvidence::new(
+            ErrorCategory::ToolTimeout,
+            astra_core::ToolFailureCause::TransientTransport,
+            false,
+            vec![astra_core::ToolRecoveryAction::WaitAndRetry],
+        );
+        let message = build_recovery_message_with_evidence(
+            "bash",
+            "approval wait expired",
+            ErrorCategory::Network,
+            &[],
+            Some(&evidence),
+        );
+        assert!(message.contains("terminal transport failure"), "{message}");
+        assert!(
+            !message.contains("system retried automatically"),
+            "{message}"
+        );
+    }
+
+    #[test]
     fn recovery_message_tool_specific() {
         // unavailable tool
         let msg = build_recovery_message(
@@ -741,30 +878,6 @@ mod tests {
         assert!(
             !alts_section.to_lowercase().contains("bash"),
             "bash must not be an alternative"
-        );
-
-        // task missing/invalid action → retry the same structured tool with
-        // the shared action contract instead of switching tools or answering
-        // as if task management succeeded.
-        let err = "Error: missing required parameter `action` for `task_board`.";
-        let cat = classify_error(err);
-        assert_eq!(cat, ErrorCategory::ToolInvalidArgs);
-        let msg = build_recovery_message("task_board", err, cat, &[]);
-        assert!(msg.contains("Retry the same `task_board` tool"));
-        assert!(msg.contains(astra_tools::task_tool_contract::TASK_ACTIONS_DISPLAY));
-        assert!(msg.contains("use only fields allowed for that action"));
-
-        let err = astra_tools::task_tool_contract::unknown_task_field_message(
-            "create",
-            "new_status",
-            astra_tools::task_tool_contract::task_action_allowed_fields("create").unwrap(),
-        );
-        let cat = classify_error(&err);
-        assert_eq!(cat, ErrorCategory::ToolInvalidArgs);
-        let msg = build_recovery_message("task_board", &err, cat, &[]);
-        assert!(
-            msg.contains("action=update with task_id + new_status"),
-            "wrong-action field errors must recover through the task contract: {msg}"
         );
 
         // write_file missing content → editing alternatives

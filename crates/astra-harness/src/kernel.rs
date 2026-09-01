@@ -277,6 +277,39 @@ mod tests {
     }
 
     #[test]
+    fn budget_verifier_allows_runtime_owned_settlement_round() {
+        let sink = InMemorySnapshotSink::arc();
+        let kernel = StandardKernel::new(
+            sink,
+            vec![Box::new(BudgetVerifier {
+                max_turns: Some(5),
+                max_tokens: None,
+                max_duration_millis: None,
+            })],
+        );
+
+        let mut record = make_record(HookPoint::PostLlmResponse, 6, 0);
+        record.snapshot.settlement_rounds_reserved = 1;
+        assert!(matches!(kernel.on_record(&record), HookVerdict::Continue));
+
+        record.snapshot.turns_used = 7;
+        assert!(matches!(
+            kernel.on_record(&record),
+            HookVerdict::Block { .. }
+        ));
+    }
+
+    #[test]
+    fn default_kernel_does_not_invent_a_turn_budget() {
+        let sink = InMemorySnapshotSink::arc();
+        let kernel = StandardKernel::configured(sink, HarnessLimits::default());
+        let record = make_record(HookPoint::PostTurn, 10_000, 0);
+
+        assert!(matches!(kernel.on_record(&record), HookVerdict::Continue));
+        assert!(HarnessLimits::default().max_turns.is_none());
+    }
+
+    #[test]
     fn pause_severity_maps_to_hook_pause() {
         let sink = InMemorySnapshotSink::arc();
         let kernel = StandardKernel::new(

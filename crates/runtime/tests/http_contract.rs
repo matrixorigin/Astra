@@ -116,6 +116,32 @@ fn assert_contract_json(actual: &serde_json::Value, expected: &serde_json::Value
     assert_eq!(actual, expected, "{label}");
 }
 
+fn assert_health_contract_json(
+    actual: &serde_json::Value,
+    expected: &serde_json::Value,
+    label: &str,
+) {
+    let expected_sha = expected
+        .as_object()
+        .and_then(|object| object.get("build_git_sha"))
+        .and_then(serde_json::Value::as_str);
+    assert_eq!(
+        expected_sha,
+        Some("<dynamic-build-git-sha>"),
+        "{label}: health contract must use the dynamic build SHA sentinel"
+    );
+
+    let mut resolved_expected = expected.clone();
+    resolved_expected
+        .as_object_mut()
+        .expect("health contract should be a JSON object")
+        .insert(
+            "build_git_sha".to_string(),
+            serde_json::Value::String(astra_core::history_work_baseline::BUILD_GIT_SHA.to_string()),
+        );
+    assert_contract_json(actual, &resolved_expected, label);
+}
+
 fn build_request(
     method: &str,
     path: &str,
@@ -149,7 +175,7 @@ async fn healthy_state_matches_shared_contract() {
     let (status, json) = read_json(build_test_app(true), "/health").await;
 
     assert_eq!(status.as_u16(), contract.health.healthy.status);
-    assert_contract_json(&json, &contract.health.healthy.json, "health_healthy");
+    assert_health_contract_json(&json, &contract.health.healthy.json, "health_healthy");
 }
 
 #[tokio::test]
@@ -159,7 +185,7 @@ async fn unhealthy_state_matches_shared_contract() {
     let (status, json) = read_json(build_test_app(false), "/health").await;
 
     assert_eq!(status.as_u16(), contract.health.unhealthy.status);
-    assert_contract_json(&json, &contract.health.unhealthy.json, "health_unhealthy");
+    assert_health_contract_json(&json, &contract.health.unhealthy.json, "health_unhealthy");
 }
 
 #[tokio::test]

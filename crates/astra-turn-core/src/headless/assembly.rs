@@ -4,8 +4,9 @@
 
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use thiserror::Error;
 
-use crate::tool::args::shape::{parse_tool_call_arguments, tool_call_name};
+use crate::tool::args::shape::canonicalize_tool_call_for_execution;
 use crate::tool::categories::is_file_mutation_tool;
 use crate::tool::result::semantics::tool_dedup_signature;
 
@@ -73,53 +74,80 @@ pub fn headless_round_tool_indices(
     }
 }
 
-/// Ensure every tool_call in the slice has a non-empty `"id"` field.
-/// Returns a `Cow::Borrowed` when all ids are present, avoiding allocation.
-/// When any id is empty/missing, clones those entries and patches them
-/// with a synthetic UUID v7.
-pub fn ensure_tool_call_ids(tool_calls: &[Value]) -> std::borrow::Cow<'_, [Value]> {
-    let needs_patch = tool_calls.iter().any(|tc| {
-        tc.get("id")
-            .and_then(|v| v.as_str())
-            .map_or(true, |s| s.is_empty())
-    });
-    if !needs_patch {
-        return std::borrow::Cow::Borrowed(tool_calls);
-    }
-    std::borrow::Cow::Owned(
-        tool_calls
-            .iter()
-            .map(|tc| {
-                let id = tc.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                if id.is_empty() {
-                    let mut patched = tc.clone();
-                    patched["id"] = Value::String(uuid::Uuid::now_v7().to_string());
-                    patched
-                } else {
-                    tc.clone()
-                }
-            })
-            .collect(),
-    )
+fn tool_call_ids_are_unique(tool_calls: &[Value]) -> bool {
+    let mut ids = HashSet::with_capacity(tool_calls.len());
+    tool_calls.iter().all(|tool_call| {
+        tool_call
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| ids.insert(id))
+    })
 }
 
-/// Parse flat `/chat/turn` tool-call JSON: top-level `id`, `name`, `arguments` (object or JSON string).
-/// Also handles OpenAI format (`function.name` / `function.arguments`) produced by
-/// `normalize_tool_call_for_accum` — see test `parse_flat_tool_call_openai_format`.
-pub fn parse_flat_tool_call_event(tc: &Value) -> (String, String, Value) {
-    let id = tc
-        .get("id")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ProviderToolBatchError {
+    #[error("provider tool call at index {index} is invalid: {detail}")]
+    InvalidCall { index: usize, detail: &'static str },
+    #[error("provider tool call at index {index} has a malformed identity")]
+    InvalidIdentity { index: usize },
+    #[error("provider tool-call identity `{id}` is duplicated")]
+    DuplicateIdentity { id: String },
+}
 
-    let name = tool_call_name(tc).unwrap_or("").to_string();
-    // Admission canonicalizes executable calls to a flat object. Legacy
-    // display paths may still pass an OpenAI-shaped call, so consume the same
-    // strict shared parser here. Invalid or conflicting representations never
-    // become an executable empty argument object.
-    let args = parse_tool_call_arguments(tc).unwrap_or(Value::Null);
+/// Canonicalize one complete provider-owned tool batch without inventing
+/// identities. Any malformed entry or repeated identity invalidates the whole
+/// batch: partially retaining it would silently lose model intent and could
+/// execute two effects under one durable key.
+pub fn canonicalize_provider_tool_batch(
+    tool_calls: &[Value],
+) -> Result<std::borrow::Cow<'_, [Value]>, ProviderToolBatchError> {
+    let all_exact = tool_calls.iter().all(|tool_call| {
+        canonicalize_tool_call_for_execution(tool_call)
+            .is_ok_and(|canonical| canonical == *tool_call)
+    });
+    let canonical = tool_calls
+        .iter()
+        .enumerate()
+        .map(|(index, tool_call)| {
+            canonicalize_tool_call_for_execution(tool_call)
+                .map_err(|detail| ProviderToolBatchError::InvalidCall { index, detail })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut identities = HashSet::with_capacity(canonical.len());
+    for (index, tool_call) in canonical.iter().enumerate() {
+        let id = tool_call["id"]
+            .as_str()
+            .filter(|id| id.len() <= 512 && !id.chars().any(char::is_control))
+            .ok_or(ProviderToolBatchError::InvalidIdentity { index })?;
+        if !identities.insert(id) {
+            return Err(ProviderToolBatchError::DuplicateIdentity { id: id.to_string() });
+        }
+    }
+    if all_exact && tool_call_ids_are_unique(tool_calls) {
+        Ok(std::borrow::Cow::Borrowed(tool_calls))
+    } else {
+        Ok(std::borrow::Cow::Owned(canonical))
+    }
+}
+
+/// Parse one exact canonical tool call. Invalid or id-less input returns an
+/// empty sentinel and must not be routed to execution.
+pub fn parse_flat_tool_call_event(tc: &Value) -> (String, String, Value) {
+    let Ok(canonical) = canonicalize_tool_call_for_execution(tc) else {
+        return (String::new(), String::new(), Value::Null);
+    };
+    if canonical != *tc {
+        return (String::new(), String::new(), Value::Null);
+    }
+    let id = canonical["id"].as_str().unwrap_or_default().to_string();
+    let name = canonical["function"]["name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let args = canonical["function"]["arguments"]
+        .as_str()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or(Value::Null);
     (id, name, args)
 }
 
@@ -279,6 +307,16 @@ pub trait EdgeToolRoundRow {
     fn tool_name(&self) -> &str;
     fn tool_args(&self) -> &Value;
     fn tool_output(&self) -> &str;
+    /// Machine-owned terminal status supplied by the edge executor.
+    ///
+    /// This is deliberately distinct from a tool's human/JSON output.  The
+    /// execution pipeline uses it to preserve a typed transport failure even
+    /// when the diagnostic body is prose.  Legacy rows that did not carry a
+    /// terminal status remain `None` and use their established compatibility
+    /// path.
+    fn tool_execution_status(&self) -> Option<&str> {
+        None
+    }
     fn tool_result_fields(&self) -> Option<&serde_json::Map<String, Value>> {
         None
     }
@@ -304,6 +342,7 @@ pub trait EdgeToolRoundRow {
 pub struct MatchedEdgeToolOutput {
     pub output: String,
     pub duration_ms: u64,
+    pub execution_status: Option<String>,
     pub tool_result_fields: Option<serde_json::Map<String, Value>>,
 }
 
@@ -311,6 +350,7 @@ fn matched_edge_tool_output<T: EdgeToolRoundRow>(row: &T) -> MatchedEdgeToolOutp
     MatchedEdgeToolOutput {
         output: row.tool_output().to_string(),
         duration_ms: row.tool_duration_ms(),
+        execution_status: row.tool_execution_status().map(ToString::to_string),
         tool_result_fields: row.tool_result_fields().cloned(),
     }
 }
@@ -369,6 +409,7 @@ pub fn take_edge_output_for_tool_call_with_duration<T: EdgeToolRoundRow>(
             no_matching_edge_execution_message(name)
         }),
         duration_ms: 0,
+        execution_status: None,
         tool_result_fields: None,
     }
 }
@@ -445,9 +486,12 @@ pub fn tool_calls_for_stall_guard<T: EdgeToolRoundRow>(
 fn openai_tool_call_entries_from_server(tool_calls: &[Value]) -> Vec<Value> {
     tool_calls
         .iter()
-        .map(|tc| {
+        .filter_map(|tc| {
             let (id, name, args) = parse_flat_tool_call_event(tc);
-            json!({
+            if id.is_empty() || name.is_empty() || !args.is_object() {
+                return None;
+            }
+            Some(json!({
                 "id": id,
                 "type": "function",
                 "function": {
@@ -455,7 +499,7 @@ fn openai_tool_call_entries_from_server(tool_calls: &[Value]) -> Vec<Value> {
                     "arguments": serde_json::to_string(&args)
                         .unwrap_or_else(|_| r#"{"error":"argument serialization failed"}"#.to_string()),
                 }
-            })
+            }))
         })
         .collect()
 }
@@ -614,7 +658,7 @@ pub fn begin_headless_tool_round_opening_ext<Edge: EdgeToolRoundRow>(
         force_reasoning_field,
     );
     let indices = headless_round_tool_indices(server_tool_calls.len(), edge_round.len());
-    let tool_count = indices.len().max(1);
+    let tool_count = indices.len();
     HeadlessRoundOpening {
         assistant_message,
         indices,
@@ -811,7 +855,9 @@ mod tests {
 
     #[test]
     fn resolve_headless_slot_server_and_synthetic() {
-        let server = vec![json!({"id":"a","name":"read_file","arguments":{}})];
+        let server = vec![
+            json!({"id":"a","type":"function","function":{"name":"read_file","arguments":"{}"}}),
+        ];
         let s0 =
             resolve_headless_tool_slot(HeadlessRoundToolIdx::ServerToolCall(0), &server, |_| {
                 panic!("edge lookup not used")
@@ -836,11 +882,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_flat_tool_call_string_arguments() {
+    fn parse_canonical_tool_call_string_arguments() {
         let tc = json!({
             "id": "c1",
-            "name": "bash",
-            "arguments": "{\"command\":\"ls\"}"
+            "type": "function",
+            "function": {"name": "bash", "arguments": "{\"command\":\"ls\"}"}
         });
         let (id, name, args) = parse_flat_tool_call_event(&tc);
         assert_eq!(id, "c1");
@@ -849,37 +895,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_flat_tool_call_object_arguments() {
+    fn parse_canonical_tool_call_rejects_non_exact_object_arguments() {
         let tc = json!({
             "id": "c2",
-            "name": "grep",
-            "arguments": {"pattern": "x"}
+            "type": "function",
+            "function": {"name": "grep", "arguments": {"pattern": "x"}}
         });
         let (id, name, args) = parse_flat_tool_call_event(&tc);
-        assert_eq!(id, "c2");
-        assert_eq!(name, "grep");
-        assert_eq!(args, json!({"pattern":"x"}));
+        assert!(id.is_empty());
+        assert!(name.is_empty());
+        assert!(args.is_null());
     }
 
     #[test]
-    fn parse_flat_tool_call_canonicalizes_name() {
-        let flat = json!({
-            "id": "c1",
-            "name": " bash ",
-            "arguments": "{}"
-        });
-        let (_, name, _) = parse_flat_tool_call_event(&flat);
-        assert_eq!(name, "bash");
-
-        let openai = json!({
+    fn parse_canonical_tool_call_requires_exact_name() {
+        let tool_call = json!({
             "id": "c2",
             "type": "function",
             "function": {
-                "name": " grep ",
+                "name": "grep",
                 "arguments": "{}"
             }
         });
-        let (_, name, _) = parse_flat_tool_call_event(&openai);
+        let (_, name, _) = parse_flat_tool_call_event(&tool_call);
         assert_eq!(name, "grep");
     }
 
@@ -1027,6 +1065,16 @@ mod tests {
     }
 
     #[test]
+    fn begin_headless_opening_does_not_invent_an_action_for_an_empty_round() {
+        let edge: Vec<Row> = vec![];
+        let opening = begin_headless_tool_round_opening(&[], &edge, "");
+
+        assert!(opening.indices.is_empty());
+        assert_eq!(opening.tool_count, 0);
+        assert!(opening.assistant_message.get("tool_calls").is_none());
+    }
+
+    #[test]
     fn tool_calls_for_stall_guard_prefers_server_list() {
         let server = vec![json!({"id":"1","name":"bash","arguments":{}})];
         let edge = vec![Row {
@@ -1097,8 +1145,8 @@ mod tests {
     fn openai_assistant_message_from_server_tool_calls() {
         let server = vec![json!({
             "id": "call_1",
-            "name": "read_file",
-            "arguments": {"path": "a.rs"}
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}
         })];
         let msg = openai_assistant_with_tool_calls_message(&server, &[] as &[Row], "");
         assert_eq!(msg["role"], "assistant");
@@ -1304,85 +1352,107 @@ mod tests {
     }
 
     #[test]
-    fn parse_flat_tool_call_generates_id_when_missing() {
-        let tc = json!({"name": "bash", "arguments": "{}"});
+    fn parse_canonical_tool_call_rejects_missing_or_empty_id() {
+        let tc = json!({"type":"function","function":{"name":"bash","arguments":"{}"}});
         let (id, name, _) = parse_flat_tool_call_event(&tc);
-        assert!(!id.is_empty(), "empty id should be replaced with UUID");
-        assert_eq!(name, "bash");
+        assert!(id.is_empty());
+        assert!(name.is_empty());
 
-        // Empty string id should also be replaced
-        let tc2 = json!({"id": "", "name": "bash", "arguments": "{}"});
+        let tc2 = json!({"id":"","type":"function","function":{"name":"bash","arguments":"{}"}});
         let (id2, _, _) = parse_flat_tool_call_event(&tc2);
-        assert!(!id2.is_empty());
-        assert_ne!(id, id2, "each call should get a unique id");
+        assert!(id2.is_empty());
     }
 
-    // ── ensure_tool_call_ids regression tests ───────────────────────────
+    // ── canonicalize_provider_tool_batch regression tests ───────────────
 
     #[test]
-    fn ensure_ids_borrows_when_all_present() {
+    fn canonical_batch_borrows_when_all_calls_are_exact() {
         let tcs = vec![
-            json!({"id": "a", "name": "bash"}),
-            json!({"id": "b", "name": "grep"}),
+            json!({"id":"a","type":"function","function":{"name":"bash","arguments":"{}"}}),
+            json!({"id":"b","type":"function","function":{"name":"grep","arguments":"{}"}}),
         ];
-        let result = ensure_tool_call_ids(&tcs);
+        let result = canonicalize_provider_tool_batch(&tcs).unwrap();
         assert!(matches!(result, std::borrow::Cow::Borrowed(_)));
     }
 
     #[test]
-    fn ensure_ids_patches_empty_id() {
+    fn canonical_batch_rejects_entire_batch_when_one_identity_is_empty() {
         let tcs = vec![
-            json!({"id": "", "name": "bash"}),
-            json!({"id": "ok", "name": "grep"}),
+            json!({"id":"","type":"function","function":{"name":"bash","arguments":"{}"}}),
+            json!({"id":"ok","type":"function","function":{"name":"grep","arguments":"{}"}}),
         ];
-        let result = ensure_tool_call_ids(&tcs);
-        assert!(matches!(result, std::borrow::Cow::Owned(_)));
-        let id0 = result[0]["id"].as_str().unwrap();
-        assert!(!id0.is_empty(), "empty id must be patched");
-        assert_eq!(
-            result[1]["id"].as_str().unwrap(),
-            "ok",
-            "valid id untouched"
-        );
+        let error = canonicalize_provider_tool_batch(&tcs).unwrap_err();
+        assert!(matches!(
+            error,
+            ProviderToolBatchError::InvalidCall { index: 0, .. }
+        ));
     }
 
     #[test]
-    fn ensure_ids_patches_missing_id() {
-        let tcs = vec![json!({"name": "bash"})];
-        let result = ensure_tool_call_ids(&tcs);
-        let id = result[0]["id"].as_str().unwrap();
-        assert!(!id.is_empty());
+    fn canonical_batch_rejects_missing_id() {
+        let tcs = vec![json!({"type":"function","function":{"name":"bash","arguments":"{}"}})];
+        assert!(matches!(
+            canonicalize_provider_tool_batch(&tcs),
+            Err(ProviderToolBatchError::InvalidCall { index: 0, .. })
+        ));
     }
 
     #[test]
-    fn ensure_ids_unique_per_call() {
+    fn canonical_batch_never_mints_identity() {
         let tcs = vec![
-            json!({"id": "", "name": "a"}),
-            json!({"id": "", "name": "b"}),
+            json!({"id":"","type":"function","function":{"name":"a","arguments":"{}"}}),
+            json!({"type":"function","function":{"name":"b","arguments":"{}"}}),
         ];
-        let result = ensure_tool_call_ids(&tcs);
-        let id0 = result[0]["id"].as_str().unwrap();
-        let id1 = result[1]["id"].as_str().unwrap();
-        assert_ne!(id0, id1, "each empty id must get a distinct UUID");
+        assert!(canonicalize_provider_tool_batch(&tcs).is_err());
     }
 
-    /// The critical invariant: after ensure_tool_call_ids, building an
-    /// assistant message and parsing tool result ids must produce matching ids.
     #[test]
-    fn ensure_ids_makes_assistant_and_result_ids_match() {
-        let tcs = vec![json!({"id": "", "name": "bash", "arguments": "{}"})];
-        let patched = ensure_tool_call_ids(&tcs);
+    fn canonical_batch_rejects_idless_call_before_assistant_pairing() {
+        let tcs =
+            vec![json!({"id":"","type":"function","function":{"name":"bash","arguments":"{}"}})];
+        assert!(canonicalize_provider_tool_batch(&tcs).is_err());
+    }
 
-        // Assistant message path
-        let assistant_msg = openai_assistant_with_tool_calls_message::<Row>(&patched, &[], "");
-        let assistant_id = assistant_msg["tool_calls"][0]["id"].as_str().unwrap();
+    #[test]
+    fn canonical_batch_rejects_entire_batch_for_duplicate_exact_identity() {
+        let tcs = vec![
+            json!({"id":"same","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}}),
+            json!({"id":"same","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}}),
+        ];
 
-        // Tool result path
-        let (result_id, _, _) = parse_flat_tool_call_event(&patched[0]);
+        assert!(matches!(
+            canonicalize_provider_tool_batch(&tcs),
+            Err(ProviderToolBatchError::DuplicateIdentity { .. })
+        ));
+    }
 
+    #[test]
+    fn canonical_batch_rejects_duplicate_identity_with_conflicting_payloads() {
+        let tcs = vec![
+            json!({"id":"same","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}}),
+            json!({"id":"same","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"b\"}"}}),
+        ];
+
+        assert!(matches!(
+            canonicalize_provider_tool_batch(&tcs),
+            Err(ProviderToolBatchError::DuplicateIdentity { .. })
+        ));
+    }
+
+    #[test]
+    fn canonical_batch_normalizes_semantically_equivalent_argument_json() {
+        let tcs = vec![json!({
+            "id":"call-a",
+            "function":{"name":"read_file","arguments":"{\n  \"path\": \"a\", \"line_start\": 1\n}"}
+        })];
+
+        let canonical = canonicalize_provider_tool_batch(&tcs).unwrap();
+
+        assert_eq!(canonical.len(), 1);
+        assert_eq!(canonical[0]["type"], "function");
         assert_eq!(
-            assistant_id, result_id,
-            "assistant tool_call id and tool result id must match after ensure_tool_call_ids"
+            canonical[0]["function"]["arguments"],
+            serde_json::to_string(&json!({"path":"a", "line_start":1})).unwrap()
         );
     }
 
@@ -1470,11 +1540,11 @@ mod tests {
         );
     }
 
-    /// Regression: mixed flat + OpenAI format tool_calls in the same round.
+    /// Multiple canonical tool calls preserve order and payload.
     #[test]
-    fn openai_assistant_message_mixed_format_tool_calls() {
+    fn openai_assistant_message_multiple_canonical_tool_calls() {
         let server = vec![
-            json!({"id": "c1", "name": "git", "arguments": {"action": "status"}}),
+            json!({"id": "c1", "type": "function", "function": {"name": "git", "arguments": "{\"action\":\"status\"}"}}),
             json!({"id": "c2", "type": "function", "function": {"name": "git", "arguments": "{\"action\":\"diff\",\"ref\":\"HEAD\"}"}}),
         ];
         let msg = openai_assistant_with_tool_calls_message(&server, &[] as &[Row], "");

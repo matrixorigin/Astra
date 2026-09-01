@@ -10,8 +10,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use futures_util::future::join_all;
@@ -25,7 +25,8 @@ use astra_tools::agent_tool_contract::{
     has_malformed_tool_args,
 };
 use astra_turn_core::orchestration::agent_result_wire::{
-    agent_tool_result_needs_recovery, fanout_slot_status_is_recoverable_issue,
+    AGENT_RESULT_CLASS_SUCCESS, agent_tool_result_needs_recovery,
+    agent_tool_structured_result_class, fanout_slot_status_is_recoverable_issue,
     render_agent_tool_error, render_agent_tool_error_with_kind, render_unknown_agent_result,
     render_wait_for_agent_status, render_wait_timeout_outcome,
 };
@@ -34,8 +35,8 @@ use astra_turn_core::orchestration_fanout_group::{
 };
 
 use super::{
-    DynamicAgentSpawner, InheritedPermissions, SpawnAgentInput, SpawnAgentOutput, SpawnContext,
-    SpawnError, WaitForAgentOutcome,
+    CancellationOrigin, DynamicAgentSpawner, InheritedPermissions, SpawnAgentInput,
+    SpawnAgentOutput, SpawnContext, SpawnError, WaitForAgentOutcome,
 };
 use astra_messaging::{
     AgentAddress, AgentMessage, MessagePayload, MessageTarget, types::RequestType,
@@ -55,12 +56,22 @@ const AGENT_RESULT_OBSERVE_GRACE: Duration = Duration::from_secs(1);
 /// `get_results`/start-that-completed. If exceeded, per-slot limits
 /// are proportionally reduced until the total fits.
 const MAX_FANOUT_AGGREGATE_BYTES: usize = 60_000;
+pub(crate) const MAX_FANOUT_TARGET_COUNT: usize = 50;
 /// A failed child admission must not turn one fanout slot into an unbounded
 /// aggregate result. The full error remains in runtime logs/transcript; the
 /// parent receives a bounded, UTF-8-safe explanation plus exact byte count.
 const MAX_FANOUT_SPAWN_ERROR_BYTES: usize = 4_096;
 const FANOUT_RESULT_DEFAULT_MAX_BYTES: usize = 8_192;
 const FANOUT_RESULT_MAX_BYTES: usize = 65_536;
+/// A foreground fanout is one structured operation. It may use the full LLM
+/// call budget, but it must eventually settle even when one child transport
+/// never reaches a terminal boundary. Expiry system-cancels only unfinished
+/// slots and returns the canonical aggregate, including completed partials.
+// One provider call has a 300s hard budget. Give its typed BudgetExhausted
+// projection and child finalizer a short settlement window before the group
+// owner force-cancels the slot; otherwise equal deadlines race and discard a
+// child partial that was already becoming terminal.
+const FANOUT_FOREGROUND_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(305);
 static NEXT_FANOUT_GROUP_ID: AtomicU64 = AtomicU64::new(1);
 /// Static prose for the `Unknown` outcome. Must NOT interpolate the
 /// caller-supplied agent_id — that value already appears in the
@@ -74,6 +85,28 @@ const UNKNOWN_AGENT_ID_ERROR: &str = "Unknown agent_id. Use the exact runtime-ge
 /// pause/resume/cancel capabilities. Conflating the two made a launch receipt
 /// invent a local control target for server-owned fanout children.
 pub use astra_turn_types::AgentTranscriptLocation;
+
+/// Shared semantic authority for workspace effects across one agent tree.
+///
+/// The root admission decision is not available when the runtime executor is
+/// first wired.  Keeping the closed value in a shared cell lets that decision
+/// become authoritative before any child is spawned, without asking child
+/// models to reclassify (or guess from) natural language.
+#[derive(Clone, Default)]
+pub struct WorkspaceMutationAuthority(
+    Arc<RwLock<astra_config::user_profile::WorkspaceMutationIntent>>,
+);
+
+impl WorkspaceMutationAuthority {
+    #[must_use]
+    pub fn get(&self) -> astra_config::user_profile::WorkspaceMutationIntent {
+        *astra_core::sync_poison::recover_rwlock_read(&self.0)
+    }
+
+    pub fn set(&self, intent: astra_config::user_profile::WorkspaceMutationIntent) {
+        *astra_core::sync_poison::recover_rwlock_write(&self.0) = intent;
+    }
+}
 
 fn render_spawn_agent_output(
     output: SpawnAgentOutput,
@@ -188,7 +221,7 @@ fn render_agent_tool_contract_error(message: &str) -> String {
 struct FanoutStartTerminalCauses {
     spawn_rejected: usize,
     cancelled_by_user: usize,
-    cancelled_by_parent_budget: usize,
+    cancelled_by_runtime: usize,
     timed_out: usize,
     executor_dropped: usize,
     interrupted: usize,
@@ -215,16 +248,11 @@ impl FanoutStartTerminalCauses {
                         .unwrap_or(false)
                     {
                         causes.cancelled_by_user += 1;
-                    } else if finish_reason.is_some_and(is_parent_budget_fanout_finish_reason) {
-                        causes.cancelled_by_parent_budget += 1;
                     } else {
-                        causes.interrupted += 1;
+                        causes.cancelled_by_runtime += 1;
                     }
                 }
                 Some("interrupted") => match finish_reason {
-                    Some(reason) if is_parent_budget_fanout_finish_reason(reason) => {
-                        causes.cancelled_by_parent_budget += 1;
-                    }
                     Some(reason) if is_timeout_fanout_finish_reason(reason) => {
                         causes.timed_out += 1;
                     }
@@ -247,7 +275,7 @@ impl FanoutStartTerminalCauses {
     fn has_stopped_slots(&self) -> bool {
         self.spawn_rejected
             + self.cancelled_by_user
-            + self.cancelled_by_parent_budget
+            + self.cancelled_by_runtime
             + self.timed_out
             + self.executor_dropped
             + self.interrupted
@@ -265,12 +293,12 @@ impl FanoutStartTerminalCauses {
             object.insert("cancelled_by_user".into(), json!(self.cancelled_by_user));
             causes.push("user_cancelled");
         }
-        if self.cancelled_by_parent_budget > 0 {
+        if self.cancelled_by_runtime > 0 {
             object.insert(
-                "cancelled_by_parent_budget".into(),
-                json!(self.cancelled_by_parent_budget),
+                "cancelled_by_runtime".into(),
+                json!(self.cancelled_by_runtime),
             );
-            causes.push("parent_budget");
+            causes.push("runtime_cancelled");
         }
         if self.timed_out > 0 {
             object.insert("timed_out".into(), json!(self.timed_out));
@@ -327,18 +355,6 @@ fn parsed_agent_output_or_bounded_error(rendered: String) -> Value {
     value
 }
 
-fn is_parent_budget_fanout_finish_reason(reason: &str) -> bool {
-    matches!(
-        reason,
-        "budget_exhausted"
-            | "turn_budget_exhausted"
-            | "token_budget_exceeded"
-            | "context_overflow"
-            | "max_turns_exceeded"
-            | "max_turns"
-    )
-}
-
 fn is_timeout_fanout_finish_reason(reason: &str) -> bool {
     matches!(reason, "timeout" | "timed_out" | "deadline_exceeded")
 }
@@ -367,6 +383,10 @@ pub struct AgentToolContext {
     pub spawner: Arc<DynamicAgentSpawner>,
     /// Effective permissions inherited by children spawned from this agent.
     pub inherited_permissions: InheritedPermissions,
+    /// Product-optional capabilities enabled on the current request.
+    /// `None` preserves the legacy unrestricted contract; `Some(empty)` is an
+    /// explicit deny-all boundary and must not be widened by delegation.
+    pub enabled_tools: Option<HashSet<String>>,
     /// Skills available to this agent and inherited by children.
     pub active_skills: Vec<String>,
     /// Optional sink for live child token/tool/status events.
@@ -378,10 +398,45 @@ pub struct AgentToolContext {
     pub trace_context: Option<TraceContext>,
     /// UI/runtime execution binding metadata inherited by child agents.
     pub execution_metadata: Option<Value>,
+    /// Root-owned workspace-effect intent inherited by every spawned child.
+    pub workspace_mutation: WorkspaceMutationAuthority,
     /// Where the canonical transcript for dynamic child runs is persisted.
     /// This is emitted in every spawn/fanout receipt so the client can open
     /// the right history without guessing from a control endpoint.
     pub transcript_location: AgentTranscriptLocation,
+}
+
+fn disabled_requested_optional_tools<'a>(
+    requested: impl IntoIterator<Item = &'a String>,
+    enabled_tools: Option<&HashSet<String>>,
+) -> Vec<String> {
+    let Some(enabled_tools) = enabled_tools else {
+        return Vec::new();
+    };
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let mut disabled = requested
+        .into_iter()
+        .map(|name| name.trim().to_ascii_lowercase())
+        .filter(|name| {
+            registry
+                .get(name)
+                .is_some_and(astra_runtime_env::ToolSpec::requires_explicit_user_enablement)
+                && !enabled_tools.contains(name)
+        })
+        .collect::<Vec<_>>();
+    disabled.sort();
+    disabled.dedup();
+    disabled
+}
+
+fn render_disabled_delegation_capabilities(disabled: &[String]) -> String {
+    render_agent_tool_error(
+        None,
+        &format!(
+            "Delegation requested product-optional capabilities that are not enabled for the current request: {}. Enable them on the parent request or delegate only currently executable capabilities.",
+            disabled.join(", ")
+        ),
+    )
 }
 
 /// Handle the consolidated `agent` tool for shared dynamic-agent actions.
@@ -694,22 +749,16 @@ pub async fn recover_agent_fanout_tool_result(
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|id| !id.is_empty());
-    let groups = ctx.spawner.list_fanout_groups().await;
-    let parent_groups: Vec<_> = groups
-        .iter()
-        .filter(|group| group.parent_run_id.as_deref() == Some(ctx.run_id.as_str()))
-        .collect();
-
     if let Some(group_id) = requested_group_id
-        && let Some(group) = parent_groups
-            .iter()
-            .find(|group| group.group_id == group_id)
+        && let Some(group) = ctx.spawner.fanout_group(group_id).await
+        && group.parent_run_id.as_deref() == Some(ctx.run_id.as_str())
     {
         return render_agent_fanout_results(
             ctx,
             &group.group_id,
             tool_call_id.map(str::to_string),
             FanoutResultReadOptions::default(),
+            true,
         )
         .await;
     }
@@ -723,42 +772,29 @@ pub async fn recover_agent_fanout_tool_result(
             ),
         );
     }
+    let parent_group = ctx.spawner.fanout_group_for_parent_run(&ctx.run_id).await;
     if let Some(tool_call_id) = tool_call_id
-        && let Some(group) = parent_groups
-            .iter()
-            .find(|group| group.created_by_tool_use_id.as_deref() == Some(tool_call_id))
+        && let Some(group) = parent_group.as_ref()
+        && group.created_by_tool_use_id.as_deref() == Some(tool_call_id)
     {
         return render_agent_fanout_results(
             ctx,
             &group.group_id,
             Some(tool_call_id.to_string()),
             FanoutResultReadOptions::default(),
+            true,
         )
         .await;
     }
-    if parent_groups.len() == 1 {
-        let group = parent_groups[0];
+    if let Some(group) = parent_group {
         return render_agent_fanout_results(
             ctx,
             &group.group_id,
             tool_call_id.map(str::to_string),
             FanoutResultReadOptions::default(),
+            true,
         )
         .await;
-    }
-    if parent_groups.len() > 1 {
-        let group_ids: Vec<_> = parent_groups
-            .iter()
-            .map(|group| group.group_id.as_str())
-            .collect();
-        return render_agent_tool_error(
-            None,
-            &format!(
-                "Cannot recover missing agent_fanout.start result unambiguously: parent run '{}' has multiple fanout groups: {}. Use agent_fanout(action='get_results', group_id=...) with one of those exact group_id values.",
-                ctx.run_id,
-                group_ids.join(", ")
-            ),
-        );
     }
 
     render_agent_tool_error(
@@ -797,6 +833,8 @@ struct AgentFanoutStartSlot {
     #[serde(default)]
     agent_type: Option<String>,
     #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
     max_turns: Option<u32>,
     #[serde(default)]
     max_output_tokens: Option<u32>,
@@ -817,6 +855,8 @@ struct AgentFanoutStartSlot {
 struct AgentFanoutDefaults {
     #[serde(default)]
     agent_type: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
     #[serde(default)]
     max_turns: Option<u32>,
     #[serde(default)]
@@ -877,6 +917,7 @@ const FANOUT_START_FIELDS: &[&str] = &[
 ];
 const FANOUT_DEFAULTS_FIELDS: &[&str] = &[
     "agent_type",
+    "model",
     "max_turns",
     "max_output_tokens",
     "complexity",
@@ -888,6 +929,7 @@ const FANOUT_SLOT_FIELDS: &[&str] = &[
     "description",
     "prompt",
     "agent_type",
+    "model",
     "max_turns",
     "max_output_tokens",
     "complexity",
@@ -904,7 +946,7 @@ const FANOUT_GET_RESULTS_FIELDS: &[&str] = &[
 ];
 const FANOUT_STOP_SLOT_FIELDS: &[&str] = &["action", "_tool_call_id", "group_id", "slot_index"];
 const FANOUT_STOP_GROUP_FIELDS: &[&str] = &["action", "_tool_call_id", "group_id"];
-const FANOUT_START_SHAPE: &str = "Use one JSON object: {\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief; inspect the shared workspace directly\"},{\"id\":\"review\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief; inspect the shared workspace directly\"}],\"defaults\":{\"agent_type\":\"code-review\"}}. Put concise work instructions in each slots[i].prompt; never paste file contents, diffs, or prior tool output because children share the bound workspace and inspect it directly. There is no top-level brief or agents payload. Runtime config belongs in `defaults`, not at top level. Fanout waits for accepted children by default; only an explicit user Ctrl+B action moves the live group to the background. Do not pass run_in_background.";
+const FANOUT_START_SHAPE: &str = "Use one JSON object: {\"action\":\"start\",\"target_count\":2,\"slots\":[{\"id\":\"api\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"},{\"id\":\"review\",\"description\":\"Short UI label\",\"prompt\":\"Concise child task brief\"}],\"defaults\":{\"agent_type\":\"code-review\"}}. Put concise work instructions in each slots[i].prompt. If no agent_type is supplied at slot or defaults level, fanout uses the bounded read-only `explore` persona; request `task` or `general-purpose` explicitly when a child must mutate or use the full surface. Children inherit the current execution binding and can use only tools exposed in their own tool surfaces; do not start workspace-dependent slots while the workspace provider is unavailable. Never paste file contents, diffs, or prior tool output. There is no top-level brief or agents payload. Runtime config belongs in `defaults`, not at top level. A per-slot tool allowlist, when truly required, is named `allowed_tools`; `tools` is not a valid field. Fanout waits for accepted children by default; only an explicit user Ctrl+B action moves the live group to the background. Do not pass run_in_background.";
 const FANOUT_GET_RESULTS_SHAPE: &str = "Use one JSON object: {\"action\":\"get_results\",\"group_id\":\"returned-group-id\"}. For large results, use {\"action\":\"get_results\",\"group_id\":\"returned-group-id\",\"slot_index\":0,\"offset\":0,\"max_bytes\":8192}.";
 const FANOUT_STOP_SLOT_SHAPE: &str = "Use one JSON object: {\"action\":\"stop_slot\",\"group_id\":\"returned-group-id\",\"slot_index\":0}.";
 const FANOUT_STOP_GROUP_SHAPE: &str =
@@ -1038,6 +1080,15 @@ fn validate_agent_fanout_group_shape(
 }
 
 async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolContext>) -> String {
+    handle_agent_fanout_start_action_with_deadline(args, ctx, FANOUT_FOREGROUND_SETTLEMENT_TIMEOUT)
+        .await
+}
+
+async fn handle_agent_fanout_start_action_with_deadline(
+    args: &Value,
+    ctx: Option<&AgentToolContext>,
+    settlement_timeout: Duration,
+) -> String {
     if let Err(e) = validate_agent_fanout_start_shape(args) {
         return render_agent_tool_error(None, &format!("Invalid input: {e}"));
     }
@@ -1062,12 +1113,12 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
     if input.target_count == 0 {
         return render_agent_tool_error(None, "Invalid input: target_count must be >= 1");
     }
-    if input.target_count > 50 {
+    if input.target_count > MAX_FANOUT_TARGET_COUNT {
         return render_agent_tool_error(
             None,
             &format!(
-                "Invalid input: target_count {} exceeds maximum of 50",
-                input.target_count
+                "Invalid input: target_count {} exceeds maximum of {}",
+                input.target_count, MAX_FANOUT_TARGET_COUNT
             ),
         );
     }
@@ -1100,7 +1151,7 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
             return render_agent_tool_error(
                 None,
                 &format!(
-                    "Invalid input: slots[{slot_index}].prompt has {prompt_chars} characters; maximum is {}. Keep the brief concise and have the child inspect files/diffs in the shared workspace instead of embedding them.",
+                    "Invalid input: slots[{slot_index}].prompt has {prompt_chars} characters; maximum is {}. Keep the brief concise and never embed file contents, diffs, or prior tool output.",
                     astra_tools::agent_tool_contract::AGENT_FANOUT_SLOT_PROMPT_MAX_CHARS
                 ),
             );
@@ -1160,19 +1211,44 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
             );
         }
     }
+    let requested_optional_tools = input
+        .slots
+        .iter()
+        .filter_map(|slot| slot.allowed_tools.as_ref())
+        .flatten()
+        .chain(
+            input
+                .defaults
+                .as_ref()
+                .and_then(|defaults| defaults.allowed_tools.as_ref())
+                .into_iter()
+                .flatten(),
+        );
+    let disabled =
+        disabled_requested_optional_tools(requested_optional_tools, ctx.enabled_tools.as_ref());
+    if !disabled.is_empty() {
+        return render_disabled_delegation_capabilities(&disabled);
+    }
     if let Some(existing) = ctx.spawner.fanout_group_for_parent_run(&ctx.run_id).await {
         let same_start = existing.group_id == group_id
             || input._tool_call_id.as_deref().is_some_and(|tool_call_id| {
                 existing.created_by_tool_use_id.as_deref() == Some(tool_call_id)
             });
         if !same_start {
-            return render_agent_tool_error(
-                None,
-                &format!(
-                    "parent run '{}' already started fanout group '{}' with fixed target_count {}; a parent run may start only one fanout group",
-                    ctx.run_id, existing.group_id, existing.target_count
+            return json!({
+                "status": "failed",
+                "error_kind": "fanout_group_already_started",
+                "retryable": false,
+                "executed": false,
+                "group_id": existing.group_id,
+                "target_count": existing.target_count,
+                "allowed_actions": ["get_results", "stop_slot", "stop_group"],
+                "error": format!(
+                    "Parent run '{}' already owns one fixed fanout group. A second start cannot replace or extend it; inspect the existing group with get_results.",
+                    ctx.run_id
                 ),
-            );
+            })
+            .to_string();
         }
         if existing.is_terminal() {
             return render_agent_fanout_results(
@@ -1180,6 +1256,7 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
                 &existing.group_id,
                 input._tool_call_id,
                 FanoutResultReadOptions::default(),
+                true,
             )
             .await;
         }
@@ -1244,7 +1321,28 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
             })
         })
         .collect();
-    let mut agents: Vec<Value> = join_all(futs).await;
+    let mut agents: Vec<Value> =
+        match tokio::time::timeout(settlement_timeout, join_all(futs)).await {
+            Ok(agents) => agents,
+            Err(_) => {
+                let reason = format!(
+                    "foreground fanout settlement deadline elapsed after {}ms",
+                    settlement_timeout.as_millis()
+                );
+                let _ = ctx
+                    .spawner
+                    .cancel_fanout_group_for_deadline(&group_id, &reason)
+                    .await;
+                return render_agent_fanout_results(
+                    ctx,
+                    &group_id,
+                    tool_call_id,
+                    FanoutResultReadOptions::default(),
+                    false,
+                )
+                .await;
+            }
+        };
     // Restore slot-index order.
     agents.sort_by_key(|v| v.get("slot_index").and_then(Value::as_u64).unwrap_or(0));
     // `Launched` is possible only after the user explicitly promotes the
@@ -1263,7 +1361,13 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
             "target_count": input.target_count,
             "transcript_location": ctx.transcript_location.wire_value(),
             "agents": agents,
-            "fanout": group.as_ref().map(fanout_group_to_json).unwrap_or(Value::Null),
+            // `agents` is the one per-child launch list in this receipt. Keep
+            // the fanout object aggregate-only so a three-slot launch cannot
+            // be misread as six agents by a client that renders both fields.
+            "fanout": group
+                .as_ref()
+                .map(fanout_group_summary_to_json)
+                .unwrap_or(Value::Null),
             "delivery": "explicit_background_handoff",
             "instruction": "The user moved this fanout group to the background. Do not claim completion or analyze individual slot events. The runtime will surface one terminal group update; live progress remains available with Shift+Down.",
         });
@@ -1301,6 +1405,7 @@ async fn handle_agent_fanout_start_action(args: &Value, ctx: Option<&AgentToolCo
         &group_id,
         tool_call_id,
         FanoutResultReadOptions::default(),
+        true,
     )
     .await
 }
@@ -1342,7 +1447,7 @@ async fn handle_agent_fanout_get_results_action(
         Ok(read_options) => read_options,
         Err(error) => return render_agent_tool_error(None, &format!("Invalid input: {error}")),
     };
-    render_agent_fanout_results(ctx, group_id, input._tool_call_id, read_options).await
+    render_agent_fanout_results(ctx, group_id, input._tool_call_id, read_options, true).await
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1391,13 +1496,14 @@ async fn render_agent_fanout_results(
     group_id: &str,
     tool_call_id: Option<String>,
     read_options: FanoutResultReadOptions,
+    reconcile_durable: bool,
 ) -> String {
     if read_options.is_default()
         && let Some(cached) = ctx.spawner.cached_terminal_fanout_result(group_id).await
     {
         return cached;
     }
-    if let Err(error) = ctx.spawner.reconcile_durable_agent_runs().await {
+    if reconcile_durable && let Err(error) = ctx.spawner.reconcile_durable_agent_runs().await {
         tracing::warn!(
             target: "fanout",
             %group_id,
@@ -1434,11 +1540,32 @@ async fn render_agent_fanout_results(
             results.push(json!({
                 "slot_index": slot.slot_index,
                 "id": &slot.slot_id,
+                "run_id": &slot.run_id,
                 "status": fanout_slot_status_label(slot.status),
                 "error": slot.terminal_reason,
             }));
             continue;
         };
+        // Group terminality is the lifecycle authority at settlement. A
+        // cancellation owner may have atomically seized the child state and
+        // be waiting on bounded durable control, leaving no queryable agent
+        // record yet. Do not spend the result-observation grace waiting for a
+        // state that is intentionally in handoff; render the typed terminal
+        // slot now and let the detached owner publish the archive afterward.
+        if slot.status.is_terminal() && ctx.spawner.get_agent_state_any(agent_id).await.is_none() {
+            results.push(json!({
+                "slot_index": slot.slot_index,
+                "id": &slot.slot_id,
+                "agent_id": agent_id,
+                "run_id": &slot.run_id,
+                "result": {
+                    "status": fanout_slot_status_label(slot.status),
+                    "finish_reason": slot.terminal_reason,
+                    "terminal_projection": "fanout_group",
+                },
+            }));
+            continue;
+        }
         let agent_id = agent_id.to_string();
         let slot_index = slot.slot_index;
         let slot_id = slot.slot_id.clone();
@@ -1477,20 +1604,15 @@ async fn render_agent_fanout_results(
                 "slot_index": slot_index,
                 "id": slot_id,
                 "agent_id": agent_id,
+                "run_id": value.get("run_id").cloned().unwrap_or(Value::Null),
                 "result": value,
             });
             if needs_recovery {
                 let object = item.as_object_mut().expect("slot result item object");
-                let resume_existing_agent_id = object
-                    .get("agent_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
                 object.insert(
                     "recovery".into(),
                     json!({
-                        "resume_existing_agent_id": resume_existing_agent_id,
-                        "rerun_policy": "resume_existing_agent_or_report_incomplete",
+                        "rerun_policy": "synthesize_retained_partial_or_report_incomplete",
                         "do_not_spawn_replacement": true,
                     }),
                 );
@@ -1515,6 +1637,27 @@ async fn render_agent_fanout_results(
     // Restore slot-index order.
     results.sort_by_key(|v| v.get("slot_index").and_then(Value::as_u64).unwrap_or(0));
 
+    // Derive lifecycle/provenance from the structured results before any
+    // presentation-only byte windowing can replace a large result object with
+    // a string. Truncation must never erase the fact that usable partial
+    // evidence exists.
+    let incomplete_result_count = results
+        .iter()
+        .filter(|item| fanout_result_item_has_terminal_incomplete(item))
+        .count();
+    let usable_partial_count = results
+        .iter()
+        .filter(|item| fanout_result_item_has_usable_partial(item))
+        .count();
+    let complete_deliverables = results
+        .iter()
+        .filter(|item| {
+            item.get("result")
+                .and_then(agent_tool_structured_result_class)
+                == Some(AGENT_RESULT_CLASS_SUCCESS)
+        })
+        .count();
+
     // Enforce total aggregate byte budget: if the combined results exceed
     // MAX_FANOUT_AGGREGATE_BYTES, re-truncate per-slot proportionally.
     let serialized_total: usize = results.iter().map(|v| v.to_string().len()).sum();
@@ -1525,13 +1668,23 @@ async fn render_agent_fanout_results(
                 let result_str = result_obj.to_string();
                 if result_str.len() > per_slot_budget {
                     let truncated = truncate_str_at_char_boundary(&result_str, per_slot_budget);
+                    let slot_index = item.get("slot_index").and_then(Value::as_u64).unwrap_or(0);
                     item["result"] = json!(format!(
                         "{}\n\n[truncated — {} bytes total; use agent_fanout(action='get_results', group_id='{}', slot_index={}, offset=0, max_bytes={}) for a bounded slot window]",
                         truncated,
                         result_str.len(),
                         group_id,
-                        item.get("slot_index").and_then(Value::as_u64).unwrap_or(0),
+                        slot_index,
                         FANOUT_RESULT_MAX_BYTES,
+                    ));
+                    item["result_truncated"] = json!(true);
+                    item["result_bytes"] = json!(result_str.len());
+                    item["result_start_offset"] = json!(0);
+                    // This is an aggregate preview, not a consumed bounded
+                    // slot window. Its typed continuation begins at byte 0.
+                    item["result_end_offset"] = json!(0);
+                    item["next_call"] = json!(format!(
+                        "agent_fanout(action='get_results', group_id='{group_id}', slot_index={slot_index}, offset=0, max_bytes={FANOUT_RESULT_MAX_BYTES})"
                     ));
                 }
             }
@@ -1540,13 +1693,14 @@ async fn render_agent_fanout_results(
 
     let updated = find_fanout_group(ctx, group_id).await.unwrap_or(group);
     let summary = updated.summary();
-    let incomplete_result_count = results
-        .iter()
-        .filter(|item| fanout_result_item_has_terminal_incomplete(item))
-        .count();
-    let all_slots_delivered = summary.completed == summary.target_count;
-    let incomplete_slot_count = summary.target_count.saturating_sub(summary.completed);
-    let work_status = updated.work_unit_status();
+    let all_slots_delivered =
+        read_options.slot_index.is_none() && complete_deliverables == summary.target_count;
+    let incomplete_slot_count = summary.target_count.saturating_sub(complete_deliverables);
+    let work_status = if summary.active == 0 && incomplete_result_count > 0 {
+        WorkUnitStatus::CompletedWithIssues
+    } else {
+        updated.work_unit_status()
+    };
     let observation_mode = if read_options.slot_index.is_some() || read_options.offset > 0 {
         WorkUnitObservationMode::Historical
     } else {
@@ -1562,7 +1716,11 @@ async fn render_agent_fanout_results(
     .expect("fanout groups have non-empty identities and revisions")
     .with_wake_policy(WorkUnitWakePolicy::OnAttentionOrTerminal);
     let mut response = json!({
-        "status": fanout_get_results_status_label(&updated),
+        "status": if summary.active == 0 && incomplete_result_count > 0 {
+            "completed_with_issues"
+        } else {
+            fanout_get_results_status_label(&updated)
+        },
         "group_id": group_id,
         "title": updated.title,
         "target_count": updated.target_count,
@@ -1572,7 +1730,7 @@ async fn render_agent_fanout_results(
         "failed": summary.failed,
         "interrupted": summary.interrupted,
         "cancelled_by_user": summary.cancelled_by_user,
-        "cancelled_by_parent_budget": summary.cancelled_by_parent_budget,
+        "cancelled_by_runtime": summary.cancelled_by_runtime,
         "timed_out": summary.timed_out,
         "spawn_rejected": summary.spawn_rejected,
         "transcript_location": ctx.transcript_location.wire_value(),
@@ -1590,14 +1748,18 @@ async fn render_agent_fanout_results(
             "offset": read_options.offset,
             "max_bytes": read_options.max_bytes,
         },
-        "fanout": fanout_group_to_json(&updated),
+        // `results` is the canonical per-slot projection for this response.
+        // The fanout object is deliberately aggregate-only; exposing the
+        // same slots table here made every child appear twice to consumers.
+        "fanout": fanout_group_summary_to_json(&updated),
         "provenance": {
             "source": "fanout_group",
             "target_count": summary.target_count,
-            "complete_deliverables": summary.completed,
+            "complete_deliverables": complete_deliverables,
             "incomplete_slots": incomplete_slot_count,
             "all_slots_delivered": all_slots_delivered,
             "observed_terminal_incomplete_results": incomplete_result_count,
+            "usable_partial_deliverables": usable_partial_count,
             "attribution_contract": "Attribute a finding to a child only when that child's returned result contains it. If all_slots_delivered is false, disclose the completion ratio and label any independent parent analysis as parent synthesis rather than fanout consensus.",
         },
         "results": results,
@@ -1609,11 +1771,13 @@ async fn render_agent_fanout_results(
     );
     if incomplete_result_count > 0 {
         obj.insert("incomplete_results".into(), json!(incomplete_result_count));
+        obj.insert("usable_partial_results".into(), json!(usable_partial_count));
         if let Some(recovery) = obj.get_mut("recovery").and_then(Value::as_object_mut) {
-            recovery.insert("resume_existing_work_before_rerun".into(), json!(true));
             recovery.insert(
                 "rerun_policy".into(),
-                json!("resume_existing_agents_or_report_incomplete; do_not_respawn_slots"),
+                json!(
+                    "synthesize_retained_partials_before_requesting_more_work; do_not_respawn_slots"
+                ),
             );
         }
     }
@@ -1631,8 +1795,8 @@ async fn render_agent_fanout_results(
         obj.insert(
             "instruction".into(),
             json!(format!(
-                "Do NOT retry, respawn, or spawn additional agents to replace failed/interrupted/cancelled slots. The fanout group has a fixed target_count and adding agents corrupts accounting. Exactly {}/{} slots produced complete deliverables. Disclose that ratio; do not describe incomplete slots as reviewers or validators, and label independent parent analysis as parent synthesis. Work with the results you have, or ask the user how to proceed.",
-                summary.completed, summary.target_count
+                "Do NOT retry, respawn, or spawn additional agents to replace failed/interrupted/cancelled slots. The fanout group has a fixed target_count and adding agents corrupts accounting. Exactly {}/{} slots produced complete deliverables; {} incomplete slots retained usable partial evidence. Disclose the completion ratio, attribute partial claims to their originating slots, and synthesize the retained evidence now while marking unverified scope. Do not discard a partial solely because its run was interrupted. Ask the user how to proceed only when no usable partial evidence remains.",
+                complete_deliverables, summary.target_count, usable_partial_count
             )),
         );
     } else if summary.active == 0 && summary.terminal == summary.target_count {
@@ -1644,7 +1808,7 @@ async fn render_agent_fanout_results(
         );
     }
     let rendered = serde_json::to_string_pretty(&response).unwrap_or_else(|_| response.to_string());
-    if read_options.is_default() && updated.is_terminal() {
+    if read_options.is_default() && updated.is_terminal() && incomplete_result_count == 0 {
         ctx.spawner
             .cache_terminal_fanout_result(group_id, rendered.clone())
             .await;
@@ -1691,6 +1855,18 @@ async fn handle_agent_fanout_stop_slot_action(
     let group_id = input.group_id.trim();
     if group_id.is_empty() {
         return render_agent_tool_error(None, "Invalid input: group_id must be non-empty");
+    }
+    // A fanout registry can outlive the executor invocation that last updated
+    // it. Refresh remotely-owned durable observations before deciding whether
+    // a slot is stoppable; otherwise a run already cancelled by an ancestor
+    // can remain locally `Waiting` until the session registry expires.
+    if let Err(error) = ctx.spawner.reconcile_durable_agent_runs().await {
+        tracing::warn!(
+            target: "fanout",
+            %group_id,
+            %error,
+            "durable fanout reconciliation failed before slot cancellation; continuing with locally owned control"
+        );
     }
     let Some(group) = find_fanout_group(ctx, group_id).await else {
         return render_agent_tool_error(None, &format!("Unknown fanout group_id: {group_id}"));
@@ -1741,18 +1917,34 @@ async fn handle_agent_fanout_stop_slot_action(
         .to_string();
     }
 
-    let stopped = ctx
+    let transfer = ctx
         .spawner
-        .cancel_agent(&agent_id, "user-requested via agent_fanout.stop_slot")
+        .cancel_agent_for_runtime(&agent_id, "parent agent stopped fanout slot")
         .await;
     let updated = find_fanout_group(ctx, group_id).await.unwrap_or(group);
     let updated_slot = updated
         .slots
         .iter()
         .find(|slot| slot.slot_index == input.slot_index);
+    let authoritative_terminal = updated_slot.is_some_and(|slot| slot.status.is_terminal());
+    let stop_outcome = if authoritative_terminal {
+        "stopped"
+    } else if transfer.is_pending() {
+        "cancellation_pending"
+    } else if transfer == crate::orchestration::CancellationTransferOutcome::AlreadyTerminal {
+        "already_terminal"
+    } else {
+        "not_stopped"
+    };
     json!({
-        "status": if stopped { "completed" } else { "completed_with_issues" },
-        "stop_outcome": if stopped { "stopped" } else { "not_stopped" },
+        "status": if stop_outcome == "cancellation_pending" {
+            "accepted"
+        } else if stop_outcome == "not_stopped" {
+            "completed_with_issues"
+        } else {
+            "completed"
+        },
+        "stop_outcome": stop_outcome,
         "group_id": group_id,
         "slot_index": input.slot_index,
         "id": updated_slot
@@ -1800,30 +1992,46 @@ async fn handle_agent_fanout_stop_group_action(
     if group_id.is_empty() {
         return render_agent_tool_error(None, "Invalid input: group_id must be non-empty");
     }
+    // Control decisions must be based on the durable run state, not merely
+    // the last in-memory fanout projection. In particular, ancestor
+    // cancellation can terminalize a remotely-owned child without a local
+    // executor callback.
+    if let Err(error) = ctx.spawner.reconcile_durable_agent_runs().await {
+        tracing::warn!(
+            target: "fanout",
+            %group_id,
+            %error,
+            "durable fanout reconciliation failed before group cancellation; continuing with locally owned control"
+        );
+    }
     let Some(group) = find_fanout_group(ctx, group_id).await else {
         return render_agent_tool_error(None, &format!("Unknown fanout group_id: {group_id}"));
     };
 
     let cancelled = ctx
         .spawner
-        .cancel_fanout_group(group_id, "user-requested via agent_fanout.stop_group")
+        .cancel_fanout_group_for_runtime(group_id, "parent agent stopped fanout group")
         .await
         // The group was confirmed immediately above; a concurrent cleanup can
         // only make it terminal, never turn it into an unknown target.
         .unwrap_or_else(|| crate::orchestration::FanoutGroupCancellation {
             group,
+            cancellation_pending_agent_ids: Vec::new(),
             stopped_agent_ids: Vec::new(),
             not_stopped_agent_ids: Vec::new(),
             already_terminal_count: 0,
             non_stoppable_count: 0,
         });
     let updated = cancelled.group;
+    let cancellation_pending_agent_ids = cancelled.cancellation_pending_agent_ids;
     let stopped_agent_ids = cancelled.stopped_agent_ids;
     let not_stopped_agent_ids = cancelled.not_stopped_agent_ids;
     let already_terminal_count = cancelled.already_terminal_count;
     let non_stoppable_count = cancelled.non_stoppable_count;
     let has_issues = !not_stopped_agent_ids.is_empty() || non_stoppable_count > 0;
-    let stop_outcome = if has_issues {
+    let stop_outcome = if !cancellation_pending_agent_ids.is_empty() {
+        "cancellation_pending"
+    } else if has_issues {
         "partially_stopped"
     } else if stopped_agent_ids.is_empty() {
         "already_terminal"
@@ -1831,11 +2039,19 @@ async fn handle_agent_fanout_stop_group_action(
         "stopped"
     };
     json!({
-        "status": if has_issues { "completed_with_issues" } else { "completed" },
+        "status": if stop_outcome == "cancellation_pending" {
+            "accepted"
+        } else if has_issues {
+            "completed_with_issues"
+        } else {
+            "completed"
+        },
         "stop_outcome": stop_outcome,
         "group_id": group_id,
         "stopped_count": stopped_agent_ids.len(),
         "stopped_agent_ids": stopped_agent_ids,
+        "cancellation_pending_count": cancellation_pending_agent_ids.len(),
+        "cancellation_pending_agent_ids": cancellation_pending_agent_ids,
         "already_terminal_count": already_terminal_count,
         "non_stoppable_count": non_stoppable_count,
         "not_stopped_agent_ids": not_stopped_agent_ids,
@@ -1869,7 +2085,14 @@ fn fanout_slot_spawn_args(
         object,
         "agent_type",
         slot.agent_type
-            .or_else(|| defaults.and_then(|d| d.agent_type.clone())),
+            .or_else(|| defaults.and_then(|d| d.agent_type.clone()))
+            .or_else(|| Some("explore".to_string())),
+    );
+    insert_optional_string(
+        object,
+        "model",
+        slot.model
+            .or_else(|| defaults.and_then(|d| d.model.clone())),
     );
     insert_optional_u32(object, "max_turns", effective_max_turns);
     insert_optional_u32(
@@ -1909,6 +2132,10 @@ fn fanout_effective_max_turns(
     slot: &AgentFanoutStartSlot,
     defaults: Option<&AgentFanoutDefaults>,
 ) -> Option<u32> {
+    // A numeric max_turns is caller-owned authority and therefore a hard
+    // boundary. Do not serialize a persona/complexity default here: spawn
+    // uses the presence of this field to distinguish a hard ceiling from a
+    // renewable initial scheduling slice.
     slot.max_turns
         .or_else(|| defaults.and_then(|defaults| defaults.max_turns))
 }
@@ -1951,11 +2178,7 @@ async fn find_fanout_group(
     ctx: &AgentToolContext,
     group_id: &str,
 ) -> Option<AgentFanoutGroupProjection> {
-    ctx.spawner
-        .list_fanout_groups()
-        .await
-        .into_iter()
-        .find(|group| group.group_id == group_id)
+    ctx.spawner.fanout_group(group_id).await
 }
 
 fn fanout_group_to_json(group: &AgentFanoutGroupProjection) -> Value {
@@ -1975,7 +2198,7 @@ fn fanout_group_to_json(group: &AgentFanoutGroupProjection) -> Value {
         "interrupted": summary.interrupted,
         "failed": summary.failed,
         "cancelled_by_user": summary.cancelled_by_user,
-        "cancelled_by_parent_budget": summary.cancelled_by_parent_budget,
+        "cancelled_by_runtime": summary.cancelled_by_runtime,
         "timed_out": summary.timed_out,
         "spawn_rejected": summary.spawn_rejected,
         "collected": summary.collected,
@@ -1994,6 +2217,25 @@ fn fanout_group_to_json(group: &AgentFanoutGroupProjection) -> Value {
     })
 }
 
+/// Aggregate-only fanout projection for responses that already carry a
+/// per-slot list (`agents` on a background handoff or `results` on result
+/// collection). A response must expose exactly one canonical per-agent list;
+/// keeping both `fanout.slots` and that list is an API-level double count,
+/// even though the runtime only launched the requested number of children.
+fn fanout_group_summary_to_json(group: &AgentFanoutGroupProjection) -> Value {
+    let mut value = fanout_group_to_json(group);
+    if let Some(object) = value.as_object_mut() {
+        object.remove("slots");
+        let agent_count = object.get("target_count").cloned().unwrap_or(Value::Null);
+        object.insert("agent_count".to_string(), agent_count);
+        object.insert(
+            "per_agent_projection".to_string(),
+            Value::String("agents_or_results".to_string()),
+        );
+    }
+    value
+}
+
 fn fanout_get_results_status_label(group: &AgentFanoutGroupProjection) -> &'static str {
     match group.work_unit_status() {
         WorkUnitStatus::Completed => "completed",
@@ -2009,6 +2251,17 @@ fn fanout_result_item_has_terminal_incomplete(item: &Value) -> bool {
         || item
             .get("result")
             .is_some_and(agent_tool_result_needs_recovery)
+}
+
+fn fanout_result_item_has_usable_partial(item: &Value) -> bool {
+    let Some(result) = item.get("result") else {
+        return false;
+    };
+    agent_tool_result_needs_recovery(result)
+        && result
+            .get("result")
+            .and_then(Value::as_str)
+            .is_some_and(|partial| !partial.trim().is_empty())
 }
 
 fn fanout_slot_status_label(status: AgentFanoutSlotStatus) -> &'static str {
@@ -2032,6 +2285,14 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
             return render_agent_runtime_binding_error("agent", "spawn");
         }
     };
+
+    let disabled = disabled_requested_optional_tools(
+        input.allowed_tools.as_deref().unwrap_or_default(),
+        ctx.enabled_tools.as_ref(),
+    );
+    if !disabled.is_empty() {
+        return render_disabled_delegation_capabilities(&disabled);
+    }
 
     // Structured concurrency is the public default. The spawner waits for the
     // child result while still streaming live progress and accepting UI
@@ -2065,10 +2326,13 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
             .await;
     }
 
+    let resolved_model_name =
+        astra_core::model_override::normalize_model_override_owned(input.model.clone())
+            .or_else(|| ctx.current_model.clone());
     let spawn_ctx = SpawnContext {
         parent_run_id: ctx.run_id.clone(),
         parent_agent_id: ctx.agent_id.clone(),
-        resolved_model_name: ctx.current_model.clone(),
+        resolved_model_name,
         recursion_depth: ctx.recursion_depth,
         parent_is_fork_child: ctx.is_fork_child,
         working_dir: ctx.working_dir.clone(),
@@ -2078,6 +2342,7 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
         client_tool_delivery_tx: ctx.client_tool_delivery_tx.clone(),
         trace_context: ctx.trace_context.clone(),
         execution_metadata: ctx.execution_metadata.clone(),
+        workspace_mutation: ctx.workspace_mutation.get(),
         spawn_tool_call_id: args
             .get("_tool_call_id")
             .and_then(Value::as_str)
@@ -2085,7 +2350,12 @@ pub async fn handle_agent_spawn_action(args: &Value, ctx: Option<&AgentToolConte
         delegation_chain: child_delegation_chain,
     };
 
-    match ctx.spawner.spawn(input, &spawn_ctx).await {
+    // Allocate the outer async state before constructing the dynamically sized
+    // spawn supervisor future. This keeps its first construction and poll off
+    // the already-deep generic tool pipeline stack on debug Tokio workers.
+    let spawner = Arc::clone(&ctx.spawner);
+    let spawn = Box::pin(async move { spawner.spawn(input, &spawn_ctx).await });
+    match spawn.await {
         Ok(output) => render_spawn_agent_output(output, ctx.transcript_location),
         Err(SpawnError::ExecutorUnavailable) => {
             render_agent_runtime_binding_error("agent", "spawn")
@@ -2142,12 +2412,17 @@ fn window_fanout_agent_result(
     offset: usize,
     max_bytes: usize,
 ) -> Option<FanoutResultWindow> {
-    let result_text = value.get("result").and_then(Value::as_str)?.to_string();
+    let result = value.get("result")?;
+    let result_was_string = result.is_string();
+    let result_text = match result {
+        Value::String(text) => text.clone(),
+        structured => serde_json::to_string(structured).ok()?,
+    };
     let total_bytes = result_text.len();
     let start = floor_char_boundary(&result_text, offset.min(total_bytes));
     let end = floor_char_boundary(&result_text, (start + max_bytes).min(total_bytes));
     let truncated = start > 0 || end < total_bytes;
-    if truncated {
+    if truncated || !result_was_string {
         value["result"] = json!(result_text[start..end].to_string());
     }
     let next_call = if end < total_bytes {
@@ -2406,7 +2681,7 @@ fn attach_fanout_to_agent_result(
             "interrupted": summary.interrupted,
             "failed": summary.failed,
             "cancelled_by_user": summary.cancelled_by_user,
-            "cancelled_by_parent_budget": summary.cancelled_by_parent_budget,
+            "cancelled_by_runtime": summary.cancelled_by_runtime,
             "timed_out": summary.timed_out,
             "spawn_rejected": summary.spawn_rejected,
             "collected": summary.collected,
@@ -2423,6 +2698,7 @@ mod tests {
     use crate::server::delegation::engine::DelegationTracker;
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use std::time::Instant;
 
     #[test]
     fn direct_agent_output_publishes_the_generic_work_contract() {
@@ -2653,6 +2929,7 @@ mod tests {
         captured_model: Mutex<Option<String>>,
         captured_execution_metadata: Mutex<Option<Value>>,
         captured_max_turns: Mutex<Option<u32>>,
+        captured_hard_turn_limit: Mutex<Option<Option<u32>>>,
         spawn_count: Mutex<usize>,
     }
 
@@ -2662,6 +2939,7 @@ mod tests {
                 captured_model: Mutex::new(None),
                 captured_execution_metadata: Mutex::new(None),
                 captured_max_turns: Mutex::new(None),
+                captured_hard_turn_limit: Mutex::new(None),
                 spawn_count: Mutex::new(0),
             }
         }
@@ -2678,6 +2956,10 @@ mod tests {
             self.captured_max_turns.lock().unwrap().take()
         }
 
+        fn take_captured_hard_turn_limit(&self) -> Option<Option<u32>> {
+            self.captured_hard_turn_limit.lock().unwrap().take()
+        }
+
         fn spawn_count(&self) -> usize {
             *self.spawn_count.lock().unwrap()
         }
@@ -2689,13 +2971,14 @@ mod tests {
             *self.spawn_count.lock().unwrap() += 1;
             *self.captured_model.lock().unwrap() = config.model.clone();
             *self.captured_execution_metadata.lock().unwrap() = config.execution_metadata.clone();
-            *self.captured_max_turns.lock().unwrap() = Some(config.max_turns);
+            *self.captured_max_turns.lock().unwrap() = Some(config.initial_turns);
+            *self.captured_hard_turn_limit.lock().unwrap() = Some(config.hard_turn_limit);
             Ok(SpawnRunResult {
                 agent_id: config.agent_id,
                 run_id: config.run_id,
                 status: "completed".into(),
                 finish_reason: "normal".into(),
-                cancelled_by_user: None,
+                cancellation_origin: CancellationOrigin::Unverified,
                 output: Some("ok".into()),
                 error: None,
                 prompt_tokens: 0,
@@ -2722,7 +3005,7 @@ mod tests {
                 run_id: config.run_id,
                 status: "completed".into(),
                 finish_reason: "normal".into(),
-                cancelled_by_user: None,
+                cancellation_origin: CancellationOrigin::Unverified,
                 output: Some(self.output.clone()),
                 error: None,
                 prompt_tokens: 0,
@@ -2747,8 +3030,33 @@ mod tests {
                 run_id: config.run_id,
                 status: "interrupted".into(),
                 finish_reason: "budget_exhausted".into(),
-                cancelled_by_user: None,
+                cancellation_origin: CancellationOrigin::Unverified,
                 output: Some("partial review".into()),
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 2,
+                turns_completed: 0,
+                permission_summary: None,
+                permission_requests: 0,
+                permission_requests_approved: 0,
+                tools_blocked: 0,
+            })
+        }
+    }
+
+    struct LargeInterruptedSpawnExecutor;
+
+    #[async_trait::async_trait]
+    impl SpawnAgentExecutor for LargeInterruptedSpawnExecutor {
+        async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            Ok(SpawnRunResult {
+                agent_id: config.agent_id,
+                run_id: config.run_id,
+                status: "interrupted".into(),
+                finish_reason: "budget_exhausted".into(),
+                cancellation_origin: CancellationOrigin::Unverified,
+                output: Some("partial evidence ".repeat(2_000)),
                 error: None,
                 prompt_tokens: 0,
                 completion_tokens: 0,
@@ -2772,7 +3080,7 @@ mod tests {
                 run_id: config.run_id,
                 status: "interrupted".into(),
                 finish_reason: "execution_incomplete".into(),
-                cancelled_by_user: None,
+                cancellation_origin: CancellationOrigin::Unverified,
                 output: Some("The bound transport was unavailable.".into()),
                 error: None,
                 prompt_tokens: 10,
@@ -2797,7 +3105,7 @@ mod tests {
                 run_id: config.run_id,
                 status: "failed".into(),
                 finish_reason: "error".into(),
-                cancelled_by_user: None,
+                cancellation_origin: CancellationOrigin::Unverified,
                 output: None,
                 error: Some("child failed".into()),
                 prompt_tokens: 0,
@@ -2822,7 +3130,7 @@ mod tests {
                 run_id: config.run_id,
                 status: "interrupted".into(),
                 finish_reason: "empty_completion".into(),
-                cancelled_by_user: None,
+                cancellation_origin: CancellationOrigin::Unverified,
                 output: Some(String::new()),
                 error: None,
                 prompt_tokens: 0,
@@ -2847,7 +3155,7 @@ mod tests {
                 run_id: config.run_id,
                 status: "failed".into(),
                 finish_reason: "executor_dropped".into(),
-                cancelled_by_user: None,
+                cancellation_origin: CancellationOrigin::Unverified,
                 output: None,
                 error: Some("child completion payload was lost".into()),
                 prompt_tokens: 0,
@@ -2868,6 +3176,134 @@ mod tests {
     impl SpawnAgentExecutor for PendingExecutor {
         async fn execute(&self, _config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
             std::future::pending::<Result<SpawnRunResult, String>>().await
+        }
+    }
+
+    struct PendingExecutionAndCancelExecutor {
+        release_cancel: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl SpawnAgentExecutor for PendingExecutionAndCancelExecutor {
+        async fn execute(&self, _config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            std::future::pending().await
+        }
+
+        async fn cancel_spawned_run(
+            &self,
+            _run_id: &str,
+            _cancellation_binding_id: Option<&str>,
+            _user_id: Option<&str>,
+            _reason: &str,
+            _origin: CancellationOrigin,
+        ) -> Result<(), String> {
+            self.release_cancel.notified().await;
+            Err("durable cancel unavailable".into())
+        }
+    }
+
+    struct PendingTraceWriter;
+
+    #[async_trait::async_trait]
+    impl astra_turn_core::trace_event::TraceEventWriter for PendingTraceWriter {
+        async fn write(
+            &self,
+            _event: astra_turn_core::trace_event::TraceEvent,
+        ) -> Result<(), astra_turn_core::trace_event::TraceWriteError> {
+            std::future::pending().await
+        }
+    }
+
+    struct ThreePartialsAndOnePendingExecutor;
+
+    #[async_trait::async_trait]
+    impl SpawnAgentExecutor for ThreePartialsAndOnePendingExecutor {
+        async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            if config.description == "pending" {
+                return std::future::pending::<Result<SpawnRunResult, String>>().await;
+            }
+            Ok(SpawnRunResult {
+                agent_id: config.agent_id,
+                run_id: config.run_id,
+                status: "interrupted".into(),
+                finish_reason: "budget_exhausted".into(),
+                cancellation_origin: CancellationOrigin::Unverified,
+                output: Some(format!("partial evidence from {}", config.description)),
+                error: None,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                tool_calls: 1,
+                turns_completed: 1,
+                permission_summary: None,
+                permission_requests: 0,
+                permission_requests_approved: 0,
+                tools_blocked: 0,
+            })
+        }
+    }
+
+    struct NearDeadlinePartialExecutor;
+
+    #[async_trait::async_trait]
+    impl SpawnAgentExecutor for NearDeadlinePartialExecutor {
+        async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Ok(SpawnRunResult {
+                agent_id: config.agent_id,
+                run_id: config.run_id,
+                status: "interrupted".into(),
+                finish_reason: "budget_exhausted".into(),
+                cancellation_origin: CancellationOrigin::Unverified,
+                output: Some("near-deadline partial evidence".into()),
+                error: None,
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                tool_calls: 0,
+                turns_completed: 1,
+                permission_summary: None,
+                permission_requests: 0,
+                permission_requests_approved: 0,
+                tools_blocked: 0,
+            })
+        }
+    }
+
+    struct WaitingAndPendingCancelErrorExecutor;
+
+    #[async_trait::async_trait]
+    impl SpawnAgentExecutor for WaitingAndPendingCancelErrorExecutor {
+        async fn execute(&self, config: SpawnRunConfig) -> Result<SpawnRunResult, String> {
+            if config.description == "pending" {
+                return std::future::pending().await;
+            }
+            Ok(SpawnRunResult {
+                agent_id: config.agent_id,
+                run_id: config.run_id,
+                status: "waiting".into(),
+                finish_reason: "waiting".into(),
+                cancellation_origin: CancellationOrigin::Unverified,
+                output: Some("partial evidence before waiting".into()),
+                error: None,
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                tool_calls: 1,
+                turns_completed: 1,
+                permission_summary: None,
+                permission_requests: 0,
+                permission_requests_approved: 0,
+                tools_blocked: 0,
+            })
+        }
+
+        async fn cancel_spawned_run(
+            &self,
+            _run_id: &str,
+            _cancellation_binding_id: Option<&str>,
+            _user_id: Option<&str>,
+            _reason: &str,
+            _origin: CancellationOrigin,
+        ) -> Result<(), String> {
+            Err("durable cancel unavailable".into())
         }
     }
 
@@ -2893,7 +3329,7 @@ mod tests {
                 run_id: config.run_id,
                 status: "completed".into(),
                 finish_reason: "normal".into(),
-                cancelled_by_user: None,
+                cancellation_origin: CancellationOrigin::Unverified,
                 output: Some(format!("evidence from {description}")),
                 error: None,
                 prompt_tokens: 0,
@@ -2936,11 +3372,13 @@ mod tests {
             working_dir: PathBuf::from("."),
             spawner,
             inherited_permissions: InheritedPermissions::auto_approve(),
+            enabled_tools: None,
             active_skills: Vec::new(),
             live_event_sink: None,
             client_tool_delivery_tx: None,
             trace_context: None,
             execution_metadata: None,
+            workspace_mutation: WorkspaceMutationAuthority::default(),
             transcript_location: AgentTranscriptLocation::LocalJournal,
         }
     }
@@ -2999,6 +3437,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn handle_spawn_agent_action_fits_fresh_two_mib_worker_stack() {
+        std::thread::Builder::new()
+            .name("agent-spawn-2mib-stack".to_string())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime");
+                runtime.block_on(async {
+                    let spawner = test_spawner(Arc::new(CapturingModelExecutor::new()));
+                    let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+                    let output = handle_agent_spawn_action(
+                        &json!({
+                            "description": "Fresh-stack child",
+                            "prompt": "Return the configured child result",
+                            "agent_type": "general-purpose",
+                        }),
+                        Some(&ctx),
+                    )
+                    .await;
+                    let receipt: Value =
+                        serde_json::from_str(&output).expect("spawn receipt is JSON");
+                    assert_eq!(receipt["status"], "completed", "{receipt}");
+                });
+            })
+            .expect("spawn fresh two MiB thread")
+            .join()
+            .expect("agent spawn must not overflow a default Tokio worker stack");
+    }
+
+    #[tokio::test]
+    async fn handle_spawn_agent_tool_forwards_explicit_model_override() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let args = json!({
+            "description": "Cross-model review",
+            "prompt": "Review the latest commit",
+            "agent_type": "general-purpose",
+            "model": "deepseek-v4-flash"
+        });
+
+        let result = handle_agent_spawn_action(&args, Some(&ctx)).await;
+
+        let completed = collect_spawn_receipt(&result, &ctx).await;
+        assert_eq!(completed["status"], "completed", "{completed}");
+        assert_eq!(
+            executor.take_captured_model().as_deref(),
+            Some("deepseek-v4-flash")
+        );
+    }
+
     #[tokio::test]
     async fn spawn_receipt_declares_the_context_transcript_location() {
         let spawner = test_spawner(Arc::new(CapturingModelExecutor::new()));
@@ -3040,8 +3532,31 @@ mod tests {
         assert_eq!(
             executor.take_captured_max_turns(),
             Some(10),
-            "the child loop must preserve an explicit caller-selected ceiling"
+            "the child loop must preserve the explicit caller-selected initial slice"
         );
+        assert_eq!(executor.take_captured_hard_turn_limit(), Some(Some(10)));
+    }
+
+    #[tokio::test]
+    async fn persona_default_turn_budget_is_not_a_hard_limit() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+
+        let result = handle_agent_spawn_action(
+            &json!({
+                "description": "Deep correctness review",
+                "prompt": "Review the complete behavior and return evidence.",
+                "agent_type": "code-review"
+            }),
+            Some(&ctx),
+        )
+        .await;
+
+        let completed = collect_spawn_receipt(&result, &ctx).await;
+        assert_eq!(completed["status"], "completed", "{completed}");
+        assert_eq!(executor.take_captured_max_turns(), Some(12));
+        assert_eq!(executor.take_captured_hard_turn_limit(), Some(None));
     }
 
     #[tokio::test]
@@ -3154,7 +3669,7 @@ mod tests {
         .await;
 
         assert!(result.contains("\"status\":\"failed\""), "{result}");
-        assert!(result.contains("inspect files/diffs"), "{result}");
+        assert!(result.contains("never embed file contents"), "{result}");
         assert!(
             spawner.list_all_agents().await.is_empty(),
             "oversized fanout arguments must be rejected before any child is admitted"
@@ -3322,11 +3837,13 @@ mod tests {
         .await;
         let second: Value = serde_json::from_str(&second).unwrap();
         assert_eq!(second["status"], "failed");
-        assert!(
-            second["error"]
-                .as_str()
-                .is_some_and(|error| error.contains("may start only one fanout group")),
-            "{second}"
+        assert_eq!(second["error_kind"], "fanout_group_already_started");
+        assert_eq!(second["retryable"], false);
+        assert_eq!(second["executed"], false);
+        assert_eq!(second["group_id"], "review-first");
+        assert_eq!(
+            second["allowed_actions"],
+            json!(["get_results", "stop_slot", "stop_group"])
         );
         assert_eq!(spawner.list_fanout_groups().await.len(), 1);
     }
@@ -3495,6 +4012,342 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fanout_deadline_returns_terminal_partials_and_system_cancels_straggler() {
+        let spawner = test_spawner(Arc::new(ThreePartialsAndOnePendingExecutor));
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+
+        let result = handle_agent_fanout_start_action_with_deadline(
+            &json!({
+                "action": "start",
+                "group_id": "bounded-settlement",
+                "target_count": 4,
+                "slots": [
+                    {"id": "a", "description": "partial-a", "prompt": "Review A."},
+                    {"id": "b", "description": "partial-b", "prompt": "Review B."},
+                    {"id": "c", "description": "partial-c", "prompt": "Review C."},
+                    {"id": "d", "description": "pending", "prompt": "Review D."}
+                ]
+            }),
+            Some(&ctx),
+            Duration::from_secs(1),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&result).expect("canonical fanout aggregate");
+
+        assert_eq!(value["status"], "completed_with_issues", "{value}");
+        let results = value["results"].as_array().expect("all slots represented");
+        assert_eq!(results.len(), 4, "{value}");
+        assert_eq!(
+            results
+                .iter()
+                .filter(|item| item.to_string().contains("partial evidence"))
+                .count(),
+            3,
+            "terminal partial evidence must survive one wedged sibling: {value}"
+        );
+        let group = spawner
+            .fanout_group("bounded-settlement")
+            .await
+            .expect("fanout group");
+        assert!(
+            group.is_terminal(),
+            "deadline must settle every slot: {group:?}"
+        );
+        assert_eq!(
+            group
+                .slots
+                .iter()
+                .filter(|slot| {
+                    slot.terminal_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("settlement deadline"))
+                })
+                .count(),
+            1,
+            "only the straggler is cancelled by the settlement deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn fanout_preserves_partial_terminalized_before_settlement_deadline() {
+        let spawner = test_spawner(Arc::new(NearDeadlinePartialExecutor));
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+
+        let result = handle_agent_fanout_start_action_with_deadline(
+            &json!({
+                "action":"start",
+                "group_id":"near-deadline-partial",
+                "target_count":1,
+                "slots":[{"id":"only","description":"partial","prompt":"Review."}]
+            }),
+            Some(&ctx),
+            Duration::from_millis(500),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&result).expect("terminal aggregate");
+
+        assert_eq!(value["status"], "completed_with_issues", "{value}");
+        assert_eq!(value["interrupted"], 1, "{value}");
+        assert_eq!(value["cancelled_by_runtime"], 0, "{value}");
+        assert!(result.contains("near-deadline partial evidence"), "{value}");
+    }
+
+    #[tokio::test]
+    async fn fanout_deadline_preserves_completed_result_during_terminal_projection_handoff() {
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let spawner = test_spawner(Arc::new(GatedFanoutExecutor {
+            started_tx,
+            gates: Mutex::new(HashMap::from([("completed".to_string(), release_rx)])),
+        }));
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+        let run = tokio::spawn({
+            let ctx = ctx.clone();
+            async move {
+                handle_agent_fanout_start_action_with_deadline(
+                    &json!({
+                        "action":"start",
+                        "group_id":"terminal-handoff-race",
+                        "target_count":1,
+                        "slots":[{"id":"only","description":"completed","prompt":"Review."}]
+                    }),
+                    Some(&ctx),
+                    Duration::from_millis(60),
+                )
+                .await
+            }
+        });
+        started_rx
+            .recv()
+            .await
+            .expect("child executor must start before handoff is gated");
+        let projection_guard = spawner.hold_fanout_projection_for_test().await;
+        release_tx.send(()).expect("release completed child");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if spawner.list_agents(&ctx.run_id).await.iter().any(|agent| {
+                    matches!(
+                        agent.status,
+                        astra_turn_core::orchestration_types::AgentStatus::Completed { .. }
+                    )
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal state must remain visible during projection handoff");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        drop(projection_guard);
+
+        let result = tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .expect("deadline settlement must finish after projection resumes")
+            .expect("fanout task must not panic");
+        let value: Value = serde_json::from_str(&result).expect("terminal aggregate");
+        assert_eq!(value["status"], "completed", "{value}");
+        assert_eq!(value["completed"], 1, "{value}");
+        assert!(result.contains("evidence from completed"), "{value}");
+        assert_eq!(value["cancelled_by_runtime"], 0, "{value}");
+    }
+
+    #[tokio::test]
+    async fn fanout_deadline_settlement_does_not_wait_for_trace_persistence() {
+        let transport = Arc::new(astra_messaging::InProcessTransport::new());
+        let tracker = Arc::new(DelegationTracker::new());
+        let router = Arc::new(astra_messaging::AgentMailboxRouter::new(transport, tracker));
+        let spawner = Arc::new(
+            DynamicAgentSpawner::new(router)
+                .with_executor(Arc::new(PendingExecutor))
+                .with_trace_writer(Arc::new(PendingTraceWriter)),
+        );
+        let mut ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        ctx.trace_context = Some(astra_turn_core::trace_event::TraceContext {
+            session_id: "session-deadline".into(),
+            user_id: "user-deadline".into(),
+            turn_id: "turn-deadline".into(),
+            turn_seq: 1,
+            causal_chain_id: "chain-deadline".into(),
+            root_event_id: "root-event-deadline".into(),
+        });
+        let started = Instant::now();
+
+        let result = handle_agent_fanout_start_action_with_deadline(
+            &json!({
+                "action":"start",
+                "group_id":"trace-writer-stall",
+                "target_count":1,
+                "slots":[{"id":"only","description":"pending","prompt":"Review."}]
+            }),
+            Some(&ctx),
+            Duration::from_millis(40),
+        )
+        .await;
+
+        assert!(started.elapsed() < Duration::from_secs(1), "{result}");
+        let value: Value = serde_json::from_str(&result).expect("terminal aggregate");
+        assert_eq!(value["status"], "completed_with_issues", "{value}");
+        assert_eq!(value["cancelled_by_runtime"], 1, "{value}");
+    }
+
+    #[tokio::test]
+    async fn fanout_deadline_terminalizes_slots_stalled_before_spawn_acceptance() {
+        let spawner = test_spawner(Arc::new(PendingExecutor));
+        let admission_guard = spawner.hold_spawn_admission_for_test().await;
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+
+        let result = handle_agent_fanout_start_action_with_deadline(
+            &json!({
+                "action":"start",
+                "group_id":"pre-accept-stall",
+                "target_count":1,
+                "slots":[{"id":"only","description":"pending setup","prompt":"Review."}]
+            }),
+            Some(&ctx),
+            Duration::from_millis(40),
+        )
+        .await;
+        drop(admission_guard);
+
+        let value: Value = serde_json::from_str(&result).expect("terminal aggregate");
+        let group = spawner
+            .fanout_group("pre-accept-stall")
+            .await
+            .expect("declared group");
+        assert!(group.is_terminal(), "{group:?}\n{value}");
+        assert_eq!(value["active"], 0, "{value}");
+        assert_eq!(value["cancelled_by_runtime"], 1, "{value}");
+        assert!(spawner.list_agents(&ctx.run_id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fanout_deadline_keeps_slots_pending_when_durable_cancel_fails() {
+        let spawner = test_spawner(Arc::new(WaitingAndPendingCancelErrorExecutor));
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+
+        let result = handle_agent_fanout_start_action_with_deadline(
+            &json!({
+                "action":"start",
+                "group_id":"waiting-cancel-error",
+                "target_count":2,
+                "slots":[
+                    {"id":"waiting","description":"waiting","prompt":"Review then wait."},
+                    {"id":"pending","description":"pending","prompt":"Remain pending."}
+                ]
+            }),
+            Some(&ctx),
+            Duration::from_millis(80),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&result).expect("terminal aggregate");
+        let group = spawner
+            .fanout_group("waiting-cancel-error")
+            .await
+            .expect("group projection");
+
+        assert!(!group.is_terminal(), "{group:?}\n{value}");
+        assert!(
+            group
+                .slots
+                .iter()
+                .all(|slot| slot.status == AgentFanoutSlotStatus::WaitingForInput),
+            "{group:?}\n{value}"
+        );
+        assert_eq!(value["status"], "incomplete", "{value}");
+        assert_eq!(value["active"], 2, "{value}");
+        assert_eq!(value["terminal"], 0, "{value}");
+        assert_eq!(value["cancelled_by_runtime"], 0, "{value}");
+        assert!(
+            spawner.has_in_flight_cancellation_owners().await,
+            "durable failure must retain explicit reconciliation ownership"
+        );
+    }
+
+    #[tokio::test]
+    async fn fanout_deadline_keeps_user_cancellation_pending_while_durable_control_is_stalled() {
+        let release_cancel = Arc::new(tokio::sync::Notify::new());
+        let spawner = test_spawner(Arc::new(PendingExecutionAndCancelExecutor {
+            release_cancel: release_cancel.clone(),
+        }));
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+        let run = tokio::spawn({
+            let ctx = ctx.clone();
+            async move {
+                handle_agent_fanout_start_action_with_deadline(
+                    &json!({
+                        "action":"start",
+                        "group_id":"user-cancel-deadline-race",
+                        "target_count":1,
+                        "slots":[{"id":"only","description":"pending","prompt":"Review."}]
+                    }),
+                    Some(&ctx),
+                    Duration::from_millis(150),
+                )
+                .await
+            }
+        });
+
+        let agent_id = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(agent_id) = spawner
+                    .fanout_group("user-cancel-deadline-race")
+                    .await
+                    .and_then(|group| group.slots[0].agent_id.clone())
+                {
+                    break agent_id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fanout child identity must be attached");
+        let user_cancel = tokio::spawn({
+            let spawner = spawner.clone();
+            let agent_id = agent_id.clone();
+            async move {
+                spawner
+                    .cancel_agent_for_user(&agent_id, "user requested stop")
+                    .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if spawner.has_in_flight_cancellation_for_test(&agent_id).await {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("user cancellation must publish in-flight ownership");
+
+        let result = tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .expect("group deadline must not wait for stalled durable cancel")
+            .expect("fanout task must not panic");
+        user_cancel.abort();
+        let value: Value = serde_json::from_str(&result).expect("terminal aggregate");
+        assert_eq!(value["active"], 1, "{value}");
+        assert_eq!(value["cancelled_by_user"], 0, "{value}");
+        assert_eq!(value["status"], "incomplete", "{value}");
+        assert_eq!(value["results"][0]["result"]["status"], "waiting");
+        release_cancel.notify_waiters();
+        assert!(matches!(
+            spawner
+                .get_agent_state_any(&agent_id)
+                .await
+                .map(|state| state.status),
+            Some(astra_turn_core::orchestration_types::AgentStatus::Waiting { .. })
+        ));
+        assert!(
+            spawner.has_in_flight_cancellation_for_test(&agent_id).await,
+            "a failed durable cancel without a recoverable outbox must remain visibly unclean"
+        );
+    }
+
+    #[tokio::test]
     async fn agent_fanout_start_rejects_slot_count_mismatch_before_spawning() {
         let executor = Arc::new(CapturingModelExecutor::new());
         let spawner = test_spawner(executor.clone());
@@ -3516,6 +4369,63 @@ mod tests {
         assert!(result.contains("requires exactly 2 slots"), "{result}");
         assert!(spawner.list_fanout_groups().await.is_empty());
         assert_eq!(executor.take_captured_model(), None);
+    }
+
+    #[tokio::test]
+    async fn agent_fanout_rejects_explicit_optional_capability_outside_parent_authority() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let mut ctx = test_spawn_context(spawner.clone(), Some("deepseek-v4-flash"));
+        ctx.enabled_tools = Some(HashSet::new());
+
+        let result = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "network-fanout",
+                "target_count": 2,
+                "defaults": {"allowed_tools": ["web_fetch"]},
+                "slots": [
+                    {"description": "Fetch first", "prompt": "Fetch the first URL."},
+                    {"description": "Fetch second", "prompt": "Fetch the second URL."}
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+
+        let value: Value = serde_json::from_str(&result).expect("structured rejection");
+        assert_eq!(value["status"], "failed");
+        assert!(
+            value["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("web_fetch") && error.contains("not enabled")),
+            "{value}"
+        );
+        assert!(spawner.list_fanout_groups().await.is_empty());
+        assert_eq!(executor.spawn_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn agent_spawn_rejects_optional_capability_outside_parent_authority() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let mut ctx = test_spawn_context(spawner.clone(), Some("deepseek-v4-flash"));
+        ctx.enabled_tools = Some(HashSet::new());
+
+        let result = handle_agent_spawn_action(
+            &json!({
+                "description": "Fetch a URL",
+                "prompt": "Fetch the URL and report the result.",
+                "allowed_tools": ["web_fetch"]
+            }),
+            Some(&ctx),
+        )
+        .await;
+
+        let value: Value = serde_json::from_str(&result).expect("structured rejection");
+        assert_eq!(value["status"], "failed");
+        assert!(spawner.list_all_agents().await.is_empty());
+        assert_eq!(executor.spawn_count(), 0);
     }
 
     #[tokio::test]
@@ -3622,6 +4532,36 @@ mod tests {
         assert!(result.contains("\"status\":\"failed\""), "{result}");
         assert!(result.contains("unknown field"), "{result}");
         assert!(result.contains("task"), "{result}");
+        assert!(result.contains("allowed_tools"), "{result}");
+        assert!(spawner.list_fanout_groups().await.is_empty());
+        assert_eq!(executor.take_captured_model(), None);
+    }
+
+    #[tokio::test]
+    async fn agent_fanout_start_explains_the_typed_tool_allowlist_field() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner.clone(), Some("deepseek-chat"));
+        let result = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "target_count": 1,
+                "slots": [
+                    {
+                        "description": "Fetch one source",
+                        "prompt": "Fetch one source",
+                        "tools": ["web_fetch"]
+                    }
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+
+        assert!(result.contains("\"status\":\"failed\""), "{result}");
+        assert!(result.contains("unknown field `tools`"), "{result}");
+        assert!(result.contains("allowed_tools"), "{result}");
+        assert!(result.contains("`tools` is not a valid field"), "{result}");
         assert!(spawner.list_fanout_groups().await.is_empty());
         assert_eq!(executor.take_captured_model(), None);
     }
@@ -3696,6 +4636,7 @@ mod tests {
             description: "Review storage".into(),
             prompt: "Review storage layer".into(),
             agent_type: None,
+            model: None,
             max_turns: None,
             max_output_tokens: None,
             complexity: None,
@@ -3734,6 +4675,7 @@ mod tests {
             description: "Review correctness".into(),
             prompt: "Review correctness deeply".into(),
             agent_type: None,
+            model: None,
             max_turns: None,
             max_output_tokens: None,
             complexity: None,
@@ -3769,6 +4711,7 @@ mod tests {
             description: "Investigate runtime".into(),
             prompt: "Investigate runtime failures".into(),
             agent_type: None,
+            model: None,
             max_turns: None,
             max_output_tokens: None,
             complexity: None,
@@ -3789,6 +4732,116 @@ mod tests {
         assert_eq!(args["agent_type"], "general-purpose");
         assert_eq!(args["complexity"], "light");
         assert_eq!(args["max_turns"], 10);
+    }
+
+    #[test]
+    fn fanout_slot_omits_implicit_explore_budget_and_propagates_model() {
+        let input = AgentFanoutStartInput {
+            _action: Some("start".into()),
+            _tool_call_id: None,
+            group_id: Some("fetch-1".into()),
+            title: Some("parallel fetch".into()),
+            target_count: 1,
+            slots: Vec::new(),
+            defaults: None,
+        };
+        let slot = AgentFanoutStartSlot {
+            slot_id: Some("one".into()),
+            description: "Fetch one source".into(),
+            prompt: "Fetch one source and return its URL".into(),
+            agent_type: None,
+            model: Some("deepseek-v4-flash".into()),
+            max_turns: None,
+            max_output_tokens: None,
+            complexity: None,
+            isolated: None,
+            allowed_tools: None,
+        };
+
+        let args = fanout_slot_spawn_args(&input, slot, "fetch-1", "parallel fetch", 1, 0, None);
+
+        assert_eq!(args["agent_type"], "explore");
+        assert_eq!(args["model"], "deepseek-v4-flash");
+        assert!(
+            args.get("max_turns").is_none(),
+            "an implicit persona budget must remain a renewable child slice"
+        );
+    }
+
+    #[test]
+    fn fanout_slot_implicit_code_review_budget_remains_renewable() {
+        let input = AgentFanoutStartInput {
+            _action: Some("start".into()),
+            _tool_call_id: None,
+            group_id: Some("review-implicit-budget".into()),
+            title: Some("review fanout".into()),
+            target_count: 3,
+            slots: Vec::new(),
+            defaults: Some(AgentFanoutDefaults {
+                agent_type: Some("code-review".into()),
+                ..Default::default()
+            }),
+        };
+        let slot = AgentFanoutStartSlot {
+            slot_id: Some("correctness".into()),
+            description: "Review correctness".into(),
+            prompt: "Review correctness and return evidence".into(),
+            agent_type: None,
+            model: None,
+            max_turns: None,
+            max_output_tokens: None,
+            complexity: None,
+            isolated: None,
+            allowed_tools: None,
+        };
+
+        let args = fanout_slot_spawn_args(
+            &input,
+            slot,
+            "review-implicit-budget",
+            "review fanout",
+            3,
+            0,
+            None,
+        );
+
+        assert!(args.get("max_turns").is_none());
+    }
+
+    #[tokio::test]
+    async fn deep_code_review_fanout_keeps_persona_budget_as_a_renewable_slice() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor.clone());
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+
+        let result = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "deep-code-review-budget",
+                "target_count": 3,
+                "defaults": {
+                    "agent_type": "code-review",
+                    "complexity": "deep"
+                },
+                "slots": [
+                    {"id": "correctness", "description": "Review correctness", "prompt": "Review correctness."},
+                    {"id": "lifecycle", "description": "Review lifecycle", "prompt": "Review lifecycle."},
+                    {"id": "harness", "description": "Review harness", "prompt": "Review harness."}
+                ]
+            }),
+            Some(&ctx),
+        )
+        .await;
+
+        let value: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(value["status"], "completed", "{result}");
+        assert_eq!(executor.spawn_count(), 3);
+        assert_eq!(executor.take_captured_max_turns(), Some(24));
+        assert_eq!(
+            executor.take_captured_hard_turn_limit(),
+            Some(None),
+            "an implicit deep code-review persona budget must not terminate the child at 24 turns"
+        );
     }
 
     #[tokio::test]
@@ -3827,10 +4880,15 @@ mod tests {
         assert_eq!(value["completed"], 1);
         assert_eq!(value["transcript_location"], "local_journal");
         assert!(
-            value["fanout"]["slots"][0]["run_id"]
+            value["results"][0]["run_id"]
                 .as_str()
                 .is_some_and(|run_id| !run_id.is_empty()),
-            "recovered fanout results must retain every child transcript identity: {result}"
+            "fanout results must retain every child transcript identity in the canonical results list: {result}"
+        );
+        assert_eq!(value["fanout"]["agent_count"], 1);
+        assert!(
+            value["fanout"].get("slots").is_none(),
+            "aggregate fanout metadata must not duplicate results[] as another agent list: {result}"
         );
         assert!(
             value["delivery_contract"]
@@ -3849,7 +4907,6 @@ mod tests {
             value["result_read"]["max_bytes"],
             FANOUT_RESULT_DEFAULT_MAX_BYTES
         );
-        assert_eq!(value["fanout"]["slots"].as_array().unwrap().len(), 1);
         assert!(
             result.contains('\n'),
             "fanout aggregate results must be readable when persisted: {result}"
@@ -3906,6 +4963,28 @@ mod tests {
             !result.contains("artifact://session/tool-result"),
             "fanout recovery must point at the owning tool window API, not internal artifacts: {result}"
         );
+    }
+
+    #[test]
+    fn structured_fanout_results_receive_typed_byte_windows() {
+        let original = json!({"status":"completed","details":{"finding":"value"}});
+        let serialized = serde_json::to_string(&original).unwrap();
+        let mut value = json!({"result": original});
+
+        let window = window_fanout_agent_result(&mut value, "group-structured", 0, 0, 8)
+            .expect("structured results must use the same bounded byte protocol");
+
+        assert_eq!(window.start, 0);
+        assert_eq!(window.total_bytes, serialized.len());
+        assert_eq!(window.end, 8);
+        assert!(window.truncated);
+        assert!(
+            window
+                .next_call
+                .as_deref()
+                .is_some_and(|call| { call.contains("slot_index=0") && call.contains("offset=8") })
+        );
+        assert_eq!(value["result"], serialized[..8]);
     }
 
     #[tokio::test]
@@ -4091,6 +5170,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fanout_recovery_is_scoped_to_the_owning_parent_run() {
+        let executor = Arc::new(CapturingModelExecutor::new());
+        let spawner = test_spawner(executor);
+        let ctx_a = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+        let mut ctx_b = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        ctx_b.run_id = "run-other-tenant-session".into();
+        ctx_b.agent_id = "other-root".into();
+
+        for (ctx, group_id) in [(&ctx_a, "group-a"), (&ctx_b, "group-b")] {
+            let receipt = handle_agent_fanout_tool(
+                &json!({
+                    "action": "start",
+                    "group_id": group_id,
+                    "target_count": 1,
+                    "slots": [{"description": "Review", "prompt": "Return evidence"}]
+                }),
+                Some(ctx),
+            )
+            .await;
+            assert_eq!(
+                collect_fanout_start(&receipt, ctx).await["status"],
+                "completed"
+            );
+        }
+
+        let foreign = recover_agent_fanout_tool_result(
+            &json!({"action": "start", "group_id": "group-b", "target_count": 1, "slots": []}),
+            Some("call-a"),
+            Some(&ctx_a),
+        )
+        .await;
+        let foreign: Value = serde_json::from_str(&foreign).unwrap();
+        assert_eq!(foreign["status"], "failed");
+        assert!(
+            foreign["error"].as_str().is_some_and(
+                |message| message.contains("does not exist for parent run 'run-parent'")
+            )
+        );
+
+        let own = recover_agent_fanout_tool_result(
+            &json!({"action": "start", "target_count": 1, "slots": []}),
+            Some("call-a"),
+            Some(&ctx_a),
+        )
+        .await;
+        let own: Value = serde_json::from_str(&own).unwrap();
+        assert_eq!(own["group_id"], "group-a");
+    }
+
+    #[tokio::test]
     async fn agent_fanout_start_refuses_second_group_for_same_parent() {
         let executor = Arc::new(CapturingModelExecutor::new());
         let spawner = test_spawner(executor.clone());
@@ -4125,12 +5254,9 @@ mod tests {
         let second_value: Value = serde_json::from_str(&second).unwrap();
 
         assert_eq!(second_value["status"], "failed");
-        assert!(
-            second_value["error"]
-                .as_str()
-                .is_some_and(|text| text.contains("a parent run may start only one fanout group")),
-            "{second}"
-        );
+        assert_eq!(second_value["error_kind"], "fanout_group_already_started");
+        assert_eq!(second_value["retryable"], false);
+        assert_eq!(second_value["group_id"], "review-one");
         assert_eq!(
             executor.spawn_count(),
             1,
@@ -4425,7 +5551,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_fanout_stop_slot_then_get_results_reports_stopped_by_user() {
+    async fn agent_fanout_stop_slot_then_get_results_reports_runtime_cancellation() {
         let spawner = test_spawner(Arc::new(PendingExecutor));
         let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
         let start_ctx = ctx.clone();
@@ -4472,8 +5598,9 @@ mod tests {
         let stop_value: Value = serde_json::from_str(&stop).unwrap();
         assert_eq!(stop_value["status"], "completed");
         assert_eq!(stop_value["stop_outcome"], "stopped");
-        assert_eq!(stop_value["slot_status"], "cancelled_by_user");
-        assert_eq!(stop_value["fanout"]["cancelled_by_user"], 1);
+        assert_eq!(stop_value["slot_status"], "cancelled_by_runtime");
+        assert_eq!(stop_value["fanout"]["cancelled_by_runtime"], 1);
+        assert_eq!(stop_value["fanout"]["cancelled_by_user"], 0);
 
         let start = tokio::time::timeout(Duration::from_secs(1), start_task)
             .await
@@ -4491,7 +5618,8 @@ mod tests {
         let value: Value = serde_json::from_str(&result).unwrap();
 
         assert_eq!(value["status"], "completed_with_issues");
-        assert_eq!(value["cancelled_by_user"], 1);
+        assert_eq!(value["cancelled_by_runtime"], 1);
+        assert_eq!(value["cancelled_by_user"], 0);
     }
 
     #[tokio::test]
@@ -4533,14 +5661,68 @@ mod tests {
         assert_eq!(stop_value["status"], "completed");
         assert_eq!(stop_value["stop_outcome"], "stopped");
         assert_eq!(stop_value["stopped_count"], 2);
-        assert_eq!(stop_value["fanout"]["cancelled_by_user"], 2);
+        assert_eq!(stop_value["fanout"]["cancelled_by_runtime"], 2);
+        assert_eq!(stop_value["fanout"]["cancelled_by_user"], 0);
 
         let start = tokio::time::timeout(Duration::from_secs(1), start_task)
             .await
             .expect("group cancellation must unblock foreground fan-in")
             .expect("fanout start task must not panic");
         let start_value: Value = serde_json::from_str(&start).unwrap();
-        assert_eq!(start_value["cancelled_by_user"], 2);
+        assert_eq!(start_value["cancelled_by_runtime"], 2);
+        assert_eq!(start_value["cancelled_by_user"], 0);
+    }
+
+    #[tokio::test]
+    async fn agent_fanout_stop_group_reports_stable_cancellation_pending() {
+        let release_cancel = Arc::new(tokio::sync::Notify::new());
+        let spawner = test_spawner(Arc::new(PendingExecutionAndCancelExecutor {
+            release_cancel: Arc::clone(&release_cancel),
+        }));
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+        let start_ctx = ctx.clone();
+        let start_task = tokio::spawn(async move {
+            handle_agent_fanout_tool(
+                &json!({
+                    "action": "start",
+                    "group_id": "review-stop-pending",
+                    "target_count": 2,
+                    "slots": [
+                        {"description": "Review runtime", "prompt": "Review runtime changes"},
+                        {"description": "Review UI", "prompt": "Review UI changes"}
+                    ]
+                }),
+                Some(&start_ctx),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while spawner.list_all_agents().await.len() != 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both fanout children must be active");
+
+        let stop = handle_agent_fanout_tool(
+            &json!({
+                "action": "stop_group",
+                "group_id": "review-stop-pending"
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&stop).expect("typed stop receipt");
+        assert_eq!(value["status"], "accepted", "{value}");
+        assert_eq!(value["stop_outcome"], "cancellation_pending", "{value}");
+        assert_eq!(value["cancellation_pending_count"], 2, "{value}");
+        assert_eq!(value["stopped_count"], 0, "{value}");
+        assert_eq!(value["not_stopped_agent_ids"], json!([]), "{value}");
+        assert_eq!(value["fanout"]["active"], 2, "{value}");
+        assert!(spawner.has_in_flight_cancellation_owners().await);
+
+        start_task.abort();
+        release_cancel.notify_waiters();
     }
 
     #[test]
@@ -4656,7 +5838,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fanout_start_preserves_parent_budget_interrupt_cause() {
+    async fn fanout_start_keeps_child_budget_exhaustion_distinct_from_parent_cancel() {
         let spawner = test_spawner(Arc::new(InterruptedSpawnExecutor));
         let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
 
@@ -4675,7 +5857,8 @@ mod tests {
         .await;
         let collected_value: Value = serde_json::from_str(&result).unwrap();
         assert_eq!(collected_value["status"], "completed_with_issues");
-        assert_eq!(collected_value["cancelled_by_parent_budget"], 1);
+        assert_eq!(collected_value["interrupted"], 1);
+        assert_eq!(collected_value["cancelled_by_runtime"], 0);
         assert_eq!(
             collected_value["cancelled_by_user"], 0,
             "terminal counters use one fixed schema even when a cause is absent"
@@ -4691,21 +5874,69 @@ mod tests {
         assert_eq!(collected_value["incomplete_results"], 1);
         assert_eq!(collected_value["provenance"]["complete_deliverables"], 0);
         assert_eq!(collected_value["provenance"]["incomplete_slots"], 1);
+        assert_eq!(
+            collected_value["provenance"]["usable_partial_deliverables"],
+            1
+        );
+        assert_eq!(collected_value["usable_partial_results"], 1);
         assert_eq!(collected_value["provenance"]["all_slots_delivered"], false);
         assert!(
             collected_value["instruction"]
                 .as_str()
                 .is_some_and(|instruction| instruction.contains("0/1")
-                    && instruction.contains("parent synthesis")),
+                    && instruction.contains("synthesize the retained evidence now")),
             "{collected_value}"
         );
         assert_eq!(
-            collected_value["recovery"]["resume_existing_work_before_rerun"],
-            true
-        );
-        assert_eq!(
             collected_value["results"][0]["recovery"]["rerun_policy"],
-            "resume_existing_agent_or_report_incomplete"
+            "synthesize_retained_partial_or_report_incomplete"
+        );
+    }
+
+    #[tokio::test]
+    async fn fanout_keeps_partial_provenance_when_aggregate_presentation_is_truncated() {
+        let spawner = test_spawner(Arc::new(LargeInterruptedSpawnExecutor));
+        let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
+        let slots = (0..8)
+            .map(|index| {
+                json!({
+                    "id": format!("partial-{index}"),
+                    "description": format!("Partial review {index}"),
+                    "prompt": "Return the retained partial evidence"
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let result = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "target_count": slots.len(),
+                "slots": slots,
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let collected_value: Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(collected_value["status"], "completed_with_issues");
+        assert_eq!(collected_value["interrupted"], 8);
+        assert_eq!(collected_value["incomplete_results"], 8);
+        assert_eq!(collected_value["usable_partial_results"], 8);
+        assert_eq!(
+            collected_value["provenance"]["usable_partial_deliverables"],
+            8
+        );
+        assert!(
+            collected_value["results"]
+                .as_array()
+                .is_some_and(|results| results.iter().all(|item| item["result"].is_string())),
+            "the regression must cross the aggregate presentation boundary: {collected_value}"
+        );
+        assert!(
+            collected_value["instruction"].as_str().is_some_and(
+                |instruction| instruction.contains("synthesize the retained evidence now")
+            ),
+            "{collected_value}"
         );
     }
 
@@ -4736,6 +5967,40 @@ mod tests {
             "execution_incomplete"
         );
         assert_eq!(collected["results"][0]["result"]["status"], "interrupted");
+    }
+
+    #[tokio::test]
+    async fn terminal_fanout_with_unavailable_result_is_not_cached_as_delivered() {
+        let spawner = test_spawner(Arc::new(EmptyCompletionExecutor));
+        let ctx = test_spawn_context(spawner.clone(), Some("MiniMax-M2.7"));
+
+        let result = handle_agent_fanout_tool(
+            &json!({
+                "action": "start",
+                "group_id": "empty-result",
+                "target_count": 1,
+                "slots": [{
+                    "id": "evidence",
+                    "description": "Return evidence",
+                    "prompt": "Return the requested evidence"
+                }]
+            }),
+            Some(&ctx),
+        )
+        .await;
+        let value: Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(value["status"], "completed_with_issues");
+        assert_eq!(value["provenance"]["complete_deliverables"], 0);
+        assert_eq!(value["provenance"]["all_slots_delivered"], false);
+        assert_eq!(value["incomplete_results"], 1);
+        assert!(
+            spawner
+                .cached_terminal_fanout_result("empty-result")
+                .await
+                .is_none(),
+            "an unavailable result must remain re-readable after durable convergence"
+        );
     }
 
     #[tokio::test]
@@ -4920,8 +6185,9 @@ mod tests {
 
         assert!(
             spawner
-                .cancel_agent(agent_id, "user-requested via test")
+                .cancel_agent_for_user(agent_id, "user-requested via test")
                 .await
+                .owns_local_stop()
         );
         let result =
             handle_agent_get_result_action(&json!({"agent_id": agent_id}), Some(&ctx)).await;
@@ -4941,7 +6207,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_result_fanout_summary_does_not_report_non_budget_interruption_as_parent_budget() {
+    async fn get_result_fanout_summary_does_not_report_child_interruption_as_runtime_cancel() {
         let spawner = test_spawner(Arc::new(EmptyCompletionExecutor));
         let ctx = test_spawn_context(spawner, Some("MiniMax-M2.7"));
         let spawn = handle_agent_spawn_action(
@@ -4967,12 +6233,12 @@ mod tests {
         assert_eq!(value["fanout"]["target_count"], 3);
         assert_eq!(value["fanout"]["failed"], 0);
         assert_eq!(value["fanout"]["interrupted"], 1);
-        assert_eq!(value["fanout"]["cancelled_by_parent_budget"], 0);
+        assert_eq!(value["fanout"]["cancelled_by_runtime"], 0);
         assert!(
             value["fanout"]["summary"]
                 .as_str()
                 .is_some_and(|summary| summary.contains("1 interrupted")
-                    && !summary.contains("cancelled by parent budget")),
+                    && !summary.contains("cancelled by runtime")),
             "{value}"
         );
     }

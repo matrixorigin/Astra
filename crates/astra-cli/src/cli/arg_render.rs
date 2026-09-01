@@ -7,8 +7,7 @@
 use crate::cli::cli_config::cli_args::{
     AgentArgs, AgentSubcommand, BugArgs, BugSubcommand, DebugArgs, DiffArgs, DiffSubcommand,
     GrepArgs, GrepSubcommand, MemoryArgs, MemorySubcommand, MessagingArgs, MessagingSubcommand,
-    PermissionsArgs, PermissionsSubcommand, ReviewArgs, ReviewSubcommand, TaskArgs, TaskSubcommand,
-    TeamArgs, TeamSubcommand,
+    PermissionsArgs, PermissionsSubcommand, ReviewArgs, ReviewSubcommand, TeamArgs, TeamSubcommand,
 };
 
 /// Prepend optional system instructions to a user message.
@@ -66,19 +65,6 @@ pub(crate) fn render_team_args(args: &TeamArgs) -> String {
             }
         }
         Some(TeamSubcommand::Restore(cmd)) => format!("restore {} {}", cmd.team, cmd.snapshot_id),
-    }
-}
-
-/// Render [`TaskArgs`] back into a stable textual argument list.
-pub(crate) fn render_task_args(args: &TaskArgs) -> String {
-    match &args.command {
-        None | Some(TaskSubcommand::List) => String::new(),
-        Some(TaskSubcommand::Pending) => "pending".to_string(),
-        Some(TaskSubcommand::Status(cmd)) => format!("status {}", join_words(&cmd.query)),
-        Some(TaskSubcommand::Run(cmd)) => format!("run {}", join_words(&cmd.text)),
-        Some(TaskSubcommand::Queue(cmd)) => format!("queue {}", join_words(&cmd.text)),
-        Some(TaskSubcommand::Worker(_)) => "worker".to_string(),
-        Some(TaskSubcommand::Result(cmd)) => format!("result {}", join_words(&cmd.query)),
     }
 }
 
@@ -226,9 +212,9 @@ pub(crate) fn render_bug_args(args: &BugArgs) -> String {
 
 #[cfg(test)]
 mod arg_render_tests {
-    use super::{render_permissions_args, render_task_args};
+    use super::render_permissions_args;
     use crate::cli::cli_config::cli_args::{
-        PermissionsArgs, PermissionsSubcommand, PermissionsTraceArgs, TaskArgs, TaskSubcommand,
+        PermissionsArgs, PermissionsSubcommand, PermissionsTraceArgs,
     };
 
     #[test]
@@ -276,13 +262,5 @@ mod arg_render_tests {
             })),
         };
         assert_eq!(render_permissions_args(&args), "trace --export trace.jsonl");
-    }
-
-    #[test]
-    fn task_pending_renders_explicit_queue_view() {
-        let args = TaskArgs {
-            command: Some(TaskSubcommand::Pending),
-        };
-        assert_eq!(render_task_args(&args), "pending");
     }
 }

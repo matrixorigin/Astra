@@ -69,8 +69,7 @@ fn build_host(
 //
 // Pins current behavior: the mock pipeline preserves the raw broken
 // `arguments` string verbatim on the accum (no silent coercion to `{}`
-// that would mask detection). The `response_guard` layer (covered in
-// `unhappy_llm_behaviors.rs`) is what flags it as `malformed_args`.
+// that would mask the strict canonical admission check on the execution path.
 // This test guarantees the TURN DOES NOT PANIC and that
 // `llm_rounds_completed` increments exactly once, catching any future
 // regression where malformed args stall the loop at round 0 forever.
@@ -128,9 +127,9 @@ async fn unhappy_tool_call_with_invalid_json_args() {
 // ── (B) Unknown tool name ──────────────────────────────────────────────────
 //
 // Pins current behavior: when the LLM hallucinates a tool that isn't
-// registered, the mock pipeline propagates the tool_call faithfully so
-// the `response_guard` (via `apply_response_guards`) can flag it as
-// `hallucinated_tools` and the next turn can recover. The test also
+// registered, the mock pipeline propagates the canonical tool call faithfully
+// so the execution admission boundary can return its structured unknown-tool
+// result and the next turn can recover. The test also
 // verifies that after the loop would inject a placeholder tool result
 // (what `merge_tool_results_into_history` does when edge disconnected),
 // the history ends well-formed — no dangling tool_calls without
@@ -170,7 +169,7 @@ async fn unhappy_tool_call_to_unknown_tool_name() {
         .expect("tool_call.function.name must exist");
     assert_eq!(
         name, "nonexistent_synth_tool",
-        "unknown tool name must be preserved verbatim (so response_guard can flag it)"
+        "unknown tool name must be preserved verbatim for execution admission"
     );
 
     // Simulate the loop appending assistant+tool_calls and the resulting

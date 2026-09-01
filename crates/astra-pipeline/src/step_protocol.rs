@@ -763,6 +763,63 @@ pub struct HeavyCheckpoint {
     /// the id is content-addressed hex, `cfg_<16-hex>`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_version_id: Option<String>,
+    /// Durable execution uncertainty carried across a heavy-checkpoint
+    /// resume.  A foreground process-group receipt proves that the leader
+    /// finished, but not that a detached descendant is gone; once observed,
+    /// the resumed loop must remain conservative until a new workspace
+    /// binding is established.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_observation_quarantine: Option<WorkspaceObservationQuarantineV1>,
+}
+
+/// Typed, transport-neutral workspace observation quarantine state.
+///
+/// This deliberately carries no path or command text.  The binding is owned
+/// by the resumed session/runtime, while the reason and scope keep the state
+/// auditable without allowing a checkpoint to become a new execution
+/// authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceObservationQuarantineV1 {
+    pub reason: String,
+    pub scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_tool_call_id: Option<String>,
+}
+
+impl WorkspaceObservationQuarantineV1 {
+    pub const WEAK_PROCESS_OWNERSHIP_REASON: &'static str = "weak_process_ownership";
+    pub const PARTIAL_MUTATION_REASON: &'static str = "partial_workspace_mutation";
+    pub const BOUND_WORKSPACE_SCOPE: &'static str = "bound_workspace";
+
+    pub fn weak_process_ownership(source_tool_call_id: Option<String>) -> Self {
+        Self {
+            reason: Self::WEAK_PROCESS_OWNERSHIP_REASON.to_string(),
+            scope: Self::BOUND_WORKSPACE_SCOPE.to_string(),
+            source_tool_call_id,
+        }
+    }
+
+    pub fn partial_workspace_mutation(source_tool_call_id: Option<String>) -> Self {
+        Self {
+            reason: Self::PARTIAL_MUTATION_REASON.to_string(),
+            scope: Self::BOUND_WORKSPACE_SCOPE.to_string(),
+            source_tool_call_id,
+        }
+    }
+
+    /// Check the closed protocol vocabulary before a checkpoint can affect
+    /// runtime safety state.  Unknown values are rejected rather than being
+    /// interpreted as a stronger or weaker policy by a newer binary.
+    pub fn is_valid(&self) -> bool {
+        matches!(
+            self.reason.as_str(),
+            Self::WEAK_PROCESS_OWNERSHIP_REASON | Self::PARTIAL_MUTATION_REASON
+        ) && self.scope == Self::BOUND_WORKSPACE_SCOPE
+            && self
+                .source_tool_call_id
+                .as_deref()
+                .is_none_or(|id| !id.trim().is_empty())
+    }
 }
 /// Summary of a completed delegation sub-run, stored in HeavyCheckpoint for recovery.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -876,6 +933,7 @@ impl StepCheckpoint {
             pipeline_state: None,
             compaction_state: None,
             config_version_id: None,
+            workspace_observation_quarantine: None,
         }))
     }
 
@@ -948,6 +1006,15 @@ impl StepCheckpoint {
         {
             return Err(ProtocolError::CheckpointCorrupt(
                 "Heavy checkpoint has no messages for non-Perceive phase".into(),
+            ));
+        }
+
+        if let Self::Heavy(h) = self
+            && let Some(quarantine) = h.workspace_observation_quarantine.as_ref()
+            && !quarantine.is_valid()
+        {
+            return Err(ProtocolError::CheckpointCorrupt(
+                "Heavy checkpoint contains an unknown workspace observation quarantine".into(),
             ));
         }
 
@@ -1428,6 +1495,9 @@ impl IdempotencyCache for InMemoryIdempotencyCache {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepEvent {
     pub event_id: String,
+    /// Server-owned execution identity for this event.  A persisted step
+    /// event is certifiable only when it is bound to the run that produced it.
+    pub run_id: String,
     /// Canonical UUID v7 shared across EventLog, TraceEvent DB, and StepRecorder.
     pub canonical_event_id: Option<String>,
     pub step_id: String,
@@ -2356,6 +2426,7 @@ mod tests {
             &mut store,
             StepEvent {
                 event_id: "e1".into(),
+                run_id: "test-run".into(),
                 canonical_event_id: None,
                 step_id: "s1".into(),
                 event_type: StepEventType::StepStarted,
@@ -2374,6 +2445,7 @@ mod tests {
         let mut store = FileBackedEventStore::empty(TEST_USER_ID, "test-events-for-step");
         let _ = store.append(StepEvent {
             event_id: "e1".into(),
+            run_id: "test-run".into(),
             canonical_event_id: None,
             step_id: "s1".into(),
             event_type: StepEventType::StepStarted,
@@ -2384,6 +2456,7 @@ mod tests {
         });
         let _ = store.append(StepEvent {
             event_id: "e2".into(),
+            run_id: "test-run".into(),
             canonical_event_id: None,
             step_id: "s2".into(),
             event_type: StepEventType::StepStarted,
@@ -2394,6 +2467,7 @@ mod tests {
         });
         let _ = store.append(StepEvent {
             event_id: "e3".into(),
+            run_id: "test-run".into(),
             canonical_event_id: None,
             step_id: "s1".into(),
             event_type: StepEventType::StepCompleted,
@@ -2414,6 +2488,7 @@ mod tests {
         let mut store = FileBackedEventStore::empty(TEST_USER_ID, "test-chain");
         let _ = store.append(StepEvent {
             event_id: "e1".into(),
+            run_id: "test-run".into(),
             canonical_event_id: None,
             step_id: "s1".into(),
             event_type: StepEventType::StepStarted,
@@ -2424,6 +2499,7 @@ mod tests {
         });
         let _ = store.append(StepEvent {
             event_id: "e2".into(),
+            run_id: "test-run".into(),
             canonical_event_id: None,
             step_id: "s1".into(),
             event_type: StepEventType::ToolCallStarted,
@@ -2434,6 +2510,7 @@ mod tests {
         });
         let _ = store.append(StepEvent {
             event_id: "e3".into(),
+            run_id: "test-run".into(),
             canonical_event_id: None,
             step_id: "s1".into(),
             event_type: StepEventType::ToolCallCompleted,
@@ -2458,6 +2535,7 @@ mod tests {
         let mut store = FileBackedEventStore::empty(TEST_USER_ID, "test-convergence");
         let _ = store.append(StepEvent {
             event_id: "start".into(),
+            run_id: "test-run".into(),
             canonical_event_id: None,
             step_id: "s1".into(),
             event_type: StepEventType::StepStarted,
@@ -2469,6 +2547,7 @@ mod tests {
         for (i, tool) in ["grep", "read_file", "git"].iter().enumerate() {
             let _ = store.append(StepEvent {
                 event_id: format!("tool_start_{i}"),
+                run_id: "test-run".into(),
                 canonical_event_id: None,
                 step_id: "s1".into(),
                 event_type: StepEventType::ToolCallStarted,
@@ -2481,6 +2560,7 @@ mod tests {
         for i in 0..3 {
             let _ = store.append(StepEvent {
                 event_id: format!("tool_done_{i}"),
+                run_id: "test-run".into(),
                 canonical_event_id: None,
                 step_id: "s1".into(),
                 event_type: StepEventType::ToolCallCompleted,
@@ -2492,6 +2572,7 @@ mod tests {
         }
         let _ = store.append(StepEvent {
             event_id: "converge".into(),
+            run_id: "test-run".into(),
             canonical_event_id: None,
             step_id: "s1".into(),
             event_type: StepEventType::ToolsConverged,
@@ -2911,6 +2992,7 @@ mod tests {
             compaction_state: None,
             pipeline_state: None,
             config_version_id: None,
+            workspace_observation_quarantine: None,
         }));
         let err = cp.validate().unwrap_err();
         assert!(matches!(err, ProtocolError::CheckpointCorrupt(_)));
@@ -2948,6 +3030,7 @@ mod tests {
             compaction_state: None,
             pipeline_state: None,
             config_version_id: None,
+            workspace_observation_quarantine: None,
         }));
         assert!(cp.validate().is_ok());
     }
@@ -2994,6 +3077,34 @@ mod tests {
         assert!(cp.validate().is_ok());
     }
 
+    #[test]
+    fn validate_rejects_unknown_workspace_observation_quarantine() {
+        let mut cp = StepCheckpoint::heavy(
+            "s-quarantine".into(),
+            "t-quarantine".into(),
+            "a-quarantine".into(),
+            ExecutionCursor::default(),
+        );
+        if let StepCheckpoint::Heavy(ref mut heavy) = cp {
+            heavy.workspace_observation_quarantine = Some(WorkspaceObservationQuarantineV1 {
+                reason: "future_reason".into(),
+                scope: "bound_workspace".into(),
+                source_tool_call_id: Some("call-1".into()),
+            });
+        }
+        let error = cp
+            .validate()
+            .expect_err("unknown quarantine must fail closed");
+        assert!(matches!(error, ProtocolError::CheckpointCorrupt(_)));
+    }
+
+    #[test]
+    fn workspace_observation_quarantine_constructor_has_closed_vocabulary() {
+        let quarantine =
+            WorkspaceObservationQuarantineV1::weak_process_ownership(Some("call-1".into()));
+        assert!(quarantine.is_valid());
+    }
+
     // ── Checkpoint Round-Trip ──
 
     #[test]
@@ -3024,6 +3135,11 @@ mod tests {
             h.budget_remaining_tokens = 2000;
             h.blocked_tools = vec!["bash".into()];
             h.activated_deferred_tool_names = vec!["github".into()];
+            h.workspace_observation_quarantine = Some(WorkspaceObservationQuarantineV1 {
+                reason: "weak_process_ownership".into(),
+                scope: "bound_workspace".into(),
+                source_tool_call_id: Some("call-1".into()),
+            });
         }
         let json = serde_json::to_string(&cp).unwrap();
         let restored: StepCheckpoint = serde_json::from_str(&json).unwrap();
@@ -3033,6 +3149,14 @@ mod tests {
             assert_eq!(h.budget_remaining_tokens, 2000);
             assert_eq!(h.blocked_tools, vec!["bash"]);
             assert_eq!(h.activated_deferred_tool_names, vec!["github"]);
+            assert_eq!(
+                h.workspace_observation_quarantine,
+                Some(WorkspaceObservationQuarantineV1 {
+                    reason: "weak_process_ownership".into(),
+                    scope: "bound_workspace".into(),
+                    source_tool_call_id: Some("call-1".into()),
+                })
+            );
         }
 
         let mut legacy_json = serde_json::to_value(&cp).unwrap();

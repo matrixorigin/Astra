@@ -1,0 +1,80 @@
+name: work_graph_user_steering
+description: |
+  **What**: A developer first asks Astra to prepare a small durable investigation without
+  starting execution, then changes scope in ordinary language.
+  **Tests**: Proactive Work establishment followed by passive user steering through the same
+  versioned task-graph contract.
+  **Why**: A task board is not useful if it is only an initial checklist or if a user correction
+  becomes untracked assistant prose. This journey proves that a newly added task and retired
+  work are an accepted canonical graph mutation.
+  **Pass means**: The initial investigation creates exactly one Work. A later user scope change
+  causes an accepted graph patch that adds declared work and retires the obsolete item without
+  asking for routine planning permission or creating a second Work.
+  **Fail means**: The assistant keeps a prose-only checklist, ignores the user change, hides it
+  behind a pending proposal, or erases task history instead of recording a retirement revision.
+prompt: |
+  I am preparing an evidence-based decision memo about whether the Session CLI distinguishes
+  closing from cancelling active work. Before any investigation begins, set up a small durable,
+  visible plan with two independently checkable tracks: the public command surface, then the
+  direct client/server route. Do not read or edit files, run tests, or begin the investigation
+  yet: I will redirect one track after I see the plan. Do not ask me to choose ordinary planning
+  details.
+steps:
+  - prompt: |
+      Change of scope: retire the earlier broad client/server-route track. Keep the same overall
+      question, but add one narrowly-scoped task that identifies the public cancellation
+      invocation and its exact endpoint. Keep the visible plan current, but do not begin the
+      investigation, read or edit files, or run tests. Give me a concise confirmation.
+models:
+  - deepseek-v4-flash
+capability: "custom:work_graph_user_steering"
+difficulty: 4
+weight: 3.0
+timeout_seconds: 120
+debug_log: true
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: start_work
+    min: 1
+    max: 1
+  - type: journal_tool_json
+    name: start_work
+    document: arguments
+    path: /activation
+    equals: defer
+  - type: journal_tool_json
+    name: start_work
+    document: result
+    path: /initial_task
+    equals: null
+  - type: journal_tool_json
+    name: start_work
+    document: result
+    path: /task_board_update/schema_version
+    equals: 1
+  - type: journal_tool_call_count
+    name: run_next_work_item
+    min: 0
+    max: 0
+  - type: journal_work_graph_patch
+    require_addition: true
+    require_retired_revision: true
+  - type: journal_tool_call_count
+    name: read_file
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: grep
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: ask_user
+    min: 0
+    max: 0
+  - type: all_of
+    criteria:
+      - type: pipeline_alert_count
+        rule: prompt_cache_break
+        max: 0

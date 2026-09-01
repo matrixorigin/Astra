@@ -1,0 +1,112 @@
+name: work_two_step_execution_journey
+description: |
+  **What**: Ask Astra for two independent, source-backed repository checks in ordinary
+  product language.
+  **Tests**: Natural Work establishment, live execution of both items, durable settlement,
+  and bounded model/tool churn without relying on task names or response prose.
+  **Why**: A task list that is only created or only visible after completion is not a usable
+  product. This is deliberately distinct from the planning-only journey: it fails unless
+  the same user turn establishes Work and carries both independently meaningful items to a
+  truthful terminal state.
+  **Pass means**: Semantic admission creates one two-item canonical Work graph before
+  primary execution, then the primary model executes and settles both items without asking
+  the user to make routine decomposition decisions.
+  **Fail means**: Astra returns a prose checklist, leaves a created item unfinished, creates
+  duplicate Work, or spins through excessive model/tool rounds.
+prompt: |
+  Before a release handoff, independently verify two things in this repository:
+  first, identify the CI command that runs the test suite; second, identify the local
+  developer command intended to run the corresponding check. Cite the source paths and
+  report the exact commands you find. Do the verification now and avoid asking me to
+  approve routine decomposition.
+models:
+  - deepseek-v4-flash
+capability: "custom:work_two_step_execution_journey"
+difficulty: 4
+weight: 3.0
+timeout_seconds: 180
+debug_log: true
+criteria:
+  - type: exit_code
+    code: 0
+  - type: tool_called
+    name: start_work
+  - type: journal_tool_call_count
+    name: start_work
+    min: 1
+    max: 1
+  # A durable two-item Work request has a single canonical execution carrier.
+  # Fanout is a different typed product mode; allowing it here would hide an
+  # admission race behind a superficially successful result.
+  - type: journal_tool_call_count
+    name: agent_fanout
+    min: 0
+    max: 0
+  - type: journal_tool_json
+    name: start_work
+    document: arguments
+    path: /activation
+    equals: start
+  - type: journal_tool_json
+    name: start_work
+    document: result
+    path: /initial_item_count
+    equals: 2
+  # The live board is a typed projection of the same server allocation.  Its
+  # receipt must be present before execution; prose or a post-hoc checklist is
+  # not a substitute for a usable task view.
+  - type: journal_tool_json
+    name: start_work
+    document: result
+    path: /task_board_update/schema_version
+    equals: 1
+  - type: journal_tool_sequence
+    tools:
+      - start_work
+      - settle_work_item
+      - settle_work_item
+  - type: journal_tool_call_count
+    name: settle_work_item
+    min: 2
+    max: 2
+  - type: journal_tool_call_count
+    name: settle_work_item
+    min: 2
+    max: 2
+    document: result
+    path: /task_board_update/schema_version
+    equals: 1
+  - type: journal_work_item_execution_from_start
+    min_distinct_items: 2
+  - type: journal_tool_call_count
+    name: ask_user
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: enter_plan_mode
+    min: 0
+    max: 0
+  - type: tools_count_between
+    min: 4
+    max: 16
+  - type: turn_rounds_between
+    min: 3
+    max: 10
+  - type: duration_between
+    min_ms: 0
+    max_ms: 120000
+  # Cache breaks are correctness-impacting for a long Work turn: they turn
+  # every subsequent boundary into a full prompt rebuild and inflate latency
+  # and token cost.  Do not use an absolute provider-dependent token ceiling.
+  - type: all_of
+    criteria:
+      - type: pipeline_alert_count
+        rule: prompt_cache_break
+        max: 0
+      - type: provider_prompt_cache_stable_prefix_reuse_ratio
+        min: 0.95
+        min_pairs: 1
+        max_identity_transitions_per_run: 1
+        # Each identity's first request is a typed cold boundary; only later
+        # requests within that same prefix epoch are scored. Legitimate
+        # runtime tool-surface changes are not assigned a fixed round number.

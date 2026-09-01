@@ -206,6 +206,36 @@ fn always_load_default_candidates_follow_tool_spec_load_policy() {
 }
 
 #[test]
+fn core_work_graph_authoring_is_stable_on_the_default_task_execution_surface() {
+    let surface = ToolSurface::build(catalog_schemas(), &ToolSurfaceConfig::default(), &[]);
+    let always_load: std::collections::BTreeSet<String> =
+        names(&surface.always_load_schemas()).into_iter().collect();
+    let deferred: std::collections::BTreeSet<&str> = surface
+        .deferred()
+        .iter()
+        .map(|entry| entry.name.as_str())
+        .collect();
+
+    for essential in ["start_work", "run_next_work_item", "settle_work_item"] {
+        assert!(
+            always_load.contains(essential),
+            "ordinary task execution must keep {essential} immediately callable"
+        );
+    }
+    for core in [
+        "inspect_work_plan",
+        "propose_work_plan",
+        "inspect_work_criteria",
+        "propose_work_criteria",
+    ] {
+        assert!(
+            always_load.contains(core) && !deferred.contains(core),
+            "durable Work graph authoring must stay available without discovery: {core}"
+        );
+    }
+}
+
+#[test]
 fn web_without_file_environment_provider_filters_workspace_executor_candidates() {
     let cfg = ToolSurfaceConfig::default();
     let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
@@ -651,40 +681,6 @@ fn deferred_entries_are_name_plus_short_desc_capped() {
             entry.short_desc.chars().count()
         );
     }
-}
-
-#[test]
-fn deferred_agent_summaries_keep_load_bearing_constraints() {
-    let cfg = ToolSurfaceConfig::default();
-    let surface = ToolSurface::build(catalog_schemas(), &cfg, &[]);
-
-    let deferred = surface
-        .deferred()
-        .iter()
-        .map(|entry| (entry.name.as_str(), entry.short_desc.as_str()))
-        .collect::<std::collections::HashMap<_, _>>();
-
-    let agent = deferred
-        .get("agent")
-        .expect("agent should be deferred by default");
-    assert!(
-        agent.contains("description+prompt")
-            && agent.contains("agent_id")
-            && agent.contains("foreground")
-            && agent.contains("run_chain"),
-        "agent deferred summary must keep spawn/get_result/run_chain constraints: {agent}"
-    );
-
-    let fanout = deferred
-        .get("agent_fanout")
-        .expect("agent_fanout should be deferred by default");
-    assert!(
-        fanout.contains("exactly that many slots")
-            && fanout.contains("description+prompt")
-            && fanout.contains("never embed diffs")
-            && fanout.contains("no brief/agents/background"),
-        "agent_fanout deferred summary must keep current count, slot-shape, and shared-workspace constraints: {fanout}"
-    );
 }
 
 #[test]

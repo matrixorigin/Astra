@@ -99,6 +99,8 @@ pub fn classify_tool_idempotency(tool_name: &str, args: Option<&Value>) -> ToolI
         | "session_history_page"
         | "session_history_search"
         | "session_history_around"
+        | "inspect_work_plan"
+        | "inspect_work_criteria"
         | "mo_query"
         | "get_agent_info"
         | "reflect"
@@ -118,7 +120,9 @@ pub fn classify_tool_idempotency(tool_name: &str, args: Option<&Value>) -> ToolI
         "ask_user" | "sleep" => ToolIdempotency::NonIdempotent,
 
         // Idempotent writes — overwrite semantics
-        "write_file" => ToolIdempotency::IdempotentWrite,
+        "write_file" | "start_work" | "propose_work_plan" | "propose_work_criteria" => {
+            ToolIdempotency::IdempotentWrite
+        }
 
         // Everything else: non-idempotent (safe default)
         _ => ToolIdempotency::NonIdempotent,

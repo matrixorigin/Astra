@@ -842,7 +842,7 @@ fn print_progress_event(event: &astra_runtime::orchestration::AgentProgressEvent
         ProgressEventType::Waiting { reason } => {
             format!("{} {}", "⏸ Waiting:".yellow(), reason)
         }
-        ProgressEventType::Cancelled { reason } => {
+        ProgressEventType::Cancelled { reason, .. } => {
             format!("{} {}", "⊘ Cancelled:".yellow(), reason)
         }
         ProgressEventType::PermissionDenied {
@@ -1174,7 +1174,7 @@ fn fanout_slot_status_label(status: AgentFanoutSlotStatus) -> &'static str {
         AgentFanoutSlotStatus::Interrupted => "interrupted",
         AgentFanoutSlotStatus::Failed => "failed",
         AgentFanoutSlotStatus::CancelledByUser => "stopped by user",
-        AgentFanoutSlotStatus::CancelledByParentBudget => "cancelled by parent budget",
+        AgentFanoutSlotStatus::CancelledByRuntime => "cancelled by runtime",
         AgentFanoutSlotStatus::TimedOut => "timed out",
     }
 }
@@ -2041,6 +2041,7 @@ mod tests {
 
     #[test]
     fn load_recent_delegations_collects_summary_and_subruns() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("slash-agent-test-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
         writer
@@ -2127,6 +2128,7 @@ mod tests {
 
     #[test]
     fn load_delegation_events_filters_matching_delegation() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("slash-agent-logs-test-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
         writer
@@ -2162,7 +2164,7 @@ mod tests {
             ))
             .unwrap();
 
-        let (delegation_id, events) = load_delegation_events(Some(&sid), "del-log")
+        let (delegation_id, events) = load_delegation_events(Some(&sid), "del-logs")
             .unwrap()
             .unwrap();
         assert_eq!(delegation_id, "del-logs");
@@ -2172,6 +2174,7 @@ mod tests {
 
     #[test]
     fn load_recent_delegations_includes_running_subruns() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let sid = format!("slash-agent-running-test-{}", uuid::Uuid::new_v4());
         let writer = session_journal::JournalWriter::new(&sid).unwrap();
         writer
@@ -2349,7 +2352,7 @@ mod tests {
     }
 
     #[test]
-    fn build_watch_snapshot_with_fanout_names_parent_budget_cancellation() {
+    fn build_watch_snapshot_with_fanout_names_runtime_cancellation() {
         let mut group = AgentFanoutGroupProjection::new("review-1", "review fanout", 2);
         group
             .set_slot_request(0, Some("auth".to_string()), "auth", "review auth flow")
@@ -2358,17 +2361,14 @@ mod tests {
         group
             .record_terminal_by_agent(
                 "auth@run-1",
-                AgentFanoutSlotStatus::CancelledByParentBudget,
+                AgentFanoutSlotStatus::CancelledByRuntime,
                 Some("turn budget exhausted".to_string()),
             )
             .unwrap();
 
         let snapshot = build_watch_snapshot_with_fanout(&[], &[group], &[]);
 
-        assert!(
-            snapshot.contains("cancelled by parent budget"),
-            "{snapshot}"
-        );
+        assert!(snapshot.contains("cancelled by runtime"), "{snapshot}");
         assert!(!snapshot.contains("cancelled by budget"), "{snapshot}");
     }
 
@@ -2590,6 +2590,7 @@ mod tests {
             spawn_tool_call_id: None,
             execution_metadata: None,
             delegation_chain: Vec::new(),
+            workspace_mutation: Default::default(),
         };
         let input = SpawnAgentInput {
             description: "watch test agent".to_string(),
@@ -2628,12 +2629,16 @@ mod tests {
 
     #[tokio::test]
     async fn wait_for_watch_snapshot_change_detects_journal_updates() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let journal_dir = session_journal::current_journal_dir_override()
+            .expect("isolated journal directory must be installed");
         let sid = format!("slash-agent-watch-test-{}", uuid::Uuid::new_v4());
         let last_snapshot = build_watch_snapshot(&[], &[]);
         let mut rx = None;
         let sid_for_writer = sid.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            let _writer_guard = session_journal::JournalDirGuard::new(journal_dir);
             let writer = session_journal::JournalWriter::new(&sid_for_writer).unwrap();
             writer
                 .append(&JournalEvent::delegation_started(

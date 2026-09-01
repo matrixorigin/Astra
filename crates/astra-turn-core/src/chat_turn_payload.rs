@@ -89,6 +89,37 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
     payload
 }
 
+/// Attach the producer-owned identity for one bridge turn as an atomic tuple.
+///
+/// The server deliberately rejects partial identity. Keeping that invariant at
+/// the shared payload boundary prevents alternate hosts from forwarding a
+/// chain id without the matching turn number or user-query event id.
+#[must_use]
+pub fn attach_bridge_turn_identity(
+    payload: &mut Value,
+    session_turn: u32,
+    turn_chain_id: Option<&str>,
+    user_query_event_id: Option<&str>,
+) -> bool {
+    let Some(turn_chain_id) = turn_chain_id.filter(|value| {
+        !value.is_empty() && value.trim() == *value && !value.chars().any(char::is_control)
+    }) else {
+        return false;
+    };
+    let Some(user_query_event_id) = user_query_event_id.filter(|value| {
+        !value.is_empty() && value.trim() == *value && !value.chars().any(char::is_control)
+    }) else {
+        return false;
+    };
+    let Some(root) = payload.as_object_mut().filter(|_| session_turn > 0) else {
+        return false;
+    };
+    root.insert("session_turn".into(), json!(session_turn));
+    root.insert("turn_chain_id".into(), json!(turn_chain_id));
+    root.insert("user_query_event_id".into(), json!(user_query_event_id));
+    true
+}
+
 /// Project producer-owned system skill identities into `edge_profile.active_skills`.
 pub fn merge_active_skills_into_edge_profile(payload: &mut Value, active_skills: &[String]) {
     if active_skills.is_empty() {
@@ -288,6 +319,36 @@ mod tests {
         assert_eq!(p["agent_id"], Value::Null);
         assert_eq!(p["interaction_mode"], Value::Null);
         assert_eq!(p["explain"], json!("verbose"));
+    }
+
+    #[test]
+    fn bridge_turn_identity_is_attached_only_as_a_complete_tuple() {
+        let mut complete = json!({});
+        assert!(attach_bridge_turn_identity(
+            &mut complete,
+            1,
+            Some("child-run"),
+            Some("child-query")
+        ));
+        assert_eq!(complete["session_turn"], 1);
+        assert_eq!(complete["turn_chain_id"], "child-run");
+        assert_eq!(complete["user_query_event_id"], "child-query");
+
+        for (turn, chain, query) in [
+            (0, Some("child-run"), Some("child-query")),
+            (1, None, Some("child-query")),
+            (1, Some("child-run"), None),
+            (1, Some(" child-run"), Some("child-query")),
+        ] {
+            let mut incomplete = json!({"stable": true});
+            assert!(!attach_bridge_turn_identity(
+                &mut incomplete,
+                turn,
+                chain,
+                query
+            ));
+            assert_eq!(incomplete, json!({"stable": true}));
+        }
     }
 
     #[test]

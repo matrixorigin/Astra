@@ -22,6 +22,7 @@ pub mod web_search;
 
 pub mod bash_cache_safety;
 pub mod build_test;
+pub mod credential_redaction;
 // run_script is the programmatic tool-calling / code execution RPC bridge.
 // It uses Unix domain sockets for the script↔host RPC channel. Windows
 // would need named pipes — deferred. Gate the modules so the crate still
@@ -42,25 +43,25 @@ pub mod internal_artifacts;
 pub mod memory_tool_contract;
 pub mod passive_cargo_check;
 pub mod passive_tsc_check;
+pub mod patch_materialization;
 pub mod relevance_score;
 #[cfg(unix)]
 pub mod rpc_bridge;
 #[cfg(unix)]
 pub mod run_script;
 pub mod shell_ops;
-pub mod task_mgmt;
-pub mod task_mgmt_matrixone;
-pub mod task_tool_contract;
+pub mod source_preimage;
 pub mod tool_engine;
 pub mod tool_result_status;
 pub mod tool_search;
+pub mod workspace_observation;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
 pub use ask_user::{
@@ -139,6 +140,72 @@ impl ToolResult {
         self
     }
 
+    /// Mark a structured writer result only after its owner has committed
+    /// different bytes. This is an execution fact, not a success-message
+    /// heuristic; consumers still require fresh post-mutation verification.
+    pub fn with_workspace_mutation_applied(mut self) -> Self {
+        self.metadata
+            .get_or_insert_with(Map::new)
+            .insert("workspace_mutation_applied".to_string(), Value::Bool(true));
+        self
+    }
+
+    /// Mark the owner-side result of a complete-state writer whose exact
+    /// requested target was already present.  This marker is intentionally
+    /// local to the executor; the workspace-owning boundary must bind it to a
+    /// normalized target before it becomes a portable live receipt.
+    pub fn with_workspace_desired_state_converged(
+        mut self,
+        requested_state: workspace_observation::WorkspaceFileStateIdentity,
+        desired_state: workspace_observation::WorkspaceFileStateIdentity,
+    ) -> Self {
+        self.metadata.get_or_insert_with(Map::new).insert(
+            workspace_observation::DESIRED_STATE_CONVERGED_FIELD.to_string(),
+            workspace_observation::workspace_desired_state_convergence_marker(
+                &requested_state,
+                &desired_state,
+            ),
+        );
+        self
+    }
+
+    /// Report that a multi-target mutation committed some targets before a
+    /// later target failed. This is deliberately distinct from `applied`:
+    /// callers must quarantine/re-observe the workspace rather than treating
+    /// the failed result as a completed write.
+    pub fn with_workspace_mutation_partial(mut self, paths: Vec<String>) -> Self {
+        let metadata = self.metadata.get_or_insert_with(Map::new);
+        metadata.insert("workspace_mutation_partial".to_string(), Value::Bool(true));
+        metadata.insert(
+            "workspace_mutation_partial_paths".to_string(),
+            Value::Array(paths.iter().cloned().map(Value::String).collect()),
+        );
+        // A partial commit is a quarantine fact only when it came from the
+        // owner-side typed multi-path writer.  Keep the provenance beside the
+        // legacy boolean so remote/runtime consumers can reject lookalike
+        // metadata from MCP or arbitrary tools.
+        metadata.insert(
+            workspace_observation::OBSERVED_FIELD.to_string(),
+            Value::Bool(true),
+        );
+        metadata.insert(
+            workspace_observation::SCOPE_FIELD.to_string(),
+            Value::String(workspace_observation::BOUND_WORKSPACE_SCOPE.to_string()),
+        );
+        metadata.insert(
+            workspace_observation::RECEIPT_FIELD.to_string(),
+            serde_json::json!({
+                "schema": "workspace_mutation_partial_receipt.v1",
+                "source": "typed_multi_path_writer",
+                "scope": workspace_observation::BOUND_WORKSPACE_SCOPE,
+                "changed": true,
+                "ownership": "typed_multi_path_writer",
+                "paths": paths,
+            }),
+        );
+        self
+    }
+
     /// Attach output-aware command result classification for downstream trace/harness use.
     pub fn with_result_class(mut self, result_class: exit_semantics::CommandResultClass) -> Self {
         let metadata = self.metadata.get_or_insert_with(serde_json::Map::new);
@@ -157,6 +224,49 @@ impl ToolResult {
             Value::Number(serde_json::Number::from(exit_code)),
         );
         self
+    }
+}
+
+/// Stable model-facing result for cooperative tool cancellation.
+///
+/// Cancellation is a terminal control outcome, not an unclassified tool
+/// failure. Keep the envelope in the shared tools crate so CLI, edge, and
+/// server-local executors cannot drift into different plain-text contracts.
+pub const TOOL_ERROR_KIND_CANCELLED: &str = "cancelled";
+
+pub fn cancelled_tool_result(name: &str, execution_started: bool) -> ToolResult {
+    let message = if execution_started {
+        format!("Tool '{name}' cancelled before completion")
+    } else {
+        format!("Tool '{name}' not executed: run was cancelled")
+    };
+    ToolResult {
+        output: json!({
+            "status": "cancelled",
+            "error_kind": TOOL_ERROR_KIND_CANCELLED,
+            "error": message,
+            "retryable": false,
+            "next_action": "stop_or_resume_parent_turn",
+        })
+        .to_string(),
+        metadata: Some(Map::from_iter([
+            (
+                "status".to_string(),
+                Value::String(TOOL_ERROR_KIND_CANCELLED.to_string()),
+            ),
+            (
+                "error_kind".to_string(),
+                Value::String(TOOL_ERROR_KIND_CANCELLED.to_string()),
+            ),
+            (
+                "reason".to_string(),
+                Value::String(TOOL_ERROR_KIND_CANCELLED.to_string()),
+            ),
+            ("cancelled".to_string(), Value::Bool(true)),
+            ("retryable".to_string(), Value::Bool(false)),
+        ])),
+        is_error: true,
+        exit_semantics: Some(exit_semantics::ExitSemantics::ExecutionError),
     }
 }
 
@@ -182,7 +292,7 @@ pub trait ToolExecutor: Send + Sync {
         };
         tokio::select! {
             _ = cancel_token.cancelled() => {
-                ToolResult::error(format!("Tool '{name}' cancelled before completion"))
+                cancelled_tool_result(name, true)
             }
             result = self.execute(name, args) => result,
         }
@@ -193,6 +303,14 @@ pub trait ToolExecutor: Send + Sync {
 
     /// The root directory for file operations and path resolution.
     fn project_root(&self) -> &Path;
+
+    /// The workspace root whose mutations belong to the current invocation.
+    /// Most executors use the project root, but a server/edge binding may
+    /// expose a project container while executing inside a narrower session
+    /// workspace.  Observation and completion receipts must use the latter.
+    fn workspace_root(&self) -> &Path {
+        self.project_root()
+    }
 
     /// Execute a tool and return extended metadata (e.g., rollback journal entries).
     /// Default implementation delegates to `execute()`.
@@ -620,18 +738,12 @@ pub const AGGREGATE_HINT_THRESHOLD: usize = AGGREGATE_SOFT_LIMIT / 2;
 
 /// Truncate tool output to `max_bytes`, cutting at a newline boundary when
 /// possible to avoid mid-line cuts that confuse the LLM.
-pub fn truncate_output(mut output: String, max_bytes: usize) -> String {
-    if output.len() > max_bytes {
-        let end = output.floor_char_boundary(max_bytes);
-        let cut = output[..end]
-            .rfind('\n')
-            .filter(|&pos| pos > end / 2)
-            .map(|pos| pos + 1)
-            .unwrap_or(end);
-        output.truncate(cut);
-        output.push_str("\n[truncated]");
-    }
-    output
+pub fn truncate_output(output: String, max_bytes: usize) -> String {
+    // This is the generic tool-output boundary used by search/git helpers.
+    // They do not prove ownership of a source file, so they may preserve an
+    // existing owner-issued marker but must not mint a new edit capability.
+    let output = credential_redaction::redact_credentials_for_display(&output).0;
+    credential_redaction::truncate_redacted_output(output, max_bytes)
 }
 
 /// Normalize empty/whitespace-only tool output to a short marker.

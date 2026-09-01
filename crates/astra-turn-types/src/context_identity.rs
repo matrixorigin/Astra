@@ -182,6 +182,16 @@ pub struct PromptCacheIdentityV1 {
 }
 
 impl PromptCacheIdentityV1 {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        Self::from_hashes(
+            self.stable_system_prefix_hash.clone(),
+            self.stable_tool_prefix_hash.clone(),
+            self.cache_layout.clone(),
+        )
+        .is_ok_and(|rebuilt| rebuilt == *self)
+    }
+
     pub fn from_prefixes(
         stable_system_prefix: &[Value],
         stable_tool_prefix: &[Value],
@@ -518,6 +528,7 @@ mod tests {
             "explicit-v1",
         )
         .unwrap();
+        assert!(baseline.is_valid());
         let tool_change = PromptCacheIdentityV1::from_prefixes(
             &[json!({"text":"system-a"})],
             &[json!({"name":"tool-b"})],
@@ -531,6 +542,9 @@ mod tests {
         let mut forged = serde_json::to_value(&baseline).unwrap();
         forged["content_id"] = json!(format!("sha256:{:064x}", 1));
         assert!(serde_json::from_value::<PromptCacheIdentityV1>(forged).is_err());
+        let mut forged_struct = baseline;
+        forged_struct.content_id = format!("sha256:{:064x}", 1);
+        assert!(!forged_struct.is_valid());
     }
 
     #[test]

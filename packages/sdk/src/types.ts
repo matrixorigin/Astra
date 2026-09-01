@@ -3,6 +3,9 @@
 
 export type StreamEventType =
   | "session_info"
+  | "work_turn_started"
+  | "work_task_graph_changed"
+  | "context_meta"
   | "run_started"
   | "run_paused"
   | "run_resumed"
@@ -63,6 +66,33 @@ export type SessionInfoEvent = {
   type: "session_info";
   session_id: string;
   run_id?: string;
+};
+
+export type WorkTurnStartedEventV1 = {
+  type: "work_turn_started";
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  run_id: string;
+};
+
+/** Canonical Task Graph invalidation emitted only after a graph revision has
+ * committed. Consumers re-read that revision instead of applying tool prose. */
+export type WorkTaskGraphChangedEventV1 = {
+  type: "work_task_graph_changed";
+  schema_version: 1;
+  graph_revision: number;
+  branch_revision: number;
+};
+
+/** Runtime context accounting. Detailed values are versioned trace payloads;
+ * consumers may retain them as evidence but must not infer lifecycle state. */
+export type ContextMetaEvent = {
+  type: "context_meta";
+  system_prompt_tokens?: number;
+  system_prompt_breakdown?: unknown;
+  context_manifest_trace?: unknown;
+  compactions?: unknown[];
 };
 
 export type RunStartedEvent = {
@@ -231,7 +261,10 @@ export type ToolCallEvent = {
 export type ToolCallEndEvent = {
   type: "tool_call_end";
   call_id: string;
-  result?: string;
+  tool?: string;
+  arguments?: unknown;
+  result?: unknown;
+  status?: string;
   success?: boolean;
   duration_ms?: number;
   error_kind?: string;
@@ -243,6 +276,8 @@ export type UsageEvent = {
   type: "usage";
   prompt_tokens: number;
   completion_tokens: number;
+  /** `run_total` is an authoritative terminal aggregate and replaces live deltas. */
+  usage_scope?: "request" | "run_total" | string;
   cache_creation_tokens?: number;
   cache_read_tokens?: number;
   // Also accept alternative field names from backend
@@ -264,6 +299,9 @@ export type StreamErrorEvent = {
   message: string;
   retryable?: boolean;
   retry_after_ms?: number;
+  http_status?: number;
+  category?: string;
+  action_hints?: string[];
 };
 
 export type WarningEvent = {
@@ -618,6 +656,9 @@ export type ToolExecutionCompletedEvent = {
 
 export type StreamEvent = (
   | SessionInfoEvent
+  | WorkTurnStartedEventV1
+  | WorkTaskGraphChangedEventV1
+  | ContextMetaEvent
   | RunStartedEvent
   | RunPausedEvent
   | RunResumedEvent
@@ -672,6 +713,13 @@ export type StreamEvent = (
   | ToolOutputDeltaEvent
   | ToolExecutionCompletedEvent
 ) & { index?: number };
+
+/** Events emitted by the Work-first continuation stream. Structural session
+ * identity is deliberately unrepresentable on this public surface. */
+export type WorkTurnStreamEvent =
+  | WorkTurnStartedEventV1
+  | WorkTaskGraphChangedEventV1
+  | (StreamEvent & { session_id?: never });
 
 export type ConnectionState =
   "disconnected" | "connecting" | "connected" | "error";
@@ -839,10 +887,14 @@ export type SSEClientOptions = {
   onEvent: (event: StreamEvent) => void;
   onStateChange?: (state: ConnectionState) => void;
   onRawLine?: (line: string) => void;
+  /** Optional typed decoder for non-2xx responses before an SSE stream starts. */
+  decodeHttpError?: (response: Response) => Promise<StreamEvent>;
   maxRetries?: number;
   retryDelayMs?: number;
   /** Abort the stream when no SSE event arrives within this window. Defaults to disabled. */
   heartbeatTimeoutMs?: number;
+  /** Require a protocol terminal before EOF is treated as a completed stream. */
+  requireTerminalEvent?: boolean;
   signal?: AbortSignal;
   /** HTTP method. Defaults to 'GET'. Use 'POST' for streaming chat endpoints. */
   method?: "GET" | "POST";
@@ -852,11 +904,20 @@ export type SSEClientOptions = {
 
 // ─── API Types ─────────────────────────────────────────────────────
 
+export type WorkBinding = {
+  /** Canonical user-visible Work identity. */
+  workId: string;
+  /** Exact Work branch owned by the current session. */
+  branchId: string;
+};
+
 export type ChatRequest = {
   message: string;
   parts?: unknown[];
   attachments?: unknown[];
   sessionId?: string;
+  /** Enables typed Work planning only after the server validates owner/session/branch coherence. */
+  workBinding?: WorkBinding;
   agentId?: string;
   modelSelection: {
     offeringId: string;
@@ -1127,7 +1188,19 @@ export type RuntimeModelListItem = {
   thinking_capability: "both" | "effort_only" | "native_only" | "none" | null;
 };
 
-export type RuntimeModelListResponse = RuntimeModelListItem[];
+export type RuntimeModelCatalogCursor = {
+  provider: string;
+  model_name: string;
+  model_id: string;
+};
+
+export type RuntimeModelListPageResponse = {
+  items: RuntimeModelListItem[];
+  next_cursor: RuntimeModelCatalogCursor | null;
+  limit: number;
+  total: number;
+  catalog_revision: string;
+};
 
 export type RuntimeModelAccessStatus =
   | "setting_up"
@@ -1190,6 +1263,9 @@ export type RuntimeModelAccessProjection = {
   offerings: RuntimeModelListItem[];
   default_offering_id: string | null;
   default_resolution?: RuntimeModelDefaultResolution;
+  next_cursor: RuntimeModelCatalogCursor | null;
+  limit: number;
+  total: number;
   catalog_revision: string;
   observed_at: string;
 };
@@ -1232,6 +1308,17 @@ export type UserInfo = {
   username: string;
   email: string;
   display_name?: string | null;
+};
+
+export type ReauthenticationPurpose =
+  | "device_trust"
+  | "device_reenroll"
+  | "session_forced_takeover";
+
+export type ReauthenticationProof = {
+  proof: string;
+  purpose: ReauthenticationPurpose;
+  expires_in: number;
 };
 
 // ─── Memory Types ──────────────────────────────────────────────────
@@ -1555,4 +1642,1124 @@ export type EdgeHeartbeatRequestBody = {
 export type TaskLeaseMutationRequestBody = {
   edge_agent_id: string;
   ttl_sec?: number;
+};
+
+// ─── Work-first public contract ────────────────────────────────────
+
+export type WorkCreateCriterion =
+  | {
+      criterionId: string;
+      kind: "command_check";
+      statement: string;
+      command: string;
+    }
+  | {
+      criterionId: string;
+      kind: "test_check";
+      statement: string;
+      command: string;
+    }
+  | {
+      criterionId: string;
+      kind: "human_review";
+      statement: string;
+    };
+
+export type WorkCreateInput = {
+  /** Stable identity for one logical Start Work action and its exact retries. */
+  requestId: string;
+  goal: string;
+  /** Explicit Done-when criteria; use [] when the user has not accepted any. */
+  criteria: readonly WorkCreateCriterion[];
+};
+
+export type WorkTurnInput = {
+  /** Stable identity for one logical branch continuation and exact retries. */
+  requestId: string;
+  /** Durable read attachment that may claim idle conversation control. */
+  attachmentId: string;
+  message: string;
+};
+
+export type WorkContentHash = `sha256:${string}`;
+export type WorkRetentionState = "active" | "archived";
+export type WorkRevisionAlignment = "current" | "behind";
+export type WorkObservationScope = "declared_work";
+export type WorkObservationSourceKind =
+  | "work"
+  | "goal"
+  | "criterion_set"
+  | "delivery_branch"
+  | "graph"
+  | "work_events";
+
+export type WorkObservationCursorV1 = {
+  work_revision: number;
+  goal_revision: number;
+  criteria_set_revision: number;
+  delivery_branch_revision: number;
+  graph_revision: number;
+  event_head: number;
+};
+
+export type WorkObservationSourceRevisionV1 =
+  | { source: "work"; revision: number }
+  | { source: "goal"; revision: number }
+  | {
+      source: "criterion_set";
+      revision: number;
+      content_hash: WorkContentHash;
+    }
+  | { source: "delivery_branch"; revision: number }
+  | {
+      source: "graph";
+      revision: number;
+      content_hash: WorkContentHash;
+    }
+  | { source: "work_events"; event_head: number };
+
+export type WorkObservationCoverageGapV1 = {
+  source: WorkObservationSourceKind;
+  reason: "source_unavailable_at_causal_cut";
+};
+
+export type WorkObservationCoherenceV1 = "coherent";
+
+export type WorkObservationFactCodeV1 =
+  | "criteria_not_accepted"
+  | "branch_basis_out_of_date"
+  | "subject_unavailable"
+  | "verification_required"
+  | "ready_for_review";
+
+export type WorkObservationCauseCodeV1 =
+  | "accepted_criteria_empty"
+  | "branch_basis_stale"
+  | "current_subject_missing"
+  | "current_evidence_incomplete"
+  | "current_evidence_complete";
+
+export type WorkObservationFindingV1 = {
+  fact_code: WorkObservationFactCodeV1;
+  cause_code: WorkObservationCauseCodeV1;
+};
+
+export type WorkObservationSatisfactionEvidenceRefV1 =
+  | {
+      kind: "check_run";
+      criterion: { criterion_id: string; revision: number };
+      check_run_id: string;
+      payload_hash: WorkContentHash;
+    }
+  | {
+      kind: "acceptance_decision";
+      criterion: { criterion_id: string; revision: number };
+      decision_id: string;
+      payload_hash: WorkContentHash;
+    };
+
+export type WorkGoalOverviewV1 = {
+  revision: number;
+  goal: string;
+};
+
+export type WorkCriteriaSummaryV1 = {
+  revision: number;
+  member_count: number;
+  manifest_hash: WorkContentHash;
+};
+
+export type WorkBranchOverviewV1 = {
+  work_id: string;
+  branch_id: string;
+  branch_revision: number;
+  origin_branch_id: string | null;
+  fork_cursor: string | null;
+  goal_revision_ref: number;
+  goal_alignment: WorkRevisionAlignment;
+  criteria_set_revision_ref: number;
+  criteria_alignment: WorkRevisionAlignment;
+  basis_graph_revision: number;
+  current_graph_revision: number;
+  retention_state: WorkRetentionState;
+  created_at: string;
+  archived_at: string | null;
+};
+
+export type WorkGraphSummaryV1 = {
+  revision: number;
+  item_count: number;
+  edge_count: number;
+  manifest_hash: WorkContentHash;
+};
+
+export type WorkDeliveryStatusV1 =
+  | "criteria_not_accepted"
+  | "branch_basis_out_of_date"
+  | "subject_unavailable"
+  | "verification_required"
+  | "ready_for_review";
+
+export type WorkDeliverySummaryV1 = {
+  status: WorkDeliveryStatusV1;
+  required_criterion_count: number;
+  satisfied_criterion_count: number;
+  fresh_check_count: number;
+  accepted_gap_count: number;
+  remaining_criterion_count: number;
+  subject_revision: WorkContentHash | null;
+  freshness_valid_until: string | null;
+};
+
+export type WorkOverviewV1 = {
+  work_id: string;
+  work_revision: number;
+  project_id: string | null;
+  original_intent_ref: string;
+  goal: WorkGoalOverviewV1;
+  criteria: WorkCriteriaSummaryV1;
+  delivery_branch: WorkBranchOverviewV1;
+  graph: WorkGraphSummaryV1;
+  delivery: WorkDeliverySummaryV1;
+  event_head: number;
+  retention_state: WorkRetentionState;
+  created_at: string;
+  archived_at: string | null;
+};
+
+export type WorkObservationReportV1 = {
+  schema_version: 1;
+  report_id: `work-observation:${string}`;
+  content_hash: WorkContentHash;
+  scope: WorkObservationScope;
+  as_of: WorkObservationCursorV1;
+  source_revisions: WorkObservationSourceRevisionV1[];
+  coherence: WorkObservationCoherenceV1;
+  coverage_gaps: WorkObservationCoverageGapV1[];
+  finding: WorkObservationFindingV1;
+  satisfaction_evidence_refs: WorkObservationSatisfactionEvidenceRefV1[];
+  overview: WorkOverviewV1;
+};
+
+export type WorkCatalogAttentionV1 = "needs_review" | "updated" | "none";
+export type WorkBranchActivityV1 = "working" | "waiting" | "paused" | "idle";
+
+export type WorkCatalogCursorV1 = {
+  created_at: string;
+  work_id: string;
+};
+
+export type WorkCatalogEntryV1 = {
+  work_id: string;
+  goal: string;
+  work_revision: number;
+  delivery_branch_id: string;
+  delivery_branch_revision: number;
+  graph_revision: number;
+  graph_item_count: number;
+  pending_decision_count: number;
+  event_head: number;
+  seen_through_event_seq: number | null;
+  unseen_event_count: number;
+  attention: WorkCatalogAttentionV1;
+  delivery_branch_activity: WorkBranchActivityV1;
+  created_at: string;
+  last_activity_at: string;
+};
+
+export type WorkCatalogPageV1 = {
+  schema_version: 1;
+  entries: WorkCatalogEntryV1[];
+  next_cursor: WorkCatalogCursorV1 | null;
+};
+
+export type WorkConversationHeadV1 = {
+  completed_turn: number;
+  journal_event_seq: number;
+  conversation_seq: number;
+  canonical_root_hash: string;
+  projection_schema: number;
+  compaction_generation: number;
+  config_version_id: string | null;
+};
+
+export type WorkBranchSyncStateV1 =
+  | "current"
+  | "projection_stale"
+  | "degraded"
+  | "corrupt"
+  | "offline";
+
+export type WorkTranscriptItemV1 = {
+  item_seq: number;
+  committed_turn: number;
+  role: string;
+  content: string;
+  content_truncated: boolean;
+  payload: unknown | null;
+  payload_omitted: boolean;
+  content_hash: string;
+  created_at: string;
+};
+
+export type WorkTranscriptPageV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  sync: WorkBranchSyncStateV1;
+  canonical_head: WorkConversationHeadV1 | null;
+  transcript_cursor: WorkConversationHeadV1 | null;
+  items: WorkTranscriptItemV1[];
+  next_before_item_seq: number | null;
+  has_more: boolean;
+};
+
+export type WorkBranchAttachmentV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  attachment_id: string;
+  attachment_epoch: number;
+  branch_revision: number;
+  mode: "read_only" | "controller";
+  sync: "current";
+  control_basis: WorkBranchControlBasisV1;
+  head: WorkConversationHeadV1 | null;
+  attached_at: string;
+  expires_at: string;
+};
+
+export type WorkBranchControlBasisV1 = {
+  writer_epoch: number;
+  canonical_root_hash: string | null;
+};
+
+export type WorkBranchControlCommand =
+  | { kind: "acquire_branch_control"; attachmentId: string }
+  | { kind: "force_takeover"; attachmentId: string; reauthenticationProof: string }
+  | { kind: "release_branch_control"; attachmentId: string };
+
+export type WorkBranchControlOperationV2 = {
+  schema_version: 2;
+  operation_id: string;
+  work_id: string;
+  branch_id: string;
+  attachment_id: string;
+  kind: "acquire_branch_control" | "force_takeover" | "release_branch_control";
+  state: "pending" | "aborted" | "succeeded" | "conflict";
+  outcome:
+    | "pending"
+    | "aborted"
+    | "acquired"
+    | "already_controlled"
+    | "taken_over"
+    | "released"
+    | "already_released"
+    | "writer_conflict"
+    | "branch_revision_conflict"
+    | "head_conflict";
+  branch_revision: number;
+  control_basis: WorkBranchControlBasisV1 | null;
+  progress?: {
+    phase: "awaiting_reauthentication" | "preparing" | "fencing" | "sealing_effects" | "activating";
+    abortable: boolean;
+  };
+  created_at: string;
+  completed_at: string | null;
+};
+
+export type WorkBranchCreationInputV1 = {
+  requestId: string;
+  expectedBranchRevision: number;
+  committedCursor: WorkConversationHeadV1;
+};
+
+export type WorkBranchCreationOperationV1 = {
+  schema_version: 1;
+  operation_id: string;
+  work_id: string;
+  origin_branch_id: string;
+  child_branch_id: string;
+  fork_cursor: WorkContentHash;
+  state: "pending" | "aborted" | "succeeded" | "conflict";
+  outcome:
+    | "pending"
+    | "aborted"
+    | "created"
+    | "branch_revision_conflict"
+    | "cursor_conflict"
+    | "capacity_exceeded";
+  origin_branch_revision: number;
+  created_at: string;
+  completed_at: string | null;
+};
+
+export type WorkBranchDeletionInputV1 = {
+  requestId: string;
+  expectedWorkRevision: number;
+  expectedBranchRevision: number;
+};
+
+export type WorkBranchDeletionOperationV1 = {
+  schema_version: 1;
+  operation_id: string;
+  work_id: string;
+  branch_id: string;
+  state: "pending" | "succeeded" | "conflict";
+  phase: "fence" | "session_cleanup" | "lineage_gc" | "branch_cleanup" | "complete";
+  outcome:
+    | "pending"
+    | "deleted"
+    | "delivery_branch_protected"
+    | "work_revision_conflict"
+    | "branch_revision_conflict";
+  work_revision: number;
+  branch_revision: number;
+  created_at: string;
+  completed_at: string | null;
+};
+
+export type WorkBranchCatalogEntryV1 = {
+  branch_id: string;
+  branch_revision: number;
+  is_delivery: boolean;
+  origin_branch_id: string | null;
+  fork_cursor: WorkContentHash | null;
+  goal_revision_ref: number;
+  criteria_set_revision_ref: number;
+  basis_graph_revision: number;
+  current_graph_revision: number;
+  materialization: WorkBranchDimensionSummaryV1[] | null;
+  created_at: string;
+};
+
+export type WorkBranchDimensionV1 =
+  | "conversation"
+  | "goal"
+  | "criteria"
+  | "task_graph"
+  | "checkpoint"
+  | "workspace"
+  | "artifacts"
+  | "transient_authority";
+
+export type WorkBranchDimensionDispositionV1 =
+  | "shared"
+  | "copied"
+  | "rebased"
+  | "excluded"
+  | "gap";
+
+export type WorkBranchDimensionSummaryV1 = {
+  dimension: WorkBranchDimensionV1;
+  disposition: WorkBranchDimensionDispositionV1;
+};
+
+export type WorkBranchCatalogV1 = {
+  schema_version: 1;
+  work_id: string;
+  work_revision: number;
+  delivery_branch_id: string;
+  branches: WorkBranchCatalogEntryV1[];
+};
+
+export type WorkArchivedBranchCursorV1 = {
+  archived_at: string;
+  branch_id: string;
+};
+
+export type WorkArchivedBranchEntryV1 = {
+  branch_id: string;
+  branch_revision: number;
+  origin_branch_id: string | null;
+  archived_at: string;
+  created_at: string;
+};
+
+export type WorkArchivedBranchPageV1 = {
+  schema_version: 1;
+  work_id: string;
+  work_revision: number;
+  branches: WorkArchivedBranchEntryV1[];
+  next_cursor: WorkArchivedBranchCursorV1 | null;
+};
+
+export type WorkArchivedBranchListParamsV1 = {
+  before?: WorkArchivedBranchCursorV1;
+  limit?: number;
+};
+
+export type WorkBranchComparisonRelationV2 = "same" | "different" | "unavailable";
+export type WorkBranchComparisonBlockerV2 =
+  | "goal_revision_differs"
+  | "criteria_revision_differs";
+export type WorkBranchComparisonCoverageGapV2 =
+  | "change_details"
+  | "risks"
+  | "time_cost";
+
+export type WorkBranchComparisonSideV2 = {
+  branch_id: string;
+  branch_revision: number;
+  is_delivery: boolean;
+  goal_revision_ref: number;
+  criteria: { revision: number; manifest_hash: WorkContentHash; member_count: number };
+  graph: {
+    basis_revision: number;
+    current_revision: number;
+    manifest_hash: WorkContentHash;
+    item_count: number;
+    edge_count: number;
+  };
+  subject: {
+    subject_ref: string;
+    subject_revision: WorkContentHash;
+    graph_revision: number;
+  } | null;
+};
+
+export type WorkBranchComparisonEvidenceV2 = {
+  manifest_hash: WorkContentHash;
+  required_count: number;
+  fresh_check_count: number;
+  accepted_gap_count: number;
+};
+
+export type WorkBranchComparisonReportV2 = {
+  schema_version: 2;
+  work_id: string;
+  work_revision: number;
+  directly_comparable: boolean;
+  blockers: WorkBranchComparisonBlockerV2[];
+  graph_relation: WorkBranchComparisonRelationV2;
+  subject_relation: WorkBranchComparisonRelationV2;
+  evidence_relation: WorkBranchComparisonRelationV2;
+  left: WorkBranchComparisonSideV2;
+  right: WorkBranchComparisonSideV2;
+  left_evidence: WorkBranchComparisonEvidenceV2;
+  right_evidence: WorkBranchComparisonEvidenceV2;
+  coverage_gaps: WorkBranchComparisonCoverageGapV2[];
+};
+
+export type WorkPatchArtifactV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  patch_artifact_id: string;
+  source_branch_revision: number;
+  source_graph_revision: number;
+  base_subject_revision: WorkContentHash;
+  result_subject_revision: WorkContentHash;
+  payload_hash: WorkContentHash;
+  payload_bytes: number;
+  format: "unified_diff_v1";
+  provider_invocation_ref: string;
+  source_ref: string;
+  created_at: string;
+};
+
+export type WorkPatchArtifactExportInputV1 = {
+  requestId: string;
+  expectedBranchRevision: number;
+  expectedGraphRevision: number;
+};
+
+export type WorkPatchArtifactContent = {
+  data: string;
+  hash: WorkContentHash;
+  bytes: number;
+};
+
+export type WorkPatchArtifactCursorV1 = {
+  created_at: string;
+  patch_artifact_id: string;
+};
+
+export type WorkPatchArtifactPageV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  artifacts: WorkPatchArtifactV1[];
+  next_cursor: WorkPatchArtifactCursorV1 | null;
+};
+
+export type WorkPatchArtifactListParamsV1 = {
+  before?: WorkPatchArtifactCursorV1;
+  limit?: number;
+};
+
+export type WorkPatchMaterializationInputV1 = {
+  requestId: string;
+  patchArtifactId: string;
+  expectedTargetBranchRevision: number;
+  expectedTargetGraphRevision: number;
+};
+
+export type WorkPatchMaterializationCursorV1 = {
+  created_at: string;
+  operation_id: string;
+};
+
+export type WorkPatchMaterializationListParamsV1 = {
+  sourceBranchId: string;
+  before?: WorkPatchMaterializationCursorV1;
+  limit?: number;
+};
+
+export type WorkPatchMaterializationOperationV2 = {
+  schema_version: 2;
+  operation_id: string;
+  work_id: string;
+  request_id: string;
+  patch_artifact_id: string;
+  source_branch_id: string;
+  target_branch_id: string;
+  target_branch_revision: number;
+  target_graph_revision: number;
+  base_subject_revision: WorkContentHash;
+  result_subject_revision: WorkContentHash;
+  payload_hash: WorkContentHash;
+  provider_ref: string;
+  policy_decision_ref: string;
+  state: "pending" | "aborted" | "succeeded" | "conflict" | "failed";
+  phase: "awaiting_dispatch" | "applying" | "reconciling" | "verifying" | "complete";
+  apply_invocation_ref: string | null;
+  observed_subject_revision: WorkContentHash | null;
+  apply_outcome:
+    | "applied"
+    | "not_applied"
+    | "result_mismatch"
+    | "target_changed"
+    | null;
+  failure_code:
+    | "provider_unavailable"
+    | "authorization_denied"
+    | "workspace_unavailable"
+    | "patch_rejected"
+    | "invocation_cancelled"
+    | "provider_internal"
+    | null;
+  verification_evidence_hash: WorkContentHash | null;
+  verification_outcome: "passed" | "target_changed" | null;
+  created_at: string;
+  completed_at: string | null;
+};
+
+export type WorkPatchMaterializationPageV2 = {
+  schema_version: 2;
+  work_id: string;
+  target_branch_id: string;
+  source_branch_id: string;
+  operations: WorkPatchMaterializationOperationV2[];
+  next_cursor: WorkPatchMaterializationCursorV1 | null;
+};
+
+export type WorkPatchCommitInputV1 = {
+  requestId: string;
+  patchArtifactId: string;
+  expectedTargetBranchRevision: number;
+  expectedTargetGraphRevision: number;
+  message: string;
+};
+
+export type WorkPatchCommitCursorV1 = {
+  created_at: string;
+  operation_id: string;
+};
+
+export type WorkPatchCommitListParamsV1 = {
+  before?: WorkPatchCommitCursorV1;
+  limit?: number;
+};
+
+export type WorkPatchCommitOperationV1 = {
+  schema_version: 1;
+  operation_id: string;
+  work_id: string;
+  request_id: string;
+  patch_artifact_id: string;
+  source_branch_id: string;
+  target_branch_id: string;
+  target_branch_revision: number;
+  target_graph_revision: number;
+  base_subject_revision: WorkContentHash;
+  result_subject_revision: WorkContentHash;
+  payload_hash: WorkContentHash;
+  message: string;
+  provider_ref: string;
+  policy_decision_ref: string;
+  state: "pending" | "aborted" | "succeeded" | "conflict" | "failed";
+  phase: "awaiting_dispatch" | "committing" | "reconciling" | "complete";
+  commit_invocation_ref: string | null;
+  commit_sha: string | null;
+  observed_subject_revision: WorkContentHash | null;
+  index_reconciled: boolean | null;
+  failure_code:
+    | "authorization_denied"
+    | "workspace_unavailable"
+    | "provider_unavailable"
+    | "invalid_metadata"
+    | "base_changed"
+    | "result_changed"
+    | "patch_rejected"
+    | "commit_rejected"
+    | "ref_conflict"
+    | null;
+  created_at: string;
+  completed_at: string | null;
+};
+
+export type WorkPatchCommitPageV1 = {
+  schema_version: 1;
+  work_id: string;
+  target_branch_id: string;
+  operations: WorkPatchCommitOperationV1[];
+  next_cursor: WorkPatchCommitCursorV1 | null;
+};
+
+export type WorkDeliverySelectionSubjectV1 = {
+  graphRevision: number;
+  subjectRef: string;
+  subjectRevision: WorkContentHash;
+};
+
+export type WorkDeliverySelectionInputV1 = {
+  requestId: string;
+  branchId: string;
+  expectedWorkRevision: number;
+  expectedBranchRevision: number;
+  expectedGoalRevision: number;
+  expectedCriteriaSetRevision: number;
+  expectedGraphRevision: number;
+  expectedSubject: WorkDeliverySelectionSubjectV1 | null;
+  expectedEvidenceManifestHash: WorkContentHash;
+};
+
+export type WorkDeliverySelectionReceiptV1 = {
+  schema_version: 1;
+  work_id: string;
+  request_id: string;
+  delivery_branch_id: string;
+  work_revision: number;
+  branch_revision: number;
+  graph_revision: number;
+  evidence_manifest_hash: WorkContentHash;
+  outcome: "selected" | "already_selected";
+};
+
+export type WorkBranchRetentionInputV1 = {
+  requestId: string;
+  expectedWorkRevision: number;
+  expectedBranchRevision: number;
+};
+
+export type WorkBranchRetentionReceiptV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  request_id: string;
+  kind: "archive" | "restore";
+  work_revision: number;
+  branch_revision: number;
+  outcome: "applied" | "already_in_state";
+};
+
+export type WorkReadCursorReceiptV1 = {
+  schema_version: 1;
+  work_id: string;
+  through_event_seq: number;
+  receipt_revision: number;
+  receipt_hash: WorkContentHash;
+  updated_at: string;
+};
+
+export type WorkEventKind =
+  | "work_created"
+  | "goal_revised"
+  | "criteria_accepted"
+  | "branch_basis_adopted"
+  | "graph_replaced"
+  | "delivery_branch_selected"
+  | "branch_archived"
+  | "branch_restored"
+  | "subject_changed"
+  | "patch_artifact_exported"
+  | "plan_proposed"
+  | "criteria_proposed"
+  | "proposal_rejected"
+  | "check_recorded"
+  | "gaps_accepted"
+  | "run_completed"
+  | "run_delegated"
+  | "run_failed"
+  | "run_cancelled"
+  | "runtime_events_expired";
+
+export type WorkEventRecordV1 = {
+  event_seq: number;
+  branch_id: string | null;
+  kind: WorkEventKind;
+  work_revision: number | null;
+  goal_revision: number | null;
+  criterion_set_revision: number | null;
+  branch_revision: number | null;
+  graph_revision: number | null;
+  source_ref: string;
+  created_at: string;
+};
+
+export type WorkEventPageV1 = {
+  schema_version: 1;
+  work_id: string;
+  requested_after_event_seq: number | null;
+  next_after_event_seq: number | null;
+  event_head: number;
+  retained_from_event_seq: number;
+  seen_through_event_seq: number | null;
+  coverage: "complete" | "expired";
+  has_more: boolean;
+  events: WorkEventRecordV1[];
+};
+
+export type WorkCriteriaBasisV1 = {
+  work_id: string;
+  work_revision: number;
+  criteria_set_revision: number;
+  manifest_hash: WorkContentHash;
+  member_count: number;
+};
+
+export type WorkCriterionV1 = {
+  criterion_id: string;
+  revision: number;
+  definition_hash: WorkContentHash;
+} & (
+  | { kind: "command_check"; statement: string; command: string }
+  | { kind: "test_check"; statement: string; command: string }
+  | { kind: "human_review"; statement: string }
+);
+
+export type WorkCriteriaCursorV1 = {
+  criteria_set_revision: number;
+  offset: number;
+};
+
+export type WorkCriteriaPageV1 = {
+  schema_version: 1;
+  basis: WorkCriteriaBasisV1;
+  cursor: WorkCriteriaCursorV1;
+  next_cursor: WorkCriteriaCursorV1 | null;
+  criteria: {
+    offset: number;
+    limit: number;
+    total: number;
+    entries: WorkCriterionV1[];
+  };
+};
+
+export type WorkProposalSourceKind = "model" | "reflection";
+export type WorkProposalStatus =
+  | "pending"
+  | "accepted"
+  | "rejected"
+  | "stale"
+  | "superseded"
+  | "expired";
+
+export type WorkCriteriaProposalBasisV1 = {
+  work_revision: number;
+  goal_revision: number;
+  criteria_set_revision: number;
+  branch_revision: number;
+  graph_revision: number;
+};
+
+export type WorkCriteriaProposalMemberV1 =
+  | {
+      member_kind: "existing";
+      criterion_id: string;
+      revision: number;
+    }
+  | {
+      member_kind: "new";
+      criterion_id: string;
+      definition:
+        | { kind: "command_check"; statement: string; command: string }
+        | { kind: "test_check"; statement: string; command: string }
+        | { kind: "human_review"; statement: string };
+    };
+
+export type WorkCriteriaProposalSummaryV1 = {
+  work_id: string;
+  branch_id: string;
+  proposal_id: string;
+  proposal_seq: number;
+  payload_hash: WorkContentHash;
+  status: WorkProposalStatus;
+  basis: WorkCriteriaProposalBasisV1;
+  member_count: number;
+  source_kind: WorkProposalSourceKind;
+  proposed_at: string;
+  expires_at: string;
+};
+
+export type WorkCriteriaProposalResolutionV1 = {
+  resolution_ref: string;
+  resolved_at: string;
+  result_work_revision: number | null;
+  result_criteria_set_revision: number | null;
+};
+
+export type WorkCriteriaProposalDetailV1 = {
+  schema_version: 1;
+  proposal: WorkCriteriaProposalSummaryV1;
+  members: WorkCriteriaProposalMemberV1[];
+  resolution: WorkCriteriaProposalResolutionV1 | null;
+};
+
+export type WorkCriteriaProposalListV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  proposals: WorkCriteriaProposalSummaryV1[];
+};
+
+export type WorkCriteriaProposalDecisionInput = {
+  /** Stable identity for one exact accept or reject action and its retries. */
+  requestId: string;
+  decision: "accept" | "reject";
+};
+
+export type WorkTaskGraphBasisV1 = {
+  work_id: string;
+  work_revision: number;
+  goal_revision: number;
+  goal: string;
+  criteria_set_revision: number;
+  criteria_member_count: number;
+  criteria_manifest_hash: WorkContentHash;
+  branch_id: string;
+  branch_revision: number;
+  branch_goal_revision: number;
+  branch_criteria_set_revision: number;
+  branch_basis_graph_revision: number;
+  graph_revision: number;
+  graph_item_count: number;
+  graph_edge_count: number;
+  graph_manifest_hash: WorkContentHash;
+};
+
+/** Constant-size bootstrap from an already-known session to public Work identity. */
+export type WorkSessionBindingV1 = {
+  schema_version: 1;
+  work_id: string;
+  branch_id: string;
+  graph_revision: number;
+};
+
+export type WorkTaskGraphItemV2 = {
+  item_id: string;
+  revision: number;
+  kind: "milestone" | "task";
+  objective: string;
+  expected_result: string;
+  declaration_state: "active" | "superseded" | "cancelled";
+  execution: WorkItemExecutionV1;
+  delivery: WorkItemDeliveryV1;
+  verification: WorkItemVerificationV1;
+};
+
+export type WorkItemDeliveryStatusV1 =
+  | "unreported"
+  | "delivered"
+  | "blocked"
+  | "failed";
+
+export type WorkItemDeliveryBlockerKindV1 =
+  | "capability_unavailable"
+  | "dependency_blocked"
+  | "policy_blocked"
+  | "external_unavailable";
+
+/** Typed result of the exact run attempt. This is independent of both the
+ * terminal execution state and verification evidence. */
+export type WorkItemDeliveryV1 = {
+  status: WorkItemDeliveryStatusV1;
+  summary: string | null;
+  blocker_kind: WorkItemDeliveryBlockerKindV1 | null;
+  unavailable_capabilities: string[];
+};
+
+export type WorkItemExecutionStatusV1 =
+  | "not_started"
+  | "running"
+  | "waiting"
+  | "paused"
+  | "completed"
+  | "delegated"
+  | "failed"
+  | "cancelled";
+
+export type WorkItemExecutionRunRefV1 = {
+  run_id: string;
+  attempt_id: string;
+  graph_revision: number;
+  run_generation: number;
+  last_event_idx: number;
+  updated_at: string;
+};
+
+export type WorkItemExecutionV1 =
+  | {
+      status: "not_started";
+      terminal: false;
+      run: null;
+    }
+  | {
+      status: "running" | "waiting" | "paused";
+      terminal: false;
+      run: WorkItemExecutionRunRefV1;
+    }
+  | {
+      status: "completed" | "delegated" | "failed" | "cancelled";
+      terminal: true;
+      run: WorkItemExecutionRunRefV1;
+    };
+
+export type WorkCheckFreshnessV1 =
+  | "current"
+  | "criteria_changed"
+  | "graph_changed"
+  | "subject_unavailable"
+  | "subject_changed"
+  | "expired";
+
+export type WorkItemVerificationStatusV1 =
+  | "unknown"
+  | "evidence_available"
+  | "stale_evidence";
+
+export type WorkItemCheckFactV1 = {
+  check_run_id: string;
+  criterion: { criterion_id: string; revision: number };
+  criterion_set_revision: number;
+  graph_revision: number;
+  verifier_kind: "command" | "test";
+  outcome: "passed" | "failed" | "error" | "cancelled";
+  coverage: "complete" | "partial" | "unavailable";
+  subject_revision: WorkContentHash;
+  evidence_ref_count: number;
+  produced_at: string;
+  expires_at: string | null;
+  freshness: WorkCheckFreshnessV1;
+};
+
+export type WorkItemVerificationV1 = {
+  status: WorkItemVerificationStatusV1;
+  latest_check: WorkItemCheckFactV1 | null;
+};
+
+export type WorkTaskGraphDependencyV1 = {
+  predecessor_item_id: string;
+  successor_item_id: string;
+  kind: "dependency";
+};
+
+export type WorkTaskGraphCursorV1 = {
+  graph_revision: number;
+  item_offset: number;
+  dependency_offset: number;
+};
+
+export type WorkTaskGraphPageV2 = {
+  schema_version: 2;
+  scope: "declared_work";
+  basis: WorkTaskGraphBasisV1;
+  cursor: WorkTaskGraphCursorV1;
+  next_cursor: WorkTaskGraphCursorV1 | null;
+  items: {
+    offset: number;
+    limit: number;
+    total: number;
+    entries: WorkTaskGraphItemV2[];
+  };
+  dependencies: {
+    offset: number;
+    limit: number;
+    total: number;
+    entries: WorkTaskGraphDependencyV1[];
+  };
+};
+
+export type WorkApiErrorV1 = {
+  code:
+    | "unsupported_client_version"
+    | "authentication_required"
+    | "authentication_rejected"
+    | "authentication_context_invalid"
+    | "invalid_work_create_request"
+    | "invalid_work_goal"
+    | "invalid_work_criteria"
+    | "invalid_work_id"
+    | "invalid_work_branch_id"
+    | "invalid_work_turn_request"
+    | "invalid_work_session_binding"
+    | "invalid_work_task_graph_query"
+    | "invalid_work_task_graph_cursor"
+    | "invalid_work_criteria_query"
+    | "invalid_work_criteria_cursor"
+    | "invalid_work_proposal_id"
+    | "invalid_work_proposal_decision"
+    | "invalid_work_read_cursor_request"
+    | "invalid_work_catalog_query"
+    | "invalid_work_catalog_cursor"
+    | "invalid_work_catalog_limit"
+    | "invalid_work_attachment_request"
+    | "invalid_work_control_request"
+    | "invalid_work_event_cursor"
+    | "invalid_work_event_query"
+    | "invalid_work_event_limit"
+    | "work_not_found"
+    | "branch_not_found"
+    | "work_session_binding_not_found"
+    | "work_read_unavailable"
+    | "work_write_unavailable"
+    | "work_event_cursor_ahead"
+    | "work_graph_revision_conflict"
+    | "work_criteria_revision_conflict"
+    | "work_criteria_proposal_not_found"
+    | "work_proposal_basis_conflict"
+    | "work_proposal_already_resolved"
+    | "work_proposal_identity_conflict"
+    | "work_creation_conflict"
+    | "idempotency_mismatch"
+    | "writer_conflict"
+    | "provider_unavailable"
+    | "work_turn_rejected"
+    | "work_turn_unavailable"
+    | "work_attach_unavailable"
+    | "work_attachment_capacity"
+    | "attachment_fenced"
+    | "attachment_in_use"
+    | "control_operation_terminal"
+    | "control_operation_not_found"
+    | "control_operation_unavailable"
+    | "causal_projection_degraded";
+  category:
+    | "authentication"
+    | "invalid_request"
+    | "not_found"
+    | "conflict"
+    | "version"
+    | "availability"
+    | "degraded";
+  retryable: boolean;
+  action_hints: (
+    | "upgrade_client"
+    | "refresh_work"
+    | "retry_read"
+    | "retry_write"
+    | "retry_attach"
+  )[];
+  request_id?: string;
 };

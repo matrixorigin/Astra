@@ -90,6 +90,25 @@ pub fn limits_payload(max_sessions_per_day: u32, max_concurrent_sessions: u32) -
     })
 }
 
+async fn resource_limit_column_default(
+    pool: &sqlx::MySqlPool,
+    schema: &str,
+    column: &str,
+) -> Option<String> {
+    sqlx::query(
+        "SELECT COLUMN_DEFAULT FROM INFORMATION_SCHEMA.COLUMNS \
+         WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'resource_limits' AND COLUMN_NAME = ? \
+         LIMIT 1",
+    )
+    .bind(schema)
+    .bind(column)
+    .fetch_optional(pool)
+    .await
+    .expect("load resource_limits column default")
+    .and_then(|row| row.try_get::<Option<String>, _>("COLUMN_DEFAULT").ok())
+    .flatten()
+}
+
 /// Insert a paused run so `count_active_sessions` sees one capacity holder (no LLM race).
 pub async fn seed_capacity_holding_run(
     pool: &sqlx::MySqlPool,
@@ -131,17 +150,32 @@ pub async fn run_saas_resource_limits_read_and_admin_override() {
 
     cleanup_resource_limits(pool, user_id).await;
 
+    for column in ["max_sessions_per_day", "max_concurrent_sessions"] {
+        assert_eq!(
+            resource_limit_column_default(pool, &ctx.matrixone_database, column)
+                .await
+                .as_deref(),
+            Some("0"),
+            "latest resource_limits schema must make {column}=0 (unlimited) the database default"
+        );
+    }
+
     let (st_lim, lim_j) = get_json(app, "/resources/limits", Some(auth), &[]).await;
     assert_eq!(st_lim, StatusCode::OK, "GET /resources/limits: {lim_j}");
     assert_eq!(
         lim_j["limits"]["max_concurrent_sessions"].as_u64(),
-        Some(100),
-        "default concurrent cap: {lim_j}"
+        Some(0),
+        "concurrent session governance must require an explicit admin policy: {lim_j}"
+    );
+    assert_eq!(
+        lim_j["limits"]["max_sessions_per_day"].as_u64(),
+        Some(0),
+        "daily session governance must require an explicit admin policy: {lim_j}"
     );
     assert_eq!(
         lim_j["limits"]["max_tokens_per_day"].as_u64(),
-        Some(10_000_000_000),
-        "default daily token budget: {lim_j}"
+        Some(0),
+        "token quota must require an explicit per-user override: {lim_j}"
     );
 
     let (st_use, use_j) = get_json(app, "/resources/usage", Some(auth), &[]).await;
@@ -181,7 +215,7 @@ pub async fn run_saas_resource_limits_read_and_admin_override() {
     assert_eq!(lim2["limits"]["max_sessions_per_day"].as_u64(), Some(99));
 
     cleanup_resource_limits(pool, user_id).await;
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Admin caps daily sessions; second auto-provisioned /chat returns 429; admin raises cap → allowed again.
@@ -259,7 +293,7 @@ pub async fn run_saas_resource_daily_session_cap_denies_chat() {
     assert_eq!(st3, StatusCode::OK, "after admin raise: {chat3}");
 
     cleanup_resource_limits(pool, user_id).await;
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Concurrent run cap: one paused run holds capacity; cap=1 denies a second /chat start.
@@ -305,7 +339,7 @@ pub async fn run_saas_resource_concurrent_session_cap_denies_chat() {
 
     cleanup_seeded_run(pool, &holding_run).await;
     cleanup_resource_limits(pool, user_id).await;
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Admin config list/get/put/delete with RBAC (403 without role).
@@ -359,7 +393,7 @@ pub async fn run_saas_admin_config_crud_rbac() {
     let (st_missing, _) = get_json(app, &format!("/admin/config/{key}"), Some(auth), &[]).await;
     assert_eq!(st_missing, StatusCode::NOT_FOUND, "GET after delete");
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Admin grant/revoke `astra_admin` via HTTP; target user gains then loses admin routes.
@@ -441,7 +475,7 @@ pub async fn run_saas_admin_grant_revoke_rbac_flow() {
 
     // Ensure admin_username still works (sanity).
     let _ = admin_username;
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Resource usage counters are scoped per authenticated user.
@@ -510,7 +544,7 @@ pub async fn run_saas_resource_usage_per_user_isolation() {
 
     cleanup_resource_limits(pool, user_a).await;
     cleanup_resource_limits(pool, user_b).await;
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// POST /auth/refresh returns a new access token that works on GET /auth/me.
@@ -537,7 +571,7 @@ pub async fn run_saas_auth_refresh_cycle() {
     assert_eq!(st_me, StatusCode::OK, "me with refreshed token: {me_j}");
     assert_eq!(me_j["user_id"].as_str(), Some(ctx.user_id.as_str()));
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// User B cannot read or mutate user A's session (IDOR matrix).
@@ -591,7 +625,7 @@ pub async fn run_saas_session_cross_user_isolation() {
     let (st_get_a, got_a) = get_json(app, &path, Some(auth_a), &[]).await;
     assert_eq!(st_get_a, StatusCode::OK, "A still reads session: {got_a}");
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Events, audit, and activity for foreign sessions return 404 (not empty leak).
@@ -656,7 +690,7 @@ pub async fn run_saas_events_and_audit_cross_user_isolation() {
         "filtered events for foreign session must be empty: {list_ev}"
     );
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 async fn register_fresh_user(app: &Router, tag: &str) -> (String, String, String, String) {
     let suffix = Uuid::new_v4().simple().to_string();
@@ -708,7 +742,7 @@ pub async fn run_saas_platform_health_and_auth_me() {
     assert_eq!(me_j["user_id"].as_str(), Some(ctx.user_id.as_str()));
     assert_eq!(me_j["username"].as_str(), Some(ctx.username.as_str()));
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Refresh rotates refresh token; old refresh is rejected (§5.1).
@@ -752,7 +786,7 @@ pub async fn run_saas_auth_refresh_token_rotation() {
     assert_eq!(st_me, StatusCode::OK, "me with rotated access: {me_j}");
 
     let _ = new_refresh;
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Memory proxy rejects unowned sessions and overwrites spoofed user identity (§5.4, §5.7).
@@ -806,7 +840,7 @@ pub async fn run_saas_memory_proxy_user_isolation() {
         Some(ctx.session_id.as_str())
     );
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// GET /models never exposes api_key; admin create stores encrypted key (§5.6).
@@ -865,7 +899,7 @@ pub async fn run_saas_models_list_and_key_encryption() {
     assert_ne!(encrypted, plain_key, "DB must not store plaintext api key");
 
     let _ = delete_json(app, &format!("/models/{model_name}"), Some(auth)).await;
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Session CRUD positive path (§5.1, §6.1).
@@ -911,7 +945,7 @@ pub async fn run_saas_session_lifecycle_positive() {
         "list contains new session: {list_j}"
     );
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Resource usage counters increment after chat creates a session (§5.3, §6.6).
@@ -951,7 +985,7 @@ pub async fn run_saas_resource_usage_increments_after_chat() {
         "sessions_created should increment: before={sessions_before} after={sessions_after}"
     );
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Cross-user run cancel forbidden; owner cancel succeeds (§4.3, §5.4).
@@ -1000,7 +1034,7 @@ pub async fn run_saas_run_cancel_cross_user_and_owner() {
         "terminal cancel status: {cancel_j}"
     );
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Approval deny decision is committed to the durable run (§4.2 negative callback path).
@@ -1035,7 +1069,7 @@ pub async fn run_saas_approval_respond_deny_path() {
     assert_eq!(decision.pointer("/data/decision"), Some(&json!("deny")));
     assert_eq!(decision.pointer("/data/outcome"), Some(&json!("denied")));
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Headless run pause/resume happy path (§4.3) — delegates to shared journey.
@@ -1061,7 +1095,7 @@ pub async fn run_saas_admin_tokens_rbac_smoke() {
     assert_eq!(st_ok, StatusCode::OK, "admin tokens: {body}");
     assert!(body.is_array(), "tokens array: {body}");
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Register + login positive path distinct from bootstrap (§5.1).
@@ -1091,7 +1125,7 @@ pub async fn run_saas_auth_register_login_positive() {
     let (st_me, me_j) = get_json(app, "/auth/me", Some(&auth), &[]).await;
     assert_eq!(st_me, StatusCode::OK, "me with register token: {me_j}");
 
-    b.ctx.pool.close().await;
+    b.ctx.close().await;
 }
 /// Duplicate email on register returns 409 (§5.1).
 pub async fn run_saas_auth_duplicate_email_register() {
@@ -1132,7 +1166,7 @@ pub async fn run_saas_auth_duplicate_email_register() {
         "duplicate email detail: {j_dup}"
     );
 
-    b.ctx.pool.close().await;
+    b.ctx.close().await;
 }
 
 /// GET /runs lists owner runs after POST /chat (§4.3).
@@ -1166,7 +1200,7 @@ pub async fn run_saas_runs_list_pagination_positive() {
         "list must contain created run: {list_j}"
     );
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// POST /agents/edge registers edge agent in registry (§4.2).
@@ -1213,7 +1247,7 @@ pub async fn run_saas_edge_agent_registration_smoke() {
         .execute(pool)
         .await;
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// POST /admin/cleanup requires admin (§5.2, §5.5).
@@ -1238,7 +1272,7 @@ pub async fn run_saas_admin_cleanup_rbac_smoke() {
     );
     assert!(body.get("tables").is_some(), "cleanup tables: {body}");
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// GET /admin/audit requires admin (§5.2).
@@ -1258,7 +1292,7 @@ pub async fn run_saas_admin_audit_rbac_smoke() {
     let (st_ok, body) = get_json(app, "/admin/audit?limit=5", Some(auth), &[]).await;
     assert_eq!(st_ok, StatusCode::OK, "admin audit: {body}");
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// User-scoped skills are invisible to other users (§5.4).
@@ -1312,7 +1346,7 @@ pub async fn run_saas_skills_cross_user_isolation() {
         "B list must not include A skill: {list_b}"
     );
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Team isolation — delegates to shared journey (§5.4).
@@ -1320,8 +1354,8 @@ pub async fn run_saas_team_cross_user_isolation() {
     super::journey_team_isolation_matrix::run_team_cross_user_isolation().await;
 }
 
-/// GET /sessions/{id}/replay/compare after chat activity (§6.1).
-pub async fn run_saas_session_replay_compare_smoke() {
+/// GET /sessions/{id}/replay/compare fails closed after chat activity (§6.1).
+pub async fn run_saas_session_replay_compare_unavailable_guardrail() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
     let app = &ctx.app;
@@ -1350,17 +1384,50 @@ pub async fn run_saas_session_replay_compare_smoke() {
         &[],
     )
     .await;
-    assert_eq!(st_cmp, StatusCode::OK, "replay compare: {cmp_j}");
+    assert_eq!(
+        st_cmp,
+        StatusCode::NOT_IMPLEMENTED,
+        "replay compare must remain unavailable: {cmp_j}"
+    );
     assert!(
-        cmp_j.get("original_event_count").is_some(),
-        "replay compare shape: {cmp_j}"
+        cmp_j["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("replay") && detail.contains("unavailable")),
+        "replay compare should explain the unavailable capability: {cmp_j}"
+    );
+    let replay_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events \
+         WHERE session_id = ? AND user_id = ? AND event_type = 'replay'",
+    )
+    .bind(session_id)
+    .bind(&ctx.user_id)
+    .fetch_one(&ctx.pool)
+    .await
+    .expect("replay rows after unavailable compare");
+    assert_eq!(
+        replay_rows, 0,
+        "compare guardrail must not write replay rows"
     );
 
-    ctx.pool.close().await;
+    let (auth_b, _, _, _) = register_fresh_user(app, "replay_compare_iso_b").await;
+    let (st_foreign, foreign_j) = get_json(
+        app,
+        &format!("/sessions/{session_id}/replay/compare"),
+        Some(&auth_b),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        st_foreign,
+        StatusCode::NOT_FOUND,
+        "foreign user compare must remain owner-oblivious: {foreign_j}"
+    );
+
+    ctx.close().await;
 }
 
-/// POST /sessions/{id}/replay after chat (§6.1).
-pub async fn run_saas_session_replay_post_positive() {
+/// POST /sessions/{id}/replay fails closed after chat activity (§6.1).
+pub async fn run_saas_session_replay_post_unavailable_guardrail() {
     let b = bootstrap().await;
     let ctx = &b.ctx;
     let app = &ctx.app;
@@ -1389,9 +1456,47 @@ pub async fn run_saas_session_replay_post_positive() {
         json!({ "mock_mode": true, "sandbox_name": "saas-e2e" }),
     )
     .await;
-    assert_eq!(st_rep, StatusCode::OK, "replay post: {rep_j}");
-    assert_eq!(rep_j["session_id"].as_str(), Some(session_id));
-    assert_eq!(rep_j["status"].as_str(), Some("completed"));
+    assert_eq!(
+        st_rep,
+        StatusCode::NOT_IMPLEMENTED,
+        "replay post must remain unavailable: {rep_j}"
+    );
+    assert!(
+        rep_j["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("replay") && detail.contains("unavailable")),
+        "replay post should explain the unavailable capability: {rep_j}"
+    );
+
+    let (st_rep_no_mock, rep_no_mock_j) = post_json(
+        app,
+        &format!("/sessions/{session_id}/replay"),
+        Some(auth),
+        json!({ "mock_mode": false, "sandbox_name": "saas-e2e-no-mock" }),
+    )
+    .await;
+    assert_eq!(
+        st_rep_no_mock,
+        StatusCode::NOT_IMPLEMENTED,
+        "replay post with mock_mode=false must remain unavailable: {rep_no_mock_j}"
+    );
+    assert!(
+        rep_no_mock_j["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("replay") && detail.contains("unavailable")),
+        "replay post with mock_mode=false should explain the unavailable capability: {rep_no_mock_j}"
+    );
+
+    let replay_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM agent_events \
+         WHERE session_id = ? AND user_id = ? AND event_type = 'replay'",
+    )
+    .bind(session_id)
+    .bind(&ctx.user_id)
+    .fetch_one(&ctx.pool)
+    .await
+    .expect("replay rows after unavailable post");
+    assert_eq!(replay_rows, 0, "post guardrail must not write replay rows");
 
     let (auth_b, _, _, _) = register_fresh_user(app, "replay_iso_b").await;
     let (st_forbid, forbid_j) = post_json(
@@ -1406,8 +1511,20 @@ pub async fn run_saas_session_replay_post_positive() {
         StatusCode::NOT_FOUND,
         "foreign user replay: {forbid_j}"
     );
+    let (st_forbid_compare, forbid_compare_j) = get_json(
+        app,
+        &format!("/sessions/{session_id}/replay/compare"),
+        Some(&auth_b),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        st_forbid_compare,
+        StatusCode::NOT_FOUND,
+        "foreign user compare: {forbid_compare_j}"
+    );
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// GET /admin/feedback/stats RBAC + filter query (§5.2).
@@ -1441,7 +1558,7 @@ pub async fn run_saas_admin_feedback_stats_rbac() {
     .await;
     assert_eq!(st_filt, StatusCode::OK, "filtered stats: {filt_j}");
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// GET /chat/runs/{id}/projection after POST /chat (§4.3).
@@ -1477,7 +1594,7 @@ pub async fn run_saas_run_projection_smoke() {
     assert_eq!(st_proj, StatusCode::OK, "run projection: {proj_j}");
     assert_eq!(proj_j["run_id"].as_str(), Some(run_id));
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Session audit endpoints after chat activity.
@@ -1512,12 +1629,7 @@ pub async fn run_saas_session_audit_after_chat_smoke() {
         assert_eq!(st, StatusCode::OK, "GET {path}: {body}");
     }
 
-    ctx.pool.close().await;
-}
-
-/// Task lease claim → renew → release (§4.2).
-pub async fn run_saas_task_lease_renew_release_positive() {
-    journey_tasks_runs::run_tasks_lease_with_db_assertions().await;
+    ctx.close().await;
 }
 
 /// GET /platform/snapshot (§5.1).
@@ -1531,7 +1643,7 @@ pub async fn run_saas_platform_snapshot_smoke() {
     assert_eq!(st_snap, StatusCode::OK, "platform snapshot: {snap_j}");
     assert_eq!(snap_j["health"]["status"].as_str(), Some("healthy"));
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Session activity, transcript, artifacts after chat.
@@ -1576,7 +1688,7 @@ pub async fn run_saas_session_activity_transcript_artifacts_smoke() {
     assert_eq!(st_tr, StatusCode::OK, "transcript: {tr_j}");
     assert_eq!(tr_j["session_id"].as_str(), Some(session_id));
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// GET /events/session/{id} after chat.
@@ -1622,7 +1734,7 @@ pub async fn run_saas_events_session_after_chat_positive() {
     let events = ev_j["events"].as_array().expect("events");
     assert!(!events.is_empty(), "events after chat: {ev_j}");
 
-    ctx.pool.close().await;
+    ctx.close().await;
 }
 
 /// Delegation HTTP boundaries (§4.3).

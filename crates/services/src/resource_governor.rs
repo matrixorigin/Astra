@@ -12,8 +12,11 @@
 //!
 //! * **Fail-open**: DB errors log a warning and return defaults / proceed.
 //! * **Atomic counters**: `ON DUPLICATE KEY UPDATE` for race-free increments.
-//! * **Explicit default budget**: users without an administrator override receive
-//!   the product defaults below; an explicit `0` still means no cap.
+//! * **No implicit token price policy**: daily tokens are unlimited unless an
+//!   administrator writes a finite per-user limit; `0` means no cap.
+//! * **No implicit conversation policy**: session creation and concurrent-run
+//!   counts are likewise unlimited by default. Deployment owners may set a
+//!   finite per-user cap explicitly when their capacity policy requires one.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -34,11 +37,11 @@ pub struct ResourceLimits {
 }
 
 impl ResourceLimits {
-    pub const DEFAULT_MAX_CONCURRENT_SESSIONS: u32 = 100;
-    pub const DEFAULT_MAX_TOKENS_PER_DAY: u64 = 10_000_000_000;
-    pub const DEFAULT_MAX_DISK_BYTES: u64 = 10_737_418_240;
-    pub const DEFAULT_MAX_CONCURRENT_BASH: u32 = 100;
-    pub const DEFAULT_MAX_SESSIONS_PER_DAY: u32 = 5_000;
+    pub const DEFAULT_MAX_CONCURRENT_SESSIONS: u32 = 0;
+    pub const DEFAULT_MAX_TOKENS_PER_DAY: u64 = 0;
+    pub const DEFAULT_MAX_DISK_BYTES: u64 = 1_073_741_824;
+    pub const DEFAULT_MAX_CONCURRENT_BASH: u32 = 3;
+    pub const DEFAULT_MAX_SESSIONS_PER_DAY: u32 = 0;
 }
 
 impl Default for ResourceLimits {
@@ -614,21 +617,15 @@ mod tests {
     #[test]
     fn product_default_limits_match_contract() {
         let limits = ResourceLimits::default();
-        assert_eq!(limits.max_concurrent_sessions, 100);
-        assert_eq!(limits.max_tokens_per_day, 10_000_000_000);
-        assert_eq!(limits.max_disk_bytes, 10_737_418_240);
-        assert_eq!(limits.max_concurrent_bash, 100);
-        assert_eq!(limits.max_sessions_per_day, 5_000);
+        assert_eq!(limits.max_concurrent_sessions, 0);
+        assert_eq!(limits.max_tokens_per_day, 0);
+        assert_eq!(limits.max_disk_bytes, 1_073_741_824);
+        assert_eq!(limits.max_concurrent_bash, 3);
+        assert_eq!(limits.max_sessions_per_day, 0);
     }
 
     #[tokio::test]
-    async fn default_limits_allow_session_create() {
-        let gov = InMemoryResourceGovernor::new();
-        assert_eq!(gov.check_session_create("u1").await, LimitCheck::Allowed);
-    }
-
-    #[tokio::test]
-    async fn concurrent_sessions_denied() {
+    async fn default_session_limits_are_unlimited() {
         let gov = InMemoryResourceGovernor::new();
         {
             let mut map = astra_core::sync_poison::recover_mutex_lock(&gov.usage);
@@ -637,7 +634,39 @@ mod tests {
                 DatedUsage {
                     date: chrono::Utc::now().date_naive(),
                     usage: ResourceUsage {
-                        active_sessions: ResourceLimits::DEFAULT_MAX_CONCURRENT_SESSIONS,
+                        sessions_created: u32::MAX,
+                        active_sessions: u32::MAX,
+                        ..Default::default()
+                    },
+                },
+            );
+        }
+        let limits = gov.get_limits("u1").await;
+        assert_eq!(limits.max_concurrent_sessions, 0);
+        assert_eq!(limits.max_sessions_per_day, 0);
+        assert_eq!(gov.check_session_create("u1").await, LimitCheck::Allowed);
+        assert_eq!(gov.check_run_start("u1").await, LimitCheck::Allowed);
+    }
+
+    #[tokio::test]
+    async fn concurrent_sessions_denied() {
+        let gov = InMemoryResourceGovernor::new();
+        gov.set_limits(
+            "u1",
+            ResourceLimits {
+                max_concurrent_sessions: 5,
+                ..Default::default()
+            },
+        )
+        .await;
+        {
+            let mut map = astra_core::sync_poison::recover_mutex_lock(&gov.usage);
+            map.insert(
+                "u1".into(),
+                DatedUsage {
+                    date: chrono::Utc::now().date_naive(),
+                    usage: ResourceUsage {
+                        active_sessions: 5,
                         ..Default::default()
                     },
                 },
@@ -655,6 +684,14 @@ mod tests {
     #[tokio::test]
     async fn daily_session_cap_enforced() {
         let gov = InMemoryResourceGovernor::new();
+        gov.set_limits(
+            "u1",
+            ResourceLimits {
+                max_sessions_per_day: 50,
+                ..Default::default()
+            },
+        )
+        .await;
         {
             let mut map = astra_core::sync_poison::recover_mutex_lock(&gov.usage);
             map.insert(
@@ -662,7 +699,7 @@ mod tests {
                 DatedUsage {
                     date: chrono::Utc::now().date_naive(),
                     usage: ResourceUsage {
-                        sessions_created: ResourceLimits::DEFAULT_MAX_SESSIONS_PER_DAY,
+                        sessions_created: 50,
                         ..Default::default()
                     },
                 },
@@ -737,7 +774,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_token_budget_is_enforced() {
+    async fn default_token_budget_is_unlimited() {
         let gov = InMemoryResourceGovernor::new();
         {
             let mut map = astra_core::sync_poison::recover_mutex_lock(&gov.usage);
@@ -746,7 +783,7 @@ mod tests {
                 DatedUsage {
                     date: chrono::Utc::now().date_naive(),
                     usage: ResourceUsage {
-                        tokens_consumed: ResourceLimits::DEFAULT_MAX_TOKENS_PER_DAY - 1,
+                        tokens_consumed: u64::MAX,
                         ..Default::default()
                     },
                 },
@@ -758,15 +795,6 @@ mod tests {
         );
         assert_eq!(gov.check_session_create("u1").await, LimitCheck::Allowed);
         assert_eq!(gov.check_token_budget("u1").await, LimitCheck::Allowed);
-
-        gov.record_tokens("u1", 1).await;
-        assert!(matches!(
-            gov.check_token_budget("u1").await,
-            LimitCheck::Denied {
-                limit: ResourceLimitKind::DailyTokens,
-                ..
-            }
-        ));
     }
 
     #[tokio::test]
@@ -800,6 +828,14 @@ mod tests {
     #[tokio::test]
     async fn run_start_does_not_enforce_daily_session_cap() {
         let gov = InMemoryResourceGovernor::new();
+        gov.set_limits(
+            "u1",
+            ResourceLimits {
+                max_sessions_per_day: 50,
+                ..Default::default()
+            },
+        )
+        .await;
         {
             let mut map = astra_core::sync_poison::recover_mutex_lock(&gov.usage);
             map.insert(
@@ -825,6 +861,14 @@ mod tests {
     #[tokio::test]
     async fn run_start_still_enforces_execution_capacity() {
         let gov = InMemoryResourceGovernor::new();
+        gov.set_limits(
+            "u1",
+            ResourceLimits {
+                max_concurrent_sessions: 5,
+                ..Default::default()
+            },
+        )
+        .await;
         {
             let mut map = astra_core::sync_poison::recover_mutex_lock(&gov.usage);
             map.insert(
@@ -832,7 +876,7 @@ mod tests {
                 DatedUsage {
                     date: chrono::Utc::now().date_naive(),
                     usage: ResourceUsage {
-                        active_sessions: ResourceLimits::DEFAULT_MAX_CONCURRENT_SESSIONS,
+                        active_sessions: 5,
                         ..Default::default()
                     },
                 },

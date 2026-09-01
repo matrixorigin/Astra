@@ -134,18 +134,18 @@ fn mcp_list(scope: &str) -> Result<(), String> {
         .unwrap_or_default();
 
     if servers.is_empty() {
-        println!("  {}", "No MCP servers configured.".dim());
-        println!("  Use {} to add a server.", "astra mcp add".magenta());
+        stdout_println!("  {}", "No MCP servers configured.".dim());
+        stdout_println!("  Use {} to add a server.", "astra mcp add".magenta());
         return Ok(());
     }
 
-    println!(
+    stdout_println!(
         "  {:<20} {:<8} {:<40}",
         "Name".bold(),
         "Type".bold(),
         "Command / URL".bold()
     );
-    println!("  {}", "─".repeat(68).dim());
+    stdout_println!("  {}", "─".repeat(68).dim());
     for (name, entry) in &servers {
         let server_type = entry
             .get("type")
@@ -176,14 +176,14 @@ fn mcp_list(scope: &str) -> Result<(), String> {
                 }
             }
         };
-        println!(
+        stdout_println!(
             "  {:<20} {:<8} {}",
             name.as_str().magenta(),
             server_type.dim(),
             detail
         );
     }
-    println!(
+    stdout_println!(
         "\n  {} {}",
         "Config:".dim(),
         path.display().to_string().dim()
@@ -193,6 +193,15 @@ fn mcp_list(scope: &str) -> Result<(), String> {
 
 fn mcp_add(name: &str, command: &str, args: &[String], scope: &str) -> Result<(), String> {
     let path = mcp_json_path_for_scope(scope)?;
+    mcp_add_at_path(name, command, args, &path)
+}
+
+fn mcp_add_at_path(
+    name: &str,
+    command: &str,
+    args: &[String],
+    path: &std::path::Path,
+) -> Result<(), String> {
     let mut config = read_mcp_config(&path)?;
 
     // Check for duplicate
@@ -218,7 +227,7 @@ fn mcp_add(name: &str, command: &str, args: &[String], scope: &str) -> Result<()
         .insert(name.to_string(), entry);
 
     write_mcp_config(&path, &config)?;
-    println!(
+    stdout_println!(
         "  {} Added '{}' to {}",
         theme::icon_ok(),
         name.magenta(),
@@ -255,7 +264,7 @@ fn mcp_add_json(name: &str, json: &str, scope: &str) -> Result<(), String> {
         .insert(name.to_string(), entry);
 
     write_mcp_config(&path, &config)?;
-    println!(
+    stdout_println!(
         "  {} Added '{}' to {}",
         theme::icon_ok(),
         name.magenta(),
@@ -282,7 +291,7 @@ fn mcp_remove(name: &str, scope: &str) -> Result<(), String> {
     }
 
     write_mcp_config(&path, &config)?;
-    println!(
+    stdout_println!(
         "  {} Removed '{}' from {}",
         theme::icon_ok(),
         name.magenta(),
@@ -292,13 +301,20 @@ fn mcp_remove(name: &str, scope: &str) -> Result<(), String> {
 }
 
 fn mcp_get(name: &str) -> Result<(), String> {
-    // Search both scopes
-    let scopes = ["project", "user"];
-    for scope in &scopes {
-        let path = match mcp_json_path_for_scope(scope) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
+    let paths = [
+        mcp_json_path_for_scope("project").map(|path| ("project", path)),
+        mcp_json_path_for_scope("user").map(|path| ("user", path)),
+    ];
+    let scopes = paths
+        .iter()
+        .filter_map(|path| path.as_ref().ok())
+        .map(|(scope, path)| (*scope, path.as_path()))
+        .collect::<Vec<_>>();
+    mcp_get_from_paths(name, &scopes)
+}
+
+fn mcp_get_from_paths(name: &str, scopes: &[(&str, &std::path::Path)]) -> Result<(), String> {
+    for (scope, path) in scopes {
         let config = match read_mcp_config(&path) {
             Ok(c) => c,
             Err(_) => continue,
@@ -308,40 +324,40 @@ fn mcp_get(name: &str) -> Result<(), String> {
             .and_then(|v| v.as_object())
             .and_then(|m| m.get(name))
         {
-            println!("  {}:", name.bold().magenta());
-            println!("    {} {scope}", "Scope:".dim());
+            stdout_println!("  {}:", name.bold().magenta());
+            stdout_println!("    {} {scope}", "Scope:".dim());
             let server_type = entry
                 .get("type")
                 .and_then(|v| v.as_str())
                 .unwrap_or("stdio");
-            println!("    {} {server_type}", "Type:".dim());
+            stdout_println!("    {} {server_type}", "Type:".dim());
             match server_type {
                 "sse" | "http" => {
                     if let Some(url) = entry.get("url").and_then(|v| v.as_str()) {
-                        println!("    {} {url}", "URL:".dim());
+                        stdout_println!("    {} {url}", "URL:".dim());
                     }
                 }
                 _ => {
                     if let Some(cmd) = entry.get("command").and_then(|v| v.as_str()) {
-                        println!("    {} {cmd}", "Command:".dim());
+                        stdout_println!("    {} {cmd}", "Command:".dim());
                     }
                     if let Some(args) = entry.get("args").and_then(|v| v.as_array()) {
                         let args_str: Vec<&str> = args.iter().filter_map(|v| v.as_str()).collect();
-                        println!("    {} {}", "Args:".dim(), args_str.join(" "));
+                        stdout_println!("    {} {}", "Args:".dim(), args_str.join(" "));
                     }
                 }
             }
             if let Some(env) = entry.get("env").and_then(|v| v.as_object()) {
-                println!("    {}:", "Environment".dim());
+                stdout_println!("    {}:", "Environment".dim());
                 for (k, v) in env {
-                    println!(
+                    stdout_println!(
                         "      {}={}",
                         k.as_str().magenta(),
                         v.as_str().unwrap_or(&v.to_string())
                     );
                 }
             }
-            println!(
+            stdout_println!(
                 "\n  {} astra mcp remove \"{}\" -s {scope}",
                 "To remove:".dim(),
                 name
@@ -553,27 +569,10 @@ async fn mcp_ping(name: &str, scope: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod mcp_cli_tests {
-    use super::{mcp_add, mcp_get, mcp_json_path_for_scope, read_mcp_config, write_mcp_config};
-    use serial_test::serial;
-
-    struct CurrentDirGuard(std::path::PathBuf);
-
-    impl Drop for CurrentDirGuard {
-        fn drop(&mut self) {
-            std::env::set_current_dir(&self.0).unwrap();
-        }
-    }
-
-    fn with_temp_project_and_home(test: impl FnOnce(&std::path::Path, &std::path::Path)) {
-        let home = tempfile::TempDir::new().unwrap();
-        let project = tempfile::TempDir::new().unwrap();
-        let restore_dir = CurrentDirGuard(std::env::current_dir().unwrap());
-        temp_env::with_var("HOME", Some(home.path()), || {
-            std::env::set_current_dir(project.path()).unwrap();
-            test(project.path(), home.path());
-        });
-        drop(restore_dir);
-    }
+    use super::{
+        mcp_add_at_path, mcp_get_from_paths, mcp_json_path_for_scope, read_mcp_config,
+        write_mcp_config,
+    };
 
     fn make_config(path: &std::path::Path, servers: serde_json::Value) {
         if let Some(parent) = path.parent() {
@@ -708,18 +707,16 @@ mod mcp_cli_tests {
         assert!(err.is_err());
     }
 
-    #[serial]
     #[test]
     fn mcp_add_duplicate_detection() {
-        with_temp_project_and_home(|project, _home| {
-            let path = project.join(".astra").join("mcp.json");
-            make_config(&path, serde_json::json!({"existing": {"command": "echo"}}));
+        let project = tempfile::TempDir::new().unwrap();
+        let path = project.path().join("mcp.json");
+        make_config(&path, serde_json::json!({"existing": {"command": "echo"}}));
 
-            let err =
-                mcp_add("existing", "echo", &[], "project").expect_err("duplicate add should fail");
+        let err =
+            mcp_add_at_path("existing", "echo", &[], &path).expect_err("duplicate add should fail");
 
-            assert!(err.contains("already exists"));
-        });
+        assert!(err.contains("already exists"));
     }
 
     #[test]
@@ -737,21 +734,26 @@ mod mcp_cli_tests {
         assert!(!removed);
     }
 
-    #[serial]
     #[test]
     fn mcp_get_searches_both_scopes() {
-        with_temp_project_and_home(|project, home| {
-            make_config(
-                &project.join(".astra").join("mcp.json"),
-                serde_json::json!({}),
-            );
-            make_config(
-                &home.join(".astra").join("mcp.json"),
-                serde_json::json!({"user-server": {"command": "echo"}}),
-            );
+        let project = tempfile::TempDir::new().unwrap();
+        let home = tempfile::TempDir::new().unwrap();
+        let project_path = project.path().join("mcp.json");
+        let home_path = home.path().join("mcp.json");
+        make_config(&project_path, serde_json::json!({}));
+        make_config(
+            &home_path,
+            serde_json::json!({"user-server": {"command": "echo"}}),
+        );
 
-            mcp_get("user-server").expect("mcp get should search project and user scopes");
-        });
+        mcp_get_from_paths(
+            "user-server",
+            &[
+                ("project", project_path.as_path()),
+                ("user", home_path.as_path()),
+            ],
+        )
+        .expect("mcp get should search project and user scopes");
     }
 
     #[test]

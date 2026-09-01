@@ -2,6 +2,22 @@ use super::super::*;
 use crate::server::header_utils::collect_forward_headers;
 use astra_services::{DelegationRequest, DelegationResult};
 
+/// Client-authored delegation intent. Owner, parent run, and parent session
+/// are derived from the authenticated URL resource and are never accepted
+/// from the body.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DelegationHttpRequest {
+    delegation_id: String,
+    task: String,
+    pattern: astra_services::CoordinationPattern,
+    depth: u32,
+    #[serde(default)]
+    delegation_chain: Vec<String>,
+    context: std::collections::HashMap<String, serde_json::Value>,
+    execution_metadata: Option<serde_json::Value>,
+}
+
 /// POST /chat/runs/{run_id}/delegate
 ///
 /// Delegates a run to one or more sub-agents according to a coordination
@@ -10,15 +26,28 @@ pub(crate) async fn delegate_run_handler(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
     headers: HeaderMap,
-    Json(mut request): Json<DelegationRequest>,
+    Json(body): Json<DelegationHttpRequest>,
 ) -> Result<Json<DelegationResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
+    let user_id = user.user_id;
     // Verify the authenticated user owns this run (IDOR prevention).
-    state
+    let parent = state
         .execution
         .run_lifecycle_service
-        .get_run_status(run_id.clone(), user.user_id)
+        .get_run_status(run_id.clone(), user_id.clone())
         .await?;
+    let mut request = DelegationRequest {
+        delegation_id: body.delegation_id,
+        session_id: parent.session_id,
+        parent_run_id: run_id.clone(),
+        task: body.task,
+        pattern: body.pattern,
+        user_id,
+        depth: body.depth,
+        delegation_chain: body.delegation_chain,
+        context: body.context,
+        execution_metadata: body.execution_metadata,
+    };
     let forward_headers = collect_forward_headers(&headers);
     request
         .context
@@ -143,6 +172,24 @@ pub(crate) struct DelegationMutationResponse {
     pub affected: usize,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DelegationMutationRequest {
+    expected_session_id: String,
+}
+
+fn validated_expected_session_id(
+    body: &DelegationMutationRequest,
+) -> Result<&str, (StatusCode, Json<ErrorResponse>)> {
+    if body.expected_session_id.trim().is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "expected_session_id must not be empty",
+        ));
+    }
+    Ok(&body.expected_session_id)
+}
+
 /// POST /chat/runs/{run_id}/delegations/pause
 ///
 /// Pause all sub-runs delegated from this parent run.
@@ -150,14 +197,11 @@ pub(crate) async fn pause_delegations_handler(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
     headers: HeaderMap,
+    Json(body): Json<DelegationMutationRequest>,
 ) -> Result<Json<DelegationMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let user_id = user.user_id;
-    state
-        .execution
-        .run_lifecycle_service
-        .get_run_status(run_id.clone(), user_id.clone())
-        .await?;
+    let expected_session_id = validated_expected_session_id(&body)?;
 
     let engine = state.delegation_engine.as_ref().ok_or_else(|| {
         error_response(
@@ -166,7 +210,9 @@ pub(crate) async fn pause_delegations_handler(
         )
     })?;
 
-    let affected = engine.pause_children_of(&user_id, &run_id).await;
+    let affected = engine
+        .pause_children_of(&user_id, expected_session_id, &run_id)
+        .await;
     Ok(Json(DelegationMutationResponse {
         parent_run_id: run_id,
         affected,
@@ -180,14 +226,11 @@ pub(crate) async fn resume_delegations_handler(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
     headers: HeaderMap,
+    Json(body): Json<DelegationMutationRequest>,
 ) -> Result<Json<DelegationMutationResponse>, (StatusCode, Json<ErrorResponse>)> {
     let user = state.auth_service.current_user(&headers).await?;
     let user_id = user.user_id;
-    state
-        .execution
-        .run_lifecycle_service
-        .get_run_status(run_id.clone(), user_id.clone())
-        .await?;
+    let expected_session_id = validated_expected_session_id(&body)?;
 
     let engine = state.delegation_engine.as_ref().ok_or_else(|| {
         error_response(
@@ -196,7 +239,9 @@ pub(crate) async fn resume_delegations_handler(
         )
     })?;
 
-    let affected = engine.resume_children_of(&user_id, &run_id).await;
+    let affected = engine
+        .resume_children_of(&user_id, expected_session_id, &run_id)
+        .await;
     Ok(Json(DelegationMutationResponse {
         parent_run_id: run_id,
         affected,
@@ -376,18 +421,15 @@ mod tests {
         headers
     }
 
-    fn fan_out_request(run_id: &str) -> DelegationRequest {
-        DelegationRequest {
-            session_id: "test-session".into(),
+    fn fan_out_request() -> DelegationHttpRequest {
+        DelegationHttpRequest {
             delegation_id: "delegation-1".into(),
-            parent_run_id: run_id.into(),
             task: "delegate this run".into(),
             pattern: CoordinationPattern::FanOut {
                 agent_ids: vec!["agent-a".into()],
                 aggregation: AggregationStrategy::AllResults,
                 timeout_sec: 30,
             },
-            user_id: "delegation-owner".into(),
             depth: 0,
             delegation_chain: Vec::new(),
             context: HashMap::new(),
@@ -395,8 +437,9 @@ mod tests {
         }
     }
 
-    /// P0-A: All delegation handlers must verify run ownership via get_run_status
-    /// before touching the delegation engine.
+    /// Read handlers verify ownership via status lookup. Mutations carry an
+    /// immutable session precondition into the atomic store write instead of
+    /// discovering session authority from run_id.
     #[tokio::test]
     async fn delegation_handlers_verify_run_ownership() {
         let auth = Arc::new(RecordingAuthService::default());
@@ -408,7 +451,7 @@ mod tests {
             State(state.clone()),
             Path(run_id.clone()),
             auth_headers(),
-            Json(fan_out_request(&run_id)),
+            Json(fan_out_request()),
         )
         .await
         .expect_err("delegate should stop at ownership check");
@@ -420,33 +463,70 @@ mod tests {
                 .expect_err("list should stop at ownership check");
         assert_eq!(list_err.0, StatusCode::FORBIDDEN);
 
-        let pause_err =
-            pause_delegations_handler(State(state.clone()), Path(run_id.clone()), auth_headers())
-                .await
-                .expect_err("pause should stop at ownership check");
-        assert_eq!(pause_err.0, StatusCode::FORBIDDEN);
+        let pause_err = pause_delegations_handler(
+            State(state.clone()),
+            Path(run_id.clone()),
+            auth_headers(),
+            Json(DelegationMutationRequest {
+                expected_session_id: "session-1".to_string(),
+            }),
+        )
+        .await
+        .expect_err("pause should require a configured delegation engine");
+        assert_eq!(pause_err.0, StatusCode::SERVICE_UNAVAILABLE);
 
-        let resume_err =
-            resume_delegations_handler(State(state), Path(run_id.clone()), auth_headers())
-                .await
-                .expect_err("resume should stop at ownership check");
-        assert_eq!(resume_err.0, StatusCode::FORBIDDEN);
+        let resume_err = resume_delegations_handler(
+            State(state),
+            Path(run_id.clone()),
+            auth_headers(),
+            Json(DelegationMutationRequest {
+                expected_session_id: "session-1".to_string(),
+            }),
+        )
+        .await
+        .expect_err("resume should require a configured delegation engine");
+        assert_eq!(resume_err.0, StatusCode::SERVICE_UNAVAILABLE);
 
         let calls = lifecycle.run_status_requests.lock().await.clone();
         assert!(
             calls
                 == vec![
                     (run_id.clone(), "delegation-owner".to_string()),
-                    (run_id.clone(), "delegation-owner".to_string()),
-                    (run_id.clone(), "delegation-owner".to_string()),
                     (run_id, "delegation-owner".to_string()),
                 ],
-            "all delegation handlers should verify run ownership before proceeding: {calls:?}"
+            "mutation handlers must not discover session authority via status lookup: {calls:?}"
         );
         assert_eq!(
             auth.current_user_calls.load(Ordering::SeqCst),
             4,
             "all delegation handlers should authenticate before checking ownership"
         );
+    }
+
+    #[test]
+    fn delegation_http_body_rejects_client_authored_authority() {
+        for field in ["user_id", "parent_run_id", "session_id"] {
+            let mut body = serde_json::json!({
+                "delegation_id": "delegation-1",
+                "task": "delegate",
+                "pattern": {
+                    "pattern": "fan_out",
+                    "agent_ids": ["agent-a"],
+                    "aggregation": "all_results",
+                    "timeout_sec": 30
+                },
+                "depth": 0,
+                "delegation_chain": [],
+                "context": {},
+                "execution_metadata": null
+            });
+            body.as_object_mut()
+                .unwrap()
+                .insert(field.to_string(), serde_json::json!("foreign-authority"));
+            assert!(
+                serde_json::from_value::<DelegationHttpRequest>(body).is_err(),
+                "{field} must not be client-authored"
+            );
+        }
     }
 }

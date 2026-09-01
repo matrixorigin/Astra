@@ -12,7 +12,7 @@ use crate::cache_diagnostics::{
     PromptStateSnapshot,
 };
 use crate::compaction_types::CompactionTier;
-use crate::context_feedback::ContextFeedback;
+use crate::context_feedback::{ContextFeedback, RuntimeFeedbackFrame};
 use crate::context_optimizer::ContextOptimized;
 use crate::context_pipeline::{
     AdaptivePipelineRunInput, ContextPipeline, HistoryOptimizationOwner, PipelineAbort,
@@ -86,6 +86,7 @@ pub struct PipelineSession {
     cache_detector: CacheBreakDetector,
     pending_prompt_snapshot: Option<PendingPromptSnapshot>,
     turns_completed: u32,
+    latest_runtime_feedback: Option<RuntimeFeedbackFrame>,
     pending_audits: Vec<crate::pipeline_journal::PipelineJournalEvent>,
 }
 
@@ -128,6 +129,7 @@ impl PipelineSession {
             cache_detector: CacheBreakDetector::new(),
             pending_prompt_snapshot: None,
             turns_completed: 0,
+            latest_runtime_feedback: None,
             pending_audits: Vec::new(),
         }
     }
@@ -150,6 +152,7 @@ impl PipelineSession {
             cache_detector: CacheBreakDetector::new(),
             pending_prompt_snapshot: None,
             turns_completed: 0,
+            latest_runtime_feedback: None,
             pending_audits: Vec::new(),
         }
     }
@@ -178,6 +181,7 @@ impl PipelineSession {
             cache_detector: CacheBreakDetector::new(),
             pending_prompt_snapshot: None,
             turns_completed: 0,
+            latest_runtime_feedback: None,
             pending_audits: Vec::new(),
         }
     }
@@ -294,6 +298,21 @@ impl PipelineSession {
         Ok(output)
     }
 
+    /// Align cache-break diagnostics with the exact provider-visible tool
+    /// schemas after runtime stabilization and cache annotation.
+    ///
+    /// Returns `false` only when no pipeline request is awaiting feedback.
+    pub fn replace_pending_wire_tool_schemas(
+        &mut self,
+        tool_schemas: &[serde_json::Value],
+    ) -> bool {
+        let Some(pending) = self.pending_prompt_snapshot.as_mut() else {
+            return false;
+        };
+        pending.snapshot.replace_tool_schemas(tool_schemas);
+        true
+    }
+
     /// Run the pipeline in shadow mode: produce pipeline output AND compare
     /// against a pre-computed legacy `ContextOptimized` for diffing.
     pub fn run_turn_shadow(
@@ -390,6 +409,75 @@ impl PipelineSession {
         if !self.recovery.should_abort() {
             self.turns_completed += 1;
         }
+    }
+
+    /// Record the canonical runtime frame for one successfully ingested model
+    /// request. Cache diagnosis is enriched in place, then the exact final
+    /// frame is retained for introspection and durable projection.
+    pub fn record_runtime_feedback(
+        &mut self,
+        query_source: &str,
+        frame: &mut RuntimeFeedbackFrame,
+        turn_output: Option<&TurnOutput>,
+    ) -> bool {
+        if !self.can_accept_runtime_feedback(frame) {
+            return false;
+        }
+        let Some(request_usage) = frame.request_usage else {
+            self.latest_runtime_feedback = Some(frame.clone());
+            return true;
+        };
+        let mut feedback = ContextFeedback {
+            tokens: request_usage,
+            cache_hit_ratio: request_usage.cache_hit_ratio(),
+            was_truncated: frame.was_truncated,
+            cache_break_detected: frame.cache_break_detected.clone(),
+        };
+        self.record_feedback(
+            &frame.identity.model_id,
+            query_source,
+            &mut feedback,
+            turn_output,
+        );
+        frame.cache_break_detected = feedback.cache_break_detected;
+        self.latest_runtime_feedback = Some(frame.clone());
+        true
+    }
+
+    /// Accept an immutable frame produced by a remote Server-owned loop.
+    ///
+    /// The receiving client may project this frame for introspection and its
+    /// local journal, but must not run local cache diagnosis over it: doing so
+    /// would mutate a Server-authored fact with client-local pending state.
+    pub fn accept_authoritative_runtime_feedback(&mut self, frame: &RuntimeFeedbackFrame) -> bool {
+        if !self.can_accept_runtime_feedback(frame) {
+            return false;
+        }
+        self.latest_runtime_feedback = Some(frame.clone());
+        true
+    }
+
+    #[must_use]
+    pub fn latest_runtime_feedback(&self) -> Option<&RuntimeFeedbackFrame> {
+        self.latest_runtime_feedback.as_ref()
+    }
+
+    fn can_accept_runtime_feedback(&self, candidate: &RuntimeFeedbackFrame) -> bool {
+        if !candidate.is_valid() {
+            return false;
+        }
+        let Some(current) = self.latest_runtime_feedback.as_ref() else {
+            return true;
+        };
+        if candidate.progress.session_turn != current.progress.session_turn {
+            return candidate.progress.session_turn > current.progress.session_turn;
+        }
+        if candidate.identity.run_id != current.identity.run_id {
+            // A successfully ingested request from the current runtime is the
+            // authority for a resumed/replaced run at the same user turn.
+            return true;
+        }
+        candidate.progress.llm_rounds_completed > current.progress.llm_rounds_completed
     }
 
     /// Record a prompt-too-long error (no successful response).
@@ -582,6 +670,7 @@ impl PipelineSession {
             cache_detector_state: self.cache_detector.snapshot_state(),
             pending_prompt_snapshot: self.pending_prompt_snapshot.clone(),
             turns_completed: self.turns_completed,
+            latest_runtime_feedback: self.latest_runtime_feedback.clone(),
             session_current_date: Some(self.session_current_date.clone()),
         }
     }
@@ -603,6 +692,7 @@ impl PipelineSession {
             cache_detector_state,
             pending_prompt_snapshot,
             turns_completed,
+            latest_runtime_feedback,
             session_current_date,
         } = snapshot;
         let mut recovery = recovery;
@@ -625,6 +715,7 @@ impl PipelineSession {
             cache_detector: CacheBreakDetector::from_state(cache_detector_state),
             pending_prompt_snapshot,
             turns_completed,
+            latest_runtime_feedback: latest_runtime_feedback.filter(RuntimeFeedbackFrame::is_valid),
             pending_audits: Vec::new(),
         }
     }
@@ -650,6 +741,8 @@ pub struct PipelineSessionSnapshot {
     pub(crate) pending_prompt_snapshot: Option<PendingPromptSnapshot>,
     #[serde(default)]
     pub turns_completed: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_runtime_feedback: Option<RuntimeFeedbackFrame>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_current_date: Option<String>,
 }
@@ -730,7 +823,6 @@ mod tests {
     use crate::microcompact::ProviderCacheStrategy;
     use crate::pipeline_config::ProviderCachePolicy;
     use crate::token_accounting::TokenAccounting;
-    use std::collections::HashMap;
 
     fn test_statics() -> StaticSections {
         StaticSections::test_default()
@@ -762,8 +854,6 @@ mod tests {
             tool_results: vec![],
             tokens: TokenAccounting::default(),
             active_skills: vec![],
-            recent_file_reads: HashMap::new(),
-            remaining_turns: 10,
             turn_index,
             recovery: RecoveryState::default(),
             last_user_message: "hello".into(),
@@ -809,6 +899,42 @@ mod tests {
         let output = sess.run_turn(input).expect("should not abort");
         assert_eq!(output.metrics.turn_index, 1);
         assert!(output.explain.phase_timings.len() == 4);
+    }
+
+    #[test]
+    fn adaptive_pipeline_keeps_deferred_tools_after_cache_boundary() {
+        let mut sess = PipelineSession::new(PipelineConfig::default());
+        let statics = test_statics();
+        let agent = AgentContext::default();
+        let mut session = test_session_context();
+        session.deferred_tools_block = "<deferred-tools>\nweb_fetch\n</deferred-tools>".to_string();
+        let turn = test_turn_state(1);
+        let external = test_external();
+
+        let output = sess
+            .run_turn_adaptive(AdaptiveTurnInput {
+                statics: &statics,
+                agent: &agent,
+                session: &session,
+                turn: &turn,
+                external: &external,
+                model_id: "claude-sonnet-4-6",
+                query_source: "repl",
+            })
+            .expect("deferred tool discovery must remain serializable");
+
+        let deferred = output
+            .serialized
+            .system_blocks
+            .iter()
+            .find(|block| block.kind == crate::section_types::SectionKind::DeferredTools)
+            .expect("non-empty deferred manifest must reach the provider request");
+        assert_eq!(
+            deferred.scope,
+            crate::section_types::CacheScope::None,
+            "admission-dependent tool names must not invalidate the session prefix"
+        );
+        assert!(deferred.text.contains("web_fetch"));
     }
 
     #[test]
@@ -1318,5 +1444,60 @@ mod tests {
         };
 
         let _output = sess.run_turn(input).expect("should succeed with emergent");
+    }
+
+    #[test]
+    fn runtime_feedback_is_monotonic_and_survives_snapshot() {
+        let mut sess = PipelineSession::new(PipelineConfig::default());
+        let mut current = crate::introspect::test_runtime_feedback(4, 2, 8);
+        assert!(sess.record_runtime_feedback("test", &mut current, None));
+
+        let mut stale = crate::introspect::test_runtime_feedback(3, 99, 0);
+        assert!(!sess.record_runtime_feedback("test", &mut stale, None));
+        let mut duplicate = current.clone();
+        assert!(!sess.record_runtime_feedback("test", &mut duplicate, None));
+        let mut resumed = crate::introspect::test_runtime_feedback(4, 1, 9);
+        resumed.identity.run_id = "run-2".into();
+        assert!(sess.record_runtime_feedback("test", &mut resumed, None));
+        assert_eq!(sess.latest_runtime_feedback(), Some(&resumed));
+
+        let restored = PipelineSession::from_snapshot(
+            PipelineConfig::default(),
+            sess.snapshot_full_state(),
+            "2026-08-09",
+        );
+        assert_eq!(restored.latest_runtime_feedback(), Some(&resumed));
+    }
+
+    #[test]
+    fn invalid_runtime_feedback_never_becomes_pipeline_authority() {
+        let mut sess = PipelineSession::new(PipelineConfig::default());
+        let mut invalid = crate::introspect::test_runtime_feedback(1, 1, 9);
+        invalid.identity.run_id.clear();
+        assert!(!sess.record_runtime_feedback("test", &mut invalid, None));
+        assert!(sess.latest_runtime_feedback().is_none());
+        assert_eq!(sess.stats.turns_executed, 0);
+
+        let mut snapshot = sess.snapshot_full_state();
+        snapshot.latest_runtime_feedback = Some(invalid);
+        let restored =
+            PipelineSession::from_snapshot(PipelineConfig::default(), snapshot, "2026-08-09");
+        assert!(restored.latest_runtime_feedback().is_none());
+    }
+
+    #[test]
+    fn authoritative_runtime_feedback_is_projected_without_local_enrichment() {
+        let mut sess = PipelineSession::new(PipelineConfig::default());
+        let frame = crate::introspect::test_runtime_feedback(2, 3, 7);
+
+        assert!(sess.accept_authoritative_runtime_feedback(&frame));
+        assert_eq!(sess.latest_runtime_feedback(), Some(&frame));
+        assert_eq!(sess.stats.turns_executed, 0);
+
+        let mut duplicate = frame.clone();
+        duplicate.cache_break_detected =
+            Some(crate::cache_diagnostics::CacheBreakReason::UnknownColdStart);
+        assert!(!sess.accept_authoritative_runtime_feedback(&duplicate));
+        assert_eq!(sess.latest_runtime_feedback(), Some(&frame));
     }
 }

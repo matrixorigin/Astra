@@ -225,6 +225,7 @@ pub struct HttpMemoriaPort {
     api_key: String,
     http: reqwest::Client,
     owner_user_id: Option<String>,
+    owner_binding_required: bool,
 }
 
 impl HttpMemoriaPort {
@@ -239,6 +240,14 @@ impl HttpMemoriaPort {
                 "memoria compact client",
             ),
             owner_user_id: None,
+            owner_binding_required: false,
+        }
+    }
+
+    fn new_master(base_url: String, master_key: String) -> Self {
+        Self {
+            owner_binding_required: true,
+            ..Self::new(base_url, master_key)
         }
     }
 
@@ -249,25 +258,48 @@ impl HttpMemoriaPort {
         self
     }
 
-    #[cfg(test)]
-    pub(crate) fn bound_owner_user_id(&self) -> Option<&str> {
-        self.owner_user_id.as_deref()
-    }
-
     /// Create from environment variables.
     pub fn from_env() -> Option<Self> {
         let mem = astra_core::MemoriaSettings::from_env();
-        Some(Self::new(mem.base_url, mem.master_key?))
+        Some(Self::new_master(mem.base_url, mem.master_key?))
     }
 
-    /// Read back active focus hints for a session (side-effect:
-    /// evicts expired entries). Public so test code can introspect.
-    pub fn active_focus_hints(&self, session_id: &str) -> Vec<(String, String, f64)> {
-        astra_memoria::memoria_runtime_state()
-            .active_focus(session_id)
-            .iter()
-            .map(|hint| (hint.focus_type.clone(), hint.value.clone(), hint.boost))
-            .collect()
+    fn request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        requested_owner: Option<&str>,
+    ) -> Result<reqwest::RequestBuilder, String> {
+        let requested_owner = requested_owner
+            .filter(|owner| !owner.is_empty())
+            .map(|owner| astra_memoria::MemoryScope::new(owner, "transport-owner"))
+            .transpose()?
+            .map(|scope| scope.user_id);
+        let bound_owner = self
+            .owner_user_id
+            .as_deref()
+            .map(|owner| astra_memoria::MemoryScope::new(owner, "transport-owner"))
+            .transpose()?
+            .map(|scope| scope.user_id);
+        if let (Some(bound), Some(requested)) = (bound_owner.as_deref(), requested_owner.as_deref())
+            && bound != requested
+        {
+            return Err("memory_scope_violation: requested owner differs from bound owner".into());
+        }
+        let owner = requested_owner.as_deref().or(bound_owner.as_deref());
+        if self.owner_binding_required && owner.is_none() {
+            return Err(
+                "Memoria master-key data request requires an authenticated owner binding".into(),
+            );
+        }
+        let request = self
+            .http
+            .request(method, url)
+            .header("Authorization", format!("Bearer {}", self.api_key));
+        Ok(match owner {
+            Some(owner) => request.header("X-User-Id", owner),
+            None => request,
+        })
     }
 
     pub async fn health_check(&self) -> Result<(), String> {
@@ -341,7 +373,8 @@ fn parse_strict_retrieved_memories(
     let entries = data
         .as_array()
         .or_else(|| data.get("memories").and_then(Value::as_array))
-        .expect("strict payload validation guarantees a memories array");
+        .or_else(|| data.get("items").and_then(Value::as_array))
+        .expect("strict payload validation guarantees a supported memory collection");
     let memories = entries
         .iter()
         .enumerate()
@@ -378,17 +411,12 @@ impl MemoriaPort for HttpMemoriaPort {
             "query": query,
             "top_k": top_k,
         });
-        if !user_id.trim().is_empty() {
-            body["user_id"] = json!(user_id);
-        }
         if !session_id.trim().is_empty() {
             body["session_id"] = json!(session_id);
         }
 
         let resp = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .request(reqwest::Method::POST, &url, Some(user_id))?
             .json(&body)
             .send()
             .await
@@ -439,39 +467,8 @@ impl MemoriaPort for HttpMemoriaPort {
                 body["session_scope"] = json!("only");
             }
         }
-        if let Some(scope) = strict_scope.as_ref() {
-            body["user_id"] = json!(scope.user_id);
-        }
-
-        // Attach active focus hints (client-side, session-scoped TTL).
-        // Memoria v1 currently ignores `boost_*`; v2 will honor.
-        let hints = self.active_focus_hints(session_id.unwrap_or(""));
-        if !hints.is_empty() {
-            let (mut topics, mut tags, mut mids) = (Vec::new(), Vec::new(), Vec::new());
-            for (ty, val, boost) in hints {
-                let entry = json!({"value": val, "boost": boost});
-                match ty.as_str() {
-                    "topic" => topics.push(entry),
-                    "tag" => tags.push(entry),
-                    "memory_id" => mids.push(entry),
-                    _ => {}
-                }
-            }
-            if !topics.is_empty() {
-                body["boost_topics"] = Value::Array(topics);
-            }
-            if !tags.is_empty() {
-                body["boost_tags"] = Value::Array(tags);
-            }
-            if !mids.is_empty() {
-                body["boost_memory_ids"] = Value::Array(mids);
-            }
-        }
-
         let resp = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .request(reqwest::Method::POST, &url, None)?
             .json(&body)
             .send()
             .await
@@ -494,49 +491,58 @@ impl MemoriaPort for HttpMemoriaPort {
 
     async fn retrieve_scoped_typed(
         &self,
-        query: &str,
+        _query: &str,
         session_id: &str,
         top_k: usize,
         memory_types: &[&str],
     ) -> Result<Vec<MemoriaMemory>, String> {
-        let url = format!(
-            "{}/v1/memories/retrieve",
-            self.base_url.trim_end_matches('/')
-        );
         let user_id = self.owner_user_id.as_deref().ok_or_else(|| {
             "typed Memoria retrieve requires an authenticated owner binding".to_string()
         })?;
         let scope = astra_memoria::MemoryScope::new(user_id, session_id)?;
-        let mut body = json!({
-            "query": query,
-            "top_k": top_k,
-            "session_id": session_id,
-            "session_scope": "only",
-            "user_id": scope.user_id,
-        });
-        if !memory_types.is_empty() {
-            body["memory_types"] = Value::Array(memory_types.iter().map(|ty| json!(ty)).collect());
+        let url = format!("{}/v1/memories", self.base_url.trim_end_matches('/'));
+        let limit = top_k.clamp(1, 500).to_string();
+        let requested_types: Vec<Option<&str>> = if memory_types.is_empty() {
+            vec![None]
+        } else {
+            memory_types.iter().copied().map(Some).collect()
+        };
+        let mut memories = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for memory_type in requested_types {
+            let mut query = vec![
+                ("session_id", scope.session_id.as_str()),
+                ("limit", limit.as_str()),
+            ];
+            if let Some(memory_type) = memory_type {
+                query.push(("memory_type", memory_type));
+            }
+            let resp = self
+                .request(reqwest::Method::GET, &url, None)?
+                .query(&query)
+                .send()
+                .await
+                .map_err(|e| format!("Memoria typed list failed: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("Memoria typed list HTTP {}", resp.status()));
+            }
+            let data: Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("Memoria typed list parse failed: {e}"))?;
+            for memory in parse_strict_retrieved_memories(&data, &scope)? {
+                if memory_type.is_some_and(|expected| memory.memory_type != expected) {
+                    return Err(
+                        "memory_scope_violation: typed list returned an invalid memory_type".into(),
+                    );
+                }
+                if seen.insert(memory.memory_id.clone()) {
+                    memories.push(memory);
+                }
+            }
         }
-
-        let resp = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("Memoria typed retrieve failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            return Err(format!("Memoria typed retrieve HTTP {}", resp.status()));
-        }
-
-        let data: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("Memoria typed retrieve parse failed: {e}"))?;
-
-        parse_strict_retrieved_memories(&data, &scope)
+        memories.truncate(top_k);
+        Ok(memories)
     }
 
     async fn store(
@@ -557,18 +563,13 @@ impl MemoriaPort for HttpMemoriaPort {
             })?;
             let scope = astra_memoria::MemoryScope::new(user_id, sid)?;
             body["session_id"] = json!(scope.session_id);
-            body["user_id"] = json!(scope.user_id);
-        } else if let Some(user_id) = self.owner_user_id.as_deref() {
-            body["user_id"] = json!(user_id);
         }
         if let Some(tier) = trust_tier {
             body["trust_tier"] = json!(tier);
         }
 
         let resp = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .request(reqwest::Method::POST, &url, None)?
             .json(&body)
             .send()
             .await
@@ -626,13 +627,10 @@ impl MemoriaPort for HttpMemoriaPort {
             "session_id": scope.session_id,
             "memory_types": memory_types,
             "reason": "session compaction cleanup",
-            "user_id": scope.user_id,
         });
 
         let resp = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .request(reqwest::Method::POST, &url, Some(&scope.user_id))?
             .json(&body)
             .send()
             .await
@@ -658,17 +656,16 @@ impl MemoriaPort for HttpMemoriaPort {
     }
 
     async fn delete(&self, memory_id: &str) -> Result<(), String> {
-        use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-        let encoded_id = utf8_percent_encode(memory_id, NON_ALPHANUMERIC).to_string();
-        let url = format!(
-            "{}/v1/memories/{}",
-            self.base_url.trim_end_matches('/'),
-            encoded_id
-        );
+        if memory_id.is_empty() {
+            return Err("delete requires a non-empty memory_id".into());
+        }
+        let url = format!("{}/v1/memories/purge", self.base_url.trim_end_matches('/'));
         let resp = self
-            .http
-            .delete(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .request(reqwest::Method::POST, &url, None)?
+            .json(&json!({
+                "memory_ids": [memory_id],
+                "reason": "superseded session memory",
+            }))
             .send()
             .await
             .map_err(|e| format!("Memoria delete failed: {e}"))?;
@@ -699,15 +696,11 @@ impl MemoriaPort for HttpMemoriaPort {
             "content": content,
             "memory_type": "episodic",
             "session_id": scope.session_id,
-            "user_id": scope.user_id,
             "trust_tier": "T3",
-            "source": {"agent": "session_end_orchestrator"},
-            "tags": ["astra:episode"],
+            "source": "astra:session_end_orchestrator",
         });
         let resp = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .request(reqwest::Method::POST, &url, Some(&scope.user_id))?
             .json(&body)
             .send()
             .await
@@ -726,10 +719,8 @@ impl MemoriaPort for HttpMemoriaPort {
             .unwrap_or_default())
     }
 
-    /// Persist a reflect scene candidate as a `semantic` memory tagged
-    /// `astra:scene`. Forward-feeds reflection output into the next
-    /// session's prewarm via the `astra:scene` tag — see
-    /// `session_end_governance` for the call site.
+    /// Persist a reflect scene candidate as a semantic memory with a stable
+    /// source label. Its typed content remains the recall protocol boundary.
     async fn store_scene(
         &self,
         session_id: &str,
@@ -745,8 +736,7 @@ impl MemoriaPort for HttpMemoriaPort {
             "content": content,
             "memory_type": "semantic",
             "trust_tier": "T4",
-            "source": {"agent": "session_end_reflect"},
-            "tags": ["astra:scene"],
+            "source": "astra:session_end_reflect",
         });
         if !session_id.is_empty() {
             let user_id = self
@@ -755,14 +745,9 @@ impl MemoriaPort for HttpMemoriaPort {
                 .ok_or_else(|| "store_scene requires an authenticated owner binding".to_string())?;
             let scope = astra_memoria::MemoryScope::new(user_id, session_id)?;
             body["session_id"] = json!(scope.session_id);
-            body["user_id"] = json!(scope.user_id);
-        } else if let Some(user_id) = self.owner_user_id.as_deref() {
-            body["user_id"] = json!(user_id);
         }
         let resp = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .request(reqwest::Method::POST, &url, None)?
             .json(&body)
             .send()
             .await
@@ -800,12 +785,9 @@ impl MemoriaPort for HttpMemoriaPort {
             })?;
             let scope = astra_memoria::MemoryScope::new(user_id, session_id)?;
             body["session_id"] = json!(scope.session_id);
-            body["user_id"] = json!(scope.user_id);
         }
         let resp = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .request(reqwest::Method::POST, &url, None)?
             .json(&body)
             .send()
             .await
@@ -836,23 +818,6 @@ impl MemoriaPort for HttpMemoriaPort {
         })
     }
 
-    async fn focus(
-        &self,
-        session_id: &str,
-        focus_type: &str,
-        value: &str,
-        boost: Option<f64>,
-        ttl_secs: Option<i64>,
-    ) -> Result<(), String> {
-        astra_memoria::memoria_runtime_state().set_focus(
-            session_id,
-            focus_type,
-            value,
-            boost.unwrap_or(1.5),
-            ttl_secs.unwrap_or(3600).max(1) as u64,
-        )
-    }
-
     async fn feedback(
         &self,
         memory_id: &str,
@@ -877,9 +842,7 @@ impl MemoriaPort for HttpMemoriaPort {
             body["context"] = json!(ctx);
         }
         let resp = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .request(reqwest::Method::POST, &url, None)?
             .json(&body)
             .send()
             .await
@@ -1308,7 +1271,59 @@ pub async fn compact_with_memoria(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn capture_one_http_request(
+        status: &str,
+        response_body: &'static [u8],
+    ) -> (
+        std::net::SocketAddr,
+        Arc<Mutex<String>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(String::new()));
+        let captured_for_server = Arc::clone(&captured);
+        let status = status.to_string();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let read = socket.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = std::str::from_utf8(&request[..header_end]).unwrap_or_default();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length: ")
+                            .or_else(|| line.strip_prefix("Content-Length: "))
+                    })
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or_default();
+                if request.len().saturating_sub(header_end + 4) >= content_length {
+                    break;
+                }
+            }
+            *captured_for_server.lock().unwrap() = String::from_utf8(request).unwrap();
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            socket.write_all(response_body).await.unwrap();
+        });
+        (address, captured, server)
+    }
 
     #[test]
     fn long_term_episode_and_scene_writers_emit_recallable_layered_protocol() {
@@ -2226,9 +2241,7 @@ mod tests {
                     }
                 }
             }
-            let full = String::from_utf8_lossy(&buf).into_owned();
-            let body_start = full.find("\r\n\r\n").map(|i| i + 4).unwrap_or(full.len());
-            *captured_cl.lock().unwrap() = full[body_start..].to_string();
+            *captured_cl.lock().unwrap() = String::from_utf8(buf).unwrap();
             let payload = b"{\"purged\": 3}";
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -2248,8 +2261,16 @@ mod tests {
         assert_eq!(purged, 3, "must parse `purged` from response");
         server.await.unwrap();
 
-        let body = captured.lock().unwrap().clone();
-        let json: serde_json::Value = serde_json::from_str(&body)
+        let raw = captured.lock().unwrap().clone();
+        let (headers, body) = raw.split_once("\r\n\r\n").unwrap();
+        assert!(headers.starts_with("POST /v1/memories/purge HTTP/1.1"));
+        assert!(
+            headers
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("x-user-id: user-7")),
+            "purge must be routed to the bound owner: {headers}"
+        );
+        let json: serde_json::Value = serde_json::from_str(body)
             .unwrap_or_else(|e| panic!("body parse fail: {e}, body=<{body}>"));
         assert_eq!(
             json.get("session_id").and_then(Value::as_str),
@@ -2266,6 +2287,10 @@ mod tests {
             json.get("topic").is_none(),
             "must NOT send topic-based selector (ngram doesn't match UUIDs)"
         );
+        assert!(
+            json.get("user_id").is_none(),
+            "transport identity must not be duplicated in the domain payload"
+        );
     }
 
     #[tokio::test]
@@ -2276,6 +2301,62 @@ mod tests {
             err.contains("non-empty"),
             "expected validation error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn delete_uses_owner_scoped_purge_instead_of_master_delete() {
+        let (address, captured, server) =
+            capture_one_http_request("200 OK", br#"{"purged":1}"#).await;
+        let client =
+            HttpMemoriaPort::new_master(format!("http://{address}"), "master-key".to_string())
+                .with_owner_user_id("owner-7");
+
+        client.delete("memory-42").await.expect("scoped delete");
+        server.await.unwrap();
+
+        let raw = captured.lock().unwrap().clone();
+        let (headers, body) = raw.split_once("\r\n\r\n").unwrap();
+        assert!(headers.starts_with("POST /v1/memories/purge HTTP/1.1"));
+        assert!(
+            headers
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("x-user-id: owner-7"))
+        );
+        let body: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["memory_ids"], json!(["memory-42"]));
+        assert!(body.get("user_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn episode_store_matches_memoria_schema_and_owner_routing() {
+        let response = br#"{"memory_id":"episode-1"}"#;
+        let (address, captured, server) = capture_one_http_request("201 Created", response).await;
+        let client =
+            HttpMemoriaPort::new_master(format!("http://{address}"), "master-key".to_string())
+                .with_owner_user_id("owner-7");
+
+        let id = client
+            .store_episode("session-9", "completed the migration")
+            .await
+            .expect("episode store");
+        assert_eq!(id, "episode-1");
+        server.await.unwrap();
+
+        let raw = captured.lock().unwrap().clone();
+        let (headers, body) = raw.split_once("\r\n\r\n").unwrap();
+        assert!(headers.starts_with("POST /v1/memories HTTP/1.1"));
+        assert!(
+            headers
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("x-user-id: owner-7"))
+        );
+        let body: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["memory_type"], "episodic");
+        assert_eq!(body["session_id"], "session-9");
+        assert_eq!(body["source"], "astra:session_end_orchestrator");
+        assert!(body["source"].is_string());
+        assert!(body.get("user_id").is_none());
+        assert!(body.get("tags").is_none());
     }
 
     #[tokio::test]
@@ -2361,9 +2442,7 @@ mod tests {
                     break;
                 }
             }
-            let raw = String::from_utf8(request).unwrap();
-            let body_start = raw.find("\r\n\r\n").map_or(raw.len(), |index| index + 4);
-            *captured_for_server.lock().unwrap() = raw[body_start..].to_string();
+            *captured_for_server.lock().unwrap() = String::from_utf8(request).unwrap();
             let payload = b"{\"memories\":[]}";
             let headers = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -2381,10 +2460,19 @@ mod tests {
         assert!(memories.is_empty());
         server.await.unwrap();
 
-        let body: Value = serde_json::from_str(&captured.lock().unwrap()).unwrap();
+        let raw = captured.lock().unwrap().clone();
+        let (headers, body) = raw.split_once("\r\n\r\n").unwrap();
+        assert!(headers.starts_with("POST /v1/memories/retrieve HTTP/1.1"));
+        assert!(
+            headers
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("x-user-id: user-7")),
+            "authenticated owner must be projected into the routing header: {headers}"
+        );
+        let body: Value = serde_json::from_str(body).unwrap();
         assert_eq!(body["query"], "typed recall");
         assert_eq!(body["top_k"], 6);
-        assert_eq!(body["user_id"], "user-7");
+        assert!(body.get("user_id").is_none());
         assert_eq!(body["session_id"], "session-9");
         assert!(body.get("session_scope").is_none());
     }
@@ -2424,10 +2512,8 @@ mod tests {
                     }
                 }
             }
-            let full = String::from_utf8_lossy(&buf).into_owned();
-            let body_start = full.find("\r\n\r\n").map(|i| i + 4).unwrap_or(full.len());
-            *captured_cl.lock().unwrap() = full[body_start..].to_string();
-            let payload = b"{\"memories\":[]}";
+            *captured_cl.lock().unwrap() = String::from_utf8(buf).unwrap();
+            let payload = br#"{"items":[{"memory_id":"working-1","content":"snapshot","memory_type":"working","user_id":"user-7","session_id":"8ae95566-f123-4abc-9def-0123456789ab"}],"next_cursor":null}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 payload.len()
@@ -2439,36 +2525,57 @@ mod tests {
 
         let client = HttpMemoriaPort::new(format!("http://{addr}"), "test-key".to_string())
             .with_owner_user_id("user-7");
-        client
+        let memories = client
             .retrieve_scoped_typed(
                 "session memory",
                 "8ae95566-f123-4abc-9def-0123456789ab",
                 7,
-                &["session_memory"],
+                &["working"],
             )
             .await
             .expect("typed retrieve ok");
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].memory_id, "working-1");
         server.await.unwrap();
 
-        let body = captured.lock().unwrap().clone();
-        let json: serde_json::Value = serde_json::from_str(&body)
-            .unwrap_or_else(|e| panic!("body parse fail: {e}, body=<{body}>"));
-        assert_eq!(
-            json.get("session_id").and_then(Value::as_str),
-            Some("8ae95566-f123-4abc-9def-0123456789ab")
+        let raw = captured.lock().unwrap().clone();
+        let (headers, body) = raw.split_once("\r\n\r\n").unwrap();
+        assert!(body.is_empty(), "typed list must be a GET without a body");
+        let request_target = headers.lines().next().unwrap();
+        assert!(request_target.starts_with("GET /v1/memories?"));
+        assert!(request_target.contains("session_id=8ae95566-f123-4abc-9def-0123456789ab"));
+        assert!(request_target.contains("memory_type=working"));
+        assert!(request_target.contains("limit=7"));
+        assert!(
+            headers
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("x-user-id: user-7")),
+            "typed list must carry authenticated owner routing: {headers}"
         );
-        assert_eq!(
-            json.get("session_scope").and_then(Value::as_str),
-            Some("only")
-        );
-        assert_eq!(json.get("user_id").and_then(Value::as_str), Some("user-7"));
-        assert_eq!(json.get("top_k").and_then(Value::as_u64), Some(7));
-        let types = json
-            .get("memory_types")
-            .and_then(Value::as_array)
-            .expect("memory_types array");
-        assert_eq!(types.len(), 1);
-        assert_eq!(types[0].as_str(), Some("session_memory"));
+    }
+
+    #[tokio::test]
+    async fn master_transport_fails_closed_without_owner_and_rejects_owner_mismatch() {
+        let unbound = HttpMemoriaPort::new_master("http://127.0.0.1:1".into(), "master-key".into());
+        let error = unbound
+            .store("content", "working", None, None)
+            .await
+            .expect_err("master data request without an owner must fail before I/O");
+        assert!(error.contains("requires an authenticated owner binding"));
+
+        let invalid = unbound.clone().with_owner_user_id(" owner-a");
+        let error = invalid
+            .store("content", "working", None, None)
+            .await
+            .expect_err("invalid bound owner must fail before I/O");
+        assert!(error.contains("memory scope user_id"));
+
+        let bound = unbound.with_owner_user_id("owner-a");
+        let error = bound
+            .retrieve_for_prompt("query", "owner-b", "session-1", 1)
+            .await
+            .expect_err("call-site owner must not override a bound owner");
+        assert!(error.starts_with("memory_scope_violation:"));
     }
 
     #[tokio::test]
@@ -2548,32 +2655,6 @@ mod tests {
         let client = HttpMemoriaPort::new(format!("http://{addr}"), "test-key".to_string());
         client.health_check().await.expect("health should pass");
         server.await.unwrap();
-    }
-
-    #[test]
-    fn tool_gateway_focus_is_visible_to_direct_runtime_port() {
-        let session_id = "shared-focus-tool-to-runtime";
-        astra_memoria::memoria_runtime_state().reset_session(session_id);
-        let gateway = astra_tools::memoria::MemoriaToolGateway::new(None, None);
-        let response = gateway.focus_set(
-            session_id,
-            &serde_json::json!({
-                "focus_type": "topic",
-                "focus_value": "session-memory",
-                "boost": 2.0,
-            }),
-        );
-        assert_eq!(
-            serde_json::from_str::<Value>(&response).unwrap()["status"],
-            "completed"
-        );
-
-        let port = HttpMemoriaPort::new("http://127.0.0.1:9".into(), "test-key".into());
-        assert_eq!(
-            port.active_focus_hints(session_id),
-            vec![("topic".into(), "session-memory".into(), 2.0)]
-        );
-        astra_memoria::memoria_runtime_state().reset_session(session_id);
     }
 
     #[tokio::test]

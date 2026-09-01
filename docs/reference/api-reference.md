@@ -6,7 +6,9 @@ Interactive docs: `http://localhost:17001/docs` (Swagger UI) | `http://localhost
 
 ## Authentication
 
-All endpoints except `/health`, `/auth/register`, `/auth/login` require JWT:
+All protected endpoints require a JWT. The public authentication exceptions
+are `/health`, `/auth/register`, `/auth/login`, `/auth/refresh`, and
+`/auth/logout` (refresh/logout authenticate the supplied refresh token):
 
 ```
 Authorization: Bearer <access_token>
@@ -62,7 +64,8 @@ Returns current user info.
 
 ### GET /agents
 
-List agents owned by current user. Query params: `limit`, `offset`.
+List all agents owned by the current user. This endpoint does not accept
+pagination parameters.
 
 ### GET /agents/{agent_id}
 
@@ -86,7 +89,9 @@ List agents owned by current user. Query params: `limit`, `offset`.
 
 ### GET /sessions
 
-Query params: `limit`, `offset`.
+Query params: `agent_id`, `session_status`, `limit`, `after_updated_at`, and
+`after_session_id`. The two `after_*` values form a seek cursor and must be
+provided together; `offset` pagination is not supported.
 
 ### GET /sessions/{session_id}
 
@@ -126,19 +131,16 @@ Query params: `limit`, `offset`.
 
 ### GET /events
 
-Query params: `session_id`, `limit`, `offset`.
+Query params: `session_id`, `event_type`, `agent_id`, `causal_chain_id`,
+`limit`, `after_created_at`, and `after_event_id`. The two `after_*` values
+form a seek cursor and must be provided together; `offset` pagination is not
+supported.
 
-Returns event summaries for list views. The `content` field may be truncated for efficiency; use `GET /events/{event_id}` for full event content and metadata.
+Returns event records for list views, including `content` and `metadata`.
 
-### GET /tasks
-
-Query params: `status`.
-
-Returns lightweight task summaries only (`task_id`, `title`, `status`, progress counters, timestamps, `project_type`). Use `GET /tasks/{task_id}` for full task detail including description, plan, checkpoint, and error fields.
-
-### GET /tasks/{task_id}
-
-Returns the full task record, including long-text and JSON fields.
+> Legacy `/tasks` and `/tasks/{task_id}` routes are not registered by the current
+> runtime. They are not public capabilities; use the versioned Work API under
+> `/v1/works` for the canonical work/task graph contract.
 
 ### GET /events/{event_id}
 
@@ -168,7 +170,8 @@ All events in a causal chain.
 
 ### GET /sandbox
 
-List sandboxes. Query params: `status`, `created_by`.
+List the current user's sandboxes. Query param: optional `pattern` name
+filter.
 
 ### GET /sandbox/{name}
 
@@ -180,11 +183,17 @@ List sandboxes. Query params: `status`, `created_by`.
 
 ### POST /sessions/{session_id}/replay
 
-Replay a session. Events are re-executed with tool mocking (no real side effects).
+Reserved for durable replay reconstruction. For an owned session this route
+currently returns HTTP 501 with an explicit unavailable detail; it does not
+create a replay identity or execute any provider, tool, or external call.
+Missing or foreign sessions return HTTP 404 without revealing ownership.
 
 ### GET /sessions/{session_id}/replay/compare
 
-Compare original session with replay results.
+Reserved for durable replay reconstruction. For an owned session this route
+currently returns HTTP 501 with an explicit unavailable detail; it does not
+return replay or comparison counts. Missing or foreign sessions return HTTP
+404 without revealing ownership.
 
 ---
 
@@ -212,6 +221,10 @@ Create a context snapshot (records exact LLM input before a call).
 
 ### GET /context
 
+Query params: `session_id`, `limit`, `after_created_at`, and
+`after_context_capture_id`. The two `after_*` values form a seek cursor and
+must be provided together.
+
 ### GET /context/{snapshot_id}
 
 ---
@@ -223,6 +236,10 @@ Create a context snapshot (records exact LLM input before a call).
 Record a decision with link to context snapshot.
 
 ### GET /decisions
+
+Query params: `session_id`, `decision_type`, `limit`, `after_created_at`, and
+`after_decision_id`. The two `after_*` values form a seek cursor and must be
+provided together.
 
 ### GET /decisions/{decision_id}
 

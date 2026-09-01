@@ -1,59 +1,107 @@
 # Astra documentation
 
-This directory is the design, operation, and reference documentation for Astra.
+The root [README](../README.md) is the product overview and fastest path to a
+running Astra instance. This index routes users, application developers,
+operators, and kernel contributors to the level of detail they need.
 
-Design docs are normative target contracts. They guide implementation; they are not summaries of whatever the current code happens to do today. Current implementation may satisfy only part of a design in a given branch.
+> [!IMPORTANT]
+> Quickstarts, guides, and references describe supported implementation paths.
+> Documents in [`design/`](design/) are normative target contracts and may be
+> ahead of the implementation on a given branch. Code, contract tests, and
+> runtime-profile tests remain authoritative for current behavior.
 
-Docs here should describe durable design, target behavior, public contracts, runbooks, and reference material. They should not be used as implementation diaries, PR status logs, verification transcripts, or historical scratchpads.
+## Choose your path
 
-## Start here
+| Goal | Start here | Next |
+| --- | --- | --- |
+| **Evaluate or use Astra** | [Getting started](quickstart/README.md) | [CLI reference](reference/cli-commands.md), [TUI slash commands](reference/slash-commands.md), [examples](../examples/README.md) |
+| **Build a product on Astra** | [TypeScript SDK](../packages/sdk/README.md) | [HTTP API](reference/api-reference.md), [configuration](reference/configuration.md) |
+| **Deploy and operate Astra** | [Deployment overview](../deployment/README.md) | [Docker](quickstart/docker.md), [production](quickstart/production.md), [troubleshooting](guides/troubleshooting.md) |
+| **Develop or contribute** | [Developer setup](quickstart/development.md) | [Development workflow](guides/development-workflow.md), [testing](guides/testing.md), [Make targets](reference/makefile-commands.md) |
+| **Understand or extend the kernel** | [Architecture](design/ARCHITECTURE.md) | [Design index](design/README.md) and the [core reading path](#kernel-design-reading-path) below |
 
-| Document | Scope |
+## Use and integrate Astra
+
+| Document | What it covers |
 | --- | --- |
-| [Architecture](design/ARCHITECTURE.md) | Current system overview and non-negotiable architecture principles. |
-| [Design index](design/README.md) | Canonical design domains and ownership boundaries. |
-| [Documentation architecture](design/documentation-architecture.md) | Rules for design ownership, document classes, and migration from historical docs. |
-| [Agent backbone and capacity providers](design/agent-backbone-capacity-provider.md) | Shared agent semantics across Web, CLI, Edge, Server, MCP, and future providers. |
-| [Runtime lifecycle](design/runtime-lifecycle.md) | Sessions, runs, turns, tasks, plan mode, cancel, resume, and recovery. |
-| [Capability system](design/capability-system.md) | Tools, skills, MCP, provider routing, admission, fallback, and diagnostics. |
-| [Tool result quality firewall](design/tool-result-quality-firewall.md) | Tool output validation and quality annotations before model reuse. |
-| [Context and prompt](design/context-and-prompt.md) | Context assembly, prompt cache, dynamic state, and memory injection boundaries. |
-| [Prompt lifecycle](design/prompt-lifecycle.md) | Prompt assembly, versioning, stable prefix, cache, and evolution boundary. |
-| [Context window management](design/context-window-management.md) | Token budgets, compaction, and context preservation. |
-| [Observation plane](design/observation-plane.md) | Trace, audit, introspect, reflect, status, and user-visible diagnostics. |
-| [Introspect and reflect](design/introspect-and-reflect.md) | Agent self-observation, reflection boundaries, and introspection dimensions. |
-| [Session observability](design/session-observability.md) | User/support visible status, stream projection, stuck diagnosis, reconnect. |
-| [Edge-cloud execution](design/edge-cloud-execution.md) | Edge/CLI local capacity and server-safe cloud fallback. |
-| [Model access and inference](design/model-access-and-inference.md) | Astra Cloud/Workspace/Device model access, TaaS bindings, inference placement, billing, invocation, and usage. |
-| [Cloud-edge sync](architecture/edge-cloud-sync-architecture.md) | Durable outbox, event facts, retention, repair, and sync status. |
-| [Safety and permissions](design/safety-and-permissions.md) | Permission, sandbox, side-effect, policy, and trust boundaries. |
-| [Permission sync](design/permission-sync.md) | Cross-surface scoped approvals, revocation, expiration, and audit. |
-| [Trust and safety](design/trust-and-safety.md) | Evidence, claim support, trust levels, and audit obligations. |
-| [Tuning jobs](design/tuning-jobs.md) | Controlled prompt/skill/routing/memory/model improvement workflows. |
-| [Evaluation](design/evaluation.md) | Behavioral evaluation, replay modes, and regression gates. |
+| [Quick start](quickstart/README.md) | Source and Docker entry points, first health check, and where to go next |
+| [CLI commands](reference/cli-commands.md) | Authentication, chat, sessions, models, skills, and administration |
+| [TUI slash commands](reference/slash-commands.md) | Interactive workspace, planning, observability, memory, MCP, and team commands |
+| [TypeScript SDK](../packages/sdk/README.md) | REST, SSE, WebSocket, React hooks, and browser integration |
+| [HTTP API](reference/api-reference.md) | Authentication and server resource contracts |
+| [Examples](../examples/README.md) | Maintained hands-on flows and integration-test examples |
 
-## Directory map
+## Deploy and operate Astra
 
-| Directory | Purpose |
+| Document | What it covers |
 | --- | --- |
-| `design/` | Current design contracts and target behavior. |
-| `architecture/` | Cross-domain architecture views. |
-| `guides/` | Operational guides and runbooks. |
-| `quickstart/` | Setup and first-run material. |
-| `reference/` | API, CLI, configuration, command, and dependency reference. |
-| `testing/` | Test strategy and coverage contracts. |
+| [Deployment overview](../deployment/README.md) | Supported deployment shapes and runtime-profile validation |
+| [Docker quick start](quickstart/docker.md) | All-in-one Compose and API-container development |
+| [Production deployment](quickstart/production.md) | Required secrets and Server-only or Server + User Runner startup |
+| [Deployment guide](guides/deployment.md) | Recommended operational path and health verification |
+| [Configuration reference](reference/configuration.md) | Server, database, authentication, model, Runner, and observability settings |
+| [Troubleshooting](guides/troubleshooting.md) | First diagnostics for dependencies, server startup, and tests |
+| [Run projection repair](guides/run-projection-repair.md) | Repair procedure when a derived run view is stale |
+
+## Develop and contribute
+
+| Document | What it covers |
+| --- | --- |
+| [Developer setup](quickstart/development.md) | Prerequisites, repository layout, local loop, and code conventions |
+| [Development workflow](guides/development-workflow.md) | Server-only, Server + User Runner, and Docker development profiles |
+| [Testing guide](guides/testing.md) | Offline, contract, online, and system test lanes |
+| [Makefile reference](reference/makefile-commands.md) | Build, validation, test, and development targets |
+| [Dependencies](reference/dependencies.md) | Required and optional development tools |
+| [System E2E matrix](testing/system-e2e-matrix.md) | Cross-surface runtime behavior and coverage obligations |
+| [Capability harness](testing/capability-harness.md) | Capability-provider and model/tool test contract |
+| [Coverage matrix](testing/coverage-matrix.md) | Feature-to-test coverage map |
+
+Before changing runtime behavior, read the owning design contract. Run the
+narrowest relevant test while iterating, then `make check` and the applicable
+offline or online lane before submitting a change.
+
+## Kernel design reading path
+
+Start with [Architecture](design/ARCHITECTURE.md), then use this path according
+to the subsystem you are changing:
+
+| Concern | Canonical design documents |
+| --- | --- |
+| One backbone and runtime profiles | [Agent backbone and capacity providers](design/agent-backbone-capacity-provider.md), [client surfaces and deployment](design/client-surfaces-and-deployment.md) |
+| Durable Work and orchestration | [Runtime lifecycle](design/runtime-lifecycle.md), [durable agent runs](design/durable-agent-runs.md), [orchestration](design/orchestration.md) |
+| User Runner and hybrid execution | [Edge-cloud execution](design/edge-cloud-execution.md), [edge runtime tool boundary](design/edge-runtime-tool-boundary.md), [Web agent runner](design/web-agent-runner.md), [cloud-edge sync](architecture/edge-cloud-sync-architecture.md) |
+| Tools, providers, and policy | [Capability system](design/capability-system.md), [provider runtime](design/capability-provider-runtime.md), [safety and permissions](design/safety-and-permissions.md), [tool-result quality firewall](design/tool-result-quality-firewall.md) |
+| Context Pipeline | [Context and prompt](design/context-and-prompt.md), [prompt lifecycle](design/prompt-lifecycle.md), [context-window management](design/context-window-management.md), [memory](design/memory.md) |
+| Trace, Explain, Introspect, and Reflect | [Observation plane](design/observation-plane.md), [introspect and reflect](design/introspect-and-reflect.md), [session observability](design/session-observability.md), [artifacts and debug bundles](design/artifacts-and-debug-bundles.md) |
+| Models, data, and learning | [Model access and inference](design/model-access-and-inference.md), [data and storage](design/data-and-storage.md), [evaluation and learning](design/evaluation-and-learning.md), [tuning jobs](design/tuning-jobs.md) |
+
+The [design index](design/README.md) is the complete map of design domains and
+ownership boundaries.
+
+## Documentation classes
+
+| Directory | Contract |
+| --- | --- |
+| `quickstart/` | Short, outcome-oriented first-run paths |
+| `guides/` | Task-oriented procedures, workflows, and runbooks |
+| `reference/` | Current commands, APIs, configuration, and dependencies |
+| `design/` | Normative architecture and target behavior |
+| `architecture/` | Cross-domain architecture views |
+| `testing/` | Test strategy, matrices, and coverage contracts |
 
 ## Documentation rules
 
 - One design domain has one canonical document.
-- Avoid implementation chronology. Describe invariants, responsibilities, and failure semantics.
-- Avoid duplicate source-of-truth documents. Merge or delete older versions.
-- Keep stable contracts in `docs/`; keep transient planning in `plans/` only while actionable.
-- Prefer concise current design over long historical documents.
-- A doc should state goals, non-goals, ownership boundaries, data/state model, failure modes, and test obligations.
+- Describe invariants, responsibilities, state, and failure semantics—not
+  implementation chronology.
+- Keep transient plans and verification transcripts out of durable docs.
+- Link to a source of truth instead of duplicating it.
+- Update the relevant quickstart, guide, or reference whenever a public
+  workflow or interface changes.
+- State test obligations for every behavioral design contract.
 
-## Architecture principle
-
-Astra has one agent backbone and multiple capacity providers.
-
-Web, CLI, Edge, Server, MCP, and future providers share session/run/turn lifecycle, context assembly, trace, reflection, checkpoint, tool admission, failure semantics, and audit. Capability differences come from providers, not from separate agent implementations.
+The governing principle is simple: Astra has one agent backbone and multiple
+capacity providers. Web, CLI, Server, User Runner, MCP, and future providers
+share lifecycle, context, policy, trace, reflection, checkpoint, and audit
+semantics; capability differences come from providers, not separate agent
+implementations.

@@ -47,10 +47,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             post(user_skill_handlers::activate_user_skill_handler),
         )
         .route(
-            "/skills/user/{skill_name}/install",
-            post(user_skill_handlers::install_user_skill_handler),
-        )
-        .route(
             "/skills/{skill_name}/info",
             get(skills::get_skill_info_handler),
         )
@@ -109,14 +105,6 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
             "/marketplace/credentials",
             post(crate::service_handlers::marketplace::save_credential_handler)
                 .delete(crate::service_handlers::marketplace::delete_credential_handler),
-        )
-        .route(
-            "/marketplace/skills/{skill_name}/publish",
-            post(crate::service_handlers::marketplace::publish_skill_handler),
-        )
-        .route(
-            "/marketplace/skills/{skill_name}/deprecate",
-            post(crate::service_handlers::marketplace::deprecate_skill_handler),
         )
         .route(
             "/marketplace/quality-report",

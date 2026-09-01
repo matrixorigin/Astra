@@ -2,10 +2,9 @@
 //!
 //! This is deliberately separate from the UI-oriented [`super::stream_events_writer`].
 //! Every record here is an exact protocol or lifecycle fact from one logical
-//! `/chat/turn` exchange. The emitter writes each line immediately, so ordinary
+//! `/chat/stream` exchange. The emitter writes each line immediately, so ordinary
 //! CLI paths do not retain a second copy of streamed token payloads.
 
-use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -21,15 +20,18 @@ struct StdoutJsonLineSink;
 
 impl JsonLineSink for StdoutJsonLineSink {
     fn write_line(&self, line: &str) -> Result<(), String> {
-        let stdout = std::io::stdout();
-        let mut lock = stdout.lock();
-        writeln!(lock, "{line}")
-            .and_then(|()| lock.flush())
-            .map_err(|error| format!("failed to write stream-json output: {error}"))
+        match crate::cli::stream::output_sink::write_stdout_line(line)
+            .map_err(|error| format!("failed to write stream-json output: {error}"))?
+        {
+            crate::cli::stream::output_sink::OutputWriteStatus::Written => Ok(()),
+            crate::cli::stream::output_sink::OutputWriteStatus::Closed => {
+                Err("stream-json output closed by its consumer".to_string())
+            }
+        }
     }
 }
 
-/// One CLI-local execution and its ordered logical `/chat/turn` exchanges.
+/// One CLI-local execution and its ordered logical `/chat/stream` exchanges.
 #[derive(Debug)]
 pub(crate) struct StreamJsonEmitter {
     sink: Arc<dyn JsonLineSink>,
@@ -81,6 +83,7 @@ impl StreamJsonEmitter {
         let exchange_id = uuid::Uuid::now_v7().to_string();
         let identity = ExchangeIdentity {
             session_id,
+            bridge_run_id: None,
             session_turn,
             round_index,
             exchange_id,
@@ -157,13 +160,16 @@ impl StreamJsonEmitter {
 #[derive(Debug)]
 struct ExchangeIdentity {
     session_id: Option<String>,
+    /// Durable run assigned by the Server for this exchange. This is distinct
+    /// from the CLI-local execution/turn-chain correlation id.
+    bridge_run_id: Option<String>,
     session_turn: u32,
     round_index: u32,
     exchange_id: String,
     request_ordinal: u32,
 }
 
-/// Mutable observer for exactly one logical `/chat/turn` response stream.
+/// Mutable observer for exactly one logical `/chat/stream` response stream.
 #[derive(Debug)]
 pub(crate) struct StreamJsonExchange {
     emitter: Arc<StreamJsonEmitter>,
@@ -201,12 +207,15 @@ impl StreamJsonExchange {
             }
             if let Some(bridge_run_id) = event.get("run_id").and_then(Value::as_str) {
                 validate_bounded_identity("bridge_run_id", bridge_run_id, 64)?;
-                if bridge_run_id != self.emitter.execution_id {
+                if let Some(expected) = self.identity.bridge_run_id.as_deref()
+                    && expected != bridge_run_id
+                {
                     return Err(
-                        "stream-json bridge_run_id differs from the execution turn_chain_id"
+                        "stream-json session_info changed bridge_run_id within one exchange"
                             .to_string(),
                     );
                 }
+                self.identity.bridge_run_id = Some(bridge_run_id.to_string());
             }
         }
         self.event_seq = self
@@ -244,11 +253,14 @@ impl StreamJsonExchange {
             "stream-json exchange reached [DONE] without a bridge run_id".to_string()
         })?;
         validate_bounded_identity("bridge_run_id", bridge_run_id, 64)?;
-        if bridge_run_id != self.emitter.execution_id {
+        if let Some(expected) = self.identity.bridge_run_id.as_deref()
+            && expected != bridge_run_id
+        {
             return Err(
-                "stream-json bridge_run_id differs from the execution turn_chain_id".to_string(),
+                "stream-json accumulator changed bridge_run_id within one exchange".to_string(),
             );
         }
+        self.identity.bridge_run_id = Some(bridge_run_id.to_string());
         let usage = accum.has_usage.then(|| {
             json!({
                 "fresh_input_tokens": accum.prompt_tokens,
@@ -356,7 +368,7 @@ mod tests {
             .accepted_event(&json!({
                 "type": "session_info",
                 "session_id": "session-canonical",
-                "run_id": "run-execution"
+                "run_id": "server-run"
             }))
             .unwrap();
         exchange
@@ -368,7 +380,7 @@ mod tests {
             .unwrap();
         let accum = ChatTurnSseAccum {
             session_id: Some("session-canonical".to_string()),
-            run_id: Some("run-execution".to_string()),
+            run_id: Some("server-run".to_string()),
             prompt_tokens: 7,
             completion_tokens: 2,
             has_usage: true,
@@ -400,7 +412,7 @@ mod tests {
         assert_eq!(records[1]["event_seq"], 1);
         assert_eq!(records[2]["event_seq"], 2);
         assert_eq!(records[3]["event_count"], 2);
-        assert_eq!(records[3]["bridge_run_id"], "run-execution");
+        assert_eq!(records[3]["bridge_run_id"], "server-run");
         assert_eq!(records[3]["session_id"], "session-canonical");
         assert_eq!(records[4]["execution_id"], "run-execution");
         assert_eq!(records[4]["turn_chain_id"], "run-execution");
@@ -480,6 +492,13 @@ mod tests {
                 }))
                 .is_err()
         );
+        exchange
+            .accepted_event(&json!({
+                "type": "session_info",
+                "session_id": "session-a",
+                "run_id": "server-run"
+            }))
+            .unwrap();
         assert!(
             exchange
                 .accepted_event(&json!({
@@ -499,7 +518,11 @@ mod tests {
                 })
                 .is_err()
         );
-        assert_eq!(parsed_lines(&sink).len(), 1);
+        assert_eq!(
+            parsed_lines(&sink).len(),
+            2,
+            "the one valid Server binding is retained before later conflicts fail closed"
+        );
     }
 
     #[test]

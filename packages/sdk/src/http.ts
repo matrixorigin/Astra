@@ -2,6 +2,18 @@ type AstraErrorBody = {
   detail?: unknown;
   error?: unknown;
   message?: unknown;
+  code?: unknown;
+  category?: unknown;
+  retryable?: unknown;
+  action_hints?: unknown;
+};
+
+export type DecodedAstraError = {
+  detail: string;
+  code?: string;
+  category?: string;
+  retryable?: boolean;
+  actionHints?: string[];
 };
 
 function stringField(value: unknown): string | undefined {
@@ -52,29 +64,42 @@ export function methodCanHaveJson(method: string): boolean {
   return normalized !== 'GET' && normalized !== 'HEAD';
 }
 
-export async function readAstraErrorDetail(response: Response): Promise<string> {
+export async function readAstraError(response: Response): Promise<DecodedAstraError> {
   const statusLine = `${response.status} ${response.statusText}`.trim();
   try {
     const text = await response.text();
     if (!text.trim()) {
-      return statusLine;
+      return { detail: statusLine };
     }
 
     const contentType = response.headers.get('content-type') ?? '';
     if (!contentType.includes('application/json')) {
-      return text.trim();
+      return { detail: text.trim() };
     }
 
     const body = JSON.parse(text) as AstraErrorBody;
-    return (
-      stringField(body.detail) ??
-      stringField(body.error) ??
-      stringField(body.message) ??
-      statusLine
-    );
+    const actionHints = Array.isArray(body.action_hints)
+      ? body.action_hints.filter((value): value is string => typeof value === 'string')
+      : undefined;
+    return {
+      detail:
+        stringField(body.detail) ??
+        stringField(body.error) ??
+        stringField(body.message) ??
+        stringField(body.code) ??
+        statusLine,
+      ...(stringField(body.code) ? { code: stringField(body.code) } : {}),
+      ...(stringField(body.category) ? { category: stringField(body.category) } : {}),
+      ...(typeof body.retryable === 'boolean' ? { retryable: body.retryable } : {}),
+      ...(actionHints ? { actionHints } : {}),
+    };
   } catch {
-    return statusLine;
+    return { detail: statusLine };
   }
+}
+
+export async function readAstraErrorDetail(response: Response): Promise<string> {
+  return (await readAstraError(response)).detail;
 }
 
 export function extractJwtSubject(token: string): string | null {

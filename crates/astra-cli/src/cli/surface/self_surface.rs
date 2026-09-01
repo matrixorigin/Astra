@@ -208,27 +208,9 @@ fn merge_workspace_with_restored(
     if workspace.git_branch.is_none() {
         workspace.git_branch = restored.git_branch.clone();
     }
-    if workspace.plan_goal.is_none() {
-        workspace.plan_goal = restored.plan_goal.clone();
-    }
-    if workspace.plan_config_json.is_none() {
-        workspace.plan_config_json = restored.plan_config_json.clone();
-    }
-    if workspace.contract_json.is_none() {
-        workspace.contract_json = restored.contract_json.clone();
-    }
-    if workspace.plan_corrections.is_empty() {
-        workspace.plan_corrections = restored.plan_corrections.clone();
-    }
     if workspace.last_context_trace.is_none() {
         workspace.last_context_trace = restored.last_context_trace.clone();
     }
-    if workspace.executing_plan_json.is_none() {
-        workspace.executing_plan_json = restored.executing_plan_json.clone();
-    }
-    workspace.plan_execution_rounds = workspace
-        .plan_execution_rounds
-        .max(restored.plan_execution_rounds);
     workspace.last_persistence_error = merge_persistence_errors(
         workspace.last_persistence_error.as_deref(),
         restored_persistence_error,

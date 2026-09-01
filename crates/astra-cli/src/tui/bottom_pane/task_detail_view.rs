@@ -8,8 +8,6 @@ use ratatui::{
 
 use super::view::{BottomPaneView, CancellationEvent};
 use crate::tui::history_cell::task::{ChildStatus, TaskCell, TaskStatus};
-use astra_tools::task_mgmt::SessionTask;
-use astra_tools::task_mgmt::SessionTaskStatusKind;
 
 /// Detail drill-in view for a TaskCell. Shows header + full children
 /// list with descriptions, durations, and output. Scrollable.
@@ -62,20 +60,6 @@ impl TaskDetailView {
         }
     }
 
-    pub fn from_session_task(task: &SessionTask) -> Self {
-        let title = format!("Task details · {}", truncate_label(&task.title, 50));
-        let lines = build_session_task_lines(task);
-        Self {
-            kind: DetailKind::Task,
-            title,
-            lines,
-            scroll: 0,
-            completed: false,
-            reopen: None,
-            live_task_id: None,
-        }
-    }
-
     pub fn with_reopen(mut self, reopen: impl Into<String>) -> Self {
         self.reopen = Some(reopen.into());
         self
@@ -98,145 +82,6 @@ impl TaskDetailView {
             self.scroll.min(new_max_scroll)
         };
     }
-}
-
-fn build_session_task_lines(task: &SessionTask) -> Vec<Line<'static>> {
-    let theme = crate::tui::theme::current();
-    let mut out = Vec::new();
-    let dim = Style::default().fg(theme.dim);
-    let bold = Style::default()
-        .fg(theme.accent)
-        .add_modifier(Modifier::BOLD);
-
-    let status_color = match task.status {
-        SessionTaskStatusKind::InProgress => theme.warn,
-        SessionTaskStatusKind::Completed => theme.success,
-        SessionTaskStatusKind::Failed => theme.error,
-        SessionTaskStatusKind::Cancelled => theme.warn,
-        _ => theme.fg,
-    };
-    out.push(Line::from(vec![
-        Span::styled(task.status.as_str(), Style::default().fg(status_color)),
-        Span::styled(" · ".to_string(), dim),
-        Span::styled(task.id.clone(), dim),
-    ]));
-
-    let plan_step = durable_plan_step_provenance(task);
-    if let Some((plan_id, version, step_id)) = plan_step {
-        out.push(Line::from(vec![
-            Span::styled("Kind · ".to_string(), dim),
-            Span::styled("Durable plan step", bold),
-        ]));
-        let mut plan_spans = vec![
-            Span::styled("Plan · ".to_string(), dim),
-            Span::styled(plan_id.to_string(), dim),
-        ];
-        if let Some(version) = version {
-            plan_spans.push(Span::styled(format!(" · v{version}"), dim));
-        }
-        out.push(Line::from(plan_spans));
-        out.push(Line::from(vec![
-            Span::styled("Step · ".to_string(), dim),
-            Span::styled(step_id.to_string(), dim),
-        ]));
-    }
-
-    if let Some(ref owner) = task.owner {
-        out.push(Line::from(vec![
-            Span::styled("Owner · ".to_string(), dim),
-            Span::styled(owner.clone(), dim),
-        ]));
-    }
-
-    if let Some(ref desc) = task.description {
-        out.push(Line::default());
-        out.push(Line::from(Span::styled("Description", bold)));
-        for line in desc.lines().take(10) {
-            out.push(Line::from(Span::styled(format!("  {line}"), dim)));
-        }
-    }
-
-    if !task.blocked_by.is_empty() {
-        out.push(Line::default());
-        out.push(Line::from(vec![
-            Span::styled("Depends on · ".to_string(), dim),
-            Span::styled(task.blocked_by.join(", "), dim),
-        ]));
-    }
-
-    if !task.subtasks.is_empty() {
-        out.push(Line::default());
-        out.push(Line::from(Span::styled(
-            format!("Checklist · {}", task.subtasks.len()),
-            bold,
-        )));
-        for sub in &task.subtasks {
-            let (icon, icon_color) = match sub.status {
-                SessionTaskStatusKind::Completed => ("✓", theme.success),
-                SessionTaskStatusKind::InProgress => ("◦", theme.warn),
-                SessionTaskStatusKind::Paused => ("⏸", theme.warn),
-                SessionTaskStatusKind::Pending => ("·", theme.dim),
-                SessionTaskStatusKind::Failed => ("✗", theme.error),
-                SessionTaskStatusKind::Cancelled => ("⏹", theme.warn),
-                SessionTaskStatusKind::Archived
-                | SessionTaskStatusKind::Deleted
-                | SessionTaskStatusKind::Migrated
-                | SessionTaskStatusKind::Other => ("·", theme.dim),
-            };
-            out.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(icon, Style::default().fg(icon_color)),
-                Span::raw(format!(" {}", sub.title)),
-            ]));
-        }
-    }
-
-    out.push(Line::default());
-    if !task.created_at.trim().is_empty() {
-        out.push(Line::from(vec![
-            Span::styled("Created · ".to_string(), dim),
-            Span::styled(task.created_at.clone(), dim),
-        ]));
-    }
-    out.push(Line::from(vec![
-        Span::styled(
-            if plan_step.is_some() {
-                "Revision · "
-            } else {
-                "Updated · "
-            }
-            .to_string(),
-            dim,
-        ),
-        Span::styled(task.updated_at.clone(), dim),
-    ]));
-
-    out
-}
-
-/// Proves plan provenance from both the reserved row namespace and typed
-/// metadata. User-authored checklist metadata alone must never make a row
-/// masquerade as a durable plan step.
-fn durable_plan_step_provenance(task: &SessionTask) -> Option<(&str, Option<u64>, &str)> {
-    if !task.id.starts_with("plan:") {
-        return None;
-    }
-    let metadata = task.metadata.as_ref()?;
-    if metadata.get("source")?.as_str()?.trim() != "plan" {
-        return None;
-    }
-    let plan_id = metadata.get("plan_id")?.as_str()?.trim();
-    let step_id = metadata.get("step_id")?.as_str()?.trim();
-    if plan_id.is_empty() || step_id.is_empty() {
-        return None;
-    }
-    Some((
-        plan_id,
-        metadata
-            .get("plan_version")
-            .and_then(serde_json::Value::as_u64),
-        step_id,
-    ))
 }
 
 use crate::cli::effects::truncate_label;
@@ -509,70 +354,6 @@ impl BottomPaneView for TaskDetailView {
 mod tests {
     use super::*;
     use crate::tui::history_cell::task::TaskCell;
-    use astra_tools::task_mgmt::SessionTask;
-
-    fn mk_session_task(id: &str, title: &str) -> SessionTask {
-        SessionTask {
-            archived_at: None,
-            id: id.into(),
-            title: title.into(),
-            description: None,
-            status: "pending".into(),
-            subtasks: Vec::new(),
-            created_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: "2026-01-01T00:00:00Z".into(),
-            active_form: None,
-            owner: None,
-            metadata: None,
-            blocks: Vec::new(),
-            blocked_by: Vec::new(),
-        }
-    }
-
-    /// C5 regression: multi-byte char title longer than 50 chars must
-    /// not panic. Old impl used `&s[..max - 1]` which slices bytes and
-    /// crashes mid-codepoint for CJK / emoji.
-    #[test]
-    fn from_session_task_with_long_cjk_title_does_not_panic() {
-        let long_cjk = "日本語のとても長いタスク名前です本当に長いんですよ".repeat(3);
-        let task = mk_session_task("1", &long_cjk);
-        // Just constructing it must not panic.
-        let view = TaskDetailView::from_session_task(&task);
-        assert!(!view.title.is_empty());
-    }
-
-    #[test]
-    fn durable_plan_step_detail_keeps_provenance_and_dependencies_distinct() {
-        let mut task = mk_session_task("plan:plan-7:verify", "Verify release");
-        task.created_at.clear();
-        task.updated_at = "plan-v12".into();
-        task.blocked_by = vec!["plan:plan-7:build".into()];
-        task.metadata = Some(serde_json::Map::from_iter([
-            ("source".into(), serde_json::json!("plan")),
-            ("plan_id".into(), serde_json::json!("plan-7")),
-            ("plan_version".into(), serde_json::json!(12)),
-            ("step_id".into(), serde_json::json!("verify")),
-        ]));
-
-        let view = TaskDetailView::from_session_task(&task);
-        let rendered = view
-            .lines
-            .iter()
-            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
-            .collect::<Vec<_>>()
-            .join("");
-
-        assert!(rendered.contains("Durable plan step"), "{rendered}");
-        assert!(rendered.contains("Plan · plan-7 · v12"), "{rendered}");
-        assert!(rendered.contains("Step · verify"), "{rendered}");
-        assert!(
-            rendered.contains("Depends on · plan:plan-7:build"),
-            "{rendered}"
-        );
-        assert!(rendered.contains("Revision · plan-v12"), "{rendered}");
-        assert!(!rendered.contains("Created ·"), "{rendered}");
-    }
-
     #[test]
     fn from_task_cell_with_emoji_description_does_not_panic() {
         let cell = TaskCell::new_running("tool-1", "🚀🔥💥".repeat(20));

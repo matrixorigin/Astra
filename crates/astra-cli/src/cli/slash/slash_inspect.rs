@@ -162,42 +162,6 @@ pub(crate) fn inspect_workbench(state: &SessionState) -> WorkbenchInspection {
         ],
     };
 
-    let mut plan_facts = Vec::new();
-    match state.executing_plan.as_ref() {
-        Some(plan) => {
-            plan_facts.push(InspectorFact::observed(
-                "Steps",
-                format!(
-                    "{}/{} complete · {}%",
-                    plan.items_done(),
-                    plan.subtasks.len(),
-                    plan.progress_pct()
-                ),
-            ));
-            if let Some(goal) = state.executing_plan_goal.as_deref() {
-                plan_facts.push(InspectorFact::observed("Goal", goal));
-            }
-            if let Some(step_id) = state.current_plan_subtask_id.as_deref() {
-                plan_facts.push(InspectorFact::observed("Active step", step_id));
-            }
-            if state.plan_execution_paused {
-                plan_facts.push(InspectorFact::observed(
-                    "Execution",
-                    "paused at a resumable boundary",
-                ));
-            }
-        }
-        None => plan_facts.push(InspectorFact::not_recorded("Execution plan", "not active")),
-    }
-    if let Some(error) = state.plan_execution_last_error.as_deref() {
-        plan_facts.push(InspectorFact::degraded("Last execution error", error));
-    }
-    let plan_section = InspectorSection {
-        title: "Plan & task".into(),
-        source: "current local execution projection · captured now".into(),
-        facts: plan_facts,
-    };
-
     let harness_facts = match render_snapshot_summary(state) {
         Ok(summary) => summary
             .lines()
@@ -216,7 +180,6 @@ pub(crate) fn inspect_workbench(state: &SessionState) -> WorkbenchInspection {
             state_section,
             capability_section,
             context_section,
-            plan_section,
             harness_section,
         ],
     }
@@ -798,7 +761,6 @@ mod tests {
                 "State",
                 "Capability & provider",
                 "Context",
-                "Plan & task",
                 "Harness evidence",
             ]
         );
@@ -833,7 +795,6 @@ mod tests {
             ("State", "Run"),
             ("State", "Model"),
             ("Context", "Assembly trace"),
-            ("Plan & task", "Execution plan"),
             ("Harness evidence", "Runtime snapshot"),
         ] {
             assert_eq!(

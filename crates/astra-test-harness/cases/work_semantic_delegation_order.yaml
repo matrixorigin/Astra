@@ -1,0 +1,106 @@
+name: work_semantic_delegation_order
+description: |
+  **What**: Start with a small ordinary product investigation that needs an inspectable,
+  evolving execution plan and one bounded independent check, without naming Astra's
+  implementation tools.
+  **Tests**: Semantic long-task routing, canonical Work establishment before task execution, durable
+  journal ordering, and non-interrupting decomposition. Runtime feedback signals such as search
+  fan-out and round churn remain diagnostic evidence; they are not universal failure conditions.
+  **Why**: A prompt that says `start_work` and supplies exact IDs only tests obedience to a
+  private API. This journey instead checks the product invariant from the user's intent: tracked
+  work is established before any collaborator is asked to do independent work.
+  **Pass means**: The runtime establishes exactly one canonical Work, then runs the two small
+  investigation tracks one at a time only after that fact is durable; it does not substitute
+  generic agents or fanout for a prose checklist and it does not ask for routine planning choices.
+  **Fail means**: Generic or parallel execution is invoked before durable Work exists, fanout replaces owned
+  WorkItems, the user sees an untracked plan, or the turn asks them to choose ordinary steps.
+prompt: |
+  I need to decide whether our CLI has a real, safe way to stop active session work. Keep this
+  small: inspect the session command surface and its HTTP client path only, then give me two
+  evidence-based bullets about whether cancellation is distinct from closing a session. Do not
+  edit files or run tests.
+
+  Keep progress inspectable as this investigation evolves. Put both already-known focused tracks
+  in the initial visible structure, then execute them one at a time. Do not add a separate task
+  just to combine or report their evidence. Do not ask me to choose routine decomposition details
+  or claim completion without evidence.
+models:
+  - deepseek-v4-flash
+capability: "custom:work_semantic_delegation_order"
+difficulty: 4
+weight: 3.0
+timeout_seconds: 180
+debug_log: true
+criteria:
+  - type: exit_code
+    code: 0
+  # A durable evaluation record is required before interpreting the Work result.
+  - type: session_event_count
+    event_type: turn_evaluation
+    min: 1
+  - type: journal_tool_call_count
+    name: start_work
+    min: 1
+    max: 2
+  # Lifecycle declaration is atomic: a rejected start burns a model boundary
+  # and leaves the product without a valid visible Work graph. Assert the
+  # durable typed outcome, not an error string or a particular task title.
+  - type: journal_tool_outcome_count
+    name: start_work
+    ok: false
+    min: 0
+    max: 0
+  - type: journal_tool_json
+    name: start_work
+    document: arguments
+    path: /activation
+    equals: start
+  - type: journal_tool_call_count
+    name: start_work
+    min: 1
+    max: 1
+    document: result
+    path: /status
+    equals: started
+  - type: journal_work_item_execution_from_start
+    min_distinct_items: 2
+  - type: journal_tool_call_count
+    name: settle_work_item
+    min: 2
+    max: 2
+  - type: journal_tool_call_count
+    name: agent
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: agent_fanout
+    min: 0
+    max: 0
+  - type: journal_tool_call_count
+    name: ask_user
+    min: 0
+    max: 0
+  - type: journal_tool_json
+    name: start_work
+    document: result
+    path: /initial_item_count
+    equals: 2
+  - type: journal_tool_json
+    name: start_work
+    document: result
+    path: /task_board_update/schema_version
+    equals: 1
+  # The coordinator and worker share a stable admitted surface across the
+  # serial items. A cache-break alert means the product rebuilt that prefix,
+  # inflating the very long-task path this case is meant to protect.
+  - type: pipeline_alert_count
+    rule: prompt_cache_break
+    max: 0
+  - type: provider_prompt_cache_read_ratio
+    min: 0.95
+    # This is an efficiency signal, not functional truth. Provider-side cache
+    # quantization can fluctuate just below 95% while every Work invariant and
+    # answer remains correct; keep the native quality severity instead of
+    # promoting it through all_of.
+    warmup_turns: 0
+    warmup_rounds: 1

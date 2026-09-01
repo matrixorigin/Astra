@@ -360,9 +360,6 @@ pub struct CompactBoundary {
     /// LLM-generated summary (Phase 2 feature).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
-    /// Files that were recently accessed and may be restored as attachments.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub recent_files: Vec<String>,
     /// Discovered tools carried across compaction/replay boundaries.
     ///
     /// These names can be used by the tool surface layer to re-materialize
@@ -382,7 +379,6 @@ impl CompactBoundary {
             messages_after: 0,
             last_pre_compact_uuid: None,
             summary: None,
-            recent_files: Vec::new(),
             discovered_tools: Vec::new(),
         }
     }
@@ -403,12 +399,6 @@ impl CompactBoundary {
     /// Set the last pre-compact message UUID for linking.
     pub fn with_last_uuid(mut self, uuid: impl Into<String>) -> Self {
         self.last_pre_compact_uuid = Some(uuid.into());
-        self
-    }
-
-    /// Set recent files for potential attachment restoration.
-    pub fn with_recent_files(mut self, files: Vec<String>) -> Self {
-        self.recent_files = files;
         self
     }
 
@@ -972,7 +962,6 @@ mod tests {
             .with_pre_metrics(5000, 8)
             .with_post_count(6)
             .with_last_uuid("abc-123")
-            .with_recent_files(vec!["src/lib.rs".into()])
             .with_discovered_tools(vec!["mcp__k8s_logs".into(), "mcp__special".into()]);
         let json = serde_json::to_string(&boundary).unwrap();
         let restored: CompactBoundary = serde_json::from_str(&json).unwrap();
@@ -982,7 +971,6 @@ mod tests {
         assert_eq!(restored.messages_before, 8);
         assert_eq!(restored.messages_after, 6);
         assert_eq!(restored.last_pre_compact_uuid.as_deref(), Some("abc-123"));
-        assert_eq!(restored.recent_files, vec!["src/lib.rs"]);
         assert_eq!(
             restored.discovered_tools,
             vec!["mcp__k8s_logs".to_string(), "mcp__special".to_string()]
@@ -1619,7 +1607,6 @@ mod tests {
         assert_eq!(b.messages_after, 0);
         assert!(b.last_pre_compact_uuid.is_none());
         assert!(b.summary.is_none());
-        assert!(b.recent_files.is_empty());
         assert!(b.discovered_tools.is_empty());
     }
 
@@ -1629,13 +1616,11 @@ mod tests {
             .with_pre_metrics(10000, 50)
             .with_post_count(10)
             .with_last_uuid("uuid-123")
-            .with_recent_files(vec!["a.rs".into(), "b.rs".into()])
             .with_discovered_tools(vec!["bash".into()]);
         assert_eq!(b.pre_tokens, 10000);
         assert_eq!(b.messages_before, 50);
         assert_eq!(b.messages_after, 10);
         assert_eq!(b.last_pre_compact_uuid.as_deref(), Some("uuid-123"));
-        assert_eq!(b.recent_files.len(), 2);
         assert_eq!(b.discovered_tools, vec!["bash"]);
     }
 
@@ -1643,25 +1628,19 @@ mod tests {
     fn compact_boundary_serde_round_trip() {
         let b = CompactBoundary::new(CompactTrigger::Auto, CompactionTier::TrimSchemas)
             .with_pre_metrics(5000, 20)
-            .with_post_count(8)
-            .with_recent_files(vec!["main.rs".into()]);
+            .with_post_count(8);
         let json = serde_json::to_string(&b).unwrap();
         let back: CompactBoundary = serde_json::from_str(&json).unwrap();
         assert_eq!(back.trigger, CompactTrigger::Auto);
         assert_eq!(back.pre_tokens, 5000);
         assert_eq!(back.messages_before, 20);
         assert_eq!(back.messages_after, 8);
-        assert_eq!(back.recent_files, vec!["main.rs"]);
     }
 
     #[test]
     fn compact_boundary_serde_skips_empty_vecs() {
         let b = CompactBoundary::new(CompactTrigger::Manual, CompactionTier::Normal);
         let json = serde_json::to_string(&b).unwrap();
-        assert!(
-            !json.contains("recent_files"),
-            "empty recent_files should be skipped"
-        );
         assert!(
             !json.contains("discovered_tools"),
             "empty discovered_tools should be skipped"

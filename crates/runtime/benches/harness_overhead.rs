@@ -28,6 +28,7 @@ fn make_snapshot() -> RuntimeSnapshot {
         context_utilization: Some(0.4),
         turns_used: 5,
         turns_limit: Some(25),
+        settlement_rounds_reserved: 0,
         session_turn: 2,
         tokens_used_session: 120_000,
         tokens_prompt: 70_000,

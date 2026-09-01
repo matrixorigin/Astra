@@ -5,9 +5,43 @@
 
 use std::time::SystemTime;
 
+use serde::Serialize;
+
 use super::fanout_group::{AgentFanoutSlotIdentity, AgentFanoutSlotStatus};
 use crate::interruption::InterruptionKind;
 pub const AGENT_FINISH_REASON_NORMAL: &str = "normal";
+
+/// Proven origin of a cancellation projected across orchestration boundaries.
+///
+/// `Unverified` is deliberately distinct from runtime cancellation: missing
+/// or malformed durable evidence must not be guessed into an irreversible
+/// user/runtime terminal fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancellationOrigin {
+    User,
+    Runtime,
+    Unverified,
+}
+
+impl CancellationOrigin {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Runtime => "runtime",
+            Self::Unverified => "unverified",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "user" => Some(Self::User),
+            "runtime" => Some(Self::Runtime),
+            "unverified" => Some(Self::Unverified),
+            _ => None,
+        }
+    }
+}
 
 /// Current status of a spawned agent.
 ///
@@ -104,18 +138,6 @@ pub fn agent_completion_is_interrupted(finish_reason: Option<&str>) -> bool {
     InterruptionKind::from_label(reason).is_some()
 }
 
-pub fn agent_finish_reason_is_parent_budget(reason: &str) -> bool {
-    matches!(
-        reason.trim(),
-        "budget_exhausted"
-            | "turn_budget_exhausted"
-            | "token_budget_exceeded"
-            | "context_overflow"
-            | "max_turns_exceeded"
-            | "max_turns"
-    )
-}
-
 pub fn project_agent_status_to_fanout_slot(status: &AgentStatus) -> AgentFanoutStatusProjection {
     let (status, terminal_reason) = match status {
         AgentStatus::Completed { finish_reason, .. } => {
@@ -128,14 +150,11 @@ pub fn project_agent_status_to_fanout_slot(status: &AgentStatus) -> AgentFanoutS
         }
         AgentStatus::Interrupted { finish_reason, .. } => {
             let reason = finish_reason.trim();
-            if agent_finish_reason_is_parent_budget(reason) {
-                (
-                    AgentFanoutSlotStatus::CancelledByParentBudget,
-                    Some(reason.to_string()),
-                )
-            } else {
-                (AgentFanoutSlotStatus::Interrupted, Some(reason.to_string()))
-            }
+            // Resource exhaustion belongs to the child that observed it. A
+            // parent/system cancellation has its own AgentStatus::Cancelled
+            // representation and must never be inferred from a free-form
+            // finish reason.
+            (AgentFanoutSlotStatus::Interrupted, Some(reason.to_string()))
         }
         AgentStatus::Failed {
             error,
@@ -153,7 +172,7 @@ pub fn project_agent_status_to_fanout_slot(status: &AgentStatus) -> AgentFanoutS
             if *by_user {
                 (AgentFanoutSlotStatus::CancelledByUser, reason)
             } else {
-                (AgentFanoutSlotStatus::CancelledByParentBudget, reason)
+                (AgentFanoutSlotStatus::CancelledByRuntime, reason)
             }
         }
         AgentStatus::Waiting { reason } => (
@@ -234,23 +253,16 @@ mod tests {
             !agent_completion_is_interrupted(Some("completed_with_warnings")),
             "unknown future successful completion reasons must not be reclassified as interrupted"
         );
-
-        assert!(agent_finish_reason_is_parent_budget("budget_exhausted"));
-        assert!(agent_finish_reason_is_parent_budget(" context_overflow "));
-        assert!(!agent_finish_reason_is_parent_budget("empty_completion"));
     }
 
     #[test]
-    fn fanout_projection_separates_budget_interruptions_from_child_interruptions() {
+    fn fanout_projection_keeps_child_budget_exhaustion_as_interrupted() {
         let budget_interrupted = AgentStatus::Interrupted {
             partial_result: "partial review".to_string(),
             finish_reason: "budget_exhausted".to_string(),
         };
         let projection = project_agent_status_to_fanout_slot(&budget_interrupted);
-        assert_eq!(
-            projection.status,
-            AgentFanoutSlotStatus::CancelledByParentBudget
-        );
+        assert_eq!(projection.status, AgentFanoutSlotStatus::Interrupted);
         assert_eq!(
             projection.terminal_reason.as_deref(),
             Some("budget_exhausted")

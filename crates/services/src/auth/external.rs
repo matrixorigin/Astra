@@ -152,14 +152,33 @@ pub struct ExternalCatalogModel {
 
 impl ExternalCatalogModel {
     fn into_model_list_item(self) -> ModelListItem {
+        // The catalog transport requires every Offering to have a non-empty
+        // provider component because it is part of the canonical seek tuple.
+        // External providers may omit `provider_ref`; normalize that absence
+        // once at the authority boundary instead of emitting a cursor that
+        // the runtime cannot accept on the next page.
+        let provider = self
+            .provider_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|provider| !provider.is_empty())
+            .unwrap_or("external")
+            .to_string();
+        let name = self
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| self.name.trim())
+            .to_string();
         ModelListItem {
             offering_id: self.id,
             access_id: "this-device".to_string(),
             access_kind: crate::models::ModelAccessKind::ThisDevice,
             access_label: "This device".to_string(),
             execution_placement: crate::models::ModelExecutionPlacement::Edge,
-            name: self.display_name.unwrap_or(self.name),
-            provider: self.provider_ref.unwrap_or_default(),
+            name,
+            provider,
             description: string_value(&self.metadata, "description"),
             is_active: true,
             context_window: i32_value(&self.limits, "context_window").unwrap_or_default(),
@@ -356,6 +375,8 @@ pub struct ExternalRuntimeCapabilityDescriptor {
     pub protocol: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_read: Option<RuntimeSemanticReadCapabilityRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_context_window: Option<u32>,
     #[serde(default)]
     pub metadata: Map<String, Value>,
 }
@@ -369,6 +390,7 @@ impl ExternalRuntimeCapabilityDescriptor {
             endpoint_url: self.endpoint_url.clone(),
             protocol: self.protocol.clone(),
             semantic_read: self.semantic_read.clone(),
+            model_context_window: self.model_context_window,
             metadata: self.metadata.clone(),
         }
     }
@@ -1136,6 +1158,18 @@ fn validate_capability_descriptor(
         &descriptor.protocol,
         expected_type,
     )
+    .and_then(
+        |()| match (expected_type, descriptor.model_context_window) {
+            ("model_gateway", Some(context_window)) if context_window > 0 => Ok(()),
+            ("model_gateway", _) => Err(provider_context_invalid(
+                "model_gateway.model_context_window must be positive",
+            )),
+            (_, Some(_)) => Err(provider_context_invalid(
+                "model_context_window is only valid for model_gateway capability descriptors",
+            )),
+            (_, None) => Ok(()),
+        },
+    )
     .map_err(|(status, error)| {
         error_response_coded(
             status,
@@ -1323,6 +1357,63 @@ mod tests {
             external_auth_endpoint: endpoint,
             auth_key: String::new(),
         }
+    }
+
+    fn external_catalog_model(provider_ref: Option<&str>) -> ModelListItem {
+        ExternalCatalogModel {
+            id: "edge-offering".to_string(),
+            name: "edge-model".to_string(),
+            display_name: None,
+            model_name: "edge-model".to_string(),
+            provider_ref: provider_ref.map(str::to_string),
+            capabilities: Vec::new(),
+            parameters: serde_json::Map::new(),
+            limits: serde_json::Map::new(),
+            metadata: serde_json::Map::new(),
+        }
+        .into()
+    }
+
+    fn external_catalog_model_with_display(display_name: Option<&str>) -> ModelListItem {
+        ExternalCatalogModel {
+            id: "edge-offering".to_string(),
+            name: "edge-model".to_string(),
+            display_name: display_name.map(str::to_string),
+            model_name: "edge-model".to_string(),
+            provider_ref: Some("moi".to_string()),
+            capabilities: Vec::new(),
+            parameters: serde_json::Map::new(),
+            limits: serde_json::Map::new(),
+            metadata: serde_json::Map::new(),
+        }
+        .into()
+    }
+
+    #[test]
+    fn external_catalog_normalizes_provider_for_seek_identity() {
+        assert_eq!(
+            external_catalog_model(None).provider,
+            "external",
+            "missing provider_ref must still produce a cursor-safe identity"
+        );
+        assert_eq!(
+            external_catalog_model(Some("  ")).provider,
+            "external",
+            "blank provider_ref must not produce an unusable cursor"
+        );
+        assert_eq!(
+            external_catalog_model(Some(" moi ")).provider,
+            "moi",
+            "provider_ref is canonicalized at the catalog authority boundary"
+        );
+        assert_eq!(
+            external_catalog_model_with_display(Some("  ")).name,
+            "edge-model"
+        );
+        assert_eq!(
+            external_catalog_model_with_display(Some(" Edge Model ")).name,
+            "Edge Model"
+        );
     }
 
     #[tokio::test]
@@ -1695,6 +1786,7 @@ mod tests {
                     "transport": "http",
                     "endpoint_url": "http://127.0.0.1/api/v1/models/openai/chat/completions",
                     "protocol": "openai_chat_completions",
+                    "model_context_window": 32768,
                     "metadata": {}
                 },
                 "edge_agent": {
@@ -1721,7 +1813,7 @@ mod tests {
             "provider_scope_id": "ws-1"
         });
 
-        let context: ExternalRuntimeContextResponse =
+        let mut context: ExternalRuntimeContextResponse =
             serde_json::from_value(value).expect("MOI runtime context should parse");
         validate_provider_runtime_context(
             &provider("http://127.0.0.1/external-auth".to_string()),
@@ -1741,11 +1833,37 @@ mod tests {
         let model_gateway = context
             .capability_descriptors
             .model_gateway
+            .as_ref()
             .expect("model gateway");
         assert_eq!(model_gateway.protocol, "openai_chat_completions");
         assert_eq!(
             model_gateway.endpoint_url,
             "http://127.0.0.1/api/v1/models/openai/chat/completions"
+        );
+
+        validate_provider_runtime_context(
+            &provider("http://127.0.0.1/external-auth".to_string()),
+            "model-qwen",
+            "ws-1",
+            &context,
+        )
+        .expect("positive model context must pass provider validation");
+
+        context
+            .capability_descriptors
+            .model_gateway
+            .as_mut()
+            .expect("model gateway")
+            .model_context_window = None;
+        assert!(
+            validate_provider_runtime_context(
+                &provider("http://127.0.0.1/external-auth".to_string()),
+                "model-qwen",
+                "ws-1",
+                &context,
+            )
+            .is_err(),
+            "provider runtime context without physical model capacity must fail closed"
         );
     }
 
@@ -1838,6 +1956,7 @@ mod tests {
                     "transport": "http",
                     "endpoint_url": "http://127.0.0.1/api/v1/models/openai/chat/completions",
                     "protocol": "openai_chat_completions",
+                    "model_context_window": 32768,
                     "metadata": {}
                 },
                 "mcp": {

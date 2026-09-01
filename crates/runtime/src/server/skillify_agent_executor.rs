@@ -101,6 +101,7 @@ impl RuntimeSkillifyAgentExecutor {
                 llm_nonstream_timeout(),
             )
             .await
+            .into_result()
             .map_err(|error| {
                 let message = crate::turn::llm::client::redact_provider_secrets(&error.message);
                 format!(
@@ -205,9 +206,11 @@ impl RuntimeSkillifyAgentExecutor {
             execution,
             astra_turn_types::InferenceInvocationScope::HarnessRun {
                 harness_run_id: request.harness_run_id.clone(),
-                operation_id: "skillify_extract".to_string(),
-                logical_attempt: u32::try_from(chunk.index)
-                    .map_err(|_| "Skillify chunk index exceeds u32".to_string())?,
+                // Each parallel chunk owns a separate logical namespace. A
+                // bounded admission recovery may consume attempt 1 without
+                // colliding with the adjacent chunk.
+                operation_id: format!("skillify_extract_{}", chunk.index),
+                logical_attempt: 0,
             },
             system_prompt,
             &user_prompt,
@@ -691,6 +694,7 @@ mod tests {
             format!("http://{provider_address}/v1/chat/completions"),
             "Bearer test-key".to_string(),
             Some(2_000),
+            128_000,
         );
         let execution = SkillifyInferenceExecution {
             ledger: DurableInferenceLedger::new(pool.clone(), &user_id, admitted.clone()),

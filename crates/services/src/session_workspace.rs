@@ -22,10 +22,6 @@ use crate::{
 
 pub const WORKSPACE_METADATA_ARTIFACT_KIND: &str = "workspace_metadata";
 
-fn is_zero(v: &usize) -> bool {
-    *v == 0
-}
-
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
@@ -55,6 +51,7 @@ pub struct ContextTraceToolSurface {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextTraceMemorySignal {
+    pub outcome: astra_turn_types::MemoryRetrievalOutcome,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub query: String,
     #[serde(default)]
@@ -150,26 +147,31 @@ impl ContextTraceSignal {
             };
             parts.push(format!("{label}: {}", selection.visible_tools.join(", ")));
         }
-        if let Some(memory) = self.memory.as_ref()
-            && !memory.selected_memory_ids.is_empty()
-        {
-            let detail = if !memory.query.is_empty() {
-                {
-                    let preview: String = memory.query.chars().take(64).collect();
-                    if memory.query.chars().count() > 64 {
-                        format!(" for \"{preview}...\"")
-                    } else {
-                        format!(" for \"{preview}\"")
+        if let Some(memory) = self.memory.as_ref() {
+            if memory.outcome.was_attempted()
+                && memory.outcome != astra_turn_types::MemoryRetrievalOutcome::Complete
+            {
+                parts.push(format!("memory: {}", memory.outcome.as_str()));
+            }
+            if !memory.selected_memory_ids.is_empty() {
+                let detail = if !memory.query.is_empty() {
+                    {
+                        let preview: String = memory.query.chars().take(64).collect();
+                        if memory.query.chars().count() > 64 {
+                            format!(" for \"{preview}...\"")
+                        } else {
+                            format!(" for \"{preview}\"")
+                        }
                     }
-                }
-            } else {
-                Default::default()
-            };
-            parts.push(format!(
-                "memory: {} selected{}",
-                memory.selected_memory_ids.len(),
-                detail
-            ));
+                } else {
+                    Default::default()
+                };
+                parts.push(format!(
+                    "memory: {} selected{}",
+                    memory.selected_memory_ids.len(),
+                    detail
+                ));
+            }
         }
         if let Some(history) = self.history.as_ref()
             && history.compressed_turns > 0
@@ -321,24 +323,6 @@ pub struct WorkspaceMetadata {
     /// Checkpoint turns (turn numbers where checkpoints were created).
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub checkpoints: Vec<u32>,
-    /// Active plan being executed (JSON-serialized TaskPlan).
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub executing_plan_json: Option<String>,
-    /// Goal text for the executing plan.
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub plan_goal: Option<String>,
-    /// Plan execution config (JSON-serialized PlanExecutionConfig).
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub plan_config_json: Option<String>,
-    /// Number of parallel execution rounds completed.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub plan_execution_rounds: usize,
-    /// Active durable task contract (JSON-serialized TaskContract).
-    #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub contract_json: Option<String>,
-    /// Operator corrections injected during plan pause (persisted for crash recovery).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub plan_corrections: Vec<String>,
     /// Set when this session was forked from another local session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
@@ -490,12 +474,6 @@ impl WorkspaceMetadata {
             status: "active".to_string(),
             summary: None,
             checkpoints: Vec::new(),
-            executing_plan_json: None,
-            plan_goal: None,
-            plan_config_json: None,
-            plan_execution_rounds: 0,
-            contract_json: None,
-            plan_corrections: Vec::new(),
             parent_session_id: None,
             forked_at_turn: None,
             fork_note: None,
@@ -542,12 +520,6 @@ impl WorkspaceMetadata {
             status: "active".to_string(),
             summary: None,
             checkpoints: Vec::new(),
-            executing_plan_json: None,
-            plan_goal: None,
-            plan_config_json: None,
-            plan_execution_rounds: 0,
-            contract_json: None,
-            plan_corrections: Vec::new(),
             parent_session_id: None,
             forked_at_turn: None,
             fork_note: None,
@@ -1267,6 +1239,7 @@ mod tests {
                 latency_ms: 18,
             }),
             memory: Some(ContextTraceMemorySignal {
+                outcome: astra_turn_types::MemoryRetrievalOutcome::Complete,
                 query: "resume trace persistence".into(),
                 candidates_considered: 7,
                 selected_memory_ids: vec!["m1".into(), "m2".into()],
@@ -1478,37 +1451,6 @@ mod tests {
         assert_eq!(parsed.total_tokens_in, 200);
         assert_eq!(parsed.total_cache_read_tokens, 40);
         assert_eq!(parsed.total_cache_creation_tokens, 8);
-    }
-
-    #[test]
-    fn workspace_plan_state_round_trip() {
-        let mut ws = WorkspaceMetadata::with_context("plan-sess", "gpt-4", "/tmp", Some("main"));
-        ws.executing_plan_json = Some(
-            r#"{"subtasks":[{"id":"s1","title":"task 1","status":"InProgress","depends_on":[]}]}"#
-                .to_string(),
-        );
-        ws.plan_goal = Some("Implement feature X".to_string());
-        ws.plan_config_json = Some(r#"{"step_by_step":true}"#.to_string());
-        ws.plan_execution_rounds = 3;
-
-        let yaml = serde_yaml_ng::to_string(&ws).unwrap();
-        let parsed: WorkspaceMetadata = serde_yaml_ng::from_str(&yaml).unwrap();
-
-        assert_eq!(parsed.executing_plan_json, ws.executing_plan_json);
-        assert_eq!(parsed.plan_goal, Some("Implement feature X".to_string()));
-        assert_eq!(parsed.plan_config_json, ws.plan_config_json);
-        assert_eq!(parsed.plan_execution_rounds, 3);
-    }
-
-    #[test]
-    fn workspace_no_plan_omits_fields() {
-        let ws = WorkspaceMetadata::with_context("s", "m", "/tmp", None);
-        let yaml = serde_yaml_ng::to_string(&ws).unwrap();
-        // Plan fields should be omitted when None/0
-        assert!(!yaml.contains("executing_plan_json"));
-        assert!(!yaml.contains("plan_goal"));
-        assert!(!yaml.contains("plan_config_json"));
-        assert!(!yaml.contains("plan_execution_rounds"));
     }
 
     #[test]

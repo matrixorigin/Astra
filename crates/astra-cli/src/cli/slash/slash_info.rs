@@ -2,7 +2,6 @@ use crate::cli::surface::health_status_surface::api_probe_is_healthy;
 use crate::cli::{
     chat_stream::{ChatTurnParams, DEFAULT_TURN_INDEX, stream_chat_sse},
     cli_config::cli_utils::truncate_str,
-    durable_bridge,
     permission_manager::PermissionManager,
     session::session_state::SessionState,
     stream::stream_render,
@@ -1261,7 +1260,13 @@ pub(crate) async fn handle_info_command(
                 ),
                 GrepRequest::Files(pattern) => (
                     format!("Workspace glob · {pattern}"),
-                    executor.glob(&serde_json::json!({"pattern": pattern, "path": "."})),
+                    astra_tools::ToolExecutor::execute_with_metadata(
+                        &executor,
+                        "glob",
+                        &serde_json::json!({"pattern": pattern, "path": "."}),
+                    )
+                    .await
+                    .output,
                 ),
                 GrepRequest::Review(pattern) => {
                     let title = format!("Review grep · {pattern}");
@@ -1363,8 +1368,10 @@ pub(crate) async fn handle_info_command(
                 plan_subtask_id: None,
                 delegation_engine: None,
                 cancel_token: None,
+                execution_time_budget: None,
                 run_control: None,
                 incremental_state: None,
+                request_session_execution_lease: None,
                 plan_assemble_line_release: None,
                 stream_event_tx: None,
                 stream_json_emitter: None,
@@ -1388,8 +1395,6 @@ pub(crate) async fn handle_info_command(
                 git_commit_journal: None,
                 git_worktree_journal: None,
                 session_state_journal: None,
-                task_manager: None,
-                task_notify_tx: None,
                 bg_task_commands: None,
                 bg_task_list_cache: None,
                 bash_detach_slot: None,
@@ -1397,10 +1402,10 @@ pub(crate) async fn handle_info_command(
                 pipeline_state: None,
                 compaction_state: None,
                 consecutive_context_window_errors: 0,
+                workspace_observation_quarantine: state.workspace_observation_quarantine.clone(),
                 idempotency_cache: None,
                 pre_loaded_messages: None,
                 append_system_prompt: None,
-                session_memory_extractor: None,
                 #[cfg(feature = "harness")]
                 harness_sink: Some(state.harness_sink.clone()),
                 #[cfg(feature = "harness")]
@@ -2103,27 +2108,6 @@ pub(crate) async fn handle_info_command(
                         format!("  ✓ Rewound to turn {target}. Removed {removed} turn(s).").green()
                     );
                 }
-            }
-        }
-
-        "/report" => {
-            // Check active durable task state first, then fallback to last saved report
-            let report = state
-                .durable_task_state
-                .as_ref()
-                .and_then(|d| d.last_report.as_ref())
-                .or(state.last_delivery_report.as_ref());
-
-            if let Some(report) = report {
-                durable_bridge::display_delivery_report(report);
-                if arg.trim() == "save" || arg.trim() == "json" {
-                    durable_bridge::save_delivery_report_json(report);
-                }
-            } else {
-                eprintln!(
-                    "{}",
-                    "  No delivery report available. Complete a plan with /plan first.".dim()
-                );
             }
         }
 

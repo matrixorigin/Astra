@@ -1,17 +1,10 @@
-//! Canonical session coordination shared by local-file and server storage.
+//! Canonical database-backed session coordination.
 //!
 //! The mutable record is intentionally small: one branch head, one writer
 //! lease, and one turn reservation. Conversation payloads and manifest nodes
 //! are immutable and durable before a head can reference them.
 
-use std::{
-    collections::HashSet,
-    fs::{self, File, OpenOptions},
-    io::{BufReader, BufWriter, Write},
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{collections::HashSet, time::Duration};
 
 use astra_core::{
     SharedPool, matrixone_statement_with_null_shape, push_matrixone_bound_string_set,
@@ -27,7 +20,6 @@ use astra_turn_types::{
     canonical_conversation_serialized_len,
 };
 use async_trait::async_trait;
-use fs2::FileExt;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -35,16 +27,14 @@ use sqlx::{MySql, QueryBuilder, Row, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
-const FILE_STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_IDEMPOTENCY_KEY_BYTES: usize = 512;
+const COORDINATOR_STATE_SCHEMA_VERSION: u32 = 1;
 const MAX_SEGMENT_BATCH: usize = 256;
 const MAX_STAGED_SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_STAGED_BATCH_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
 const MAX_RESERVATION_TTL: Duration = Duration::from_secs(15 * 60);
 const RECEIPT_HASH_DOMAIN: &[u8] = b"astra.session-coordinator-receipt.v1\0";
-const SESSION_PATH_HASH_DOMAIN: &[u8] = b"astra.session-coordinator-path.v1\0";
-const OWNER_PATH_HASH_DOMAIN: &[u8] = b"astra.session-coordinator-owner-path.v1\0";
 const TURN_DELTA_HASH_DOMAIN: &[u8] = b"astra.canonical-turn-delta.v1\0";
 
 #[derive(Debug, Error)]
@@ -67,20 +57,6 @@ pub enum SessionContextCoordinatorError {
     SegmentNotFound,
     #[error("coordinator clock is outside the supported range")]
     Clock,
-    #[error("coordinator task failed: {0}")]
-    Task(String),
-    #[error("coordinator I/O failed for {path}: {source}")]
-    Io {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("coordinator JSON failed for {path}: {source}")]
-    Json {
-        path: PathBuf,
-        #[source]
-        source: serde_json::Error,
-    },
     #[error("coordinator database operation {operation} failed: {source}")]
     Database {
         operation: &'static str,
@@ -114,6 +90,18 @@ pub enum ReserveTurnOutcome {
     },
 }
 
+/// One atomically renewed writer/reservation pair.
+///
+/// A canonical turn is writable only while both authorities are live. Renewing
+/// them in separate transactions creates a state in which the writer has been
+/// extended but its turn reservation has not, so callers must not compose the
+/// two narrower renewal operations when they own an active turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenewedTurnAuthority {
+    pub writer_lease: ConversationWriterLeaseV1,
+    pub turn_reservation: TurnReservationV1,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WriterTransferConflictV1 {
     CursorChanged,
@@ -128,6 +116,8 @@ pub struct WriterTransferRequestV1 {
     pub key: SessionKeyV1,
     pub mode: SessionHandoffModeV1,
     pub source_lease: Option<ConversationWriterLeaseV1>,
+    /// Optional command-level CAS fence for writer-only authority changes.
+    pub expected_writer_epoch: Option<u64>,
     pub expected_cursor: Option<SessionCursorV1>,
     pub target_actor: ActorContextV1,
     pub risk: HandoffRiskEvidenceV1,
@@ -260,6 +250,14 @@ pub trait SessionContextCoordinator: Send + Sync {
         ttl: Duration,
     ) -> Result<TurnReservationV1, SessionContextCoordinatorError>;
 
+    /// Atomically renew the complete authority required to commit one turn.
+    async fn renew_turn_authority(
+        &self,
+        lease: &ConversationWriterLeaseV1,
+        reservation: &TurnReservationV1,
+        ttl: Duration,
+    ) -> Result<RenewedTurnAuthority, SessionContextCoordinatorError>;
+
     async fn commit_turn(
         &self,
         reservation: &TurnReservationV1,
@@ -272,30 +270,6 @@ pub trait SessionContextCoordinator: Send + Sync {
         key: &SessionKeyV1,
         epochs: AuthorityEpochsV1,
     ) -> Result<(), SessionContextCoordinatorError>;
-}
-
-pub trait CoordinatorClock: Send + Sync {
-    fn now_unix_ms(&self) -> Result<i64, SessionContextCoordinatorError>;
-}
-
-#[derive(Debug, Default)]
-pub struct SystemCoordinatorClock;
-
-impl CoordinatorClock for SystemCoordinatorClock {
-    fn now_unix_ms(&self) -> Result<i64, SessionContextCoordinatorError> {
-        let duration = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| SessionContextCoordinatorError::Clock)?;
-        i64::try_from(duration.as_millis()).map_err(|_| SessionContextCoordinatorError::Clock)
-    }
-}
-
-#[derive(Clone)]
-pub struct FileSessionContextCoordinator {
-    root: Arc<PathBuf>,
-    clock: Arc<dyn CoordinatorClock>,
-    #[cfg(test)]
-    fail_before_head_install: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Clone)]
@@ -401,914 +375,6 @@ impl DatabaseSessionContextCoordinator {
                 })
             })
             .collect()
-    }
-}
-
-impl FileSessionContextCoordinator {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self::with_clock(root, Arc::new(SystemCoordinatorClock))
-    }
-
-    pub fn with_clock(root: impl Into<PathBuf>, clock: Arc<dyn CoordinatorClock>) -> Self {
-        Self {
-            root: Arc::new(root.into()),
-            clock,
-            #[cfg(test)]
-            fail_before_head_install: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        }
-    }
-
-    fn session_dir(&self, key: &SessionKeyV1) -> PathBuf {
-        self.root.join("sessions").join(hash_session_path(key))
-    }
-
-    fn owner_objects_dir(&self, key: &SessionKeyV1) -> PathBuf {
-        self.root.join("owners").join(hash_owner_path(key))
-    }
-
-    async fn run_blocking<T, F>(&self, operation: F) -> Result<T, SessionContextCoordinatorError>
-    where
-        T: Send + 'static,
-        F: FnOnce(Self) -> Result<T, SessionContextCoordinatorError> + Send + 'static,
-    {
-        let coordinator = self.clone();
-        tokio::task::spawn_blocking(move || operation(coordinator))
-            .await
-            .map_err(|error| SessionContextCoordinatorError::Task(error.to_string()))?
-    }
-
-    fn locked_state<T>(
-        &self,
-        key: &SessionKeyV1,
-        operation: impl FnOnce(
-            &mut CoordinatorStateV1,
-            &Path,
-        ) -> Result<T, SessionContextCoordinatorError>,
-    ) -> Result<T, SessionContextCoordinatorError> {
-        key.validate()
-            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
-        let session_dir = self.session_dir(key);
-        create_dir_all(&session_dir)?;
-        let lock_path = session_dir.join("state.lock");
-        let lock = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|source| io_error(&lock_path, source))?;
-        lock.lock_exclusive()
-            .map_err(|source| io_error(&lock_path, source))?;
-
-        let state_path = session_dir.join("state.json");
-        let mut state = if state_path.exists() {
-            read_json(&state_path)?
-        } else {
-            CoordinatorStateV1::new(key.clone())
-        };
-        state.validate_for(key)?;
-        operation(&mut state, &session_dir)
-    }
-
-    fn store_state(
-        &self,
-        session_dir: &Path,
-        state: &CoordinatorStateV1,
-    ) -> Result<(), SessionContextCoordinatorError> {
-        atomic_write_json(&session_dir.join("state.json"), state)
-    }
-
-    fn read_archived_receipt<T: DeserializeOwned>(
-        &self,
-        session_dir: &Path,
-        operation: &str,
-        idempotency_key: &str,
-    ) -> Result<Option<T>, SessionContextCoordinatorError> {
-        let path = receipt_path(session_dir, operation, idempotency_key);
-        if !path.exists() {
-            return Ok(None);
-        }
-        read_json(&path).map(Some)
-    }
-
-    fn archive_receipt<T: Serialize>(
-        &self,
-        session_dir: &Path,
-        operation: &str,
-        idempotency_key: &str,
-        value: &T,
-    ) -> Result<(), SessionContextCoordinatorError> {
-        let path = receipt_path(session_dir, operation, idempotency_key);
-        if path.exists() {
-            return Ok(());
-        }
-        atomic_write_json(&path, value)
-    }
-
-    fn persist_immutable<T: Serialize + DeserializeOwned + PartialEq>(
-        &self,
-        path: &Path,
-        value: &T,
-    ) -> Result<(), SessionContextCoordinatorError> {
-        if path.exists() {
-            let stored: T = read_json(path)?;
-            if stored != *value {
-                return Err(SessionContextCoordinatorError::NeedsRepair(format!(
-                    "immutable object at {} does not match its content-addressed identity",
-                    path.display()
-                )));
-            }
-            return Ok(());
-        }
-        atomic_write_json(path, value)
-    }
-
-    #[cfg(test)]
-    fn fail_next_before_head_install(&self) {
-        self.fail_before_head_install
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-#[async_trait]
-impl SessionContextCoordinator for FileSessionContextCoordinator {
-    async fn load_head(
-        &self,
-        key: &SessionKeyV1,
-    ) -> Result<Option<SessionContextHeadV1>, SessionContextCoordinatorError> {
-        let key = key.clone();
-        self.run_blocking(move |coordinator| {
-            coordinator.locked_state(&key, |state, _| Ok(state.head.clone()))
-        })
-        .await
-    }
-
-    async fn load_fork_prefix(
-        &self,
-        key: &SessionKeyV1,
-    ) -> Result<Option<SharedManifestPrefixV1>, SessionContextCoordinatorError> {
-        let key = key.clone();
-        self.run_blocking(move |coordinator| {
-            let state_path = coordinator.session_dir(&key).join("state.json");
-            if !state_path.exists() {
-                return Ok(None);
-            }
-            coordinator.locked_state(&key, |state, _| Ok(state.fork_base.clone()))
-        })
-        .await
-    }
-
-    async fn activate_fork(
-        &self,
-        manifest: &SessionForkManifestV1,
-    ) -> Result<SessionContextHeadV1, SessionContextCoordinatorError> {
-        validate_prepared_fork(manifest)?;
-        let manifest = manifest.clone();
-        self.run_blocking(move |coordinator| {
-            let parent_node_path = coordinator
-                .owner_objects_dir(&manifest.parent_key)
-                .join("manifests")
-                .join(format!(
-                    "{}.json",
-                    manifest.parent_head.latest_manifest_root
-                ));
-            let parent_node: ContextManifestNodeV1 = read_json(&parent_node_path)?;
-            if parent_node.key != manifest.parent_key
-                || parent_node.cursor() != manifest.parent_head.cursor
-            {
-                return Err(SessionContextCoordinatorError::Invalid(
-                    "fork parent manifest does not match the prepared cursor".into(),
-                ));
-            }
-            coordinator.locked_state(&manifest.child_key, |state, session_dir| {
-                if let Some(stored) = &state.fork_manifest {
-                    if stored.fork_id != manifest.fork_id {
-                        return Err(SessionContextCoordinatorError::Fenced);
-                    }
-                    return state.head.clone().ok_or_else(|| {
-                        SessionContextCoordinatorError::NeedsRepair(
-                            "active file fork has no child head".into(),
-                        )
-                    });
-                }
-                if state.head.is_some()
-                    || state.active_writer.is_some()
-                    || state.active_reservation.is_some()
-                {
-                    return Err(SessionContextCoordinatorError::Fenced);
-                }
-                let now = coordinator.clock.now_unix_ms()?;
-                let mut active_manifest = manifest.clone();
-                active_manifest.state = SessionForkStateV1::Active;
-                active_manifest.activated_at_unix_ms = Some(now);
-                active_manifest
-                    .validate()
-                    .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
-                let child_head = fork_child_head(&active_manifest, state.writer_epoch);
-                state.fork_base = Some(active_manifest.shared_prefix());
-                state.fork_manifest = Some(active_manifest);
-                state.head = Some(child_head.clone());
-                coordinator.store_state(session_dir, state)?;
-                Ok(child_head)
-            })
-        })
-        .await
-    }
-
-    async fn materialize(
-        &self,
-        head: &SessionContextHeadV1,
-    ) -> Result<MaterializedConversationV1, SessionContextCoordinatorError> {
-        let head = head.clone();
-        self.run_blocking(move |coordinator| coordinator.materialize_sync(&head))
-            .await
-    }
-
-    async fn load_manifest_delta(
-        &self,
-        key: &SessionKeyV1,
-        after_manifest_root: Option<&str>,
-    ) -> Result<ManifestDeltaV1, SessionContextCoordinatorError> {
-        key.validate()
-            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
-        validate_optional_manifest_root(after_manifest_root)?;
-        let key = key.clone();
-        let after_manifest_root = after_manifest_root.map(str::to_owned);
-        self.run_blocking(move |coordinator| {
-            let (head, fork_base) = coordinator.locked_state(&key, |state, _| {
-                Ok((state.head.clone(), state.fork_base.clone()))
-            })?;
-            let Some(head) = head else {
-                if after_manifest_root.is_some() {
-                    return Err(SessionContextCoordinatorError::DivergentManifest);
-                }
-                return Ok(ManifestDeltaV1 {
-                    schema_version: MANIFEST_DELTA_SCHEMA_VERSION,
-                    key,
-                    after_manifest_root: None,
-                    head: None,
-                    shared_prefix: None,
-                    missing_nodes: Vec::new(),
-                    missing_canonical_bytes: 0,
-                    missing_message_count: 0,
-                });
-            };
-            let owner_dir = coordinator.owner_objects_dir(&key);
-            let mut current = Some(head.latest_manifest_root.clone());
-            let mut reverse = Vec::new();
-            let boundary = after_manifest_root.as_deref().or_else(|| {
-                fork_base
-                    .as_ref()
-                    .map(|prefix| prefix.parent_manifest_root.as_str())
-            });
-            let mut found_after = boundary.is_none();
-            let mut seen = HashSet::new();
-            while let Some(root) = current {
-                if boundary == Some(root.as_str()) {
-                    found_after = true;
-                    break;
-                }
-                if !seen.insert(root.clone()) {
-                    return Err(SessionContextCoordinatorError::NeedsRepair(
-                        "manifest cycle detected while loading delta".into(),
-                    ));
-                }
-                let path = owner_dir.join("manifests").join(format!("{root}.json"));
-                let node: ContextManifestNodeV1 = read_json(&path)?;
-                node.validate().map_err(|error| {
-                    SessionContextCoordinatorError::NeedsRepair(error.to_string())
-                })?;
-                if node.key != key || node.manifest_root != root {
-                    return Err(SessionContextCoordinatorError::NeedsRepair(
-                        "manifest delta identity mismatch".into(),
-                    ));
-                }
-                if node.replaces_history
-                    && boundary.is_some()
-                    && node.parent_manifest_root.as_deref() != boundary
-                {
-                    return Err(SessionContextCoordinatorError::DivergentManifest);
-                }
-                current = if node.replaces_history && boundary.is_none() {
-                    None
-                } else {
-                    node.parent_manifest_root.clone()
-                };
-                reverse.push(node);
-            }
-            if !found_after {
-                return Err(SessionContextCoordinatorError::DivergentManifest);
-            }
-            reverse.reverse();
-            let shared_prefix = after_manifest_root.is_none().then_some(fork_base).flatten();
-            manifest_delta(key, after_manifest_root, Some(head), shared_prefix, reverse)
-        })
-        .await
-    }
-
-    async fn load_segments(
-        &self,
-        key: &SessionKeyV1,
-        segment_hashes: &[String],
-    ) -> Result<Vec<ConversationSegmentV1>, SessionContextCoordinatorError> {
-        validate_segment_batch(key, segment_hashes)?;
-        let key = key.clone();
-        let hashes = segment_hashes.to_vec();
-        self.run_blocking(move |coordinator| {
-            let owner_dir = coordinator.owner_objects_dir(&key);
-            hashes
-                .into_iter()
-                .map(|hash| {
-                    let path = owner_dir.join("segments").join(format!("{hash}.json"));
-                    if !path.exists() {
-                        return Err(SessionContextCoordinatorError::SegmentNotFound);
-                    }
-                    let segment: ConversationSegmentV1 = read_json(&path)?;
-                    segment.validate_for(&key).map_err(|error| {
-                        SessionContextCoordinatorError::NeedsRepair(error.to_string())
-                    })?;
-                    if segment.segment_hash != hash {
-                        return Err(SessionContextCoordinatorError::NeedsRepair(
-                            "file segment key does not match content".into(),
-                        ));
-                    }
-                    Ok(segment)
-                })
-                .collect()
-        })
-        .await
-    }
-
-    async fn store_segments(
-        &self,
-        key: &SessionKeyV1,
-        segments: &[ConversationSegmentV1],
-    ) -> Result<(), SessionContextCoordinatorError> {
-        validate_segment_upload(key, segments)?;
-        let key = key.clone();
-        let segments = segments.to_vec();
-        self.run_blocking(move |coordinator| {
-            let owner_dir = coordinator.owner_objects_dir(&key);
-            for segment in &segments {
-                coordinator.persist_immutable(
-                    &owner_dir
-                        .join("segments")
-                        .join(format!("{}.json", segment.segment_hash)),
-                    segment,
-                )?;
-            }
-            Ok(())
-        })
-        .await
-    }
-
-    async fn load_authority_epochs(
-        &self,
-        key: &SessionKeyV1,
-    ) -> Result<Option<AuthorityEpochsV1>, SessionContextCoordinatorError> {
-        let key = key.clone();
-        self.run_blocking(move |coordinator| {
-            let state_path = coordinator.session_dir(&key).join("state.json");
-            if !state_path.exists() {
-                return Ok(None);
-            }
-            coordinator.locked_state(&key, |state, _| Ok(Some(state.authority_epochs)))
-        })
-        .await
-    }
-
-    async fn load_active_writer(
-        &self,
-        key: &SessionKeyV1,
-    ) -> Result<Option<ConversationWriterLeaseV1>, SessionContextCoordinatorError> {
-        let key = key.clone();
-        self.run_blocking(move |coordinator| {
-            let now = coordinator.clock.now_unix_ms()?;
-            coordinator.locked_state(&key, |state, _| {
-                Ok(state
-                    .active_writer
-                    .clone()
-                    .filter(|lease| lease.expires_at_unix_ms > now))
-            })
-        })
-        .await
-    }
-
-    async fn acquire_writer(
-        &self,
-        key: &SessionKeyV1,
-        expected_cursor: Option<&SessionCursorV1>,
-        actor: &ActorContextV1,
-        ttl: Duration,
-        idempotency_key: &str,
-    ) -> Result<AcquireWriterOutcome, SessionContextCoordinatorError> {
-        validate_ttl(ttl, MAX_LEASE_TTL)?;
-        validate_idempotency_key(idempotency_key)?;
-        actor
-            .validate_for(key)
-            .map_err(|_| SessionContextCoordinatorError::Unauthorized)?;
-        validate_optional_cursor(key, expected_cursor)?;
-        let key = key.clone();
-        let expected_cursor = expected_cursor.cloned();
-        let actor = actor.clone();
-        let idempotency_key = idempotency_key.to_owned();
-        self.run_blocking(move |coordinator| {
-            let now = coordinator.clock.now_unix_ms()?;
-            let expires_at = checked_expiry(now, ttl)?;
-            coordinator.locked_state(&key, |state, session_dir| {
-                if let Some(receipt) = coordinator.read_archived_receipt::<LeaseReceiptV1>(
-                    session_dir,
-                    "acquire",
-                    &idempotency_key,
-                )? {
-                    validate_lease_request(&receipt.lease, &key, &expected_cursor, &actor)?;
-                    return Ok(AcquireWriterOutcome::AlreadyAcquired(receipt.lease));
-                }
-                if let Some(active) = &state.active_writer
-                    && active.idempotency_key == idempotency_key
-                {
-                    validate_lease_request(active, &key, &expected_cursor, &actor)?;
-                    // An idempotent re-acquire by the same owner is a liveness
-                    // heartbeat: refresh the TTL so a long multi-round turn is
-                    // not pinned to its first admission time.
-                    let expires_at =
-                        refreshed_live_expiry(now, ttl, active.expires_at_unix_ms, None)?;
-                    let refreshed = state
-                        .active_writer
-                        .as_mut()
-                        .expect("matched active writer lease");
-                    refreshed.expires_at_unix_ms = expires_at;
-                    let refreshed = refreshed.clone();
-                    coordinator.store_state(session_dir, state)?;
-                    return Ok(AcquireWriterOutcome::AlreadyAcquired(refreshed));
-                }
-                if state.head.as_ref().map(|head| &head.cursor) != expected_cursor.as_ref() {
-                    return Ok(AcquireWriterOutcome::Conflict {
-                        current_head: state.head.clone(),
-                        active_lease_expires_at_unix_ms: state
-                            .active_writer
-                            .as_ref()
-                            .filter(|lease| lease.expires_at_unix_ms > now)
-                            .map(|lease| lease.expires_at_unix_ms),
-                    });
-                }
-                if state
-                    .active_writer
-                    .as_ref()
-                    .is_some_and(|lease| lease.expires_at_unix_ms > now)
-                {
-                    return Ok(AcquireWriterOutcome::Conflict {
-                        current_head: state.head.clone(),
-                        active_lease_expires_at_unix_ms: state
-                            .active_writer
-                            .as_ref()
-                            .map(|lease| lease.expires_at_unix_ms),
-                    });
-                }
-                if actor.authority_epochs != state.authority_epochs {
-                    if state.writer_epoch == 0 && state.head.is_none() {
-                        state.authority_epochs = actor.authority_epochs;
-                    } else {
-                        return Err(SessionContextCoordinatorError::Fenced);
-                    }
-                }
-                archive_previous_lease(&coordinator, state, session_dir)?;
-                archive_previous_reservation(&coordinator, state, session_dir)?;
-                state.active_reservation = None;
-                state.writer_epoch = state.writer_epoch.checked_add(1).ok_or_else(|| {
-                    SessionContextCoordinatorError::NeedsRepair("writer epoch overflow".into())
-                })?;
-                let lease = ConversationWriterLeaseV1 {
-                    schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
-                    key: key.clone(),
-                    lease_id: Uuid::new_v4().to_string(),
-                    writer_epoch: state.writer_epoch,
-                    actor,
-                    expected_cursor,
-                    acquired_at_unix_ms: now,
-                    expires_at_unix_ms: expires_at,
-                    idempotency_key,
-                };
-                state.active_writer = Some(lease.clone());
-                coordinator.store_state(session_dir, state)?;
-                Ok(AcquireWriterOutcome::Acquired(lease))
-            })
-        })
-        .await
-    }
-
-    async fn renew_writer(
-        &self,
-        lease: &ConversationWriterLeaseV1,
-        ttl: Duration,
-    ) -> Result<ConversationWriterLeaseV1, SessionContextCoordinatorError> {
-        validate_ttl(ttl, MAX_LEASE_TTL)?;
-        let lease = lease.clone();
-        self.run_blocking(move |coordinator| {
-            let now = coordinator.clock.now_unix_ms()?;
-            let expires_at = checked_expiry(now, ttl)?;
-            coordinator.locked_state(&lease.key, |state, session_dir| {
-                validate_active_lease(state, &lease, now)?;
-                let renewed = state
-                    .active_writer
-                    .as_mut()
-                    .expect("validated active lease");
-                renewed.expires_at_unix_ms = expires_at;
-                let renewed = renewed.clone();
-                coordinator.store_state(session_dir, state)?;
-                Ok(renewed)
-            })
-        })
-        .await
-    }
-
-    async fn release_writer(
-        &self,
-        lease: &ConversationWriterLeaseV1,
-    ) -> Result<(), SessionContextCoordinatorError> {
-        let lease = lease.clone();
-        self.run_blocking(move |coordinator| {
-            coordinator.locked_state(&lease.key, |state, session_dir| {
-                if state.active_writer.as_ref().is_some_and(|active| {
-                    active.lease_id == lease.lease_id && active.writer_epoch == lease.writer_epoch
-                }) {
-                    archive_previous_lease(&coordinator, state, session_dir)?;
-                    archive_previous_reservation(&coordinator, state, session_dir)?;
-                    state.active_reservation = None;
-                    state.active_writer = None;
-                    coordinator.store_state(session_dir, state)?;
-                    Ok(())
-                } else if state.writer_epoch > lease.writer_epoch {
-                    Err(SessionContextCoordinatorError::Fenced)
-                } else {
-                    Ok(())
-                }
-            })
-        })
-        .await
-    }
-
-    async fn transfer_writer(
-        &self,
-        request: &WriterTransferRequestV1,
-        ttl: Duration,
-    ) -> Result<TransferWriterOutcome, SessionContextCoordinatorError> {
-        validate_writer_transfer_request(request)?;
-        validate_ttl(ttl, MAX_LEASE_TTL)?;
-        let request = request.clone();
-        self.run_blocking(move |coordinator| {
-            let now = coordinator.clock.now_unix_ms()?;
-            let expires_at = checked_expiry(now, ttl)?;
-            let request_hash = writer_transfer_request_hash(&request);
-            coordinator.locked_state(&request.key, |state, session_dir| {
-                if let Some(receipt) = &state.last_transfer
-                    && receipt.idempotency_key == request.idempotency_key
-                {
-                    validate_writer_transfer_receipt(receipt, &request_hash)?;
-                    return Ok(TransferWriterOutcome::AlreadyTransferred(
-                        receipt.lease.clone(),
-                    ));
-                }
-                if let Some(receipt) = coordinator
-                    .read_archived_receipt::<WriterTransferReceiptV1>(
-                        session_dir,
-                        "transfer",
-                        &request.idempotency_key,
-                    )?
-                {
-                    validate_writer_transfer_receipt(&receipt, &request_hash)?;
-                    return Ok(TransferWriterOutcome::AlreadyTransferred(receipt.lease));
-                }
-                if state.head.as_ref().map(|head| &head.cursor) != request.expected_cursor.as_ref()
-                {
-                    return Ok(writer_transfer_conflict(
-                        state,
-                        WriterTransferConflictV1::CursorChanged,
-                        now,
-                    ));
-                }
-                if request.target_actor.authority_epochs != state.authority_epochs {
-                    return Err(SessionContextCoordinatorError::Fenced);
-                }
-                if request.mode == SessionHandoffModeV1::Graceful {
-                    let source = request
-                        .source_lease
-                        .as_ref()
-                        .expect("validated graceful source lease");
-                    if validate_active_lease(state, source, now).is_err() {
-                        return Ok(writer_transfer_conflict(
-                            state,
-                            WriterTransferConflictV1::SourceWriterChanged,
-                            now,
-                        ));
-                    }
-                    if state
-                        .active_reservation
-                        .as_ref()
-                        .is_some_and(|reservation| reservation.expires_at_unix_ms > now)
-                    {
-                        return Ok(writer_transfer_conflict(
-                            state,
-                            WriterTransferConflictV1::ActiveTurn,
-                            now,
-                        ));
-                    }
-                }
-
-                archive_previous_lease(&coordinator, state, session_dir)?;
-                archive_previous_reservation(&coordinator, state, session_dir)?;
-                archive_previous_transfer(&coordinator, state, session_dir)?;
-                state.active_reservation = None;
-                state.writer_epoch = state.writer_epoch.checked_add(1).ok_or_else(|| {
-                    SessionContextCoordinatorError::NeedsRepair("writer epoch overflow".into())
-                })?;
-                let lease = ConversationWriterLeaseV1 {
-                    schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
-                    key: request.key.clone(),
-                    lease_id: Uuid::new_v4().to_string(),
-                    writer_epoch: state.writer_epoch,
-                    actor: request.target_actor.clone(),
-                    expected_cursor: request.expected_cursor.clone(),
-                    acquired_at_unix_ms: now,
-                    expires_at_unix_ms: expires_at,
-                    idempotency_key: request.idempotency_key.clone(),
-                };
-                let receipt = WriterTransferReceiptV1 {
-                    idempotency_key: request.idempotency_key.clone(),
-                    request_hash,
-                    handoff_id: request.handoff_id.clone(),
-                    mode: request.mode,
-                    risk: request.risk.clone(),
-                    lease: lease.clone(),
-                };
-                state.active_writer = Some(lease.clone());
-                state.last_transfer = Some(receipt);
-                coordinator.store_state(session_dir, state)?;
-                Ok(TransferWriterOutcome::Transferred(lease))
-            })
-        })
-        .await
-    }
-
-    async fn reserve_turn(
-        &self,
-        lease: &ConversationWriterLeaseV1,
-        expected_cursor: Option<&SessionCursorV1>,
-        ttl: Duration,
-        idempotency_key: &str,
-    ) -> Result<ReserveTurnOutcome, SessionContextCoordinatorError> {
-        validate_ttl(ttl, MAX_RESERVATION_TTL)?;
-        validate_idempotency_key(idempotency_key)?;
-        validate_optional_cursor(&lease.key, expected_cursor)?;
-        let lease = lease.clone();
-        let expected_cursor = expected_cursor.cloned();
-        let idempotency_key = idempotency_key.to_owned();
-        self.run_blocking(move |coordinator| {
-            let now = coordinator.clock.now_unix_ms()?;
-            coordinator.locked_state(&lease.key, |state, session_dir| {
-                if let Some(receipt) = coordinator.read_archived_receipt::<ReservationReceiptV1>(
-                    session_dir,
-                    "reserve",
-                    &idempotency_key,
-                )? {
-                    validate_reservation_request(&receipt.reservation, &lease, &expected_cursor)?;
-                    return Ok(ReserveTurnOutcome::AlreadyReserved(receipt.reservation));
-                }
-                if let Some(active) = state.active_reservation.clone()
-                    && active.idempotency_key == idempotency_key
-                {
-                    validate_reservation_request(&active, &lease, &expected_cursor)?;
-                    validate_active_lease(state, &lease, now)?;
-                    if fence_expired_reservation_authority(state, &lease, now) {
-                        // acquire_writer may have refreshed this writer immediately
-                        // before the reservation check. Persist the fence in this
-                        // same state lock so that failed readmissions cannot pin it.
-                        coordinator.store_state(session_dir, state)?;
-                        return Err(SessionContextCoordinatorError::Expired);
-                    }
-                    let expires_at = refreshed_live_expiry(
-                        now,
-                        ttl,
-                        active.expires_at_unix_ms,
-                        Some(lease.expires_at_unix_ms),
-                    )?;
-                    let refreshed = state
-                        .active_reservation
-                        .as_mut()
-                        .expect("matched active reservation");
-                    refreshed.expires_at_unix_ms = expires_at;
-                    let refreshed = refreshed.clone();
-                    coordinator.store_state(session_dir, state)?;
-                    return Ok(ReserveTurnOutcome::AlreadyReserved(refreshed));
-                }
-                validate_active_lease(state, &lease, now)?;
-                if state.head.as_ref().map(|head| &head.cursor) != expected_cursor.as_ref() {
-                    return Ok(ReserveTurnOutcome::Conflict {
-                        current_head: state.head.clone(),
-                    });
-                }
-                if state
-                    .active_reservation
-                    .as_ref()
-                    .is_some_and(|reservation| reservation.expires_at_unix_ms > now)
-                {
-                    return Ok(ReserveTurnOutcome::Conflict {
-                        current_head: state.head.clone(),
-                    });
-                }
-                archive_previous_reservation(&coordinator, state, session_dir)?;
-                let reserved_turn = expected_cursor
-                    .as_ref()
-                    .map_or(1, |cursor| cursor.completed_turn.saturating_add(1));
-                let expires_at = checked_expiry(now, ttl)?.min(lease.expires_at_unix_ms);
-                let reservation = TurnReservationV1 {
-                    schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
-                    reservation_id: Uuid::new_v4().to_string(),
-                    key: lease.key.clone(),
-                    lease_id: lease.lease_id.clone(),
-                    writer_epoch: lease.writer_epoch,
-                    expected_cursor,
-                    reserved_turn,
-                    created_at_unix_ms: now,
-                    expires_at_unix_ms: expires_at,
-                    idempotency_key,
-                };
-                state.active_reservation = Some(reservation.clone());
-                coordinator.store_state(session_dir, state)?;
-                Ok(ReserveTurnOutcome::Reserved(reservation))
-            })
-        })
-        .await
-    }
-
-    async fn commit_turn(
-        &self,
-        reservation: &TurnReservationV1,
-        delta: CanonicalTurnDeltaV1,
-        idempotency_key: &str,
-    ) -> Result<CoordinatorMutationV1, SessionContextCoordinatorError> {
-        delta
-            .validate()
-            .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
-        validate_idempotency_key(idempotency_key)?;
-        let reservation = reservation.clone();
-        let key = reservation.key.clone();
-        let idempotency_key = idempotency_key.to_owned();
-        self.run_blocking(move |coordinator| {
-            let now = coordinator.clock.now_unix_ms()?;
-            coordinator.locked_state(&key, |state, session_dir| {
-                if let Some(last) = &state.last_commit
-                    && last.idempotency_key == idempotency_key
-                {
-                    validate_commit_request(last, &reservation, &delta)?;
-                    return Ok(CoordinatorMutationV1::AlreadyApplied {
-                        cursor: last.cursor.clone(),
-                    });
-                }
-                if let Some(receipt) = coordinator.read_archived_receipt::<CommitReceiptV1>(
-                    session_dir,
-                    "commit",
-                    &idempotency_key,
-                )? {
-                    validate_commit_request(&receipt, &reservation, &delta)?;
-                    return Ok(CoordinatorMutationV1::AlreadyApplied {
-                        cursor: receipt.cursor,
-                    });
-                }
-                validate_active_reservation(state, &reservation, now)?;
-                validate_delta_advance(state.head.as_ref(), &reservation, &delta)?;
-
-                let mut segments = Vec::with_capacity(delta.logical_segments.len());
-                for messages in delta.logical_segments.iter().cloned() {
-                    segments.push(
-                        ConversationSegmentV1::new(&reservation.key, messages).map_err(
-                            |error| SessionContextCoordinatorError::Invalid(error.to_string()),
-                        )?,
-                    );
-                }
-                let node = manifest_node_for_delta(
-                    &reservation.key,
-                    state.head.as_ref(),
-                    &delta,
-                    &segments,
-                )
-                .map_err(|error| SessionContextCoordinatorError::Invalid(error.to_string()))?;
-
-                let owner_dir = coordinator.owner_objects_dir(&reservation.key);
-                for segment in &segments {
-                    coordinator.persist_immutable(
-                        &owner_dir
-                            .join("segments")
-                            .join(format!("{}.json", segment.segment_hash)),
-                        segment,
-                    )?;
-                }
-                coordinator.persist_immutable(
-                    &owner_dir
-                        .join("manifests")
-                        .join(format!("{}.json", node.manifest_root)),
-                    &node,
-                )?;
-
-                #[cfg(test)]
-                if coordinator
-                    .fail_before_head_install
-                    .swap(false, std::sync::atomic::Ordering::SeqCst)
-                {
-                    return Err(SessionContextCoordinatorError::Io {
-                        path: session_dir.join("state.json"),
-                        source: std::io::Error::other("injected before head install"),
-                    });
-                }
-
-                archive_previous_commit(&coordinator, state, session_dir)?;
-                let cursor = node.cursor();
-                let (total_canonical_bytes, total_message_count) =
-                    next_head_totals(state.head.as_ref(), &segments, delta.mode)?;
-                state.head = Some(SessionContextHeadV1 {
-                    schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
-                    key: reservation.key.clone(),
-                    cursor: cursor.clone(),
-                    latest_manifest_root: node.manifest_root,
-                    total_canonical_bytes,
-                    total_message_count,
-                    writer_epoch: reservation.writer_epoch,
-                });
-                state.last_commit = Some(CommitReceiptV1 {
-                    idempotency_key,
-                    reservation_id: reservation.reservation_id.clone(),
-                    reservation: reservation.clone(),
-                    delta_hash: turn_delta_hash(&delta),
-                    cursor: cursor.clone(),
-                });
-                state.active_reservation = None;
-                coordinator.store_state(session_dir, state)?;
-                Ok(CoordinatorMutationV1::Applied { cursor })
-            })
-        })
-        .await
-    }
-
-    async fn renew_turn_reservation(
-        &self,
-        reservation: &TurnReservationV1,
-        ttl: Duration,
-    ) -> Result<TurnReservationV1, SessionContextCoordinatorError> {
-        validate_ttl(ttl, MAX_RESERVATION_TTL)?;
-        let reservation = reservation.clone();
-        self.run_blocking(move |coordinator| {
-            let now = coordinator.clock.now_unix_ms()?;
-            coordinator.locked_state(&reservation.key, |state, session_dir| {
-                validate_active_reservation(state, &reservation, now)?;
-                let lease_expiry = state
-                    .active_writer
-                    .as_ref()
-                    .expect("validated reservation lease")
-                    .expires_at_unix_ms;
-                let renewed = state
-                    .active_reservation
-                    .as_mut()
-                    .expect("validated active reservation");
-                renewed.expires_at_unix_ms = checked_expiry(now, ttl)?.min(lease_expiry);
-                let renewed = renewed.clone();
-                coordinator.store_state(session_dir, state)?;
-                Ok(renewed)
-            })
-        })
-        .await
-    }
-
-    async fn advance_authority_epochs(
-        &self,
-        key: &SessionKeyV1,
-        epochs: AuthorityEpochsV1,
-    ) -> Result<(), SessionContextCoordinatorError> {
-        let key = key.clone();
-        self.run_blocking(move |coordinator| {
-            coordinator.locked_state(&key, |state, session_dir| {
-                if epochs.authorization_epoch < state.authority_epochs.authorization_epoch
-                    || epochs.device_trust_epoch < state.authority_epochs.device_trust_epoch
-                    || epochs.permission_epoch < state.authority_epochs.permission_epoch
-                {
-                    return Err(SessionContextCoordinatorError::Invalid(
-                        "authority epochs cannot decrease".into(),
-                    ));
-                }
-                if epochs != state.authority_epochs {
-                    archive_previous_lease(&coordinator, state, session_dir)?;
-                    archive_previous_reservation(&coordinator, state, session_dir)?;
-                    state.authority_epochs = epochs;
-                    state.active_writer = None;
-                    state.active_reservation = None;
-                    state.writer_epoch = state.writer_epoch.checked_add(1).ok_or_else(|| {
-                        SessionContextCoordinatorError::NeedsRepair("writer epoch overflow".into())
-                    })?;
-                    coordinator.store_state(session_dir, state)?;
-                }
-                Ok(())
-            })
-        })
-        .await
     }
 }
 
@@ -1969,25 +1035,14 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             && active.idempotency_key == idempotency_key
         {
             validate_lease_request(&active, key, &expected_cursor.cloned(), actor)?;
-            // An idempotent re-acquire by the same owner is a liveness
-            // heartbeat: refresh the TTL so a long multi-round turn is
-            // not pinned to its first admission time.
-            let expires_at = refreshed_live_expiry(now, ttl, active.expires_at_unix_ms, None)?;
-            let refreshed = state
-                .active_writer
-                .as_mut()
-                .expect("matched active writer lease");
-            refreshed.expires_at_unix_ms = expires_at;
-            let refreshed = refreshed.clone();
-            update_database_state(&mut tx, &state).await?;
             record_database_authority_event(
                 &mut tx,
                 &state,
                 AuthorityAuditFact {
                     operation: "acquire_writer",
-                    outcome: "idempotent_refreshed",
+                    outcome: "idempotent_replay",
                     actor: Some(actor),
-                    lease_id: Some(&refreshed.lease_id),
+                    lease_id: Some(&active.lease_id),
                     reservation_id: None,
                     expected_cursor,
                 },
@@ -1996,7 +1051,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_acquire_retry", source))?;
-            return Ok(AcquireWriterOutcome::AlreadyAcquired(refreshed));
+            return Ok(AcquireWriterOutcome::AlreadyAcquired(active.clone()));
         }
         if state.head.as_ref().map(|head| &head.cursor) != expected_cursor {
             let outcome = AcquireWriterOutcome::Conflict {
@@ -2167,6 +1222,77 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
         Ok(renewed)
     }
 
+    async fn renew_turn_authority(
+        &self,
+        lease: &ConversationWriterLeaseV1,
+        reservation: &TurnReservationV1,
+        ttl: Duration,
+    ) -> Result<RenewedTurnAuthority, SessionContextCoordinatorError> {
+        validate_ttl(ttl, MAX_LEASE_TTL)?;
+        validate_ttl(ttl, MAX_RESERVATION_TTL)?;
+        validate_reservation_request(reservation, lease, &lease.expected_cursor)?;
+        let mut tx = self
+            .pool
+            .get()
+            .begin()
+            .await
+            .map_err(|source| database_error("begin_renew_turn_authority", source))?;
+        let now = database_now_ms(&mut tx).await?;
+        let mut state = lock_database_state(&mut tx, &lease.key).await?;
+        let validation = validate_active_lease(&state, lease, now)
+            .and_then(|()| validate_active_reservation(&state, reservation, now));
+        if let Err(error) = validation {
+            record_database_authority_event(
+                &mut tx,
+                &state,
+                AuthorityAuditFact {
+                    operation: "renew_turn_authority",
+                    outcome: authority_error_outcome(&error),
+                    actor: Some(&lease.actor),
+                    lease_id: Some(&lease.lease_id),
+                    reservation_id: Some(&reservation.reservation_id),
+                    expected_cursor: reservation.expected_cursor.as_ref(),
+                },
+            )
+            .await?;
+            tx.commit()
+                .await
+                .map_err(|source| database_error("commit_renew_turn_authority_audit", source))?;
+            return Err(error);
+        }
+        let expires_at_unix_ms = checked_expiry(now, ttl)?;
+        let writer_lease = state.active_writer.as_mut().expect("validated lease");
+        writer_lease.expires_at_unix_ms = expires_at_unix_ms;
+        let writer_lease = writer_lease.clone();
+        let turn_reservation = state
+            .active_reservation
+            .as_mut()
+            .expect("validated reservation");
+        turn_reservation.expires_at_unix_ms = expires_at_unix_ms;
+        let turn_reservation = turn_reservation.clone();
+        update_database_state(&mut tx, &state).await?;
+        record_database_authority_event(
+            &mut tx,
+            &state,
+            AuthorityAuditFact {
+                operation: "renew_turn_authority",
+                outcome: "renewed",
+                actor: Some(&lease.actor),
+                lease_id: Some(&lease.lease_id),
+                reservation_id: Some(&reservation.reservation_id),
+                expected_cursor: reservation.expected_cursor.as_ref(),
+            },
+        )
+        .await?;
+        tx.commit()
+            .await
+            .map_err(|source| database_error("commit_renew_turn_authority", source))?;
+        Ok(RenewedTurnAuthority {
+            writer_lease,
+            turn_reservation,
+        })
+    }
+
     async fn release_writer(
         &self,
         lease: &ConversationWriterLeaseV1,
@@ -2290,6 +1416,33 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             tx.commit()
                 .await
                 .map_err(|source| database_error("commit_transfer_cursor_conflict", source))?;
+            return Ok(outcome);
+        }
+        if request
+            .expected_writer_epoch
+            .is_some_and(|expected| expected != state.writer_epoch)
+        {
+            let outcome = writer_transfer_conflict(
+                &state,
+                WriterTransferConflictV1::SourceWriterChanged,
+                now,
+            );
+            record_database_authority_event(
+                &mut tx,
+                &state,
+                AuthorityAuditFact {
+                    operation: "transfer_writer",
+                    outcome: "writer_epoch_conflict",
+                    actor: Some(&request.target_actor),
+                    lease_id: None,
+                    reservation_id: None,
+                    expected_cursor: request.expected_cursor.as_ref(),
+                },
+            )
+            .await?;
+            tx.commit().await.map_err(|source| {
+                database_error("commit_transfer_writer_epoch_conflict", source)
+            })?;
             return Ok(outcome);
         }
         if request.target_actor.authority_epochs != state.authority_epochs {
@@ -3069,121 +2222,6 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
     }
 }
 
-impl FileSessionContextCoordinator {
-    fn materialize_sync(
-        &self,
-        head: &SessionContextHeadV1,
-    ) -> Result<MaterializedConversationV1, SessionContextCoordinatorError> {
-        validate_head(head)?;
-        let owner_dir = self.owner_objects_dir(&head.key);
-        let state_path = self.session_dir(&head.key).join("state.json");
-        let fork_base = if state_path.exists() {
-            read_json::<CoordinatorStateV1>(&state_path)?.fork_base
-        } else {
-            None
-        };
-        let mut manifest_root = Some(head.latest_manifest_root.clone());
-        let mut seen = HashSet::new();
-        let mut reverse_nodes = Vec::new();
-        while let Some(root) = manifest_root {
-            if !seen.insert(root.clone()) {
-                return Err(SessionContextCoordinatorError::NeedsRepair(
-                    "manifest cycle detected".into(),
-                ));
-            }
-            let path = owner_dir.join("manifests").join(format!("{root}.json"));
-            if !path.exists() {
-                return Err(SessionContextCoordinatorError::NeedsRepair(format!(
-                    "missing manifest {root}"
-                )));
-            }
-            let node: ContextManifestNodeV1 = read_json(&path)?;
-            node.validate()
-                .map_err(|error| SessionContextCoordinatorError::NeedsRepair(error.to_string()))?;
-            let valid_key = node.key == head.key
-                || fork_base
-                    .as_ref()
-                    .is_some_and(|prefix| node.key == prefix.parent_key);
-            if !valid_key || node.manifest_root != root {
-                return Err(SessionContextCoordinatorError::NeedsRepair(
-                    "manifest owner, branch, or root mismatch".into(),
-                ));
-            }
-            manifest_root = if node.replaces_history {
-                None
-            } else {
-                node.parent_manifest_root.clone()
-            };
-            reverse_nodes.push(node);
-        }
-        reverse_nodes.reverse();
-        if reverse_nodes
-            .last()
-            .is_none_or(|node| !cursor_projection_matches_head(&node.cursor(), &head.cursor))
-        {
-            return Err(SessionContextCoordinatorError::NeedsRepair(
-                "head cursor does not match its manifest".into(),
-            ));
-        }
-
-        let mut messages = Vec::new();
-        let mut logical_segment_count = 0_u64;
-        let mut canonical_segment_bytes = 0_u64;
-        let mut prior_cursor: Option<SessionCursorV1> = None;
-        for node in reverse_nodes {
-            validate_manifest_advance(prior_cursor.as_ref(), &node)?;
-            let node_cursor = node.cursor();
-            for segment_ref in node.appended_segments {
-                let path = owner_dir
-                    .join("segments")
-                    .join(format!("{}.json", segment_ref.segment_hash));
-                if !path.exists() {
-                    return Err(SessionContextCoordinatorError::NeedsRepair(format!(
-                        "missing segment {}",
-                        segment_ref.segment_hash
-                    )));
-                }
-                let segment: ConversationSegmentV1 = read_json(&path)?;
-                segment.validate_for(&head.key).map_err(|error| {
-                    SessionContextCoordinatorError::NeedsRepair(error.to_string())
-                })?;
-                if segment.reference() != segment_ref {
-                    return Err(SessionContextCoordinatorError::NeedsRepair(
-                        "segment metadata does not match manifest reference".into(),
-                    ));
-                }
-                canonical_segment_bytes = canonical_segment_bytes
-                    .checked_add(segment.canonical_bytes)
-                    .ok_or_else(|| {
-                        SessionContextCoordinatorError::NeedsRepair(
-                            "materialized byte count overflow".into(),
-                        )
-                    })?;
-                logical_segment_count = logical_segment_count.checked_add(1).ok_or_else(|| {
-                    SessionContextCoordinatorError::NeedsRepair(
-                        "materialized segment count overflow".into(),
-                    )
-                })?;
-                messages.extend(segment.messages);
-            }
-            prior_cursor = Some(node_cursor);
-        }
-        if canonical_segment_bytes != head.total_canonical_bytes
-            || u64::try_from(messages.len()).ok() != Some(head.total_message_count)
-        {
-            return Err(SessionContextCoordinatorError::NeedsRepair(
-                "materialized totals do not match the canonical head".into(),
-            ));
-        }
-        Ok(MaterializedConversationV1 {
-            head: head.clone(),
-            messages,
-            logical_segment_count,
-            canonical_segment_bytes,
-        })
-    }
-}
-
 impl DatabaseSessionContextCoordinator {
     async fn load_database_segments(
         &self,
@@ -3718,7 +2756,7 @@ struct CoordinatorStateV1 {
 impl CoordinatorStateV1 {
     fn new(key: SessionKeyV1) -> Self {
         Self {
-            schema_version: FILE_STATE_SCHEMA_VERSION,
+            schema_version: COORDINATOR_STATE_SCHEMA_VERSION,
             key,
             writer_epoch: 0,
             authority_epochs: AuthorityEpochsV1::default(),
@@ -3733,7 +2771,7 @@ impl CoordinatorStateV1 {
     }
 
     fn validate_for(&self, key: &SessionKeyV1) -> Result<(), SessionContextCoordinatorError> {
-        if self.schema_version != FILE_STATE_SCHEMA_VERSION || &self.key != key {
+        if self.schema_version != COORDINATOR_STATE_SCHEMA_VERSION || &self.key != key {
             return Err(SessionContextCoordinatorError::NeedsRepair(
                 "state schema or owner-scoped key mismatch".into(),
             ));
@@ -4639,10 +3677,6 @@ fn checked_expiry(now_unix_ms: i64, ttl: Duration) -> Result<i64, SessionContext
 }
 
 /// Extends a live authority window without reviving an expired holder.
-///
-/// Lease expiry is the fencing boundary: once crossed, the caller must acquire
-/// a new writer epoch instead of retaining authority through an idempotent
-/// replay. A reservation is additionally capped by its writer lease.
 fn refreshed_live_expiry(
     now_unix_ms: i64,
     ttl: Duration,
@@ -4658,17 +3692,7 @@ fn refreshed_live_expiry(
     Ok(ceiling_expires_at_unix_ms.map_or(refreshed, |ceiling| refreshed.min(ceiling)))
 }
 
-/// Fences a writer whose in-flight reservation has expired.
-///
-/// A bridge readmission first replays `acquire_writer`, then replays
-/// `reserve_turn`. The first step can extend a still-live writer just before
-/// the reservation crosses its expiry boundary. Keeping that writer after the
-/// second step fails lets retries extend it indefinitely. Both backends call
-/// this helper while holding their durable state lock/transaction, so the
-/// failed reservation atomically removes the matching writer as well.
-///
-/// Deliberately do not archive either object as an idempotency receipt: their
-/// authority has expired and a retry must acquire a fresh writer epoch.
+/// Atomically removes a writer whose matching in-flight reservation expired.
 fn fence_expired_reservation_authority(
     state: &mut CoordinatorStateV1,
     lease: &ConversationWriterLeaseV1,
@@ -4929,6 +3953,13 @@ fn writer_transfer_request_hash(request: &WriterTransferRequestV1) -> String {
     } else {
         digest.update([0]);
     }
+    match request.expected_writer_epoch {
+        Some(epoch) => {
+            digest.update([1]);
+            digest.update(epoch.to_be_bytes());
+        }
+        None => digest.update([0]),
+    }
     hash_optional_cursor(&mut digest, request.expected_cursor.as_ref());
     hash_field(&mut digest, &request.target_actor.actor_user_id);
     hash_field(&mut digest, &request.target_actor.actor_id);
@@ -5064,131 +4095,6 @@ fn hash_optional_cursor(digest: &mut Sha256, cursor: Option<&SessionCursorV1>) {
     );
 }
 
-fn archive_previous_lease(
-    coordinator: &FileSessionContextCoordinator,
-    state: &CoordinatorStateV1,
-    session_dir: &Path,
-) -> Result<(), SessionContextCoordinatorError> {
-    if let Some(lease) = &state.active_writer {
-        coordinator.archive_receipt(
-            session_dir,
-            "acquire",
-            &lease.idempotency_key,
-            &LeaseReceiptV1 {
-                lease: lease.clone(),
-            },
-        )?;
-    }
-    Ok(())
-}
-
-fn archive_previous_reservation(
-    coordinator: &FileSessionContextCoordinator,
-    state: &CoordinatorStateV1,
-    session_dir: &Path,
-) -> Result<(), SessionContextCoordinatorError> {
-    if let Some(reservation) = &state.active_reservation {
-        coordinator.archive_receipt(
-            session_dir,
-            "reserve",
-            &reservation.idempotency_key,
-            &ReservationReceiptV1 {
-                reservation: reservation.clone(),
-            },
-        )?;
-    }
-    Ok(())
-}
-
-fn archive_previous_commit(
-    coordinator: &FileSessionContextCoordinator,
-    state: &CoordinatorStateV1,
-    session_dir: &Path,
-) -> Result<(), SessionContextCoordinatorError> {
-    if let Some(receipt) = &state.last_commit {
-        coordinator.archive_receipt(session_dir, "commit", &receipt.idempotency_key, receipt)?;
-    }
-    Ok(())
-}
-
-fn archive_previous_transfer(
-    coordinator: &FileSessionContextCoordinator,
-    state: &CoordinatorStateV1,
-    session_dir: &Path,
-) -> Result<(), SessionContextCoordinatorError> {
-    if let Some(receipt) = &state.last_transfer {
-        coordinator.archive_receipt(session_dir, "transfer", &receipt.idempotency_key, receipt)?;
-    }
-    Ok(())
-}
-
-fn create_dir_all(path: &Path) -> Result<(), SessionContextCoordinatorError> {
-    fs::create_dir_all(path).map_err(|source| io_error(path, source))
-}
-
-fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, SessionContextCoordinatorError> {
-    let file = File::open(path).map_err(|source| io_error(path, source))?;
-    serde_json::from_reader(BufReader::new(file)).map_err(|source| {
-        SessionContextCoordinatorError::Json {
-            path: path.to_path_buf(),
-            source,
-        }
-    })
-}
-
-fn atomic_write_json<T: Serialize>(
-    path: &Path,
-    value: &T,
-) -> Result<(), SessionContextCoordinatorError> {
-    let parent = path.parent().ok_or_else(|| {
-        SessionContextCoordinatorError::Invalid("coordinator path has no parent".into())
-    })?;
-    create_dir_all(parent)?;
-    let temp = parent.join(format!(".{}.{}.tmp", file_name(path), Uuid::new_v4()));
-    let file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temp)
-        .map_err(|source| io_error(&temp, source))?;
-    {
-        let mut writer = BufWriter::new(&file);
-        serde_json::to_writer(&mut writer, value).map_err(|source| {
-            SessionContextCoordinatorError::Json {
-                path: temp.clone(),
-                source,
-            }
-        })?;
-        writer.flush().map_err(|source| io_error(&temp, source))?;
-    }
-    file.sync_all().map_err(|source| io_error(&temp, source))?;
-    fs::rename(&temp, path).map_err(|source| io_error(path, source))?;
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| io_error(parent, source))?;
-    Ok(())
-}
-
-fn file_name(path: &Path) -> String {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("state")
-        .to_owned()
-}
-
-fn io_error(path: &Path, source: std::io::Error) -> SessionContextCoordinatorError {
-    SessionContextCoordinatorError::Io {
-        path: path.to_path_buf(),
-        source,
-    }
-}
-
-fn receipt_path(session_dir: &Path, operation: &str, idempotency_key: &str) -> PathBuf {
-    session_dir
-        .join("receipts")
-        .join(operation)
-        .join(format!("{}.json", hash_receipt(operation, idempotency_key)))
-}
-
 fn hash_receipt(operation: &str, idempotency_key: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(RECEIPT_HASH_DOMAIN);
@@ -5197,1278 +4103,7 @@ fn hash_receipt(operation: &str, idempotency_key: &str) -> String {
     format!("{:x}", digest.finalize())
 }
 
-fn hash_session_path(key: &SessionKeyV1) -> String {
-    let mut digest = Sha256::new();
-    digest.update(SESSION_PATH_HASH_DOMAIN);
-    hash_field(&mut digest, &key.isolation_domain);
-    hash_field(&mut digest, &key.owner_user_id);
-    hash_field(&mut digest, &key.session_id);
-    hash_field(&mut digest, &key.branch_id);
-    format!("{:x}", digest.finalize())
-}
-
-fn hash_owner_path(key: &SessionKeyV1) -> String {
-    let mut digest = Sha256::new();
-    digest.update(OWNER_PATH_HASH_DOMAIN);
-    hash_field(&mut digest, &key.isolation_domain);
-    hash_field(&mut digest, &key.owner_user_id);
-    format!("{:x}", digest.finalize())
-}
-
 fn hash_field(digest: &mut Sha256, value: &str) {
     digest.update((value.len() as u64).to_be_bytes());
     digest.update(value.as_bytes());
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::atomic::{AtomicI64, Ordering};
-
-    use astra_turn_types::{
-        ActorKindV1, ForkBasisDimensionV1, ForkDimensionDispositionV1, ForkDimensionEvidenceV1,
-        ForkExcludedAuthorityV1, SESSION_FORK_MANIFEST_SCHEMA_VERSION, SessionSurfaceV1,
-    };
-    use serde_json::json;
-    use tempfile::TempDir;
-
-    use super::*;
-
-    #[derive(Default)]
-    struct ManualClock(AtomicI64);
-
-    impl ManualClock {
-        fn new(now: i64) -> Self {
-            Self(AtomicI64::new(now))
-        }
-
-        fn advance(&self, millis: i64) {
-            self.0.fetch_add(millis, Ordering::SeqCst);
-        }
-    }
-
-    impl CoordinatorClock for ManualClock {
-        fn now_unix_ms(&self) -> Result<i64, SessionContextCoordinatorError> {
-            Ok(self.0.load(Ordering::SeqCst))
-        }
-    }
-
-    fn key(owner: &str) -> SessionKeyV1 {
-        SessionKeyV1::owner_session("test", owner, "shared-session-id", "main")
-    }
-
-    fn actor(owner: &str) -> ActorContextV1 {
-        actor_at(owner, &format!("actor-{owner}"), &format!("device-{owner}"))
-    }
-
-    fn actor_at(owner: &str, actor_id: &str, device_id: &str) -> ActorContextV1 {
-        ActorContextV1::owner_user(
-            owner,
-            actor_id,
-            ActorKindV1::Cli,
-            SessionSurfaceV1::Cli,
-            Some(device_id.to_owned()),
-            AuthorityEpochsV1::default(),
-        )
-    }
-
-    fn coordinator(temp: &TempDir, clock: Arc<ManualClock>) -> FileSessionContextCoordinator {
-        FileSessionContextCoordinator::with_clock(temp.path(), clock)
-    }
-
-    fn acquired(outcome: AcquireWriterOutcome) -> ConversationWriterLeaseV1 {
-        match outcome {
-            AcquireWriterOutcome::Acquired(lease)
-            | AcquireWriterOutcome::AlreadyAcquired(lease) => lease,
-            AcquireWriterOutcome::Conflict { .. } => panic!("unexpected lease conflict"),
-        }
-    }
-
-    fn reserved(outcome: ReserveTurnOutcome) -> TurnReservationV1 {
-        match outcome {
-            ReserveTurnOutcome::Reserved(reservation)
-            | ReserveTurnOutcome::AlreadyReserved(reservation) => reservation,
-            ReserveTurnOutcome::Conflict { .. } => panic!("unexpected reservation conflict"),
-        }
-    }
-
-    fn delta(turn: u32, event_seq: u64, conversation_seq: u64) -> CanonicalTurnDeltaV1 {
-        CanonicalTurnDeltaV1 {
-            schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
-            completed_turn: turn,
-            journal_event_seq: event_seq,
-            conversation_seq,
-            compaction_generation: 0,
-            config_version_id: None,
-            mode: astra_turn_types::CanonicalDeltaModeV1::Append,
-            logical_segments: vec![vec![
-                json!({"role": "user", "content": format!("question-{turn}")}),
-                json!({"role": "assistant", "content": format!("answer-{turn}")}),
-            ]],
-        }
-    }
-
-    fn transfer_request(
-        key: &SessionKeyV1,
-        mode: SessionHandoffModeV1,
-        source_lease: Option<ConversationWriterLeaseV1>,
-        expected_cursor: Option<SessionCursorV1>,
-        idempotency_key: &str,
-    ) -> WriterTransferRequestV1 {
-        WriterTransferRequestV1 {
-            handoff_id: format!("handoff-{idempotency_key}"),
-            idempotency_key: idempotency_key.into(),
-            key: key.clone(),
-            mode,
-            source_lease,
-            expected_cursor,
-            target_actor: actor_at(&key.owner_user_id, "actor-target", "device-target"),
-            risk: if mode == SessionHandoffModeV1::Forced {
-                HandoffRiskEvidenceV1 {
-                    forced_authorization_id: Some("verified-reauth-1".into()),
-                    unknown_effect_invocation_ids: vec!["invocation-uncertain-1".into()],
-                    unsynced_suffix_root: None,
-                }
-            } else {
-                HandoffRiskEvidenceV1::default()
-            },
-        }
-    }
-
-    fn fork_manifest(
-        parent_head: &SessionContextHeadV1,
-        child_key: SessionKeyV1,
-    ) -> SessionForkManifestV1 {
-        SessionForkManifestV1 {
-            schema_version: SESSION_FORK_MANIFEST_SCHEMA_VERSION,
-            fork_id: "fork-exact-prefix".into(),
-            parent_key: parent_head.key.clone(),
-            child_key,
-            parent_head: parent_head.clone(),
-            dimensions: [
-                ForkBasisDimensionV1::Conversation,
-                ForkBasisDimensionV1::TaskBoard,
-                ForkBasisDimensionV1::Checkpoint,
-                ForkBasisDimensionV1::Workspace,
-                ForkBasisDimensionV1::Artifacts,
-            ]
-            .into_iter()
-            .map(|dimension| ForkDimensionEvidenceV1 {
-                dimension,
-                disposition: if dimension == ForkBasisDimensionV1::Conversation {
-                    ForkDimensionDispositionV1::SharedPrefix
-                } else {
-                    ForkDimensionDispositionV1::Gap
-                },
-                source_cursor: (dimension == ForkBasisDimensionV1::Conversation)
-                    .then(|| parent_head.cursor.clone()),
-                evidence_digest: (dimension == ForkBasisDimensionV1::Conversation)
-                    .then(|| parent_head.latest_manifest_root.clone()),
-                detail: (dimension != ForkBasisDimensionV1::Conversation)
-                    .then(|| "state dimension was unavailable at the fork boundary".into()),
-            })
-            .collect(),
-            excluded_authority: vec![
-                ForkExcludedAuthorityV1::Run,
-                ForkExcludedAuthorityV1::WriterLease,
-                ForkExcludedAuthorityV1::Approval,
-                ForkExcludedAuthorityV1::Mailbox,
-                ForkExcludedAuthorityV1::Invocation,
-            ],
-            state: SessionForkStateV1::Prepared,
-            created_at_unix_ms: 1_000,
-            activated_at_unix_ms: None,
-            status_detail: Some("test exact copy-on-write fork".into()),
-        }
-    }
-
-    #[tokio::test]
-    async fn one_of_two_writers_wins_and_retry_is_idempotent() {
-        let temp = TempDir::new().unwrap();
-        let clock = Arc::new(ManualClock::new(1_000));
-        let coordinator = coordinator(&temp, clock);
-        let key = key("owner-a");
-
-        let first = acquired(
-            coordinator
-                .acquire_writer(
-                    &key,
-                    None,
-                    &actor("owner-a"),
-                    Duration::from_secs(30),
-                    "acquire-a",
-                )
-                .await
-                .unwrap(),
-        );
-        let retry = acquired(
-            coordinator
-                .acquire_writer(
-                    &key,
-                    None,
-                    &actor("owner-a"),
-                    Duration::from_secs(30),
-                    "acquire-a",
-                )
-                .await
-                .unwrap(),
-        );
-        assert_eq!(first, retry);
-        assert!(matches!(
-            coordinator
-                .acquire_writer(
-                    &key,
-                    None,
-                    &actor("owner-a"),
-                    Duration::from_secs(30),
-                    "acquire-b",
-                )
-                .await
-                .unwrap(),
-            AcquireWriterOutcome::Conflict { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn idempotent_reacquire_refreshes_liveness_while_authority_is_live() {
-        let temp = TempDir::new().unwrap();
-        let clock = Arc::new(ManualClock::new(1_000));
-        let coordinator = coordinator(&temp, clock.clone());
-        let key = key("owner-heartbeat");
-        let ttl = Duration::from_secs(30);
-
-        let first = acquired(
-            coordinator
-                .acquire_writer(
-                    &key,
-                    None,
-                    &actor("owner-heartbeat"),
-                    ttl,
-                    "acquire-heartbeat",
-                )
-                .await
-                .unwrap(),
-        );
-        let first_reservation = reserved(
-            coordinator
-                .reserve_turn(&first, None, ttl, "reserve-heartbeat")
-                .await
-                .unwrap(),
-        );
-        assert_eq!(first.expires_at_unix_ms, 31_000);
-        assert_eq!(first_reservation.expires_at_unix_ms, 31_000);
-
-        // The next bridge round arrives before the original lease expires.
-        clock.advance(20_000);
-
-        // Same-owner idempotent re-acquire refreshes the lease instead of
-        // replaying the stale window...
-        let refreshed = match coordinator
-            .acquire_writer(
-                &key,
-                None,
-                &actor("owner-heartbeat"),
-                ttl,
-                "acquire-heartbeat",
-            )
-            .await
-            .unwrap()
-        {
-            AcquireWriterOutcome::AlreadyAcquired(lease) => lease,
-            other => panic!("expected refreshed replay, got {other:?}"),
-        };
-        assert_eq!(refreshed.lease_id, first.lease_id);
-        assert_eq!(refreshed.writer_epoch, first.writer_epoch);
-        assert_eq!(refreshed.expires_at_unix_ms, 51_000);
-
-        // ...and the same-owner reservation replay refreshes as well, staying
-        // bounded by the lease.
-        let refreshed_reservation = match coordinator
-            .reserve_turn(&refreshed, None, ttl, "reserve-heartbeat")
-            .await
-            .unwrap()
-        {
-            ReserveTurnOutcome::AlreadyReserved(reservation) => reservation,
-            other => panic!("expected refreshed reservation replay, got {other:?}"),
-        };
-        assert_eq!(
-            refreshed_reservation.reservation_id,
-            first_reservation.reservation_id
-        );
-        assert_eq!(refreshed_reservation.expires_at_unix_ms, 51_000);
-
-        // A different owner can never piggyback on the heartbeat: while the
-        // refreshed lease is active, foreign keys still conflict.
-        assert!(matches!(
-            coordinator
-                .acquire_writer(
-                    &key,
-                    None,
-                    &actor("owner-heartbeat"),
-                    ttl,
-                    "acquire-intruder"
-                )
-                .await
-                .unwrap(),
-            AcquireWriterOutcome::Conflict { .. }
-        ));
-
-        // The original window has elapsed, but the refreshed authority remains
-        // valid and commits the reserved turn.
-        clock.advance(15_000);
-        let mutation = coordinator
-            .commit_turn(&refreshed_reservation, delta(1, 1, 1), "commit-heartbeat")
-            .await
-            .unwrap();
-        let cursor = match mutation {
-            CoordinatorMutationV1::Applied { cursor } => cursor,
-            other => panic!("unexpected commit outcome {other:?}"),
-        };
-        assert_eq!(cursor.completed_turn, 1);
-    }
-
-    #[tokio::test]
-    async fn expired_reservation_fences_refreshed_writer_across_retries() {
-        let temp = TempDir::new().unwrap();
-        let clock = Arc::new(ManualClock::new(1_000));
-        let coordinator = coordinator(&temp, clock.clone());
-        let key = key("owner-expired-heartbeat");
-        let actor = actor("owner-expired-heartbeat");
-
-        // Reproduce the acquire/reserve boundary repeatedly. The writer is
-        // still live when acquire_writer refreshes it, while the reservation
-        // has already expired by the time reserve_turn runs.
-        for attempt in 0..3 {
-            let lease = acquired(
-                coordinator
-                    .acquire_writer(
-                        &key,
-                        None,
-                        &actor,
-                        Duration::from_secs(30),
-                        "acquire-expired-heartbeat",
-                    )
-                    .await
-                    .unwrap(),
-            );
-            let _reservation = reserved(
-                coordinator
-                    .reserve_turn(
-                        &lease,
-                        None,
-                        Duration::from_secs(10),
-                        "reserve-expired-heartbeat",
-                    )
-                    .await
-                    .unwrap(),
-            );
-
-            clock.advance(11_000);
-            let refreshed_lease = match coordinator
-                .acquire_writer(
-                    &key,
-                    None,
-                    &actor,
-                    Duration::from_secs(30),
-                    "acquire-expired-heartbeat",
-                )
-                .await
-                .unwrap()
-            {
-                AcquireWriterOutcome::AlreadyAcquired(lease) => lease,
-                other => panic!("expected writer heartbeat, got {other:?}"),
-            };
-            assert!(matches!(
-                coordinator
-                    .reserve_turn(
-                        &refreshed_lease,
-                        None,
-                        Duration::from_secs(10),
-                        "reserve-expired-heartbeat",
-                    )
-                    .await,
-                Err(SessionContextCoordinatorError::Expired)
-            ));
-            assert!(
-                coordinator
-                    .load_active_writer(&key)
-                    .await
-                    .unwrap()
-                    .is_none(),
-                "attempt {attempt} retained a writer after the failed reservation heartbeat"
-            );
-
-            // A new chain is immediately admissible; retries cannot leave the
-            // session in a live-writer conflict until the original TTL expires.
-            let recovery = acquired(
-                coordinator
-                    .acquire_writer(
-                        &key,
-                        None,
-                        &actor_at(
-                            "owner-expired-heartbeat",
-                            &format!("recovery-{attempt}"),
-                            &format!("recovery-device-{attempt}"),
-                        ),
-                        Duration::from_secs(30),
-                        &format!("acquire-recovery-{attempt}"),
-                    )
-                    .await
-                    .unwrap(),
-            );
-            coordinator.release_writer(&recovery).await.unwrap();
-        }
-
-        // The original chain can retry too, but receives a new fencing epoch
-        // rather than reviving the expired writer/reservation pair.
-        let retried_lease = match coordinator
-            .acquire_writer(
-                &key,
-                None,
-                &actor,
-                Duration::from_secs(30),
-                "acquire-expired-heartbeat",
-            )
-            .await
-            .unwrap()
-        {
-            AcquireWriterOutcome::Acquired(lease) => lease,
-            other => panic!("expected a fresh writer epoch, got {other:?}"),
-        };
-        assert!(matches!(
-            coordinator
-                .reserve_turn(
-                    &retried_lease,
-                    None,
-                    Duration::from_secs(10),
-                    "reserve-expired-heartbeat",
-                )
-                .await
-                .unwrap(),
-            ReserveTurnOutcome::Reserved(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn expired_writer_is_fenced_after_reclaim() {
-        let temp = TempDir::new().unwrap();
-        let clock = Arc::new(ManualClock::new(1_000));
-        let coordinator = coordinator(&temp, clock.clone());
-        let key = key("owner-a");
-        let stale = acquired(
-            coordinator
-                .acquire_writer(
-                    &key,
-                    None,
-                    &actor("owner-a"),
-                    Duration::from_millis(10),
-                    "stale",
-                )
-                .await
-                .unwrap(),
-        );
-        clock.advance(11);
-        let current = acquired(
-            coordinator
-                .acquire_writer(
-                    &key,
-                    None,
-                    &actor("owner-a"),
-                    Duration::from_secs(30),
-                    "current",
-                )
-                .await
-                .unwrap(),
-        );
-
-        assert!(current.writer_epoch > stale.writer_epoch);
-        assert!(matches!(
-            coordinator
-                .reserve_turn(&stale, None, Duration::from_secs(1), "stale-reservation")
-                .await,
-            Err(SessionContextCoordinatorError::Fenced)
-        ));
-    }
-
-    #[tokio::test]
-    async fn graceful_transfer_waits_for_drain_then_fences_source_atomically() {
-        let temp = TempDir::new().unwrap();
-        let clock = Arc::new(ManualClock::new(1_000));
-        let coordinator = coordinator(&temp, clock.clone());
-        let key = key("owner-a");
-        let source = acquired(
-            coordinator
-                .acquire_writer(
-                    &key,
-                    None,
-                    &actor("owner-a"),
-                    Duration::from_secs(30),
-                    "acquire-source",
-                )
-                .await
-                .unwrap(),
-        );
-        let active = reserved(
-            coordinator
-                .reserve_turn(&source, None, Duration::from_millis(5), "active-turn")
-                .await
-                .unwrap(),
-        );
-        let request = transfer_request(
-            &key,
-            SessionHandoffModeV1::Graceful,
-            Some(source.clone()),
-            None,
-            "graceful-transfer",
-        );
-        assert!(matches!(
-            coordinator
-                .transfer_writer(&request, Duration::from_secs(30))
-                .await
-                .unwrap(),
-            TransferWriterOutcome::Conflict {
-                reason: WriterTransferConflictV1::ActiveTurn,
-                ..
-            }
-        ));
-
-        clock.advance(6);
-        let target = match coordinator
-            .transfer_writer(&request, Duration::from_secs(30))
-            .await
-            .unwrap()
-        {
-            TransferWriterOutcome::Transferred(lease) => lease,
-            other => panic!("unexpected transfer outcome {other:?}"),
-        };
-        assert_eq!(target.writer_epoch, source.writer_epoch + 1);
-        assert_eq!(
-            coordinator
-                .transfer_writer(&request, Duration::from_secs(30))
-                .await
-                .unwrap(),
-            TransferWriterOutcome::AlreadyTransferred(target.clone())
-        );
-        assert!(matches!(
-            coordinator
-                .commit_turn(&active, delta(1, 1, 1), "late-source-commit")
-                .await,
-            Err(SessionContextCoordinatorError::Fenced)
-        ));
-        assert!(matches!(
-            coordinator
-                .reserve_turn(&target, None, Duration::from_secs(10), "target-turn")
-                .await
-                .unwrap(),
-            ReserveTurnOutcome::Reserved(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn forced_transfer_preserves_risk_and_fences_inflight_source() {
-        let temp = TempDir::new().unwrap();
-        let clock = Arc::new(ManualClock::new(1_000));
-        let coordinator = coordinator(&temp, clock);
-        let key = key("owner-a");
-        let source = acquired(
-            coordinator
-                .acquire_writer(
-                    &key,
-                    None,
-                    &actor("owner-a"),
-                    Duration::from_secs(30),
-                    "acquire-source",
-                )
-                .await
-                .unwrap(),
-        );
-        let inflight = reserved(
-            coordinator
-                .reserve_turn(&source, None, Duration::from_secs(20), "inflight-turn")
-                .await
-                .unwrap(),
-        );
-        let request = transfer_request(
-            &key,
-            SessionHandoffModeV1::Forced,
-            None,
-            None,
-            "forced-transfer",
-        );
-        let target = match coordinator
-            .transfer_writer(&request, Duration::from_secs(30))
-            .await
-            .unwrap()
-        {
-            TransferWriterOutcome::Transferred(lease) => lease,
-            other => panic!("unexpected transfer outcome {other:?}"),
-        };
-
-        assert_eq!(target.writer_epoch, source.writer_epoch + 1);
-        assert!(matches!(
-            coordinator
-                .commit_turn(&inflight, delta(1, 1, 1), "late-forced-commit")
-                .await,
-            Err(SessionContextCoordinatorError::Fenced)
-        ));
-        let stored: CoordinatorStateV1 =
-            read_json(&coordinator.session_dir(&key).join("state.json")).unwrap();
-        assert_eq!(
-            stored
-                .last_transfer
-                .as_ref()
-                .unwrap()
-                .risk
-                .unknown_effect_invocation_ids,
-            ["invocation-uncertain-1"]
-        );
-    }
-
-    #[tokio::test]
-    async fn renewed_authority_accepts_the_original_fenced_identity() {
-        let temp = TempDir::new().unwrap();
-        let clock = Arc::new(ManualClock::new(1_000));
-        let coordinator = coordinator(&temp, clock.clone());
-        let key = key("owner-a");
-        let lease = acquired(
-            coordinator
-                .acquire_writer(
-                    &key,
-                    None,
-                    &actor("owner-a"),
-                    Duration::from_millis(10),
-                    "acquire",
-                )
-                .await
-                .unwrap(),
-        );
-        let reservation = reserved(
-            coordinator
-                .reserve_turn(&lease, None, Duration::from_millis(10), "reserve")
-                .await
-                .unwrap(),
-        );
-
-        clock.advance(5);
-        let renewed_lease = coordinator
-            .renew_writer(&lease, Duration::from_millis(20))
-            .await
-            .unwrap();
-        let renewed_reservation = coordinator
-            .renew_turn_reservation(&reservation, Duration::from_millis(20))
-            .await
-            .unwrap();
-        assert!(renewed_lease.expires_at_unix_ms > lease.expires_at_unix_ms);
-        assert!(renewed_reservation.expires_at_unix_ms > reservation.expires_at_unix_ms);
-
-        // The request retains immutable fencing identity, not mutable expiry.
-        // A heartbeat must not force every model/tool callback to replace its
-        // grant just because the same lease was renewed.
-        clock.advance(6);
-        assert!(matches!(
-            coordinator
-                .commit_turn(&reservation, delta(1, 1, 1), "commit")
-                .await
-                .unwrap(),
-            CoordinatorMutationV1::Applied { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn commit_is_write_before_head_and_retry_is_exactly_once() {
-        let temp = TempDir::new().unwrap();
-        let clock = Arc::new(ManualClock::new(1_000));
-        let coordinator = coordinator(&temp, clock);
-        let key = key("owner-a");
-        let lease = acquired(
-            coordinator
-                .acquire_writer(
-                    &key,
-                    None,
-                    &actor("owner-a"),
-                    Duration::from_secs(30),
-                    "acquire",
-                )
-                .await
-                .unwrap(),
-        );
-        let reservation = reserved(
-            coordinator
-                .reserve_turn(&lease, None, Duration::from_secs(20), "reserve")
-                .await
-                .unwrap(),
-        );
-        let delta = delta(1, 7, 1);
-        coordinator.fail_next_before_head_install();
-        assert!(matches!(
-            coordinator
-                .commit_turn(&reservation, delta.clone(), "commit")
-                .await,
-            Err(SessionContextCoordinatorError::Io { .. })
-        ));
-        assert!(coordinator.load_head(&key).await.unwrap().is_none());
-
-        let applied = coordinator
-            .commit_turn(&reservation, delta.clone(), "commit")
-            .await
-            .unwrap();
-        let cursor = match applied {
-            CoordinatorMutationV1::Applied { cursor } => cursor,
-            other => panic!("unexpected outcome {other:?}"),
-        };
-        assert_eq!(
-            coordinator
-                .commit_turn(&reservation, delta, "commit")
-                .await
-                .unwrap(),
-            CoordinatorMutationV1::AlreadyApplied {
-                cursor: cursor.clone()
-            }
-        );
-        let materialized = coordinator
-            .materialize(&coordinator.load_head(&key).await.unwrap().unwrap())
-            .await
-            .unwrap();
-        assert_eq!(materialized.messages.len(), 2);
-        assert_eq!(materialized.head.cursor, cursor);
-    }
-
-    #[tokio::test]
-    async fn replacement_commit_recalculates_head_and_cuts_materialization_history() {
-        let temp = TempDir::new().unwrap();
-        let clock = Arc::new(ManualClock::new(1_000));
-        let coordinator = coordinator(&temp, clock);
-        let key = key("owner-a");
-        let lease = acquired(
-            coordinator
-                .acquire_writer(
-                    &key,
-                    None,
-                    &actor("owner-a"),
-                    Duration::from_secs(30),
-                    "acquire",
-                )
-                .await
-                .unwrap(),
-        );
-
-        let first_reservation = reserved(
-            coordinator
-                .reserve_turn(&lease, None, Duration::from_secs(20), "reserve-1")
-                .await
-                .unwrap(),
-        );
-        coordinator
-            .commit_turn(&first_reservation, delta(1, 1, 1), "commit-1")
-            .await
-            .unwrap();
-        let first_head = coordinator.load_head(&key).await.unwrap().unwrap();
-
-        let second_reservation = reserved(
-            coordinator
-                .reserve_turn(
-                    &lease,
-                    Some(&first_head.cursor),
-                    Duration::from_secs(20),
-                    "reserve-2",
-                )
-                .await
-                .unwrap(),
-        );
-        coordinator
-            .commit_turn(&second_reservation, delta(2, 2, 2), "commit-2")
-            .await
-            .unwrap();
-        let pre_compaction_head = coordinator.load_head(&key).await.unwrap().unwrap();
-        assert_eq!(pre_compaction_head.total_message_count, 4);
-
-        let replacement_reservation = reserved(
-            coordinator
-                .reserve_turn(
-                    &lease,
-                    Some(&pre_compaction_head.cursor),
-                    Duration::from_secs(20),
-                    "reserve-replacement",
-                )
-                .await
-                .unwrap(),
-        );
-        let compacted_messages = vec![
-            json!({"role": "user", "content": "compacted question"}),
-            json!({"role": "assistant", "content": "compacted answer"}),
-        ];
-        let replacement = CanonicalTurnDeltaV1 {
-            schema_version: CANONICAL_TURN_DELTA_SCHEMA_VERSION,
-            completed_turn: 3,
-            journal_event_seq: 3,
-            conversation_seq: 3,
-            compaction_generation: 1,
-            config_version_id: None,
-            mode: CanonicalDeltaModeV1::Replace,
-            logical_segments: vec![compacted_messages.clone()],
-        };
-        coordinator
-            .commit_turn(&replacement_reservation, replacement, "commit-replacement")
-            .await
-            .unwrap();
-
-        let compacted_head = coordinator.load_head(&key).await.unwrap().unwrap();
-        assert_eq!(compacted_head.cursor.compaction_generation, 1);
-        assert_eq!(compacted_head.total_message_count, 2);
-        let materialized = coordinator.materialize(&compacted_head).await.unwrap();
-        assert_eq!(materialized.messages, compacted_messages);
-        assert_eq!(materialized.logical_segment_count, 1);
-
-        let delta_from_empty = coordinator.load_manifest_delta(&key, None).await.unwrap();
-        assert_eq!(delta_from_empty.missing_nodes.len(), 1);
-        assert!(delta_from_empty.missing_nodes[0].replaces_history);
-        assert!(matches!(
-            coordinator
-                .reserve_turn(
-                    &lease,
-                    Some(&pre_compaction_head.cursor),
-                    Duration::from_secs(20),
-                    "stale-after-replacement",
-                )
-                .await
-                .unwrap(),
-            ReserveTurnOutcome::Conflict { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn same_session_id_is_owner_isolated() {
-        let temp = TempDir::new().unwrap();
-        let clock = Arc::new(ManualClock::new(1_000));
-        let coordinator = coordinator(&temp, clock);
-        let staged = ConversationSegmentV1::new(
-            &key("owner-a"),
-            vec![json!({"role": "user", "content": "staged but unreachable"})],
-        )
-        .unwrap();
-        coordinator
-            .store_segments(&key("owner-a"), std::slice::from_ref(&staged))
-            .await
-            .unwrap();
-        coordinator
-            .store_segments(&key("owner-a"), std::slice::from_ref(&staged))
-            .await
-            .expect("content-addressed upload retry must be idempotent");
-        assert!(
-            coordinator
-                .load_head(&key("owner-a"))
-                .await
-                .unwrap()
-                .is_none(),
-            "staging immutable content must not install a canonical head"
-        );
-        assert!(matches!(
-            coordinator
-                .load_segments(&key("owner-b"), std::slice::from_ref(&staged.segment_hash))
-                .await,
-            Err(SessionContextCoordinatorError::SegmentNotFound)
-        ));
-        for owner in ["owner-a", "owner-b"] {
-            let key = key(owner);
-            let lease = acquired(
-                coordinator
-                    .acquire_writer(
-                        &key,
-                        None,
-                        &actor(owner),
-                        Duration::from_secs(30),
-                        &format!("acquire-{owner}"),
-                    )
-                    .await
-                    .unwrap(),
-            );
-            let reservation = reserved(
-                coordinator
-                    .reserve_turn(
-                        &lease,
-                        None,
-                        Duration::from_secs(20),
-                        &format!("reserve-{owner}"),
-                    )
-                    .await
-                    .unwrap(),
-            );
-            coordinator
-                .commit_turn(&reservation, delta(1, 1, 1), &format!("commit-{owner}"))
-                .await
-                .unwrap();
-        }
-
-        let a = coordinator
-            .load_head(&key("owner-a"))
-            .await
-            .unwrap()
-            .unwrap();
-        let b = coordinator
-            .load_head(&key("owner-b"))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_ne!(a.cursor.canonical_root_hash, b.cursor.canonical_root_hash);
-        assert!(matches!(
-            coordinator
-                .load_manifest_delta(&key("owner-a"), Some(&b.latest_manifest_root))
-                .await,
-            Err(SessionContextCoordinatorError::DivergentManifest)
-        ));
-        let a_delta = coordinator
-            .load_manifest_delta(&key("owner-a"), None)
-            .await
-            .unwrap();
-        let a_segment_hash = a_delta.missing_nodes[0].appended_segments[0]
-            .segment_hash
-            .clone();
-        assert_eq!(
-            coordinator
-                .load_segments(&key("owner-a"), std::slice::from_ref(&a_segment_hash))
-                .await
-                .unwrap()
-                .len(),
-            1
-        );
-        assert!(matches!(
-            coordinator
-                .load_segments(&key("owner-b"), std::slice::from_ref(&a_segment_hash))
-                .await,
-            Err(SessionContextCoordinatorError::SegmentNotFound)
-        ));
-        assert!(matches!(
-            coordinator
-                .load_segments(&key("owner-a"), &[a_segment_hash.clone(), a_segment_hash])
-                .await,
-            Err(SessionContextCoordinatorError::Invalid(_))
-        ));
-        assert_eq!(
-            coordinator
-                .materialize(&a)
-                .await
-                .unwrap()
-                .head
-                .key
-                .owner_user_id,
-            "owner-a"
-        );
-        assert_eq!(
-            coordinator
-                .materialize(&b)
-                .await
-                .unwrap()
-                .head
-                .key
-                .owner_user_id,
-            "owner-b"
-        );
-    }
-
-    #[test]
-    fn database_materialization_preserves_repeated_content_addressed_segments() {
-        let key = key("owner-a");
-        let repeated_messages = vec![
-            json!({"role": "user", "content": "same"}),
-            json!({"role": "assistant", "content": "same"}),
-        ];
-        let segment = ConversationSegmentV1::new(&key, repeated_messages.clone()).unwrap();
-        let first = ContextManifestNodeV1::new(
-            key.clone(),
-            None,
-            1,
-            1,
-            1,
-            0,
-            None,
-            vec![segment.reference()],
-        )
-        .unwrap();
-        let second = ContextManifestNodeV1::new(
-            key.clone(),
-            Some(first.manifest_root.clone()),
-            2,
-            2,
-            2,
-            0,
-            None,
-            vec![segment.reference()],
-        )
-        .unwrap();
-        let head = SessionContextHeadV1 {
-            schema_version: SESSION_COORDINATION_SCHEMA_VERSION,
-            key,
-            cursor: second.cursor(),
-            latest_manifest_root: second.manifest_root.clone(),
-            total_canonical_bytes: segment.canonical_bytes * 2,
-            total_message_count: u64::from(segment.message_count) * 2,
-            writer_epoch: 1,
-        };
-        let mut segments =
-            std::collections::HashMap::from([(segment.segment_hash.clone(), segment)]);
-
-        let materialized = materialize_nodes(&head, vec![first, second], &mut segments).unwrap();
-
-        assert_eq!(
-            materialized.messages,
-            [repeated_messages.clone(), repeated_messages].concat(),
-            "physical deduplication must not collapse repeated logical history"
-        );
-        assert_eq!(materialized.logical_segment_count, 2);
-    }
-
-    #[tokio::test]
-    async fn long_session_mutable_state_stays_constant_shape() {
-        let temp = TempDir::new().unwrap();
-        let clock = Arc::new(ManualClock::new(1_000));
-        let coordinator = coordinator(&temp, clock);
-        let key = key("owner-a");
-        let lease = acquired(
-            coordinator
-                .acquire_writer(
-                    &key,
-                    None,
-                    &actor("owner-a"),
-                    Duration::from_secs(60),
-                    "acquire",
-                )
-                .await
-                .unwrap(),
-        );
-        let mut cursor = None;
-        let mut penultimate_manifest_root = None;
-        for turn in 1..=128 {
-            let reservation = reserved(
-                coordinator
-                    .reserve_turn(
-                        &lease,
-                        cursor.as_ref(),
-                        Duration::from_secs(30),
-                        &format!("reserve-{turn}"),
-                    )
-                    .await
-                    .unwrap(),
-            );
-            cursor = Some(
-                match coordinator
-                    .commit_turn(
-                        &reservation,
-                        delta(turn, u64::from(turn), u64::from(turn)),
-                        &format!("commit-{turn}"),
-                    )
-                    .await
-                    .unwrap()
-                {
-                    CoordinatorMutationV1::Applied { cursor } => cursor,
-                    other => panic!("unexpected outcome {other:?}"),
-                },
-            );
-            if turn == 127 {
-                penultimate_manifest_root = cursor
-                    .as_ref()
-                    .map(|cursor| cursor.canonical_root_hash.clone());
-            }
-        }
-
-        let state_path = coordinator.session_dir(&key).join("state.json");
-        let state_bytes = fs::metadata(state_path).unwrap().len();
-        assert!(
-            state_bytes < 16 * 1024,
-            "mutable head grew to {state_bytes}"
-        );
-        let head = coordinator.load_head(&key).await.unwrap().unwrap();
-        let current = coordinator
-            .load_manifest_delta(&key, Some(&head.latest_manifest_root))
-            .await
-            .unwrap();
-        assert!(current.missing_nodes.is_empty());
-        assert_eq!(current.missing_canonical_bytes, 0);
-
-        let warm = coordinator
-            .load_manifest_delta(&key, penultimate_manifest_root.as_deref())
-            .await
-            .unwrap();
-        assert_eq!(
-            warm.missing_nodes.len(),
-            1,
-            "warm hydration work must scale with the missing suffix"
-        );
-        assert_eq!(warm.missing_message_count, 2);
-        assert!(
-            warm.missing_canonical_bytes < head.total_canonical_bytes,
-            "warm hydration must not report the full history payload"
-        );
-        assert_eq!(
-            warm.missing_nodes[0].manifest_root,
-            head.latest_manifest_root
-        );
-
-        let materialized = coordinator.materialize(&head).await.unwrap();
-        assert_eq!(materialized.logical_segment_count, 128);
-        assert_eq!(materialized.messages.len(), 256);
-    }
-
-    #[tokio::test]
-    async fn long_session_fork_shares_constant_size_prefix_and_then_diverges() {
-        let temp = TempDir::new().unwrap();
-        let clock = Arc::new(ManualClock::new(1_000));
-        let coordinator = coordinator(&temp, clock);
-        let parent_key = key("owner-a");
-        let child_key = SessionKeyV1::owner_session("test", "owner-a", "fork-child", "main");
-        let parent_lease = acquired(
-            coordinator
-                .acquire_writer(
-                    &parent_key,
-                    None,
-                    &actor("owner-a"),
-                    Duration::from_secs(60),
-                    "parent-writer",
-                )
-                .await
-                .unwrap(),
-        );
-        let mut parent_cursor = None;
-        for turn in 1..=96 {
-            let reservation = reserved(
-                coordinator
-                    .reserve_turn(
-                        &parent_lease,
-                        parent_cursor.as_ref(),
-                        Duration::from_secs(30),
-                        &format!("parent-reserve-{turn}"),
-                    )
-                    .await
-                    .unwrap(),
-            );
-            parent_cursor = Some(
-                match coordinator
-                    .commit_turn(
-                        &reservation,
-                        delta(turn, u64::from(turn), u64::from(turn)),
-                        &format!("parent-commit-{turn}"),
-                    )
-                    .await
-                    .unwrap()
-                {
-                    CoordinatorMutationV1::Applied { cursor } => cursor,
-                    other => panic!("unexpected parent outcome {other:?}"),
-                },
-            );
-        }
-        let fork_point = coordinator.load_head(&parent_key).await.unwrap().unwrap();
-        let object_dir = coordinator.owner_objects_dir(&parent_key);
-        let manifest_count_before = fs::read_dir(object_dir.join("manifests")).unwrap().count();
-        let segment_count_before = fs::read_dir(object_dir.join("segments")).unwrap().count();
-
-        let prepared = fork_manifest(&fork_point, child_key.clone());
-        let child_head = coordinator.activate_fork(&prepared).await.unwrap();
-        assert_eq!(
-            coordinator.activate_fork(&prepared).await.unwrap(),
-            child_head,
-            "activation must be exactly-once"
-        );
-        assert_eq!(
-            fs::read_dir(object_dir.join("manifests")).unwrap().count(),
-            manifest_count_before,
-            "fork activation must not copy manifest history"
-        );
-        assert_eq!(
-            fs::read_dir(object_dir.join("segments")).unwrap().count(),
-            segment_count_before,
-            "fork activation must not copy message payloads"
-        );
-        let cold_delta = coordinator
-            .load_manifest_delta(&child_key, None)
-            .await
-            .unwrap();
-        assert_eq!(cold_delta.shared_prefix, Some(prepared.shared_prefix()));
-        assert!(cold_delta.missing_nodes.is_empty());
-        assert_eq!(
-            coordinator
-                .materialize(&child_head)
-                .await
-                .unwrap()
-                .messages
-                .len(),
-            192
-        );
-
-        let child_lease = acquired(
-            coordinator
-                .acquire_writer(
-                    &child_key,
-                    Some(&child_head.cursor),
-                    &actor("owner-a"),
-                    Duration::from_secs(60),
-                    "child-writer",
-                )
-                .await
-                .unwrap(),
-        );
-        let child_reservation = reserved(
-            coordinator
-                .reserve_turn(
-                    &child_lease,
-                    Some(&child_head.cursor),
-                    Duration::from_secs(30),
-                    "child-reserve-97",
-                )
-                .await
-                .unwrap(),
-        );
-        let child_cursor = match coordinator
-            .commit_turn(&child_reservation, delta(97, 97, 97), "child-commit-97")
-            .await
-            .unwrap()
-        {
-            CoordinatorMutationV1::Applied { cursor } => cursor,
-            other => panic!("unexpected child outcome {other:?}"),
-        };
-        let parent_reservation = reserved(
-            coordinator
-                .reserve_turn(
-                    &parent_lease,
-                    Some(&fork_point.cursor),
-                    Duration::from_secs(30),
-                    "parent-reserve-97",
-                )
-                .await
-                .unwrap(),
-        );
-        let parent_cursor = match coordinator
-            .commit_turn(&parent_reservation, delta(97, 97, 97), "parent-commit-97")
-            .await
-            .unwrap()
-        {
-            CoordinatorMutationV1::Applied { cursor } => cursor,
-            other => panic!("unexpected parent outcome {other:?}"),
-        };
-        assert_ne!(
-            child_cursor.canonical_root_hash,
-            parent_cursor.canonical_root_hash
-        );
-        let child_warm = coordinator
-            .load_manifest_delta(&child_key, Some(&fork_point.latest_manifest_root))
-            .await
-            .unwrap();
-        assert_eq!(child_warm.missing_nodes.len(), 1);
-        assert!(child_warm.shared_prefix.is_none());
-        assert_eq!(
-            coordinator
-                .materialize(&coordinator.load_head(&child_key).await.unwrap().unwrap())
-                .await
-                .unwrap()
-                .messages
-                .len(),
-            194
-        );
-        assert_eq!(
-            coordinator
-                .materialize(&coordinator.load_head(&parent_key).await.unwrap().unwrap())
-                .await
-                .unwrap()
-                .messages
-                .len(),
-            194
-        );
-    }
 }

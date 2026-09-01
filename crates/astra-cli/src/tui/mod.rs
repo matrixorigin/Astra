@@ -14,10 +14,8 @@ mod bg_task_proxy;
 pub(crate) mod bg_task_rendering;
 mod board_pin;
 mod bottom_pane;
-mod cancel_fanout;
 mod config_edit_router;
 mod context_panel;
-mod resume_summary;
 // Core (post-refactor): HistoryCell trait + TurnEvent schema +
 // single ChatWidget router + on-disk JSONL transcript. See
 // `docs/design/tui-refactor.md`.
@@ -89,6 +87,7 @@ mod theme;
 mod timeline;
 pub(crate) mod turn_event;
 pub(crate) mod ui_adapter;
+pub(crate) mod work_board_projection;
 mod worktrees;
 mod wrapping;
 

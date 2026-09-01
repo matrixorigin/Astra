@@ -153,20 +153,16 @@ impl Default for AdminState {
 
 #[derive(Clone)]
 pub(crate) struct ExecutionServicesState {
-    pub(crate) task_service: Arc<dyn TaskService>,
     pub(crate) edge_registry_service: Arc<dyn EdgeRegistryService>,
     pub(crate) edge_dispatch_service: Arc<dyn EdgeDispatchService>,
-    pub(crate) task_lease_service: Arc<dyn TaskLeaseService>,
     pub(crate) run_lifecycle_service: Arc<dyn RunLifecycleService>,
 }
 
 impl Default for ExecutionServicesState {
     fn default() -> Self {
         Self {
-            task_service: Arc::new(UnconfiguredTaskService),
             edge_registry_service: Arc::new(UnconfiguredEdgeRegistryService),
             edge_dispatch_service: Arc::new(UnconfiguredEdgeDispatchService),
-            task_lease_service: Arc::new(UnconfiguredTaskLeaseService),
             run_lifecycle_service: Arc::new(UnconfiguredRunLifecycleService),
         }
     }
@@ -207,16 +203,17 @@ pub struct AppState {
     pub(crate) turn_persistence: TurnPersistenceState,
     pub(crate) execution: ExecutionServicesState,
     pub(crate) admin: AdminState,
-    pub(crate) chat_turn_bridge:
-        Option<Arc<crate::turn::bridge::inprocess::InProcessChatTurnBridge>>,
-    pub(crate) chat_turn_bridge_secret: String,
-    pub(crate) chat_turn_bridge_cache: Arc<tokio::sync::Mutex<SessionCache>>,
+    pub(crate) artifact_signing_secret: String,
     pub memoria_base_url: String,
     pub memoria_master_key: Option<String>,
     pub memoria_forwarder: Arc<dyn MemoriaForwarder>,
     memoria_health_cache: Arc<std::sync::RwLock<CachedMemoriaHealth>>,
     memoria_health_refresh: Arc<tokio::sync::Mutex<()>>,
     pub shared_pool: Option<SharedPool>,
+    /// Auxiliary database pools owned by the application lifecycle, such as
+    /// the bounded control-plane reservation used by auth and health checks.
+    /// They must be closed with `shared_pool` during graceful shutdown.
+    pub(crate) auxiliary_pools: Vec<SharedPool>,
     /// Owner-neutral Matrix pool, journal ingestion, sync persistence, and shutdown tracking.
     pub(crate) matrix_cloud_runtime: Option<Arc<crate::matrix_cloud_runtime::MatrixCloudRuntime>>,
     /// Edge §5.5 callbacks (`/tools/result`, `/approval/respond`); keys via [`astra_turn_core::edge_ledger`].
@@ -239,7 +236,6 @@ pub struct AppState {
     pub(crate) session_handoff_service: Option<Arc<astra_services::DatabaseSessionHandoffService>>,
     pub(crate) session_fork_coordinator:
         Option<Arc<astra_services::DatabaseSessionForkCoordinator>>,
-    pub(crate) session_publish_service: Option<Arc<astra_services::DatabaseSessionPublishService>>,
     pub(crate) execution_grant_signer: Option<Arc<astra_services::ExecutionGrantSigner>>,
     pub(crate) session_actor_id: String,
     /// Live edge agent WebSocket connections for remote tool execution (Phase 6).
@@ -267,8 +263,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Shared §5.5 ledger (`POST /tools/result`, `POST /approval/respond`); same `Arc` as
-    /// [`InProcessChatTurnBridge`](crate::turn::bridge::inprocess::InProcessChatTurnBridge) when wired.
+    /// Shared §5.5 ledger (`POST /tools/result`, `POST /approval/respond`).
     pub fn edge_callback_ledger(
         &self,
     ) -> Arc<tokio::sync::Mutex<std::collections::HashMap<String, serde_json::Value>>> {
@@ -276,8 +271,6 @@ impl AppState {
     }
 
     pub fn new(service_info: ServiceInfo, health_checker: Arc<dyn HealthChecker>) -> Self {
-        let chat_turn_bridge_cache =
-            Arc::new(tokio::sync::Mutex::new(SessionCache::new(1000, 86400.0)));
         let default_memoria = astra_core::MemoriaSettings::from_env();
         let edge_connection_pool =
             astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
@@ -329,9 +322,7 @@ impl AppState {
             turn_persistence: TurnPersistenceState::default(),
             execution: ExecutionServicesState::default(),
             admin: AdminState::default(),
-            chat_turn_bridge: None,
-            chat_turn_bridge_secret: "dev-bridge-secret-change-me".to_string(),
-            chat_turn_bridge_cache,
+            artifact_signing_secret: "dev-artifact-signing-secret-change-me".to_string(),
             memoria_base_url: default_memoria.base_url,
             memoria_master_key: default_memoria.master_key,
             memoria_forwarder: Arc::new(NoopMemoriaForwarder),
@@ -340,6 +331,7 @@ impl AppState {
             ))),
             memoria_health_refresh: Arc::new(tokio::sync::Mutex::new(())),
             shared_pool: None,
+            auxiliary_pools: Vec::new(),
             matrix_cloud_runtime: None,
             edge_callback_ledger: Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -353,7 +345,6 @@ impl AppState {
             session_context_coordinator: None,
             session_handoff_service: None,
             session_fork_coordinator: None,
-            session_publish_service: None,
             execution_grant_signer: None,
             session_actor_id: std::env::var("ASTRA_POD_ID")
                 .ok()
@@ -404,14 +395,6 @@ impl AppState {
         coordinator: Arc<astra_services::DatabaseSessionForkCoordinator>,
     ) -> Self {
         self.session_fork_coordinator = Some(coordinator);
-        self
-    }
-
-    pub fn with_session_publish_service(
-        mut self,
-        service: Arc<astra_services::DatabaseSessionPublishService>,
-    ) -> Self {
-        self.session_publish_service = Some(service);
         self
     }
 
@@ -734,11 +717,6 @@ impl AppState {
         self
     }
 
-    pub fn with_task_service(mut self, task_service: Arc<dyn TaskService>) -> Self {
-        self.execution.task_service = task_service;
-        self
-    }
-
     pub fn with_edge_registry_service(
         mut self,
         edge_registry_service: Arc<dyn EdgeRegistryService>,
@@ -760,14 +738,6 @@ impl AppState {
         tool_execution_service: ToolExecutionService,
     ) -> Self {
         self.tool_execution_service = tool_execution_service;
-        self
-    }
-
-    pub fn with_task_lease_service(
-        mut self,
-        task_lease_service: Arc<dyn TaskLeaseService>,
-    ) -> Self {
-        self.execution.task_lease_service = task_lease_service;
         self
     }
 
@@ -816,25 +786,65 @@ impl AppState {
         self
     }
 
-    pub fn with_chat_turn_bridge(
+    pub fn with_artifact_signing_secret(
         mut self,
-        chat_turn_bridge: Arc<crate::turn::bridge::inprocess::InProcessChatTurnBridge>,
+        artifact_signing_secret: impl Into<String>,
     ) -> Self {
-        self.chat_turn_bridge = Some(chat_turn_bridge);
-        self
-    }
-
-    pub fn with_chat_turn_bridge_secret(
-        mut self,
-        chat_turn_bridge_secret: impl Into<String>,
-    ) -> Self {
-        self.chat_turn_bridge_secret = chat_turn_bridge_secret.into();
+        self.artifact_signing_secret = artifact_signing_secret.into();
         self
     }
 
     pub fn with_shared_pool(mut self, pool: SharedPool) -> Self {
         self.shared_pool = Some(pool);
         self
+    }
+
+    pub(crate) fn with_auxiliary_pools(mut self, pools: Vec<SharedPool>) -> Self {
+        self.auxiliary_pools = pools;
+        self
+    }
+
+    /// Stop application-owned database workers and close every pool whose
+    /// lifetime belongs to this application.
+    ///
+    /// Services retain cloneable pool handles, so callers should invoke this
+    /// only after stopping request processing. Matrix ingestion and audit
+    /// workers are drained before their shared pool is closed.
+    pub async fn close_database_pools(&self) {
+        // Provider settlement ownership is process-scoped so a detached
+        // reconciliation job can outlive the request that admitted it. Drain
+        // those jobs while the database pool is still usable; otherwise a
+        // lifecycle that closes its pool can strand reservations in the
+        // global coordinator and make later provider admissions fail closed
+        // at capacity.
+        if !crate::turn::llm::durable::wait_for_provider_settlement_coordinator(
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        {
+            tracing::warn!(
+                "provider settlement coordinator did not drain before database pool shutdown"
+            );
+        }
+        if let Some(runtime) = self.matrix_cloud_runtime.as_ref() {
+            runtime.shutdown_ingestion_and_wait().await;
+        }
+        if let Some(pool) = self.shared_pool.as_ref() {
+            pool.close().await;
+        }
+        for pool in &self.auxiliary_pools {
+            pool.close().await;
+        }
+    }
+
+    /// Stop server-owned run tasks before removing their durable resources or
+    /// closing database pools. Returns whether the lifecycle reported a clean
+    /// drain/stop within `timeout`.
+    pub async fn stop_background_runs(&self, timeout: std::time::Duration) -> bool {
+        self.execution
+            .run_lifecycle_service
+            .stop_background_tasks_for_shutdown(timeout)
+            .await
     }
 
     pub fn with_matrix_cloud_runtime(
@@ -979,9 +989,17 @@ impl ReqwestMemoriaForwarder {
             .filter(|user_id| !user_id.is_empty());
         let request = self
             .client
-            .request(method, url)
-            .header("Authorization", format!("Bearer {}", self.master_key))
-            .json(&payload);
+            .request(method.clone(), url)
+            .header("Authorization", format!("Bearer {}", self.master_key));
+        // Memoria's owner-scoped list endpoint is a GET with query
+        // parameters.  Keep the existing JSON body for write/POST/PUT
+        // routes, but never send a JSON body on GET: some HTTP servers ignore
+        // it and silently return an unscoped/default page.
+        let request = if method == reqwest::Method::GET {
+            request.query(&payload)
+        } else {
+            request.json(&payload)
+        };
         // Astra authenticates the caller before reaching this boundary and
         // overwrites body.user_id. Memoria's master-key mode derives its
         // storage scope from X-User-Id, not from arbitrary request fields.
@@ -1078,6 +1096,9 @@ impl MemoriaForwarder for NoopMemoriaForwarder {
 pub struct MatrixOneHealthChecker {
     settings: MatrixOneSettings,
     shared_pool: Option<SharedPool>,
+    /// Optional control-plane pool. Health must not compete with long-running
+    /// agent/session work for the last connection in the general pool.
+    control_pool: Option<SharedPool>,
 }
 
 impl MatrixOneHealthChecker {
@@ -1085,11 +1106,17 @@ impl MatrixOneHealthChecker {
         Self {
             settings,
             shared_pool: None,
+            control_pool: None,
         }
     }
 
     pub fn with_pool(mut self, shared_pool: SharedPool) -> Self {
         self.shared_pool = Some(shared_pool);
+        self
+    }
+
+    pub fn with_control_pool(mut self, control_pool: SharedPool) -> Self {
+        self.control_pool = Some(control_pool);
         self
     }
 }
@@ -1102,7 +1129,7 @@ impl HealthChecker for MatrixOneHealthChecker {
 
     async fn database_health(&self) -> DatabaseHealth {
         let query_timeout = Duration::from_secs(2);
-        if let Some(shared_pool) = &self.shared_pool {
+        if let Some(shared_pool) = self.control_pool.as_ref().or(self.shared_pool.as_ref()) {
             return match tokio::time::timeout(
                 query_timeout,
                 query("SELECT 1").execute(shared_pool.get()),
@@ -1249,6 +1276,48 @@ mod tests {
                 .get("Authorization")
                 .and_then(|value| value.to_str().ok()),
             Some("Bearer test-key")
+        );
+    }
+
+    #[test]
+    fn memoria_forwarder_get_uses_query_without_a_json_body() {
+        let forwarder = ReqwestMemoriaForwarder::new_with_timeouts(
+            "http://memoria.test".to_string(),
+            "test-key".to_string(),
+            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(1),
+        );
+
+        let request = forwarder
+            .request_builder(
+                reqwest::Method::GET,
+                "/v1/memories",
+                &serde_json::json!({
+                    "session_id": "session-7",
+                    "memory_type": "working",
+                    "limit": 7,
+                    "user_id": "user-3"
+                }),
+            )
+            .build()
+            .expect("request builder");
+
+        assert_eq!(request.method(), reqwest::Method::GET);
+        assert!(
+            request.body().is_none(),
+            "GET list must not carry JSON body"
+        );
+        let query = request.url().query().expect("query parameters");
+        assert!(query.contains("session_id=session-7"));
+        assert!(query.contains("memory_type=working"));
+        assert!(query.contains("limit=7"));
+        assert!(!query.contains("user_id="));
+        assert_eq!(
+            request
+                .headers()
+                .get("X-User-Id")
+                .and_then(|value| value.to_str().ok()),
+            Some("user-3")
         );
     }
 

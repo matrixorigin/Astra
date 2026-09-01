@@ -100,7 +100,11 @@ Please produce a dense, structured summary of our conversation above so I can \
 discard the old turns and continue with just the summary in context. Preserve: \
 the user's original goals and any constraints they stated, decisions we made \
 and why, files read or modified (with paths), tools invoked and their key \
-results, errors encountered and their fixes, and any pending work. Omit \
+results, errors encountered and their fixes, and any pending work. Treat file \
+content in the conversation as a historical observation, not as proof of the \
+current workspace state. If continuing the task requires exact or current file \
+bytes, use the ordinary admitted read tool after compaction; never imply that \
+the summary refreshed a file. Omit \
 chit-chat, redundant acknowledgements, and exploration that did not change the outcome.\n\n\
 Use exactly these section headers so the compacted context can be validated and resumed:\n\
 ### Primary Request\n\
@@ -568,6 +572,9 @@ mod tests {
             !INLINE_COMPACT_INSTRUCTION.contains("**Goals**"),
             "inline compaction must not use a parallel summary schema"
         );
+        assert!(INLINE_COMPACT_INSTRUCTION.contains("historical observation"));
+        assert!(INLINE_COMPACT_INSTRUCTION.contains("ordinary admitted read tool"));
+        assert!(INLINE_COMPACT_INSTRUCTION.contains("never imply"));
     }
 
     #[tokio::test]

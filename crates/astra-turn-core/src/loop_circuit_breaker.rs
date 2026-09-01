@@ -17,12 +17,6 @@ pub struct RoundSignal {
     pub tool_signatures: BTreeSet<String>,
     /// Whether this round produced a mutation (file write, shell with side effects).
     pub produced_mutation: bool,
-    /// Whether this round produced strong evidence that the user task is complete.
-    ///
-    /// This is a positive completion signal, not an anomaly. Callers should set
-    /// it only from structured execution evidence (for example a successful
-    /// `git_commit` round), not from natural-language completion phrases.
-    pub task_completed: bool,
     /// Number of tool calls this round.
     pub tool_count: usize,
 }
@@ -63,9 +57,6 @@ pub enum BreakerAction {
     /// Periodic self-reflection evidence, emitted every N consecutive read-only
     /// rounds. Tools remain enabled and the model decides whether to continue.
     Introspect { consecutive_read_only: usize },
-    /// Suggest that the next model round should stop unless it can identify
-    /// concrete remaining work. Tools remain enabled.
-    CompletionObserved,
     /// A repeated behavior pattern was detected. Advisory only.
     PatternObserved,
     /// The observed behavior pattern persisted past its configured patience.
@@ -278,13 +269,6 @@ impl LoopCircuitBreaker {
                 rounds: self.rounds.len(),
                 limit: self.config.absolute_max_rounds,
             };
-        }
-
-        if self.rounds.last().is_some_and(|round| round.task_completed) {
-            self.state = BreakerState::Closed;
-            self.half_open_rounds = 0;
-            self.consecutive_read_only = 0;
-            return BreakerAction::CompletionObserved;
         }
 
         match self.state {
@@ -505,17 +489,7 @@ mod tests {
         RoundSignal {
             tool_signatures: sig(tools),
             produced_mutation: mutation,
-            task_completed: false,
             tool_count: tools.len(),
-        }
-    }
-
-    fn completion_signal() -> RoundSignal {
-        RoundSignal {
-            tool_signatures: sig(&["git_commit:{\"message\":\"finish\"}"]),
-            produced_mutation: true,
-            task_completed: true,
-            tool_count: 1,
         }
     }
 
@@ -555,36 +529,6 @@ mod tests {
             cb.observe(signal(&["write_file:a.rs"], true)),
             BreakerAction::Continue
         );
-        assert_eq!(cb.state(), BreakerState::Closed);
-    }
-
-    #[test]
-    fn completion_signal_emits_observation_without_opening_breaker() {
-        let mut cb = LoopCircuitBreaker::new(BreakerConfig::default());
-
-        assert_eq!(
-            cb.observe(completion_signal()),
-            BreakerAction::CompletionObserved
-        );
-        assert_eq!(cb.state(), BreakerState::Closed);
-    }
-
-    #[test]
-    fn completion_signal_takes_precedence_over_repetition_observation() {
-        let mut cb = LoopCircuitBreaker::new(BreakerConfig::default());
-
-        assert_eq!(
-            cb.observe(signal(&["read_file:same.rs"], false)),
-            BreakerAction::Continue
-        );
-        assert_eq!(
-            cb.observe(signal(&["read_file:same.rs"], false)),
-            BreakerAction::Continue
-        );
-        let mut done = completion_signal();
-        done.tool_signatures = sig(&["read_file:same.rs"]);
-
-        assert_eq!(cb.observe(done), BreakerAction::CompletionObserved);
         assert_eq!(cb.state(), BreakerState::Closed);
     }
 
@@ -839,7 +783,6 @@ mod tests {
         let empty = RoundSignal {
             tool_signatures: BTreeSet::new(),
             produced_mutation: false,
-            task_completed: false,
             tool_count: 0,
         };
         // Empty rounds should not trigger repetition (they're text-only responses).
@@ -943,7 +886,6 @@ mod tests {
                 cb.observe(RoundSignal {
                     tool_signatures: BTreeSet::new(),
                     produced_mutation: false,
-                    task_completed: false,
                     tool_count: 0,
                 });
             }
@@ -975,7 +917,6 @@ mod tests {
             BreakerAction::Introspect {
                 consecutive_read_only: 12,
             },
-            BreakerAction::CompletionObserved,
             BreakerAction::PatternObserved,
             BreakerAction::AdvisoryThresholdReached,
             BreakerAction::HardRoundLimitReached {
@@ -988,7 +929,6 @@ mod tests {
                 BreakerAction::Continue => {}
                 BreakerAction::PatternObserved => {}
                 BreakerAction::Introspect { .. } => {}
-                BreakerAction::CompletionObserved => {}
                 BreakerAction::AdvisoryThresholdReached => {}
                 BreakerAction::HardRoundLimitReached { .. } => {}
             }
@@ -1314,7 +1254,6 @@ mod tests {
         let empty = RoundSignal {
             tool_signatures: BTreeSet::new(),
             produced_mutation: false,
-            task_completed: false,
             tool_count: 0,
         };
         assert_eq!(cb.observe(empty), BreakerAction::Continue);

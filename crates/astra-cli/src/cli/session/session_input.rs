@@ -1,7 +1,6 @@
 use crate::cli::project_instructions::format_project_instructions;
 use crate::cli::session::session_state::SessionState;
 use astra_runtime::prompts;
-use astra_tools::task_mgmt::{SessionTask, unresolved_task_blocker_ids};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FinalizedInput {
@@ -9,8 +8,8 @@ pub(crate) struct FinalizedInput {
     pub(crate) user_intent: String,
     /// External/session-recovery context required for the next turn.
     pub(crate) runtime_required_texts: Vec<String>,
-    /// Dynamic text from external session sources such as task-board
-    /// snapshots. Internal runtime state uses required/typed lanes.
+    /// Dynamic text from external session sources. Internal runtime state
+    /// uses required/typed lanes and must not be projected here.
     pub(crate) runtime_volatile_texts: Vec<String>,
     /// Producer-owned names for built-in system skills active on this turn.
     /// The payload builder projects these into `edge_profile.active_skills`;
@@ -48,7 +47,7 @@ pub(crate) async fn finalize_effective_line(
 ) -> FinalizedInput {
     state.diagnostics_context = None;
     let mut runtime_required_texts = prepared.runtime_required_texts;
-    let mut runtime_volatile_texts = Vec::new();
+    let runtime_volatile_texts = Vec::new();
 
     if !state.pending_bg_notifications.is_empty() {
         let notifications = state
@@ -59,29 +58,6 @@ pub(crate) async fn finalize_effective_line(
         runtime_required_texts.push(format!(
             "Background task updates since your last turn:\n{notifications}"
         ));
-    }
-
-    const TURNS_SINCE_TASK_USE_THRESHOLD: u32 = 10;
-    const TURNS_BETWEEN_REMINDERS: u32 = 10;
-    if state.recent_tools.iter().any(|tool| tool == "task_board") {
-        state.turns_since_task_use = 0;
-    } else {
-        state.turns_since_task_use += 1;
-    }
-    state.turns_since_task_reminder += 1;
-
-    if state.turns_since_task_use >= TURNS_SINCE_TASK_USE_THRESHOLD
-        && state.turns_since_task_reminder >= TURNS_BETWEEN_REMINDERS
-    {
-        let snapshot = match state.task_manager.load_tasks().await {
-            Ok(tasks) => format_open_task_snapshot(&tasks)
-                .map(|task_list| format!("External task board snapshot:\n{task_list}")),
-            Err(error) => Some(format!("External task board snapshot unavailable: {error}")),
-        };
-        if let Some(snapshot) = snapshot {
-            runtime_volatile_texts.push(snapshot);
-        }
-        state.turns_since_task_reminder = 0;
     }
 
     if let Some(guidance) = resume_guidance
@@ -96,49 +72,6 @@ pub(crate) async fn finalize_effective_line(
         runtime_required_texts,
         runtime_volatile_texts,
         active_system_skill_names: prepared.active_system_skill_names,
-    }
-}
-
-fn compact_blocker_ids(blockers: &[String]) -> String {
-    const MAX_IDS: usize = 3;
-    let mut ids = blockers.iter().take(MAX_IDS).cloned().collect::<Vec<_>>();
-    if blockers.len() > MAX_IDS {
-        ids.push(format!("+{} more", blockers.len() - MAX_IDS));
-    }
-    ids.join(", ")
-}
-
-fn format_open_task_snapshot(tasks: &[SessionTask]) -> Option<String> {
-    let mut open = tasks
-        .iter()
-        .filter(|task| task.status.is_open_work())
-        .map(|task| (task, unresolved_task_blocker_ids(tasks, task)))
-        .collect::<Vec<_>>();
-    open.sort_by_key(|(task, blockers)| (task.status.active_priority(), !blockers.is_empty()));
-    let mut lines: Vec<String> = open
-        .iter()
-        .take(10)
-        .map(|(task, blockers)| {
-            let title = task.title.chars().take(120).collect::<String>();
-            let blocked = if blockers.is_empty() {
-                String::new()
-            } else {
-                format!(" [blocked by: {}]", compact_blocker_ids(blockers))
-            };
-            format!("- [{}] {}: {}{}", task.status, task.id, title, blocked)
-        })
-        .collect();
-    let open_total = open.len();
-    if open_total > lines.len() {
-        lines.push(format!(
-            "- ... {} more open task(s)",
-            open_total - lines.len()
-        ));
-    }
-    if lines.is_empty() {
-        None
-    } else {
-        Some(lines.join("\n"))
     }
 }
 
@@ -207,36 +140,6 @@ mod tests {
     };
     use crate::cli::session::session_state::{ContinuationAnchor, SessionState, SkillDevState};
     use astra_runtime::prompts;
-    use astra_tools::task_mgmt::{SessionTask, TaskManager, TaskMutation, TaskStore};
-
-    struct FailingTaskLoadStore;
-
-    #[async_trait::async_trait]
-    impl TaskStore for FailingTaskLoadStore {
-        async fn load(&self, session_id: &str) -> Result<Vec<SessionTask>, String> {
-            Err(format!("forced task load failure for {session_id}"))
-        }
-
-        async fn save(&self, _session_id: &str, _tasks: Vec<SessionTask>) -> Result<(), String> {
-            Ok(())
-        }
-
-        async fn mutate(
-            &self,
-            session_id: &str,
-            _mutation: TaskMutation,
-        ) -> Result<astra_tools::task_mgmt::TaskMutationOutcome, String> {
-            Err(format!("forced task mutate failure for {session_id}"))
-        }
-
-        async fn next_task_id(&self, session_id: &str) -> Result<u32, String> {
-            Err(format!("forced next task id failure for {session_id}"))
-        }
-
-        async fn peek_next_task_id(&self, _session_id: &str) -> Result<u32, String> {
-            Ok(1)
-        }
-    }
 
     #[test]
     fn build_effective_line_does_not_phrase_match_short_continue() {
@@ -264,24 +167,6 @@ mod tests {
 
         let prepared = prepare_input("修复?", &state, &mut crate::cli::ui_adapter::LineUiAdapter);
         assert_eq!(prepared.user_message, "修复?");
-        assert!(prepared.runtime_required_texts.is_empty());
-    }
-
-    #[test]
-    fn build_effective_line_does_not_reanchor_generic_followup_to_task_board() {
-        let state = SessionState {
-            continuation_anchor: Some(ContinuationAnchor::rendered_for_test(
-                "Latest user input: improve session memory flow\nActive task board:\n- [in_progress] task-1: Phase 1: /memory show — TDD",
-            )),
-            ..SessionState::default()
-        };
-
-        let prepared = prepare_input(
-            "还有什么？",
-            &state,
-            &mut crate::cli::ui_adapter::LineUiAdapter,
-        );
-        assert_eq!(prepared.user_message, "还有什么？");
         assert!(prepared.runtime_required_texts.is_empty());
     }
 
@@ -545,202 +430,6 @@ mod tests {
         assert!(!finalized.user_message.contains("<system-reminder>"));
         assert!(state.pending_bg_notifications.is_empty());
         assert!(state.diagnostics_context.is_none());
-    }
-
-    #[tokio::test]
-    async fn finalize_effective_line_injects_task_tool_reminder_and_resets_counter() {
-        let mut state = SessionState {
-            recent_tools: vec!["read_file".into(), "str_replace".into()],
-            turns_since_task_use: 9,
-            turns_since_task_reminder: 9,
-            ..SessionState::default()
-        };
-        state.task_manager.rebind("sess-task-nudge");
-        let create = state
-            .task_manager
-            .create(&serde_json::json!({"title": "Track the recovery cleanup"}))
-            .await;
-        assert!(!create.starts_with("Error:"), "{create}");
-        let paused = state
-            .task_manager
-            .create(&serde_json::json!({"title": "Wait for operator input"}))
-            .await;
-        assert!(!paused.starts_with("Error:"), "{paused}");
-        let pause_update = state
-            .task_manager
-            .update(&serde_json::json!({"task_id": "task-2", "new_status": "paused"}))
-            .await;
-        assert!(!pause_update.starts_with("Error:"), "{pause_update}");
-        let done = state
-            .task_manager
-            .create(&serde_json::json!({"title": "Already finished"}))
-            .await;
-        assert!(!done.starts_with("Error:"), "{done}");
-        let done_start = state
-            .task_manager
-            .update(&serde_json::json!({"task_id": "task-3", "new_status": "in_progress"}))
-            .await;
-        assert!(!done_start.starts_with("Error:"), "{done_start}");
-        let done_update = state
-            .task_manager
-            .update(&serde_json::json!({"task_id": "task-3", "new_status": "completed"}))
-            .await;
-        assert!(!done_update.starts_with("Error:"), "{done_update}");
-        let dependent = state
-            .task_manager
-            .create(&serde_json::json!({
-                "title": "Ready after finished work",
-                "add_blocked_by": ["task-3"]
-            }))
-            .await;
-        assert!(!dependent.starts_with("Error:"), "{dependent}");
-
-        let finalized = finalize_effective_line(
-            PreparedInput::user_only("continue"),
-            "continue".into(),
-            None,
-            &mut state,
-        )
-        .await;
-
-        assert_eq!(finalized.user_message, "continue");
-        assert_eq!(finalized.runtime_volatile_texts.len(), 1);
-        let snapshot = &finalized.runtime_volatile_texts[0];
-        assert!(snapshot.contains("External task board snapshot:"));
-        assert!(snapshot.contains("Track the recovery cleanup"));
-        assert!(snapshot.contains("[paused] task-2: Wait for operator input"));
-        assert!(snapshot.contains("Ready after finished work"), "{snapshot}");
-        assert!(!snapshot.contains("blocked by: task-3"), "{snapshot}");
-        assert!(
-            !snapshot.contains("Already finished"),
-            "terminal completed history should not clutter the open-work snapshot: {snapshot}"
-        );
-        assert!(
-            !finalized
-                .user_message
-                .contains("External task board snapshot:")
-        );
-        assert_eq!(state.turns_since_task_use, 10);
-        assert_eq!(state.turns_since_task_reminder, 0);
-    }
-
-    #[tokio::test]
-    async fn finalize_effective_line_skips_task_tool_reminder_when_no_open_work() {
-        let mut state = SessionState {
-            recent_tools: vec!["read_file".into()],
-            turns_since_task_use: 9,
-            turns_since_task_reminder: 9,
-            ..SessionState::default()
-        };
-        state.task_manager.rebind("sess-task-no-open-nudge");
-        let done = state
-            .task_manager
-            .create(&serde_json::json!({"title": "Already finished"}))
-            .await;
-        assert!(!done.starts_with("Error:"), "{done}");
-        let done_start = state
-            .task_manager
-            .update(&serde_json::json!({"task_id": "task-1", "new_status": "in_progress"}))
-            .await;
-        assert!(!done_start.starts_with("Error:"), "{done_start}");
-        let done_update = state
-            .task_manager
-            .update(&serde_json::json!({"task_id": "task-1", "new_status": "completed"}))
-            .await;
-        assert!(!done_update.starts_with("Error:"), "{done_update}");
-
-        let finalized = finalize_effective_line(
-            PreparedInput::user_only("continue"),
-            "continue".into(),
-            None,
-            &mut state,
-        )
-        .await;
-
-        assert!(
-            finalized.runtime_volatile_texts.is_empty(),
-            "no-open-work sessions should not get noisy task reminders: {finalized:?}"
-        );
-        assert!(
-            !finalized
-                .user_message
-                .contains("External task board snapshot:"),
-            "no-open-work sessions should not render an empty board reminder in user text: {finalized:?}"
-        );
-        assert_eq!(state.turns_since_task_use, 10);
-        assert_eq!(
-            state.turns_since_task_reminder, 0,
-            "no-open-work checks should still be throttled"
-        );
-    }
-
-    #[tokio::test]
-    async fn finalize_effective_line_surfaces_task_reminder_load_failure_boundedly() {
-        let mut state = SessionState {
-            recent_tools: vec!["read_file".into()],
-            turns_since_task_use: 9,
-            turns_since_task_reminder: 9,
-            ..SessionState::default()
-        };
-        state.task_manager = std::sync::Arc::new(TaskManager::new(
-            "sess-task-load-fails",
-            std::sync::Arc::new(FailingTaskLoadStore),
-        ));
-
-        let finalized = finalize_effective_line(
-            PreparedInput::user_only("continue"),
-            "continue".into(),
-            None,
-            &mut state,
-        )
-        .await;
-
-        assert_eq!(finalized.user_message, "continue");
-        assert_eq!(finalized.runtime_volatile_texts.len(), 1);
-        assert!(
-            finalized.runtime_volatile_texts[0]
-                .contains("External task board snapshot unavailable"),
-            "task snapshot load failures must not be silently treated as no open work: {finalized:?}"
-        );
-        assert_eq!(state.turns_since_task_use, 10);
-        assert_eq!(
-            state.turns_since_task_reminder, 0,
-            "load failure reminders should still be throttled"
-        );
-    }
-
-    #[tokio::test]
-    async fn finalize_effective_line_does_not_treat_non_task_tool_names_as_recent_use() {
-        let mut state = SessionState {
-            recent_tools: vec!["taskish".into()],
-            turns_since_task_use: 9,
-            turns_since_task_reminder: 9,
-            ..SessionState::default()
-        };
-        state.task_manager.rebind("sess-task-non-task-nudge");
-        let create = state
-            .task_manager
-            .create(&serde_json::json!({"title": "Open work"}))
-            .await;
-        assert!(!create.starts_with("Error:"), "{create}");
-
-        let finalized = finalize_effective_line(
-            PreparedInput::user_only("continue"),
-            "continue".into(),
-            None,
-            &mut state,
-        )
-        .await;
-
-        assert_eq!(finalized.user_message, "continue");
-        assert_eq!(finalized.runtime_volatile_texts.len(), 1);
-        assert!(
-            finalized.runtime_volatile_texts[0].contains("External task board snapshot:")
-                && finalized.runtime_volatile_texts[0].contains("Open work"),
-            "non-task tool names should not suppress the external task snapshot: {finalized:?}"
-        );
-        assert_eq!(state.turns_since_task_use, 10);
-        assert_eq!(state.turns_since_task_reminder, 0);
     }
 
     #[tokio::test]

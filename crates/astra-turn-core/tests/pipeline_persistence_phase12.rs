@@ -2,10 +2,52 @@
 //!
 //! Tests written first (red), then implementation makes them green.
 
-use astra_turn_core::context_feedback::ContextFeedback;
+use astra_turn_core::context_feedback::{
+    ContextFeedback, RuntimeContextFeedback, RuntimeFeedbackFrame, RuntimeFeedbackIdentity,
+    RuntimeFeedbackProgress,
+};
 use astra_turn_core::pipeline_config::PipelineConfig;
 use astra_turn_core::pipeline_session::PipelineSession;
 use astra_turn_core::section_types::CacheScope;
+
+fn runtime_feedback(turn: u32) -> RuntimeFeedbackFrame {
+    RuntimeFeedbackFrame {
+        schema_version: RuntimeFeedbackFrame::SCHEMA_VERSION,
+        identity: RuntimeFeedbackIdentity {
+            session_id: "session-1".into(),
+            run_id: "run-1".into(),
+            agent_id: "agent-1".into(),
+            model_id: "claude-sonnet-4-6".into(),
+            topology: astra_services::ModelRequestTopology::ServerOnly,
+            request: None,
+        },
+        progress: RuntimeFeedbackProgress {
+            session_turn: turn,
+            agentic_round_index: 0,
+            llm_rounds_completed: 1,
+            slice_round_limit: 10,
+            slice_rounds_remaining: 9,
+            absolute_round_ceiling: None,
+        },
+        context: RuntimeContextFeedback {
+            prompt_cache_identity: None,
+            model_context_window_tokens: Some(200_000),
+            effective_input_limit_tokens: Some(160_000),
+            estimated_input_tokens: Some(2_000),
+            token_pressure: Some(0.0125),
+            compaction_tier: astra_turn_core::compaction_types::CompactionTier::Normal,
+        },
+        request_usage: Some(
+            astra_turn_core::token_accounting::TokenAccounting::from_fields(1_000, 800, 200, 500),
+        ),
+        run_usage: Some(
+            astra_turn_core::token_accounting::TokenAccounting::from_fields(1_000, 800, 200, 500),
+        ),
+        was_truncated: false,
+        cache_break_detected: None,
+        policy_feedback: Default::default(),
+    }
+}
 
 // ── 12.2: EmergentContext in checkpoints ────────────────────────────────────
 
@@ -53,15 +95,16 @@ fn emergent_context_restored_into_session() {
 fn pipeline_feedback_event_captures_cache_metrics() {
     use astra_turn_core::pipeline_journal::{PipelineEventKind, PipelineJournalEvent};
 
-    let feedback = ContextFeedback::from_usage(1000, 800, 200, 500, false);
-    let event = PipelineJournalEvent::from_feedback(3, "claude-sonnet-4-6", &feedback);
+    let feedback = runtime_feedback(3);
+    let event = PipelineJournalEvent::from_feedback(&feedback);
 
     assert_eq!(event.kind, PipelineEventKind::Feedback);
     assert_eq!(event.turn, 3);
     // Read share is measured against the complete prompt-token workload:
     // fresh prompt + cache read + cache creation = 1000 + 800 + 200.
-    assert!((event.cache_hit_ratio.unwrap() - 0.4).abs() < 1e-9);
-    assert_eq!(event.completion_tokens, Some(500));
+    let persisted = event.runtime_feedback.unwrap();
+    assert!((persisted.cache_hit_ratio().unwrap() - 0.4).abs() < 1e-9);
+    assert_eq!(persisted.request_usage.unwrap().completion, 500);
 }
 
 #[test]
@@ -103,13 +146,14 @@ fn compaction_audit_event_captures_what_was_dropped() {
 fn pipeline_events_serialize_to_journal_compatible_json() {
     use astra_turn_core::pipeline_journal::PipelineJournalEvent;
 
-    let feedback = ContextFeedback::from_usage(0, 900, 100, 300, false);
-    let event = PipelineJournalEvent::from_feedback(1, "model", &feedback);
+    let feedback = runtime_feedback(1);
+    let event = PipelineJournalEvent::from_feedback(&feedback);
     let json = serde_json::to_value(&event).unwrap();
 
     assert_eq!(json["kind"], "Feedback");
     assert_eq!(json["turn"], 1);
-    assert!(json["cache_hit_ratio"].as_f64().unwrap() > 0.8);
+    assert_eq!(json["runtime_feedback"]["identity"]["run_id"], "run-1");
+    assert_eq!(json["runtime_feedback"]["request_usage"]["cache_read"], 800);
 }
 
 // ── 12.5: Cloud sync compatibility ─────────────────────────────────────────

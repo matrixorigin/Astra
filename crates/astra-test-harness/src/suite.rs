@@ -3,20 +3,24 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Semaphore;
 
 use crate::case::Case;
 use crate::classify::{FailureClass, classify};
-use crate::criteria::{Criterion, CriterionSeverity, evaluate_deterministic_with_session};
+use crate::criteria::{
+    Criterion, CriterionSeverity, evaluate_deterministic_with_session,
+    requires_durable_run_binding, requires_session_capture,
+};
 use crate::digest::DigestCollector;
 use crate::exec::CaseExecutor;
 use crate::judger::{Judger, evaluate_judger};
 use crate::model_profiles::{ModelReuseSupport, load_profiles};
-use crate::report::{CaseRunReport, StepResult, SuiteReport};
+use crate::report::{AttemptRecord, CaseRunReport, CaseRunStatus, StepResult, SuiteReport};
 use crate::runner::{RunOutcome, RunnerConfig, resolve_models};
 use crate::session_capture::{SessionCapture, load_session, load_session_for_owners};
+use crate::session_identity::is_valid_server_session_id;
 
 /// What to do with session journals.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +120,7 @@ impl<'a> SuiteRunner<'a> {
 
         // Build the work items: (case, model, run_index) triples.
         let mut work: Vec<(&Case, String, u32)> = Vec::new();
+        let mut unavailable: Vec<CaseRunReport> = Vec::new();
         for case in cases {
             match resolve_models(case, &self.runner_cfg) {
                 Ok(models) => {
@@ -126,17 +131,29 @@ impl<'a> SuiteRunner<'a> {
                     }
                 }
                 Err(e) => {
-                    eprintln!("[astra-test] skip case {:?}: {e}", case.name);
+                    eprintln!(
+                        "[astra-test] [UNAVAILABLE] case {:?}: model resolution failed: {e}",
+                        case.name
+                    );
+                    for run_index in 0..self.suite_cfg.runs.max(1) {
+                        unavailable.push(self.model_resolution_unavailable(
+                            case,
+                            &e.to_string(),
+                            run_index,
+                        ));
+                    }
                 }
             }
         }
 
+        let unavailable_count = unavailable.len();
         let semaphore = Arc::new(Semaphore::new(self.suite_cfg.parallel));
         let aborted = Arc::new(AtomicBool::new(false));
         let consecutive_infra = Arc::new(AtomicUsize::new(0));
         let total_auth_failures = Arc::new(AtomicUsize::new(0));
 
         let mut suite = SuiteReport {
+            runs: unavailable,
             started_at: Some(started_at.clone()),
             ..Default::default()
         };
@@ -151,26 +168,57 @@ impl<'a> SuiteRunner<'a> {
                 .collect();
             let _ = tx.send(crate::dashboard::DashboardEvent::SuiteStarted {
                 run_id: run_id.clone(),
-                total_cases: work.len(),
+                total_cases: work.len() + unavailable_count,
                 models,
                 started_at,
                 source: "suite".into(),
+                sequence: crate::dashboard::next_dashboard_event_sequence(),
             });
+            // Model-resolution failures have no executable work item, but
+            // they are still authoritative unavailable rows. Publish them
+            // through the same completion stream so live dashboards cannot
+            // silently drop them from their counters.
+            for report in &suite.runs {
+                let _ = tx.send(crate::dashboard::DashboardEvent::CaseCompleted {
+                    run_id: run_id.clone(),
+                    report: Arc::new(report.clone()),
+                    sequence: crate::dashboard::next_dashboard_event_sequence(),
+                });
+            }
+        }
+
+        // Publish the complete admission queue before the first permit is
+        // acquired.  A user can now distinguish "waiting for a slot" from
+        // "the model call is running" even when suite parallelism is 1.
+        if let Some(ref tx) = self.dashboard_tx {
+            for (queue_index, (case, model, run_index)) in work.iter().enumerate() {
+                let _ = tx.send(crate::dashboard::DashboardEvent::CaseQueued {
+                    run_id: run_id.clone(),
+                    case_name: case.name.clone(),
+                    model: model.clone(),
+                    run_index: *run_index,
+                    queue_position: queue_index + 1,
+                    sequence: crate::dashboard::next_dashboard_event_sequence(),
+                });
+            }
         }
 
         if self.suite_cfg.parallel <= 1 {
             // Serial path: simpler, preserves ordering, supports circuit breaker inline.
-            for (case, model, run_index) in work {
+            let mut stop_at = None;
+            for (index, (case, model, run_index)) in work.iter().enumerate() {
                 if self
                     .cancel_flag
                     .as_ref()
                     .is_some_and(|f| f.load(Ordering::Relaxed))
                 {
                     eprintln!("[astra-test] run cancelled by user");
+                    stop_at = Some((index, "cancelled by user"));
                     break;
                 }
                 if aborted.load(Ordering::Relaxed) {
                     eprintln!("[astra-test] circuit breaker tripped — aborting remaining cases");
+                    stop_at = Some((index, "circuit breaker"));
                     break;
                 }
                 if let Some(ref tx) = self.dashboard_tx {
@@ -178,11 +226,14 @@ impl<'a> SuiteRunner<'a> {
                         run_id: run_id.clone(),
                         case_name: case.name.clone(),
                         model: model.clone(),
-                        run_index,
+                        run_index: *run_index,
+                        sequence: crate::dashboard::next_dashboard_event_sequence(),
                     });
                 }
-                let mut report = self.run_one(case, &model).await;
-                report.run_index = run_index;
+                let mut report = self
+                    .run_one_with_progress(case, model, &run_id, *run_index)
+                    .await;
+                report.run_index = *run_index;
                 self.update_circuit_breaker(
                     &report,
                     &consecutive_infra,
@@ -193,9 +244,23 @@ impl<'a> SuiteRunner<'a> {
                     let _ = tx.send(crate::dashboard::DashboardEvent::CaseCompleted {
                         run_id: run_id.clone(),
                         report: Arc::new(report.clone()),
+                        sequence: crate::dashboard::next_dashboard_event_sequence(),
                     });
                 }
                 suite.runs.push(report);
+            }
+            if let Some((start, reason)) = stop_at {
+                for (case, model, run_index) in work.into_iter().skip(start) {
+                    let report = self.cancelled_case_report(case, &model, run_index, reason);
+                    if let Some(ref tx) = self.dashboard_tx {
+                        let _ = tx.send(crate::dashboard::DashboardEvent::CaseCompleted {
+                            run_id: run_id.clone(),
+                            report: Arc::new(report.clone()),
+                            sequence: crate::dashboard::next_dashboard_event_sequence(),
+                        });
+                    }
+                    suite.runs.push(report);
+                }
             }
         } else {
             // Parallel path: use FuturesUnordered with semaphore.
@@ -216,14 +281,85 @@ impl<'a> SuiteRunner<'a> {
                             .as_ref()
                             .is_some_and(|f| f.load(Ordering::Relaxed))
                         {
-                            return None;
+                            let report = self.cancelled_case_report(
+                                case,
+                                &model,
+                                run_index,
+                                "cancelled before execution",
+                            );
+                            if let Some(ref tx) = dashboard_tx {
+                                let _ = tx.send(crate::dashboard::DashboardEvent::CaseCompleted {
+                                    run_id: run_id.clone(),
+                                    report: Arc::new(report.clone()),
+                                    sequence: crate::dashboard::next_dashboard_event_sequence(),
+                                });
+                            }
+                            return report;
                         }
                         if aborted.load(Ordering::Relaxed) {
-                            return None;
+                            let report = self.cancelled_case_report(
+                                case,
+                                &model,
+                                run_index,
+                                "circuit breaker before execution",
+                            );
+                            if let Some(ref tx) = dashboard_tx {
+                                let _ = tx.send(crate::dashboard::DashboardEvent::CaseCompleted {
+                                    run_id: run_id.clone(),
+                                    report: Arc::new(report.clone()),
+                                    sequence: crate::dashboard::next_dashboard_event_sequence(),
+                                });
+                            }
+                            return report;
                         }
-                        let _permit = sem.acquire().await.ok()?;
+                        let _permit = match sem.acquire().await {
+                            Ok(permit) => permit,
+                            Err(_) => {
+                                return self.cancelled_case_report(
+                                    case,
+                                    &model,
+                                    run_index,
+                                    "execution semaphore closed",
+                                );
+                            }
+                        };
+                        // Cancellation can happen while a work item is
+                        // queued. Never launch it merely because a permit
+                        // became available after cancellation.
+                        if cancel_flag
+                            .as_ref()
+                            .is_some_and(|f| f.load(Ordering::Relaxed))
+                        {
+                            let report = self.cancelled_case_report(
+                                case,
+                                &model,
+                                run_index,
+                                "cancelled while waiting for execution",
+                            );
+                            if let Some(ref tx) = dashboard_tx {
+                                let _ = tx.send(crate::dashboard::DashboardEvent::CaseCompleted {
+                                    run_id: run_id.clone(),
+                                    report: Arc::new(report.clone()),
+                                    sequence: crate::dashboard::next_dashboard_event_sequence(),
+                                });
+                            }
+                            return report;
+                        }
                         if aborted.load(Ordering::Relaxed) {
-                            return None;
+                            let report = self.cancelled_case_report(
+                                case,
+                                &model,
+                                run_index,
+                                "circuit breaker while waiting for execution",
+                            );
+                            if let Some(ref tx) = dashboard_tx {
+                                let _ = tx.send(crate::dashboard::DashboardEvent::CaseCompleted {
+                                    run_id: run_id.clone(),
+                                    report: Arc::new(report.clone()),
+                                    sequence: crate::dashboard::next_dashboard_event_sequence(),
+                                });
+                            }
+                            return report;
                         }
                         if let Some(ref tx) = dashboard_tx {
                             let _ = tx.send(crate::dashboard::DashboardEvent::CaseStarted {
@@ -231,9 +367,12 @@ impl<'a> SuiteRunner<'a> {
                                 case_name: case.name.clone(),
                                 model: model.clone(),
                                 run_index,
+                                sequence: crate::dashboard::next_dashboard_event_sequence(),
                             });
                         }
-                        let mut report = self.run_one(case, &model).await;
+                        let mut report = self
+                            .run_one_with_progress(case, &model, &run_id, run_index)
+                            .await;
                         report.run_index = run_index;
                         self.update_circuit_breaker(
                             &report,
@@ -245,15 +384,16 @@ impl<'a> SuiteRunner<'a> {
                             let _ = tx.send(crate::dashboard::DashboardEvent::CaseCompleted {
                                 run_id: run_id.clone(),
                                 report: Arc::new(report.clone()),
+                                sequence: crate::dashboard::next_dashboard_event_sequence(),
                             });
                         }
-                        Some(report)
+                        report
                     }
                 })
                 .collect();
 
             let results: Vec<_> = futures.collect().await;
-            for r in results.into_iter().flatten() {
+            for r in results {
                 suite.runs.push(r);
             }
             // Stabilize ordering: sort by (case_name, model, run_index)
@@ -265,12 +405,10 @@ impl<'a> SuiteRunner<'a> {
 
         suite.wall_time_ms = wall_start.elapsed().as_millis() as u64;
         suite.ended_at = Some(chrono::Utc::now().to_rfc3339());
-        if let Some(ref tx) = self.dashboard_tx {
-            let _ = tx.send(crate::dashboard::DashboardEvent::SuiteCompleted {
-                run_id: run_id.clone(),
-                report: Arc::new(suite.clone()),
-            });
-        }
+        // The dashboard entry point publishes the terminal event after it
+        // commits its authoritative snapshot. Emitting it here would let a
+        // browser observe completion while REST/reconnect state still points
+        // at the previous run.
         suite
     }
 
@@ -281,7 +419,7 @@ impl<'a> SuiteRunner<'a> {
         aborted: &AtomicBool,
         total_auth_failures: &AtomicUsize,
     ) {
-        if report.passed {
+        if report.is_passed() {
             consecutive_infra.store(0, Ordering::Relaxed);
             return;
         }
@@ -300,6 +438,8 @@ impl<'a> SuiteRunner<'a> {
             let is_infra = matches!(
                 class,
                 FailureClass::InfraAuth
+                    | FailureClass::InfraRuntime
+                    | FailureClass::InfraQuota
                     | FailureClass::InfraTimeout
                     | FailureClass::InfraModelInactive
                     | FailureClass::InfraProviderError { .. }
@@ -320,55 +460,99 @@ impl<'a> SuiteRunner<'a> {
         }
     }
 
+    async fn load_session_until_settled(
+        &self,
+        session_id: &str,
+        settled_subsystem: Option<&str>,
+    ) -> Option<SessionCapture> {
+        let deadline = tokio::time::Instant::now() + self.runner_cfg.session_settle_timeout;
+        let mut latest = None;
+        loop {
+            if let Some(capture) = self.session_loader.load(session_id) {
+                let settled = settled_subsystem
+                    .is_none_or(|expected| capture.subsystem_settled_for_latest_turn(expected));
+                if settled {
+                    return Some(capture);
+                }
+                latest = Some(capture);
+            }
+            if settled_subsystem.is_none()
+                || self.runner_cfg.session_settle_timeout.is_zero()
+                || tokio::time::Instant::now() >= deadline
+            {
+                return latest;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     async fn run_one(&self, case: &Case, model: &str) -> CaseRunReport {
         if let Some(report) = self.skip_for_unsupported_cache_scope(case, model) {
             eprintln!(
-                "[astra-test] [PASS] {} × {} (skipped: unsupported cache scope)",
+                "[astra-test] [UNAVAILABLE] {} × {} (unsupported cache scope)",
                 case.name, model
             );
             return report;
         }
 
-        // Run setup command if specified. Non-zero exit aborts the case.
-        if let Some(ref cmd) = case.setup_cmd
-            && let Err(error) = self.run_shell_hook("setup_cmd", case, cmd).await
-        {
-            eprintln!("[astra-test] {error}");
-            return CaseRunReport {
-                case_name: case.name.clone(),
-                model: model.to_string(),
-                passed: false,
-                run_index: 0,
-                capability: case.capability.clone(),
-                weight: case.weight,
-                difficulty: case.difficulty,
-                outcome: RunOutcome::new(model)
-                    .with_text("setup_cmd failed")
-                    .with_stderr(format!("[astra-test] {error}")),
-                criteria: vec![],
-                steps: vec![],
-                session: None,
-                reproducer: None,
-                digest: None,
-                digest_error: None,
-                failure_class: Some(crate::classify::FailureClass::PlatformSetupFailed),
-                has_warnings: false,
-            };
+        // Setup is part of the case lifecycle, not a branch that may skip
+        // teardown. Preserve the setup failure, then flow through the same
+        // finalization path so shared state is always cleaned up.
+        let setup_error = if let Some(ref cmd) = case.setup_cmd {
+            match self.run_shell_hook("setup_cmd", case, cmd).await {
+                Ok(()) => None,
+                Err(error) => {
+                    eprintln!("[astra-test] {error}");
+                    Some(error)
+                }
+            }
+        } else {
+            None
+        };
+        let setup_failed = setup_error.is_some();
+        let invocation_started_at = chrono::Utc::now();
+        let mut outcome = if let Some(error) = &setup_error {
+            RunOutcome::new(model)
+                .with_text("setup_cmd failed")
+                .with_stderr(format!("[astra-test] {error}"))
+        } else {
+            self.executor.execute(case, model).await
+        };
+        let mut attempts = vec![AttemptRecord {
+            attempt_index: 0,
+            outcome: outcome.clone(),
+        }];
+        let mut step_results: Vec<StepResult> = Vec::new();
+        let mut lifecycle_errors = Vec::new();
+        if let Some(error) = &setup_error {
+            lifecycle_errors.push(format!("setup command failed: {error}"));
         }
 
-        let mut outcome = self.executor.execute(case, model).await;
-        let mut step_results: Vec<StepResult> = Vec::new();
-
-        // Multi-turn: execute follow-up steps using the same session.
-        if !case.steps.is_empty() && outcome.session_id.is_none() {
+        // Multi-turn: execute follow-up steps using the same server-issued
+        // session. Identity validity is a lifecycle invariant, not a case
+        // criterion: comparing two attacker-controlled strings is insufficient.
+        let root_session_is_valid = outcome
+            .session_id
+            .as_deref()
+            .is_some_and(is_valid_server_session_id);
+        if !setup_failed && !case.steps.is_empty() && outcome.session_id.is_none() {
             eprintln!(
                 "[astra-test] WARNING: case {} has {} steps but turn 1 returned no session_id — \
                  steps will be skipped. This usually means the first turn failed.",
                 case.name,
                 case.steps.len()
             );
+            lifecycle_errors
+                .push("follow-up turns require the root turn's server-issued session_id".into());
+        } else if !setup_failed && !case.steps.is_empty() && !root_session_is_valid {
+            let invalid_id = outcome.session_id.as_deref().unwrap_or("<missing>");
+            lifecycle_errors.push(format!(
+                "follow-up turns require a valid server-issued UUID session_id (got {invalid_id:?})"
+            ));
         }
-        if !case.steps.is_empty()
+        if !setup_failed
+            && !case.steps.is_empty()
+            && root_session_is_valid
             && let Some(ref session_id) = outcome.session_id
         {
             for (idx, step) in case.steps.iter().enumerate() {
@@ -376,6 +560,7 @@ impl<'a> SuiteRunner<'a> {
                     name: format!("{}__step{}", case.name, idx),
                     description: None,
                     prompt: step.prompt.clone(),
+                    prompt_variants: vec![],
                     models: Some(vec![model.to_string()]),
                     criteria: vec![],
                     debug_log: case.debug_log,
@@ -391,7 +576,7 @@ impl<'a> SuiteRunner<'a> {
                     difficulty: None,
                     weight: 1.0,
                     steps: vec![],
-                    env: case.env.clone(),
+                    cli_env: case.cli_env.clone(),
                     setup_cmd: None,
                     teardown_cmd: None,
                     cleanup_memory_records: false,
@@ -437,10 +622,42 @@ impl<'a> SuiteRunner<'a> {
                         }
                     }
                 }
-                let step_passed = step_criteria_results
-                    .iter()
-                    .filter(|r| r.severity == CriterionSeverity::Hard)
-                    .all(|r| r.passed);
+                let mut step_lifecycle_ok = true;
+                if step_outcome.exit_code != 0 {
+                    step_lifecycle_ok = false;
+                    lifecycle_errors.push(format!(
+                        "step {idx} did not reach a successful terminal outcome (exit_code={})",
+                        step_outcome.exit_code
+                    ));
+                }
+                match step_outcome.session_id.as_deref() {
+                    Some(actual) if !is_valid_server_session_id(actual) => {
+                        step_lifecycle_ok = false;
+                        lifecycle_errors.push(format!(
+                            "step {idx} returned an invalid server-issued UUID session_id (got {actual:?})"
+                        ));
+                    }
+                    Some(actual) if actual != session_id => {
+                        step_lifecycle_ok = false;
+                        lifecycle_errors.push(format!(
+                            "step {idx} session identity diverged (expected {}, got {:?})",
+                            session_id, step_outcome.session_id
+                        ));
+                    }
+                    None => {
+                        step_lifecycle_ok = false;
+                        lifecycle_errors.push(format!(
+                            "step {idx} session identity diverged (expected {}, got None)",
+                            session_id
+                        ));
+                    }
+                    _ => {}
+                }
+                let step_passed = step_lifecycle_ok
+                    && step_criteria_results
+                        .iter()
+                        .filter(|r| r.severity == CriterionSeverity::Hard)
+                        .all(|r| r.passed);
 
                 step_results.push(StepResult {
                     step_index: idx as u32,
@@ -485,26 +702,189 @@ impl<'a> SuiteRunner<'a> {
             }
         }
 
-        // Retry on 429 if enabled. Skip for multi-turn cases because
-        // retrying only re-executes the first turn, not the full step sequence.
+        // Retry on a typed rate-limit terminal only when the first attempt
+        // produced no session, turn, or tool evidence. Once a server-owned
+        // session exists, retrying would abandon its durable side effects and
+        // health/cleanup obligations; fail closed and retain that attempt.
         if self.suite_cfg.retry_on_429 && case.steps.is_empty() && is_rate_limited(&outcome) {
-            eprintln!(
-                "[astra-test] rate-limited on case={} model={}, retrying after 5s",
-                case.name, model
-            );
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            outcome = self.executor.execute(case, model).await;
+            let has_first_attempt_evidence = outcome.session_id.is_some()
+                || outcome.run_id.is_some()
+                || outcome.tool_calls_count > 0
+                || outcome.turn_rounds > 0;
+            if has_first_attempt_evidence {
+                lifecycle_errors.push(
+                    "rate-limit retry refused after first attempt produced session or durable evidence"
+                        .into(),
+                );
+            } else {
+                eprintln!(
+                    "[astra-test] typed rate-limit on case={} model={}, retrying after 5s",
+                    case.name, model
+                );
+                let first_attempt = outcome.clone();
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                outcome = self.executor.execute(case, model).await;
+                attempts.push(AttemptRecord {
+                    attempt_index: 1,
+                    outcome: outcome.clone(),
+                });
+                // Preserve total cost/latency across attempts. The first
+                // attempt had no server identity, so no durable cleanup is
+                // being dropped; its complete terminal receipt remains in
+                // `attempts` for audit.
+                outcome.prompt_tokens = outcome
+                    .prompt_tokens
+                    .saturating_add(first_attempt.prompt_tokens);
+                outcome.completion_tokens = outcome
+                    .completion_tokens
+                    .saturating_add(first_attempt.completion_tokens);
+                outcome.cached_input_tokens = outcome
+                    .cached_input_tokens
+                    .saturating_add(first_attempt.cached_input_tokens);
+                outcome.cache_creation_tokens = outcome
+                    .cache_creation_tokens
+                    .saturating_add(first_attempt.cache_creation_tokens);
+                outcome.duration_ms = outcome
+                    .duration_ms
+                    .saturating_add(first_attempt.duration_ms);
+                if !first_attempt.stderr.is_empty() {
+                    outcome.stderr = format!(
+                        "[attempt 0 stderr]\n{}\n[attempt 1 stderr]\n{}",
+                        first_attempt.stderr, outcome.stderr
+                    );
+                }
+            }
         }
 
-        // Load session.
-        let session = if self.session_mode.should_load(case) || case.cleanup_memory_records {
-            outcome
-                .session_id
-                .as_deref()
-                .and_then(|id| self.session_loader.load(id))
+        if outcome.exit_code != 0 {
+            lifecycle_errors.push(format!(
+                "root turn did not reach a successful terminal outcome (exit_code={})",
+                outcome.exit_code
+            ));
+        }
+        if case.steps.is_empty() {
+            match outcome.session_id.as_deref() {
+                Some(session_id) if !is_valid_server_session_id(session_id) => {
+                    lifecycle_errors.push(format!(
+                        "root turn returned an invalid server-issued UUID session_id (got {session_id:?})"
+                    ));
+                }
+                None => lifecycle_errors
+                    .push("root turn did not return the server-issued UUID session_id".into()),
+                _ => {}
+            }
+        }
+        for error in &lifecycle_errors {
+            if !outcome.stderr.is_empty() {
+                outcome.stderr.push('\n');
+            }
+            outcome.stderr.push_str("[astra-test] lifecycle: ");
+            outcome.stderr.push_str(error);
+        }
+
+        // A visible answer cannot certify product health while asynchronous
+        // work is failing out of band. This invariant belongs to the runner,
+        // not individual YAML authors or one particular CLI/dashboard entry.
+        let mut criteria = case.criteria.clone();
+        if let Some(scope) = case.required_cache_scope {
+            criteria.push(Criterion::PromptCacheReuseScope { scope });
+        }
+        if self.runner_cfg.require_session_subsystem_health
+            && !criteria
+                .iter()
+                .any(|criterion| matches!(criterion, Criterion::SessionSubsystemHealthy { .. }))
+        {
+            criteria.push(Criterion::SessionSubsystemHealthy {
+                settled_subsystem: Some("post_loop_memory".into()),
+            });
+        }
+        let settled_subsystem = criteria.iter().find_map(|criterion| match criterion {
+            Criterion::SessionSubsystemHealthy { settled_subsystem } => {
+                settled_subsystem.as_deref()
+            }
+            _ => None,
+        });
+
+        // Load session whenever a criterion needs durable evidence. Keeping
+        // this decision beside the effective criteria prevents entry points
+        // from accidentally running the health gate without its evidence.
+        let mut session = if self.session_mode.should_load(case)
+            || case.cleanup_memory_records
+            || requires_session_capture(&criteria)
+        {
+            if let Some(session_id) = outcome.session_id.as_deref() {
+                self.load_session_until_settled(session_id, settled_subsystem)
+                    .await
+            } else {
+                None
+            }
         } else {
             None
         };
+        // Every executed invocation must identify itself. Never use
+        // filter_map here: a missing root/step identity must not disappear
+        // merely because another step returned a valid run_id.
+        let mut invocation_run_ids = Vec::with_capacity(step_results.len() + 1);
+        let mut missing_invocation_id = None;
+        match outcome.run_id.as_deref() {
+            Some(run_id) if !run_id.trim().is_empty() => {
+                invocation_run_ids.push(run_id.to_string())
+            }
+            _ => missing_invocation_id = Some("root terminal outcome has no run_id".to_string()),
+        }
+        for (idx, step) in step_results.iter().enumerate() {
+            match step.outcome.run_id.as_deref() {
+                Some(run_id) if !run_id.trim().is_empty() => {
+                    invocation_run_ids.push(run_id.to_string())
+                }
+                _ => {
+                    missing_invocation_id =
+                        Some(format!("step {idx} terminal outcome has no run_id"));
+                }
+            }
+        }
+        invocation_run_ids.sort_unstable();
+        invocation_run_ids.dedup();
+
+        if requires_durable_run_binding(&criteria) {
+            let binding_error = if let Some(error) = missing_invocation_id.clone() {
+                Some(format!(
+                    "hard durable evidence requires every invocation identity: {error}"
+                ))
+            } else if invocation_run_ids.is_empty() {
+                Some("hard durable evidence requires terminal run_id(s)".to_string())
+            } else if session.is_none() {
+                Some("hard durable evidence unavailable: no session capture".to_string())
+            } else {
+                invocation_run_ids.iter().find_map(|run_id| {
+                    (!session.as_ref().is_some_and(|capture| {
+                        capture.has_canonical_run_evidence_since(run_id, invocation_started_at)
+                    }))
+                    .then(|| {
+                        format!(
+                            "captured session has no canonical turn for terminal run_id {run_id:?} created during this invocation"
+                        )
+                    })
+                })
+            };
+            if let Some(error) = binding_error {
+                if !outcome.stderr.is_empty() {
+                    outcome.stderr.push('\n');
+                }
+                outcome.stderr.push_str("[astra-test] lifecycle: ");
+                outcome.stderr.push_str(&error);
+                lifecycle_errors.push(error);
+            }
+        }
+
+        // Durable criteria must never inspect the whole resumable journal.
+        // Bind the evidence surface to every current run id and timestamp;
+        // stale turns remain available only through diagnostics outside the
+        // certification path.
+        if let Some(capture) = session.take() {
+            session =
+                Some(capture.scoped_to_invocation(&invocation_run_ids, invocation_started_at));
+        }
         let mut judger_outcome = outcome.clone();
         if let Some(session) = &session {
             // Preserve complete moderate-sized receipts here; the judger owns
@@ -517,41 +897,6 @@ impl<'a> SuiteRunner<'a> {
                     .push_str("\n[durable-tool-evidence jsonl]\n");
                 judger_outcome.stderr.push_str(&evidence);
             }
-        }
-
-        // Evaluate criteria.
-        // Auto-attach a default judger criterion when the case has none
-        // and judger is enabled. This ensures every case gets a quality check.
-        let mut criteria = case.criteria.clone();
-        if !self.no_judger
-            && !criteria
-                .iter()
-                .any(|c| matches!(c, Criterion::Judger { .. } | Criterion::HardJudger { .. }))
-        {
-            let question = if case.steps.is_empty() {
-                let preview: String = case.prompt.trim().chars().take(500).collect();
-                format!(
-                    "Given the task: \"{preview}\"\nDid the agent complete it correctly and efficiently? \
-                     Score 0.0 for wrong/incomplete, 0.5 for partially correct, 1.0 for fully correct."
-                )
-            } else {
-                let initial: String = case.prompt.trim().chars().take(300).collect();
-                let last_step = &case.steps.last().unwrap().prompt;
-                let followup: String = last_step.trim().chars().take(300).collect();
-                format!(
-                    "This is a multi-turn conversation.\n\
-                     Initial task: \"{initial}\"\n\
-                     Follow-up instruction: \"{followup}\"\n\
-                     The agent's final response should address the FOLLOW-UP instruction \
-                     (which may refine or change the original task).\n\
-                     Score 0.0 for wrong/incomplete, 0.5 for partially correct, 1.0 for fully correct."
-                )
-            };
-            criteria.push(Criterion::Judger {
-                question,
-                threshold: 0.7,
-                model: None,
-            });
         }
 
         let mut det = evaluate_deterministic_with_session(&criteria, &outcome, session.as_ref());
@@ -591,10 +936,12 @@ impl<'a> SuiteRunner<'a> {
             .filter(|c| c.severity == crate::criteria::CriterionSeverity::Hard)
             .all(|c| c.passed);
         let all_passed = det.iter().all(|c| c.passed) && steps_passed;
-        let product_passed = hard_passed && steps_passed;
+        let product_passed = lifecycle_errors.is_empty() && hard_passed && steps_passed;
 
         // Classify failure.
-        let product_failure_class = if !product_passed {
+        let product_failure_class = if setup_failed {
+            Some(crate::classify::FailureClass::PlatformSetupFailed)
+        } else if !product_passed {
             Some(classify(&outcome, &det))
         } else {
             None
@@ -661,10 +1008,15 @@ impl<'a> SuiteRunner<'a> {
             dur = outcome.duration_ms,
         );
 
+        let retry_attempted = attempts.len() > 1;
         CaseRunReport {
             case_name: case.name.clone(),
             model: model.to_string(),
-            passed,
+            status: if passed {
+                CaseRunStatus::Passed
+            } else {
+                CaseRunStatus::Failed
+            },
             run_index: 0, // overwritten by caller
             capability: case.capability.clone(),
             weight: case.weight,
@@ -672,12 +1024,56 @@ impl<'a> SuiteRunner<'a> {
             outcome,
             criteria: det,
             steps: step_results,
+            attempts,
             session,
             reproducer,
             digest,
             digest_error,
             failure_class,
-            has_warnings: passed && !all_passed,
+            has_warnings: passed && (!all_passed || retry_attempted),
+        }
+    }
+
+    /// Execute one case while preserving a user-visible liveness boundary.
+    /// The heartbeat is deliberately weaker than product progress: it only
+    /// proves that the harness task is still awaiting the case.  Tool/turn
+    /// counts and terminal criteria remain sourced from the final outcome.
+    async fn run_one_with_progress(
+        &self,
+        case: &Case,
+        model: &str,
+        run_id: &str,
+        run_index: u32,
+    ) -> CaseRunReport {
+        let started = Instant::now();
+        let mut execution = Box::pin(self.run_one(case, model));
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+        // Consume interval's immediate first tick so the first heartbeat is
+        // a real five-second observation rather than a duplicate start event.
+        heartbeat.tick().await;
+
+        loop {
+            tokio::select! {
+                report = &mut execution => return report,
+                _ = heartbeat.tick() => {
+                    let elapsed_ms = started.elapsed().as_millis() as u64;
+                    eprintln!(
+                        "[astra-test] [RUNNING] {} × {} elapsed={}ms",
+                        case.name, model, elapsed_ms
+                    );
+                    if let Some(ref tx) = self.dashboard_tx {
+                        let _ = tx.send(crate::dashboard::DashboardEvent::CaseProgress {
+                            run_id: run_id.to_string(),
+                            case_name: case.name.clone(),
+                            model: model.to_string(),
+                            run_index,
+                            phase: "executing".into(),
+                            elapsed_ms,
+                            sequence: crate::dashboard::next_dashboard_event_sequence(),
+                        });
+                    }
+                }
+            }
         }
     }
 
@@ -698,10 +1094,13 @@ impl<'a> SuiteRunner<'a> {
                 case.name
             )];
         };
-        if session.skipped_lines != 0 || session.dropped_lines != 0 {
+        if session.skipped_lines != 0
+            || session.dropped_lines != 0
+            || session.has_integrity_errors()
+        {
             return vec![format!(
-                "memory cleanup unavailable for case={}: session capture is incomplete (skipped_lines={}, dropped_lines={})",
-                case.name, session.skipped_lines, session.dropped_lines
+                "memory cleanup unavailable for case={}: session capture is incomplete (skipped_lines={}, dropped_lines={}, integrity_errors={})",
+                case.name, session.skipped_lines, session.dropped_lines, session.integrity_errors
             )];
         }
 
@@ -776,6 +1175,93 @@ impl<'a> SuiteRunner<'a> {
         }
     }
 
+    fn model_resolution_unavailable(
+        &self,
+        case: &Case,
+        detail: &str,
+        run_index: u32,
+    ) -> CaseRunReport {
+        let reason = format!("unavailable: could not resolve a model for case: {detail}");
+        let criteria = case
+            .criteria
+            .iter()
+            .cloned()
+            .map(|criterion| crate::criteria::CriterionResult {
+                severity: crate::criteria::criterion_severity(&criterion),
+                criterion,
+                passed: false,
+                detail: reason.clone(),
+                full_detail: None,
+                score: None,
+            })
+            .collect();
+        CaseRunReport {
+            case_name: case.name.clone(),
+            model: "<unresolved>".into(),
+            status: CaseRunStatus::Unavailable,
+            run_index,
+            capability: case.capability.clone(),
+            weight: case.weight,
+            difficulty: case.difficulty,
+            outcome: RunOutcome::new("<unresolved>")
+                .with_text(reason.clone())
+                .with_stderr(reason),
+            criteria,
+            steps: Vec::new(),
+            attempts: Vec::new(),
+            session: None,
+            reproducer: None,
+            digest: None,
+            digest_error: None,
+            failure_class: Some(crate::classify::FailureClass::InfraVerificationUnavailable),
+            has_warnings: false,
+        }
+    }
+
+    fn cancelled_case_report(
+        &self,
+        case: &Case,
+        model: &str,
+        run_index: u32,
+        reason: &str,
+    ) -> CaseRunReport {
+        let detail = format!("cancelled before execution: {reason}");
+        let criteria = case
+            .criteria
+            .iter()
+            .cloned()
+            .map(|criterion| crate::criteria::CriterionResult {
+                severity: crate::criteria::criterion_severity(&criterion),
+                criterion,
+                passed: false,
+                detail: detail.clone(),
+                full_detail: None,
+                score: None,
+            })
+            .collect();
+        CaseRunReport {
+            case_name: case.name.clone(),
+            model: model.to_string(),
+            status: CaseRunStatus::Cancelled,
+            run_index,
+            capability: case.capability.clone(),
+            weight: case.weight,
+            difficulty: case.difficulty,
+            outcome: RunOutcome::new(model)
+                .with_text(detail.clone())
+                .with_stderr(detail),
+            criteria,
+            steps: Vec::new(),
+            attempts: Vec::new(),
+            session: None,
+            reproducer: None,
+            digest: None,
+            digest_error: None,
+            failure_class: Some(FailureClass::InfraVerificationUnavailable),
+            has_warnings: false,
+        }
+    }
+
     fn skip_for_unsupported_cache_scope(&self, case: &Case, model: &str) -> Option<CaseRunReport> {
         let required = case.required_cache_scope?;
         let profiles = load_profiles(self.runner_cfg.working_dir.as_deref());
@@ -783,12 +1269,15 @@ impl<'a> SuiteRunner<'a> {
             .get(model)
             .map(|profile| profile.reuse_support)
             .unwrap_or(ModelReuseSupport::Unknown);
-        if reuse_support.supports(required) {
+        // Unknown metadata is not an exclusion: run the case and let its
+        // criteria provide actual evidence. Only an explicit profile claim
+        // that cannot satisfy the requested scope is unavailable.
+        if !reuse_support.explicitly_unsupported(required) {
             return None;
         }
 
         let detail = format!(
-            "skipped: model metadata reports prompt-cache reuse_scope={reuse_support:?}, \
+            "unavailable: model metadata reports prompt-cache reuse_scope={reuse_support:?}, \
              but case requires {required:?}"
         );
         let criteria = case
@@ -798,7 +1287,7 @@ impl<'a> SuiteRunner<'a> {
             .map(|criterion| crate::criteria::CriterionResult {
                 severity: crate::criteria::criterion_severity(&criterion),
                 criterion,
-                passed: true,
+                passed: false,
                 detail: detail.clone(),
                 full_detail: None,
                 score: None,
@@ -807,23 +1296,23 @@ impl<'a> SuiteRunner<'a> {
         Some(CaseRunReport {
             case_name: case.name.clone(),
             model: model.to_string(),
-            passed: true,
+            status: CaseRunStatus::Unavailable,
             run_index: 0,
             capability: case.capability.clone(),
             weight: case.weight,
             difficulty: case.difficulty,
             outcome: RunOutcome::new(model)
-                .with_exit_code(0)
                 .with_text(detail.clone())
                 .with_stderr(detail.clone()),
             criteria,
             steps: Vec::new(),
+            attempts: Vec::new(),
             session: None,
             reproducer: None,
             digest: None,
             digest_error: None,
-            failure_class: None,
-            has_warnings: true,
+            failure_class: Some(crate::classify::FailureClass::InfraVerificationUnavailable),
+            has_warnings: false,
         })
     }
 }
@@ -847,12 +1336,7 @@ fn hook_output_detail(stderr: &str, stdout: &str) -> String {
 }
 
 fn is_rate_limited(outcome: &crate::runner::RunOutcome) -> bool {
-    let s = &outcome.stderr;
-    s.contains("Too many requests")
-        || s.contains("rate_limit")
-        || s.contains("rate limit")
-        || s.contains("[rate_limit]")
-        || (s.contains("429") && (s.contains("error") || s.contains("Error") || s.contains("HTTP")))
+    crate::classify::outcome_is_rate_limited(outcome)
 }
 
 #[cfg(test)]
@@ -872,6 +1356,7 @@ mod tests {
             name: name.into(),
             description: None,
             prompt: format!("prompt-for-{name}"),
+            prompt_variants: vec![],
             models: None,
             criteria,
             debug_log: false,
@@ -882,11 +1367,80 @@ mod tests {
             difficulty: None,
             weight: 1.0,
             steps: vec![],
-            env: std::collections::HashMap::new(),
+            cli_env: std::collections::HashMap::new(),
             setup_cmd: None,
             teardown_cmd: None,
             cleanup_memory_records: false,
         }
+    }
+
+    #[test]
+    fn rate_limit_retry_requires_typed_failed_terminal() {
+        let successful_text = RunOutcome::new("m")
+            .with_text("the provider mentioned a rate limit")
+            .with_stderr("rate limit");
+        assert!(!is_rate_limited(&successful_text));
+
+        let untyped_failure = RunOutcome::new("m")
+            .with_exit_code(1)
+            .with_stderr("rate limit");
+        assert!(!is_rate_limited(&untyped_failure));
+
+        let typed_failure = RunOutcome::new("m")
+            .with_exit_code(1)
+            .with_final_state("interrupted")
+            .with_interruption_kind("rate_limit")
+            .with_stderr("HTTP 429: Too many requests");
+        assert!(is_rate_limited(&typed_failure));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_retry_refuses_to_abandon_a_session_attempt() {
+        let mut first = RunOutcome::new("m")
+            .with_exit_code(1)
+            .with_session_id("550e8400-e29b-41d4-a716-446655440000")
+            .with_final_state("interrupted")
+            .with_interruption_kind("rate_limit")
+            .with_stderr("HTTP 429: Too many requests");
+        first.run_id = Some("run-first".into());
+        let mut second = RunOutcome::new("m")
+            .with_exit_code(0)
+            .with_text("second attempt must not execute")
+            .with_session_id("550e8400-e29b-41d4-a716-446655440000");
+        second.run_id = Some("run-second".into());
+        let exec = SequenceExecutor {
+            outcomes: std::sync::Mutex::new(vec![first, second]),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let suite_cfg = SuiteConfig {
+            retry_on_429: true,
+            ..SuiteConfig::default()
+        };
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: RunnerConfig::new(PathBuf::from("astra"))
+                .with_fallback_models(vec!["m".into()]),
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg,
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+        let report = runner.run_all(&[case_with("retry-session", vec![])]).await;
+        assert_eq!(exec.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(report.runs[0].attempts.len(), 1);
+        assert!(
+            report.runs[0]
+                .outcome
+                .stderr
+                .contains("retry refused after first attempt produced session")
+        );
     }
 
     fn outcome_ok(model: &str, text: &str, tools: &[&str]) -> RunOutcome {
@@ -895,8 +1449,8 @@ mod tests {
             exit_code: 0,
             text: text.into(),
             stderr: String::new(),
-            session_id: Some(format!("sess-{model}")),
-            run_id: None,
+            session_id: Some("550e8400-e29b-41d4-a716-446655440000".into()),
+            run_id: Some("run-test".into()),
             tool_calls_count: tools.len() as u32,
             tools_used: tools.iter().map(|s| s.to_string()).collect(),
             completion_tokens: 0,
@@ -916,6 +1470,23 @@ mod tests {
 
     struct FixedJudger {
         score: f64,
+    }
+
+    struct SequenceExecutor {
+        outcomes: std::sync::Mutex<Vec<RunOutcome>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl CaseExecutor for SequenceExecutor {
+        async fn execute(&self, _case: &Case, _model: &str) -> RunOutcome {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.outcomes.lock().unwrap().remove(0)
+        }
+
+        fn reproducer(&self, _case: &Case, _model: &str) -> String {
+            "<sequence executor>".into()
+        }
     }
 
     #[async_trait]
@@ -940,6 +1511,249 @@ mod tests {
         fn load(&self, _id: &str) -> Option<SessionCapture> {
             None
         }
+    }
+
+    struct FixedSessionLoader {
+        capture: SessionCapture,
+    }
+
+    impl SessionLoader for FixedSessionLoader {
+        fn load(&self, _id: &str) -> Option<SessionCapture> {
+            Some(self.capture.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn required_subsystem_health_is_runner_wide_and_forces_capture() {
+        let exec = FakeExecutor::new();
+        exec.seed("healthy", "m", outcome_ok("m", "done", &[]));
+        let judger = FixedJudger { score: 1.0 };
+        let loader = FixedSessionLoader {
+            capture: SessionCapture {
+                session_id: "sess-m".into(),
+                journal_path: PathBuf::from("/typed-fixture"),
+                events: vec![
+                    crate::session_capture::JournalEvent {
+                        event_type: "turn".into(),
+                        raw: serde_json::json!({
+                            "type": "turn",
+                            "ts": (chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339(),
+                            "session_id": "sess-m",
+                            "turn": 3,
+                            "metadata": {"run_id": "run-test"}
+                        }),
+                    },
+                    crate::session_capture::JournalEvent {
+                        event_type: "session_memory_extraction".into(),
+                        raw: serde_json::json!({
+                        "turn": 3,
+                        "ts": (chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339(),
+                        "metadata": {"run_id": "run-test", "outcome": "extracted", "source": "rule_fallback"}
+                        }),
+                    },
+                    crate::session_capture::JournalEvent {
+                        event_type: "subsystem_settled".into(),
+                        raw: serde_json::json!({
+                        "turn": 3,
+                        "ts": (chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339(),
+                        "metadata": {"run_id": "run-test", "subsystem": "post_loop_memory"}
+                        }),
+                    },
+                ],
+                skipped_lines: 0,
+                dropped_lines: 0,
+                integrity_errors: 0,
+            },
+        };
+        let mut cfg = RunnerConfig::new(PathBuf::from("astra"))
+            .with_fallback_models(vec!["m".into()])
+            .with_required_session_subsystem_health();
+        cfg.session_settle_timeout = Duration::ZERO;
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+
+        let report = runner.run_all(&[case_with("healthy", vec![])]).await;
+        assert_eq!(report.passed(), 1);
+        assert!(
+            report.runs[0].session.is_some(),
+            "health gate must force durable capture"
+        );
+        assert!(report.runs[0].criteria.iter().any(|result| {
+            matches!(result.criterion, Criterion::SessionSubsystemHealthy { .. }) && result.passed
+        }));
+    }
+
+    #[tokio::test]
+    async fn hard_session_evidence_rejects_old_run_id_replay() {
+        let exec = FakeExecutor::new();
+        let mut outcome = outcome_ok("m", "done", &[]);
+        outcome.run_id = Some("run-new".into());
+        exec.seed("replay", "m", outcome);
+        let judger = FixedJudger { score: 1.0 };
+        let loader = FixedSessionLoader {
+            capture: SessionCapture {
+                session_id: "sess-replay".into(),
+                journal_path: PathBuf::from("/old-session"),
+                events: vec![
+                    crate::session_capture::JournalEvent {
+                        event_type: "turn".into(),
+                        raw: serde_json::json!({
+                            "type": "turn",
+                            "ts": chrono::Utc::now().to_rfc3339(),
+                            "session_id": "sess-replay",
+                            "turn": 1,
+                            "metadata": {"run_id": "run-old"}
+                        }),
+                    },
+                    crate::session_capture::JournalEvent {
+                        event_type: "subsystem_settled".into(),
+                        raw: serde_json::json!({
+                            "turn": 1,
+                            "metadata": {"subsystem": "post_loop_memory"}
+                        }),
+                    },
+                ],
+                skipped_lines: 0,
+                dropped_lines: 0,
+                integrity_errors: 0,
+            },
+        };
+        let mut cfg = RunnerConfig::new(PathBuf::from("astra"))
+            .with_fallback_models(vec!["m".into()])
+            .with_required_session_subsystem_health();
+        cfg.session_settle_timeout = Duration::ZERO;
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+        let report = runner.run_all(&[case_with("replay", vec![])]).await;
+        assert!(!report.runs[0].is_passed());
+        assert!(report.runs[0].outcome.stderr.contains("canonical turn"));
+    }
+
+    #[tokio::test]
+    async fn hard_session_evidence_ignores_old_tools_when_fresh_turn_has_none() {
+        let exec = FakeExecutor::new();
+        let mut outcome = outcome_ok("m", "done", &[]);
+        outcome.run_id = Some("run-new".into());
+        exec.seed("mixed-replay", "m", outcome);
+        let fresh_ts = chrono::Utc::now() + chrono::Duration::minutes(1);
+        let loader = FixedSessionLoader {
+            capture: SessionCapture {
+                session_id: "sess-mixed-replay".into(),
+                journal_path: PathBuf::from("/mixed-session"),
+                events: vec![
+                    crate::session_capture::JournalEvent {
+                        event_type: "turn".into(),
+                        raw: serde_json::json!({
+                            "type": "turn",
+                            "ts": chrono::Utc::now().to_rfc3339(),
+                            "session_id": "sess-mixed-replay",
+                            "turn": 1,
+                            "metadata": {"run_id": "run-old"},
+                            "tool_calls": [{"name": "Read", "ok": true}]
+                        }),
+                    },
+                    crate::session_capture::JournalEvent {
+                        event_type: "turn".into(),
+                        raw: serde_json::json!({
+                            "type": "turn",
+                            "ts": fresh_ts.to_rfc3339(),
+                            "session_id": "sess-mixed-replay",
+                            "turn": 2,
+                            "metadata": {"run_id": "run-new"},
+                            "tool_calls": []
+                        }),
+                    },
+                ],
+                skipped_lines: 0,
+                dropped_lines: 0,
+                integrity_errors: 0,
+            },
+        };
+        let mut cfg =
+            RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
+        cfg.session_settle_timeout = Duration::ZERO;
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &FixedJudger { score: 1.0 },
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+        let case = case_with(
+            "mixed-replay",
+            vec![Criterion::JournalToolCalled {
+                name: "Read".into(),
+                optional: false,
+            }],
+        );
+        let report = runner.run_all(&[case]).await;
+        assert_eq!(report.runs.len(), 1);
+        assert!(
+            !report.runs[0].is_passed(),
+            "old tool evidence must not certify a fresh tool-free turn"
+        );
+        assert!(report.runs[0].criteria.iter().any(|result| {
+            matches!(result.criterion, Criterion::JournalToolCalled { .. }) && !result.passed
+        }));
+    }
+
+    #[tokio::test]
+    async fn required_subsystem_health_fails_without_durable_capture() {
+        let exec = FakeExecutor::new();
+        exec.seed("missing", "m", outcome_ok("m", "done", &[]));
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let mut cfg = RunnerConfig::new(PathBuf::from("astra"))
+            .with_fallback_models(vec!["m".into()])
+            .with_required_session_subsystem_health();
+        cfg.session_settle_timeout = Duration::ZERO;
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+
+        let report = runner.run_all(&[case_with("missing", vec![])]).await;
+        assert_eq!(report.passed(), 0);
+        assert!(report.runs[0].criteria.iter().any(|result| {
+            matches!(result.criterion, Criterion::SessionSubsystemHealthy { .. }) && !result.passed
+        }));
     }
 
     #[tokio::test]
@@ -972,7 +1786,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_conversation_scope_is_skip_passed_from_model_metadata() {
+    async fn dashboard_lifecycle_exposes_queue_before_start_and_terminal() {
+        let exec = FakeExecutor::new();
+        exec.seed("queued", "m", outcome_ok("m", "done", &[]));
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let (tx, mut rx) = tokio::sync::broadcast::channel(32);
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: RunnerConfig::new(PathBuf::from("astra"))
+                .with_fallback_models(vec!["m".into()]),
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: Some(tx),
+            run_id: "run-lifecycle".into(),
+            cancel_flag: None,
+        };
+
+        let report = runner.run_all(&[case_with("queued", vec![])]).await;
+        assert_eq!(report.passed(), 1);
+
+        let mut types = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            let value = serde_json::to_value(event).expect("dashboard event serializes");
+            types.push(value["type"].as_str().unwrap().to_string());
+        }
+        assert_eq!(
+            types,
+            vec![
+                "suite_started",
+                "case_queued",
+                "case_started",
+                "case_completed"
+            ],
+            "a case must never look started before its queue admission is visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_conversation_scope_is_unavailable_from_model_metadata() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(
             tmp.path().join(".models.yaml"),
@@ -1011,7 +1867,10 @@ mod tests {
         case.required_cache_scope = Some(PromptCacheReuseScope::ConversationTurns);
         let report = runner.run_all(&[case]).await;
         assert_eq!(report.total(), 1);
-        assert_eq!(report.passed(), 1);
+        assert_eq!(report.passed(), 0);
+        assert_eq!(report.failed(), 0);
+        assert_eq!(report.unavailable(), 1);
+        assert_eq!(report.runs[0].status, CaseRunStatus::Unavailable);
         assert_eq!(
             exec.calls.lock().unwrap_or_else(|e| e.into_inner()).len(),
             0,
@@ -1021,11 +1880,68 @@ mod tests {
             report.runs[0]
                 .outcome
                 .text
-                .contains("skipped: model metadata reports"),
+                .contains("unavailable: model metadata reports"),
             "{:#?}",
             report.runs[0].outcome
         );
-        assert!(report.runs[0].has_warnings);
+        assert!(!report.runs[0].has_warnings);
+        assert_eq!(
+            report.runs[0].failure_class,
+            Some(crate::classify::FailureClass::InfraVerificationUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_cache_scope_metadata_executes_for_actual_evidence() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            tmp.path().join(".models.yaml"),
+            "- name: unknown-model\n  provider: openai\n",
+        )
+        .expect("write models yaml");
+
+        let exec = FakeExecutor::new();
+        exec.seed(
+            "cache-prefix",
+            "unknown-model",
+            outcome_ok("unknown-model", "cache evidence", &[]),
+        );
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let mut cfg = RunnerConfig::new(PathBuf::from("astra"))
+            .with_fallback_models(vec!["unknown-model".into()]);
+        cfg.working_dir = Some(tmp.path().to_path_buf());
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+
+        let mut case = case_with("cache-prefix", vec![Criterion::ExitCode { code: 0 }]);
+        case.required_cache_scope = Some(PromptCacheReuseScope::ConversationTurns);
+        let report = runner.run_all(&[case]).await;
+        assert_eq!(report.total(), 1);
+        assert_eq!(report.passed(), 0);
+        assert_eq!(report.failed(), 1);
+        assert_eq!(report.unavailable(), 0);
+        assert_eq!(report.runs[0].status, CaseRunStatus::Failed);
+        assert!(report.runs[0].criteria.iter().any(|criterion| {
+            matches!(criterion.criterion, Criterion::PromptCacheReuseScope { .. })
+                && !criterion.passed
+        }));
+        assert_eq!(
+            exec.calls.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            1,
+            "unknown metadata must execute so criteria can prove the case"
+        );
     }
 
     #[tokio::test]
@@ -1034,7 +1950,13 @@ mod tests {
         // All cases return auth failure.
         for i in 0..5 {
             let name = format!("c{i}");
-            exec.seed(&name, "m", RunOutcome::new("m").with_exit_code(3));
+            exec.seed(
+                &name,
+                "m",
+                RunOutcome::new("m")
+                    .with_exit_code(3)
+                    .with_stderr("Could not validate credentials"),
+            );
         }
 
         let judger = FixedJudger { score: 1.0 };
@@ -1062,9 +1984,12 @@ mod tests {
             .map(|i| case_with(&format!("c{i}"), vec![Criterion::ExitCode { code: 0 }]))
             .collect();
         let report = runner.run_all(&cases).await;
-        // Circuit breaker should trip after 3, so we get 3 runs not 5.
-        assert_eq!(report.total(), 3);
+        // Every planned item remains a terminal row: three real failures and
+        // two explicit circuit-breaker cancellations.
+        assert_eq!(report.total(), 5);
         assert_eq!(report.failed(), 3);
+        assert_eq!(report.cancelled(), 2);
+        assert!(report.runs[3..].iter().all(|r| r.is_cancelled()));
     }
 
     #[tokio::test]
@@ -1234,7 +2159,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn skips_case_when_no_model_source() {
+    async fn reports_case_when_no_model_source_as_unavailable() {
         let exec = FakeExecutor::new();
         let judger = FixedJudger { score: 1.0 };
         let loader = NoopSessionLoader;
@@ -1254,7 +2179,23 @@ mod tests {
         };
         let cases = vec![case_with("c1", vec![])];
         let report = runner.run_all(&cases).await;
-        assert_eq!(report.total(), 0);
+        assert_eq!(report.total(), 1);
+        assert_eq!(report.passed(), 0);
+        assert_eq!(report.failed(), 0);
+        assert_eq!(report.unavailable(), 1);
+        assert_eq!(report.runs[0].status, CaseRunStatus::Unavailable);
+        assert!(
+            report.runs[0]
+                .outcome
+                .text
+                .contains("could not resolve a model")
+        );
+        assert!(
+            exec.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1267,7 +2208,10 @@ mod tests {
         let judger = FixedJudger { score: 1.0 };
         let loader = NoopSessionLoader;
         let digest = FakeDigestCollector::new();
-        digest.seed_ok("sess-m", serde_json::json!({"aggregates": {"turns": 2}}));
+        digest.seed_ok(
+            "550e8400-e29b-41d4-a716-446655440000",
+            serde_json::json!({"aggregates": {"turns": 2}}),
+        );
 
         let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
         let runner = SuiteRunner {
@@ -1295,7 +2239,7 @@ mod tests {
         assert_eq!(report.failed(), 1);
         let calls = digest.calls.lock().unwrap_or_else(|e| e.into_inner());
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0], "sess-m");
+        assert_eq!(calls[0], "550e8400-e29b-41d4-a716-446655440000");
     }
 
     #[tokio::test]
@@ -1313,6 +2257,7 @@ mod tests {
                     events: vec![],
                     skipped_lines: 0,
                     dropped_lines: 0,
+                    integrity_errors: 0,
                 })
             }
         }
@@ -1335,7 +2280,7 @@ mod tests {
         case.debug_log = true;
         let report = runner.run_all(&[case]).await;
         let s = report.runs[0].session.as_ref().unwrap();
-        assert_eq!(s.session_id, "sess-m");
+        assert_eq!(s.session_id, "550e8400-e29b-41d4-a716-446655440000");
     }
 
     #[tokio::test]
@@ -1363,7 +2308,7 @@ mod tests {
         let report = runner.run_all(&[case]).await;
         assert_eq!(report.total(), 1);
         assert!(
-            !report.runs[0].passed,
+            !report.runs[0].is_passed(),
             "setup failure must mark case as FAIL"
         );
         assert_eq!(
@@ -1384,6 +2329,42 @@ mod tests {
                 .is_empty(),
             "executor must NOT be called when setup fails"
         );
+    }
+
+    #[tokio::test]
+    async fn setup_failure_still_runs_teardown() {
+        let exec = FakeExecutor::new();
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let cfg = RunnerConfig::new(PathBuf::from("astra")).with_fallback_models(vec!["m".into()]);
+        let marker =
+            std::env::temp_dir().join(format!("astra-harness-teardown-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let mut case = case_with("setup-teardown", vec![]);
+        case.setup_cmd = Some("false".into());
+        case.teardown_cmd = Some(format!("printf done > {}", marker.display()));
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: cfg,
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+        let report = runner.run_all(&[case]).await;
+        assert!(!report.runs[0].is_passed());
+        assert_eq!(
+            std::fs::read_to_string(&marker)
+                .expect("teardown marker")
+                .as_str(),
+            "done"
+        );
+        let _ = std::fs::remove_file(marker);
     }
 
     #[tokio::test]
@@ -1412,7 +2393,7 @@ mod tests {
         let report = runner.run_all(&[case]).await;
         assert_eq!(report.total(), 1);
         assert!(
-            !report.runs[0].passed,
+            !report.runs[0].is_passed(),
             "a contaminated environment must not be reported as a passing harness run"
         );
         assert_eq!(
@@ -1453,9 +2434,13 @@ mod tests {
                     journal_path: PathBuf::from("/fake"),
                     skipped_lines: 0,
                     dropped_lines: 0,
+                    integrity_errors: 0,
                     events: vec![crate::session_capture::JournalEvent {
                         event_type: "ToolCallCompleted".into(),
-                        raw: serde_json::json!({"payload": {
+                        raw: serde_json::json!({
+                            "ts": chrono::Utc::now().to_rfc3339(),
+                            "metadata": {"run_id": "run-test"},
+                            "payload": {
                             "tool_name": "memory", "is_error": false,
                             "output": format!(
                                 r#"{{"memory_id":"created-by-case","session_id":"{}","created_at":null,"retrieval_score":null}}"#,
@@ -1484,7 +2469,7 @@ mod tests {
         case.cleanup_memory_records = true;
 
         let report = runner.run_all(&[case]).await;
-        assert!(report.runs[0].passed, "{:#?}", report.runs[0]);
+        assert!(report.runs[0].is_passed(), "{:#?}", report.runs[0]);
         assert_eq!(
             std::fs::read_to_string(marker).unwrap(),
             "memory\nforget\ncreated-by-case\n--reason\nAstra harness cleanup for case cleanup\n"
@@ -1521,7 +2506,7 @@ mod tests {
         }];
         let report = runner.run_all(&[case]).await;
         assert_eq!(report.total(), 1);
-        assert!(report.runs[0].passed);
+        assert!(report.runs[0].is_passed());
         assert_eq!(report.runs[0].steps.len(), 1);
         assert_eq!(report.runs[0].steps[0].step_index, 0);
         assert_eq!(report.runs[0].steps[0].prompt, "follow up");
@@ -1530,6 +2515,183 @@ mod tests {
         assert!(
             merged.contains("step0-text") && merged.contains("step1-text"),
             "accumulated text should contain both turns; got: {merged:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_gate_rejects_nonzero_root_and_follow_up_outcomes() {
+        let exec = FakeExecutor::new();
+        let mut root = outcome_ok("m", "root", &["Read"]);
+        root.exit_code = 9;
+        exec.seed("lifecycle-root", "m", root);
+        let mut step = outcome_ok("m", "step", &[]);
+        step.exit_code = -1;
+        step.session_id = None;
+        exec.seed("lifecycle-root__step0", "m", step);
+
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: RunnerConfig::new(PathBuf::from("astra"))
+                .with_fallback_models(vec!["m".into()]),
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+        let mut case = case_with(
+            "lifecycle-root",
+            vec![Criterion::ToolCalled {
+                name: "Read".into(),
+            }],
+        );
+        case.steps = vec![crate::case::CaseStep {
+            prompt: "follow up".into(),
+            criteria: vec![],
+            timeout_seconds: None,
+        }];
+
+        let report = runner.run_all(&[case]).await;
+        assert!(!report.runs[0].is_passed());
+        assert!(
+            report.runs[0]
+                .outcome
+                .stderr
+                .contains("lifecycle: root turn did not reach")
+        );
+        assert!(!report.runs[0].steps[0].passed);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_gate_rejects_follow_up_session_identity_drift() {
+        let exec = FakeExecutor::new();
+        exec.seed("lifecycle-session", "m", outcome_ok("m", "root", &[]));
+        let mut step = outcome_ok("m", "step", &[]);
+        step.session_id = Some("660e8400-e29b-41d4-a716-446655440000".into());
+        exec.seed("lifecycle-session__step0", "m", step);
+
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: RunnerConfig::new(PathBuf::from("astra"))
+                .with_fallback_models(vec!["m".into()]),
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+        let mut case = case_with("lifecycle-session", vec![]);
+        case.steps = vec![crate::case::CaseStep {
+            prompt: "follow up".into(),
+            criteria: vec![],
+            timeout_seconds: None,
+        }];
+
+        let report = runner.run_all(&[case]).await;
+        assert!(!report.runs[0].is_passed());
+        assert!(
+            report.runs[0]
+                .outcome
+                .stderr
+                .contains("session identity diverged")
+        );
+        assert!(!report.runs[0].steps[0].passed);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_gate_rejects_invalid_equal_root_identity_before_follow_up() {
+        let exec = FakeExecutor::new();
+        let mut root = outcome_ok("m", "root", &[]);
+        root.session_id = Some("not-a-uuid".into());
+        exec.seed("invalid-session", "m", root);
+        let mut step = outcome_ok("m", "step", &[]);
+        step.session_id = Some("not-a-uuid".into());
+        exec.seed("invalid-session__step0", "m", step);
+
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: RunnerConfig::new(PathBuf::from("astra"))
+                .with_fallback_models(vec!["m".into()]),
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+        let mut case = case_with("invalid-session", vec![]);
+        case.steps = vec![crate::case::CaseStep {
+            prompt: "follow up".into(),
+            criteria: vec![],
+            timeout_seconds: None,
+        }];
+
+        let report = runner.run_all(&[case]).await;
+        assert!(!report.runs[0].is_passed());
+        assert!(report.runs[0].steps.is_empty());
+        assert!(
+            report.runs[0]
+                .outcome
+                .stderr
+                .contains("valid server-issued UUID session_id")
+        );
+        assert_eq!(
+            exec.calls.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            1,
+            "invalid root identity must prevent a follow-up admission"
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_gate_rejects_missing_root_identity_on_success() {
+        let exec = FakeExecutor::new();
+        let mut root = outcome_ok("m", "root", &[]);
+        root.session_id = None;
+        exec.seed("missing-session", "m", root);
+
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: RunnerConfig::new(PathBuf::from("astra"))
+                .with_fallback_models(vec!["m".into()]),
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig::default(),
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: None,
+        };
+
+        let report = runner
+            .run_all(&[case_with("missing-session", vec![])])
+            .await;
+        assert!(!report.runs[0].is_passed());
+        assert!(
+            report.runs[0]
+                .outcome
+                .stderr
+                .contains("did not return the server-issued UUID session_id")
         );
     }
 
@@ -1568,7 +2730,7 @@ mod tests {
         assert_eq!(report.total(), 1);
         // Step criterion fails → overall case fails.
         assert!(
-            !report.runs[0].passed,
+            !report.runs[0].is_passed(),
             "step criteria failure must propagate"
         );
         assert!(!report.runs[0].steps[0].passed);
@@ -1614,7 +2776,7 @@ mod tests {
         }];
 
         let report = runner.run_all(&[case]).await;
-        assert!(report.runs[0].passed, "{:#?}", report.runs[0]);
+        assert!(report.runs[0].is_passed(), "{:#?}", report.runs[0]);
         assert!(report.runs[0].steps[0].criteria[0].passed);
         assert_eq!(report.runs[0].steps[0].criteria[0].score, Some(1.0));
     }
@@ -1678,7 +2840,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_judger_uses_last_step_prompt_for_multi_turn() {
+    async fn deterministic_multi_turn_case_does_not_invoke_a_judger() {
         let exec = FakeExecutor::new();
         exec.seed("mt", "m", outcome_ok("m", "step0", &[]));
         exec.seed("mt__step0", "m", outcome_ok("m", "6", &[]));
@@ -1733,15 +2895,9 @@ mod tests {
         }];
         let _ = runner.run_all(&[case]).await;
         let questions = judger.questions.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(questions.len(), 1);
-        let q = &questions[0];
         assert!(
-            q.contains("2+2+2"),
-            "auto-judger question must reference the LAST step prompt, not the initial: {q}"
-        );
-        assert!(
-            q.contains("multi-turn") || q.contains("Follow-up"),
-            "auto-judger should indicate this is multi-turn: {q}"
+            questions.is_empty(),
+            "only an explicit semantic criterion may spend a judge call or product session"
         );
     }
 
@@ -1749,9 +2905,14 @@ mod tests {
     async fn auth_failure_warning_on_non_consecutive_failures() {
         let exec = FakeExecutor::new();
         // c0: auth fail, c1: pass, c2: auth fail → total=2, warning expected
-        exec.seed("c0", "m", RunOutcome::new("m").with_exit_code(3));
+        let auth_failure = || {
+            RunOutcome::new("m")
+                .with_exit_code(3)
+                .with_stderr("Could not validate credentials")
+        };
+        exec.seed("c0", "m", auth_failure());
         exec.seed("c1", "m", outcome_ok("m", "ok", &[]));
-        exec.seed("c2", "m", RunOutcome::new("m").with_exit_code(3));
+        exec.seed("c2", "m", auth_failure());
 
         let judger = FixedJudger { score: 1.0 };
         let loader = NoopSessionLoader;
@@ -1888,13 +3049,74 @@ mod tests {
             .map(|i| case_with(&format!("c{i}"), vec![]))
             .collect();
         let report = runner.run_all(&cases).await;
-        // Cancel fires after 1st case; the 2nd case still executes
-        // (cancel is checked BEFORE each case, not during), then the
-        // loop sees the flag and stops. So we expect fewer than 5.
+        // Cancellation stops execution, but planned work is represented by
+        // explicit terminal rows instead of disappearing from the report.
+        assert_eq!(report.total(), 5);
+        assert_eq!(report.passed(), 2);
+        assert_eq!(report.cancelled(), 3);
+        assert!(report.runs[2..].iter().all(|r| r.is_cancelled()));
+    }
+
+    #[tokio::test]
+    async fn parallel_cancel_does_not_launch_cases_that_are_still_queued() {
+        struct SlowExecutor {
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl CaseExecutor for SlowExecutor {
+            async fn execute(&self, _case: &Case, model: &str) -> RunOutcome {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                outcome_ok(model, "done", &[])
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let exec = SlowExecutor {
+            calls: calls.clone(),
+        };
+        let judger = FixedJudger { score: 1.0 };
+        let loader = NoopSessionLoader;
+        let runner = SuiteRunner {
+            executor: &exec,
+            judger: &judger,
+            session_loader: &loader,
+            digest_collector: None,
+            runner_cfg: RunnerConfig::new(PathBuf::from("astra"))
+                .with_fallback_models(vec!["m".into()]),
+            no_judger: true,
+            session_mode: SessionCaptureMode::Never,
+            suite_cfg: SuiteConfig {
+                parallel: 2,
+                ..Default::default()
+            },
+            dashboard_tx: None,
+            run_id: String::new(),
+            cancel_flag: Some(cancel.clone()),
+        };
+        let cases: Vec<Case> = (0..4)
+            .map(|index| case_with(&format!("parallel-{index}"), vec![]))
+            .collect();
+
+        let mut run = Box::pin(runner.run_all(&cases));
+        tokio::select! {
+            report = &mut run => panic!("run completed before cancellation: {report:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        cancel.store(true, Ordering::Relaxed);
+        let report = run.await;
+
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_eq!(report.passed(), 2);
+        assert_eq!(report.cancelled(), 2);
         assert!(
-            report.total() < 5,
-            "cancel_flag should stop the run early, got {} results",
-            report.total()
+            report
+                .runs
+                .iter()
+                .filter(|r| r.is_cancelled())
+                .all(|r| { r.outcome.text.contains("cancelled") })
         );
     }
 
@@ -1933,7 +3155,7 @@ mod tests {
         );
         let report = runner.run_all(&[case]).await;
         assert!(
-            report.runs[0].passed,
+            report.runs[0].is_passed(),
             "case should PASS because Hard criterion passed"
         );
         assert!(
@@ -1977,7 +3199,7 @@ mod tests {
         // Step's Soft criterion fails, but the case should still PASS
         // because only Hard step criteria cause case failure.
         assert!(
-            report.runs[0].passed,
+            report.runs[0].is_passed(),
             "step soft criterion failure must NOT fail the case"
         );
         // The step itself should be marked as passed (only Hard matters).

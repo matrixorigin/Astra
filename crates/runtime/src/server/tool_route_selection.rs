@@ -59,6 +59,7 @@ pub(crate) const SERVER_LOCAL_RUNTIME_TOOL_NAMES: &[&str] = &[
     "glob",
     "grep",
     "list_dir",
+    "publish_artifact",
     "read_file",
     "rollback_file_edits",
     "run_script",
@@ -586,7 +587,7 @@ mod tests {
 
     #[test]
     fn server_only_service_tools_do_not_follow_edge_executor() {
-        for name in ["memory", "mo_query", "github"] {
+        for name in ["memory", "mo_query"] {
             let req = make_request(
                 name,
                 WorkspaceBindingKind::EdgeWorkspace,
@@ -598,6 +599,20 @@ mod tests {
                 "{name} must remain server-service owned"
             );
         }
+    }
+
+    #[test]
+    fn external_github_capability_follows_an_admitted_edge_executor() {
+        let req = make_request(
+            "github",
+            WorkspaceBindingKind::EdgeWorkspace,
+            ToolTransportKind::EdgeWs,
+        );
+        assert_eq!(
+            routing_decision(&req, &registry()),
+            ToolExecutionRouteKind::EdgeBound,
+            "GitHub is an external capability and may use the selected edge executor"
+        );
     }
 
     #[test]

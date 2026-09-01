@@ -15,7 +15,9 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value, json};
 
-use super::super::llm::client::LlmCallResult;
+use super::super::llm::client::{
+    LlmCallResult, MAX_STREAM_ACCUMULATION_BYTES, MAX_STREAM_TOOL_CALLS,
+};
 use super::super::token_usage::{TokenUsage, UsageDialect, extract_usage};
 use super::eventstream::EventStreamFrame;
 
@@ -57,6 +59,8 @@ pub enum BedrockStreamError {
     PayloadJson(#[from] serde_json::Error),
     #[error("frame missing `:event-type` header")]
     MissingEventType,
+    #[error("Bedrock stream exceeded {MAX_STREAM_ACCUMULATION_BYTES} retained bytes")]
+    AccumulationLimit,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -65,6 +69,13 @@ struct ToolCallInProgress {
     name: String,
     /// Arguments arrive as streamed JSON text; we concatenate and parse at the end.
     args_buf: String,
+}
+
+#[derive(Clone, Copy)]
+enum RetainedField {
+    Text,
+    Reasoning,
+    ReasoningSignature,
 }
 
 /// Bedrock Converse streaming aggregator.
@@ -82,6 +93,9 @@ pub struct BedrockStreamAccumulator {
     usage: Option<TokenUsage>,
     finish_reason: Option<String>,
     exception: Option<(String, String)>,
+    /// Total bytes retained across all response fields. This must remain
+    /// bounded because transport failures snapshot the accumulator.
+    retained_bytes: usize,
 }
 
 /// Classify a Bedrock exception `kind` string for retry / cooldown handling.
@@ -116,6 +130,7 @@ pub(crate) enum RetryKind {
 }
 
 impl RetryKind {
+    #[cfg(test)]
     pub(crate) fn is_retryable(self) -> bool {
         !matches!(self, Self::Terminal)
     }
@@ -126,8 +141,42 @@ impl BedrockStreamAccumulator {
         Self::default()
     }
 
-    pub(crate) fn set_provider_response_id(&mut self, response_id: Option<String>) {
+    pub(crate) fn set_provider_response_id(
+        &mut self,
+        response_id: Option<String>,
+    ) -> Result<(), BedrockStreamError> {
+        let retained_bytes = response_id.as_ref().map_or(0, String::len);
+        if retained_bytes > MAX_STREAM_ACCUMULATION_BYTES {
+            return Err(BedrockStreamError::AccumulationLimit);
+        }
+        self.retained_bytes = retained_bytes;
         self.provider_response_id = response_id;
+        Ok(())
+    }
+
+    fn reserve_retained(&mut self, additional_bytes: usize) -> Result<(), BedrockStreamError> {
+        let Some(total) = self.retained_bytes.checked_add(additional_bytes) else {
+            return Err(BedrockStreamError::AccumulationLimit);
+        };
+        if total > MAX_STREAM_ACCUMULATION_BYTES {
+            return Err(BedrockStreamError::AccumulationLimit);
+        }
+        self.retained_bytes = total;
+        Ok(())
+    }
+
+    fn append_retained(
+        &mut self,
+        target: RetainedField,
+        value: &str,
+    ) -> Result<(), BedrockStreamError> {
+        self.reserve_retained(value.len())?;
+        match target {
+            RetainedField::Text => self.full_text.push_str(value),
+            RetainedField::Reasoning => self.reasoning.push_str(value),
+            RetainedField::ReasoningSignature => self.reasoning_signature.push_str(value),
+        }
+        Ok(())
     }
 
     /// True only when an exception frame has been seen — the only signal
@@ -172,6 +221,7 @@ impl BedrockStreamAccumulator {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            self.reserve_retained(kind.len().saturating_add(msg.len()))?;
             self.exception = Some((kind.clone(), msg.clone()));
             return Ok(vec![BedrockStreamEvent::Exception { kind, message: msg }]);
         }
@@ -216,6 +266,16 @@ impl BedrockStreamAccumulator {
                 // keep the first-seen id/name and suppress the duplicate
                 // ToolCallStart event so downstream doesn't see phantom calls.
                 use std::collections::btree_map::Entry;
+                if !self.tool_calls.contains_key(&idx) {
+                    if self.tool_calls.len() >= MAX_STREAM_TOOL_CALLS {
+                        astra_core::agent_warn!(
+                            "llm",
+                            "bedrock stream tool calls exceeded {MAX_STREAM_TOOL_CALLS} — ignoring index {idx}"
+                        );
+                        return Ok(vec![]);
+                    }
+                    self.reserve_retained(id.len().saturating_add(name.len()))?;
+                }
                 match self.tool_calls.entry(idx) {
                     Entry::Vacant(v) => {
                         v.insert(ToolCallInProgress {
@@ -244,18 +304,18 @@ impl BedrockStreamAccumulator {
                     return Ok(vec![]);
                 };
                 if let Some(text) = delta.get("text").and_then(Value::as_str) {
-                    self.full_text.push_str(text);
+                    self.append_retained(RetainedField::Text, text)?;
                     return Ok(vec![BedrockStreamEvent::TextDelta(text.to_string())]);
                 }
                 if let Some(rc) = delta.get("reasoningContent").and_then(Value::as_object) {
                     // Capture signature if present (arrives as its own delta).
                     if let Some(sig) = rc.get("signature").and_then(Value::as_str) {
-                        self.reasoning_signature.push_str(sig);
+                        self.append_retained(RetainedField::ReasoningSignature, sig)?;
                         return Ok(vec![]);
                     }
                     // Text variant: `reasoningContent.text`
                     if let Some(rc_text) = rc.get("text").and_then(Value::as_str) {
-                        self.reasoning.push_str(rc_text);
+                        self.append_retained(RetainedField::Reasoning, rc_text)?;
                         return Ok(vec![BedrockStreamEvent::ReasoningDelta(
                             rc_text.to_string(),
                         )]);
@@ -266,7 +326,7 @@ impl BedrockStreamAccumulator {
                         .and_then(|rt| rt.get("text"))
                         .and_then(Value::as_str)
                     {
-                        self.reasoning.push_str(rt_text);
+                        self.append_retained(RetainedField::Reasoning, rt_text)?;
                         return Ok(vec![BedrockStreamEvent::ReasoningDelta(
                             rt_text.to_string(),
                         )]);
@@ -277,7 +337,7 @@ impl BedrockStreamAccumulator {
                         .and_then(|rt| rt.get("signature"))
                         .and_then(Value::as_str)
                     {
-                        self.reasoning_signature.push_str(sig);
+                        self.append_retained(RetainedField::ReasoningSignature, sig)?;
                         return Ok(vec![]);
                     }
                     return Ok(vec![]);
@@ -293,7 +353,17 @@ impl BedrockStreamAccumulator {
                         .unwrap_or(0);
                     // Bedrock guarantees a matching `contentBlockStart` before
                     // any delta, so the entry should exist. Tolerate missing
-                    // (create a stub) rather than panic.
+                    // (create a bounded stub) rather than panic.
+                    if !self.tool_calls.contains_key(&idx)
+                        && self.tool_calls.len() >= MAX_STREAM_TOOL_CALLS
+                    {
+                        astra_core::agent_warn!(
+                            "llm",
+                            "bedrock stream tool calls exceeded {MAX_STREAM_TOOL_CALLS} — ignoring orphan delta index {idx}"
+                        );
+                        return Ok(vec![]);
+                    }
+                    self.reserve_retained(tool_input.len())?;
                     let entry = self.tool_calls.entry(idx).or_default();
                     entry.args_buf.push_str(tool_input);
                     return Ok(vec![BedrockStreamEvent::ToolCallDelta {
@@ -332,7 +402,9 @@ impl BedrockStreamAccumulator {
                     .and_then(Value::as_str)
                     .unwrap_or("stop")
                     .to_string();
-                self.finish_reason = Some(map_bedrock_finish_reason(&stop_reason));
+                let finish_reason = map_bedrock_finish_reason(&stop_reason);
+                self.reserve_retained(finish_reason.len())?;
+                self.finish_reason = Some(finish_reason);
                 Ok(vec![BedrockStreamEvent::MessageStop { stop_reason }])
             }
 
@@ -403,6 +475,7 @@ impl BedrockStreamAccumulator {
             model_used: model_name.to_string(),
             duration_ms,
             finish_reason,
+            effective_finish_reason: None,
         }
     }
 }
@@ -503,7 +576,8 @@ mod tests {
     #[test]
     fn transport_response_identity_survives_stream_aggregation() {
         let mut acc = BedrockStreamAccumulator::new();
-        acc.set_provider_response_id(Some("bedrock-request-7".to_string()));
+        acc.set_provider_response_id(Some("bedrock-request-7".to_string()))
+            .expect("response id fits retained-byte cap");
         acc.push_frame(&frame(
             "event",
             "messageStop",
@@ -596,6 +670,57 @@ mod tests {
         let r = acc.into_result("claude", 0);
         assert_eq!(r.reasoning, "let me think");
         assert_eq!(r.reasoning_signature, "abc123sig");
+    }
+
+    #[test]
+    fn retained_reasoning_is_capped_across_multiple_bedrock_frames() {
+        let mut acc = BedrockStreamAccumulator::new();
+        let chunk = "x".repeat(MAX_STREAM_ACCUMULATION_BYTES / 2);
+        let payload = serde_json::to_vec(&json!({
+            "contentBlockIndex": 0,
+            "delta": {"reasoningContent": {"text": chunk}}
+        }))
+        .expect("serialize fixture frame");
+        let frame = frame("event", "contentBlockDelta", &payload);
+
+        acc.push_frame(&frame)
+            .expect("first retained reasoning chunk fits");
+        acc.push_frame(&frame)
+            .expect("second retained reasoning chunk fits");
+        assert!(matches!(
+            acc.push_frame(&frame),
+            Err(BedrockStreamError::AccumulationLimit)
+        ));
+    }
+
+    #[test]
+    fn empty_bedrock_tool_starts_are_cardinality_bounded() {
+        let mut acc = BedrockStreamAccumulator::new();
+        for index in 0..=MAX_STREAM_TOOL_CALLS {
+            let payload = serde_json::to_vec(&json!({
+                "contentBlockIndex": index,
+                "start": {"toolUse": {"toolUseId": "", "name": ""}}
+            }))
+            .expect("serialize empty tool start");
+            acc.push_frame(&frame("event", "contentBlockStart", &payload))
+                .expect("excess tool start is ignored, not fatal");
+        }
+        assert_eq!(acc.tool_calls.len(), MAX_STREAM_TOOL_CALLS);
+    }
+
+    #[test]
+    fn orphan_bedrock_tool_deltas_are_cardinality_bounded() {
+        let mut acc = BedrockStreamAccumulator::new();
+        for index in 0..=MAX_STREAM_TOOL_CALLS {
+            let payload = serde_json::to_vec(&json!({
+                "contentBlockIndex": index,
+                "delta": {"toolUse": {"input": ""}}
+            }))
+            .expect("serialize empty orphan tool delta");
+            acc.push_frame(&frame("event", "contentBlockDelta", &payload))
+                .expect("excess orphan delta is ignored, not fatal");
+        }
+        assert_eq!(acc.tool_calls.len(), MAX_STREAM_TOOL_CALLS);
     }
 
     #[test]

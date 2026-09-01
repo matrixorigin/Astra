@@ -13,6 +13,7 @@ mod context_window;
 mod inference;
 mod memory_ranking;
 mod memory_structure;
+mod phase_receipt;
 mod provider_contract;
 mod result_quality;
 mod resume;
@@ -30,7 +31,7 @@ mod user_intent;
 
 pub use agent_communication::{
     AGENT_COMMUNICATION_SCHEMA_VERSION, AgentCommunicationDirection, AgentCommunicationEvent,
-    AgentCommunicationParty, AgentCommunicationTarget,
+    AgentCommunicationParty, AgentCommunicationPayloadKind, AgentCommunicationTarget,
 };
 pub use agent_transcript_evidence::AgentTranscriptEvidence;
 pub use agent_transcript_location::AgentTranscriptLocation;
@@ -52,12 +53,16 @@ pub use inference::{
     client_direct_execution_field,
 };
 pub use memory_ranking::{
-    PERSISTENT_TYPES, RankableMemory, SESSION_SCOPED_TYPE, freshness_suffix_for,
-    is_persistent_type, partition_by_scope, sort_by_retrieval_score,
+    MemoryRetrievalOutcome, PERSISTENT_TYPES, RankableMemory, SESSION_SCOPED_TYPE,
+    freshness_suffix_for, is_persistent_type, partition_by_scope, sort_by_retrieval_score,
 };
 pub use memory_structure::{
     PERSISTENT_MEMORY_TYPES, PersistentStoreRejection, is_persistent_memory_type,
     should_store_persistent_memory, validate_persistent_memory_content,
+};
+pub use phase_receipt::{
+    TURN_PHASE_EVENT_TYPE, TURN_PHASE_SCHEMA_VERSION, TurnPhaseKindV1, TurnPhaseOutcomeV1,
+    TurnPhaseReceiptV1,
 };
 pub use provider_contract::{
     DescriptorVersion, NativeToolId, PROVIDER_INTERACTION_REQUEST_METADATA_KEY,
@@ -80,8 +85,7 @@ pub use resume::{
     RESUME_BUNDLE_SCHEMA_VERSION, ResumeActivationProjectionV1, ResumeBundleV1, ResumeCandidateV1,
     ResumeCheckpointProjectionV1, ResumeDegradedReasonV1, ResumeDescriptorV1,
     ResumeProjectionSetV1, ResumeProviderProjectionV1, ResumeRepairActionV1, ResumeSelectionError,
-    ResumeSourceV1, ResumeTaskProjectionV1, cursor_relation, legacy_resume_cursor,
-    select_resume_bundle, select_resume_candidate_index,
+    ResumeSourceV1, cursor_relation, select_resume_bundle, select_resume_candidate_index,
 };
 pub use runtime_scaffolding::{
     RUNTIME_MESSAGE_PROVENANCE_FIELD, RuntimeMessageDelivery, is_runtime_owned_message,

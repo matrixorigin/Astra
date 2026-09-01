@@ -178,13 +178,6 @@ fn plan_section_manifest(budget: &TokenBudget, has_memory: bool) -> Vec<PlannedS
             source: SectionSource::Environment,
         },
         PlannedSection {
-            kind: SectionKind::DeferredTools,
-            scope: CacheScope::Session,
-            estimated_tokens: budget.budget_for(SectionKind::DeferredTools),
-            priority: CompressionPriority::LastResort,
-            source: SectionSource::Environment,
-        },
-        PlannedSection {
             kind: SectionKind::AvailableSkills,
             scope: CacheScope::Session,
             estimated_tokens: budget.budget_for(SectionKind::AvailableSkills),
@@ -224,6 +217,18 @@ fn plan_section_manifest(budget: &TokenBudget, has_memory: bool) -> Vec<PlannedS
             scope: CacheScope::None,
             estimated_tokens: budget.budget_for(SectionKind::RuntimeVolatile),
             priority: CompressionPriority::Normal,
+            source: SectionSource::Environment,
+        },
+        // Deferred names are derived from the current wire surface,
+        // restrictions, readiness, and runtime binding. A Work admission or
+        // tool activation may therefore change them within one user turn.
+        // Keep a dedicated budget and trace entry, but place the section
+        // after the Session→None cache boundary.
+        PlannedSection {
+            kind: SectionKind::DeferredTools,
+            scope: CacheScope::None,
+            estimated_tokens: budget.budget_for(SectionKind::DeferredTools),
+            priority: CompressionPriority::LastResort,
             source: SectionSource::Environment,
         },
         // Goal/task continuity is turn-facing by nature: current decisions,
@@ -545,11 +550,11 @@ mod tests {
                 SectionKind::Constraints,
                 SectionKind::SelfModel,
                 SectionKind::ProjectContext,
-                SectionKind::DeferredTools,
                 SectionKind::AvailableSkills,
                 SectionKind::Skills,
                 SectionKind::RuntimeIdentity,
                 SectionKind::RuntimeVolatile,
+                SectionKind::DeferredTools,
                 SectionKind::WorkingMemory,
                 SectionKind::EmergentSkills,
                 SectionKind::EmergentMemory,
@@ -575,11 +580,11 @@ mod tests {
                 SectionKind::Constraints,
                 SectionKind::SelfModel,
                 SectionKind::ProjectContext,
-                SectionKind::DeferredTools,
                 SectionKind::AvailableSkills,
                 SectionKind::Skills,
                 SectionKind::RuntimeIdentity,
                 SectionKind::RuntimeVolatile,
+                SectionKind::DeferredTools,
                 SectionKind::WorkingMemory,
                 SectionKind::Memory,
                 SectionKind::EmergentSkills,
@@ -678,6 +683,35 @@ mod tests {
             "RuntimeVolatile (tool_guidance/effort/plan_context/extras) must be None-scoped \
              so turn-to-turn drift doesn't invalidate the cached prefix"
         );
+    }
+
+    #[test]
+    fn deferred_tools_are_turn_volatile_not_session_cached() {
+        let (tokens, recovery, latches, stats, policy) = default_input();
+        let input = make_plan_input(&tokens, &recovery, &latches, &stats, &policy);
+        let plan = plan_turn(&input);
+        let deferred = plan
+            .sections
+            .iter()
+            .find(|section| section.kind == SectionKind::DeferredTools)
+            .expect("deferred tool section must be planned");
+        assert_eq!(deferred.scope, CacheScope::None);
+        assert_eq!(
+            deferred.priority,
+            CompressionPriority::LastResort,
+            "tool discovery remains available under pressure without entering the cache prefix"
+        );
+        let runtime_identity = plan
+            .sections
+            .iter()
+            .position(|section| section.kind == SectionKind::RuntimeIdentity)
+            .expect("runtime identity section must be planned");
+        let deferred_position = plan
+            .sections
+            .iter()
+            .position(|section| section.kind == SectionKind::DeferredTools)
+            .expect("deferred tool section must be planned");
+        assert!(deferred_position > runtime_identity);
     }
 
     #[test]
