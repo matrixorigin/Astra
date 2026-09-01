@@ -2028,12 +2028,12 @@ async fn record_inference_settlement_debt(
     } else {
         None
     };
-    if mode == SettlementDebtMode::RequireQuiescent {
-        if attempt_state.is_some_and(|state| state.has_open_attempt) {
-            return Err(ServiceError::conflict(format!(
-                "inference invocation {invocation_id} still has an active provider attempt"
-            )));
-        }
+    if mode == SettlementDebtMode::RequireQuiescent
+        && attempt_state.is_some_and(|state| state.has_open_attempt)
+    {
+        return Err(ServiceError::conflict(format!(
+            "inference invocation {invocation_id} still has an active provider attempt"
+        )));
     }
     if successful_terminal && !attempt_state.is_some_and(|state| state.successful_attempt_matches) {
         return Err(ServiceError::conflict(format!(

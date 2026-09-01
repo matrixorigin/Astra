@@ -16,7 +16,7 @@ pub fn project_external_artifacts(value: &Value) -> Option<Value> {
         .iter()
         .filter_map(project_external_artifact)
         .collect::<Vec<_>>();
-    (!artifacts.is_empty()).then(|| Value::Array(artifacts))
+    (!artifacts.is_empty()).then_some(Value::Array(artifacts))
 }
 
 fn project_external_artifact(value: &Value) -> Option<Value> {
