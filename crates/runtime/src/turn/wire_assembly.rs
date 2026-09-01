@@ -2229,9 +2229,10 @@ mod tests {
             &cache_cfg(),
         );
 
-        assert_eq!(msgs[1]["role"], "system");
-        assert!(message_text(&msgs[1]).contains("volatile"));
-        assert_eq!(msgs[2], json!({"role": "user", "content": "hi"}));
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[1], json!({"role": "user", "content": "hi"}));
+        assert_eq!(msgs[2]["role"], "system");
+        assert!(message_text(&msgs[2]).contains("volatile"));
         assert_eq!(
             msgs[3],
             json!({"role": "assistant", "content": "tail assistant"})
