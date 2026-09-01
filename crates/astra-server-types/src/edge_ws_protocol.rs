@@ -31,6 +31,18 @@ pub use astra_turn_types::ToolInvocationIdentity;
 /// subprocess without receiving file-transfer metadata or bytes.
 pub const RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY: &str = "runtime_process_authorization_v1";
 
+/// Whether an Edge runtime advertisement supports request-scoped process
+/// authorization. This protocol predicate is shared by registration, run
+/// admission, and dispatch so an incompatible Edge cannot be offered Bash and
+/// rejected only after the model selects it.
+pub fn supports_runtime_process_authorization(capabilities: Option<&Value>) -> bool {
+    capabilities
+        .and_then(|value| value.get("protocol_capabilities"))
+        .and_then(|items| items.get(RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY))
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
 /// Whether the process-authorization capability applies to this tool.
 ///
 /// This is protocol semantics shared by the server and Edge, not a second
@@ -291,6 +303,24 @@ mod tests {
             } => assert_eq!(context.authorization, "Bearer runtime-grant"),
             other => panic!("expected tool request with process authorization, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn process_authorization_support_requires_explicit_v1_advertisement() {
+        assert!(!supports_runtime_process_authorization(None));
+        assert!(!supports_runtime_process_authorization(Some(&json!({
+            "protocol_capabilities": {}
+        }))));
+        assert!(!supports_runtime_process_authorization(Some(&json!({
+            "protocol_capabilities": {
+                "runtime_process_authorization_v1": false
+            }
+        }))));
+        assert!(supports_runtime_process_authorization(Some(&json!({
+            "protocol_capabilities": {
+                "runtime_process_authorization_v1": true
+            }
+        }))));
     }
 
     #[test]

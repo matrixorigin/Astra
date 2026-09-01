@@ -1493,6 +1493,28 @@ mod tests {
     }
 
     #[test]
+    fn new_edge_rejects_old_server_file_transfer_request_at_upgrade_boundary() {
+        let raw = serde_json::json!({
+            "type": "edge_tool_request",
+            "request_id": "request-legacy-transfer",
+            "identity": {
+                "user_id": "user-1",
+                "session_id": "session-1",
+                "run_id": "run-1",
+                "turn_chain_id": "turn-1",
+                "invocation_id": "call-1"
+            },
+            "delivery_generation": 1,
+            "tool": "bash",
+            "args": {"command": "pwd"},
+            "runtime_file_transfer_v2": {},
+            "timeout_secs": 120
+        });
+
+        assert!(decode_edge_server_message(&raw.to_string()).is_err());
+    }
+
+    #[test]
     fn reconnect_flag_accepts_an_explicit_false_for_bounded_process_runs() {
         let args = Args::try_parse_from(["astra-edge", "--reconnect=false"])
             .expect("explicit false must be a valid bounded-run configuration");

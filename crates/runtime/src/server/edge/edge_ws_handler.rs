@@ -1370,15 +1370,10 @@ fn validate_edge_capabilities(
     _user_id: &str,
 ) -> Option<serde_json::Value> {
     let capabilities = capabilities?;
-    let protocol_capabilities = capabilities.get("protocol_capabilities");
-    let runtime_process_authorization_v1 = protocol_capabilities
-        .and_then(|value| {
-            value.get(
-                astra_server_types::edge_ws_protocol::RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY,
-            )
-        })
-        .and_then(serde_json::Value::as_bool)
-        == Some(true);
+    let runtime_process_authorization_v1 =
+        astra_server_types::edge_ws_protocol::supports_runtime_process_authorization(Some(
+            &capabilities,
+        ));
 
     let mut advert = match serde_json::from_value::<
         astra_runtime_env::RuntimeEnvironmentAdvertisement,

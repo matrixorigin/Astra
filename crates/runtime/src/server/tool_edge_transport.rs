@@ -361,17 +361,9 @@ async fn try_edge_websocket(
         }
     }
     if plan.runtime_process_authorization().is_some()
-        && !edge.capabilities.as_ref().is_some_and(|capabilities| {
-            capabilities
-                .get("protocol_capabilities")
-                .and_then(|items| {
-                    items.get(
-                        astra_server_types::edge_ws_protocol::RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY,
-                    )
-                })
-                .and_then(serde_json::Value::as_bool)
-                == Some(true)
-        })
+        && !astra_server_types::edge_ws_protocol::supports_runtime_process_authorization(
+            edge.capabilities.as_ref(),
+        )
     {
         return EdgeTransportAttempt::AdmissionRejected(
             "selected edge does not support runtime process authorization".to_string(),

@@ -5946,6 +5946,92 @@ fn authorized_edge_dispatch_request() -> astra_services::runs::ChatRequestData {
     request
 }
 
+fn edge_runtime_advertisement(edge_agent_id: &str, process_authorization_v1: bool) -> Value {
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let binding = astra_runtime_env::RunBinding::resolve(
+        astra_runtime_env::WorkspaceBinding::edge_workspace(
+            "/workspace",
+            astra_runtime_env::WorkspaceAuthority::ReadWrite,
+        ),
+        astra_runtime_env::ExecutorBinding::edge_agent(edge_agent_id.to_string()),
+        astra_runtime_env::RuntimeBinding::host_process(format!("edge-host:{edge_agent_id}")),
+        astra_runtime_env::PolicyIntent::local_developer(),
+        &registry,
+    );
+    let mut advertisement = serde_json::to_value(
+        astra_runtime_env::RuntimeEnvironmentAdvertisement::new(binding),
+    )
+    .expect("serialize edge runtime advertisement");
+    if process_authorization_v1 {
+        advertisement["protocol_capabilities"] = json!({
+            "runtime_process_authorization_v1": true,
+        });
+    }
+    advertisement
+}
+
+#[tokio::test]
+async fn provider_edge_requires_process_authorization_support_before_host_start() {
+    let pool = astra_server_types::edge_connection_pool::EdgeConnectionPool::new();
+    let (old_tx, _old_rx) = tokio::sync::mpsc::channel(1);
+    let old_advertisement = edge_runtime_advertisement("runner-r1", false);
+    assert!(
+        old_advertisement["binding"]["tool_surface"]["tool_names"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool == "bash")),
+        "the pre-v1 Edge must advertise Bash to exercise the mixed-version regression"
+    );
+    pool.register_with_capabilities(
+        "user-1",
+        "runner-r1",
+        Some("old-runner".to_string()),
+        Some("/workspace".to_string()),
+        Some(old_advertisement),
+        None,
+        old_tx,
+    );
+    let service = test_service().with_edge_connection_pool(pool.clone());
+    let mut request = authorized_edge_dispatch_request();
+    let descriptors = request
+        .capability_descriptors
+        .as_mut()
+        .expect("authorized edge descriptor");
+    descriptors.model_gateway = Some(test_runtime_descriptor(
+        "moi-model-gateway",
+        "model_gateway",
+        "http://127.0.0.1/model-gateway",
+    ));
+    request.context = Some(serde_json::Map::from_iter([(
+        "edge_tools".to_string(),
+        json!([{"function": {"name": "bash", "parameters": {}}}]),
+    )]));
+
+    let error = service
+        .validate_request_constraints("user-1", &request)
+        .await
+        .expect_err("a pre-v1 Edge must be rejected before its Bash surface reaches the host");
+    assert_eq!(error.0, StatusCode::PRECONDITION_FAILED);
+    assert_eq!(
+        error.1.0.error_code.as_deref(),
+        Some("runtime_executor_upgrade_required")
+    );
+
+    let (current_tx, _current_rx) = tokio::sync::mpsc::channel(1);
+    pool.register_with_capabilities(
+        "user-1",
+        "runner-r1",
+        Some("current-runner".to_string()),
+        Some("/workspace".to_string()),
+        Some(edge_runtime_advertisement("runner-r1", true)),
+        None,
+        current_tx,
+    );
+    service
+        .validate_request_constraints("user-1", &request)
+        .await
+        .expect("a v1-capable Edge keeps the existing Bash surface");
+}
+
 #[test]
 fn provider_edge_bash_uses_runtime_auth_without_an_extra_capability() {
     let mut request = authorized_edge_dispatch_request();

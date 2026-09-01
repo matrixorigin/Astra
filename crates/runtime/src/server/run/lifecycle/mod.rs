@@ -5139,9 +5139,10 @@ impl AgenticRunLifecycleService {
         Self::validate_resolved_model_selection(request)?;
         self.validate_runtime_profile_shape(request)?;
         Self::validate_runtime_auth_shape(request)?;
-        Self::runtime_process_authorization_context(request).map_err(|detail| {
-            error_response_coded(StatusCode::BAD_REQUEST, detail, "edge_runtime_auth_invalid")
-        })?;
+        let runtime_process_authorization = Self::runtime_process_authorization_context(request)
+            .map_err(|detail| {
+                error_response_coded(StatusCode::BAD_REQUEST, detail, "edge_runtime_auth_invalid")
+            })?;
         Self::runtime_edge_dispatch_authorization_context(request).map_err(|detail| {
             error_response_coded(
                 StatusCode::BAD_REQUEST,
@@ -5198,6 +5199,10 @@ impl AgenticRunLifecycleService {
                     ));
                 }
             }
+        }
+        if runtime_process_authorization.is_some() {
+            self.validate_runtime_process_authorization_executor(request)
+                .await?;
         }
         if !request.has_agent_binding_runtime() && request.runtime_skill_binding.is_none() {
             let (_, resolver) = build_server_skill_resolver(self.skill_service.clone(), user_id);
@@ -5256,6 +5261,80 @@ impl AgenticRunLifecycleService {
                 authorization: auth.authorization.clone(),
             },
         )))
+    }
+
+    /// Reject a provider-bound Edge run before model I/O when the selected
+    /// executor cannot receive request-scoped process authorization. The live
+    /// pool is authoritative on the owning pod; the durable registry supplies
+    /// the same sanitized advertisement for cross-pod connections.
+    async fn validate_runtime_process_authorization_executor(
+        &self,
+        request: &ChatRequestData,
+    ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+        let executor_id = request
+            .executor_binding
+            .as_ref()
+            .and_then(|binding| binding.executor_id.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .expect("process authorization validation requires a selected executor");
+        let workspace_id = request
+            .provider_run_owner
+            .as_ref()
+            .map(|owner| owner.provider_scope_id.as_str());
+        let executor_unavailable = || {
+            error_response_coded(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("selected runtime executor '{executor_id}' is not connected"),
+                "runtime_executor_unavailable",
+            )
+        };
+
+        let local_edge = self.edge_connection_pool.as_ref().and_then(|pool| {
+            pool.find_edge_by_agent_id(executor_id, workspace_id)
+                .map(|(_, edge)| edge)
+        });
+        let capabilities = if let Some(edge) = local_edge {
+            edge.capabilities
+        } else {
+            let Some(registry) = self.edge_registry_service.as_ref() else {
+                return Err(executor_unavailable());
+            };
+            registry
+                .find_by_agent_id_and_workspace(executor_id, workspace_id)
+                .await
+                .map_err(|error| {
+                    tracing::warn!(
+                        target: "astra_runtime::run_lifecycle",
+                        executor_id,
+                        workspace_id,
+                        error = %error,
+                        "runtime executor capability lookup failed before run admission"
+                    );
+                    error_response_coded(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!(
+                            "selected runtime executor '{executor_id}' capability is unavailable"
+                        ),
+                        "runtime_executor_capability_unavailable",
+                    )
+                })?
+                .ok_or_else(executor_unavailable)?
+                .capabilities
+        };
+
+        if !astra_server_types::edge_ws_protocol::supports_runtime_process_authorization(
+            capabilities.as_ref(),
+        ) {
+            return Err(error_response_coded(
+                StatusCode::PRECONDITION_FAILED,
+                format!(
+                    "selected runtime executor '{executor_id}' must be upgraded before it can run Bash"
+                ),
+                "runtime_executor_upgrade_required",
+            ));
+        }
+        Ok(())
     }
 
     fn runtime_edge_dispatch_authorization_context(
