@@ -15,7 +15,7 @@
 //!     OpenAI-gpt, Qwen, DeepSeek-v4, MiniMax-M2.7.
 //!   * scenarios: fresh-turn, multi-round with assistant-only turns,
 //!     tool-loop with appended (assistant_tc, tool) pairs, runtime
-//!     runtime-system injections at the current-turn boundary.
+//!     runtime-system injections at the provider-specific volatile boundary.
 //!
 //! # What it asserts
 //!
@@ -28,7 +28,7 @@
 //!   2. **Runtime-system placement**: user/tool messages remain byte-for-byte
 //!      conversational data. Marker-isolated providers keep runtime context
 //!      after the explicit message cache boundary; OpenAI-compatible
-//!      providers place it before the current user turn; strict-history
+//!      providers place it before the current tail message; strict-history
 //!      providers suppress optional runtime context.
 //!   3. **No runtime-cc-marker on trailing system msgs**: the cache
 //!      breakpoint MUST land on the last non-system message before runtime
@@ -132,6 +132,15 @@ fn messages_with_role<'a>(messages: &'a [Value], role: &str) -> Vec<&'a Value> {
         .iter()
         .filter(|message| message.get("role").and_then(Value::as_str) == Some(role))
         .collect()
+}
+
+fn first_runtime_system_index(messages: &[Value]) -> Option<usize> {
+    messages.iter().position(|message| {
+        message
+            .get("__astra_runtime_system_context")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    })
 }
 
 /// A (provider, model) pair and whether we expect the Anthropic-native
@@ -259,6 +268,22 @@ async fn run_user_turn(
 /// every new matrix test, threaded via the label so a failure names the
 /// offending provider row directly.
 fn assert_protocol_valid(label: &str, turn: usize, messages: &[Value]) {
+    // The initial system message and marked runtime-system messages are the
+    // only system messages allowed in the internal wire. Keep this guard
+    // separate from conversation-role validation so an unmarked system
+    // message cannot silently hide a provider-consolidation regression.
+    for (index, message) in messages.iter().enumerate().skip(1) {
+        if message.get("role").and_then(Value::as_str) == Some("system") {
+            assert!(
+                message
+                    .get("__astra_runtime_system_context")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                "[{label} t{turn}] msg[{index}] is an unmarked mid-history system message"
+            );
+        }
+    }
+
     // Runtime-owned system messages are not conversation turns. The provider
     // adapter either preserves their OpenAI-compatible placement or projects
     // them into Anthropic's top-level system blocks.
@@ -511,10 +536,11 @@ async fn matrix_cache_control_marker_placement_matches_provider() {
 // ── Invariant 4: tool-loop growth preserves conversation bytes ─────────────
 //
 // Runtime context is a separate system message. It must never be appended to
-// the current user or tool result. OpenAI-compatible providers place it before
-// the current user-turn boundary; marker-isolated providers keep it after the
-// last conversation message so the explicit cache breakpoint stays on real
-// history. Strict-history providers suppress optional runtime context.
+// the current user or tool result. Auto-prefix providers place it immediately
+// before the current tail message so each later round can reuse the accumulated
+// conversation prefix. Marker-isolated providers keep it after the last
+// conversation message so the explicit cache breakpoint stays on real history.
+// Strict-history providers suppress optional runtime context.
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial(prompt_cache_env)]
@@ -526,6 +552,7 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
             vec![
                 scripted_round("round 1 reply"),
                 scripted_round("round 2 reply"),
+                scripted_round("round 3 reply"),
             ],
             capture.clone(),
         );
@@ -577,15 +604,44 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
         }));
         host.run_one_mock_turn_for_test(&mut state).await.unwrap();
 
+        // Round 3 proves that TailSuffix accumulates current-turn cache. A
+        // two-round probe cannot distinguish current-user-boundary placement
+        // from the legacy tail behavior because both first diverge at the
+        // initial runtime snapshot.
+        state.push_volatile(
+            astra_runtime::turn::agentic_loop::host::VolatileKind::StallNudge,
+            "runtime advisory round 3",
+        );
+        state.messages.push(json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": "call_3",
+                "type": "function",
+                "function": {"name": "bash", "arguments": "{}"}
+            }]
+        }));
+        state.messages.push(json!({
+            "role": "tool",
+            "tool_call_id": "call_3",
+            "content": "result 3"
+        }));
+        host.run_one_mock_turn_for_test(&mut state).await.unwrap();
+
         let guard = capture.lock().unwrap();
+        assert_eq!(guard.len(), 3, "[{}] captured request count", case.label);
         let r1 = &guard[0];
         let r2 = &guard[1];
+        let r3 = &guard[2];
         let r1_users = messages_with_role(&r1.messages, "user");
         let r2_users = messages_with_role(&r2.messages, "user");
+        let r3_users = messages_with_role(&r3.messages, "user");
         assert_eq!(r1_users.len(), 1, "[{}] round 1 user count", case.label);
         assert_eq!(r2_users.len(), 1, "[{}] round 2 user count", case.label);
+        assert_eq!(r3_users.len(), 1, "[{}] round 3 user count", case.label);
         assert_eq!(flatten_content(r1_users[0]), "look it up");
         assert_eq!(flatten_content(r2_users[0]), "look it up");
+        assert_eq!(flatten_content(r3_users[0]), "look it up");
 
         let r1_tools = messages_with_role(&r1.messages, "tool");
         let r2_tools = messages_with_role(&r2.messages, "tool");
@@ -594,11 +650,18 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
         assert_eq!(flatten_content(r1_tools[0]), "result 1");
         assert_eq!(flatten_content(r2_tools[0]), "result 1");
         assert_eq!(flatten_content(r2_tools[1]), "result 2");
+        let r3_tools = messages_with_role(&r3.messages, "tool");
+        assert_eq!(r3_tools.len(), 3, "[{}] round 3 tool count", case.label);
+        assert_eq!(flatten_content(r3_tools[0]), "result 1");
+        assert_eq!(flatten_content(r3_tools[1]), "result 2");
+        assert_eq!(flatten_content(r3_tools[2]), "result 3");
         for message in r1_users
             .iter()
             .chain(r2_users.iter())
+            .chain(r3_users.iter())
             .chain(r1_tools.iter())
             .chain(r2_tools.iter())
+            .chain(r3_tools.iter())
         {
             let text = flatten_content(message);
             assert!(!text.contains("runtime advisory"));
@@ -611,6 +674,7 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
         );
         let r1_runtime_systems = messages_with_role(&r1.messages, "system");
         let r2_runtime_systems = messages_with_role(&r2.messages, "system");
+        let r3_runtime_systems = messages_with_role(&r3.messages, "system");
         if suppresses_volatile {
             assert!(
                 r1_runtime_systems
@@ -619,6 +683,11 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
             );
             assert!(
                 r2_runtime_systems
+                    .iter()
+                    .all(|message| !flatten_content(message).contains("runtime advisory round"))
+            );
+            assert!(
+                r3_runtime_systems
                     .iter()
                     .all(|message| !flatten_content(message).contains("runtime advisory round"))
             );
@@ -632,6 +701,11 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
                 r2_runtime_systems
                     .iter()
                     .any(|message| flatten_content(message).contains("runtime advisory round 2"))
+            );
+            assert!(
+                r3_runtime_systems
+                    .iter()
+                    .any(|message| flatten_content(message).contains("runtime advisory round 3"))
             );
         }
         if case.is_marker_isolated {
@@ -647,6 +721,12 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
                 "[{label}] round 2 must advance through the new tool result while excluding runtime system",
                 label = case.label,
             );
+            assert_eq!(
+                r3.message_cache_control_indices,
+                vec![6],
+                "[{label}] round 3 must advance through the new tool result while excluding runtime system",
+                label = case.label,
+            );
         }
         // Primary system + tools remain the same even when runtime context and
         // conversation tail grow.
@@ -657,6 +737,28 @@ async fn matrix_tool_loop_growth_preserves_prefix_bytes() {
              tool-loop rounds",
             label = case.label,
         );
+
+        if matches!(
+            cache_capability_for(case).volatile_placement,
+            VolatilePlacement::TailSuffix
+        ) {
+            let r1_runtime = first_runtime_system_index(&r1.messages)
+                .expect("TailSuffix round 1 must contain runtime system context");
+            let r2_runtime = first_runtime_system_index(&r2.messages)
+                .expect("TailSuffix round 2 must contain runtime system context");
+            assert_eq!(
+                r1.message_sha256[..r1_runtime],
+                r2.message_sha256[..r1_runtime],
+                "[{label}] round 2 must retain the round-1 prefix before its runtime tail",
+                label = case.label,
+            );
+            assert_eq!(
+                r2.message_sha256[..r2_runtime],
+                r3.message_sha256[..r2_runtime],
+                "[{label}] round 3 must retain the accumulated round-2 prefix before its runtime tail",
+                label = case.label,
+            );
+        }
     }
 }
 
@@ -1040,10 +1142,29 @@ fn assert_protocol_valid_accepts_runtime_system_boundary() {
         json!({"role": "system", "content": "sys"}),
         json!({"role": "user", "content": "q1"}),
         json!({"role": "assistant", "content": "a1"}),
-        json!({"role": "system", "content": "runtime context"}),
+        json!({
+            "role": "system",
+            "content": "runtime context",
+            "__astra_runtime_system_context": true
+        }),
         json!({"role": "user", "content": "q2"}),
     ];
     assert_protocol_valid("self-test", 0, &good);
+}
+
+#[test]
+fn assert_protocol_valid_catches_unmarked_mid_history_system() {
+    let bad = vec![
+        json!({"role": "system", "content": "sys"}),
+        json!({"role": "user", "content": "q"}),
+        json!({"role": "system", "content": "unexpected system"}),
+        json!({"role": "user", "content": "r"}),
+    ];
+    let caught = std::panic::catch_unwind(|| assert_protocol_valid("self-test", 0, &bad));
+    assert!(
+        caught.is_err(),
+        "assert_protocol_valid must reject unmarked mid-history system messages"
+    );
 }
 
 #[test]

@@ -980,7 +980,7 @@ fn always_load_tool_names_for_bridge(
 }
 
 /// Suppress advisory `dynamic_sections` when the provider cannot tolerate
-/// per-round byte churn before conversation history.
+/// per-round byte churn inside request history.
 ///
 /// Strict-history providers (MiniMax-style, classified as
 /// `VolatilePlacement::CurrentUserOnly`) invalidate the whole cache
@@ -3234,6 +3234,10 @@ impl InProcessChatTurnBridge {
 
             llm_messages.extend(merged_messages);
 
+            // Retain the optional runtime snapshot for a context-window retry.
+            // The retry compactor deliberately removes runtime-system messages
+            // from history, so this value is the only source for re-injection.
+            let retry_bridge_volatile_text = bridge_volatile_text.clone();
             let bridge_synthetic_tail_prefix_end =
                 crate::turn::llm::context::finalize_bridge_wire_messages(
                 &mut llm_messages,
@@ -3243,7 +3247,6 @@ impl InProcessChatTurnBridge {
                 &model_name,
                 &thinking_config,
                 cache_capability,
-                &cache_cfg,
             );
 
             // Cloud loop: every tool round waits on §5.5 ledger (`POST /tools/result`) then continues LLM.
@@ -4022,7 +4025,7 @@ impl InProcessChatTurnBridge {
                                         previous_messages: &llm_messages,
                                         compacted_messages: compact_result.messages,
                                         boundary_present: compact_result.boundary.is_some(),
-                                        volatile_runtime_text: bridge_volatile_text.clone(),
+                                        volatile_runtime_text: retry_bridge_volatile_text.clone(),
                                         required_runtime_text: required_runtime_text.clone(),
                                         provider: &provider,
                                         model_name: &model_name,
@@ -7468,7 +7471,6 @@ mod tests {
                 "claude-sonnet-4",
                 &astra_turn_core::thinking_config::ThinkingConfig::Off,
                 None,
-                &cache_cfg,
             );
         crate::turn::llm::context::apply_bridge_message_cache_metadata(
             &mut llm_messages,

@@ -261,14 +261,29 @@ fn current_turn_boundary(messages: &[Value]) -> usize {
         .unwrap_or(messages.len())
 }
 
+fn current_tail_boundary(messages: &[Value]) -> usize {
+    messages
+        .iter()
+        .rposition(|message| message.get("role").and_then(Value::as_str) != Some("system"))
+        .unwrap_or(messages.len())
+}
+
 pub(crate) fn insert_runtime_system_context(
     messages: &mut Vec<Value>,
     runtime_messages: Vec<Value>,
+    placement: astra_turn_core::cache_placement::VolatilePlacement,
 ) -> Option<usize> {
     if runtime_messages.is_empty() {
         return None;
     }
-    let boundary = current_turn_boundary(messages);
+    let boundary = if matches!(
+        placement,
+        astra_turn_core::cache_placement::VolatilePlacement::TailSuffix
+    ) {
+        current_tail_boundary(messages)
+    } else {
+        current_turn_boundary(messages)
+    };
     messages.splice(boundary..boundary, runtime_messages);
     Some(boundary)
 }
@@ -708,9 +723,11 @@ pub(crate) fn maybe_append_continuation_prompt(
 ///
 /// 1. `system_messages` (from the context pipeline).
 /// 2. `compacted_messages` (conversation history from Memoria), unchanged.
-/// 3. Model-visible runtime context is inserted immediately before the current
-///    user-turn boundary. Prior history remains a byte-stable prefix, while the
-///    real user message remains byte-for-byte unchanged.
+/// 3. Model-visible runtime context is inserted according to the provider's
+///    volatile placement. Auto-prefix providers place it immediately before
+///    the current tail message so later tool rounds can reuse the accumulated
+///    current-turn prefix. Other non-marker providers keep the current-user
+///    boundary. Real user/tool messages remain byte-for-byte unchanged.
 /// 4. `strip_stale_reasoning` is applied in place.
 /// 5. `apply_anthropic_cache_metadata` (Anthropic path only).
 pub(crate) fn assemble_llm_messages_with_cache_capability(
@@ -737,7 +754,7 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
         astra_turn_core::cache_placement::VolatilePlacement::CurrentUserOnly
     );
     // Structured volatile lane (`state.volatile_pending`): drained upstream,
-    // rendered to the runtime-system slot at the current-turn boundary.
+    // rendered to the provider-specific runtime-system slot.
     // Producers use `state.push_volatile(Kind, content)` and never touch
     // `state.messages[]` for volatile content, so `messages[]` stays byte-
     // stable across rounds. The runtime system message is wire-only and never
@@ -802,7 +819,11 @@ pub(crate) fn assemble_llm_messages_with_cache_capability(
         llm_messages.extend(runtime_system_messages);
         Some(start)
     } else {
-        insert_runtime_system_context(&mut llm_messages, runtime_system_messages)
+        insert_runtime_system_context(
+            &mut llm_messages,
+            runtime_system_messages,
+            cache_cap.volatile_placement,
+        )
     };
     let reasoning_policy = astra_turn_core::edge_ledger::ReasoningReplayPolicy::infer(
         &llm_messages,
@@ -2131,7 +2152,7 @@ mod tests {
     }
 
     #[test]
-    fn volatile_preamble_precedes_current_user_and_leaves_tool_history_unchanged() {
+    fn tail_suffix_runtime_precedes_current_tail_and_leaves_history_unchanged() {
         let system = vec![json!({"role": "system", "content": "sys"})];
         let preamble = vec![json!({"role": "system", "content": "volatile"})];
         let compacted = vec![
@@ -2152,13 +2173,13 @@ mod tests {
             None,
             &cache_cfg(),
         );
-        assert_eq!(msgs[1]["role"], "system");
-        assert!(message_text(&msgs[1]).contains("volatile"));
+        assert_eq!(msgs[3]["role"], "system");
+        assert!(message_text(&msgs[3]).contains("volatile"));
         assert_eq!(
-            msgs[2]["content"], "hi",
+            msgs[1]["content"], "hi",
             "historical user message must stay unchanged"
         );
-        assert_eq!(msgs[3]["role"], "assistant");
+        assert_eq!(msgs[2]["role"], "assistant");
         assert_eq!(msgs[4]["role"], "tool");
         assert_eq!(message_text(&msgs[4]), "tool output");
         assert_eq!(msgs.len(), 5);

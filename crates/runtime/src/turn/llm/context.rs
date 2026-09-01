@@ -1892,7 +1892,6 @@ pub(crate) fn rebuild_bridge_retry_wire_messages(
         input.model_name,
         input.thinking,
         input.cache_capability,
-        input.cache_cfg,
     );
     apply_bridge_message_cache_metadata(
         &mut messages,
@@ -1913,8 +1912,8 @@ pub(crate) fn rebuild_bridge_retry_wire_messages(
 /// The bridge currently compacts and mutates its message vector inline. This
 /// helper centralizes the runtime-authority rule shared with
 /// [`assemble_wire_messages`]: model-visible runtime context keeps `system`
-/// authority and is inserted immediately before the current user-turn
-/// boundary. Canonical user/tool history is never rewritten.
+/// authority and uses the provider's cache-aware placement. Canonical
+/// user/tool history is never rewritten.
 pub(crate) fn finalize_bridge_wire_messages(
     llm_messages: &mut Vec<Value>,
     volatile_text: Option<String>,
@@ -1923,7 +1922,6 @@ pub(crate) fn finalize_bridge_wire_messages(
     model_name: &str,
     thinking: &astra_turn_core::thinking_config::ThinkingConfig,
     cache_capability: Option<astra_turn_core::cache_placement::CacheCapability>,
-    _cache_cfg: &PromptCacheConfig,
 ) -> Option<usize> {
     let reasoning_policy = astra_turn_core::edge_ledger::ReasoningReplayPolicy::infer(
         llm_messages,
@@ -1981,7 +1979,11 @@ pub(crate) fn finalize_bridge_wire_messages(
         llm_messages.extend(runtime_messages);
         Some(index)
     } else {
-        crate::turn::wire_assembly::insert_runtime_system_context(llm_messages, runtime_messages)
+        crate::turn::wire_assembly::insert_runtime_system_context(
+            llm_messages,
+            runtime_messages,
+            cache_cap.volatile_placement,
+        )
     }
 }
 
@@ -3603,7 +3605,7 @@ mod context_cache_contract_tests {
     }
 
     #[test]
-    fn finalize_bridge_wire_messages_places_runtime_system_before_tool_history() {
+    fn finalize_bridge_wire_messages_places_tail_suffix_before_current_tool() {
         let mut messages = vec![
             json!({"role": "user", "content": "original user"}),
             json!({"role": "assistant", "content": ""}),
@@ -3618,13 +3620,13 @@ mod context_cache_contract_tests {
             "gpt-4",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
-            &PromptCacheConfig::latch("openai", "gpt-4"),
         );
 
         assert_eq!(messages.len(), 4);
-        assert_eq!(messages[0]["role"], "system");
-        assert_eq!(messages[0]["content"], "volatile");
-        assert_eq!(messages[1]["content"], "original user");
+        assert_eq!(messages[0]["content"], "original user");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[2]["role"], "system");
+        assert_eq!(messages[2]["content"], "volatile");
         assert_eq!(messages[3]["role"], "tool");
         assert!(messages[3]["content"].to_string().contains("tool output"));
     }
@@ -3655,7 +3657,6 @@ mod context_cache_contract_tests {
             "us.anthropic.claude-haiku-4-5-20251001-v1:0",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
-            &cache_cfg,
         );
         apply_bridge_message_cache_metadata(
             &mut messages,
@@ -3767,7 +3768,6 @@ mod context_cache_contract_tests {
             "gpt-4",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
-            &PromptCacheConfig::latch("openai", "gpt-4"),
         );
 
         assert_eq!(synthetic_tail_prefix_end, Some(0));
@@ -3793,7 +3793,6 @@ mod context_cache_contract_tests {
             "gpt-4",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
-            &PromptCacheConfig::latch("openai", "gpt-4"),
         );
 
         assert_eq!(messages.len(), 2);
@@ -3829,7 +3828,6 @@ mod context_cache_contract_tests {
             "gpt-4",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
-            &PromptCacheConfig::latch("openai", "gpt-4"),
         );
 
         assert_eq!(messages.len(), 3);
@@ -3853,7 +3851,6 @@ mod context_cache_contract_tests {
             "gpt-4",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
-            &PromptCacheConfig::latch("openai", "gpt-4"),
         );
 
         assert!(synthetic_tail_prefix_end.is_none());
@@ -3875,7 +3872,6 @@ mod context_cache_contract_tests {
             "deepseek-v4-flash",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
-            &PromptCacheConfig::latch("openai", "deepseek-v4-flash"),
         );
 
         assert!(synthetic_tail_prefix_end.is_none());
@@ -3895,7 +3891,6 @@ mod context_cache_contract_tests {
             "deepseek-v4-flash",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
             None,
-            &PromptCacheConfig::latch("openai", "deepseek-v4-flash"),
         );
 
         assert_eq!(synthetic_tail_prefix_end, Some(0));
@@ -3927,7 +3922,6 @@ mod context_cache_contract_tests {
             "gpt-4o",
             &astra_turn_core::thinking_config::ThinkingConfig::Off,
             Some(explicit),
-            &PromptCacheConfig::latch("openai", "gpt-4o"),
         );
 
         assert!(synthetic_tail_prefix_end.is_none());

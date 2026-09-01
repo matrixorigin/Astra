@@ -10,16 +10,20 @@ DeepSeek endpoints before enabling a placement policy:
     ASTRA_PROBE_MODEL=qwen3.5-plus \
     python3 openai_runtime_system_placement_probe.py
 
-It compares two request shapes:
+It compares three request shapes:
 
 * ``initial``: dynamic runtime text is merged into the initial system message.
-* ``tail``: stable system + prior history + runtime system + current user.
+* ``legacy``: dynamic runtime text is appended to the current tail message.
+  This is unsafe for role isolation and is used only as the cache baseline.
+* ``tail``: runtime context keeps ``system`` authority and is inserted
+  immediately before the current tail user/tool message.
 
 The gate checks API acceptance, instruction isolation, forced tool calling,
-and the second tool round's provider-reported cache ratio. The candidate fails
-if any deterministic behavior case regresses or if its median cached-token
-ratio is more than ``ASTRA_PROBE_CACHE_TOLERANCE_PP`` percentage points below
-the initial-system baseline (default: 5 pp).
+and the second and third tool rounds' provider-reported cache ratios. The
+candidate fails if any deterministic behavior case regresses or if either
+round's median cached-token ratio is more than
+``ASTRA_PROBE_CACHE_TOLERANCE_PP`` percentage points below the legacy cache
+baseline (default: 5 pp).
 """
 
 from __future__ import annotations
@@ -107,19 +111,38 @@ def runtime_system(round_index: int) -> str:
     )
 
 
-def messages(placement: str, user: str, runtime_text: str) -> list[dict]:
+def messages(
+    placement: str,
+    user: str,
+    runtime_text: str,
+    continuation: list[dict] | None = None,
+) -> list[dict]:
+    conversation = [{"role": "user", "content": user}, *(continuation or [])]
     if placement == "initial":
         return [
             {"role": "system", "content": f"{STABLE_SYSTEM}\n\n{runtime_text}"},
             *PRIOR_HISTORY,
-            {"role": "user", "content": user},
+            *conversation,
         ]
     if placement == "tail":
         return [
             {"role": "system", "content": STABLE_SYSTEM},
             *PRIOR_HISTORY,
+            *conversation[:-1],
             {"role": "system", "content": runtime_text},
-            {"role": "user", "content": user},
+            conversation[-1],
+        ]
+    if placement == "legacy":
+        legacy_conversation = json.loads(json.dumps(conversation))
+        tail = legacy_conversation[-1]
+        content = tail.get("content")
+        if not isinstance(content, str):
+            raise ValueError("legacy probe requires a string tail message")
+        tail["content"] = f"{content}\n\n{runtime_text}"
+        return [
+            {"role": "system", "content": STABLE_SYSTEM},
+            *PRIOR_HISTORY,
+            *legacy_conversation,
         ]
     raise ValueError(placement)
 
@@ -152,29 +175,16 @@ def translation_case(placement: str) -> tuple[bool, str, float]:
     return passed, content, elapsed_ms
 
 
-def tool_loop_case(placement: str) -> tuple[bool, float, int, int, float]:
-    user = "Call cache_probe exactly once with value=warm."
-    first_messages = messages(placement, user, runtime_system(0))
-    first, _ = request(
-        {
-            "model": MODEL,
-            "messages": first_messages,
-            "tools": TOOLS,
-            "tool_choice": {"type": "function", "function": {"name": "cache_probe"}},
-            "max_tokens": 128,
-            "temperature": 0,
-        }
-    )
-    assistant = first.get("choices", [{}])[0].get("message", {})
+def validated_tool_call(assistant: dict) -> tuple[str, dict] | None:
     calls = assistant.get("tool_calls") or []
     if len(calls) != 1:
-        return False, 0.0, 0, 0, 0.0
+        return None
     tool_call = calls[0]
     if tool_call.get("type") != "function":
-        return False, 0.0, 0, 0, 0.0
+        return None
     function = tool_call.get("function") or {}
     if function.get("name") != "cache_probe":
-        return False, 0.0, 0, 0, 0.0
+        return None
     raw_arguments = function.get("arguments")
     try:
         arguments = (
@@ -183,75 +193,124 @@ def tool_loop_case(placement: str) -> tuple[bool, float, int, int, float]:
             else raw_arguments
         )
     except (TypeError, json.JSONDecodeError):
-        return False, 0.0, 0, 0, 0.0
+        return None
     if arguments != {"value": "warm"}:
-        return False, 0.0, 0, 0, 0.0
+        return None
     tool_call_id = tool_call.get("id")
     if not tool_call_id:
-        return False, 0.0, 0, 0, 0.0
-    # Reassemble round 2 from canonical conversation data with a changed
-    # runtime snapshot. Reusing `first_messages` here would accidentally test
-    # a byte-stable runtime message that Astra never sends in a real tool loop.
-    second_messages = [
-        *messages(placement, user, runtime_system(1)),
-        assistant,
-        {
-            "role": "tool",
-            "tool_call_id": tool_call_id,
-            "content": '{"value":"warm"}',
-        },
-    ]
-    second, elapsed_ms = request(
-        {
-            "model": MODEL,
-            "messages": second_messages,
-            "tools": TOOLS,
-            "max_tokens": 128,
-            "temperature": 0,
-        }
-    )
-    prompt, cached, ratio = usage(second)
-    return prompt > 0, ratio, prompt, cached, elapsed_ms
+        return None
+    return tool_call_id, tool_call
 
 
-def run_placement(placement: str) -> dict:
+def tool_loop_case(placement: str) -> tuple[bool, list[dict]]:
+    user = "Call cache_probe once per requested round with value=warm."
+    continuation: list[dict] = []
+    observations: list[dict] = []
+    for round_index in range(3):
+        payload, elapsed_ms = request(
+            {
+                "model": MODEL,
+                "messages": messages(
+                    placement,
+                    user,
+                    runtime_system(round_index),
+                    continuation,
+                ),
+                "tools": TOOLS,
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "cache_probe"},
+                },
+                "max_tokens": 128,
+                "temperature": 0,
+            }
+        )
+        assistant = payload.get("choices", [{}])[0].get("message", {})
+        validated = validated_tool_call(assistant)
+        prompt, cached, ratio = usage(payload)
+        observations.append(
+            {
+                "round": round_index + 1,
+                "prompt": prompt,
+                "cached": cached,
+                "ratio": ratio,
+                "elapsed_ms": elapsed_ms,
+            }
+        )
+        if validated is None or prompt <= 0:
+            return False, observations
+        tool_call_id, _ = validated
+        if round_index < 2:
+            continuation.extend(
+                [
+                    assistant,
+                    {
+                        "role": "tool",
+                        "tool_call_id": tool_call_id,
+                        "content": '{"value":"warm"}',
+                    },
+                ]
+            )
+    return True, observations
+
+
+def run_placement(placement: str, *, check_translation: bool) -> dict:
     translation_passes = []
     tool_passes = []
-    ratios = []
+    ratios_by_round = {2: [], 3: []}
     for index in range(RUNS):
-        translated, content, translation_ms = translation_case(placement)
-        tool_ok, ratio, prompt, cached, tool_ms = tool_loop_case(placement)
-        translation_passes.append(translated)
+        if check_translation:
+            translated, content, translation_ms = translation_case(placement)
+            translation_passes.append(translated)
+        else:
+            translated, content, translation_ms = True, "", 0.0
+        tool_ok, observations = tool_loop_case(placement)
         tool_passes.append(tool_ok)
-        ratios.append(ratio)
+        for observation in observations:
+            round_number = observation["round"]
+            if round_number in ratios_by_round:
+                ratios_by_round[round_number].append(observation["ratio"])
+        cache_text = " ".join(
+            f"r{observation['round']}={observation['cached']}/{observation['prompt']} "
+            f"({observation['ratio']:.1%})"
+            for observation in observations
+        )
         print(
             f"{placement:7s} run={index + 1} translation={translated} "
-            f"tool={tool_ok} cached={cached}/{prompt} ({ratio:.1%}) "
-            f"translation_ms={translation_ms:.0f} tool_r2_ms={tool_ms:.0f}"
+            f"tool={tool_ok} {cache_text} translation_ms={translation_ms:.0f}"
         )
         if not translated:
             print(f"  translation output: {content[:300]!r}")
         time.sleep(2)
     return {
-        "translation": all(translation_passes),
+        "translation": all(translation_passes) if check_translation else None,
         "tool": all(tool_passes),
-        "median_cache_ratio": statistics.median(ratios),
+        "median_cache_ratio_by_round": {
+            str(round_number): statistics.median(ratios)
+            if ratios
+            else 0.0
+            for round_number, ratios in ratios_by_round.items()
+        },
     }
 
 
 def main() -> int:
-    baseline = run_placement("initial")
-    candidate = run_placement("tail")
+    behavior_baseline = run_placement("initial", check_translation=True)
+    cache_baseline = run_placement("legacy", check_translation=False)
+    candidate = run_placement("tail", check_translation=True)
     tolerance = CACHE_TOLERANCE_PP / 100.0
-    cache_pass = (
-        candidate["median_cache_ratio"] + tolerance
-        >= baseline["median_cache_ratio"]
-    )
+    cache_pass_by_round = {
+        round_number: candidate["median_cache_ratio_by_round"][round_number] + tolerance
+        >= cache_baseline["median_cache_ratio_by_round"][round_number]
+        for round_number in ("2", "3")
+    }
+    cache_pass = all(cache_pass_by_round.values())
     passed = (
         candidate["translation"]
         and candidate["tool"]
-        and baseline["translation"]
-        and baseline["tool"]
+        and behavior_baseline["translation"]
+        and behavior_baseline["tool"]
+        and cache_baseline["tool"]
         and cache_pass
     )
     print(
@@ -260,8 +319,10 @@ def main() -> int:
                 "model": MODEL,
                 "runs": RUNS,
                 "cache_tolerance_pp": CACHE_TOLERANCE_PP,
-                "baseline": baseline,
+                "behavior_baseline": behavior_baseline,
+                "cache_baseline": cache_baseline,
                 "candidate": candidate,
+                "cache_pass_by_round": cache_pass_by_round,
                 "cache_pass": cache_pass,
                 "passed": passed,
             },
