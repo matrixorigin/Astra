@@ -1,14 +1,13 @@
 # Keep this aligned with rust-toolchain.toml. The cargo-chef and final build
 # stages must use the same compiler or the cooked dependency artifacts cannot
-# be reused.
-ARG RUST_VERSION=1.97.0-bookworm
+# be reused. The digest pins the current multi-architecture image index.
 ARG CARGO_CHEF_VERSION=0.1.77
 # Optional build accelerators for restricted or regional networks. Public
 # builds use the upstream Cargo and Debian sources by default.
 ARG CARGO_REGISTRY
 ARG DEBIAN_MIRROR
 
-FROM rust:${RUST_VERSION} AS chef
+FROM rust:1.97.0-bookworm@sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e75fea57e2a2a5c3073 AS chef
 
 ARG CARGO_CHEF_VERSION
 ARG CARGO_REGISTRY
@@ -66,7 +65,7 @@ RUN cargo build --release --no-default-features \
     mkdir -p /out && \
     cp target/release/astra-server target/release/astra /out/
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
 
 ARG IMAGE_VERSION=dev
 ARG IMAGE_REVISION=unknown
