@@ -2,8 +2,8 @@
 name = "astra-plan"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Plan decomposition engine — breaks complex goals into subtasks"
-license = "MIT"
 
 [dependencies]
 astra-core.workspace = true

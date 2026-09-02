@@ -2,6 +2,7 @@
 name = "astra-memoria"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Canonical Memoria port, records, and per-session runtime state"
 
 [dependencies]

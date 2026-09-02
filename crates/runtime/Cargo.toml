@@ -2,6 +2,7 @@
 name = "astra-runtime"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [features]
 default = ["harness"]

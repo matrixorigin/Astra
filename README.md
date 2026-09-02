@@ -13,6 +13,7 @@
 [![Terminal-Bench](https://img.shields.io/badge/Terminal--Bench-Results_coming_soon-0A7EA4)](#research-and-benchmarks)
 [![Rust 1.97](https://img.shields.io/badge/Rust-1.97-000000?logo=rust)](rust-toolchain.toml)
 [![TypeScript](https://img.shields.io/badge/SDK-TypeScript-3178C6?logo=typescript&logoColor=white)](packages/sdk)
+[![License](https://img.shields.io/badge/License-Apache%202.0-red.svg)](LICENSE)
 
 [Why Astra](#why-astra) · [Quick start](#quick-start) · [Architecture](#architecture) · [User Runner](#user-runner) · [Enterprise](#enterprise-agents-by-design) · [Research](#research-and-benchmarks) · [Docs](#documentation)
 
@@ -584,6 +585,10 @@ Issues and pull requests are welcome. Before submitting a change:
 
 For substantial behavior changes, open an issue first so the runtime contract
 and implementation can evolve together.
+
+## License
+
+Astra is licensed under the [Apache License, Version 2.0](LICENSE).
 
 ---
 

@@ -2,6 +2,7 @@
 name = "astra-test-harness"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "CLI test framework for astra — runs YAML cases × model list, captures session state, scores with agent judger."
 
 [[bin]]

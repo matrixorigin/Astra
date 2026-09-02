@@ -2,6 +2,7 @@
 name = "astra-runtime-env"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Runtime environment bindings, capabilities, and tool surface resolution for Astra."
 
 [dependencies]

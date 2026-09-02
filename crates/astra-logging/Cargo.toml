@@ -2,6 +2,7 @@
 name = "astra-logging"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Shared tracing subscriber initialization for Astra binaries"
 
 [features]

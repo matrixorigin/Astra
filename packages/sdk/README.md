@@ -275,4 +275,4 @@ Vitest config: `vitest.config.ts`. Suites cover `AstraClient`, SSE/WebSocket hel
 
 ## License
 
-MIT
+Apache-2.0. See the repository's [LICENSE](../../LICENSE).

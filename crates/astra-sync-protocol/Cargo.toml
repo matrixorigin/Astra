@@ -2,6 +2,7 @@
 name = "astra-sync-protocol"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 description = "Versioned edge/cloud sync wire contract"
 
 [dependencies]
@@ -10,4 +11,3 @@ hmac.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-

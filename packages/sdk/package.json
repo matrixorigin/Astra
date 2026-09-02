@@ -1,6 +1,7 @@
 {
   "name": "@astra/sdk",
   "version": "0.1.0",
+  "license": "Apache-2.0",
   "description": "TypeScript SDK for Astra — streaming chat, tool execution, and WebSocket support",
   "type": "module",
   "main": "./dist/index.cjs",
