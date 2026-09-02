@@ -193,7 +193,7 @@ jobs:
             - astra-v${{ needs.version.outputs.value }}-darwin-amd64.tar.gz
             - astra-v${{ needs.version.outputs.value }}-darwin-arm64.tar.gz
             - checksums.txt
-          make_latest: false
+          make_latest: ${{ needs.version.outputs.prerelease == 'false' }}
           files: dist/*
           fail_on_unmatched_files: true
 
