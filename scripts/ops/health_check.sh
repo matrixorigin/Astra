@@ -1,7 +1,7 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Health check for all services
 
-set -e
+set -euo pipefail
 
 # Colors
 RED='\033[0;31m'
@@ -26,6 +26,15 @@ DB_PORT="${MATRIXONE_PORT:-6001}"
 DB_USER="${MATRIXONE_USER:-root}"
 DB_PASSWORD="${MATRIXONE_PASSWORD}"
 
+matrixone_container_ids=""
+if command -v docker >/dev/null 2>&1 && \
+   { [ "${DB_HOST}" = "localhost" ] || [ "${DB_HOST}" = "127.0.0.1" ]; }; then
+    matrixone_container_ids="$(docker ps \
+        --filter label=com.docker.compose.service=matrixone \
+        --format '{{.ID}}' 2>/dev/null || true)"
+fi
+matrixone_container_count="$(printf '%s\n' "${matrixone_container_ids}" | sed '/^$/d' | wc -l | tr -d ' ')"
+
 echo "🏥 Health Check"
 echo "==============="
 echo ""
@@ -42,16 +51,21 @@ fi
 
 # Check MatrixOne
 echo -n "MatrixOne (${DB_HOST}:${DB_PORT}): "
-if command -v docker &> /dev/null && docker ps | grep -q matrixone; then
-    if docker exec matrixone mysql -h127.0.0.1 -P${DB_PORT} -u${DB_USER} -p${DB_PASSWORD} -e "SELECT 1" > /dev/null 2>&1; then
+if [ "${matrixone_container_count}" -eq 1 ]; then
+    if MYSQL_PWD="${DB_PASSWORD}" docker exec -e MYSQL_PWD "${matrixone_container_ids}" \
+        mysql -h127.0.0.1 -P6001 -u"${DB_USER}" -e "SELECT 1" > /dev/null 2>&1; then
         echo -e "${GREEN}✅ Connected${NC}"
         DB_STATUS=0
     else
         echo -e "${RED}❌ Connection failed${NC}"
         DB_STATUS=1
     fi
-elif command -v mysql &> /dev/null; then
-    if mysql -h${DB_HOST} -P${DB_PORT} -u${DB_USER} -p${DB_PASSWORD} -e "SELECT 1" > /dev/null 2>&1; then
+elif [ "${matrixone_container_count}" -gt 1 ]; then
+    echo -e "${RED}❌ Multiple local MatrixOne Compose containers found; stop unused stacks${NC}"
+    DB_STATUS=1
+elif command -v mysql >/dev/null 2>&1; then
+    if MYSQL_PWD="${DB_PASSWORD}" mysql -h"${DB_HOST}" -P"${DB_PORT}" \
+        -u"${DB_USER}" -e "SELECT 1" > /dev/null 2>&1; then
         echo -e "${GREEN}✅ Connected${NC}"
         DB_STATUS=0
     else
@@ -60,7 +74,7 @@ elif command -v mysql &> /dev/null; then
     fi
 else
     echo -e "${YELLOW}⚠️  Cannot check (mysql client not found)${NC}"
-    DB_STATUS=0
+    DB_STATUS=1
 fi
 
 echo ""

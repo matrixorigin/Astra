@@ -98,6 +98,7 @@ mo-data/
 trustmem_cloud_v1/data/
 
 feedback_export.jsonl
+/backups/
 
 review/
 /plans/
