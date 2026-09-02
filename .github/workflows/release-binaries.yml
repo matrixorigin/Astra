@@ -22,6 +22,7 @@ jobs:
   version:
     name: Resolve Version
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       value: ${{ steps.resolve.outputs.value }}
       mirror_tag: ${{ steps.resolve.outputs.mirror_tag }}
@@ -71,6 +72,7 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: version
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
@@ -178,6 +180,7 @@ jobs:
       - version
       - build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
 
@@ -216,6 +219,7 @@ jobs:
       - build
       - release
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4

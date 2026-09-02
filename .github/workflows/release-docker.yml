@@ -31,6 +31,7 @@ jobs:
   version:
     name: Resolve Image Settings
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       image_version: ${{ steps.release.outputs.image_version }}
       rolling_version: ${{ steps.release.outputs.rolling_version }}
@@ -201,6 +202,7 @@ jobs:
       - version
       - build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
