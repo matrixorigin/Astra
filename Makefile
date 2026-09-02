@@ -94,7 +94,6 @@ help:
 	@echo "  make memoria-stop       - Stop Memoria service"
 	@echo "  make memoria-logs       - Show Memoria logs"
 	@echo "  make memoria-status     - Show Memoria status"
-	@echo "  make memoria-clean      - Stop and remove Memoria data"
 	@echo ""
 	@echo "All-in-One Docker Deployment:"
 	@echo "  make stack-env          - Create .env and generate stack secrets"
@@ -1547,29 +1546,20 @@ check-web:
 # ============================================================================
 
 .PHONY: memoria-start
-memoria-start:
-	@echo "Starting Memoria..."
-	@docker compose -f memoria/docker-compose.yml up -d
-	@echo "API: http://localhost:8100  Swagger: http://localhost:8100/docs"
+memoria-start: dev-deps-up
+	@echo "Memoria API: http://localhost:8100  Swagger: http://localhost:8100/docs"
 
 .PHONY: memoria-stop
 memoria-stop:
-	@docker compose -f memoria/docker-compose.yml down
+	@$(DEPS_COMPOSE) stop memoria
 
 .PHONY: memoria-logs
 memoria-logs:
-	@docker compose -f memoria/docker-compose.yml logs -f api
+	@$(DEPS_COMPOSE) logs -f memoria
 
 .PHONY: memoria-status
 memoria-status:
-	@docker compose -f memoria/docker-compose.yml ps
-
-.PHONY: memoria-clean
-memoria-clean:
-	@echo "Stopping and removing Memoria (including data)..."
-	@docker compose -f memoria/docker-compose.yml down
-	@rm -rf memoria/data/
-	@echo "Done."
+	@$(DEPS_COMPOSE) ps memoria
 
 # ============================================================================
 # Database

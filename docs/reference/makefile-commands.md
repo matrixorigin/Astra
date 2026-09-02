@@ -53,7 +53,10 @@
 | `make memoria-stop` | Stop Memoria |
 | `make memoria-logs` | Tail Memoria logs |
 | `make memoria-status` | Show Memoria status |
-| `make memoria-clean` | Stop and remove Memoria data |
+
+Memoria persists through the shared MatrixOne dependency. Use
+`make dev-deps-clean` when you intentionally need to remove all local
+dependency data; that command prompts before deletion.
 
 ## Useful Direct Cargo Commands
 
