@@ -9462,7 +9462,7 @@ mod tests {
 
         let ctx = approval_scope_context_for_tool(
             "bash",
-            &serde_json::json!({"command": "cd /home/xupeng/github/astra && cargo build -p astra-turn-core -p astra-cli"}),
+            &serde_json::json!({"command": "cd /workspace/astra && cargo build -p astra-turn-core -p astra-cli"}),
             false,
             false,
         );
@@ -9480,7 +9480,7 @@ mod tests {
 
         let ctx = approval_scope_context_for_tool(
             "bash",
-            &serde_json::json!({"command": "cd /home/xupeng/github/astra && cargo test -p astra-turn-core --lib cloud_approval_policy -- --nocapture"}),
+            &serde_json::json!({"command": "cd /workspace/astra && cargo test -p astra-turn-core --lib cloud_approval_policy -- --nocapture"}),
             false,
             false,
         );
@@ -9516,7 +9516,7 @@ mod tests {
 
         let ctx = approval_scope_context_for_tool(
             "bash",
-            &serde_json::json!({"command": r#"cd /home/xupeng/github/astra && grep -n "fn powershell\|fn bash_with_cancel\|execute_with_metadata_responsive" crates/astra-cli/src/edge_tools/shell.rs crates/astra-cli/src/cli/stream_render.rs"#}),
+            &serde_json::json!({"command": r#"cd /workspace/astra && grep -n "fn powershell\|fn bash_with_cancel\|execute_with_metadata_responsive" crates/astra-cli/src/edge_tools/shell.rs crates/astra-cli/src/cli/stream_render.rs"#}),
             false,
             false,
         );

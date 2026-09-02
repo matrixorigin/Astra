@@ -454,7 +454,7 @@ mod tests {
 
     #[test]
     fn shorten_path_tail_ellipsizes() {
-        let s = shorten_path("/home/xupeng/astra/very/deep/path/inside", 20);
+        let s = shorten_path("/workspace/astra/very/deep/path/inside", 20);
         assert!(s.starts_with('…'));
         assert!(s.chars().count() <= 20);
     }

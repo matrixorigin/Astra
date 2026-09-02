@@ -1215,7 +1215,7 @@ them."#
             "src/tui/wrapping.rs",
             "./crates/astra-cli/src/main.rs:42",
             "../docs/reference/config.md",
-            "/home/xupeng/astra/Cargo.toml:12",
+            "/workspace/astra/Cargo.toml:12",
         ];
         for text in positives {
             assert!(

@@ -34,10 +34,10 @@ directory.
 
 ```bash
 # ✓ repo root
-cd /home/xupeng/github/astra && cargo build -p astra-runtime
+cargo build -p astra-runtime
 
 # ✓ any directory
-cargo build --manifest-path /home/xupeng/github/astra/Cargo.toml -p astra-runtime
+cargo build --manifest-path /path/to/astra/Cargo.toml -p astra-runtime
 ```
 
 Prefer `make <target>` from the repo root when possible.

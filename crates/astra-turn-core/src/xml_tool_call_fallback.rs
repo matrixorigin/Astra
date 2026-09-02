@@ -1291,7 +1291,7 @@ Done."#;
         // followed by a valid <invoke> block.
         let text = "1. Let me start by exploring the project structure and understanding the context better.\n\n\
 <invoke name=\"list_dir\">\n\
-<parameter name=\"path\">/home/xupeng/github/astra</parameter>\n\
+<parameter name=\"path\">/workspace/astra</parameter>\n\
 </invoke>";
         let calls = parse_degraded_tool_calls(text);
         assert!(
@@ -1306,7 +1306,7 @@ Done."#;
     fn prose_prefix_invoke_is_stripped_from_text() {
         let text = "1. Let me start by exploring the project structure and understanding the context better.\n\n\
 <invoke name=\"list_dir\">\n\
-<parameter name=\"path\">/home/xupeng/github/astra</parameter>\n\
+<parameter name=\"path\">/workspace/astra</parameter>\n\
 </invoke>";
         let stripped = strip_degraded_tool_calls(text);
         assert!(

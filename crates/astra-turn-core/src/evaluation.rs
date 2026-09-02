@@ -561,7 +561,7 @@ pub fn evaluate_tool_call_records_with_thresholds_and_telemetry(
             name: record.name.clone(),
             // Prefer the *untruncated* args for the repeat-key. `args_preview`
             // is capped at ~80 chars, so two distinct calls that share a long
-            // common prefix (e.g. `grep -n '<long-pattern>' /home/xupeng/githu…`)
+            // common prefix (e.g. `grep -n '<long-pattern>' /workspace/astr…`)
             // collide and surface as a false repeat-loop. Hash `args_full`
             // when present to keep the key bounded; fall back to the preview
             // for legacy records, then to the bare tool name.
@@ -4531,7 +4531,7 @@ mod tests {
         use astra_services::session_journal::ToolCallRecord;
 
         let identical_truncated_preview =
-            "grep -n 'canonicalize|unique_path_variants|normalize_path' /home/xupeng/githu…";
+            "grep -n 'canonicalize|unique_path_variants|normalize_path' /workspace/astr…";
 
         let record = |full_path: &str| ToolCallRecord {
             name: "bash".to_string(),
@@ -4553,9 +4553,9 @@ mod tests {
         };
 
         let distinct_full_args = vec![
-            record("/home/xupeng/github/astra/crates/services/src/work.rs"),
-            record("/home/xupeng/github/astra/crates/astra-tools/src/fs_ops.rs"),
-            record("/home/xupeng/github/astra/crates/astra-sandbox/src/policy.rs"),
+            record("/workspace/astra/crates/services/src/work.rs"),
+            record("/workspace/astra/crates/astra-tools/src/fs_ops.rs"),
+            record("/workspace/astra/crates/astra-sandbox/src/policy.rs"),
         ];
 
         let eval = evaluate_tool_call_records(

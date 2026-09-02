@@ -696,9 +696,9 @@ mod tests {
     fn file_op_preserves_absolute_root_when_normalizing() {
         let fp = ApprovalFingerprint::file_op(
             "write_file",
-            Some("/home/xupeng/github/astra/src/turn/interruption.rs"),
+            Some("/workspace/astra/src/turn/interruption.rs"),
         );
-        assert_eq!(fp.path_pattern.as_deref(), Some("/home/xupeng/**"));
+        assert_eq!(fp.path_pattern.as_deref(), Some("/workspace/astra/**"));
     }
 
     #[test]

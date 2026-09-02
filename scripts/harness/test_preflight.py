@@ -1422,7 +1422,7 @@ class PreflightTests(unittest.TestCase):
             )
         self.assertTrue(ok, detail)
         self.assertEqual(probe.call_args.args[1], {"PYTHONPATH": str(adapter_path)})
-        self.assertNotIn("/home/xupeng/astra", detail)
+        self.assertNotIn("/home/", detail)
 
     def test_runner_rejects_semantic_harbor_overrides_before_preflight(self):
         for arguments in (

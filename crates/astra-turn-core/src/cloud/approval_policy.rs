@@ -1464,7 +1464,7 @@ mod tests {
         // Package metadata queries with no execution/fix behavior.
         assert!(bash_command_is_read_only("npm list"));
         assert!(bash_command_is_read_only(
-            r#"cd /home/xupeng/github/astra && grep -n "fn powershell\|fn bash_with_cancel\|execute_with_metadata_responsive" crates/astra-cli/src/edge_tools/shell.rs crates/astra-cli/src/cli/stream_render.rs"#
+            r#"cd /workspace/astra && grep -n "fn powershell\|fn bash_with_cancel\|execute_with_metadata_responsive" crates/astra-cli/src/edge_tools/shell.rs crates/astra-cli/src/cli/stream_render.rs"#
         ));
         assert!(bash_command_is_read_only(
             r#"grep -n "is_unsafe_bare_shell_prefix\|UNSAFE_SHELL\|is_dangerous_bash_allow_shape" crates/astra-cli/src/edge_tools/shell.rs | head -n 20"#

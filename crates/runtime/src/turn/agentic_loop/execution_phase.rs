@@ -16079,13 +16079,13 @@ mod tests {
     #[test]
     fn external_scratch_shell_snapshot_does_not_create_global_mutation_obligation() {
         let mut state = make_state();
-        state.hooks.workspace_root_hint = Some("/home/xupeng/astra".into());
+        state.hooks.workspace_root_hint = Some("/workspace/astra".into());
         state.stall.tool_call_records.push(ToolCallRecord {
             name: "bash".into(),
             ok: true,
             args_full: Some(
                 serde_json::json!({
-                    "command": "cd /home/xupeng/astra && git show HEAD:src/lib.rs > /tmp/inspected.rs && sed -n '1,20p' /tmp/inspected.rs"
+                    "command": "cd /workspace/astra && git show HEAD:src/lib.rs > /tmp/inspected.rs && sed -n '1,20p' /tmp/inspected.rs"
                 })
                 .to_string(),
             ),
@@ -16099,7 +16099,7 @@ mod tests {
     #[test]
     fn historical_review_diff_scratch_snapshot_does_not_create_global_mutation_obligation() {
         let mut state = make_state();
-        state.hooks.workspace_root_hint = Some("/home/xupeng/astra".into());
+        state.hooks.workspace_root_hint = Some("/workspace/astra".into());
         state.stall.tool_call_records.push(ToolCallRecord {
             name: "bash".into(),
             ok: true,

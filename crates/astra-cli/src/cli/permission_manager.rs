@@ -7133,7 +7133,7 @@ mod tests {
         ));
 
         let read_only_compound = serde_json::json!({
-            "command": "cd /home/xupeng/astra && git diff origin/main...HEAD --stat | awk '{print $1}'"
+            "command": "cd /workspace/astra && git diff origin/main...HEAD --stat | awk '{print $1}'"
         });
         assert!(matches!(
             pm.check_nonblocking("bash", &read_only_compound),

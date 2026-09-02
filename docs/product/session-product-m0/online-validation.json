@@ -4,7 +4,7 @@
   "evidence_class": "online-integration",
   "correctness_authority": false,
   "role": "online integration and output-distribution evidence only; not deterministic correctness proof",
-  "command": "target/release/astra-test --suite crates/astra-test-harness/cases --filter introspection_reflection_source_boundary --models deepseek-v4-flash --force-model deepseek-v4-flash --judger-model deepseek-v4-flash --parallel 1 --runs 1 --working-dir /home/xupeng/astra --verbose",
+  "command": "target/release/astra-test --suite crates/astra-test-harness/cases --filter introspection_reflection_source_boundary --models deepseek-v4-flash --force-model deepseek-v4-flash --judger-model deepseek-v4-flash --parallel 1 --runs 1 --working-dir . --verbose",
   "case": "introspection_reflection_source_boundary",
   "model": "deepseek-v4-flash",
   "session_id": "f6bba2b2-74dd-4408-8ec1-bafcba00cc8e",

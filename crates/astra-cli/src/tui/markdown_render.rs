@@ -1104,11 +1104,11 @@ mod polish_tests {
         let out = lines_at_cwd(
             "See src/tui/wrapping.rs:42 for details.",
             80,
-            Path::new("/home/xupeng/astra/crates/astra-cli"),
+            Path::new("/workspace/astra/crates/astra-cli"),
         );
         let joined = out.join("\n");
         assert!(joined.contains(
-            "\x1b]8;;file:///home/xupeng/astra/crates/astra-cli/src/tui/wrapping.rs\x1b\\src/tui/wrapping.rs:42\x1b]8;;\x1b\\"
+            "\x1b]8;;file:///workspace/astra/crates/astra-cli/src/tui/wrapping.rs\x1b\\src/tui/wrapping.rs:42\x1b]8;;\x1b\\"
         ));
     }
 
@@ -1117,7 +1117,7 @@ mod polish_tests {
         let out = lines_at_cwd(
             "inspect ./crates/astra-cli/src/tui/markdown_render.rs:757 before changing anything",
             34,
-            Path::new("/home/xupeng/astra"),
+            Path::new("/workspace/astra"),
         );
         assert!(out.len() >= 2, "expected wrapped output; got {out:?}");
         assert!(
