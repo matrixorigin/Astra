@@ -122,6 +122,14 @@ jobs:
           echo "latest=${latest}" >> "${GITHUB_OUTPUT}"
           echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
 
+      - name: Check out release source
+        if: ${{ github.event_name == 'push' }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Validate manifest version
+        if: ${{ github.event_name == 'push' }}
+        run: scripts/validate-release-version.sh "${{ steps.release.outputs.image_version }}"
+
   build:
     name: Build ${{ matrix.platform }}
     needs: version

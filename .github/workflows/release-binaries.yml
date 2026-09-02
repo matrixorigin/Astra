@@ -58,6 +58,14 @@ jobs:
           echo "source_tag=v${value}" >> "${GITHUB_OUTPUT}"
           echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
 
+      - name: Check out release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ steps.resolve.outputs.source_tag }}
+
+      - name: Validate manifest version
+        run: scripts/validate-release-version.sh "${{ steps.resolve.outputs.value }}"
+
   build:
     name: Build ${{ matrix.target }}
     needs: version

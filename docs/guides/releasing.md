@@ -22,6 +22,8 @@ rolling tags.
 2. Update the workspace version in `Cargo.toml` and any user-facing version
    references that apply to the release.
 3. Confirm that the version matches the intended tag without the leading `v`.
+   Both tag-triggered release workflows reject a mismatched workspace version
+   before building or publishing artifacts.
 4. Summarize user-visible changes, compatibility impact, and migration steps in
    the pull request.
 5. Apply the most specific `kind/*`, `documentation`, or `improvement` label to
