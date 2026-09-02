@@ -13,9 +13,9 @@ body:
           required: true
   - type: input
     attributes:
-      label: Environment (optional)
-      description: OS, runtime version, or other relevant info.
-      placeholder: e.g. macOS 14, Node 20
+      label: Version and environment (optional)
+      description: Astra version or commit, deployment profile, OS, and CPU architecture.
+      placeholder: e.g. Astra 0.1.0, Server + Edge, macOS 15 arm64
     validations:
       required: false
   - type: textarea
@@ -40,6 +40,6 @@ body:
   - type: textarea
     attributes:
       label: Additional information
-      description: Logs, errors, or other context.
+      description: Sanitized logs, traces, screenshots, or other context. Remove credentials, private URLs and paths, customer data, and proprietary information.
     validations:
       required: false
