@@ -23,8 +23,6 @@ on:
 
 env:
   IMAGE_NAME: matrixorigin/astra
-  IDC_REGISTRY: shanghai.idc.matrixorigin.cn:30019
-  IDC_IMAGE_NAME: shanghai.idc.matrixorigin.cn:30019/mocloud/astra
 
 jobs:
   version:
@@ -244,17 +242,20 @@ jobs:
 
           docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
 
-  idc:
-    name: Publish IDC Manifest
+  registry-mirror:
+    name: Publish Registry Mirror
+    if: >-
+      vars.CONTAINER_MIRROR_REGISTRY != '' &&
+      vars.CONTAINER_MIRROR_IMAGE != ''
     needs:
       - version
       - merge
-    runs-on: amd64-mo-shanghai-dind
+    runs-on: ${{ vars.CONTAINER_MIRROR_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 45
     env:
-      http_proxy: http://proxy-service.proxy.svc.cluster.local:8001
-      https_proxy: http://proxy-service.proxy.svc.cluster.local:8001
-      no_proxy: .local,.cn,.gitee.com,.tencent.com,.tencentyun.com,.aliyun.com,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,localhost,127.0.0.0/8,.qq.com,169.254.0.0/16,.myqcloud.com,.matrixone.tech,.aliyuncs.com,.digicert.com,.microsoft.com,.visualstudio.com,.symcb.com,0.0.0.0
+      http_proxy: ${{ vars.CONTAINER_MIRROR_HTTP_PROXY || '' }}
+      https_proxy: ${{ vars.CONTAINER_MIRROR_HTTPS_PROXY || '' }}
+      no_proxy: ${{ vars.CONTAINER_MIRROR_NO_PROXY || '' }}
 
     steps:
       - name: Install crane
@@ -276,15 +277,16 @@ jobs:
           ROLLING_VERSION: ${{ needs.version.outputs.rolling_version }}
           PUBLISH_LATEST: ${{ needs.version.outputs.latest }}
           SOURCE_IMAGE: ${{ env.IMAGE_NAME }}
-          TARGET_IMAGE: ${{ env.IDC_IMAGE_NAME }}
+          MIRROR_REGISTRY: ${{ vars.CONTAINER_MIRROR_REGISTRY }}
+          TARGET_IMAGE: ${{ vars.CONTAINER_MIRROR_IMAGE }}
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          IDC_USERNAME: ${{ secrets.IDC_REGISTRY_USERNAME }}
-          IDC_PASSWORD: ${{ secrets.IDC_REGISTRY_PASSWORD }}
+          MIRROR_USERNAME: ${{ secrets.IDC_REGISTRY_USERNAME }}
+          MIRROR_PASSWORD: ${{ secrets.IDC_REGISTRY_PASSWORD }}
         run: |
           set -euo pipefail
           printf '%s' "${DOCKERHUB_TOKEN}" | crane auth login index.docker.io -u "${DOCKERHUB_USERNAME}" --password-stdin
-          printf '%s' "${IDC_PASSWORD}" | crane auth login "${IDC_REGISTRY}" -u "${IDC_USERNAME}" --password-stdin
+          printf '%s' "${MIRROR_PASSWORD}" | crane auth login "${MIRROR_REGISTRY}" -u "${MIRROR_USERNAME}" --password-stdin
 
           tags=("${IMAGE_VERSION}")
           if [ "${PUBLISH_LATEST}" = "true" ]; then
