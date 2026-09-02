@@ -14,6 +14,11 @@ on:
         required: true
         type: string
 
+concurrency:
+  group: release-binaries
+  # Never cancel a run that may already be publishing immutable artifacts.
+  cancel-in-progress: false
+
 env:
   BINARY: astra
   CROSS_REVISION: 8c1a8aa4b661711f4b7b6ac07c2e8929ce2f7d27 # upstream main, 2026-08-19

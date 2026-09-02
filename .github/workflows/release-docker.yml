@@ -24,6 +24,11 @@ on:
           - amd64
           - arm64
 
+concurrency:
+  group: release-docker
+  # Never cancel a run that may already have pushed a platform image.
+  cancel-in-progress: false
+
 env:
   IMAGE_NAME: matrixorigin/astra
 
