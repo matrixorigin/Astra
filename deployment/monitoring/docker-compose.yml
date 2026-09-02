@@ -5,9 +5,7 @@
 #
 # Access:
 #   Prometheus: http://localhost:9091
-#   Grafana: http://localhost:3000 (admin/admin)
-
-version: '3.8'
+#   Grafana: http://localhost:3000 (credentials from .env)
 
 services:
 
@@ -38,8 +36,8 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?Set GRAFANA_ADMIN_PASSWORD in deployment/monitoring/.env}
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
       - grafana-data:/var/lib/grafana

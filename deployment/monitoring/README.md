@@ -5,12 +5,13 @@ Prometheus + Grafana monitoring for astra.
 ## Quick Start
 
 ```bash
-# Start monitoring stack
-docker-compose up -d
+cp .env.example .env
+# Set GRAFANA_ADMIN_PASSWORD in .env to a strong, unique value.
+docker compose up -d
 
 # Access services
 open http://localhost:9091  # Prometheus
-open http://localhost:3000  # Grafana (admin/admin)
+open http://localhost:3000  # Grafana
 ```
 
 ## Components
@@ -30,7 +31,7 @@ open http://localhost:3000  # Grafana (admin/admin)
 ### Grafana
 
 - **Port**: 3000
-- **Default credentials**: admin/admin
+- **Credentials**: `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD` from `.env`
 - **Dashboards**: Pre-configured in `dashboards/`
 
 **Available dashboards:**
@@ -188,7 +189,7 @@ docker logs grafana
 --storage.tsdb.retention.time=7d
 
 # Or limit memory
-docker-compose up -d --scale prometheus=1 --memory=2g
+docker compose up -d --scale prometheus=1 --memory=2g
 ```
 
 ## Production Recommendations
