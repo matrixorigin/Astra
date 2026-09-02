@@ -1,0 +1,44 @@
+cff-version: 1.2.0
+message: "If you use Astra, please cite the ContextPipe paper and this software."
+title: Astra
+type: software
+version: 0.1.0
+authors:
+  - name: MatrixOrigin
+repository-code: "https://github.com/matrixorigin/Astra"
+url: "https://github.com/matrixorigin/Astra"
+license: Apache-2.0
+abstract: >-
+  Astra is an enterprise agent runtime that unifies CLI, Server, and Edge
+  execution with durable runs, governed User Runners, traceability, policy,
+  and a database-inspired Context Pipeline.
+keywords:
+  - enterprise agents
+  - agent runtime
+  - context engineering
+  - context pipeline
+  - user runner
+  - observability
+
+preferred-citation:
+  type: conference-paper
+  title: "ContextPipe: Database-Inspired Context Assembly for Long-Horizon Agents"
+  authors:
+    - family-names: Xu
+      given-names: Peng
+    - family-names: Zhang
+      given-names: Zuyu
+    - family-names: Sun
+      given-names: Yuze
+    - family-names: Tian
+      given-names: Feng
+    - family-names: Wang
+      given-names: Long
+    - family-names: Zhang
+      given-names: Chen
+  year: 2026
+  url: "https://arxiv.org/abs/2609.00749"
+  identifiers:
+    - type: other
+      value: "arXiv:2609.00749"
+      description: arXiv preprint identifier

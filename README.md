@@ -106,7 +106,7 @@ trace.
 Peng Xu, Zuyu Zhang, Yuze Sun, Feng Tian, Long Wang, and Chen Zhang ·
 **[Accepted at ADS 2026](https://vldb-ads.top/#program)**, co-located with VLDB
 2026 · [arXiv](https://arxiv.org/abs/2609.00749) ·
-[PDF](https://arxiv.org/pdf/2609.00749)
+[PDF](https://arxiv.org/pdf/2609.00749) · [Citation](CITATION.cff)
 
 In a preliminary evaluation on the SWE-bench Pro Qutebrowser subset,
 ContextPipe reduced total token volume by **31%**, LLM calls by **23%**, and
