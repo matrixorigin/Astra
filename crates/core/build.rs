@@ -3,6 +3,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const BUILD_ATTESTATION_NONCE_ENV: &str = "ASTRA_BUILD_ATTESTATION_NONCE";
+const BUILD_SOURCE_GIT_SHA_ENV: &str = "ASTRA_BUILD_SOURCE_GIT_SHA";
+const BUILD_SOURCE_GIT_DIRTY_ENV: &str = "ASTRA_BUILD_SOURCE_GIT_DIRTY";
+
+fn valid_git_sha(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
 
 fn git_text(workspace: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
@@ -37,6 +43,8 @@ fn watch_git_path(workspace: &Path, name: &str) {
 
 fn main() {
     println!("cargo:rerun-if-env-changed={BUILD_ATTESTATION_NONCE_ENV}");
+    println!("cargo:rerun-if-env-changed={BUILD_SOURCE_GIT_SHA_ENV}");
+    println!("cargo:rerun-if-env-changed={BUILD_SOURCE_GIT_DIRTY_ENV}");
     let build_target = env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
     let build_profile = env::var("PROFILE").unwrap_or_else(|_| "unknown".to_string());
     let manifest = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest directory"));
@@ -56,20 +64,30 @@ fn main() {
         watch_git_path(&workspace, &symbolic_ref);
     }
 
-    let git_sha = git_text(&workspace, &["rev-parse", "--verify", "HEAD^{commit}"])
-        .filter(|sha| {
-            matches!(sha.len(), 40 | 64) && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+    // Container builds intentionally exclude `.git` from their context. Their
+    // trusted build orchestrator passes the same source identity used for OCI
+    // image metadata so the binary and image remain auditable as one artifact.
+    let git_sha = env::var(BUILD_SOURCE_GIT_SHA_ENV)
+        .ok()
+        .filter(|sha| valid_git_sha(sha))
+        .or_else(|| {
+            git_text(&workspace, &["rev-parse", "--verify", "HEAD^{commit}"])
+                .filter(|sha| valid_git_sha(sha))
         })
         .unwrap_or_else(|| "unknown".to_string());
     // Executable identity gates only on tracked source changes.  Benchmark
     // artifacts, logs, and user worktrees are intentionally untracked and
     // must not make an otherwise reproducible build unverifiable.
-    let git_dirty = git_text(
-        &workspace,
-        &["status", "--porcelain=v1", "--untracked-files=no"],
-    )
-    .map(|status| !status.is_empty())
-    .unwrap_or(true);
+    let git_dirty = match env::var(BUILD_SOURCE_GIT_DIRTY_ENV).as_deref() {
+        Ok("true") => true,
+        Ok("false") => false,
+        _ => git_text(
+            &workspace,
+            &["status", "--porcelain=v1", "--untracked-files=no"],
+        )
+        .map(|status| !status.is_empty())
+        .unwrap_or(true),
+    };
     let attestation_nonce = env::var(BUILD_ATTESTATION_NONCE_ENV)
         .ok()
         .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))

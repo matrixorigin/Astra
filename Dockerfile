@@ -2,6 +2,8 @@
 # stages must use the same compiler or the cooked dependency artifacts cannot
 # be reused. The digest pins the current multi-architecture image index.
 ARG CARGO_CHEF_VERSION=0.1.77
+ARG IMAGE_REVISION=unknown
+ARG IMAGE_SOURCE_DIRTY=true
 # Optional build accelerators for restricted or regional networks. Public
 # builds use the upstream Cargo and Debian sources by default.
 ARG CARGO_REGISTRY
@@ -49,6 +51,9 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 
+ARG IMAGE_REVISION
+ARG IMAGE_SOURCE_DIRTY
+
 WORKDIR /app
 COPY --from=planner /app/recipe.json recipe.json
 # Runtime image intentionally ships the API server plus the single public CLI.
@@ -59,7 +64,9 @@ RUN cargo chef cook --release --no-default-features --recipe-path recipe.json \
 
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN cargo build --release --no-default-features \
+RUN ASTRA_BUILD_SOURCE_GIT_SHA="${IMAGE_REVISION}" \
+    ASTRA_BUILD_SOURCE_GIT_DIRTY="${IMAGE_SOURCE_DIRTY}" \
+    cargo build --release --no-default-features \
         -p astra-runtime --bin astra-server \
         -p astra-cli --bin astra && \
     mkdir -p /out && \
