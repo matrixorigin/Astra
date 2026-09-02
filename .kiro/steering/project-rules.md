@@ -21,11 +21,10 @@ make dev-stop           # Stop all
 
 ## Workspace Structure
 
-- `rust/crates/core/` — shared types
-- `rust/crates/services/` — sessions, journals, durable tasks, cloud sync
-- `rust/crates/runtime/` — Axum HTTP server, contract tests in `tests/`
-- `rust/crates/astra-cli/` — CLI, edge tools, plan executor, code intel
-- `rust/crates/astra-cli/` — CLI (admin subcommands under `src/admin_cli/`)
+- `crates/core/` — shared types
+- `crates/services/` — sessions, journals, durable tasks, cloud sync
+- `crates/runtime/` — Axum HTTP server, contract tests in `tests/`
+- `crates/astra-cli/` — CLI, including admin subcommands under `src/admin_cli/`
 - `.agent/skills/` — Agent Skills (SKILL.md format, see `.agent/skills/`)
 - `web/` — Next.js admin dashboard
 
@@ -34,7 +33,7 @@ make dev-stop           # Stop all
 - Edition 2024, clippy warnings = errors
 - Error types: `thiserror`, async: Tokio, HTTP: Axum 0.8, DB: SQLx (MySQL/MatrixOne)
 - No `unsafe` without safety comments
-- Contract tests: `rust/crates/runtime/tests/`
+- Contract tests: `crates/runtime/tests/`
 
 ## Development Rules (MANDATORY)
 

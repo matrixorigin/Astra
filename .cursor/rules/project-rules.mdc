@@ -5,7 +5,7 @@ alwaysApply: true
 
 # mo-agent-runtime Development & Testing Guide
 
-You are working on **mo-agent-runtime**, a Rust-first agent platform (workspace crates `astra-core`, `astra-cli`, `astra-admin`, etc.). Primary focus: development, testing, and debugging.
+You are working on **Astra**, a Rust-first agent platform (workspace crates `astra-core`, `astra-cli`, `astra-runtime`, etc.). Primary focus: development, testing, and debugging.
 
 ## Quick Reference
 
@@ -27,8 +27,7 @@ Optional **`ASTRA_DATABASE_PREFIX`**: effective DB name is `{prefix}{ASTRA_DATAB
 - `crates/core/` — package `astra-core`, shared types and config contract tests
 - `crates/services/` — sessions, journals, durable tasks, cloud sync
 - `crates/runtime/` — Axum HTTP server, contract tests in `tests/`
-- `crates/astra-cli/` — CLI, edge tools, plan executor, code intel
-- `crates/astra-admin/` — admin CLI
+- `crates/astra-cli/` — CLI, admin subcommands, edge tools, plan executor, code intel
 - `crates/astra-thin-client/` — stateless HTTP + SSE client for the thin client protocol
 - `.claude/skills/` — curated Agent Skills for Claude-compatible agents
 - `.agent/skills/` — mirror of the curated Agent Skills for Agent-compatible runtimes
