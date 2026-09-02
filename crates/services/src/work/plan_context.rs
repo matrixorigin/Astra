@@ -439,9 +439,7 @@ impl WorkTaskExecutionSnapshot {
                     .is_some_and(|cut| cut.graph_revision == self.basis.graph_revision)
             })
         });
-        let Some(item) = terminal_cut_items.next() else {
-            return None;
-        };
+        let item = terminal_cut_items.next()?;
         if terminal_cut_items.next().is_some() {
             return None;
         }

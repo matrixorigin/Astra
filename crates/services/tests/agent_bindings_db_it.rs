@@ -2,8 +2,7 @@ mod common;
 
 use astra_services::{
     AgentBindingCreateRequestData, AgentBindingOwnerScope, AgentBindingPayload,
-    AgentBindingService, CapabilityServerEndpoint, CapabilityServerTransport, CapabilityServerType,
-    DatabaseAgentBindingService, RuntimePolicy, ToolMode,
+    AgentBindingService, DatabaseAgentBindingService,
 };
 use axum::http::StatusCode;
 use serial_test::serial;
@@ -17,22 +16,6 @@ fn binding_request(suffix: &str) -> AgentBindingCreateRequestData {
         binding: AgentBindingPayload {
             binding_name: format!("binding-{suffix}"),
             agent_md: "You are a test agent.".to_string(),
-            capability_servers: vec![
-                CapabilityServerEndpoint {
-                    id: "tools".to_string(),
-                    server_type: CapabilityServerType::Mcp,
-                    transport: CapabilityServerTransport::StreamableHttp,
-                },
-                CapabilityServerEndpoint {
-                    id: "skills".to_string(),
-                    server_type: CapabilityServerType::Skill,
-                    transport: CapabilityServerTransport::StreamableHttp,
-                },
-            ],
-            runtime_policy: RuntimePolicy {
-                max_steps: Some(5),
-                tool_mode: ToolMode::McpGateway,
-            },
             metadata: Some(serde_json::json!({"source": "agent-bindings-db-it"})),
             binding_schema_version: "v1".to_string(),
         },

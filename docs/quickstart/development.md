@@ -44,7 +44,7 @@ make dev-deps-down
 ## Testing
 
 ```bash
-make test-offline         # workspace tests + bridge hooks (no DB)
+make test-offline         # workspace tests + server E2E hooks (no DB)
 make test                 # test-offline + test-online (DB required)
 make test-online          # only #[ignore] Matrix E2E + multi-agent integration
 make test-contract        # contract tests (http/admin/config)

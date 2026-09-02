@@ -1042,7 +1042,7 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
         //      hash+bytes+is_empty — no raw text leaves the bridge.
         //
         // If the bridge's `injection_freshness` SSE event was missing
-        // (`bridge_injection_fingerprints` is None), the bridge-internal
+        // (`injection_fingerprints` is None), the server-internal
         // channels are NOT defaulted to empty — they stay Untracked so
         // the freshness report surfaces the broken pipe rather than
         // hiding it behind uniformly-"empty" entries.
@@ -1069,15 +1069,15 @@ impl AgenticLoopHost for CliServerAdmissionHost<'_> {
                 .filter(|m| m.has_meaningful_self_awareness())
                 .map(|m| m.to_system_prompt_section())
                 .unwrap_or_default();
-            let bridge_fps = turn_result.core.bridge_injection_fingerprints.as_ref();
+            let injection_fingerprints = turn_result.core.injection_fingerprints.as_ref();
             if let Ok(mut session) = session_lock.write() {
-                session.observe_bridge_injections_partial(
-                    astra_runtime::observability::BridgeInjectionPreviews {
+                session.observe_injections_partial(
+                    astra_runtime::observability::InjectionPreviews {
                         lessons: &lessons_text,
                         self_awareness: &self_awareness_text,
-                        ..astra_runtime::observability::BridgeInjectionPreviews::EMPTY
+                        ..astra_runtime::observability::InjectionPreviews::EMPTY
                     },
-                    bridge_fps,
+                    injection_fingerprints,
                 );
             }
         }

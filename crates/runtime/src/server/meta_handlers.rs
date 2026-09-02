@@ -1,10 +1,8 @@
 use super::*;
-use crate::bridge::side_effects::{PERSIST_FAIL_COUNT, PERSIST_OK_COUNT};
 use astra_services::multi_agent::MetricTarget;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 // ─── MetricTarget bridge ────────────────────────────────────────────────────
 // Connect the services layer's MetricTarget trait to the runtime's
@@ -393,8 +391,6 @@ pub(super) async fn current_health(state: &AppState) -> HealthResponse {
         status: status.to_string(),
         database: database_health.database_label().to_string(),
         memoria: memoria_health.label().to_string(),
-        persist_ok: PERSIST_OK_COUNT.load(Ordering::Relaxed),
-        persist_fail: PERSIST_FAIL_COUNT.load(Ordering::Relaxed),
         interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.to_string(),
         build_git_sha: astra_core::history_work_baseline::BUILD_GIT_SHA.to_string(),
     }

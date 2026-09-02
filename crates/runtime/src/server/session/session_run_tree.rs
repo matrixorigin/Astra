@@ -3,8 +3,8 @@ use crate::server::run::lifecycle::run_state::{
 };
 use crate::server::*;
 use astra_server_types::{
-    SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction, SessionRunCapabilityServerRefs,
-    SessionRunLifecycleStatus, SessionRunNode, SessionRunRuntimeFacts, SessionRunTreeSnapshot,
+    SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction, SessionRunLifecycleStatus, SessionRunNode,
+    SessionRunRuntimeFacts, SessionRunTreeSnapshot,
 };
 use astra_services::runs::{DurableRunRecord, validate_run_list_limit};
 use serde::Deserialize;
@@ -172,23 +172,6 @@ fn project_run_node_with_status(
         RunStatus::Failed => SessionRunLifecycleStatus::Failed,
         RunStatus::Cancelled => SessionRunLifecycleStatus::Cancelled,
     };
-    let capability_server_refs = run.capability_server_refs_json.as_deref().and_then(|raw| {
-        match serde_json::from_str::<astra_services::runs::CapabilityServerRefs>(raw) {
-            Ok(refs) => Some(SessionRunCapabilityServerRefs {
-                mcp: refs.mcp,
-                skills: refs.skills,
-            }),
-            Err(error) => {
-                tracing::warn!(
-                    target: "astra_runtime::session_run_tree",
-                    run_id = %run.run_id,
-                    %error,
-                    "durable run capability refs are malformed; omitting inspector fact"
-                );
-                None
-            }
-        }
-    });
     let available_actions = if inherited_control {
         matches!(lifecycle_status, RunStatus::Paused)
             .then_some(SessionRunAction::Cancel)
@@ -236,7 +219,6 @@ fn project_run_node_with_status(
             agent_binding_id: run.agent_binding_id.clone(),
             agent_binding_name: run.agent_binding_name.clone(),
             agent_binding_schema_version: run.agent_binding_schema_version.clone(),
-            capability_server_refs,
             background: None,
             permission: None,
         },
@@ -294,7 +276,6 @@ mod tests {
             agent_binding_schema_version: (depth > 0).then(|| "2".into()),
             model_offering_id: (depth > 0).then(|| "offer-gpt-5".into()),
             resolved_model_name: (depth > 0).then(|| "gpt-5".into()),
-            capability_server_refs_json: None,
             runtime_profile: Some("server".into()),
             start_request_fingerprint: None,
             work_binding: None,

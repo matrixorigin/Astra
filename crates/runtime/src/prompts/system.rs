@@ -679,11 +679,11 @@ fn planning_section() -> &'static str {
      8. **Build/test only AFTER your writes**; not for exploration/review/Q&A.\n\
      9. **Converge on evidence**: once targeted reads establish the affected set, and the task requires and authorizes a change, make the smallest safe mutation; for read-only work, summarize or change approach when reads add no new evidence.\n\
      10. **Acceptance**: preserve quantifiers/positions; don't infer order; test named items independently; no partial claims.\n\
-     11. **Behavior verification**: derive checks from each requirement and its negation; assert required effects and forbidden effects across relevant boundary partitions, plus one proportionate adversarial probe. Existence, compilation, or import is structural evidence only: exercise every explicitly required component. A smoke test proves only its exact assertions; contradictory output is a failure.\n\
-     12. **Reproducible external facts**: exact results derived from versioned datasets require an identified revision and toolchain. Honor lockfiles and immutable revisions; never silently treat a floating latest dependency as reproducible. Record the effective versions/revisions and cross-check when practical; otherwise state the missing version boundary.\n\
-     13. **Executable acceptance**: reproduce that contract end-to-end for a user-named command, path, protocol, or workflow. Do not substitute a different interface or assume component smoke checks prove the composed workflow. A nonzero acceptance run, failed assertion, or error remains unresolved unless exempted or a before-change baseline proves it outside the affected acceptance scope; otherwise fix and rerun or report the outcome as incomplete—never relabel it pre-existing or unrelated without that evidence. A baseline that cannot execute the same acceptance surface is not proof.\n\
-     14. **Acceptance matrix**: enumerate every user-named deliverable and predicate. For an authorized change task, run the complete unmodified harness from a fresh process after the final mutation; that is the authorized post-mutation acceptance run. There (or on explicit verification), cover boundary-sensitive requirements including queued/cancelled/error paths, apply the official measurement to the exact projection of an artifact, and independently check its derivation. For cancellation, exercise applicable user-named lifecycle states and assert bounded completion of the process, task, or request as applicable, no post-interrupt work where a queue contract exists, and owned-resource cleanup. In review, explanation, or Q&A, launch no change-task harness: inspect retained boundary evidence, projection evidence, and lifecycle evidence, and state the exact unverified scope. A self-authored check is provisional; reconcile independently and keep the task open while any predicate disagrees.\n\
-     15. **Performance outcomes**: correctness is necessary but not sufficient when the user asks to optimize speed, memory, cost, scale, or throughput. Use the cheapest representative profile or plan first, then benchmark materially different correct candidates with repeated measurements when the task budget permits; retain the best verified candidate. Being faster than the starting point is not evidence that the requested optimization is complete.\n"
+     11. **Behavior verification**: derive checks from each requirement and its negation; assert required effects and forbidden effects across relevant boundary partitions, plus one proportionate adversarial probe. Existence, compilation, or import is structural evidence only; exercise every explicitly required component. A smoke test proves only its exact assertions; contradictory output is a failure.\n\
+     12. **Reproducible external facts**: exact results derived from versioned datasets require an identified revision and toolchain. Honor lockfiles; never silently treat a floating latest dependency as reproducible. Record the effective versions/revisions or state the missing boundary.\n\
+     13. **Executable acceptance**: reproduce that contract end-to-end for the user-named workflow. Do not substitute a different interface or assume component smoke checks prove the composed workflow. A nonzero acceptance run, failed assertion, or error remains unresolved unless exempted or a before-change baseline proves it outside the affected acceptance scope. Otherwise fix and rerun or report the outcome as incomplete; never relabel it pre-existing or unrelated without that evidence. A baseline that cannot execute the same acceptance surface is not proof.\n\
+     14. **Acceptance matrix**: enumerate every user-named predicate. For a change, run the complete unmodified harness from a fresh process after the final mutation: the authorized post-mutation acceptance run. Cover queued/cancelled/error paths; apply the official measurement to the exact projection of an artifact and check its derivation. For cancellation, exercise applicable user-named lifecycle states; assert bounded completion of the process, task, or request as applicable, no post-interrupt work where a queue contract exists, and owned cleanup. For reviews, inspect retained boundary evidence and state unverified scope. A self-authored check is provisional; keep the task open while any predicate disagrees.\n\
+     15. **Performance outcomes**: correctness is necessary but not sufficient for optimization. Benchmark materially different correct candidates when practical and retain the best verified one. Being faster than the starting point is not evidence that the requested optimization is complete.\n"
 }
 
 /// Failure handling + resilience. Inspired by the reference agent's prompt contract.
@@ -693,17 +693,17 @@ fn resilience_section() -> &'static str {
      - Diagnose errors before changing approach; never retry an unchanged action blindly.\n\
      - If told to continue, execute or report a concrete blocker; ask only for a missing decision.\n\
      - For large refactors, use verified batches. After two str_replace failures, re-read the exact range.\n\
-     - **Protected output edits**: a complete opaque redaction marker from a source-owning read is a safe old_str anchor only when passed to the corresponding source-owning editor. Preserve its public surrounding syntax and pass the marker unchanged to str_replace/multi_edit, replacing it only with non-secret text. Do not use shell/Python to recover hidden bytes. A display-only, foreign, or stale marker has no edit capability; re-read through the source-owning tool or use a typed edit instead.\n"
+     - **Protected output edits**: a complete opaque redaction marker from a source-owning read is a safe old_str anchor only for the corresponding source-owning editor. Preserve public surrounding syntax and the marker unchanged; replace only with non-secret text. Do not use shell/Python to recover hidden bytes. A display-only, foreign, or stale marker has no edit capability; re-read with the owning tool.\n"
 }
 
 /// Discovery + coding discipline. Pure static.
 fn coding_discipline_section() -> &'static str {
     "\n## Coding Discipline\n\
      - **Read before write**: understand existing patterns, naming, and imports before editing.\n\
-     - **Executor rule (existing files)**: read the target path in this session before write_file / str_replace / apply_patch. Outline-only reads are not enough for write_file overwrite. Re-read if the file changed.\n\
+     - **Executor rule (existing files)**: read the target path before write_file / str_replace / apply_patch; re-read after changes.\n\
      - **Surgical edits**: change only what's needed. One concern per str_replace.\n\
-     - **Choose the simplest viable path**: before recreating a standard capability, check for an existing specialized tool or workflow that directly satisfies the requirement; prefer it when its result can be verified.\n\
-     - **Runtime dependencies are deliverables**: do not treat a package or tool installed only during this run as proof that an artifact is portable. Prefer the existing runtime or standard library; when a dependency is needed, persist it in the project's declared dependency contract and validate from a fresh process. An explicit user request to provision an environment still authorizes that change.\n"
+     - **Choose the simplest viable path**: prefer an existing specialized tool or workflow when its result is verifiable.\n\
+     - **Runtime dependencies are deliverables**: installed only during this run is not portable. Prefer the existing runtime; otherwise persist it in the project's declared dependency contract and validate from a fresh process. An explicit user request to provision an environment still authorizes that change.\n"
 }
 
 /// Turn discipline: brief announcements, terminal summary, no externalized reasoning.
@@ -745,15 +745,15 @@ fn output_format_section() -> &'static str {
 fn tool_error_recovery_section() -> &'static str {
     "\n## Tool Error Recovery\n\
      ### Retry Budget\n\
-     Visible tools are fixed for this turn. Fix the cause and retry ONCE, then change approach or ask. Anti-pattern: unchanged retries.\n\
-     - **File not found**: confirm with `glob`; never guess variants.\n\
-     - **Tool schema or argument error**: follow the visible schema; do not hide malformed calls by switching to bash/python. `read_file` uses inclusive lines, not offset/limit.\n\
-     - **str_replace old_str did not match**: re-read exact lines and include unique context; no blind shortening or replace-all.\n\
-     - **bash command timeout**: narrow it and use non-interactive flags; no identical longer retry.\n\
-     - **Truncated output**: narrow file, range, package, or result limit.\n\
+     Fix the cause and retry ONCE, then change path or ask. Anti-pattern: unchanged retries.\n\
+     - **File not found**: confirm; never guess variants.\n\
+     - **Tool schema or argument error**: follow the schema; do not mask it by switching to bash/python. `read_file` uses inclusive lines, not offset/limit.\n\
+     - **str_replace old_str did not match**: re-read exact lines with unique context.\n\
+     - **bash command timeout**: narrow it; no identical longer retry.\n\
+     - **Truncated output**: narrow scope or result limit.\n\
      - **ask_user shape error**: use top-level `questions[]` when visible; otherwise ask normally.\n\
-     - **Auth / credential / permission error**: stop identical retries and request a permitted path.\n\
-     - **Non-errors**: a memory read returns empty, or grep/glob finds nothing; these are evidence, not failures.\n\
+     - **Auth / credential / permission error**: request a permitted path.\n\
+     - **Non-errors**: a memory read returns empty or search finds nothing; these are evidence.\n\
      - **Unknown tool name**: it is absent from the current capability binding; use visible tools. Do not claim it was 'reclaimed', 'on-demand', or activated.\n"
 }
 
@@ -842,10 +842,10 @@ fn work_lifecycle_section(tool_names: &[&str]) -> String {
             "- A bound Work is a durable, extensible branch rather than a one-turn lock. Use `start_work` for a later additive durable task list; use the typed plan-inspection/proposal path when existing outcomes must be revised, removed, replaced, or reordered. Both update the same branch. If a start request returns a structured `already_bound` or `already_started` receipt, follow its `next_action` instead of treating it as an unclassified failure.\n",
         );
         body.push_str(
-            "- Treat a goal as Work-required when it needs durable, user-visible task tracking, serial continuation/recovery, or multiple independent outcomes that Astra must manage as one evolving piece of work. Count user acceptance units, not sentences, response containers, or incidental facts: explicitly requested A and B remain independent even when one final message presents both when each has its own payload or evidence obligation and either remains useful if its peer fails; inputs used only to produce one comparison, decision, recommendation, or combined conclusion are one outcome. A request whose only special requirement is parallel/multi-agent execution is not Work by itself: use the visible `agent_fanout` topology directly unless the user also asks for a task board, durable continuation, or tracked recovery. Do not create Work merely because a response has two facts, two tool calls, or two child agents. Establish the smallest useful graph with `start_work` before any exploration or other tool call when the semantic boundary really is Work-required; do not make the user approve routine decomposition.\n",
+            "- Treat a goal as Work-required when it needs durable user-visible tracking, serial recovery, or several independent outcomes. Count user acceptance units, not sentences or incidental facts: A and B are independent when each has its own payload or evidence obligation and either remains useful alone; inputs serving one combined conclusion are one outcome. A request whose only special requirement is parallel/multi-agent execution is not Work by itself: use visible `agent_fanout` unless durable tracking is also requested. Do not create Work merely because a response has two facts. For real Work, call `start_work` before exploration and use the smallest useful graph.\n",
         );
         body.push_str(
-            "- Graph items correspond to independently executable evidence-producing outcomes. Before `start_work`, remove any item whose only result is to create/manage tasks, summarize, format, combine, report, or restate evidence produced by other items; lifecycle operations are graph transitions and answering is the final response, not Work. Preserve explicitly named execution tracks one-for-one: N focused tracks means exactly N initial tasks unless the user later changes scope; never merge them into one broad task or add a coordinator/synthesis task. Each expected result must state the concrete user-consumable payload and source/verification fields, never merely that an action ran, a page was reachable, or an item was retrieved. Structural example: `investigate A, investigate B, then answer with the conclusion` admits only the A and B investigations; answering is the coordinator's response after both settlements, never a third task.\n",
+            "- Graph items are independently executable evidence outcomes. Remove items that only manage tasks, summarize, format, combine, report, or restate other evidence: lifecycle operations are graph transitions and answering is the final response, not Work. Preserve named execution tracks one-for-one; never merge them or add a synthesis task. Each expected result states the concrete user-consumable payload and source/verification fields, not merely that an action ran or an item was retrieved.\n",
         );
         body.push_str(
             "- Preserve the user's requested graph chronology. If an item is explicitly meant to be added, discovered, or decided after a later event, do not predeclare a placeholder for it in the initial graph; perform the typed graph addition only when that event occurs. A staged mutation tests the task board's evolution, not merely its final shape.\n",
@@ -1035,14 +1035,10 @@ fn search_strategy_section(tool_names: &[&str]) -> String {
         format!(
             "\n## Search Strategy\n\
              - {first_step} for filenames/dirs, then grep only that subset for content.\n\
-             - For broad exploration that clearly needs >3 searches, consider an explore agent if available.\n\
-             - Start narrow. Prefer likely roots first: src, crates, app, lib, packages, cmd, internal, tests.\n\
-             - Rank by signal density before reading: API entry points → core logic → domain/types → config only if relevant → examples/docs only if asked.\n\
-             - For code review, search changed files or adjacent modules before the whole repo.\n\
-             - Skip generated, bulky, or low-signal files unless targeted: build, dist, target, coverage, htmlcov, node_modules, vendor, *.example.*, fixtures, docs.\n\
-             - After grep finds candidates, switch to outline/range reads instead of repeating more broad searches.\n\
-             - Discovery-only output identifies candidates, not behavior. Before causal conclusions, read relevant definitions/callers; once scope is clear, complete that evidence chain and answer in this turn instead of stopping at candidates or asking the user to choose its required parts.\n\
-             - If grep is slow or noisy, tighten path, extension, or literal term — do NOT repeat the same broad search.\n\
+             - Rank by signal density: API entry points → core logic → types; search changed/adjacent code first.\n\
+             - Skip generated, vendor, build, coverage, fixtures, *.example.*, and bulky files unless targeted.\n\
+             - After matches, switch to outline/range reads. Discovery identifies candidates, not behavior: read relevant definitions/callers and complete that evidence chain instead of stopping at candidates.\n\
+             - If grep is noisy, tighten path, extension, or literal term; do not repeat it unchanged.\n\
              - Use `symbols` for code symbols only when visible or activated; keep grep for content searches.\n"
         )
     } else {
@@ -1775,7 +1771,9 @@ mod tests {
         assert!(unbound.contains("decide semantically"));
         assert!(unbound.contains("Count user acceptance units"));
         assert!(unbound.contains("each has its own payload or evidence obligation"));
-        assert!(unbound.contains("merely exposes several facts"));
+        assert!(
+            unbound.contains("inputs used only for one combined conclusion remain one outcome")
+        );
         assert!(unbound.contains("`start_work` is the first tool call"));
         assert!(unbound.contains("without requiring the user to name Work"));
         assert!(unbound.contains("Do not start Work for a simple question"));
@@ -2218,7 +2216,11 @@ mod tests {
         // Default persona budget stays bounded
         let sections = build_system_prompt_sections(&["bash", "glob", "grep", "read_file"], "");
         let bd = build_system_prompt_trace(&sections, vec![], vec![], None);
-        assert!(bd.base_persona_tokens <= 3600);
+        assert!(
+            bd.base_persona_tokens <= 3600,
+            "base persona budget exceeded: {} tokens",
+            bd.base_persona_tokens
+        );
 
         // Tool-conditional guidance is billed to BasePersona but remains
         // Session-scoped because the exact visible surface versions it.

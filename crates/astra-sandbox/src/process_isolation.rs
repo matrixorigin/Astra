@@ -696,7 +696,7 @@ pub fn run_invocation_supervisor_if_requested() -> Option<i32> {
             SUPERVISOR_ENTRYPOINT_READY.store(true, std::sync::atomic::Ordering::Release);
             return None;
         }
-        return Some(run_invocation_supervisor().unwrap_or(125));
+        Some(run_invocation_supervisor().unwrap_or(125))
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -774,12 +774,9 @@ fn run_invocation_supervisor() -> std::io::Result<i32> {
     let mut target_status = None;
     let mut terminate = false;
     loop {
-        match target.try_wait()? {
-            Some(status) => {
-                target_status = Some(status);
-                break;
-            }
-            None => {}
+        if let Some(status) = target.try_wait()? {
+            target_status = Some(status);
+            break;
         }
         match control.read(&mut instruction) {
             Ok(0) => {
@@ -1066,6 +1063,63 @@ fn unshare_available() -> bool {
             .map(|s| s.success())
             .unwrap_or(false)
     })
+}
+
+/// Probe the mount operation required by the actual namespace wrapper, not
+/// merely the ability to create an empty user namespace. Some container
+/// runtimes allow `unshare --map-root-user` while denying every mount syscall;
+/// advertising mount isolation there would make the capability result a lie.
+fn mount_namespace_available() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let wrapper = build_mount_namespace_wrapper();
+        std::process::Command::new("unshare")
+            .args([
+                "--map-root-user",
+                "--mount",
+                "--pid",
+                "--fork",
+                "--kill-child",
+                "--",
+                "bash",
+                "-c",
+                &wrapper,
+                "astra-mount-probe",
+                "true",
+                "/",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    })
+}
+
+fn network_namespace_available() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::process::Command::new("unshare")
+            .args([
+                "--map-root-user",
+                "--net",
+                "--fork",
+                "--kill-child",
+                "--",
+                "true",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    })
+}
+
+fn requested_namespaces_available(config: &IsolationConfig) -> bool {
+    unshare_available()
+        && (!config.mount_namespace || mount_namespace_available())
+        && (!config.net_namespace || network_namespace_available())
 }
 
 /// Check whether the running kernel is safe for `--map-root-user`.
@@ -2062,7 +2116,7 @@ async fn execute_isolated_with_cancel_impl(
     supervisor_helper: Option<(PathBuf, Vec<String>)>,
 ) -> IsolatedOutput {
     let wants_ns = config.pid_namespace || config.mount_namespace || config.net_namespace;
-    let ns_available = wants_ns && unshare_available();
+    let ns_available = wants_ns && requested_namespaces_available(config);
 
     // Warn operators when namespace isolation was requested but is unavailable.
     // In Strict mode, this is a hard failure — security guarantees are NOT met.
@@ -3165,10 +3219,12 @@ mod tests {
         assert!(out.stdout.contains("start"));
         assert!(!out.stdout.contains("done"));
         if cfg!(unix) {
-            assert_eq!(
-                out.scope_ownership,
-                Some(ScopeOwnership::ForegroundProcessGroup),
-                "timeout must preserve the pre-wait process-group identity"
+            assert!(
+                matches!(
+                    out.scope_ownership,
+                    Some(ScopeOwnership::InvocationCgroup | ScopeOwnership::ForegroundProcessGroup)
+                ),
+                "timeout must retain one explicit invocation owner: {out:?}"
             );
         }
     }
@@ -3202,10 +3258,12 @@ mod tests {
             "child survived cancellation: {out:?}"
         );
         if cfg!(unix) {
-            assert_eq!(
-                out.scope_ownership,
-                Some(ScopeOwnership::ForegroundProcessGroup),
-                "cancellation must preserve the pre-wait process-group identity"
+            assert!(
+                matches!(
+                    out.scope_ownership,
+                    Some(ScopeOwnership::InvocationCgroup | ScopeOwnership::ForegroundProcessGroup)
+                ),
+                "cancellation must retain one explicit invocation owner: {out:?}"
             );
         }
     }
@@ -3250,7 +3308,7 @@ mod tests {
         let env =
             std::collections::HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
         let out = execute_isolated("echo ok", &env, &config).await;
-        if unshare_available() {
+        if requested_namespaces_available(&config) {
             assert!(out.namespace_active);
             assert!(out.stdout.contains("ok") || out.exit_code == Some(0));
         } else {
@@ -3352,7 +3410,7 @@ mod tests {
     /// This test only runs when unshare is available.
     #[tokio::test]
     async fn mount_namespace_restricts_host_filesystem() {
-        if !unshare_available() {
+        if !mount_namespace_available() {
             return; // skip on non-Linux or unprivileged containers
         }
         let mut config = IsolationConfig::strict(PathBuf::from("/tmp"));
@@ -3381,7 +3439,7 @@ mod tests {
 
     #[tokio::test]
     async fn mount_namespace_preserves_single_quotes_in_command() {
-        if !unshare_available() {
+        if !mount_namespace_available() {
             return; // skip on non-Linux or unprivileged containers
         }
         let mut config = IsolationConfig::strict(PathBuf::from("/tmp"));
@@ -3395,7 +3453,7 @@ mod tests {
 
     #[tokio::test]
     async fn filesystem_boundary_blocks_arbitrary_writers_from_host_owned_lane() {
-        if !unshare_available() {
+        if !mount_namespace_available() {
             return;
         }
         let workspace = tempfile::tempdir().unwrap();

@@ -169,7 +169,7 @@ pub(crate) fn build_child_messages(
             messages.push(bridge);
         }
         let mut current_task = json!({ "role": "user", "content": child_task });
-        astra_turn_types::mark_bridge_turn_message(&mut current_task, turn_chain_id);
+        astra_turn_types::mark_turn_message(&mut current_task, turn_chain_id);
         messages.push(current_task);
         messages
     } else {
@@ -178,7 +178,7 @@ pub(crate) fn build_child_messages(
             json!({ "role": "system", "content": system_prompt }),
             json!({ "role": "user", "content": child_task }),
         ];
-        astra_turn_types::mark_bridge_turn_message(
+        astra_turn_types::mark_turn_message(
             messages
                 .last_mut()
                 .expect("fresh child messages always contain the task"),
@@ -2047,7 +2047,7 @@ mod tests {
     #[test]
     fn child_bridge_identity_marks_only_the_current_task_suffix() {
         let mut inherited_user = json!({"role": "user", "content": "parent task"});
-        assert!(astra_turn_types::mark_bridge_turn_message(
+        assert!(astra_turn_types::mark_turn_message(
             &mut inherited_user,
             "parent-run"
         ));
@@ -2067,7 +2067,7 @@ mod tests {
         let provenances = messages
             .iter()
             .map(|message| {
-                astra_turn_types::bridge_turn_message_provenance(message)
+                astra_turn_types::turn_message_provenance(message)
                     .expect("producer-owned provenance must be valid")
                     .map(|provenance| provenance.turn_chain_id)
             })

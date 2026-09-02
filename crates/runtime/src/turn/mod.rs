@@ -39,10 +39,10 @@ pub mod tool_side_effects;
 pub mod turn_trace_collector;
 pub(crate) mod wire_assembly;
 
-#[cfg(feature = "bridge-e2e-hooks")]
+#[cfg(feature = "e2e-hooks")]
 pub mod stream_idle_test_hooks {
     pub struct StreamIdleTimeoutGuard {
-        inner: Option<super::llm::client::BridgeE2eStreamIdleTimeoutGuard>,
+        inner: Option<super::llm::client::E2eStreamIdleTimeoutGuard>,
     }
 
     impl Drop for StreamIdleTimeoutGuard {
@@ -53,15 +53,15 @@ pub mod stream_idle_test_hooks {
 
     pub fn set_stream_idle_timeouts_for_test(pre_ms: u64, post_ms: u64) -> StreamIdleTimeoutGuard {
         StreamIdleTimeoutGuard {
-            inner: Some(
-                super::llm::client::set_bridge_e2e_stream_idle_timeouts_for_test(pre_ms, post_ms),
-            ),
+            inner: Some(super::llm::client::set_e2e_stream_idle_timeouts_for_test(
+                pre_ms, post_ms,
+            )),
         }
     }
 
     pub fn current_stream_idle_timeouts_for_test()
     -> (Option<std::time::Duration>, Option<std::time::Duration>) {
-        super::llm::client::current_bridge_e2e_stream_idle_timeouts_for_test()
+        super::llm::client::current_e2e_stream_idle_timeouts_for_test()
     }
 }
 

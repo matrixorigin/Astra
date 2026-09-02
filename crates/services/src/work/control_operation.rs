@@ -288,31 +288,6 @@ impl DatabaseWorkBranchControlService {
             .begin()
             .await
             .map_err(|source| database_error("begin", source))?;
-        sqlx::query(
-            "INSERT IGNORE INTO work_branch_control_operations
-             (owner_id, work_id, branch_id, operation_id, idempotency_hash,
-              request_hash, session_id, attachment_id, operation_kind,
-              operation_state, operation_outcome, expected_branch_revision,
-              expected_writer_epoch, expected_root_hash)
-             VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, 'pending', 'pending', ?, ?, ?)",
-        )
-        .bind(request.owner_id.as_str())
-        .bind(request.work_id.as_str())
-        .bind(request.branch_id.as_str())
-        .bind(&candidate_operation_id)
-        .bind(&idempotency_hash)
-        .bind(&request_hash)
-        .bind(&request.attachment_id)
-        .bind(kind_name(request.kind))
-        .bind(request.expected_branch_revision.get())
-        .bind(i64_from_u64(
-            "expected writer epoch",
-            request.expected_basis.writer_epoch,
-        )?)
-        .bind(request.expected_basis.canonical_root_hash.as_deref())
-        .execute(&mut *tx)
-        .await
-        .map_err(|source| database_error("admit operation", source))?;
         let admitted = sqlx::query(
             "SELECT operation_id, request_hash, operation_state
              FROM work_branch_control_operations
@@ -324,22 +299,53 @@ impl DatabaseWorkBranchControlService {
         .bind(request.work_id.as_str())
         .bind(request.branch_id.as_str())
         .bind(&idempotency_hash)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|source| database_error("load admitted operation", source))?;
-        if admitted
-            .try_get::<String, _>("request_hash")
-            .map_err(|source| database_error("decode request hash", source))?
-            != request_hash
-        {
-            return Err(WorkBranchControlError::IdempotencyMismatch);
-        }
-        let operation_id: String = admitted
-            .try_get("operation_id")
-            .map_err(|source| database_error("decode operation id", source))?;
-        let state: String = admitted
-            .try_get("operation_state")
-            .map_err(|source| database_error("decode operation state", source))?;
+        let (operation_id, state) = if let Some(admitted) = admitted {
+            if admitted
+                .try_get::<String, _>("request_hash")
+                .map_err(|source| database_error("decode request hash", source))?
+                != request_hash
+            {
+                return Err(WorkBranchControlError::IdempotencyMismatch);
+            }
+            (
+                admitted
+                    .try_get("operation_id")
+                    .map_err(|source| database_error("decode operation id", source))?,
+                admitted
+                    .try_get("operation_state")
+                    .map_err(|source| database_error("decode operation state", source))?,
+            )
+        } else {
+            sqlx::query(
+                "INSERT INTO work_branch_control_operations
+                 (owner_id, work_id, branch_id, operation_id, idempotency_hash,
+                  request_hash, session_id, attachment_id, operation_kind,
+                  operation_state, operation_outcome, expected_branch_revision,
+                  expected_writer_epoch, expected_root_hash)
+                 VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, 'pending', 'pending', ?, ?, ?)",
+            )
+            .bind(request.owner_id.as_str())
+            .bind(request.work_id.as_str())
+            .bind(request.branch_id.as_str())
+            .bind(&candidate_operation_id)
+            .bind(&idempotency_hash)
+            .bind(&request_hash)
+            .bind(&request.attachment_id)
+            .bind(kind_name(request.kind))
+            .bind(request.expected_branch_revision.get())
+            .bind(i64_from_u64(
+                "expected writer epoch",
+                request.expected_basis.writer_epoch,
+            )?)
+            .bind(request.expected_basis.canonical_root_hash.as_deref())
+            .execute(&mut *tx)
+            .await
+            .map_err(|source| database_error("admit operation", source))?;
+            (candidate_operation_id.clone(), "pending".to_string())
+        };
         if operation_id != candidate_operation_id {
             if state == "pending" {
                 return Err(WorkBranchControlError::NeedsRepair(
@@ -499,31 +505,6 @@ impl DatabaseWorkBranchControlService {
             .begin()
             .await
             .map_err(|source| database_error("begin force admission", source))?;
-        sqlx::query(
-            "INSERT IGNORE INTO work_branch_control_operations
-             (owner_id, work_id, branch_id, operation_id, idempotency_hash,
-              request_hash, session_id, attachment_id, operation_kind,
-              operation_state, operation_outcome, expected_branch_revision,
-              expected_writer_epoch, expected_root_hash)
-             VALUES (?, ?, ?, ?, ?, ?, '', ?, 'force_takeover',
-                     'pending', 'pending', ?, ?, ?)",
-        )
-        .bind(request.owner_id.as_str())
-        .bind(request.work_id.as_str())
-        .bind(request.branch_id.as_str())
-        .bind(&candidate_operation_id)
-        .bind(&idempotency_hash)
-        .bind(&request_hash)
-        .bind(&request.attachment_id)
-        .bind(request.expected_branch_revision.get())
-        .bind(i64_from_u64(
-            "expected writer epoch",
-            request.expected_basis.writer_epoch,
-        )?)
-        .bind(request.expected_basis.canonical_root_hash.as_deref())
-        .execute(&mut *tx)
-        .await
-        .map_err(|source| database_error("admit force operation", source))?;
         let admitted = sqlx::query(
             "SELECT operation_id, request_hash, session_id, forced_authorization_id, handoff_id
              FROM work_branch_control_operations
@@ -535,28 +516,60 @@ impl DatabaseWorkBranchControlService {
         .bind(request.work_id.as_str())
         .bind(request.branch_id.as_str())
         .bind(&idempotency_hash)
-        .fetch_one(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|source| database_error("load force admission", source))?;
-        if admitted
-            .try_get::<String, _>("request_hash")
-            .map_err(|source| database_error("decode force request hash", source))?
-            != request_hash
-        {
-            return Err(WorkBranchControlError::IdempotencyMismatch);
-        }
-        let operation_id: String = admitted
-            .try_get("operation_id")
-            .map_err(|source| database_error("decode force operation id", source))?;
-        let mut session_id: String = admitted
-            .try_get("session_id")
-            .map_err(|source| database_error("decode force session binding", source))?;
-        let authorization_id: Option<String> = admitted
-            .try_get("forced_authorization_id")
-            .map_err(|source| database_error("decode force authorization", source))?;
-        let handoff_id: Option<String> = admitted
-            .try_get("handoff_id")
-            .map_err(|source| database_error("decode force handoff binding", source))?;
+        let (operation_id, mut session_id, authorization_id, handoff_id) =
+            if let Some(admitted) = admitted {
+                if admitted
+                    .try_get::<String, _>("request_hash")
+                    .map_err(|source| database_error("decode force request hash", source))?
+                    != request_hash
+                {
+                    return Err(WorkBranchControlError::IdempotencyMismatch);
+                }
+                (
+                    admitted
+                        .try_get("operation_id")
+                        .map_err(|source| database_error("decode force operation id", source))?,
+                    admitted
+                        .try_get("session_id")
+                        .map_err(|source| database_error("decode force session binding", source))?,
+                    admitted
+                        .try_get("forced_authorization_id")
+                        .map_err(|source| database_error("decode force authorization", source))?,
+                    admitted
+                        .try_get("handoff_id")
+                        .map_err(|source| database_error("decode force handoff binding", source))?,
+                )
+            } else {
+                sqlx::query(
+                    "INSERT INTO work_branch_control_operations
+                     (owner_id, work_id, branch_id, operation_id, idempotency_hash,
+                      request_hash, session_id, attachment_id, operation_kind,
+                      operation_state, operation_outcome, expected_branch_revision,
+                      expected_writer_epoch, expected_root_hash)
+                     VALUES (?, ?, ?, ?, ?, ?, '', ?, 'force_takeover',
+                             'pending', 'pending', ?, ?, ?)",
+                )
+                .bind(request.owner_id.as_str())
+                .bind(request.work_id.as_str())
+                .bind(request.branch_id.as_str())
+                .bind(&candidate_operation_id)
+                .bind(&idempotency_hash)
+                .bind(&request_hash)
+                .bind(&request.attachment_id)
+                .bind(request.expected_branch_revision.get())
+                .bind(i64_from_u64(
+                    "expected writer epoch",
+                    request.expected_basis.writer_epoch,
+                )?)
+                .bind(request.expected_basis.canonical_root_hash.as_deref())
+                .execute(&mut *tx)
+                .await
+                .map_err(|source| database_error("admit force operation", source))?;
+                (candidate_operation_id.clone(), String::new(), None, None)
+            };
         if operation_id == candidate_operation_id {
             lock_active_work(&mut tx, &request.owner_id, &request.work_id).await?;
             let branch = lock_branch(&mut tx, request).await?;

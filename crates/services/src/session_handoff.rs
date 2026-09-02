@@ -2228,7 +2228,7 @@ mod tests {
     };
     use serde_json::json;
 
-    static HANDOFF_DB: tokio::sync::OnceCell<SharedPool> = tokio::sync::OnceCell::const_new();
+    static HANDOFF_SCHEMA: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
     async fn setup_handoff_db_it() -> SharedPool {
         assert_eq!(
@@ -2237,18 +2237,17 @@ mod tests {
             "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
         );
         let _ = dotenvy::dotenv();
-        HANDOFF_DB
+        let settings = astra_core::MatrixOneSettings::from_env();
+        HANDOFF_SCHEMA
             .get_or_init(|| async {
-                let settings = astra_core::MatrixOneSettings::from_env();
                 let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
                     .unwrap_or_else(|_| "mysql".to_owned());
                 crate::storage::ensure_core_schema(&settings, &catalog)
                     .await
                     .expect("ensure core schema");
-                SharedPool::new(&settings).await.expect("shared pool")
             })
-            .await
-            .clone()
+            .await;
+        SharedPool::new(&settings).await.expect("shared pool")
     }
 
     fn actor(owner: &str, identity: &str) -> ActorContextV1 {

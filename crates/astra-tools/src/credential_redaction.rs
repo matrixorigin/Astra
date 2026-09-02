@@ -1289,10 +1289,7 @@ mod tests {
         assert_eq!(markers.len(), 1);
         assert_eq!(markers[0].0, 4096 - 3);
 
-        let overlong = format!(
-            "-----BEGIN {}-----",
-            format!("{}PRIVATE KEY", "A".repeat(65))
-        );
+        let overlong = format!("-----BEGIN {}PRIVATE KEY-----", "A".repeat(65));
         assert!(private_key_header_markers_bytes(overlong.as_bytes()).is_empty());
     }
 

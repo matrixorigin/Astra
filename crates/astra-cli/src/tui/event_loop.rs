@@ -1428,13 +1428,9 @@ fn spawn_primary_guidance_reconciliation(
     run_control: std::sync::Arc<crate::cli::turn::local_run_control::LocalRunControl>,
     receipt: crate::cli::turn::local_run_control::UserIntentReceipt,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let Some(run_id) = receipt.run_id else {
-        return None;
-    };
+    let run_id = receipt.run_id?;
     run_control.expect_remote_user_intent_disposition(&receipt.intent_id, receipt.event_index);
-    let Some(oldest_pending_cursor) = run_control.claim_remote_disposition_observer() else {
-        return None;
-    };
+    let oldest_pending_cursor = run_control.claim_remote_disposition_observer()?;
     let Ok(after_event_index) = u32::try_from(oldest_pending_cursor) else {
         tracing::warn!(
             intent_id = %receipt.intent_id,
@@ -1568,16 +1564,30 @@ fn spawn_primary_guidance_reconciliation(
     }))
 }
 
+struct ActiveRunGuidanceRequest<'a> {
+    api: &'a astra_thin_client::ThinClient,
+    profile: Option<&'a str>,
+    remote_run_id: &'a std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    run_control: &'a std::sync::Weak<crate::cli::turn::local_run_control::LocalRunControl>,
+    intent_id: &'a str,
+    text: &'a str,
+    background_work_snapshot: Option<&'a str>,
+    work_unit_observations: &'a [astra_core::work_unit::WorkUnitObservation],
+}
+
 async fn submit_active_run_guidance(
-    api: &astra_thin_client::ThinClient,
-    profile: Option<&str>,
-    remote_run_id: &std::sync::Arc<std::sync::Mutex<Option<String>>>,
-    run_control: &std::sync::Weak<crate::cli::turn::local_run_control::LocalRunControl>,
-    intent_id: &str,
-    text: &str,
-    background_work_snapshot: Option<&str>,
-    work_unit_observations: &[astra_core::work_unit::WorkUnitObservation],
+    request: ActiveRunGuidanceRequest<'_>,
 ) -> Result<crate::cli::turn::local_run_control::UserIntentReceipt, GuidanceSubmissionError> {
+    let ActiveRunGuidanceRequest {
+        api,
+        profile,
+        remote_run_id,
+        run_control,
+        intent_id,
+        text,
+        background_work_snapshot,
+        work_unit_observations,
+    } = request;
     let run_id = astra_core::sync_poison::recover_mutex_lock(remote_run_id)
         .clone()
         .ok_or_else(|| {
@@ -6653,14 +6663,16 @@ pub(crate) async fn run_tui_session(
                                                                         guidance_submission_in_flight = true;
                                                                         guidance_submission_task = Some(tokio::spawn(async move {
                                                                             let result = submit_active_run_guidance(
-                                                                                &submission_api,
-                                                                                submission_profile.as_deref(),
-                                                                                &submission_run_id,
-                                                                                &submission_run_control,
-                                                                                &submission_intent_id,
-                                                                                &submission_text,
-                                                                                Some(&active_work_snapshot),
-                                                                                &active_work_observations,
+                                                                                ActiveRunGuidanceRequest {
+                                                                                    api: &submission_api,
+                                                                                    profile: submission_profile.as_deref(),
+                                                                                    remote_run_id: &submission_run_id,
+                                                                                    run_control: &submission_run_control,
+                                                                                    intent_id: &submission_intent_id,
+                                                                                    text: &submission_text,
+                                                                                    background_work_snapshot: Some(&active_work_snapshot),
+                                                                                    work_unit_observations: &active_work_observations,
+                                                                                },
                                                                             )
                                                                             .await;
                                                                             let _ = submission_tx
@@ -10709,7 +10721,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_rebind_retires_active_local_agents_as_system_lifecycle_work() {
+    async fn session_rebind_hands_active_agents_to_durable_cancellation_reconciliation() {
         let spawner = test_agent_spawner(Arc::new(PendingAgentExecutor));
         let output = spawner
             .spawn(
@@ -10735,14 +10747,15 @@ mod tests {
             .get_agent_state_any(&agent_id)
             .await
             .expect("retired agent remains inspectable");
-        assert!(matches!(
-            state.status,
-            AgentStatus::Cancelled {
-                by_user: false,
-                ref reason,
-            } if reason == LOCAL_AGENT_SESSION_REBIND_REASON
-        ));
-        assert!(state.ended_at.is_some());
+        assert!(
+            matches!(
+                &state.status,
+                AgentStatus::Waiting { reason }
+                    if reason == "durable cancellation reconciliation pending"
+            ),
+            "retired state: {state:?}"
+        );
+        assert!(state.ended_at.is_none());
         assert_eq!(spawner.background_task_count(), 0);
     }
 

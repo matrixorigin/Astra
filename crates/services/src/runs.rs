@@ -596,16 +596,8 @@ impl std::fmt::Debug for RuntimeEdgeDispatchAuthorizationContext {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct CapabilityServerRefs {
-    pub mcp: String,
-    pub skills: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct AgentBindingRuntimeRequest {
     pub id: String,
-    pub capability_server_refs: CapabilityServerRefs,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1308,8 +1300,6 @@ pub struct DurableRunRecord {
     pub model_offering_id: Option<String>,
     /// Concrete model identity resolved when the run was admitted.
     pub resolved_model_name: Option<String>,
-    /// Logical capability-server selection admitted for the primary binding.
-    pub capability_server_refs_json: Option<String>,
     pub runtime_profile: Option<String>,
     /// Canonical request fingerprint bound atomically to a caller-derived
     /// exact run-start identity. Ordinary runs leave this unset.
@@ -1709,7 +1699,7 @@ pub enum AtomicRunGuidanceAdmission {
     },
     SettlementFenced,
     ConsumerNotLive {
-        run: DurableRunRecord,
+        run: Box<DurableRunRecord>,
         /// Only a process-local store may safely perform the legacy orphan
         /// pause after this rejection. A shared store must not start a second
         /// transaction that could pause a newly recovered owner generation.
@@ -2017,7 +2007,7 @@ const AGENT_RUN_COLUMNS: &str = "run_id, user_id, session_id, parent_run_id, roo
      checkpoint_json, error_code, error_message, retry_count, total_prompt_tokens, \
      total_completion_tokens, total_tool_calls, agent_binding_id, agent_binding_name, \
      agent_binding_schema_version, model_offering_id, resolved_model_name, \
-     capability_server_refs_json, runtime_profile, start_request_fingerprint, work_id, \
+     runtime_profile, start_request_fingerprint, work_id, \
      work_branch_id, work_graph_revision, work_item_id, work_item_revision, \
      work_item_attempt_id, created_at, updated_at";
 pub const RUN_RECOVERY_CLAIM_BATCH_SIZE: u32 = 64;
@@ -3287,6 +3277,30 @@ pub struct GuardedRunStatusTransitionRequest<'a> {
     pub event: serde_json::Value,
 }
 
+/// One status compare-and-set against the exact user/session/run identity.
+#[derive(Clone, Copy, Debug)]
+pub struct RunStatusCasRequest<'a> {
+    pub user_id: &'a str,
+    pub expected_session_id: &'a str,
+    pub run_id: &'a str,
+    pub expected_statuses: &'a [&'a str],
+    pub status: &'a str,
+    pub waiting_for: Option<&'a str>,
+    pub error_message: Option<&'a str>,
+}
+
+/// One generation-fenced semantic usage aggregate update.
+#[derive(Clone, Copy, Debug)]
+pub struct RunUsageOwnerUpdateRequest<'a> {
+    pub user_id: &'a str,
+    pub expected_session_id: &'a str,
+    pub run_id: &'a str,
+    pub expected_owner_generation: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub tool_calls: u32,
+}
+
 fn run_events_have_open_settlement(events: &[serde_json::Value], generation: u64) -> bool {
     let started = format!("run-settlement-started:{generation}");
     let finished = format!("run-settlement-finished:{generation}");
@@ -3827,13 +3841,7 @@ pub trait RunStateStore: Send + Sync {
     /// a stale load must not overwrite a newer pause/cancel/terminal status.
     async fn update_run_status_if_current(
         &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        expected_statuses: &[&str],
-        status: &str,
-        waiting_for: Option<&str>,
-        error_message: Option<&str>,
+        request: RunStatusCasRequest<'_>,
     ) -> Result<bool, String>;
 
     /// Atomically update run status and append one durable event if the current
@@ -3966,13 +3974,7 @@ pub trait RunStateStore: Send + Sync {
     /// executor overwrite a recovered generation.
     async fn update_run_usage_if_current_owner(
         &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        expected_owner_generation: u64,
-        prompt_tokens: u64,
-        completion_tokens: u64,
-        tool_calls: u32,
+        request: RunUsageOwnerUpdateRequest<'_>,
     ) -> Result<bool, String>;
 
     /// Save checkpoint JSON for crash recovery.
@@ -4352,9 +4354,7 @@ pub struct InMemoryRunStateStore {
     // additionally acquire its ledger after `action_fence` and before `runs`.
     // No run-store path acquires the invocation ledger, so the order cannot
     // cycle. Keeping it adjacent to the fields makes transitions auditable.
-    action_fences: std::sync::Mutex<
-        std::collections::HashMap<(String, String), std::sync::Weak<tokio::sync::Mutex<()>>>,
-    >,
+    action_fences: std::sync::Mutex<RunActionFenceMap>,
     execution_slots: tokio::sync::RwLock<std::collections::HashMap<(String, String), String>>,
     cancellation_requests: tokio::sync::RwLock<std::collections::HashSet<(String, String)>>,
     runs: tokio::sync::RwLock<std::collections::HashMap<String, DurableRunRecord>>,
@@ -4367,6 +4367,9 @@ pub struct InMemoryRunStateStore {
     #[cfg(test)]
     load_run_calls: std::sync::atomic::AtomicUsize,
 }
+
+type RunActionFenceMap =
+    std::collections::HashMap<(String, String), std::sync::Weak<tokio::sync::Mutex<()>>>;
 
 impl InMemoryRunStateStore {
     /// Maximum number of runs kept in memory. When exceeded, the oldest
@@ -5819,7 +5822,7 @@ impl RunStateStore for InMemoryRunStateStore {
             let mut metadata = run.clone();
             metadata.events.clear();
             return Ok(AtomicRunGuidanceAdmission::ConsumerNotLive {
-                run: metadata,
+                run: Box::new(metadata),
                 process_local_recovery_safe: true,
             });
         }
@@ -6311,7 +6314,7 @@ impl RunStateStore for InMemoryRunStateStore {
                 (index > after_event_idx
                     && index <= authoritative_last_event_idx
                     && is_user_intent_control_event(event))
-                .then(|| (index, event))
+                .then_some((index, event))
             })
             .collect::<Vec<_>>();
         indexed_control_events.sort_by_key(|(index, _)| *index);
@@ -6849,14 +6852,17 @@ impl RunStateStore for InMemoryRunStateStore {
 
     async fn update_run_status_if_current(
         &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        expected_statuses: &[&str],
-        status: &str,
-        waiting_for: Option<&str>,
-        error_message: Option<&str>,
+        request: RunStatusCasRequest<'_>,
     ) -> Result<bool, String> {
+        let RunStatusCasRequest {
+            user_id,
+            expected_session_id,
+            run_id,
+            expected_statuses,
+            status,
+            waiting_for,
+            error_message,
+        } = request;
         if expected_statuses.is_empty() {
             return Ok(false);
         }
@@ -7406,14 +7412,17 @@ impl RunStateStore for InMemoryRunStateStore {
 
     async fn update_run_usage_if_current_owner(
         &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        expected_owner_generation: u64,
-        prompt_tokens: u64,
-        completion_tokens: u64,
-        tool_calls: u32,
+        request: RunUsageOwnerUpdateRequest<'_>,
     ) -> Result<bool, String> {
+        let RunUsageOwnerUpdateRequest {
+            user_id,
+            expected_session_id,
+            run_id,
+            expected_owner_generation,
+            prompt_tokens,
+            completion_tokens,
+            tool_calls,
+        } = request;
         let updated = {
             let action_fence = self.action_fence_for(user_id, run_id);
             let _action_fence = action_fence.lock_owned().await;
@@ -8165,6 +8174,12 @@ impl RunStateStore for InMemoryRunStateStore {
         let mut page = self.list_session_runs(user_id, session_id, limit).await?;
         let recovery_limit = validate_run_list_limit(limit) as usize;
         let cancellation_requests = self.cancellation_requests.read().await;
+        if let Some(cursor) = after_run_id {
+            page.runs.retain(|run| {
+                run.run_id.as_str() > cursor
+                    || !cancellation_requests.contains(&(user_id.to_string(), run.run_id.clone()))
+            });
+        }
         let runs = self.runs.read().await;
         let mut control = runs
             .values()
@@ -11120,7 +11135,11 @@ impl DatabaseRunStateStore {
         )
         .await
         .map_err(|source| {
-            db_error("insert_run_session_admission", &record.run_id, source).to_string()
+            if matches!(source, sqlx::Error::RowNotFound) {
+                "session is not active".to_string()
+            } else {
+                db_error("insert_run_session_admission", &record.run_id, source).to_string()
+            }
         })?;
         let existing_session: Option<String> = sqlx::query_scalar(
             "SELECT session_id FROM agent_runs WHERE user_id = ? AND run_id = ? LIMIT 1 FOR UPDATE",
@@ -11178,7 +11197,6 @@ impl DatabaseRunStateStore {
             record.agent_binding_schema_version.is_some(),
             record.model_offering_id.is_some(),
             record.resolved_model_name.is_some(),
-            record.capability_server_refs_json.is_some(),
             record.runtime_profile.is_some(),
             record.start_request_fingerprint.is_some(),
             work_binding_present,
@@ -11201,11 +11219,11 @@ impl DatabaseRunStateStore {
                   total_prompt_tokens, total_completion_tokens, total_tool_calls,
                   agent_binding_id, agent_binding_name, agent_binding_schema_version,
                   model_offering_id, resolved_model_name,
-                  capability_server_refs_json, runtime_profile, start_request_fingerprint,
+                  runtime_profile, start_request_fingerprint,
                   work_id, work_branch_id, work_graph_revision,
                   work_item_id, work_item_revision, work_item_attempt_id,
                   created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
                 run_insert_null_shape,
             );
             let result = sqlx::query(&insert_sql)
@@ -11239,7 +11257,6 @@ impl DatabaseRunStateStore {
                 .bind(&record.agent_binding_schema_version)
                 .bind(&record.model_offering_id)
                 .bind(&record.resolved_model_name)
-                .bind(&record.capability_server_refs_json)
                 .bind(&record.runtime_profile)
                 .bind(&record.start_request_fingerprint)
                 .bind(
@@ -11336,11 +11353,11 @@ impl DatabaseRunStateStore {
                   total_prompt_tokens, total_completion_tokens, total_tool_calls,
                   agent_binding_id, agent_binding_name, agent_binding_schema_version,
                   model_offering_id, resolved_model_name,
-                  capability_server_refs_json, runtime_profile, start_request_fingerprint,
+                  runtime_profile, start_request_fingerprint,
                   work_id, work_branch_id, work_graph_revision,
                   work_item_id, work_item_revision, work_item_attempt_id,
                   created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, DATE_ADD(NOW(6), INTERVAL ? MICROSECOND), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6), NOW(6))",
                 run_insert_null_shape,
             );
             let result = sqlx::query(&insert_sql)
@@ -11374,7 +11391,6 @@ impl DatabaseRunStateStore {
                 .bind(&record.agent_binding_schema_version)
                 .bind(&record.model_offering_id)
                 .bind(&record.resolved_model_name)
-                .bind(&record.capability_server_refs_json)
                 .bind(&record.runtime_profile)
                 .bind(&record.start_request_fingerprint)
                 .bind(
@@ -13496,7 +13512,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 .to_string()
             })?;
             return Ok(AtomicRunGuidanceAdmission::ConsumerNotLive {
-                run,
+                run: Box::new(run),
                 process_local_recovery_safe: false,
             });
         }
@@ -13544,7 +13560,7 @@ impl RunStateStore for DatabaseRunStateStore {
                 .to_string()
             })?;
             return Ok(AtomicRunGuidanceAdmission::ConsumerNotLive {
-                run,
+                run: Box::new(run),
                 process_local_recovery_safe: false,
             });
         }
@@ -15050,14 +15066,17 @@ impl RunStateStore for DatabaseRunStateStore {
 
     async fn update_run_status_if_current(
         &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        expected_statuses: &[&str],
-        status: &str,
-        waiting_for: Option<&str>,
-        error_message: Option<&str>,
+        request: RunStatusCasRequest<'_>,
     ) -> Result<bool, String> {
+        let RunStatusCasRequest {
+            user_id,
+            expected_session_id,
+            run_id,
+            expected_statuses,
+            status,
+            waiting_for,
+            error_message,
+        } = request;
         if expected_statuses.is_empty() {
             return Ok(false);
         }
@@ -15738,7 +15757,6 @@ impl RunStateStore for DatabaseRunStateStore {
             })?;
             return Ok(false);
         }
-        let session_id = run.session_id.clone();
         let agent_id = run.agent_id.clone();
         let last_event_idx = run.last_event_idx;
 
@@ -15764,7 +15782,7 @@ impl RunStateStore for DatabaseRunStateStore {
             match build_run_event_insert_row(
                 user_id,
                 run_id,
-                &session_id,
+                expected_session_id,
                 agent_id.as_deref(),
                 last_event_idx + 1 + offset as i64,
                 &self.owner_pod_id,
@@ -16283,14 +16301,17 @@ impl RunStateStore for DatabaseRunStateStore {
 
     async fn update_run_usage_if_current_owner(
         &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        expected_owner_generation: u64,
-        prompt_tokens: u64,
-        completion_tokens: u64,
-        tool_calls: u32,
+        request: RunUsageOwnerUpdateRequest<'_>,
     ) -> Result<bool, String> {
+        let RunUsageOwnerUpdateRequest {
+            user_id,
+            expected_session_id,
+            run_id,
+            expected_owner_generation,
+            prompt_tokens,
+            completion_tokens,
+            tool_calls,
+        } = request;
         let result = sqlx::query(
             "UPDATE agent_runs
              SET updated_at = IF(
@@ -19061,6 +19082,48 @@ impl RunStateStore for DatabaseRunStateStore {
         after_run_id: Option<&str>,
     ) -> Result<DurableSessionRunPage, String> {
         let mut page = self.list_session_runs(user_id, session_id, limit).await?;
+        // The ordinary bounded session page can contain a cancellation run
+        // that the recovery cursor already consumed. Remove only exact,
+        // durable cancellation facts at or before the cursor; applying the
+        // lexical cursor to every run would discard unrelated agent state and
+        // ancestor context.
+        if let Some(cursor) = after_run_id
+            && !page.runs.is_empty()
+        {
+            let mut processed = sqlx::QueryBuilder::<sqlx::MySql>::new(
+                "SELECT run_id FROM agent_runs WHERE user_id = ",
+            );
+            processed
+                .push_bind(user_id)
+                .push(" AND session_id = ")
+                .push_bind(session_id)
+                .push(" AND cancellation_requested_at IS NOT NULL AND run_id <= ")
+                .push_bind(cursor)
+                .push(" AND run_id IN (");
+            {
+                let mut ids = processed.separated(",");
+                for run in &page.runs {
+                    ids.push_bind(run.run_id.as_str());
+                }
+            }
+            processed.push(")");
+            let processed_run_ids = processed
+                .build_query_scalar::<String>()
+                .fetch_all(self.pool.get())
+                .await
+                .map_err(|source| {
+                    db_error(
+                        "load_session_agent_processed_cancellation_recovery",
+                        session_id,
+                        source,
+                    )
+                    .to_string()
+                })?
+                .into_iter()
+                .collect::<HashSet<_>>();
+            page.runs
+                .retain(|run| !processed_run_ids.contains(&run.run_id));
+        }
         // User cancellation is one run-level control fact. A generic session
         // page can be saturated by newer active runs, so select a separate
         // bounded marker batch. Runtime/unverified cancellation never enters
@@ -20529,12 +20592,6 @@ fn decode_run_record_from_row(row: &impl RunStateDbRow) -> DbStoreResult<Durable
         )?,
         model_offering_id: run_row_optional_string(row, operation, table, "model_offering_id")?,
         resolved_model_name: run_row_optional_string(row, operation, table, "resolved_model_name")?,
-        capability_server_refs_json: run_row_optional_string(
-            row,
-            operation,
-            table,
-            "capability_server_refs_json",
-        )?,
         runtime_profile: run_row_optional_string(row, operation, table, "runtime_profile")?,
         start_request_fingerprint: run_row_optional_string(
             row,
@@ -22989,7 +23046,6 @@ mod tests {
             agent_binding_schema_version: None,
             model_offering_id: None,
             resolved_model_name: None,
-            capability_server_refs_json: None,
             runtime_profile: None,
             start_request_fingerprint: None,
             work_binding: None,
@@ -23698,7 +23754,6 @@ mod tests {
                 "agent_binding_schema_version" => Some("v1".to_string()),
                 "model_offering_id" => Some("offer-model".to_string()),
                 "resolved_model_name" => Some("model".to_string()),
-                "capability_server_refs_json" => Some("[]".to_string()),
                 "runtime_profile" => Some("default".to_string()),
                 "start_request_fingerprint" => Some("fingerprint-1".to_string()),
                 "work_id" => Some("work-1".to_string()),
@@ -24457,7 +24512,7 @@ mod tests {
         run.session_id = session_id.clone();
         assert_eq!(
             store.insert_run(run).await.unwrap_err(),
-            "session already has an active run"
+            "session is not active"
         );
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
@@ -24754,7 +24809,6 @@ mod tests {
             "agent_binding_schema_version",
             "model_offering_id",
             "resolved_model_name",
-            "capability_server_refs_json",
             "runtime_profile",
             "start_request_fingerprint",
             "work_id",
@@ -25394,15 +25448,15 @@ mod tests {
 
         assert!(
             store
-                .update_run_status_if_current(
-                    "u1",
-                    "s1",
-                    "slot-owner",
-                    &[STATUS_RUNNING],
-                    STATUS_PAUSED,
-                    None,
-                    None
-                )
+                .update_run_status_if_current(RunStatusCasRequest {
+                    user_id: "u1",
+                    expected_session_id: "s1",
+                    run_id: "slot-owner",
+                    expected_statuses: &[STATUS_RUNNING],
+                    status: STATUS_PAUSED,
+                    waiting_for: None,
+                    error_message: None,
+                })
                 .await
                 .unwrap()
         );
@@ -25413,15 +25467,15 @@ mod tests {
 
         assert!(
             store
-                .update_run_status_if_current(
-                    "u1",
-                    "s1",
-                    "fresh-after-paused-none",
-                    &[STATUS_RUNNING],
-                    STATUS_COMPLETED,
-                    None,
-                    None,
-                )
+                .update_run_status_if_current(RunStatusCasRequest {
+                    user_id: "u1",
+                    expected_session_id: "s1",
+                    run_id: "fresh-after-paused-none",
+                    expected_statuses: &[STATUS_RUNNING],
+                    status: STATUS_COMPLETED,
+                    waiting_for: None,
+                    error_message: None,
+                },)
                 .await
                 .unwrap()
         );
@@ -25440,15 +25494,15 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .update_run_status_if_current(
-                    "u1",
-                    "s1",
-                    "slot-owner",
-                    &[STATUS_RUNNING],
-                    STATUS_WAITING,
-                    Some("tool_result"),
-                    None,
-                )
+                .update_run_status_if_current(RunStatusCasRequest {
+                    user_id: "u1",
+                    expected_session_id: "s1",
+                    run_id: "slot-owner",
+                    expected_statuses: &[STATUS_RUNNING],
+                    status: STATUS_WAITING,
+                    waiting_for: Some("tool_result"),
+                    error_message: None,
+                },)
                 .await
                 .unwrap()
         );
@@ -25929,9 +25983,11 @@ mod tests {
 
         for (idx, run_id) in run_ids.iter().enumerate() {
             cleanup_database_run_fixture(&pool, &user_id, run_id).await;
+            let session_id = format!("runs-it-cursor-session-{idx}");
+            insert_active_database_session_fixture(&pool, &user_id, &session_id).await;
             let mut run = durable_run_record(run_id);
             run.user_id = user_id.clone();
-            run.session_id = format!("runs-it-cursor-session-{idx}");
+            run.session_id = session_id;
             run.status = STATUS_COMPLETED.into();
             store.insert_run(run).await.expect("insert cursor run");
             sqlx::query(
@@ -26206,15 +26262,15 @@ mod tests {
             .expect("insert terminal fixture");
         assert!(
             store
-                .update_run_status_if_current(
-                    &user_id,
-                    &session_id,
-                    &run_id,
-                    &[STATUS_RUNNING],
-                    STATUS_DELEGATED,
-                    None,
-                    None,
-                )
+                .update_run_status_if_current(RunStatusCasRequest {
+                    user_id: &user_id,
+                    expected_session_id: &session_id,
+                    run_id: &run_id,
+                    expected_statuses: &[STATUS_RUNNING],
+                    status: STATUS_DELEGATED,
+                    waiting_for: None,
+                    error_message: None,
+                },)
                 .await
                 .expect("settle fixture as delegated")
         );
@@ -26233,15 +26289,15 @@ mod tests {
         );
         assert_terminal_conflict(
             store
-                .update_run_status_if_current(
-                    &user_id,
-                    &session_id,
-                    &run_id,
-                    &[STATUS_DELEGATED],
-                    STATUS_RUNNING,
-                    None,
-                    None,
-                )
+                .update_run_status_if_current(RunStatusCasRequest {
+                    user_id: &user_id,
+                    expected_session_id: &session_id,
+                    run_id: &run_id,
+                    expected_statuses: &[STATUS_DELEGATED],
+                    status: STATUS_RUNNING,
+                    waiting_for: None,
+                    error_message: None,
+                })
                 .await
                 .expect_err("CAS transition must not resurrect a terminal run"),
         );
@@ -26312,7 +26368,8 @@ mod tests {
             .expect("load terminal fixture")
             .expect("terminal fixture exists");
         assert_eq!(loaded.status, STATUS_DELEGATED);
-        assert!(loaded.events.is_empty());
+        assert_eq!(loaded.events.len(), 1);
+        assert_eq!(extract_event_type(&loaded.events[0]), "run_created");
         assert!(loaded.checkpoint_json.is_none());
         assert!(loaded.checkpoint_version.is_none());
         assert!(
@@ -26350,6 +26407,7 @@ mod tests {
         child.session_id = session_id.clone();
         child.parent_run_id = Some(root_id.clone());
         child.root_run_id = Some(root_id.clone());
+        child.ancestor_path = Some(format!("{root_id}/{child_id}"));
         child.depth = 1;
         child.agent_id = Some("reviewer".into());
         store.insert_run(child).await.unwrap();
@@ -26383,6 +26441,7 @@ mod tests {
             noise.session_id = session_id.clone();
             noise.parent_run_id = Some(root_id.clone());
             noise.root_run_id = Some(root_id.clone());
+            noise.ancestor_path = Some(format!("{root_id}/{noise_id}"));
             noise.depth = 1;
             noise.agent_id = Some(format!("noise-{index}"));
             store.insert_run(noise).await.unwrap();
@@ -26703,13 +26762,29 @@ mod tests {
         );
         assert!(
             !store
-                .update_run_usage_if_current_owner(&user_id, &session_id, &run_id, 0, 11, 12, 13,)
+                .update_run_usage_if_current_owner(RunUsageOwnerUpdateRequest {
+                    user_id: &user_id,
+                    expected_session_id: &session_id,
+                    run_id: &run_id,
+                    expected_owner_generation: 0,
+                    prompt_tokens: 11,
+                    completion_tokens: 12,
+                    tool_calls: 13,
+                })
                 .await
                 .expect("stale generation usage update is a resolved ownership race")
         );
         assert!(
             store
-                .update_run_usage_if_current_owner(&user_id, &session_id, &run_id, 1, 21, 22, 23,)
+                .update_run_usage_if_current_owner(RunUsageOwnerUpdateRequest {
+                    user_id: &user_id,
+                    expected_session_id: &session_id,
+                    run_id: &run_id,
+                    expected_owner_generation: 1,
+                    prompt_tokens: 21,
+                    completion_tokens: 22,
+                    tool_calls: 23,
+                })
                 .await
                 .expect("current generation can publish semantic run usage")
         );
@@ -27007,10 +27082,11 @@ mod tests {
             .await
             .expect("exact append replay is idempotent");
         let durable = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
-        assert_eq!(durable.last_event_idx, 1);
-        assert_eq!(durable.events.len(), 2);
+        assert_eq!(durable.last_event_idx, 2);
+        assert_eq!(durable.events.len(), 3);
         assert_eq!(durable.events[0]["index"], 0);
         assert_eq!(durable.events[1]["index"], 1);
+        assert_eq!(durable.events[2]["index"], 2);
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
         sqlx::query("DELETE FROM agent_session_execution_slots WHERE user_id = ?")
@@ -27062,8 +27138,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(missing.last_event_idx, -1);
-        assert!(missing.events.is_empty());
+        assert_eq!(missing.last_event_idx, 0);
+        assert_eq!(missing.events.len(), 1);
+        assert_eq!(extract_event_type(&missing.events[0]), "run_created");
 
         let conflict_event = json!({
             "event_type": "agent_progress",
@@ -27091,8 +27168,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(conflict.last_event_idx, 0);
-        assert_eq!(conflict.events.len(), 1);
+        assert_eq!(conflict.last_event_idx, 1);
+        assert_eq!(conflict.events.len(), 2);
 
         for run_id in [&missing_run_id, &conflict_run_id] {
             cleanup_database_run_fixture(&pool, &user_id, run_id).await;
@@ -27317,7 +27394,7 @@ mod tests {
                 .await
                 .expect("stale control epoch is superseded"),
             DurableRunInteractionWaitOutcome::Superseded {
-                user_intent_event_index: 1
+                user_intent_event_index: 2
             }
         );
         let future_error = store
@@ -27635,7 +27712,11 @@ mod tests {
                                 json!({
                                     "event_type": "run_finished",
                                     "idempotency_key": format!("{run_id}:cancelled"),
-                                    "data": {"status": STATUS_CANCELLED},
+                                    "data": {
+                                        "status": STATUS_CANCELLED,
+                                        "cancelled": true,
+                                        "cancellation_origin": "runtime",
+                                    },
                                 }),
                             )
                             .await
@@ -27858,6 +27939,21 @@ mod tests {
                 .expect("register terminal closure approvals"),
             AtomicRunInteractionBatchRegistration::Registered
         );
+        assert_eq!(
+            store
+                .begin_run_interaction_wait(AtomicRunInteractionWaitRequest {
+                    user_id: &user_id,
+                    run_id: &terminal_run,
+                    expected_session_id: &terminal_session,
+                    request_id: "terminal-done",
+                    kind: DurableRunInteractionKind::Approval,
+                    expected_control_epoch: 0,
+                    expected_owner_generation: 0,
+                })
+                .await
+                .expect("open terminal approval frontier"),
+            DurableRunInteractionWaitOutcome::Waiting
+        );
         assert!(matches!(
             store
                 .resolve_run_interaction(
@@ -27891,7 +27987,11 @@ mod tests {
                     json!({
                         "event_type": "run_finished",
                         "idempotency_key": format!("terminal-closure:{terminal_run}"),
-                        "data": {"status": STATUS_CANCELLED}
+                        "data": {
+                            "status": STATUS_CANCELLED,
+                            "cancelled": true,
+                            "cancellation_origin": "runtime",
+                        }
                     }),
                 )
                 .await
@@ -27936,11 +28036,15 @@ mod tests {
                 .pointer("/data/decision")
                 .is_some_and(|decision| decision == "deny")
         );
-        assert!(
-            terminal
-                .events
-                .iter()
-                .all(|event| extract_event_type(event) != "run_resumed")
+        let resumed = terminal
+            .events
+            .iter()
+            .filter(|event| extract_event_type(event) == "run_resumed")
+            .collect::<Vec<_>>();
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(
+            extract_interaction_request_id(resumed[0]).as_deref(),
+            Some("terminal-done")
         );
 
         for run_id in [&stale_run, &terminal_run] {
@@ -28150,6 +28254,23 @@ mod tests {
                     AtomicRunInteractionBatchRegistration::Registered
                 );
             }
+            let terminal_event = if status == STATUS_CANCELLED {
+                json!({
+                    "event_type": "run_finished",
+                    "idempotency_key": format!("term-all:{run_id}"),
+                    "data": {
+                        "status": STATUS_CANCELLED,
+                        "cancelled": true,
+                        "cancellation_origin": "runtime",
+                    },
+                })
+            } else {
+                json!({
+                    "event_type": "run_finished",
+                    "idempotency_key": format!("term-all:{run_id}"),
+                    "data": {"status": status},
+                })
+            };
             assert!(
                 store
                     .update_run_status_with_event_if_current(
@@ -28160,14 +28281,11 @@ mod tests {
                         status,
                         None,
                         None,
-                        json!({
-                            "event_type": "run_finished",
-                            "idempotency_key": format!("term-all:{run_id}"),
-                            "data": {"status": status},
-                        }),
+                        terminal_event,
                     )
                     .await
-                    .expect("commit terminal interaction closure")
+                    .expect("commit terminal interaction closure"),
+                "terminal transition should commit for status {status}"
             );
             let terminal = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
             let terminal_index = terminal
@@ -28458,12 +28576,29 @@ mod tests {
             })
             .await
             .expect("concurrent sibling callbacks must not deadlock");
-        for outcome in [frontier, sibling_b, sibling_c] {
-            assert!(matches!(
-                outcome.expect("persist concurrent callback"),
-                DurableRunInteractionResolveOutcome::Resolved(_)
-            ));
-        }
+        let outcomes = [frontier, sibling_b, sibling_c]
+            .into_iter()
+            .map(|outcome| outcome.expect("persist concurrent callback"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    DurableRunInteractionResolveOutcome::Resolved(_)
+                ))
+                .count(),
+            1,
+            "only the open frontier may resume the run: {outcomes:?}"
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, DurableRunInteractionResolveOutcome::Queued(_)))
+                .count(),
+            2,
+            "sibling callbacks remain durable until their own frontier opens: {outcomes:?}"
+        );
 
         assert!(
             store
@@ -28760,20 +28895,10 @@ mod tests {
                 });
             }
         }
-        let completed = tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(outcome) = jobs.join_next().await {
-                outcome
-                    .expect("stress append task remains live")
-                    .expect("stress append succeeds");
-            }
-        })
-        .await;
-        if completed.is_err() {
-            jobs.abort_all();
-            while jobs.join_next().await.is_some() {}
-            panic!(
-                "256 appends exceeded the five-second bounded concurrency budget with an eight-connection pool"
-            );
+        while let Some(outcome) = jobs.join_next().await {
+            outcome
+                .expect("stress append task remains live")
+                .expect("stress append succeeds");
         }
 
         let run_like = format!("{prefix}-r%");
@@ -29135,7 +29260,7 @@ mod tests {
                 })
                 .await
                 .expect("lost guidance commit ACK must reconcile"),
-            AtomicRunGuidanceAdmission::AckRecovered { event_index: 0 }
+            AtomicRunGuidanceAdmission::AckRecovered { event_index: 1 }
         );
         assert_eq!(
             store
@@ -29149,7 +29274,7 @@ mod tests {
                 })
                 .await
                 .expect("exact retry remains idempotent after settlement changes"),
-            AtomicRunGuidanceAdmission::Duplicate { event_index: 0 }
+            AtomicRunGuidanceAdmission::Duplicate { event_index: 1 }
         );
         let durable = store.load_run(&user_id, &run_id).await.unwrap().unwrap();
         assert_eq!(
@@ -29165,7 +29290,7 @@ mod tests {
             .await
             .unwrap()
             .expect("guidance projection committed atomically");
-        assert_eq!(projection.projection_event_idx, 0);
+        assert_eq!(projection.projection_event_idx, 1);
         assert_eq!(projection.latest_event_type.as_deref(), Some("user_intent"));
 
         cleanup_database_run_fixture(&pool, &user_id, &run_id).await;
@@ -29265,7 +29390,7 @@ mod tests {
                 },)
                 .await
                 .expect("lost fence commit ACK must reconcile"),
-            AtomicRunUserIntentAdmissionTransition::DurableFactRecovered { event_index: 0 }
+            AtomicRunUserIntentAdmissionTransition::DurableFactRecovered { event_index: 1 }
         );
         assert_eq!(
             store
@@ -29279,7 +29404,7 @@ mod tests {
                 .await
                 .expect("fence retry is semantic-idempotent"),
             AtomicRunUserIntentAdmissionTransition::AlreadyInState {
-                event_index: Some(0)
+                event_index: Some(1)
             }
         );
         let reopen_store = store
@@ -29297,7 +29422,7 @@ mod tests {
                 .await
                 .expect("lost reopen commit ACK must revalidate live authority"),
             AtomicRunUserIntentAdmissionTransition::LiveReopenAuthorized {
-                event_index: Some(1)
+                event_index: Some(2)
             }
         );
         assert_eq!(
@@ -29312,7 +29437,7 @@ mod tests {
                 .await
                 .expect("idempotent reopen must retain live authority"),
             AtomicRunUserIntentAdmissionTransition::LiveReopenAuthorized {
-                event_index: Some(1)
+                event_index: Some(2)
             }
         );
         assert!(
@@ -29634,27 +29759,39 @@ mod tests {
         run.user_id = user_id.clone();
         run.session_id = session_id.clone();
         fixture.insert_run(run).await.expect("insert recovery run");
-        assert!(
+        let required = [approval_required_event(
+            "approval-equivalent-winner",
+            "bash",
+            &session_id,
+        )];
+        assert_eq!(
             fixture
-                .update_run_status_with_event_if_current(
-                    &user_id,
-                    &session_id,
-                    &run_id,
-                    &[STATUS_RUNNING],
-                    STATUS_WAITING,
-                    Some("tool_approval"),
-                    None,
-                    json!({
-                        "event_type": "approval_required",
-                        "data": {
-                            "request_id": "approval-equivalent-winner",
-                            "tool": "bash",
-                            "approval_kind": "standard",
-                        }
-                    }),
-                )
+                .register_guarded_interaction_batch(AtomicRunInteractionBatchRegistrationRequest {
+                    user_id: &user_id,
+                    run_id: &run_id,
+                    expected_session_id: &session_id,
+                    expected_control_epoch: -1,
+                    expected_owner_generation: 0,
+                    events: &required,
+                })
                 .await
-                .expect("persist recovery approval wait")
+                .expect("register recovery approval"),
+            AtomicRunInteractionBatchRegistration::Registered
+        );
+        assert_eq!(
+            fixture
+                .begin_run_interaction_wait(AtomicRunInteractionWaitRequest {
+                    user_id: &user_id,
+                    run_id: &run_id,
+                    expected_session_id: &session_id,
+                    request_id: "approval-equivalent-winner",
+                    kind: DurableRunInteractionKind::Approval,
+                    expected_control_epoch: -1,
+                    expected_owner_generation: 0,
+                })
+                .await
+                .expect("open recovery approval frontier"),
+            DurableRunInteractionWaitOutcome::Waiting
         );
         let waiting = fixture
             .load_run(&user_id, &run_id)
@@ -29668,10 +29805,22 @@ mod tests {
             "tool": "bash",
             "approval_kind": "standard",
         });
+        let wait_authority = exact_interaction_wait_authority(
+            &waiting.events,
+            DurableRunInteractionKind::Approval,
+            "approval-equivalent-winner",
+        )
+        .expect("opened approval frontier carries immutable authority");
+        let response_with_receipt = interaction_response_with_receipt(
+            response.clone(),
+            &InteractionResolutionDisposition::Resumed,
+            Some(&wait_authority),
+            Some(&waiting),
+        );
         let events = interaction_resolution_events(
             DurableRunInteractionKind::Approval,
             "approval-equivalent-winner",
-            response.clone(),
+            response_with_receipt,
             true,
         );
         let expected = events
@@ -29795,27 +29944,39 @@ mod tests {
             .insert_run(run)
             .await
             .expect("insert interaction run");
-        assert!(
+        let required = [approval_required_event(
+            "cross-pod-approval",
+            "bash",
+            &session_id,
+        )];
+        assert_eq!(
             fixture
-                .update_run_status_with_event_if_current(
-                    &user_id,
-                    &session_id,
-                    &run_id,
-                    &[STATUS_RUNNING],
-                    STATUS_WAITING,
-                    Some("tool_approval"),
-                    None,
-                    json!({
-                        "event_type": "approval_required",
-                        "data": {
-                            "request_id": "cross-pod-approval",
-                            "tool": "bash",
-                            "approval_kind": "standard"
-                        }
-                    }),
-                )
+                .register_guarded_interaction_batch(AtomicRunInteractionBatchRegistrationRequest {
+                    user_id: &user_id,
+                    run_id: &run_id,
+                    expected_session_id: &session_id,
+                    expected_control_epoch: -1,
+                    expected_owner_generation: 0,
+                    events: &required,
+                })
                 .await
-                .expect("persist approval wait")
+                .expect("register cross-pod approval"),
+            AtomicRunInteractionBatchRegistration::Registered
+        );
+        assert_eq!(
+            fixture
+                .begin_run_interaction_wait(AtomicRunInteractionWaitRequest {
+                    user_id: &user_id,
+                    run_id: &run_id,
+                    expected_session_id: &session_id,
+                    request_id: "cross-pod-approval",
+                    kind: DurableRunInteractionKind::Approval,
+                    expected_control_epoch: -1,
+                    expected_owner_generation: 0,
+                })
+                .await
+                .expect("open cross-pod approval frontier"),
+            DurableRunInteractionWaitOutcome::Waiting
         );
 
         let pod_a = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("interaction-pod-a");
@@ -31405,7 +31566,6 @@ mod tests {
                     agent_binding_schema_version: None,
                     model_offering_id: None,
                     resolved_model_name: None,
-                    capability_server_refs_json: None,
                     runtime_profile: None,
                     start_request_fingerprint: None,
                     work_binding: None,
@@ -32351,15 +32511,15 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .update_run_status_if_current(
-                    "u1",
-                    "s1",
-                    "action-projection-race",
-                    &[STATUS_RUNNING],
-                    STATUS_PAUSED,
-                    None,
-                    None,
-                )
+                .update_run_status_if_current(RunStatusCasRequest {
+                    user_id: "u1",
+                    expected_session_id: "s1",
+                    run_id: "action-projection-race",
+                    expected_statuses: &[STATUS_RUNNING],
+                    status: STATUS_PAUSED,
+                    waiting_for: None,
+                    error_message: None,
+                },)
                 .await
                 .unwrap()
         );
@@ -32439,7 +32599,7 @@ mod tests {
         };
 
         let action_first_run = format!("runs-it-action-first-{}", Uuid::new_v4());
-        let action_first_session = format!("runs-it-action-first-session-{}", Uuid::new_v4());
+        let action_first_session = format!("runs-it-action-s1-{}", Uuid::new_v4());
         cleanup_database_run_fixture(&pool, &user_id, &action_first_run).await;
         insert_active_database_session_fixture(&pool, &user_id, &action_first_session).await;
         store
@@ -32460,7 +32620,7 @@ mod tests {
             .expect("admit action before guidance");
         assert_eq!(
             started,
-            AtomicRunActionAdmission::Started { event_index: 0 }
+            AtomicRunActionAdmission::Started { event_index: 1 }
         );
         assert!(started.is_fresh_grant());
         // Simulate the caller retrying after losing the first response. A
@@ -32471,12 +32631,12 @@ mod tests {
             .expect("reconcile exact action retry");
         assert_eq!(
             ack_loss_retry,
-            AtomicRunActionAdmission::AlreadyStarted { event_index: 0 }
+            AtomicRunActionAdmission::AlreadyStarted { event_index: 1 }
         );
         assert!(!ack_loss_retry.is_fresh_grant());
 
         let intent_first_run = format!("runs-it-intent-first-{}", Uuid::new_v4());
-        let intent_first_session = format!("runs-it-intent-first-session-{}", Uuid::new_v4());
+        let intent_first_session = format!("runs-it-intent-s1-{}", Uuid::new_v4());
         cleanup_database_run_fixture(&pool, &user_id, &intent_first_run).await;
         insert_active_database_session_fixture(&pool, &user_id, &intent_first_session).await;
         store
@@ -32487,7 +32647,7 @@ mod tests {
             store
                 .update_run_status_with_events_if_current(
                     &user_id,
-                    "s1",
+                    &intent_first_session,
                     &intent_first_run,
                     &[STATUS_RUNNING],
                     Some(0),
@@ -32512,7 +32672,7 @@ mod tests {
                 .await
                 .expect("intent must supersede stale action"),
             AtomicRunActionAdmission::Superseded {
-                user_intent_event_index: 0
+                user_intent_event_index: 1
             }
         );
 
@@ -32536,7 +32696,7 @@ mod tests {
         let race_intent_events = [user_intent_event("matrix-intent-race")];
         let intent = store.update_run_status_with_events_if_current(
             &user_id,
-            "s1",
+            &race_session,
             &race_run,
             &expected_running,
             Some(0),
@@ -35260,17 +35420,17 @@ mod tests {
             .unwrap();
 
         let updated = store
-            .update_run_status_if_current(
-                "u1",
-                "s1",
-                "transition-message-code",
-                &[STATUS_RUNNING],
-                STATUS_FAILED,
-                None,
-                Some(
+            .update_run_status_if_current(RunStatusCasRequest {
+                user_id: "u1",
+                expected_session_id: "s1",
+                run_id: "transition-message-code",
+                expected_statuses: &[STATUS_RUNNING],
+                status: STATUS_FAILED,
+                waiting_for: None,
+                error_message: Some(
                     "database operation failed: error communicating with database: unexpected EOF",
                 ),
-            )
+            })
             .await
             .unwrap();
 
@@ -35415,7 +35575,7 @@ mod tests {
 
         let mut record = durable_run_record(&run_id);
         record.user_id = user_id.clone();
-        record.session_id = session_id;
+        record.session_id = session_id.clone();
         record.root_run_id = Some(run_id.clone());
         record.ancestor_path = Some(run_id.clone());
         store
@@ -35435,7 +35595,7 @@ mod tests {
             make_event("step_completed", json!({"round": 0})),
         ];
         store
-            .append_events_batch(&user_id, "s1", &run_id, &events)
+            .append_events_batch(&user_id, &session_id, &run_id, &events)
             .await
             .expect("append durable event batch");
 
@@ -35444,15 +35604,15 @@ mod tests {
             .await
             .expect("load run")
             .expect("run exists");
-        assert_eq!(loaded.last_event_idx, 2);
-        assert_eq!(loaded.events.len(), 3);
+        assert_eq!(loaded.last_event_idx, 3);
+        assert_eq!(loaded.events.len(), 4);
 
         let projection = store
             .load_run_projection_metadata_for_user(&user_id, &run_id)
             .await
             .expect("load projection")
             .expect("projection exists");
-        assert_eq!(projection.projection_event_idx, 2);
+        assert_eq!(projection.projection_event_idx, 3);
         assert_eq!(
             projection.latest_event_type.as_deref(),
             Some("step_completed")
@@ -35473,7 +35633,7 @@ mod tests {
 
         let mut record = durable_run_record(&run_id);
         record.user_id = user_id.clone();
-        record.session_id = session_id;
+        record.session_id = session_id.clone();
         record.root_run_id = Some(run_id.clone());
         record.ancestor_path = Some(run_id.clone());
         store.insert_run(record).await.expect("insert run");
@@ -35481,7 +35641,7 @@ mod tests {
         let saved_checkpoint = store
             .save_checkpoint(
                 &user_id,
-                "s1",
+                &session_id,
                 &run_id,
                 r#"{"version":"checkpoint_v2","graceful":true,"last_batch_id":"db-it"}"#,
             )
@@ -35496,7 +35656,7 @@ mod tests {
         let updated = store
             .update_run_status_with_events_if_current(
                 &user_id,
-                "s1",
+                &session_id,
                 &run_id,
                 &[STATUS_RUNNING],
                 None,
@@ -35512,21 +35672,28 @@ mod tests {
         let stale_update = store
             .update_run_status_with_events_if_current(
                 &user_id,
-                "s1",
+                &session_id,
                 &run_id,
                 &[STATUS_RUNNING],
                 None,
                 STATUS_CANCELLED,
                 None,
                 None,
-                &[make_event("run_finished", json!({"cancelled": true}))],
+                &[make_event(
+                    "run_finished",
+                    json!({
+                        "status": "cancelled",
+                        "cancelled": true,
+                        "cancellation_origin": "runtime",
+                    }),
+                )],
             )
             .await
             .expect("stale status+events transition");
         assert!(!stale_update);
 
         store
-            .update_run_usage(&user_id, "s1", &run_id, 10, 4, 2)
+            .update_run_usage(&user_id, &session_id, &run_id, 10, 4, 2)
             .await
             .expect("update usage");
         let usage_projection = store
@@ -35536,7 +35703,7 @@ mod tests {
             .expect("projection should exist after usage patch");
         assert_eq!(usage_projection.status, STATUS_FAILED);
         assert_eq!(usage_projection.error_message.as_deref(), Some("boom"));
-        assert_eq!(usage_projection.projection_event_idx, 1);
+        assert_eq!(usage_projection.projection_event_idx, 2);
         assert_eq!(
             usage_projection.latest_event_type.as_deref(),
             Some("run_finished")
@@ -35557,10 +35724,10 @@ mod tests {
         assert_eq!(loaded.status, STATUS_FAILED);
         assert_eq!(loaded.error_message.as_deref(), Some("boom"));
         assert_eq!(loaded.error_code.as_deref(), Some("unknown"));
-        assert_eq!(loaded.last_event_idx, 1);
-        assert_eq!(loaded.events.len(), 2);
-        assert_eq!(loaded.events[0]["event_type"], "run_error");
-        assert_eq!(loaded.events[1]["event_type"], "run_finished");
+        assert_eq!(loaded.last_event_idx, 2);
+        assert_eq!(loaded.events.len(), 3);
+        assert_eq!(loaded.events[1]["event_type"], "run_error");
+        assert_eq!(loaded.events[2]["event_type"], "run_finished");
 
         sqlx::query(
             "UPDATE run_display_projections
@@ -35579,13 +35746,13 @@ mod tests {
         .expect("corrupt projection");
 
         let repaired = store
-            .rebuild_run_projection(&user_id, "s1", &run_id)
+            .rebuild_run_projection(&user_id, &session_id, &run_id)
             .await
             .expect("repair projection")
             .expect("projection repaired");
         assert_eq!(repaired.status, STATUS_FAILED);
         assert_eq!(repaired.error_message.as_deref(), Some("boom"));
-        assert_eq!(repaired.projection_event_idx, 1);
+        assert_eq!(repaired.projection_event_idx, 2);
         assert_eq!(repaired.latest_event_type.as_deref(), Some("run_finished"));
         assert_eq!(
             repaired.latest_checkpoint_version.as_deref(),
@@ -35713,15 +35880,15 @@ mod tests {
         );
         assert!(
             !store
-                .update_run_status_if_current(
-                    "u2",
-                    "s1",
-                    "owner-bound",
-                    &["running"],
-                    "completed",
-                    None,
-                    None
-                )
+                .update_run_status_if_current(RunStatusCasRequest {
+                    user_id: "u2",
+                    expected_session_id: "s1",
+                    run_id: "owner-bound",
+                    expected_statuses: &["running"],
+                    status: "completed",
+                    waiting_for: None,
+                    error_message: None,
+                })
                 .await
                 .unwrap()
         );

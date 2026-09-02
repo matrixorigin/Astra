@@ -10,8 +10,10 @@ use astra_runtime::{
     SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData, build_app,
 };
 use astra_services::runs::{
-    CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DurableRunInteractionKind,
-    DurableRunInteractionResolveOutcome, DurableRunRecord, RunLifecycleService, RunListCursor,
+    AtomicRunInteractionBatchRegistration, AtomicRunInteractionBatchRegistrationRequest,
+    AtomicRunInteractionWaitRequest, CancelRunRecord, ChatRequestData, ChatRunRecord,
+    ChatStreamRecord, DurableRunInteractionKind, DurableRunInteractionResolveOutcome,
+    DurableRunInteractionWaitOutcome, DurableRunRecord, RunLifecycleService, RunListCursor,
     RunListRecord, RunMutationRecord, RunStateStore, RunStatusRecord, RunUserIntentData,
     RunUserIntentRecord,
 };
@@ -293,7 +295,6 @@ fn durable_record(run_id: &str, session_id: &str, user_id: &str) -> DurableRunRe
         agent_binding_schema_version: None,
         model_offering_id: None,
         resolved_model_name: None,
-        capability_server_refs_json: None,
         runtime_profile: None,
         start_request_fingerprint: None,
         work_binding: None,
@@ -301,6 +302,59 @@ fn durable_record(run_id: &str, session_id: &str, user_id: &str) -> DurableRunRe
         created_at: chrono::Utc::now().to_rfc3339(),
         updated_at: chrono::Utc::now().to_rfc3339(),
     }
+}
+
+fn owned_durable_record(
+    run_id: &str,
+    session_id: &str,
+    user_id: &str,
+    owner_pod_id: &str,
+) -> DurableRunRecord {
+    let mut record = durable_record(run_id, session_id, user_id);
+    record.owner_pod_id = Some(owner_pod_id.to_string());
+    record.owner_lease_expires_at =
+        Some((chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339());
+    record
+}
+
+async fn register_durable_interaction_wait(
+    store: &DatabaseRunStateStore,
+    user_id: &str,
+    session_id: &str,
+    run_id: &str,
+    request_id: &str,
+    kind: DurableRunInteractionKind,
+    required_event: Value,
+) {
+    assert!(matches!(
+        store
+            .register_guarded_interaction_batch(AtomicRunInteractionBatchRegistrationRequest {
+                user_id,
+                run_id,
+                expected_session_id: session_id,
+                expected_control_epoch: 0,
+                expected_owner_generation: 0,
+                events: std::slice::from_ref(&required_event),
+            })
+            .await
+            .expect("register immutable interaction authority"),
+        AtomicRunInteractionBatchRegistration::Registered
+    ));
+    assert!(matches!(
+        store
+            .begin_run_interaction_wait(AtomicRunInteractionWaitRequest {
+                user_id,
+                run_id,
+                expected_session_id: session_id,
+                request_id,
+                kind,
+                expected_control_epoch: 0,
+                expected_owner_generation: 0,
+            })
+            .await
+            .expect("open durable interaction wait"),
+        DurableRunInteractionWaitOutcome::Waiting
+    ));
 }
 
 #[derive(Clone)]
@@ -1574,45 +1628,38 @@ async fn server_only_interaction_callbacks_survive_disconnect_restart_and_cross_
         insert_session(&pool, &user_id, session_id).await;
     }
 
-    let owner_store =
-        DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id("server-only-owner-pod");
+    let owner_pod_id = "server-only-owner-pod";
+    let owner_store = DatabaseRunStateStore::new(pool.clone()).with_owner_pod_id(owner_pod_id);
     owner_store
-        .insert_run(durable_record(
+        .insert_run(owned_durable_record(
             &approval_run_id,
             &approval_session_id,
             &user_id,
+            owner_pod_id,
         ))
         .await
         .expect("owner pod inserts approval run");
-    owner_store
-        .append_event(
-            &user_id,
-            &approval_session_id,
-            &approval_run_id,
-            json!({
-                "event_type": "approval_required",
-                "data": {
-                    "request_id": approval_request_id,
-                    "tool": "bash",
-                    "args": {"command": "git status"},
-                    "approval_kind": "standard",
-                    "delivery": "durable",
-                }
-            }),
-        )
-        .await
-        .expect("owner pod persists approval request");
-    owner_store
-        .update_run_status(
-            &user_id,
-            &approval_session_id,
-            &approval_run_id,
-            "waiting",
-            Some("tool_approval"),
-            None,
-        )
-        .await
-        .expect("owner pod persists approval wait");
+    register_durable_interaction_wait(
+        &owner_store,
+        &user_id,
+        &approval_session_id,
+        &approval_run_id,
+        &approval_request_id,
+        DurableRunInteractionKind::Approval,
+        json!({
+            "event_type": "approval_required",
+            "idempotency_key": format!("approval:{approval_request_id}:required"),
+            "data": {
+                "request_id": approval_request_id,
+                "session_id": approval_session_id,
+                "tool": "bash",
+                "args": {"command": "git status"},
+                "approval_kind": "standard",
+                "delivery": "durable",
+            }
+        }),
+    )
+    .await;
 
     let owner_app = build_joint_app(
         pool.clone(),
@@ -1732,45 +1779,43 @@ async fn server_only_interaction_callbacks_survive_disconnect_restart_and_cross_
     assert_eq!(status, StatusCode::CONFLICT);
 
     owner_store
-        .insert_run(durable_record(&prompt_run_id, &prompt_session_id, &user_id))
+        .insert_run(owned_durable_record(
+            &prompt_run_id,
+            &prompt_session_id,
+            &user_id,
+            owner_pod_id,
+        ))
         .await
         .expect("owner pod inserts ask_user run");
-    owner_store
-        .append_event(
-            &user_id,
-            &prompt_session_id,
-            &prompt_run_id,
-            json!({
-                "event_type": "ask_user_prompted",
-                "data": {
-                    "request_id": prompt_request_id,
-                    "prompt": {
-                        "context": "Server-only durable question",
-                        "questions": [{
-                            "header": "Scope",
-                            "question": "Continue?",
-                            "options": [],
-                            "multi_select": false,
-                            "allow_freeform": true
-                        }],
-                        "timeout_ms": null
-                    }
-                }
-            }),
-        )
-        .await
-        .expect("owner pod persists ask_user prompt");
-    owner_store
-        .update_run_status(
-            &user_id,
-            &prompt_session_id,
-            &prompt_run_id,
-            "waiting",
-            Some("user_input"),
-            None,
-        )
-        .await
-        .expect("owner pod persists ask_user wait");
+    register_durable_interaction_wait(
+        &owner_store,
+        &user_id,
+        &prompt_session_id,
+        &prompt_run_id,
+        &prompt_request_id,
+        DurableRunInteractionKind::AskUser,
+        json!({
+            "event_type": "ask_user_prompted",
+            "idempotency_key": format!("ask_user:{prompt_request_id}:required"),
+            "data": {
+                "request_id": prompt_request_id,
+                "session_id": prompt_session_id,
+                "prompt": {
+                    "context": "Server-only durable question",
+                    "questions": [{
+                        "header": "Scope",
+                        "question": "Continue?",
+                        "options": [],
+                        "multi_select": false,
+                        "allow_freeform": true
+                    }],
+                    "timeout_ms": null
+                },
+                "delivery": "durable"
+            }
+        }),
+    )
+    .await;
     let prompt_body = json!({
         "request_id": prompt_request_id,
         "session_id": prompt_session_id,
@@ -1858,42 +1903,35 @@ async fn server_only_interaction_callbacks_survive_disconnect_restart_and_cross_
     assert_eq!(cancel_status, StatusCode::CONFLICT);
 
     owner_store
-        .insert_run(durable_record(
+        .insert_run(owned_durable_record(
             &expired_run_id,
             &expired_session_id,
             &user_id,
+            owner_pod_id,
         ))
         .await
         .expect("owner pod inserts expiring approval run");
-    owner_store
-        .append_event(
-            &user_id,
-            &expired_session_id,
-            &expired_run_id,
-            json!({
-                "event_type": "approval_required",
-                "data": {
-                    "request_id": expired_request_id,
-                    "tool": "bash",
-                    "args": {"command": "git status"},
-                    "approval_kind": "standard",
-                    "delivery": "durable"
-                }
-            }),
-        )
-        .await
-        .expect("owner pod persists expiring approval request");
-    owner_store
-        .update_run_status(
-            &user_id,
-            &expired_session_id,
-            &expired_run_id,
-            "waiting",
-            Some("tool_approval"),
-            None,
-        )
-        .await
-        .expect("owner pod persists expiring approval wait");
+    register_durable_interaction_wait(
+        &owner_store,
+        &user_id,
+        &expired_session_id,
+        &expired_run_id,
+        &expired_request_id,
+        DurableRunInteractionKind::Approval,
+        json!({
+            "event_type": "approval_required",
+            "idempotency_key": format!("approval:{expired_request_id}:required"),
+            "data": {
+                "request_id": expired_request_id,
+                "session_id": expired_session_id,
+                "tool": "bash",
+                "args": {"command": "git status"},
+                "approval_kind": "standard",
+                "delivery": "durable"
+            }
+        }),
+    )
+    .await;
     owner_store
         .resolve_run_interaction(
             &user_id,

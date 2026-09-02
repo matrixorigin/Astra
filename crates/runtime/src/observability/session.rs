@@ -178,7 +178,7 @@ impl ObservabilitySession {
     /// actually landed in `edge_profile` / `dynamic_sections` this
     /// turn.
     ///
-    /// wip-7 fix #4 (missing event): if `bridge_fingerprints` is
+    /// wip-7 fix #4 (missing event): if `injection_fingerprints` is
     /// `None`, the bridge did not emit the `injection_freshness`
     /// event this turn — the observation pipe is broken. Skip the
     /// bridge-internal channels entirely so their history stays
@@ -189,11 +189,11 @@ impl ObservabilitySession {
     /// `cli_loop_host::execute_turn` — fires AFTER the bridge's SSE
     /// stream has drained so every live channel gets fingerprinted
     /// against the exact bytes the model consumed this turn.
-    pub fn observe_bridge_injections_partial(
+    pub fn observe_injections_partial(
         &mut self,
-        self_observed: BridgeInjectionPreviews<'_>,
-        bridge_fingerprints: Option<
-            &astra_turn_core::chat_turn_sse_dispatch::BridgeInjectionFingerprints,
+        self_observed: InjectionPreviews<'_>,
+        injection_fingerprints: Option<
+            &astra_turn_core::chat_turn_sse_dispatch::InjectionFingerprints,
         >,
     ) {
         use astra_turn_core::injection_tracking::{InjectionChannel, InjectionFingerprint};
@@ -224,7 +224,7 @@ impl ObservabilitySession {
         // CLI-owned channels: fingerprint from the raw text the CLI
         // already has. Preview is populated so introspect can show
         // the first 80 chars of the actual injection.
-        let BridgeInjectionPreviews {
+        let InjectionPreviews {
             lessons,
             volatile,
             memoria_prefetch,
@@ -281,12 +281,12 @@ impl ObservabilitySession {
         // call sites), honour it so they still get observed — but
         // wip-7 contract: CLI should NOT have raw text for
         // bridge-internal channels, these are expected to be `""`.
-        let cli_bridge_echo: &[(InjectionChannel, &str)] = &[
+        let cli_echo: &[(InjectionChannel, &str)] = &[
             (InjectionChannel::VolatilePending, volatile),
             (InjectionChannel::MemoriaPrefetch, memoria_prefetch),
             (InjectionChannel::ToolRoundGuidance, tool_round_guidance),
         ];
-        for (channel, text) in cli_bridge_echo {
+        for (channel, text) in cli_echo {
             if !text.is_empty() {
                 self.injection_history.observe(
                     round,
@@ -301,7 +301,7 @@ impl ObservabilitySession {
         // DO NOT synthesize an empty bundle — that would mark every
         // bridge channel as `Empty` in the freshness report and
         // silently mask the fact that the observation pipe failed.
-        if let Some(fps) = bridge_fingerprints {
+        if let Some(fps) = injection_fingerprints {
             for entry in &fps.channels {
                 if observed_tags.contains(entry.tag.as_str()) {
                     // CLI already observed this channel with raw

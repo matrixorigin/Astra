@@ -42,7 +42,7 @@
 //! `astra-turn-core/tests/fixtures/*_cache_probe.py` and must be run
 //! manually on behavior change — they cost money and can't gate CI.
 
-#![cfg(feature = "bridge-e2e-hooks")]
+#![cfg(feature = "e2e-hooks")]
 
 use std::sync::{Arc, Mutex};
 
@@ -907,8 +907,8 @@ async fn matrix_volatile_lane_keeps_history_clean() {
             assert!(
                 !runtime_text.contains("⚠ REFLECTION")
                     && !runtime_text.contains("✓ 2 tools executed")
-                    && !runtime_text.contains("runtime behavior evidence"),
-                "[{label}] strict-history providers must suppress optional runtime context while retaining required context; got {runtime_text:?}",
+                    && runtime_text.contains("runtime behavior evidence"),
+                "[{label}] strict-history providers must retain typed decision feedback while suppressing lower-authority optional evidence; got {runtime_text:?}",
                 label = case.label,
             );
         } else {
@@ -933,10 +933,6 @@ async fn matrix_volatile_lane_keeps_history_clean() {
 #[serial_test::serial(prompt_cache_env)]
 async fn matrix_runtime_injections_do_not_rewrite_history() {
     for case in PROVIDER_MATRIX.iter().copied() {
-        let suppresses_volatile = matches!(
-            cache_capability_for(case).volatile_placement,
-            VolatilePlacement::CurrentUserOnly
-        );
         let capture = Arc::new(Mutex::new(Vec::new()));
         let mut host = build_host_for(case, vec![scripted_round("r1")], capture.clone());
         let mut state = make_test_loop_state();
@@ -980,19 +976,11 @@ async fn matrix_runtime_injections_do_not_rewrite_history() {
             .map(flatten_content)
             .collect::<Vec<_>>()
             .join("\n");
-        if suppresses_volatile {
-            assert!(
-                !runtime_text.contains("runtime evidence: duplicate read"),
-                "[{label}] strict-history providers must suppress optional runtime evidence while retaining required context; got {runtime_text:?}",
-                label = case.label,
-            );
-        } else {
-            assert!(
-                runtime_text.contains("runtime evidence: duplicate read"),
-                "[{label}] runtime evidence must be delivered with system authority; got {runtime_text:?}",
-                label = case.label,
-            );
-        }
+        assert!(
+            runtime_text.contains("runtime evidence: duplicate read"),
+            "[{label}] typed decision feedback must be delivered with system authority; got {runtime_text:?}",
+            label = case.label,
+        );
     }
 }
 

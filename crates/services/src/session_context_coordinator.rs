@@ -2973,7 +2973,7 @@ async fn update_database_state(
     let compaction_generation = state.head.as_ref().map_or(Ok(0_i64), |head| {
         i64_from_u64("compaction generation", head.cursor.compaction_generation)
     })?;
-    let result = sqlx::query(
+    let update_sql = matrixone_statement_with_null_shape(
         "UPDATE session_context_heads
          SET head_json = ?, canonical_root_hash = ?, latest_manifest_root = ?,
              total_canonical_bytes = ?, total_message_count = ?,
@@ -2985,57 +2985,69 @@ async fn update_database_state(
              last_commit_json = ?, fork_base_json = ?, updated_at = NOW(6)
          WHERE isolation_domain = ? AND owner_user_id = ?
            AND session_id = ? AND branch_id = ?",
-    )
-    .bind(head_json)
-    .bind(canonical_root)
-    .bind(manifest_root)
-    .bind(state.head.as_ref().map_or(Ok(0_i64), |head| {
-        i64_from_u64("total canonical bytes", head.total_canonical_bytes)
-    })?)
-    .bind(state.head.as_ref().map_or(Ok(0_i64), |head| {
-        i64_from_u64("total message count", head.total_message_count)
-    })?)
-    .bind(completed_turn)
-    .bind(journal_event_seq)
-    .bind(conversation_seq)
-    .bind(projection_schema)
-    .bind(compaction_generation)
-    .bind(i64_from_u64("writer epoch", state.writer_epoch)?)
-    .bind(i64_from_u64(
-        "authorization epoch",
-        state.authority_epochs.authorization_epoch,
-    )?)
-    .bind(i64_from_u64(
-        "device trust epoch",
-        state.authority_epochs.device_trust_epoch,
-    )?)
-    .bind(i64_from_u64(
-        "permission epoch",
-        state.authority_epochs.permission_epoch,
-    )?)
-    .bind(active_writer_json)
-    .bind(
-        state
-            .active_writer
-            .as_ref()
-            .map(|lease| lease.expires_at_unix_ms),
-    )
-    .bind(active_reservation_json)
-    .bind(
-        state
-            .active_reservation
-            .as_ref()
-            .map(|reservation| reservation.expires_at_unix_ms),
-    )
-    .bind(last_commit_json)
-    .bind(fork_base_json)
-    .bind(&state.key.isolation_domain)
-    .bind(&state.key.owner_user_id)
-    .bind(&state.key.session_id)
-    .bind(&state.key.branch_id)
-    .execute(&mut **tx)
-    .await
-    .map_err(|source| database_error("update_context_head", source))?;
+        [
+            head_json.is_some(),
+            canonical_root.is_some(),
+            manifest_root.is_some(),
+            active_writer_json.is_some(),
+            state.active_writer.is_some(),
+            active_reservation_json.is_some(),
+            state.active_reservation.is_some(),
+            last_commit_json.is_some(),
+            fork_base_json.is_some(),
+        ],
+    );
+    let result = sqlx::query(&update_sql)
+        .bind(head_json)
+        .bind(canonical_root)
+        .bind(manifest_root)
+        .bind(state.head.as_ref().map_or(Ok(0_i64), |head| {
+            i64_from_u64("total canonical bytes", head.total_canonical_bytes)
+        })?)
+        .bind(state.head.as_ref().map_or(Ok(0_i64), |head| {
+            i64_from_u64("total message count", head.total_message_count)
+        })?)
+        .bind(completed_turn)
+        .bind(journal_event_seq)
+        .bind(conversation_seq)
+        .bind(projection_schema)
+        .bind(compaction_generation)
+        .bind(i64_from_u64("writer epoch", state.writer_epoch)?)
+        .bind(i64_from_u64(
+            "authorization epoch",
+            state.authority_epochs.authorization_epoch,
+        )?)
+        .bind(i64_from_u64(
+            "device trust epoch",
+            state.authority_epochs.device_trust_epoch,
+        )?)
+        .bind(i64_from_u64(
+            "permission epoch",
+            state.authority_epochs.permission_epoch,
+        )?)
+        .bind(active_writer_json)
+        .bind(
+            state
+                .active_writer
+                .as_ref()
+                .map(|lease| lease.expires_at_unix_ms),
+        )
+        .bind(active_reservation_json)
+        .bind(
+            state
+                .active_reservation
+                .as_ref()
+                .map(|reservation| reservation.expires_at_unix_ms),
+        )
+        .bind(last_commit_json)
+        .bind(fork_base_json)
+        .bind(&state.key.isolation_domain)
+        .bind(&state.key.owner_user_id)
+        .bind(&state.key.session_id)
+        .bind(&state.key.branch_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|source| database_error("update_context_head", source))?;
     if result.rows_affected() != 1 {
         return Err(SessionContextCoordinatorError::NeedsRepair(
             "context head CAS row disappeared".into(),

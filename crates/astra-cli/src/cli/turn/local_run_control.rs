@@ -348,10 +348,8 @@ impl LocalRunControl {
         &self,
         deadline: std::time::Duration,
     ) -> bool {
-        let settled = self
-            .wait_for_remote_user_intent_dispositions_with_hook(deadline, || async {})
-            .await;
-        settled
+        self.wait_for_remote_user_intent_dispositions_with_hook(deadline, || async {})
+            .await
     }
 
     async fn wait_for_remote_user_intent_dispositions_with_hook<F, Fut>(

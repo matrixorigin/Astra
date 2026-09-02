@@ -7823,17 +7823,31 @@ mod tests {
                 .start_run(run_id, "user-1", "session-1")
                 .await
                 .unwrap();
-            engine
-                .persist_status(
-                    "user-1",
-                    "session-1",
-                    run_id,
-                    durable_status,
-                    Some("control-plane"),
-                    None,
-                )
-                .await
-                .unwrap();
+            if durable_status == STATUS_CANCELLED {
+                engine
+                    .persist_delegation_outcome_status(
+                        "user-1",
+                        "session-1",
+                        run_id,
+                        durable_status,
+                        None,
+                        Some("control-plane"),
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                engine
+                    .persist_status(
+                        "user-1",
+                        "session-1",
+                        run_id,
+                        durable_status,
+                        Some("control-plane"),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }
 
             let authoritative = reconcile_agent_result_with_durable_authority(
                 &engine,
@@ -8896,7 +8910,6 @@ mod tests {
                 agent_binding_schema_version: None,
                 model_offering_id: None,
                 resolved_model_name: None,
-                capability_server_refs_json: None,
                 runtime_profile: None,
                 start_request_fingerprint: None,
                 work_binding: None,
@@ -8935,7 +8948,6 @@ mod tests {
                 agent_binding_schema_version: None,
                 model_offering_id: None,
                 resolved_model_name: None,
-                capability_server_refs_json: None,
                 runtime_profile: None,
                 start_request_fingerprint: None,
                 work_binding: None,
@@ -8974,7 +8986,6 @@ mod tests {
                 agent_binding_schema_version: None,
                 model_offering_id: None,
                 resolved_model_name: None,
-                capability_server_refs_json: None,
                 runtime_profile: None,
                 start_request_fingerprint: None,
                 work_binding: None,
@@ -9014,7 +9025,6 @@ mod tests {
                 agent_binding_schema_version: None,
                 model_offering_id: None,
                 resolved_model_name: None,
-                capability_server_refs_json: None,
                 runtime_profile: None,
                 start_request_fingerprint: None,
                 work_binding: None,

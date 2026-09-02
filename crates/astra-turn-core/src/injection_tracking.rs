@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 /// observer and into `freshness_report` ordering.
 ///
 /// Every variant corresponds to a `dynamic_sections.push(...)` call in
-/// `runtime::turn::bridge_inprocess::build_turn_payload` (or the
+/// `runtime::turn::server_loop::build_turn_payload` (or the
 /// equivalent CLI edge_profile write). Keep them in one-to-one
 /// correspondence — if a new section is added to the prompt without a
 /// matching variant here, `introspect facet=noise`

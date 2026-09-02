@@ -1182,30 +1182,6 @@ async fn deliver_approval_block_concurrent(
     out
 }
 
-pub async fn deliver_tool_calls_through_edge_ledger(
-    ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
-    edge_agent_id: &str,
-    user_id: &str,
-    session_id: &str,
-    run_id: &str,
-    turn_chain_id: &str,
-    tool_calls: &[Value],
-    ledger_wait: Duration,
-) -> Result<EdgeToolRoundDelivery, crate::headless_tool_assembly::ProviderToolBatchError> {
-    deliver_tool_calls_through_edge_ledger_with_approval_audit(EdgeToolDeliveryRequest {
-        ledger,
-        edge_agent_id,
-        user_id,
-        session_id,
-        run_id,
-        turn_chain_id,
-        tool_calls,
-        ledger_wait,
-        approval_audit: None,
-    })
-    .await
-}
-
 pub async fn deliver_tool_calls_through_edge_ledger_with_approval_audit(
     request: EdgeToolDeliveryRequest<'_>,
 ) -> Result<EdgeToolRoundDelivery, crate::headless_tool_assembly::ProviderToolBatchError> {
@@ -1259,7 +1235,7 @@ pub async fn deliver_tool_calls_through_edge_ledger_with_approval_audit(
     Ok(out)
 }
 
-/// Concurrent variant of [`deliver_tool_calls_through_edge_ledger`] for testing.
+/// Concurrent variant of [`deliver_tool_calls_through_edge_ledger_with_approval_audit`] for testing.
 ///
 /// **Not used in production** — the bridge generator must `yield` SSE events
 /// immediately (before waiting), so it inlines the same logic. This function
@@ -1267,31 +1243,6 @@ pub async fn deliver_tool_calls_through_edge_ledger_with_approval_audit(
 /// can't POST results until it receives the SSE events).
 ///
 /// Tests use spawned tasks to populate the ledger, so the accumulation is safe.
-#[cfg(test)]
-pub async fn deliver_tool_calls_concurrent(
-    ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
-    edge_agent_id: &str,
-    user_id: &str,
-    session_id: &str,
-    run_id: &str,
-    turn_chain_id: &str,
-    tool_calls: &[Value],
-    ledger_wait: Duration,
-) -> Result<EdgeToolRoundDelivery, crate::headless_tool_assembly::ProviderToolBatchError> {
-    deliver_tool_calls_concurrent_with_approval_audit(EdgeToolDeliveryRequest {
-        ledger,
-        edge_agent_id,
-        user_id,
-        session_id,
-        run_id,
-        turn_chain_id,
-        tool_calls,
-        ledger_wait,
-        approval_audit: None,
-    })
-    .await
-}
-
 #[cfg(test)]
 pub async fn deliver_tool_calls_concurrent_with_approval_audit(
     request: EdgeToolDeliveryRequest<'_>,
@@ -1393,16 +1344,17 @@ mod tests {
         tool_calls: &[Value],
         ledger_wait: Duration,
     ) -> EdgeToolRoundDelivery {
-        super::deliver_tool_calls_through_edge_ledger(
+        super::deliver_tool_calls_through_edge_ledger_with_approval_audit(EdgeToolDeliveryRequest {
             ledger,
-            TEST_EDGE_AGENT_ID,
+            edge_agent_id: TEST_EDGE_AGENT_ID,
             user_id,
-            TEST_SESSION_ID,
-            TEST_RUN_ID,
-            TEST_TURN_CHAIN_ID,
+            session_id: TEST_SESSION_ID,
+            run_id: TEST_RUN_ID,
+            turn_chain_id: TEST_TURN_CHAIN_ID,
             tool_calls,
             ledger_wait,
-        )
+            approval_audit: None,
+        })
         .await
         .expect("canonical test tool batch")
     }
@@ -1435,16 +1387,17 @@ mod tests {
         tool_calls: &[Value],
         ledger_wait: Duration,
     ) -> EdgeToolRoundDelivery {
-        super::deliver_tool_calls_concurrent(
+        super::deliver_tool_calls_concurrent_with_approval_audit(EdgeToolDeliveryRequest {
             ledger,
-            TEST_EDGE_AGENT_ID,
+            edge_agent_id: TEST_EDGE_AGENT_ID,
             user_id,
-            TEST_SESSION_ID,
-            TEST_RUN_ID,
-            TEST_TURN_CHAIN_ID,
+            session_id: TEST_SESSION_ID,
+            run_id: TEST_RUN_ID,
+            turn_chain_id: TEST_TURN_CHAIN_ID,
             tool_calls,
             ledger_wait,
-        )
+            approval_audit: None,
+        })
         .await
         .expect("canonical test tool batch")
     }
@@ -1509,15 +1462,18 @@ mod tests {
 
         for tool_calls in cases {
             let ledger = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-            let error = super::deliver_tool_calls_through_edge_ledger(
-                &ledger,
-                TEST_EDGE_AGENT_ID,
-                "test-user",
-                TEST_SESSION_ID,
-                TEST_RUN_ID,
-                TEST_TURN_CHAIN_ID,
-                &tool_calls,
-                Duration::ZERO,
+            let error = super::deliver_tool_calls_through_edge_ledger_with_approval_audit(
+                EdgeToolDeliveryRequest {
+                    ledger: &ledger,
+                    edge_agent_id: TEST_EDGE_AGENT_ID,
+                    user_id: "test-user",
+                    session_id: TEST_SESSION_ID,
+                    run_id: TEST_RUN_ID,
+                    turn_chain_id: TEST_TURN_CHAIN_ID,
+                    tool_calls: &tool_calls,
+                    ledger_wait: Duration::ZERO,
+                    approval_audit: None,
+                },
             )
             .await
             .expect_err("invalid nonempty batch must not look like empty success");

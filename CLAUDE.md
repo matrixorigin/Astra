@@ -33,7 +33,7 @@ make build-cli          # astra CLI only
 make build-server       # astra-server only
 
 make test               # Full: offline + online (online needs MatrixOne running)
-make test-offline       # Rust workspace (nextest) + bridge-e2e-hooks + @astra/sdk offline
+make test-offline       # Rust workspace (nextest) + e2e-hooks + @astra/sdk offline
 make test-online        # Live MatrixOne #[ignore] suites + Matrix E2E
 make test-live-llm      # Real provider APIs from .models.yaml (opt-in, ASTRA_LIVE_LLM=1)
 make test-contract      # HTTP + admin contract binaries + astra-core settings JSON
@@ -67,7 +67,7 @@ Important env vars for tests:
 ## Dev Loop
 
 ```bash
-make dev-init           # First-time: generate JWT_SECRET_KEY, TOKEN_ENCRYPTION_KEY, CHAT_TURN_BRIDGE_SECRET, fetch deps
+make dev-init           # First-time: generate JWT_SECRET_KEY, TOKEN_ENCRYPTION_KEY, CHAT_TURN_RUNTIME_ROOT_SECRET, fetch deps
 make dev-start          # dev-deps-up → dev-deps-wait → dev-api-start  (release)
 make dev-stop           # dev-api-stop + dev-deps-down
 make dev-status         # all-service status

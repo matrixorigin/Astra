@@ -31,7 +31,7 @@ use crate::tool_ledger_receipt::ToolLedgerReceipt;
 /// (`memoria_prefetch`, `tool_round_guidance`, `volatile`) carry an empty preview in the
 /// CLI history — introspect still sees tag + hash + bytes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct BridgeChannelFingerprint {
+pub struct InjectionChannelFingerprint {
     pub tag: String,
     pub hash: u64,
     pub bytes: u64,
@@ -39,8 +39,8 @@ pub struct BridgeChannelFingerprint {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct BridgeInjectionFingerprints {
-    pub channels: Vec<BridgeChannelFingerprint>,
+pub struct InjectionFingerprints {
+    pub channels: Vec<InjectionChannelFingerprint>,
 }
 
 /// One context compaction that changed the provider-visible prompt.
@@ -262,7 +262,7 @@ pub struct ChatTurnSseAccum {
     /// broken observation pipe by reporting every bridge channel as
     /// `Empty` in the freshness report. Stays `None` → downstream
     /// observers skip those channels (history remains `Untracked`).
-    pub bridge_injection_fingerprints: Option<BridgeInjectionFingerprints>,
+    pub injection_fingerprints: Option<InjectionFingerprints>,
     /// The lifecycle-effective model `finish_reason` from the final response.
     /// `"stop"` denotes natural completion, `"length"` denotes a typed
     /// output-cap boundary, and `"tool_calls"` denotes a tool request.  When
@@ -1328,7 +1328,7 @@ fn apply_one_event(
             // but we don't want to populate a fingerprint bundle from
             // a raw-text event either (that would suggest the channel
             // was observed when the bridge actually regressed to the
-            // old shape). `bridge_injection_fingerprints` stays `None`
+            // old shape). `injection_fingerprints` stays `None`
             // so the CLI observer treats those channels as untracked.
             if let Some(arr) = event.get("channels").and_then(|v| v.as_array()) {
                 let mut channels = Vec::with_capacity(arr.len());
@@ -1352,15 +1352,14 @@ fn apply_one_event(
                         .get("is_empty")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(bytes == 0);
-                    channels.push(BridgeChannelFingerprint {
+                    channels.push(InjectionChannelFingerprint {
                         tag,
                         hash,
                         bytes,
                         is_empty,
                     });
                 }
-                accum.bridge_injection_fingerprints =
-                    Some(BridgeInjectionFingerprints { channels });
+                accum.injection_fingerprints = Some(InjectionFingerprints { channels });
             }
         }
         "run_started" => {}
@@ -1943,16 +1942,13 @@ mod tests {
         dispatch_chat_turn_sse_event_block(
             &sse(
                 "error",
-                ",\"message\":\"turn mismatch\",\"error_code\":\"bridge_session_turn_mismatch\",\"metadata\":{\"actual_session_turn\":1,\"expected_session_turn\":2}",
+                ",\"message\":\"turn mismatch\",\"error_code\":\"session_turn_mismatch\",\"metadata\":{\"actual_session_turn\":1,\"expected_session_turn\":2}",
             ),
             &mut a,
             &mut vec![],
         );
         assert_eq!(a.error_message.as_deref(), Some("Error: turn mismatch"));
-        assert_eq!(
-            a.error_code.as_deref(),
-            Some("bridge_session_turn_mismatch")
-        );
+        assert_eq!(a.error_code.as_deref(), Some("session_turn_mismatch"));
         let metadata = a.error_metadata.as_ref().expect("metadata");
         assert_eq!(metadata["actual_session_turn"], 1);
         assert_eq!(metadata["expected_session_turn"], 2);

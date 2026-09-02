@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use astra_core::SubRunState;
 use astra_services::coordination::{AgentProfileRegistry, DelegationRequest, DelegationResult};
+use astra_services::runs::RunStatusCasRequest;
 
 // ─── Types that must live here for trait signatures ─────────────────────
 
@@ -107,13 +108,7 @@ pub trait RunPersistence: Send + Sync {
     /// decision.
     async fn persist_status_if_current(
         &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        expected_statuses: &[&str],
-        status: &str,
-        waiting_for: Option<&str>,
-        error_message: Option<&str>,
+        request: RunStatusCasRequest<'_>,
     ) -> Result<bool, String>;
 
     /// Persist token/tool usage counters.

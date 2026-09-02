@@ -1,4 +1,4 @@
-//! `GET /` and `GET /health` on the real app (no auth) — service metadata + DB + persist counters.
+//! `GET /` and `GET /health` on the real app (no auth) — service and dependency health.
 
 use axum::http::StatusCode;
 use serde_json::Value;
@@ -27,12 +27,12 @@ pub async fn run_meta_root_and_health() {
     assert_eq!(health["memoria"].as_str(), Some("connected"));
 
     assert!(
-        health["persist_ok"].as_u64().is_some(),
-        "persist_ok counter: {health}"
+        health.get("persist_ok").is_none(),
+        "dead bridge counters must not remain in the health API: {health}"
     );
     assert!(
-        health["persist_fail"].as_u64().is_some(),
-        "persist_fail counter: {health}"
+        health.get("persist_fail").is_none(),
+        "dead bridge counters must not remain in the health API: {health}"
     );
 
     // Keep the real MatrixOne path healthy while the producer-owned Memoria

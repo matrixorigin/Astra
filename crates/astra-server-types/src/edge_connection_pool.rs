@@ -622,6 +622,16 @@ impl EdgeConnectionPool {
         &self,
         invocation: DurablyAdmittedEdgeInvocation<'_>,
     ) -> Option<EdgeToolResult> {
+        self.execute_durably_admitted_invocation_on_connection_with_authorization_timeout_and_cancel(
+            invocation,
+        )
+        .await
+    }
+
+    async fn execute_durably_admitted_invocation_on_connection_with_authorization_timeout_and_cancel(
+        &self,
+        invocation: DurablyAdmittedEdgeInvocation<'_>,
+    ) -> Option<EdgeToolResult> {
         let DurablyAdmittedEdgeInvocation {
             connection_user_id,
             identity,
@@ -632,59 +642,6 @@ impl EdgeConnectionPool {
             timeout_secs,
             cancel_token,
         } = invocation;
-        self.execute_durably_admitted_invocation_on_connection_with_authorization_timeout_and_cancel(
-            connection_user_id,
-            identity,
-            edge_agent_id,
-            tool,
-            args,
-            runtime_process_authorization,
-            timeout_secs,
-            cancel_token,
-        )
-        .await
-    }
-
-    /// As above, but preserves the execution deadline selected by the runtime
-    /// policy.  Database admission is complete before this method starts its
-    /// socket wait; the deadline therefore governs only the edge invocation,
-    /// never a checked-out database connection or transaction.
-    pub async fn execute_durably_admitted_invocation_on_connection_with_timeout_and_cancel(
-        &self,
-        connection_user_id: &str,
-        identity: &ToolInvocationIdentity,
-        edge_agent_id: &str,
-        tool: &str,
-        args: &serde_json::Value,
-        timeout_secs: u64,
-        cancel_token: Option<&CancellationToken>,
-    ) -> Option<EdgeToolResult> {
-        self.execute_durably_admitted_invocation_on_connection_with_authorization_timeout_and_cancel(
-            connection_user_id,
-            identity,
-            edge_agent_id,
-            tool,
-            args,
-            None,
-            timeout_secs,
-            cancel_token,
-        )
-        .await
-    }
-
-    async fn execute_durably_admitted_invocation_on_connection_with_authorization_timeout_and_cancel(
-        &self,
-        connection_user_id: &str,
-        identity: &ToolInvocationIdentity,
-        edge_agent_id: &str,
-        tool: &str,
-        args: &serde_json::Value,
-        runtime_process_authorization: Option<
-            &astra_services::runs::RuntimeProcessAuthorizationContext,
-        >,
-        timeout_secs: u64,
-        cancel_token: Option<&CancellationToken>,
-    ) -> Option<EdgeToolResult> {
         if cancel_token.is_some_and(CancellationToken::is_cancelled) {
             return None;
         }
@@ -1222,14 +1179,17 @@ mod tests {
         let caller_pool = pool.clone();
         let caller = tokio::spawn(async move {
             caller_pool
-                .execute_durably_admitted_invocation_on_connection_with_timeout_and_cancel(
-                    "user-1",
-                    &identity,
-                    "edge-a",
-                    "bash",
-                    &json!({ "command": "effect" }),
-                    MAX_EDGE_TOOL_TIMEOUT_SECS + 1,
-                    None,
+                .execute_durably_admitted_invocation_on_connection_with_cancel(
+                    DurablyAdmittedEdgeInvocation {
+                        connection_user_id: "user-1",
+                        identity: &identity,
+                        edge_agent_id: "edge-a",
+                        tool: "bash",
+                        args: &json!({ "command": "effect" }),
+                        runtime_process_authorization: None,
+                        timeout_secs: MAX_EDGE_TOOL_TIMEOUT_SECS + 1,
+                        cancel_token: None,
+                    },
                 )
                 .await
         });

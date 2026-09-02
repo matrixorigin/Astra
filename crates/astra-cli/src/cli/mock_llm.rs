@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use axum::Router;
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use serde_json::Value;
@@ -189,9 +189,8 @@ fn tool_call_start(call_id: &str, tool: &str, args: Value) -> String {
     // Canonical tool_call_start shape: flat `tool` (name string) + top-level
     // `arguments` (JSON-stringified). See
     // `chat_turn_sse_dispatch::normalize_tool_call_for_accum` — a nested
-    // `tool: {name, arguments}` would be silently dropped because that
-    // normalizer reads `tool` with `as_str()` and falls back to "" on a
-    // non-string, returning None. The regression anchor is
+    // `tool: {name, arguments}` is rejected as a producer contract violation.
+    // The regression anchor is
     // `phase_r2_mock_dispatch_contract::mock_llm_tool_call_start_shape_is_captured_by_dispatch`.
     sse_line(&serde_json::json!({
         "type": "tool_call_start",
@@ -219,6 +218,8 @@ fn tool_request_for_run(
         "turn_chain_id": turn_chain_id,
         "request_id": call_id,
         "schema_admitted_by_server": true,
+        "execution_timeout_ms": 300_000,
+        "execution_deadline_unix_ms": 4_102_444_800_000_u64,
         "tool": tool,
         "args": args,
     }))
@@ -1075,6 +1076,11 @@ async fn handle_chat_turn(
         .expect("valid HTTP response")
 }
 
+async fn handle_unimplemented_mock_route(method: Method, uri: Uri) -> StatusCode {
+    eprintln!("  mock LLM server has no route for {method} {uri}");
+    StatusCode::NOT_FOUND
+}
+
 fn mock_model_catalog_entry(name: &str) -> Value {
     serde_json::json!({
         "offering_id": format!("offer-{name}"),
@@ -1136,6 +1142,10 @@ async fn handle_model_access() -> axum::Json<Value> {
     }))
 }
 
+async fn handle_create_session() -> axum::Json<Value> {
+    axum::Json(serde_json::json!({ "session_id": "mock-session" }))
+}
+
 async fn handle_tool_result(
     State(state): State<ServerState>,
     headers: HeaderMap,
@@ -1165,15 +1175,17 @@ async fn handle_tool_result(
         && matches!(record.status.as_str(), "completed" | "failed" | "skipped")
         && record.result_hash
             == astra_thin_client::ToolResultRequest::compute_result_hash(
-                &record.session_id,
-                &record.run_id,
-                &record.turn_chain_id,
-                &record.request_id,
-                &record.edge_agent_id,
-                &record.status,
-                &record.output,
-                record.duration_ms,
-                record.tool_result_fields.as_ref(),
+                astra_thin_client::ToolResultHashParts {
+                    session_id: &record.session_id,
+                    run_id: &record.run_id,
+                    turn_chain_id: &record.turn_chain_id,
+                    request_id: &record.request_id,
+                    edge_agent_id: &record.edge_agent_id,
+                    status: &record.status,
+                    output: &record.output,
+                    duration_ms: record.duration_ms,
+                    tool_result_fields: record.tool_result_fields.as_ref(),
+                },
             );
     let header_edge_id = headers
         .get(astra_thin_client::ASTRA_EDGE_ID_HEADER)
@@ -1354,8 +1366,10 @@ impl MockLlmServer {
             .route("/tools/result", post(handle_tool_result))
             .route("/chat/runs/{run_id}/intents", post(handle_run_user_intent))
             .route("/chat/runs/{run_id}/stream", get(handle_run_stream))
+            .route("/sessions", post(handle_create_session))
             .route("/models", get(handle_models))
             .route("/model-access", get(handle_model_access))
+            .fallback(handle_unimplemented_mock_route)
             .with_state(state);
 
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();

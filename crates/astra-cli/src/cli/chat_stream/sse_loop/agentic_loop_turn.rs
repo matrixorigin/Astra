@@ -35,7 +35,7 @@ use astra_runtime::{
     turn::chat_turn_explain_wire::{AgenticChatExplainFlags, AgenticExplainUiMode},
     turn::chat_turn_heuristics::extract_repos_from_memory,
     turn::chat_turn_payload::{
-        ChatTurnBasePayloadInput, attach_bridge_turn_identity, chat_turn_base_payload,
+        ChatTurnBasePayloadInput, attach_turn_identity, chat_turn_base_payload,
         merge_active_skills_into_edge_profile, merge_edge_profile_extensions,
         set_payload_tool_results_if_non_empty,
     },
@@ -1176,20 +1176,12 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
         ctx.skill_effort.as_deref(),
         ctx.skill_agent_type.as_deref(),
     );
-    let _ = attach_bridge_turn_identity(
+    let _ = attach_turn_identity(
         &mut payload,
         ctx.session_turn,
         ctx.turn_chain_id,
         ctx.user_query_event_id,
     );
-    // The outer agentic loop is the single owner of aggregate turn journal
-    // rows for every LLM round. The bridge may still capture full request /
-    // response payloads for debugging, but it must not emit duplicate
-    // `llm_round` summaries for later rounds.
-    if let Some(root) = payload.as_object_mut() {
-        root.insert("root_turn_journal_owned".into(), json!(true));
-    }
-
     // ─── SelfModel: inject self-awareness text into edge_profile ───
     // Publish fresh denial-pressure + per-tool outcome bias + recent
     // rejections to the observability session so SelfModel can render the
@@ -1241,7 +1233,7 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
             session.ingest_self_model_inputs(skills, tool_health_entries, scenario, recent_signals);
 
             // Injection-freshness observation is deferred to after the
-            // turn's SSE stream finishes (see `post_turn_observe_bridge_injections`
+            // turn's SSE stream finishes (see `post_turn_observe_injections`
             // in `server_admission_host.rs`). Observing here would fire before
             // the bridge has actually composed its bridge-generated
             // channels (memoria_prefetch, tool_round_guidance, volatile) and leave
@@ -1295,10 +1287,10 @@ async fn prepare_chat_turn_payload(ctx: PrepareChatTurnRequest<'_>) -> PreparedC
     log_chat_turn_timing_phase(timing, "self_awareness_inject", &mut mark);
 
     // Injection-freshness observation happens AFTER the bridge's SSE
-    // stream completes (see `post_turn_observe_bridge_injections` in
+    // stream completes (see `post_turn_observe_injections` in
     // `server_admission_host.rs`), so we can merge the 5 bridge-generated
     // channels (captured via the `injection_freshness` SSE event into
-    // `ChatTurnSseAccum.bridge_injection_fingerprints`) with the CLI-owned
+    // `ChatTurnSseAccum.injection_fingerprints`) with the CLI-owned
     // `lessons` snapshot.
 
     // ─── Context-window estimate / trace collection ───────────────────────
@@ -1567,17 +1559,20 @@ fn chat_turn_sse_fetch_ui(
 ///
 /// The caller must drop [`ChatTurnPrepLineGuard`] when entering SSE consume (`consume_turn_sse`)
 /// or on early error after reading the body, so the stderr status line stays through TTFB.
-async fn chat_turn_post_payload_after_prepare(
-    api: &astra_thin_client::ThinClient,
-    token: &str,
+struct ChatTurnPostPayloadRequest<'a> {
+    api: &'a astra_thin_client::ThinClient,
+    token: &'a str,
     quiet: bool,
-    ui: &ChatTurnSseFetchUi,
-    stream_event_tx: Option<&crate::cli::chat_stream::StreamEventTx>,
-    stream_json_emitter: Option<
-        &std::sync::Arc<crate::cli::stream::stream_json::StreamJsonEmitter>,
-    >,
-    execution_time_budget_clock: Option<&crate::cli::chat_stream::ExecutionTimeBudgetClock>,
-    prepare: PrepareChatTurnRequest<'_>,
+    ui: &'a ChatTurnSseFetchUi,
+    stream_event_tx: Option<&'a crate::cli::chat_stream::StreamEventTx>,
+    stream_json_emitter:
+        Option<&'a std::sync::Arc<crate::cli::stream::stream_json::StreamJsonEmitter>>,
+    execution_time_budget_clock: Option<&'a crate::cli::chat_stream::ExecutionTimeBudgetClock>,
+    prepare: PrepareChatTurnRequest<'a>,
+}
+
+async fn chat_turn_post_payload_after_prepare(
+    request: ChatTurnPostPayloadRequest<'_>,
 ) -> Result<
     (
         astra_thin_client::HttpResponse,
@@ -1587,6 +1582,16 @@ async fn chat_turn_post_payload_after_prepare(
     ),
     String,
 > {
+    let ChatTurnPostPayloadRequest {
+        api,
+        token,
+        quiet,
+        ui,
+        stream_event_tx,
+        stream_json_emitter,
+        execution_time_budget_clock,
+        prepare,
+    } = request;
     let prep_line = ChatTurnPrepLineGuard::maybe_start(ui.show_prep_line, ui.prep_ui_phase.clone());
     let (current_session_id, session_turn, round_index) = (
         prepare.current_session_id,
@@ -1743,15 +1748,15 @@ pub(crate) async fn fetch_chat_turn_sse(
     let lessons_text_ref: Option<&str> = lessons_text.as_deref();
 
     let (resp, prep_line, prepared_schema_tokens, stream_json_exchange) =
-        chat_turn_post_payload_after_prepare(
+        chat_turn_post_payload_after_prepare(ChatTurnPostPayloadRequest {
             api,
             token,
-            render_policy.is_silent(),
-            &ui,
-            stream_event_tx.as_ref(),
-            stream_json_emitter.as_ref(),
-            execution_time_budget,
-            PrepareChatTurnRequest {
+            quiet: render_policy.is_silent(),
+            ui: &ui,
+            stream_event_tx: stream_event_tx.as_ref(),
+            stream_json_emitter: stream_json_emitter.as_ref(),
+            execution_time_budget_clock: execution_time_budget,
+            prepare: PrepareChatTurnRequest {
                 messages,
                 runtime_required_texts,
                 active_system_skills,
@@ -1809,7 +1814,7 @@ pub(crate) async fn fetch_chat_turn_sse(
                     == crate::cli::permission_manager::PermissionMode::Plan,
                 lessons_text: lessons_text_ref,
             },
-        )
+        })
         .await?;
 
     *pinned_tool_schema_tokens = prepared_schema_tokens;
@@ -1979,7 +1984,7 @@ mod tests {
         assert_eq!(admitted["execution_policy"]["turn_intent"], "auto");
         assert!(
             admitted.get("execution_time_budget").is_none(),
-            "legacy callers without a wall budget must preserve the old wire shape"
+            "an absent wall budget must not fabricate execution authority"
         );
         for forbidden in [
             "messages",
@@ -2086,7 +2091,7 @@ mod tests {
             "prepared developer loop payload has invalid workspace authority"
         );
     }
-    use astra_turn_core::chat_turn_payload::attach_bridge_turn_identity;
+    use astra_turn_core::chat_turn_payload::attach_turn_identity;
     use serde_json::{Value, json};
 
     #[test]
@@ -2537,9 +2542,9 @@ mod tests {
     }
 
     #[test]
-    fn shared_bridge_turn_identity_adds_authoritative_ids() {
+    fn shared_turn_provenance_identity_adds_authoritative_ids() {
         let mut payload = json!({});
-        assert!(attach_bridge_turn_identity(
+        assert!(attach_turn_identity(
             &mut payload,
             2,
             Some("root-chain"),

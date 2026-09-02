@@ -59,7 +59,7 @@ pub struct SelfModel {
     /// P3.1: most recent applied strategy-delta rendered as a structured
     /// before/after diff. `None` when the last reflection was a noop.
     #[serde(default)]
-    pub skill_diff: Option<crate::turn::agentic::stage_bridge::SkillDiffEntry>,
+    pub skill_diff: Option<crate::turn::agentic::strategy_application::SkillDiffEntry>,
     /// Cumulative permission-denial pressure for the current session.
     /// `None` when the permission layer is not wired up (unit tests / headless).
     /// Surfaced back into the system prompt so the agent can self-regulate
@@ -370,7 +370,7 @@ impl SelfModel {
         plan_goal: Option<&str>,
         recent_signals: &[FeedbackSignal],
         _config: &RuntimeConfig,
-        last_strategy: Option<&crate::turn::agentic::stage_bridge::StrategyApplication>,
+        last_strategy: Option<&crate::turn::agentic::strategy_application::StrategyApplication>,
     ) -> Self {
         // ── Capabilities ──
         let mut tool_health_summaries = Vec::new();
@@ -580,7 +580,7 @@ impl SelfModel {
     /// that want to inject a diff independently of `last_strategy`.
     pub fn with_skill_diff(
         mut self,
-        diff: crate::turn::agentic::stage_bridge::SkillDiffEntry,
+        diff: crate::turn::agentic::strategy_application::SkillDiffEntry,
     ) -> Self {
         self.skill_diff = Some(diff);
         self
@@ -1693,7 +1693,7 @@ mod tests {
     #[test]
     fn snapshot_with_strategy_renders_boosted_and_widen() {
         let config = RuntimeConfig::default();
-        let app = crate::turn::agentic::stage_bridge::StrategyApplication {
+        let app = crate::turn::agentic::strategy_application::StrategyApplication {
             newly_blocked: vec![],
             already_blocked: vec![],
             widen_requested: true,
@@ -1735,7 +1735,7 @@ mod tests {
 
     #[test]
     fn snapshot_with_skill_diff_renders_strategy_diff_line() {
-        use crate::turn::agentic::stage_bridge::{DiffSnapshot, SkillDiffEntry};
+        use crate::turn::agentic::strategy_application::{DiffSnapshot, SkillDiffEntry};
         let config = RuntimeConfig::default();
         let diff = SkillDiffEntry {
             skill: "pipeline.tool_surface_policy".to_string(),

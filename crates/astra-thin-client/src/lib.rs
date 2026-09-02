@@ -21,10 +21,10 @@ pub mod work;
 pub use astra_server_types::{
     CompletionChoice, CompletionMessage, CompletionOperation, CompletionRequest,
     CompletionResponse, CompletionUsage, SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction,
-    SessionRunCapabilityServerRefs, SessionRunLifecycleStatus, SessionRunNode,
-    SessionRunPermissionFacts, SessionRunRuntimeFacts, SessionRunTreeSnapshot,
-    WorkBranchAttachRequestV1, WorkBranchControlCommandV1, WorkBranchControlOperationRequestV1,
-    WorkCreateCriterionV1, WorkCreateRequestV1, WorkTurnRequestV1,
+    SessionRunLifecycleStatus, SessionRunNode, SessionRunPermissionFacts, SessionRunRuntimeFacts,
+    SessionRunTreeSnapshot, WorkBranchAttachRequestV1, WorkBranchControlCommandV1,
+    WorkBranchControlOperationRequestV1, WorkCreateCriterionV1, WorkCreateRequestV1,
+    WorkTurnRequestV1,
 };
 pub use client::ThinClient;
 pub use device_proof::{
@@ -43,8 +43,9 @@ pub use protocol::{
     ModelSelection, ProviderInteractionRespondRequest, RunUserIntentRequest, RunUserIntentResponse,
     SessionCreateRequest, SessionTranscriptItem, SessionTranscriptPage, SessionTranscriptPageRef,
     SessionTranscriptReadScope, SessionTranscriptToolCall, SessionTranscriptToolResult,
-    SessionUpdateRequest, StreamEvent, ToolResultRequest, ToolResultRequestParts,
-    UserPromptRespondRequest, classify_stream_event, tool_result_status_is_error,
+    SessionUpdateRequest, StreamEvent, ToolResultHashParts, ToolResultRequest,
+    ToolResultRequestParts, UserPromptRespondRequest, classify_stream_event,
+    tool_result_status_is_error,
 };
 /// SSE / buffered HTTP response from a Server-owned developer loop.
 pub use reqwest::Response as HttpResponse;

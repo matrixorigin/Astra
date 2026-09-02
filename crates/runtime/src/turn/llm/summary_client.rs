@@ -40,7 +40,7 @@ impl DurableSummaryAttemptAllocator {
         scope_key: &str,
         durable_pair_base: u32,
     ) -> Result<u32, String> {
-        if durable_pair_base % 2 != 0 {
+        if !durable_pair_base.is_multiple_of(2) {
             return Err("durable summary logical attempt cursor is not pair-aligned".to_string());
         }
         let mut cursors = self

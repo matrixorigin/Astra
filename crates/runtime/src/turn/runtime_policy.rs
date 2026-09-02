@@ -1783,7 +1783,7 @@ mod tests {
             let _ = evaluate_tool_boundary(&mut state, subject.clone(), &records, round);
             let feedback = state.latest();
             assert_eq!(
-                entries(&feedback)
+                entries(feedback)
                     .iter()
                     .find(|entry| entry.signal == RuntimePolicySignal::UnresolvedToolOutcomes)
                     .map(|entry| entry.stage),
@@ -1791,7 +1791,7 @@ mod tests {
                 "one old failure remains diagnostic evidence"
             );
             assert!(
-                entries(&feedback)
+                entries(feedback)
                     .iter()
                     .all(|entry| entry.signal != RuntimePolicySignal::LowYieldRoundChurn),
                 "one old, never-reobserved recoverable failure must not turn healthy rounds into synthesis pressure at round {round}"

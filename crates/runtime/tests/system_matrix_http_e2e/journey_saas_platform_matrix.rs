@@ -1028,10 +1028,15 @@ pub async fn run_saas_run_cancel_cross_user_and_owner() {
     let (st_cancel, cancel_j) =
         delete_json(app, &format!("/chat/runs/{run_id}"), Some(auth_a)).await;
     assert_eq!(st_cancel, StatusCode::OK, "owner cancel: {cancel_j}");
-    let status = cancel_j["status"].as_str().unwrap_or("");
-    assert!(
-        status == "cancelled" || status == "failed" || status == "completed",
-        "terminal cancel status: {cancel_j}"
+    assert_eq!(
+        cancel_j["status"].as_str(),
+        Some("cancellation_requested"),
+        "the durable user cancellation marker is the immediate authority: {cancel_j}"
+    );
+    assert_eq!(
+        cancel_j["execution_settled"].as_bool(),
+        Some(false),
+        "the HTTP boundary must not fabricate terminal execution settlement: {cancel_j}"
     );
 
     ctx.close().await;

@@ -880,6 +880,7 @@ mod tests {
             crate::server::tool_execution_binding::WorkspaceBinding::server_sandbox(workspace),
             crate::server::tool_execution_binding::ExecutorBinding::server_local(),
         );
+        executor.enable_durable_invocations();
         executor
     }
 
@@ -976,7 +977,6 @@ mod tests {
                 turn_index,
                 session_turn.max(1),
                 runtime_tool_executor,
-                false,
             )
         }
 
@@ -984,12 +984,7 @@ mod tests {
             &'a mut self,
             runtime_tool_executor: &'a crate::server::runtime_tool_executor::RuntimeToolExecutor,
         ) -> HeadlessToolExecutionPipeline<'a, EdgeToolExecResult> {
-            self.pipeline_with_server_executor_for_session_turn(
-                0,
-                1,
-                Some(runtime_tool_executor),
-                true,
-            )
+            self.pipeline_with_server_executor_for_session_turn(0, 1, Some(runtime_tool_executor))
         }
 
         fn pipeline_with_server_executor_for_session_turn<'a>(
@@ -999,8 +994,8 @@ mod tests {
             runtime_tool_executor: Option<
                 &'a crate::server::runtime_tool_executor::RuntimeToolExecutor,
             >,
-            durable_scope: bool,
         ) -> HeadlessToolExecutionPipeline<'a, EdgeToolExecResult> {
+            let has_runtime_executor = runtime_tool_executor.is_some();
             HeadlessToolExecutionPipeline::new(
                 HeadlessToolExecutionCtx {
                     turn_index,
@@ -1008,10 +1003,11 @@ mod tests {
                     quiet: true,
                     api: &self.api,
                     token: "",
-                    current_user_id: durable_scope.then_some("test-user"),
-                    current_session_id: durable_scope.then_some(&self.session_id),
-                    current_run_id: durable_scope.then_some(self.run_id.as_str()),
-                    current_turn_chain_id: durable_scope.then_some(self.turn_chain_id.as_str()),
+                    current_user_id: has_runtime_executor.then_some("test-user"),
+                    current_session_id: has_runtime_executor.then_some(&self.session_id),
+                    current_run_id: has_runtime_executor.then_some(self.run_id.as_str()),
+                    current_turn_chain_id: has_runtime_executor
+                        .then_some(self.turn_chain_id.as_str()),
                     durable_dispatch_admission: None,
                     tool_calls: &self.tool_calls,
                     edge_tool_round: &self.edge_tool_round,
@@ -2001,6 +1997,15 @@ mod tests {
     #[tokio::test]
     async fn semantic_dedup_short_circuit_records_step_skip_trace() {
         let mut harness = PipelineHarness::new();
+        harness.tool_calls = vec![json!({
+            "id": "call-grep-semantic-cache",
+            "type": "function",
+            "function": {
+                "name": "grep",
+                "arguments": serde_json::to_string(&json!({ "pattern": "headless" })).unwrap()
+            }
+        })];
+        harness.edge_tool_round.clear();
         harness.semantic_dedup.check_and_record(
             "grep",
             &json!({ "pattern": "headless" }),
@@ -2011,7 +2016,7 @@ mod tests {
 
         {
             let mut pipeline = harness.pipeline_with_server_executor(1, None);
-            let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::SyntheticEdge(0)) {
+            let validated = match pipeline.validate_slot(HeadlessRoundToolIdx::ServerToolCall(0)) {
                 HeadlessPipelineStage::Continue(validated) => validated,
                 _ => panic!("semantic cache candidates must still pass validation"),
             };
@@ -2288,7 +2293,11 @@ mod tests {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "arguments": r#"{"path":"models.rs","start_line":2900,"end_line":2940}"#
+                "arguments": serde_json::to_string(&json!({
+                    "path": "models.rs",
+                    "start_line": 2900,
+                    "end_line": 2940
+                })).unwrap()
             }
         })];
 
@@ -2338,7 +2347,11 @@ mod tests {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "arguments": r#"{"path":"models.rs","start_line":2900,"end_line":2940}"#
+                "arguments": serde_json::to_string(&json!({
+                    "path": "models.rs",
+                    "start_line": 2900,
+                    "end_line": 2940
+                })).unwrap()
             }
         })];
         let mut pipeline = harness.pipeline_with_server_executor(2, None);
@@ -2493,7 +2506,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_writers_cannot_reset_exact_call_limit_inside_one_provider_round() {
+    async fn settled_edge_writers_are_not_reclassified_by_pre_execution_call_limits() {
         let mut harness = PipelineHarness::new();
         begin_recorded_turn(&mut harness, 3);
         let writer = |id: &str| EdgeToolExecResult {
@@ -2522,8 +2535,8 @@ mod tests {
                 );
             }
             assert_eq!(
-                pipeline.executed_this_turn, 2,
-                "the third identical writer in one provider batch must not execute"
+                pipeline.executed_this_turn, 3,
+                "all three settled edge results are historical executions and must be recorded"
             );
         }
         let tool_events = tool_trace_events(&harness);
@@ -2540,8 +2553,8 @@ mod tests {
                     .and_then(Value::as_str)
                     == Some("duplicate_within_turn"))
                 .count(),
-            1,
-            "the third writer must produce the typed duplicate skip event"
+            0,
+            "pre-execution duplicate policy must not rewrite a settled edge effect as skipped"
         );
 
         // A separately constructed pipeline is the next provider round. Its
@@ -2923,7 +2936,10 @@ mod tests {
         let executed = pipeline.execute_execution(permitted).await;
         assert!(executed.is_err, "got: {}", executed.execution.result_str);
         assert!(
-            executed.execution.result_str.contains("returned an error"),
+            executed
+                .execution
+                .result_str
+                .contains("failed with an unclassified tool error"),
             "typed edge failure must receive error feedback: {}",
             executed.execution.result_str
         );
@@ -2948,7 +2964,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let server_exec = server_executor_for_test_workspace(dir.path(), "test-session");
         let mut pipeline =
-            harness.pipeline_with_server_executor_for_session_turn(3, 7, Some(&server_exec), false);
+            harness.pipeline_with_server_executor_for_session_turn(3, 7, Some(&server_exec));
         let args = json!({"path": "turn.txt", "content": "hello"});
         let permitted = PermittedExecution {
             execution: HeadlessResolvedExecution {
@@ -3733,9 +3749,12 @@ mod tests {
         for i in 0..3 {
             harness.tool_calls.push(json!({
                 "id": format!("call-outline-{i}"),
+                "type": "function",
                 "function": {
                     "name": "outline",
-                    "arguments": format!("{{\"path\": \"file{i}.rs\"}}")
+                    "arguments": serde_json::to_string(&json!({
+                        "path": format!("file{i}.rs")
+                    })).unwrap()
                 }
             }));
         }
@@ -3804,6 +3823,7 @@ mod tests {
         // Push a tool call with empty name.
         harness.tool_calls.push(json!({
             "id": "call-empty-0",
+            "type": "function",
             "function": {
                 "name": "",
                 "arguments": "{}"
@@ -3855,6 +3875,7 @@ mod tests {
         for i in 0..3 {
             harness.tool_calls.push(json!({
                 "id": format!("call-outline-{i}"),
+                "type": "function",
                 "function": {
                     "name": "outline",
                     "arguments": "{}"
@@ -3917,15 +3938,21 @@ mod tests {
         let mut harness = PipelineHarness::new();
         harness.tool_calls.push(json!({
             "id": "call-outline-0",
+            "type": "function",
             "function": { "name": "outline", "arguments": "{}" }
         }));
         harness.tool_calls.push(json!({
             "id": "call-foobar-0",
+            "type": "function",
             "function": { "name": "foobar", "arguments": "{}" }
         }));
         harness.tool_calls.push(json!({
             "id": "call-outline-1",
-            "function": { "name": "outline", "arguments": "{\"path\": \"a.rs\"}" }
+            "type": "function",
+            "function": {
+                "name": "outline",
+                "arguments": serde_json::to_string(&json!({ "path": "a.rs" })).unwrap()
+            }
         }));
         let mut pipeline = harness.pipeline();
 
@@ -3951,9 +3978,12 @@ mod tests {
         for i in 0..3 {
             harness.tool_calls.push(json!({
                 "id": format!("call-outline-{i}"),
+                "type": "function",
                 "function": {
                     "name": "outline",
-                    "arguments": format!("{{\"path\": \"file{i}.rs\"}}")
+                    "arguments": serde_json::to_string(&json!({
+                        "path": format!("file{i}.rs")
+                    })).unwrap()
                 }
             }));
         }
@@ -3977,6 +4007,7 @@ mod tests {
         for i in 0..3 {
             harness.tool_calls.push(json!({
                 "id": format!("call-empty-{i}"),
+                "type": "function",
                 "function": { "name": "", "arguments": "{}" }
             }));
         }
@@ -4002,7 +4033,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn server_executor_unknown_tool_records_health_failure() {
+    async fn server_executor_unavailable_tool_does_not_pollute_execution_health() {
         // Simulates the DefaultToolExecutor "not available" path:
         // tool passes valid_tool_names but executor returns error.
         let mut harness = PipelineHarness::new();
@@ -4011,6 +4042,7 @@ mod tests {
         harness.valid_tool_names.insert(missing_tool.to_string());
         harness.tool_calls.push(json!({
             "id": "call-missing-0",
+            "type": "function",
             "function": { "name": missing_tool, "arguments": "{}" }
         }));
         let dir = tempfile::TempDir::new().unwrap();
@@ -4037,21 +4069,20 @@ mod tests {
             "server executor should return error for unknown tool"
         );
 
-        // record_execution feeds through append_headless_result_quality_feedback
-        // → turn_guard.record_tool_result → health.record_failure
         pipeline.record_execution(executed).await;
 
         let health = pipeline.ctx.turn_guard.health.get(missing_tool);
         assert!(
-            health.is_some(),
-            "missing tool should be tracked after alternate execution provider error"
+            health.is_none(),
+            "an unavailable capability is an admission/environment fact, not a flaky execution"
         );
-        let h = health.unwrap();
-        assert_eq!(
-            h.total_failures, 1,
-            "alternate execution provider error should count as failure"
-        );
-        assert_eq!(h.consecutive_failures, 1);
+        let record = pipeline
+            .ctx
+            .tool_call_records
+            .last()
+            .expect("unavailable execution must still be journaled");
+        assert!(!record.ok);
+        assert!(record.error.is_some());
     }
 
     #[tokio::test]
@@ -4060,6 +4091,7 @@ mod tests {
         harness.valid_tool_names.insert("github".to_string());
         harness.tool_calls.push(json!({
             "id": "call-github-0",
+            "type": "function",
             "function": {
                 "name": "github",
                 "arguments": serde_json::to_string(&json!({
@@ -4117,6 +4149,7 @@ mod tests {
         harness.valid_tool_names = HashSet::from(["agent_fanout".to_string()]);
         harness.tool_calls.push(json!({
             "id": "call-agent-fanout-1",
+            "type": "function",
             "function": {
                 "name": "agent_fanout",
                 "arguments": serde_json::to_string(&server_args).unwrap()
@@ -4186,6 +4219,7 @@ mod tests {
             harness.valid_tool_names.insert(tool_name.to_string());
             harness.tool_calls.push(json!({
                 "id": format!("call-{tool_name}-0"),
+                "type": "function",
                 "function": {
                     "name": tool_name,
                     "arguments": serde_json::to_string(&args).unwrap()
@@ -4254,6 +4288,7 @@ mod tests {
 
         harness.tool_calls.push(json!({
             "id": "call-git-diff-stat",
+            "type": "function",
             "function": { "name": "git", "arguments": "{\"action\":\"diff\",\"stat_only\":true}" }
         }));
         {
@@ -4274,6 +4309,7 @@ mod tests {
         harness.tool_calls.clear();
         harness.tool_calls.push(json!({
             "id": "call-git-diff-path",
+            "type": "function",
             "function": { "name": "git", "arguments": "{\"action\":\"diff\",\"path\":\"tracked.txt\"}" }
         }));
         let mut pipeline = harness.pipeline_with_server_executor(1, Some(&server_exec));
@@ -4326,6 +4362,7 @@ mod tests {
         harness.valid_tool_names.insert(missing_tool.to_string());
         harness.tool_calls.push(json!({
             "id": "call-missing-0",
+            "type": "function",
             "function": { "name": missing_tool, "arguments": "{}" }
         }));
         let dir = tempfile::TempDir::new().unwrap();
@@ -4623,6 +4660,7 @@ mod tests {
         });
         harness.tool_calls.push(json!({
             "id": "call-edit-0",
+            "type": "function",
             "function": { "name": "str_replace", "arguments": serde_json::to_string(&args).unwrap() }
         }));
         let sig =
@@ -4689,6 +4727,7 @@ mod tests {
         let mut harness = PipelineHarness::new();
         harness.tool_calls.push(json!({
             "id": "call-grep-0",
+            "type": "function",
             "function": { "name": "grep", "arguments": "{\"pattern\":\"headless\"}" }
         }));
         let sig = astra_turn_core::tool_result_semantics::tool_dedup_signature(
@@ -4735,6 +4774,7 @@ mod tests {
         let args = json!({"action":"get_result","agent_id":"general-purpose_demo@123"});
         harness.tool_calls.push(json!({
             "id": "call-agent-0",
+            "type": "function",
             "function": { "name": "agent", "arguments": serde_json::to_string(&args).unwrap() }
         }));
         let sig = astra_turn_core::tool_result_semantics::tool_dedup_signature("agent", &args);
@@ -4777,6 +4817,7 @@ mod tests {
         let args = json!({"action":"get_result","agent_id":"general-purpose_demo@123"});
         harness.tool_calls.push(json!({
             "id": "call-agent-1",
+            "type": "function",
             "function": { "name": "agent", "arguments": serde_json::to_string(&args).unwrap() }
         }));
         harness.edge_tool_round = vec![EdgeToolExecResult {
@@ -4896,6 +4937,7 @@ mod tests {
         harness.turn_guard = TurnGuard::with_health(restored);
         harness.tool_calls.push(json!({
             "id": "call-grep-0",
+            "type": "function",
             "function": { "name": "grep", "arguments": "{\"pattern\":\"headless\"}" }
         }));
 
@@ -4919,6 +4961,7 @@ mod tests {
             harness.valid_tool_names.insert("outline".to_string());
             harness.tool_calls.push(json!({
                 "id": "call-outline-0",
+                "type": "function",
                 "function": { "name": "outline", "arguments": "{}" }
             }));
             if let Some(health) = restored {
@@ -5022,13 +5065,10 @@ mod tests {
             "memory-guided path still reaches grep success"
         );
         assert_eq!(
-            blind_retry.1, 1,
-            "blind retry incurs one fresh outline failure"
+            blind_retry.1, 0,
+            "an unavailable capability must not be persisted as flaky tool health"
         );
-        assert_eq!(
-            memory_guided.1, 0,
-            "restored failure memory should prevent another outline execution"
-        );
+        assert_eq!(memory_guided.1, 0);
         assert!(
             memory_guided.0 < blind_retry.0,
             "memory-guided recovery should use fewer actual tool executions: blind={:?}, memory={:?}",
@@ -5043,13 +5083,18 @@ mod tests {
         // Call 1: schema-invalid tool "outline"
         harness.tool_calls.push(json!({
             "id": "call-outline-0",
+            "type": "function",
             "function": { "name": "outline", "arguments": "{}" }
         }));
         // Call 2: valid tool "grep" (via synthetic edge, already in harness)
         // Call 3: schema-invalid tool "outline" with different args
         harness.tool_calls.push(json!({
             "id": "call-outline-1",
-            "function": { "name": "outline", "arguments": "{\"path\": \"b.rs\"}" }
+            "type": "function",
+            "function": {
+                "name": "outline",
+                "arguments": serde_json::to_string(&json!({ "path": "b.rs" })).unwrap()
+            }
         }));
         let mut pipeline = harness.pipeline();
 

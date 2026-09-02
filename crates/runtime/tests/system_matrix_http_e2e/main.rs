@@ -84,7 +84,7 @@
 //! - **`e2e_matrix_branches_cost_estimate_http`** — `POST /branches/cost-estimate` (JWT, numeric
 //!   estimate fields); 401 without auth (no DDL branch ops).
 //! - **`e2e_matrix_delegate_http_boundaries`** — `POST /chat` → `run_id`; `GET .../delegations`;
-//!   `POST .../delegate` fails at validation (`400`) without executing sub-runs.
+//!   `POST .../delegate` fails at typed validation (`422`) without executing sub-runs.
 //! - **`e2e_matrix_admin_control_plane_rbac`** — global token and model-gateway control-plane
 //!   routes reject normal users, then work after `grant_astra_admin_role`.
 //!
@@ -92,19 +92,19 @@
 //! journey (not duplicated in a separate test).
 //!
 //! External dependencies remain mocked where the product already allows it:
-//! - LLM: `context.test_llm_rounds` + the legacy `bridge-e2e-hooks` mock-inference hook on
+//! - LLM: `context.test_llm_rounds` + the legacy `e2e-hooks` mock-inference hook on
 //!   server-owned `/chat/stream` (no external model server).
-//!   `ASTRA_TEST_BRIDGE_SECRET` is test-hook configuration, not route authorization.
+//!   `ASTRA_TEST_E2E_SECRET` is test-hook configuration, not route authorization.
 //! - Memoria: [`astra_runtime::MemoriaForwarder`] stub (memory proxy routes only).
 //!
 //! ## How to run
 //! ```text
 //! ASTRA_TEST_DB_IT=1 \
-//! ASTRA_TEST_BRIDGE_SECRET=system-matrix-e2e-secret \
+//! ASTRA_TEST_E2E_SECRET=system-matrix-e2e-secret \
 //! ASTRA_BACKEND_SERVICE_KEY=test-service-key-e2e \
 //! ASTRA_LLM_RETRY_BASE_MS=10 ASTRA_DEFAULT_RETRY_AFTER_MS=10 ASTRA_BCRYPT_COST=4 \
 //! RUST_MIN_STACK=16777216 \
-//! cargo test -p astra-runtime --test system_matrix_http_e2e --features bridge-e2e-hooks -- \
+//! cargo test -p astra-runtime --test system_matrix_http_e2e --features e2e-hooks -- \
 //!   --ignored --nocapture
 //! ```
 //!

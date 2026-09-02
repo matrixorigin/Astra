@@ -1348,6 +1348,7 @@ mod tests {
                 "apply_patch" => {
                     json!({"path": "tmp.txt", "patch": "--- a\n+++ b\n@@ -1 +1 @@\n-a\n+b"})
                 }
+                "publish_artifact" => json!({"path": "tmp.txt"}),
                 "rollback_database_snapshots" | "rollback_file_edits" => json!({}),
                 other => panic!("add sample args for {other}"),
             }

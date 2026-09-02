@@ -48,8 +48,6 @@ Legend: **E2E** = `crates/runtime/tests/system_matrix_http_e2e/` with `ASTRA_TES
 | `POST /streaming/chat` (stub `X-User-Id`) | — (prod uses configured `StreamingService`; `journey_extended` covers `POST /chat/stream` SSE) | `streaming_contract` |
 | Route registration (no accidental 404 on major paths) | `runtime/src/server/router_builder.rs` `#[cfg(test)]` (`route_count_regression`, `critical_route_paths_exist`, `all_api_groups_have_routes`) + Matrix `journey_full` | `route_registry_contract` (HTTP smoke) |
 | `SharedPool` on `AppState` / auth+session service constructors | Compile-time API + real pool in services tests / Matrix E2E | `shared_pool_contract`, `shared_pool_migration_contract` |
-| `/health` includes `persist_ok` / `persist_fail` | `http_contract` + `fixtures/contracts/http_shell_contract.json` | `persist_counter_contract` |
-| Global `PERSIST_*` atomics increment | `runtime/src/bridge/side_effects.rs` `#[cfg(test)]` | `persist_counter_contract` |
 | Thinking models: `reasoning_content` on every assistant+`tool_calls` after mid-session switch / DB recovery | `runtime/src/turn/edge_ledger.rs` `#[cfg(test)]` (`mid_session_switch_*`, `append_recovered_events` + `strip_stale_reasoning` pipeline) | — (avoid extra integration binary) |
 
 ## Large integration binaries (audit — not removed in this pass)
@@ -90,6 +88,6 @@ Legend: **E2E** = `crates/runtime/tests/system_matrix_http_e2e/` with `ASTRA_TES
 
 ## How to run
 
-- Offline slice: `make test-offline` (workspace + bridge hooks; no online `#[ignore]` suites).
+- Offline slice: `make test-offline` (workspace + server E2E hooks; no online `#[ignore]` suites).
 - Full validation with MatrixOne: `make test` (`test-offline` then `test-online`) or run `make test-online` alone when you only need ignored suites.
 - Advanced: set `ASTRA_TEST_DB_IT=1` / `ASTRA_TEST_DB_IT=1` manually as in [`system-e2e-matrix.md`](./system-e2e-matrix.md).

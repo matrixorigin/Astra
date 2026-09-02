@@ -159,15 +159,15 @@ impl TeamExecutionOrchestrator {
     async fn persist_active_run_outcome(&self, run_id: &str, status: &str, error: Option<&str>) {
         match self
             .run_engine
-            .persist_status_if_current(
-                &self.config.user_id,
-                &self.config.session_id,
+            .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                user_id: &self.config.user_id,
+                expected_session_id: &self.config.session_id,
                 run_id,
-                &[STATUS_RUNNING],
+                expected_statuses: &[STATUS_RUNNING],
                 status,
-                None,
-                error,
-            )
+                waiting_for: None,
+                error_message: error,
+            })
             .await
         {
             Ok(true) => {}
@@ -1472,6 +1472,11 @@ mod tests {
         }
 
         let registry = Arc::new(RwLock::new(AgentProfileRegistry::new()));
+        registry
+            .write()
+            .await
+            .register(AgentProfile::new("orch", "orch", AgentTier::Orchestrator))
+            .expect("register trusted orchestration source");
         let run_store = Arc::new(InMemoryRunStateStore::new());
         let run_engine = Arc::new(RunEngine::new(run_store));
         let tracker = Arc::new(DelegationTracker::new());
@@ -1575,6 +1580,11 @@ mod tests {
         store.save_team(&team).await.unwrap();
 
         let registry = Arc::new(RwLock::new(AgentProfileRegistry::new()));
+        registry
+            .write()
+            .await
+            .register(AgentProfile::new("orch", "orch", AgentTier::Orchestrator))
+            .expect("register trusted orchestration source");
         let run_store = Arc::new(InMemoryRunStateStore::new());
         let run_engine = Arc::new(RunEngine::new(run_store));
         let tracker = Arc::new(DelegationTracker::new());

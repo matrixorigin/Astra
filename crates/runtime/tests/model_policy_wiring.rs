@@ -6,7 +6,7 @@
 //! Exercised via `make_test_loop_state_for_model`, which mirrors production's
 //! `run_lifecycle.rs:1949` state construction.
 
-#![cfg(feature = "bridge-e2e-hooks")]
+#![cfg(feature = "e2e-hooks")]
 
 use astra_runtime::turn::agentic_loop::host::make_test_loop_state_for_model;
 

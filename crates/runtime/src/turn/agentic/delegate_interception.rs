@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 
-use astra_services::session_journal::ToolCallRecord;
 use serde_json::Value;
 
 use super::headless_round::HeadlessStderrStyle;
@@ -20,6 +19,7 @@ pub(crate) const REQUEST_ALLOWED_SKILL_SOURCES_CONTEXT_KEY: &str =
 
 pub(crate) struct DelegationInterceptionResult {
     pub(crate) effective_tool_calls: Vec<Value>,
+    pub(crate) pre_resolved_results: Vec<(String, String)>,
     pub(crate) intercepted_any: bool,
 }
 
@@ -71,6 +71,7 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
     {
         return DelegationInterceptionResult {
             effective_tool_calls: turn_result.accum.tool_calls.clone(),
+            pre_resolved_results: Vec::new(),
             intercepted_any: false,
         };
     }
@@ -148,11 +149,12 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
         }
         return DelegationInterceptionResult {
             effective_tool_calls: effective,
+            pre_resolved_results: Vec::new(),
             intercepted_any: true,
         };
     }
 
-    let (delegation_results, remaining_tool_calls) = if let Some(engine) = &state.delegation_engine
+    let (delegation_results, _remaining_tool_calls) = if let Some(engine) = &state.delegation_engine
     {
         let adaptive_delegation_context =
             state
@@ -225,81 +227,6 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
                 }
             }
         }
-        let delegate_tool_calls: Vec<&Value> = turn_result
-            .accum
-            .tool_calls
-            .iter()
-            .filter(|tc| is_delegation_call(tc))
-            .collect();
-        if !delegate_tool_calls.is_empty() {
-            let tc_entries: Vec<Value> = delegate_tool_calls
-                .iter()
-                .map(|tc| {
-                    let id = tc
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
-                    let name = tool_call_name(tc).unwrap_or(DELEGATE_TOOL_NAME);
-                    let args = tool_call_arguments_value(tc);
-                    serde_json::json!({
-                        "id": id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": serde_json::to_string(&args)
-                                .unwrap_or_else(|_| "{}".to_string()),
-                        }
-                    })
-                })
-                .collect();
-            let mut assistant_msg = serde_json::json!({
-                "role": "assistant",
-                "content": Value::Null,
-                "tool_calls": tc_entries,
-            });
-            let rc = &turn_result.accum.reasoning_content;
-            if !rc.is_empty() {
-                assistant_msg["reasoning_content"] = Value::String(rc.clone());
-                let sig = &turn_result.accum.reasoning_signature;
-                if !sig.is_empty() {
-                    assistant_msg["reasoning_signature"] = Value::String(sig.clone());
-                }
-            } else if astra_turn_core::edge_ledger::history_has_reasoning(&state.messages) {
-                assistant_msg["reasoning_content"] = Value::String(String::new());
-            }
-            state.push_prompt_history_message(assistant_msg);
-        }
-        for result in &delegation_results {
-            let summary_for_model =
-                astra_turn_core::tool_result_sanitize::tool_result_content_for_model(
-                    DELEGATE_TOOL_NAME,
-                    &result.summary,
-                );
-            let tool_msg = serde_json::json!({
-                "role": "tool",
-                "tool_call_id": result.call_id,
-                "content": summary_for_model,
-            });
-            state.push_prompt_history_message(tool_msg.clone());
-            state.tool_results.push(tool_msg);
-            state.stall.tool_call_records.push(ToolCallRecord {
-                name: DELEGATE_TOOL_NAME.to_string(),
-                ok: !result.summary.starts_with("Delegation failed:")
-                    && !result.summary.starts_with("Invalid delegation request:"),
-                ms: 0,
-                error: None,
-                input_bytes: None,
-                output_bytes: Some(result.summary.len() as u32),
-                args_preview: Some(result.call_id.clone()),
-                result_preview: Some(result.summary.chars().take(500).collect::<String>()),
-                file_path: None,
-                surgically_removed: None,
-                original_tool_name: None,
-                ..Default::default()
-            });
-        }
         if !quiet {
             host.emit_headless_line(
                 HeadlessStderrStyle::Dim,
@@ -330,12 +257,25 @@ pub(crate) async fn intercept_delegations<H: AgenticLoopHost>(
         }
     }
 
+    let pre_resolved_results = delegation_results
+        .iter()
+        .map(|result| {
+            (
+                result.call_id.clone(),
+                astra_turn_core::tool_result_sanitize::tool_result_content_for_model(
+                    DELEGATE_TOOL_NAME,
+                    &result.summary,
+                ),
+            )
+        })
+        .collect();
     DelegationInterceptionResult {
-        effective_tool_calls: if delegation_results.is_empty() {
-            turn_result.accum.tool_calls.clone()
-        } else {
-            remaining_tool_calls
-        },
+        // Intercepted calls remain in the canonical round and close through
+        // the same pre-resolved terminal lane as every other runtime-owned
+        // control result. This preserves one assistant carrier and one tool
+        // terminal per provider call without dispatching delegation twice.
+        effective_tool_calls: turn_result.accum.tool_calls.clone(),
+        pre_resolved_results,
         intercepted_any: !delegation_results.is_empty(),
     }
 }
@@ -2322,16 +2262,15 @@ mod tests {
                 .await;
 
         assert!(result.intercepted_any);
-        assert!(result.effective_tool_calls.is_empty());
-        assert_eq!(state.tool_results.len(), 1);
+        assert_eq!(result.effective_tool_calls, turn_result.accum.tool_calls);
+        assert_eq!(result.pre_resolved_results.len(), 1);
+        assert_eq!(result.pre_resolved_results[0].0, "call_delegate");
         assert!(
-            state.tool_results[0]["content"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("Delegation"),
+            result.pre_resolved_results[0].1.contains("Delegation"),
             "{:?}",
-            state.tool_results
+            result.pre_resolved_results
         );
+        assert!(state.tool_results.is_empty());
     }
 
     #[tokio::test]

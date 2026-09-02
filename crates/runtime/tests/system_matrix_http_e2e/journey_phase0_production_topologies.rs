@@ -936,7 +936,7 @@ fn spawn_server(
             local_state_root.path().join("prompts"),
         )
         .env("ASTRA_TEST_PROMPT_CACHE_DISABLED", "0")
-        .env("ASTRA_TEST_BRIDGE_SECRET", "")
+        .env("ASTRA_TEST_E2E_SECRET", "")
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(stderr)
@@ -997,7 +997,7 @@ fn spawn_edge(
             local_state_root.path().join("prompts"),
         )
         .env("ASTRA_TEST_PROMPT_CACHE_DISABLED", "0")
-        .env("ASTRA_TEST_BRIDGE_SECRET", "")
+        .env("ASTRA_TEST_E2E_SECRET", "")
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(stderr)
@@ -1054,7 +1054,7 @@ enum CliStreamRecord {
         request_ordinal: u32,
         round_index: u32,
         event_count: u64,
-        bridge_run_id: String,
+        server_run_id: String,
         stream_complete: bool,
         usage: Option<Value>,
         context_manifest_trace: Option<Value>,
@@ -1316,10 +1316,10 @@ fn parse_cli_stream_json(
                 required_bounded_string(event_type, "CLI SSE event type", 128)?;
                 if event_type == "session_info" {
                     let session_id = required_json_string(&event, "session_id")?;
-                    let bridge_run_id = required_json_string(&event, "run_id")?;
+                    let server_run_id = required_json_string(&event, "run_id")?;
                     let turn_chain_id = required_json_string(&event, "turn_chain_id")?;
                     if session_id != record_identity.session_id
-                        || bridge_run_id != record_identity.turn_chain_id
+                        || server_run_id != record_identity.turn_chain_id
                         || turn_chain_id != record_identity.turn_chain_id
                         || event.get("durable").and_then(Value::as_bool) != Some(false)
                     {
@@ -1337,7 +1337,7 @@ fn parse_cli_stream_json(
                 request_ordinal,
                 round_index,
                 event_count,
-                bridge_run_id,
+                server_run_id,
                 stream_complete,
                 usage,
                 context_manifest_trace,
@@ -1368,12 +1368,12 @@ fn parse_cli_stream_json(
                         "CLI exchange {exchange_id} did not reach a clean [DONE] terminal"
                     )));
                 }
-                required_bounded_string(&bridge_run_id, "CLI bridge_run_id", 64)?;
-                if bridge_run_id != record_identity.execution_id
-                    || bridge_run_id != record_identity.turn_chain_id
+                required_bounded_string(&server_run_id, "CLI server_run_id", 64)?;
+                if server_run_id != record_identity.execution_id
+                    || server_run_id != record_identity.turn_chain_id
                 {
                     return Err(invalid(format!(
-                        "CLI exchange {exchange_id} bridge_run_id disagrees with turn_chain_id"
+                        "CLI exchange {exchange_id} server_run_id disagrees with turn_chain_id"
                     )));
                 }
                 if usage.as_ref().is_some_and(|value| !value.is_object())
@@ -1510,7 +1510,7 @@ async fn run_cli_turn(
             local_state_root.path().join("prompts"),
         )
         .env("ASTRA_TEST_PROMPT_CACHE_DISABLED", "0")
-        .env("ASTRA_TEST_BRIDGE_SECRET", "")
+        .env("ASTRA_TEST_E2E_SECRET", "")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::from(log))
@@ -2332,7 +2332,7 @@ mod tests {
         finished.insert("request_ordinal".to_string(), json!(request_ordinal));
         finished.insert("round_index".to_string(), json!(round_index));
         finished.insert("event_count".to_string(), json!(1));
-        finished.insert("bridge_run_id".to_string(), json!("run-execution"));
+        finished.insert("server_run_id".to_string(), json!("run-execution"));
         finished.insert("stream_complete".to_string(), json!(true));
         finished.insert("usage".to_string(), Value::Null);
         finished.insert("context_manifest_trace".to_string(), Value::Null);
@@ -2568,7 +2568,7 @@ mod tests {
         }
         padded_identity[1]["event"]["run_id"] = json!(" run-execution");
         padded_identity[1]["event"]["turn_chain_id"] = json!(" run-execution");
-        padded_identity[2]["bridge_run_id"] = json!(" run-execution");
+        padded_identity[2]["server_run_id"] = json!(" run-execution");
         let padded = serialize_cli_records(&padded_identity);
         assert!(parse_cli_stream_json(padded.as_bytes(), "session-1", "fixture").is_err());
 

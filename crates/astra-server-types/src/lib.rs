@@ -45,9 +45,8 @@ pub use edge_ws_protocol::{
     EDGE_TOOL_TIMEOUT_SECS, EdgeClientMessage, EdgeServerMessage, MAX_EDGE_TOOL_TIMEOUT_SECS,
 };
 pub use session_run_tree::{
-    SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction, SessionRunCapabilityServerRefs,
-    SessionRunLifecycleStatus, SessionRunNode, SessionRunPermissionFacts, SessionRunRuntimeFacts,
-    SessionRunTreeSnapshot,
+    SESSION_RUN_TREE_SCHEMA_VERSION, SessionRunAction, SessionRunLifecycleStatus, SessionRunNode,
+    SessionRunPermissionFacts, SessionRunRuntimeFacts, SessionRunTreeSnapshot,
 };
 
 pub const WORK_API_MAJOR_HEADER: &str = "x-astra-work-api-major";
@@ -770,9 +769,9 @@ pub struct ChatRequest {
     pub plan_subtask_id: Option<String>,
     #[serde(default)]
     pub is_plan_subtask: Option<bool>,
-    /// Server-issued canonical authority. Omitted only by the revisioned
-    /// legacy bridge; identity inside this envelope is never trusted without
-    /// signature and authenticated-owner validation.
+    /// Server-issued canonical authority. Omitted on initial admission;
+    /// identity inside this envelope is never trusted without signature and
+    /// authenticated-owner validation.
     #[serde(default)]
     pub conversation_authority: Option<astra_turn_types::ConversationAuthorityEnvelopeV1>,
 }
@@ -1130,8 +1129,6 @@ pub struct HealthResponse {
     pub status: String,
     pub database: String,
     pub memoria: String,
-    pub persist_ok: u64,
-    pub persist_fail: u64,
     pub interaction_api_major: String,
     pub build_git_sha: String,
 }

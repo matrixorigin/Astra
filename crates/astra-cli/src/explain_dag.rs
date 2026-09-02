@@ -836,6 +836,7 @@ mod tests {
                 "schema_version": 1,
                 "phase": "turn_intent_admission",
                 "round_index": 0,
+                "attempt_index": 0,
                 "outcome": "decided",
                 "duration_ms": 5_021,
             }),

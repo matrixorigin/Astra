@@ -2372,7 +2372,7 @@ mod tests {
         let mut det = CacheBreakDetector::new();
 
         for _ in 0..5 {
-            det.record_turn_for_source("bridge_inprocess", snap("prompt", &tools, "claude"), None);
+            det.record_turn_for_source("server_loop", snap("prompt", &tools, "claude"), None);
         }
 
         let hint = det.compression_hint(20, 2);
@@ -2392,8 +2392,8 @@ mod tests {
 
         det.record_turn_for_source(DEFAULT_SOURCE, main.clone(), None);
         det.record_turn_for_source(DEFAULT_SOURCE, main, None);
-        det.record_turn_for_source("bridge_inprocess", bridge.clone(), None);
-        det.record_turn_for_source("bridge_inprocess", bridge, None);
+        det.record_turn_for_source("server_loop", bridge.clone(), None);
+        det.record_turn_for_source("server_loop", bridge, None);
 
         let hint = det.compression_hint_for_source(DEFAULT_SOURCE, 20, 2);
         assert_eq!(hint.protected_token_estimate, 7_000);

@@ -343,9 +343,7 @@ fn fanout_result_page_next_offset(args: &Value, output: &Value) -> Option<Option
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|group| !group.is_empty());
-    let Some(requested_slot) = args.get("slot_index").and_then(Value::as_u64) else {
-        return None;
-    };
+    let requested_slot = args.get("slot_index").and_then(Value::as_u64)?;
     let requested_offset = args
         .get("offset")
         .and_then(Value::as_u64)
@@ -2250,6 +2248,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
     let round_records_start = state.stall.tool_call_records.len();
     let DelegationInterceptionResult {
         effective_tool_calls,
+        pre_resolved_results: delegation_pre_resolved_results,
         intercepted_any: delegation_intercepted,
     } = intercept_delegations(host, state, &turn_result, prep.quiet, &valid_tool_names).await;
 
@@ -2271,6 +2270,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         &valid_tool_names,
     )
     .await;
+    pre_resolved_results.extend(delegation_pre_resolved_results);
     for event in communication_events {
         host.on_agent_communication(event);
     }
@@ -3765,7 +3765,11 @@ mod tests {
             "result": payload().to_string(),
         });
         assert!(
-            canonical_work_settlement_boundary(&[rejected.clone()], &[result.clone()]).is_none()
+            canonical_work_settlement_boundary(
+                std::slice::from_ref(&rejected),
+                std::slice::from_ref(&result),
+            )
+            .is_none()
         );
         rejected.ok = true;
         rejected.disposition = Some(astra_services::session_journal::ToolCallDisposition::Rejected);

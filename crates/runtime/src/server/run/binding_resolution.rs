@@ -60,8 +60,21 @@ pub(crate) fn request_needs_edge_bound_server_executor(
 
 pub(crate) fn resolve_request_execution_bindings_without_server_workspace(
     request: &astra_services::runs::ChatRequestData,
-    _edge_profile: &Map<String, Value>,
+    edge_profile: &Map<String, Value>,
 ) -> Option<(WorkspaceBinding, ExecutorBinding)> {
+    // An entirely absent execution profile is the safe, explicit no-file
+    // control-plane case.  Do not treat a populated legacy edge profile as
+    // authority to infer a workspace or executor: those require typed request
+    // bindings in the canonical architecture.
+    if edge_profile.is_empty()
+        && request.workspace_binding.is_none()
+        && request.executor_binding.is_none()
+    {
+        return Some((
+            WorkspaceBinding::none(),
+            ExecutorBinding::server_control_plane(),
+        ));
+    }
     resolve_request_execution_bindings_from_request(request, None)
 }
 
@@ -223,8 +236,6 @@ pub(crate) fn run_start_context_from_request(
             .map(|binding| binding.binding_schema_version.clone()),
         model_selection: request.model_selection.clone(),
         resolved_model_selection: request.resolved_model_selection.clone(),
-        capability_server_refs: requested_primary_binding
-            .map(|binding| binding.capability_server_refs.clone()),
         runtime_profile: effective_runtime_profile(request),
         provider_request_fingerprint: None,
         provider_run_owner: request.provider_run_owner.clone(),
@@ -572,10 +583,6 @@ mod tests {
         let mut request = test_request("hello");
         request.agent_binding = Some(astra_services::runs::AgentBindingRuntimeRequest {
             id: "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391".to_string(),
-            capability_server_refs: astra_services::runs::CapabilityServerRefs {
-                mcp: "mcp-main".to_string(),
-                skills: "skills-main".to_string(),
-            },
         });
 
         let context = run_start_context_from_request(&request, None, None);
@@ -606,17 +613,9 @@ mod tests {
         request.agent_bindings = vec![
             astra_services::runs::AgentBindingRuntimeRequest {
                 id: "binding-foundation".to_string(),
-                capability_server_refs: astra_services::runs::CapabilityServerRefs {
-                    mcp: "mcp-main".to_string(),
-                    skills: "skills-main".to_string(),
-                },
             },
             astra_services::runs::AgentBindingRuntimeRequest {
                 id: "binding-extension".to_string(),
-                capability_server_refs: astra_services::runs::CapabilityServerRefs {
-                    mcp: "mcp-main".to_string(),
-                    skills: "skills-main".to_string(),
-                },
             },
         ];
 

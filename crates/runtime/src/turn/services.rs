@@ -6,6 +6,29 @@ use crate::*;
 use astra_core::canonical_names::metadata_tool_name;
 use astra_turn_core::trace_event::{TraceEvent, TraceEventWriter, TraceWriteError};
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct InMemoryTurnReflectionStateStore {
+    pub(crate) state: Arc<tokio::sync::Mutex<HashMap<String, TurnReflectionMark>>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NoopTurnReflectionLessonWriter;
+
+#[derive(Clone, Debug)]
+pub struct DatabaseTurnReflectionLessonWriter {
+    pub(crate) base_url: String,
+    pub(crate) master_key: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NoopTurnObserverWorker;
+
+#[derive(Clone, Debug)]
+pub struct DatabaseTurnObserverWorker {
+    pub(crate) base_url: String,
+    pub(crate) master_key: Option<String>,
+}
+
 fn validate_tool_lifecycle_event_type(event_type: &str) -> Result<(), String> {
     if matches!(
         event_type,
@@ -209,7 +232,7 @@ async fn apply_touched_session_deltas_in_tx(
     Ok(())
 }
 
-fn bridge_transcript_item(event: &TurnCoreEventRecord) -> Option<TranscriptPersistItem> {
+fn transcript_item(event: &TurnCoreEventRecord) -> Option<TranscriptPersistItem> {
     let role = match event.event_type.as_str() {
         "user_query" => "user",
         "llm_response" => "assistant",
@@ -220,7 +243,7 @@ fn bridge_transcript_item(event: &TurnCoreEventRecord) -> Option<TranscriptPersi
     };
     // Tool-only model rounds intentionally have no user-visible assistant
     // text. Persist their typed tool events, but do not materialize a blank
-    // transcript row on every bridge continuation.
+    // transcript row on every continuation.
     if role == "assistant"
         && event.content.trim().is_empty()
         && event
@@ -240,7 +263,7 @@ fn bridge_transcript_item(event: &TurnCoreEventRecord) -> Option<TranscriptPersi
             ..Default::default()
         });
     Some(TranscriptPersistItem {
-        // CLI bridge runs are local runtime identities, not durable
+        // CLI turns use local runtime identities, not durable
         // `agent_runs` rows. A NULL run_id keeps them visible in both the
         // session transcript and its root-conversation projection.
         run_id: None,
@@ -338,7 +361,7 @@ impl TurnCoreEventWriter for DatabaseTurnCoreEventWriter {
             .user_query_event
             .iter()
             .chain(plan.llm_response_event.iter())
-            .filter_map(bridge_transcript_item)
+            .filter_map(transcript_item)
             .collect::<Vec<_>>();
         admit_event_owners_in_tx(&mut tx, transcript_owner.clone()).await?;
         let mut deltas =
@@ -369,14 +392,14 @@ impl TurnCoreEventWriter for DatabaseTurnCoreEventWriter {
                 &transcript_items,
             )
             .await
-            .map_err(|error| format!("persist bridge transcript items: {error}"))?;
+            .map_err(|error| format!("persist transcript items: {error}"))?;
         }
         apply_touched_session_deltas_in_tx(&mut tx, &deltas).await?;
         tx.commit().await.map_err(|error| error.to_string())?;
         if let Some(snapshot_link_plan) = plan.snapshot_link_plan.as_ref()
             && let Err(error) = update_snapshot_llm_ids(&pool, snapshot_link_plan).await
         {
-            astra_core::agent_error!("bridge", "snapshot link update failed: {error}");
+            astra_core::agent_error!("turn", "snapshot link update failed: {error}");
         }
         let outcome = TurnCorePersistOutcome {
             llm_response_event_id: plan.llm_response_event.map(|event| event.event_id),
@@ -958,7 +981,7 @@ mod tests {
     }
 
     #[test]
-    fn bridge_transcript_projection_excludes_runtime_envelope_but_keeps_reply() {
+    fn transcript_projection_excludes_runtime_envelope_but_keeps_reply() {
         let user = core_event(
             "user-event",
             "user-1",
@@ -987,19 +1010,18 @@ mod tests {
             Some("runtime-event"),
         );
 
-        let user_item = bridge_transcript_item(&user).expect("human input transcript item");
+        let user_item = transcript_item(&user).expect("human input transcript item");
         assert_eq!(user_item.role, "user");
         assert_eq!(user_item.content, "real user input");
         assert!(user_item.run_id.is_none());
-        assert!(bridge_transcript_item(&runtime).is_none());
-        let response_item =
-            bridge_transcript_item(&response).expect("runtime reply transcript item");
+        assert!(transcript_item(&runtime).is_none());
+        let response_item = transcript_item(&response).expect("runtime reply transcript item");
         assert_eq!(response_item.role, "assistant");
         assert_eq!(response_item.content, "reconciled result");
     }
 
     #[test]
-    fn bridge_transcript_projection_skips_blank_tool_only_model_rounds() {
+    fn transcript_projection_skips_blank_tool_only_model_rounds() {
         let response = core_event(
             "response-event",
             "user-1",
@@ -1010,7 +1032,7 @@ mod tests {
             Some("user-event"),
         );
 
-        assert!(bridge_transcript_item(&response).is_none());
+        assert!(transcript_item(&response).is_none());
     }
 
     fn core_event(

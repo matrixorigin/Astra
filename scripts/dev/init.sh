@@ -44,12 +44,12 @@ else
     echo "✅ ASTRA_JWT_SECRET already configured"
 fi
 
-if ! grep -q "^ASTRA_BRIDGE_SECRET=" "$ENV_FILE" || grep -Eq "^ASTRA_BRIDGE_SECRET=(|your-bridge-secret.*)$" "$ENV_FILE"; then
-    BRIDGE_KEY="$(openssl rand -hex 32)"
-    update_or_add "ASTRA_BRIDGE_SECRET" "$BRIDGE_KEY"
-    echo "✅ Generated ASTRA_BRIDGE_SECRET"
+if ! grep -q "^ASTRA_RUNTIME_ROOT_SECRET=" "$ENV_FILE" || grep -Eq "^ASTRA_RUNTIME_ROOT_SECRET=(|your-runtime-root-secret.*)$" "$ENV_FILE"; then
+    RUNTIME_ROOT_KEY="$(openssl rand -hex 32)"
+    update_or_add "ASTRA_RUNTIME_ROOT_SECRET" "$RUNTIME_ROOT_KEY"
+    echo "✅ Generated ASTRA_RUNTIME_ROOT_SECRET"
 else
-    echo "✅ ASTRA_BRIDGE_SECRET already configured"
+    echo "✅ ASTRA_RUNTIME_ROOT_SECRET already configured"
 fi
 
 # ── Optional: fast linker (mold) ──

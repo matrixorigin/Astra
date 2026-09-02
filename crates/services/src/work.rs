@@ -1221,8 +1221,9 @@ pub(crate) const WORK_EVENTS_CREATE_SQL: &str = "CREATE TABLE IF NOT EXISTS work
     CONSTRAINT chk_work_event_seq CHECK (event_seq > 0),
     CONSTRAINT chk_work_event_kind CHECK (event_kind IN (
         'work_created', 'goal_revised', 'criteria_accepted', 'branch_basis_adopted',
-        'graph_replaced', 'delivery_branch_selected',
-        'subject_changed', 'plan_proposed', 'criteria_proposed', 'proposal_rejected',
+        'graph_replaced', 'delivery_branch_selected', 'branch_archived', 'branch_restored',
+        'subject_changed', 'patch_artifact_exported',
+        'plan_proposed', 'criteria_proposed', 'proposal_rejected',
         'check_recorded', 'gaps_accepted',
         'run_completed', 'run_delegated', 'run_failed', 'run_cancelled',
         'runtime_events_expired'

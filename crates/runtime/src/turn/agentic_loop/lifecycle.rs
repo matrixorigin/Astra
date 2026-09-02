@@ -1681,22 +1681,17 @@ fn shell_pipeline_literal_script_artifact(segment: &str) -> Option<String> {
     {
         return None;
     }
-    let Some(words) = astra_turn_core::evaluation::split_static_shell_words(segment) else {
-        return None;
-    };
+    let words = astra_turn_core::evaluation::split_static_shell_words(segment)?;
     let [interpreter, script, ..] = words.as_slice() else {
         return None;
     };
     if script.starts_with('-') || matches!(script.as_str(), "-" | "." | "..") {
         return None;
     }
-    let Some(interpreter) = Path::new(interpreter)
+    let interpreter = Path::new(interpreter)
         .file_name()
         .and_then(|name| name.to_str())
-        .map(str::to_ascii_lowercase)
-    else {
-        return None;
-    };
+        .map(str::to_ascii_lowercase)?;
     let extension = Path::new(script)
         .extension()
         .and_then(|extension| extension.to_str())
@@ -3873,8 +3868,8 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
     reserve_budget_settlement_boundary(state);
 
     match state.rate_limit_cooldown.check_request(false) {
-        crate::bridge::RateLimitAction::Proceed => {}
-        crate::bridge::RateLimitAction::WaitAndRetry { delay_ms } => {
+        astra_turn_core::rate_limit_cooldown::RateLimitAction::Proceed => {}
+        astra_turn_core::rate_limit_cooldown::RateLimitAction::WaitAndRetry { delay_ms } => {
             if !quiet {
                 host.emit_headless_line(
                     HeadlessStderrStyle::Yellow,
@@ -3886,7 +3881,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             }
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
-        crate::bridge::RateLimitAction::UseFallback { .. } => {
+        astra_turn_core::rate_limit_cooldown::RateLimitAction::UseFallback { .. } => {
             if !quiet {
                 host.emit_headless_line(
                     HeadlessStderrStyle::Yellow,
@@ -3895,7 +3890,7 @@ pub(crate) async fn prepare_turn_iteration<H: AgenticLoopHost>(
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
-        crate::bridge::RateLimitAction::Reject {
+        astra_turn_core::rate_limit_cooldown::RateLimitAction::Reject {
             reason,
             reset_in_ms,
         } => {
@@ -7956,8 +7951,8 @@ mod tests {
             "cancel during pause must return Cancelled immediately"
         );
         assert!(
-            state.interruption.is_some(),
-            "interruption must be set when cancel wins inside pause loop"
+            state.interruption.is_none(),
+            "runtime cancellation must not fabricate user interruption authority"
         );
     }
 
@@ -7982,7 +7977,10 @@ mod tests {
             ),
             "token cancel during pause must return Cancelled immediately"
         );
-        assert!(state.interruption.is_some());
+        assert!(
+            state.interruption.is_none(),
+            "runtime cancellation must not fabricate user interruption authority"
+        );
     }
 
     /// Clean state (no cancel, no pause) → normal turn preparation.

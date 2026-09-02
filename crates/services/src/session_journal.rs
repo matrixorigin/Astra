@@ -2062,6 +2062,7 @@ impl SessionExecutionLease {
         }
         let file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&lock_path)
@@ -2095,8 +2096,7 @@ impl SessionExecutionLease {
             }),
             Ok(false) => Err(SessionExecutionLeaseError::Io {
                 session_id: session_id.to_string(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                source: std::io::Error::other(
                     "execution lease inode was replaced during acquisition",
                 ),
             }),
@@ -2486,234 +2486,217 @@ impl JournalWriter {
             );
         }
 
-        const MAX_GENERATION_RETRIES: usize = 8;
-        for _ in 0..MAX_GENERATION_RETRIES {
-            let opened = match open_unlocked_journal_file_with_creation(&self.path) {
-                Ok(opened) => opened,
-                Err(error) => {
-                    return CanonicalCommitCasOutcome::Unknown(format!(
-                        "failed to open canonical journal CAS: {error}"
-                    ));
-                }
-            };
-            let journal_created = opened.created;
-            let mut file = opened.file;
-            #[cfg(test)]
-            run_canonical_commit_cas_open_hook(&self.path);
-            if let Err(error) = file.lock_exclusive() {
+        let opened = match open_unlocked_journal_file_with_creation(&self.path) {
+            Ok(opened) => opened,
+            Err(error) => {
                 return CanonicalCommitCasOutcome::Unknown(format!(
-                    "failed to lock canonical journal CAS: {error}"
+                    "failed to open canonical journal CAS: {error}"
                 ));
             }
-            match open_journal_file_is_current(&file, &self.path) {
-                Ok(true) => {}
-                Ok(false) => {
-                    return CanonicalCommitCasOutcome::Unknown(
-                        "canonical journal generation rotated before CAS validation".to_string(),
-                    );
-                }
-                Err(error) => {
-                    return CanonicalCommitCasOutcome::Unknown(format!(
-                        "failed to verify canonical journal generation: {error}"
-                    ));
-                }
-            }
-
-            if let Err(error) = file.seek(SeekFrom::Start(0)) {
-                return CanonicalCommitCasOutcome::Unknown(format!(
-                    "failed to seek canonical journal CAS: {error}"
-                ));
-            }
-            let mut content = String::new();
-            if let Err(error) = file.read_to_string(&mut content) {
-                return CanonicalCommitCasOutcome::Unknown(format!(
-                    "failed to read canonical journal CAS: {error}"
-                ));
-            }
-            let (current_events, _, malformed_lines) =
-                match parse_complete_journal_text_in_append_order(&content) {
-                    Ok(parsed) => parsed,
-                    Err(error) => {
-                        return CanonicalCommitCasOutcome::Unknown(format!(
-                            "canonical journal CAS readback is incomplete: {error}"
-                        ));
-                    }
-                };
-            match classify_canonical_commit_presence(
-                &current_events,
-                malformed_lines,
-                turn,
-                intended,
-            ) {
-                CanonicalCommitPresence::Exact => {
-                    if let Err(error) = file.sync_data() {
-                        return CanonicalCommitCasOutcome::Unknown(format!(
-                            "failed canonical journal CAS durability fence: {error}"
-                        ));
-                    }
-                    return match open_journal_file_is_current(&file, &self.path) {
-                        Ok(true) => {
-                            if let Err(error) = self.sync_creation_metadata_if_needed(
-                                journal_created,
-                                false,
-                                lease_created_dirs,
-                            ) {
-                                CanonicalCommitCasOutcome::Unknown(format!(
-                                    "failed to sync canonical journal creation metadata: {error}"
-                                ))
-                            } else {
-                                CanonicalCommitCasOutcome::Committed {
-                                    persistence_warning: None,
-                                }
-                            }
-                        }
-                        Ok(false) => CanonicalCommitCasOutcome::Unknown(
-                            "canonical commit exists only on a rotated journal generation"
-                                .to_string(),
-                        ),
-                        Err(error) => CanonicalCommitCasOutcome::Unknown(format!(
-                            "failed to confirm canonical journal generation: {error}"
-                        )),
-                    };
-                }
-                CanonicalCommitPresence::Conflict(reason) => {
-                    return CanonicalCommitCasOutcome::Conflict(reason);
-                }
-                CanonicalCommitPresence::Unknown(reason) => {
-                    return CanonicalCommitCasOutcome::Unknown(reason);
-                }
-                CanonicalCommitPresence::Absent => {}
-            }
-
-            let current_base_cursor = current_events
-                .iter()
-                .filter_map(|event| event.conversation_commit.as_ref())
-                .last()
-                .map(|commit| &commit.cursor);
-            let first_canonical_commit = current_base_cursor.is_none();
-            if current_base_cursor != expected_base_cursor {
-                return CanonicalCommitCasOutcome::Conflict(
-                    "canonical journal base changed before turn settlement".to_string(),
+        };
+        let journal_created = opened.created;
+        let mut file = opened.file;
+        #[cfg(test)]
+        run_canonical_commit_cas_open_hook(&self.path);
+        if let Err(error) = file.lock_exclusive() {
+            return CanonicalCommitCasOutcome::Unknown(format!(
+                "failed to lock canonical journal CAS: {error}"
+            ));
+        }
+        match open_journal_file_is_current(&file, &self.path) {
+            Ok(true) => {}
+            Ok(false) => {
+                return CanonicalCommitCasOutcome::Unknown(
+                    "canonical journal generation rotated before CAS validation".to_string(),
                 );
             }
+            Err(error) => {
+                return CanonicalCommitCasOutcome::Unknown(format!(
+                    "failed to verify canonical journal generation: {error}"
+                ));
+            }
+        }
 
-            let needs_session_start = current_events
-                .last()
-                .is_none_or(|event| event.event_type == JournalEventType::SessionEnd);
-            let append_events = prepend_session_start_for_known_state(events, needs_session_start);
-            let serialized = match serialize_journal_events(append_events.as_ref()) {
-                Ok(serialized) => serialized,
+        if let Err(error) = file.seek(SeekFrom::Start(0)) {
+            return CanonicalCommitCasOutcome::Unknown(format!(
+                "failed to seek canonical journal CAS: {error}"
+            ));
+        }
+        let mut content = String::new();
+        if let Err(error) = file.read_to_string(&mut content) {
+            return CanonicalCommitCasOutcome::Unknown(format!(
+                "failed to read canonical journal CAS: {error}"
+            ));
+        }
+        let (current_events, _, malformed_lines) =
+            match parse_complete_journal_text_in_append_order(&content) {
+                Ok(parsed) => parsed,
                 Err(error) => {
-                    return CanonicalCommitCasOutcome::NotCommitted(format!(
-                        "failed to serialize canonical journal CAS: {error}"
+                    return CanonicalCommitCasOutcome::Unknown(format!(
+                        "canonical journal CAS readback is incomplete: {error}"
                     ));
                 }
             };
-            let write_error = file.write_all(&serialized).err();
-            if let Err(error) = file.sync_data() {
-                return CanonicalCommitCasOutcome::Unknown(format!(
-                    "failed canonical journal CAS durability fence: {error}"
-                ));
-            }
-            match open_journal_file_is_current(&file, &self.path) {
-                Ok(true) => {}
-                Ok(false) => {
-                    return CanonicalCommitCasOutcome::Unknown(
-                        "canonical journal generation rotated after CAS write".to_string(),
-                    );
-                }
-                Err(error) => {
+        match classify_canonical_commit_presence(&current_events, malformed_lines, turn, intended) {
+            CanonicalCommitPresence::Exact => {
+                if let Err(error) = file.sync_data() {
                     return CanonicalCommitCasOutcome::Unknown(format!(
-                        "failed to confirm canonical journal generation: {error}"
+                        "failed canonical journal CAS durability fence: {error}"
                     ));
                 }
+                return match open_journal_file_is_current(&file, &self.path) {
+                    Ok(true) => {
+                        if let Err(error) = self.sync_creation_metadata_if_needed(
+                            journal_created,
+                            false,
+                            lease_created_dirs,
+                        ) {
+                            CanonicalCommitCasOutcome::Unknown(format!(
+                                "failed to sync canonical journal creation metadata: {error}"
+                            ))
+                        } else {
+                            CanonicalCommitCasOutcome::Committed {
+                                persistence_warning: None,
+                            }
+                        }
+                    }
+                    Ok(false) => CanonicalCommitCasOutcome::Unknown(
+                        "canonical commit exists only on a rotated journal generation".to_string(),
+                    ),
+                    Err(error) => CanonicalCommitCasOutcome::Unknown(format!(
+                        "failed to confirm canonical journal generation: {error}"
+                    )),
+                };
             }
+            CanonicalCommitPresence::Conflict(reason) => {
+                return CanonicalCommitCasOutcome::Conflict(reason);
+            }
+            CanonicalCommitPresence::Unknown(reason) => {
+                return CanonicalCommitCasOutcome::Unknown(reason);
+            }
+            CanonicalCommitPresence::Absent => {}
+        }
 
-            if let Err(error) = file.seek(SeekFrom::Start(0)) {
-                return CanonicalCommitCasOutcome::Unknown(format!(
-                    "failed to seek canonical journal CAS verification: {error}"
+        let current_base_cursor = current_events
+            .iter()
+            .filter_map(|event| event.conversation_commit.as_ref())
+            .next_back()
+            .map(|commit| &commit.cursor);
+        let first_canonical_commit = current_base_cursor.is_none();
+        if current_base_cursor != expected_base_cursor {
+            return CanonicalCommitCasOutcome::Conflict(
+                "canonical journal base changed before turn settlement".to_string(),
+            );
+        }
+
+        let needs_session_start = current_events
+            .last()
+            .is_none_or(|event| event.event_type == JournalEventType::SessionEnd);
+        let append_events = prepend_session_start_for_known_state(events, needs_session_start);
+        let serialized = match serialize_journal_events(append_events.as_ref()) {
+            Ok(serialized) => serialized,
+            Err(error) => {
+                return CanonicalCommitCasOutcome::NotCommitted(format!(
+                    "failed to serialize canonical journal CAS: {error}"
                 ));
             }
-            let mut verified_content = String::new();
-            if let Err(error) = file.read_to_string(&mut verified_content) {
+        };
+        let write_error = file.write_all(&serialized).err();
+        if let Err(error) = file.sync_data() {
+            return CanonicalCommitCasOutcome::Unknown(format!(
+                "failed canonical journal CAS durability fence: {error}"
+            ));
+        }
+        match open_journal_file_is_current(&file, &self.path) {
+            Ok(true) => {}
+            Ok(false) => {
+                return CanonicalCommitCasOutcome::Unknown(
+                    "canonical journal generation rotated after CAS write".to_string(),
+                );
+            }
+            Err(error) => {
                 return CanonicalCommitCasOutcome::Unknown(format!(
-                    "failed to read canonical journal CAS verification: {error}"
+                    "failed to confirm canonical journal generation: {error}"
                 ));
             }
-            let (verified_events, _, verified_malformed_lines) =
-                match parse_complete_journal_text_in_append_order(&verified_content) {
-                    Ok(parsed) => parsed,
+        }
+
+        if let Err(error) = file.seek(SeekFrom::Start(0)) {
+            return CanonicalCommitCasOutcome::Unknown(format!(
+                "failed to seek canonical journal CAS verification: {error}"
+            ));
+        }
+        let mut verified_content = String::new();
+        if let Err(error) = file.read_to_string(&mut verified_content) {
+            return CanonicalCommitCasOutcome::Unknown(format!(
+                "failed to read canonical journal CAS verification: {error}"
+            ));
+        }
+        let (verified_events, _, verified_malformed_lines) =
+            match parse_complete_journal_text_in_append_order(&verified_content) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    return CanonicalCommitCasOutcome::Unknown(format!(
+                        "canonical journal CAS verification is incomplete: {error}"
+                    ));
+                }
+            };
+        match classify_canonical_commit_presence(
+            &verified_events,
+            verified_malformed_lines,
+            turn,
+            intended,
+        ) {
+            CanonicalCommitPresence::Exact => {
+                match open_journal_file_is_current(&file, &self.path) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return CanonicalCommitCasOutcome::Unknown(
+                            "canonical journal generation rotated during CAS verification"
+                                .to_string(),
+                        );
+                    }
                     Err(error) => {
                         return CanonicalCommitCasOutcome::Unknown(format!(
-                            "canonical journal CAS verification is incomplete: {error}"
+                            "failed final canonical journal generation check: {error}"
                         ));
                     }
-                };
-            return match classify_canonical_commit_presence(
-                &verified_events,
-                verified_malformed_lines,
-                turn,
-                intended,
-            ) {
-                CanonicalCommitPresence::Exact => {
-                    match open_journal_file_is_current(&file, &self.path) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            return CanonicalCommitCasOutcome::Unknown(
-                                "canonical journal generation rotated during CAS verification"
-                                    .to_string(),
-                            );
-                        }
-                        Err(error) => {
-                            return CanonicalCommitCasOutcome::Unknown(format!(
-                                "failed final canonical journal generation check: {error}"
-                            ));
-                        }
-                    }
-                    if let Err(error) = self.sync_creation_metadata_if_needed(
-                        journal_created,
-                        first_canonical_commit,
-                        lease_created_dirs,
-                    ) {
-                        return CanonicalCommitCasOutcome::Unknown(format!(
-                            "failed to sync canonical journal creation metadata: {error}"
-                        ));
-                    }
-                    update_cached_session_start_state_from_events(
-                        &self.path,
-                        append_events.as_ref(),
-                    );
-                    CanonicalCommitCasOutcome::Committed {
+                }
+                if let Err(error) = self.sync_creation_metadata_if_needed(
+                    journal_created,
+                    first_canonical_commit,
+                    lease_created_dirs,
+                ) {
+                    return CanonicalCommitCasOutcome::Unknown(format!(
+                        "failed to sync canonical journal creation metadata: {error}"
+                    ));
+                }
+                update_cached_session_start_state_from_events(&self.path, append_events.as_ref());
+                CanonicalCommitCasOutcome::Committed {
                         persistence_warning: write_error.map(|error| {
                             format!(
                                 "canonical journal CAS write reported an error but exact durable verification succeeded: {error}"
                             )
                         }),
                     }
+            }
+            CanonicalCommitPresence::Absent => {
+                if let Some(error) = write_error {
+                    CanonicalCommitCasOutcome::NotCommitted(format!(
+                        "canonical journal CAS write failed and exact commit is absent: {error}"
+                    ))
+                } else {
+                    CanonicalCommitCasOutcome::Unknown(
+                        "canonical journal CAS write succeeded but exact commit is absent"
+                            .to_string(),
+                    )
                 }
-                CanonicalCommitPresence::Absent => {
-                    if let Some(error) = write_error {
-                        CanonicalCommitCasOutcome::NotCommitted(format!(
-                            "canonical journal CAS write failed and exact commit is absent: {error}"
-                        ))
-                    } else {
-                        CanonicalCommitCasOutcome::Unknown(
-                            "canonical journal CAS write succeeded but exact commit is absent"
-                                .to_string(),
-                        )
-                    }
-                }
-                CanonicalCommitPresence::Conflict(reason)
-                | CanonicalCommitPresence::Unknown(reason) => CanonicalCommitCasOutcome::Unknown(
-                    format!("canonical journal CAS verification failed: {reason}"),
-                ),
-            };
+            }
+            CanonicalCommitPresence::Conflict(reason)
+            | CanonicalCommitPresence::Unknown(reason) => CanonicalCommitCasOutcome::Unknown(
+                format!("canonical journal CAS verification failed: {reason}"),
+            ),
         }
-
-        CanonicalCommitCasOutcome::Unknown(format!(
-            "journal {} kept rotating before canonical CAS write",
-            self.session_id
-        ))
     }
 
     /// Commit prior no-sync appends to the local durable boundary without

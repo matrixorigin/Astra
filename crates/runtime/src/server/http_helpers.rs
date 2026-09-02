@@ -42,10 +42,18 @@ pub(super) fn sse_json_response(events: Vec<serde_json::Value>) -> Response {
         })
         .collect::<String>();
 
-    with_interaction_protocol(bridge::sse_stream_response(
-        StatusCode::OK,
-        Body::from(body),
-    ))
+    with_interaction_protocol(sse_stream_response(StatusCode::OK, Body::from(body)))
+}
+
+pub(crate) fn sse_stream_response(status: StatusCode, body: Body) -> Response {
+    Response::builder()
+        .status(status)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("connection", "keep-alive")
+        .header("x-accel-buffering", "no")
+        .body(body)
+        .expect("static SSE response headers are valid")
 }
 
 fn with_interaction_protocol(mut response: Response) -> Response {
@@ -506,7 +514,7 @@ pub(super) fn sse_projected_streaming_response(
     };
 
     let body = Body::from_stream(stream);
-    with_interaction_protocol(bridge::sse_stream_response(StatusCode::OK, body))
+    with_interaction_protocol(sse_stream_response(StatusCode::OK, body))
 }
 
 fn sse_stream_event_string_field<'a>(event: &'a serde_json::Value, field: &str) -> Option<&'a str> {
@@ -689,7 +697,7 @@ mod tests {
     #[tokio::test]
     async fn sse_error_response_from_error_preserves_machine_fields() {
         let error = ErrorResponse::new("stale")
-            .with_error_code("bridge_session_turn_mismatch")
+            .with_error_code("session_turn_mismatch")
             .with_request_id("req-1")
             .with_metadata(serde_json::json!({"expected_session_turn": 2}));
         let response = sse_error_response_from_error_with_context(
@@ -708,7 +716,7 @@ mod tests {
         let event: serde_json::Value = serde_json::from_str(data).expect("json");
         assert_eq!(event["type"], "error");
         assert_eq!(event["message"], "stale");
-        assert_eq!(event["error_code"], "bridge_session_turn_mismatch");
+        assert_eq!(event["error_code"], "session_turn_mismatch");
         assert_eq!(event["request_id"], "req-1");
         assert_eq!(event["metadata"]["expected_session_turn"], 2);
     }

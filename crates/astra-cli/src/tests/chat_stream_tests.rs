@@ -37,11 +37,26 @@ fn sse_text_response_with_execution_summary(
     tools_used: &[&str],
     llm_rounds: u32,
 ) -> String {
+    let tool_ledger_receipt = astra_turn_core::tool_ledger_receipt::ToolLedgerReceipt::new(
+        format!("run-{session_id}"),
+        1,
+        tool_calls_count,
+        tool_calls_count,
+        0,
+        astra_turn_core::tool_ledger_receipt::ToolLedgerResultClassCounts {
+            succeeded: tool_calls_count,
+            ..Default::default()
+        },
+        u64::from(tool_calls_count),
+        astra_turn_core::tool_ledger_receipt::EMPTY_TOOL_LEDGER_ROOT,
+        true,
+    );
     format!(
         "data: {{\"type\":\"session_info\",\"session_id\":\"{session_id}\",\"run_id\":\"run-{session_id}\"}}\n\n\
              data: {{\"type\":\"text_delta\",\"content\":\"{text}\"}}\n\n\
              data: {{\"type\":\"text_done\",\"full_text\":\"{text}\"}}\n\n\
              data: {{\"type\":\"usage\",\"input_tokens\":10,\"output_tokens\":5}}\n\n\
+             data: {{\"type\":\"run_finished\",\"run_id\":\"run-{session_id}\",\"status\":\"completed\",\"owner_generation\":1}}\n\n\
              data: {}\n\n\
              data: [DONE]\n\n",
         serde_json::json!({
@@ -52,6 +67,7 @@ fn sse_text_response_with_execution_summary(
             "observation_tool_calls_count": observation_tool_calls_count,
             "tools_used": tools_used,
             "llm_rounds": llm_rounds,
+            "tool_ledger_receipt": tool_ledger_receipt,
             "runtime_feedback": {
                 "schema_version": astra_turn_core::context_feedback::RuntimeFeedbackFrame::SCHEMA_VERSION,
                 "identity": {
@@ -1196,6 +1212,8 @@ async fn stream_chat_sse_journals_transaction_boundaries_end_to_end() {
                                     "turn_chain_id": turn_chain_id,
                                     "request_id": "tr-tx-1",
                                     "schema_admitted_by_server": true,
+                                    "execution_timeout_ms": 300_000,
+                                    "execution_deadline_unix_ms": 4_102_444_800_000_u64,
                                     "tool": "bash",
                                     "args": {
                                         "command": "echo hi",
@@ -1533,7 +1551,7 @@ async fn stream_chat_sse_does_not_retry_server_conflicts_with_client_cursor_stat
                             serde_json::json!({
                                 "type": "error",
                                 "message": "explicit bridge session_turn 3 does not match canonical turn 2",
-                                "error_code": "bridge_session_turn_mismatch",
+                                "error_code": "session_turn_mismatch",
                                 "metadata": {
                                     "session_id": "sess-stale",
                                     "actual_session_turn": 3,

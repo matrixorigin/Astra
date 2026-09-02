@@ -805,6 +805,26 @@ impl ToolExecutor for DefaultToolExecutor {
 // ─── Dispatch ───────────────────────────────────────────────────────────────
 
 impl DefaultToolExecutor {
+    /// Execute through this workspace owner while binding convergence facts to
+    /// the caller's live run/turn authority. The shallow clone keeps the
+    /// executor's caches and generation counters shared; only the authority
+    /// envelope is request-scoped.
+    pub async fn execute_with_workspace_convergence_authority(
+        &self,
+        name: &str,
+        args: &Value,
+        convergence_tracker: &crate::workspace_observation::DesiredStateConvergenceTracker,
+        convergence_authority: &str,
+        cancel_token: Option<&CancellationToken>,
+    ) -> ToolResult {
+        let mut delegated = self.clone();
+        delegated.convergence_tracker = convergence_tracker.clone();
+        delegated.convergence_authority = Arc::from(convergence_authority);
+        delegated
+            .execute_with_cancel(name, args, cancel_token)
+            .await
+    }
+
     fn bash_cache_key(&self, args: &Value) -> Option<BashCacheKey> {
         use crate::bash_cache_safety::bash_command_is_cache_safe;
         use std::collections::hash_map::DefaultHasher;

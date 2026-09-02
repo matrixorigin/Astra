@@ -80,7 +80,7 @@ async fn build_app_keeps_core_http_and_websocket_surfaces_registered() {
             &[
                 ("authorization", "Bearer test-token"),
                 ("content-type", "application/json"),
-                ("x-mo-bridge-test-secret", "guardrail-secret"),
+                ("x-astra-e2e-test-secret", "guardrail-secret"),
             ],
             Body::from("{}"),
         ),

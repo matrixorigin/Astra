@@ -641,7 +641,7 @@ pub(crate) fn durable_agent_status(run: &astra_services::runs::DurableRunRecord)
             match terminal
                 .and_then(|event| event.pointer("/data/cancellation_origin"))
                 .and_then(serde_json::Value::as_str)
-                .and_then(CancellationOrigin::from_str)
+                .and_then(|origin| origin.parse().ok())
                 .unwrap_or(CancellationOrigin::Unverified)
             {
                 CancellationOrigin::User => AgentStatus::cancelled_by_user(reason),
@@ -6562,7 +6562,6 @@ mod tests {
             agent_binding_schema_version: None,
             model_offering_id: None,
             resolved_model_name: None,
-            capability_server_refs_json: None,
             runtime_profile: None,
             start_request_fingerprint: None,
             work_binding: None,
@@ -9647,7 +9646,10 @@ mod tests {
             .cancel_fanout_group_for_runtime(group_id, "runtime deadline")
             .await
             .expect("fanout remains queryable");
-        assert_eq!(runtime.cancellation_pending_agent_ids, [agent_id.clone()]);
+        assert_eq!(
+            runtime.cancellation_pending_agent_ids,
+            std::slice::from_ref(&agent_id)
+        );
         tokio::time::timeout(
             Duration::from_secs(1),
             executor.runtime_attempted.notified(),
@@ -12720,7 +12722,10 @@ mod tests {
                 CancellationOrigin::Unverified => unreachable!(),
             }
             .expect("fanout remains queryable");
-            assert_eq!(cancellation.stopped_agent_ids, [agent_id.clone()]);
+            assert_eq!(
+                cancellation.stopped_agent_ids,
+                std::slice::from_ref(&agent_id)
+            );
             tokio::time::timeout(Duration::from_secs(1), async {
                 while spawner.has_in_flight_cancellation_owners().await {
                     tokio::task::yield_now().await;
@@ -12822,7 +12827,7 @@ mod tests {
         assert!(cancellation.stopped_agent_ids.is_empty());
         assert_eq!(
             cancellation.cancellation_pending_agent_ids,
-            [agent_id.clone()]
+            std::slice::from_ref(&agent_id)
         );
         assert!(cancellation.not_stopped_agent_ids.is_empty());
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -12987,7 +12992,7 @@ mod tests {
         assert!(cancellation.stopped_agent_ids.is_empty());
         assert_eq!(
             cancellation.cancellation_pending_agent_ids,
-            [agent_id.clone()]
+            std::slice::from_ref(&agent_id)
         );
         assert!(cancellation.not_stopped_agent_ids.is_empty());
         assert_pending_cancellation_projection(&spawner, group_id, &agent_id).await;
@@ -13094,7 +13099,7 @@ mod tests {
         assert!(cancellation.stopped_agent_ids.is_empty());
         assert_eq!(
             cancellation.cancellation_pending_agent_ids,
-            [agent_id.clone()]
+            std::slice::from_ref(&agent_id)
         );
         assert!(cancellation.not_stopped_agent_ids.is_empty());
         assert_pending_cancellation_projection(&spawner, group_id, &agent_id).await;

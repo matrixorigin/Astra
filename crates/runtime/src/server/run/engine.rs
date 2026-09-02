@@ -47,19 +47,19 @@ use astra_services::{
         AtomicRunGuidanceAdmission, AtomicRunGuidanceAdmissionRequest,
         AtomicRunToolRequestCommitOutcome, AtomicRunToolRequestCommitRequest,
         AtomicRunUserIntentAdmissionTransition, AtomicRunUserIntentAdmissionTransitionRequest,
-        AtomicRunUserIntentApply, AtomicRunUserIntentApplyRequest, CapabilityServerRefs,
-        DurableCancellationOrigin, DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord,
-        DurableRunEventDelta, DurableRunGuidanceAdmissionRecord, DurableRunInteractionKind,
+        AtomicRunUserIntentApply, AtomicRunUserIntentApplyRequest, DurableCancellationOrigin,
+        DurableRunCheckpointRecord, DurableRunDisplayProjectionRecord, DurableRunEventDelta,
+        DurableRunGuidanceAdmissionRecord, DurableRunInteractionKind,
         DurableRunInteractionResolveOutcome, DurableRunListPage, DurableRunRecord,
         DurableRunStartClaim, DurableRunStatusKind, DurableRunStatusSnapshot,
         DurableRunUserIntentControlDelta, DurableWorkItemRunBinding, DurableWorkRunBinding,
         GuardedRunStatusTransition, GuardedRunStatusTransitionRequest,
         RUN_RECOVERY_CLAIM_BATCH_SIZE, RequestedTurnInteractionMode, ResolvedModelSelection,
         RunExecutionBoundaryAuthorization, RunExecutionBoundaryAuthorizationRequest, RunListCursor,
-        RunStateStore, RunUserIntentAdmissionTransition, RuntimeProfileRequest,
-        SkillAutoRouteExecutionPolicy, TurnIntentExecutionPolicy,
-        USER_INTENT_CONTROL_DELTA_PAGE_SIZE, durable_run_status_is_terminal,
-        durable_run_status_kind,
+        RunStateStore, RunStatusCasRequest, RunUsageOwnerUpdateRequest,
+        RunUserIntentAdmissionTransition, RuntimeProfileRequest, SkillAutoRouteExecutionPolicy,
+        TurnIntentExecutionPolicy, USER_INTENT_CONTROL_DELTA_PAGE_SIZE,
+        durable_run_status_is_terminal, durable_run_status_kind,
     },
 };
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
@@ -320,7 +320,6 @@ pub struct RunStartContext {
     pub agent_binding_schema_version: Option<String>,
     pub model_selection: Option<ModelSelection>,
     pub resolved_model_selection: Option<ResolvedModelSelection>,
-    pub capability_server_refs: Option<CapabilityServerRefs>,
     pub runtime_profile: Option<RuntimeProfileRequest>,
     pub provider_request_fingerprint: Option<String>,
     pub provider_run_owner: Option<astra_services::runs::ProviderRunOwner>,
@@ -352,7 +351,6 @@ impl Default for RunStartContext {
             agent_binding_schema_version: None,
             model_selection: None,
             resolved_model_selection: None,
-            capability_server_refs: None,
             runtime_profile: None,
             provider_request_fingerprint: None,
             provider_run_owner: None,
@@ -516,7 +514,7 @@ pub(crate) fn effective_requested_interaction_mode(
     requested: Option<RequestedTurnInteractionMode>,
     interactive_client: bool,
 ) -> RequestedTurnInteractionMode {
-    requested.unwrap_or_else(|| {
+    requested.unwrap_or({
         if interactive_client {
             RequestedTurnInteractionMode::Prompt
         } else {
@@ -750,11 +748,6 @@ fn run_started_event_data(context: &RunStartContext) -> serde_json::Value {
         && let Ok(value) = serde_json::to_value(resolved_model_selection)
     {
         data.insert("resolved_model_selection".to_string(), value);
-    }
-    if let Some(capability_server_refs) = context.capability_server_refs.as_ref()
-        && let Ok(value) = serde_json::to_value(capability_server_refs)
-    {
-        data.insert("capability_server_refs".to_string(), value);
     }
     if let Some(runtime_profile) = context.runtime_profile {
         data.insert(
@@ -1191,19 +1184,6 @@ impl RunEngine {
             (Some(run_id.to_string()), Some(run_id.to_string()), 0)
         };
         let (model_offering_id, resolved_model_name) = durable_model_identity(&context)?;
-        let capability_server_refs_json =
-            context.capability_server_refs.as_ref().and_then(|refs| {
-                serde_json::to_string(refs)
-                    .inspect_err(|error| {
-                        tracing::warn!(
-                            target: "astra_runtime::engine",
-                            run_id = %run_id,
-                            %error,
-                            "failed to serialize capability_server_refs for durable run record"
-                        );
-                    })
-                    .ok()
-            });
         let runtime_profile = context
             .runtime_profile
             .map(runtime_profile_label)
@@ -1240,7 +1220,6 @@ impl RunEngine {
             agent_binding_schema_version: context.agent_binding_schema_version,
             model_offering_id,
             resolved_model_name,
-            capability_server_refs_json,
             runtime_profile,
             start_request_fingerprint: context.start_request_fingerprint,
             work_binding: context.work_binding,
@@ -1327,14 +1306,17 @@ impl RunEngine {
     /// overwriting a newer pause/cancel/terminal status.
     pub async fn persist_status_if_current(
         &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        expected_statuses: &[&str],
-        status: &str,
-        waiting_for: Option<&str>,
-        error_message: Option<&str>,
+        request: RunStatusCasRequest<'_>,
     ) -> Result<bool, String> {
+        let RunStatusCasRequest {
+            user_id,
+            expected_session_id,
+            run_id,
+            expected_statuses,
+            status,
+            waiting_for,
+            error_message,
+        } = request;
         if durable_run_status_kind(status) == DurableRunStatusKind::Cancelled {
             return Err(format!(
                 "persist_status_if_current cannot infer cancellation authority for run {run_id}; use the durable User marker flow or cancel_if_exact_live_owner with an explicit Runtime/Unverified origin"
@@ -1362,7 +1344,7 @@ impl RunEngine {
                 .await?
         } else {
             self.store
-                .update_run_status_if_current(
+                .update_run_status_if_current(RunStatusCasRequest {
                     user_id,
                     expected_session_id,
                     run_id,
@@ -1370,7 +1352,7 @@ impl RunEngine {
                     status,
                     waiting_for,
                     error_message,
-                )
+                })
                 .await?
         };
         if updated {
@@ -1454,15 +1436,15 @@ impl RunEngine {
 
         if !transition.terminal {
             return self
-                .persist_status_if_current(
+                .persist_status_if_current(RunStatusCasRequest {
                     user_id,
                     expected_session_id,
                     run_id,
-                    transition.expected_statuses,
-                    transition.canonical_status,
+                    expected_statuses: transition.expected_statuses,
+                    status: transition.canonical_status,
                     waiting_for,
                     error_message,
-                )
+                })
                 .await;
         }
 
@@ -2269,7 +2251,7 @@ impl RunEngine {
         tool_calls: u32,
     ) -> Result<bool, String> {
         self.store
-            .update_run_usage_if_current_owner(
+            .update_run_usage_if_current_owner(RunUsageOwnerUpdateRequest {
                 user_id,
                 expected_session_id,
                 run_id,
@@ -2277,7 +2259,7 @@ impl RunEngine {
                 prompt_tokens,
                 completion_tokens,
                 tool_calls,
-            )
+            })
             .await
     }
 
@@ -3971,25 +3953,9 @@ impl astra_server_types::team_orchestrator_traits::RunPersistence for RunEngine 
 
     async fn persist_status_if_current(
         &self,
-        user_id: &str,
-        expected_session_id: &str,
-        run_id: &str,
-        expected_statuses: &[&str],
-        status: &str,
-        waiting_for: Option<&str>,
-        error_message: Option<&str>,
+        request: RunStatusCasRequest<'_>,
     ) -> Result<bool, String> {
-        RunEngine::persist_status_if_current(
-            self,
-            user_id,
-            expected_session_id,
-            run_id,
-            expected_statuses,
-            status,
-            waiting_for,
-            error_message,
-        )
-        .await
+        RunEngine::persist_status_if_current(self, request).await
     }
 
     async fn persist_usage(
@@ -5137,7 +5103,13 @@ mod tests {
                                 Some("cancelled elsewhere"),
                                 &[serde_json::json!({
                                     "event_type": "run_finished",
-                                    "data": {"status": STATUS_CANCELLED}
+                                    "data": {
+                                        "status": STATUS_CANCELLED,
+                                        "cancelled": true,
+                                        "cancellation_origin": "unverified",
+                                        "reason": "concurrent cancellation won",
+                                        "source": "test_store",
+                                    }
                                 })],
                             )
                             .await?;
@@ -5212,25 +5184,9 @@ mod tests {
 
         async fn update_run_status_if_current(
             &self,
-            user_id: &str,
-            expected_session_id: &str,
-            run_id: &str,
-            expected_statuses: &[&str],
-            status: &str,
-            waiting_for: Option<&str>,
-            error_message: Option<&str>,
+            request: RunStatusCasRequest<'_>,
         ) -> Result<bool, String> {
-            self.inner
-                .update_run_status_if_current(
-                    user_id,
-                    expected_session_id,
-                    run_id,
-                    expected_statuses,
-                    status,
-                    waiting_for,
-                    error_message,
-                )
-                .await
+            self.inner.update_run_status_if_current(request).await
         }
 
         async fn update_run_status_with_event_if_current(
@@ -5294,7 +5250,7 @@ mod tests {
                     }
                     BatchTransitionFailureMode::FailAfterStatusWrite => {
                         self.inner
-                            .update_run_status_if_current(
+                            .update_run_status_if_current(RunStatusCasRequest {
                                 user_id,
                                 expected_session_id,
                                 run_id,
@@ -5302,7 +5258,7 @@ mod tests {
                                 status,
                                 waiting_for,
                                 error_message,
-                            )
+                            })
                             .await?;
                         return Err("transient EOF after status-only commit".to_string());
                     }
@@ -5319,7 +5275,13 @@ mod tests {
                                 Some("cancelled elsewhere"),
                                 &[serde_json::json!({
                                     "event_type": "run_finished",
-                                    "data": {"status": STATUS_CANCELLED}
+                                    "data": {
+                                        "status": STATUS_CANCELLED,
+                                        "cancelled": true,
+                                        "cancellation_origin": "unverified",
+                                        "reason": "concurrent cancellation won",
+                                        "source": "test_store",
+                                    }
                                 })],
                             )
                             .await?;
@@ -5365,25 +5327,9 @@ mod tests {
 
         async fn update_run_usage_if_current_owner(
             &self,
-            user_id: &str,
-            expected_session_id: &str,
-            run_id: &str,
-            expected_owner_generation: u64,
-            prompt_tokens: u64,
-            completion_tokens: u64,
-            tool_calls: u32,
+            request: RunUsageOwnerUpdateRequest<'_>,
         ) -> Result<bool, String> {
-            self.inner
-                .update_run_usage_if_current_owner(
-                    user_id,
-                    expected_session_id,
-                    run_id,
-                    expected_owner_generation,
-                    prompt_tokens,
-                    completion_tokens,
-                    tool_calls,
-                )
-                .await
+            self.inner.update_run_usage_if_current_owner(request).await
         }
 
         async fn save_checkpoint(
@@ -5604,13 +5550,7 @@ mod tests {
 
         async fn update_run_status_if_current(
             &self,
-            _user_id: &str,
-            _expected_session_id: &str,
-            _run_id: &str,
-            _expected_statuses: &[&str],
-            _status: &str,
-            _waiting_for: Option<&str>,
-            _error_message: Option<&str>,
+            _request: RunStatusCasRequest<'_>,
         ) -> Result<bool, String> {
             Err("store unavailable".into())
         }
@@ -5658,13 +5598,7 @@ mod tests {
 
         async fn update_run_usage_if_current_owner(
             &self,
-            _user_id: &str,
-            _expected_session_id: &str,
-            _run_id: &str,
-            _expected_owner_generation: u64,
-            _prompt_tokens: u64,
-            _completion_tokens: u64,
-            _tool_calls: u32,
+            _request: RunUsageOwnerUpdateRequest<'_>,
         ) -> Result<bool, String> {
             Err("store unavailable".into())
         }
@@ -6317,10 +6251,6 @@ mod tests {
             agent_bindings: Vec::new(),
             agent_binding: Some(astra_services::runs::AgentBindingRuntimeRequest {
                 id: "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391".to_string(),
-                capability_server_refs: astra_services::runs::CapabilityServerRefs {
-                    mcp: "mcp-main".to_string(),
-                    skills: "skills-main".to_string(),
-                },
             }),
             runtime_auth: None,
             runtime_skill_binding: None,
@@ -7334,15 +7264,15 @@ mod tests {
             .unwrap_err();
         assert!(direct_error.contains("cannot infer cancellation authority"));
         let cas_error = engine
-            .persist_status_if_current(
-                "user-1",
-                "session-1",
-                "ambiguous-cancel",
-                &[STATUS_RUNNING],
-                STATUS_CANCELLED,
-                None,
-                None,
-            )
+            .persist_status_if_current(RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: "session-1",
+                run_id: "ambiguous-cancel",
+                expected_statuses: &[STATUS_RUNNING],
+                status: STATUS_CANCELLED,
+                waiting_for: None,
+                error_message: None,
+            })
             .await
             .unwrap_err();
         assert!(cas_error.contains("cannot infer cancellation authority"));
@@ -8719,15 +8649,15 @@ mod tests {
             .unwrap();
 
         let updated = engine
-            .persist_status_if_current(
-                "user-1",
-                "sess-cas",
-                "run-cas",
-                &[STATUS_RUNNING],
-                STATUS_RUNNING,
-                None,
-                None,
-            )
+            .persist_status_if_current(RunStatusCasRequest {
+                user_id: "user-1",
+                expected_session_id: "sess-cas",
+                run_id: "run-cas",
+                expected_statuses: &[STATUS_RUNNING],
+                status: STATUS_RUNNING,
+                waiting_for: None,
+                error_message: None,
+            })
             .await
             .unwrap();
 
@@ -9100,7 +9030,6 @@ mod tests {
                 agent_binding_schema_version: None,
                 model_offering_id: None,
                 resolved_model_name: None,
-                capability_server_refs_json: None,
                 runtime_profile: None,
                 start_request_fingerprint: None,
                 work_binding: None,

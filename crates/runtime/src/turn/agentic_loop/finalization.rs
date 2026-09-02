@@ -1909,7 +1909,9 @@ mod tests {
         assert!(
             state
                 .final_text
-                .contains("Why stopped: required workspace mutation was still missing")
+                .contains("Why stopped: typed completion action was not satisfied"),
+            "unexpected incomplete terminal: {}",
+            state.final_text
         );
         assert!(state.final_text.contains(answer));
         assert_eq!(state.messages.len(), 2);

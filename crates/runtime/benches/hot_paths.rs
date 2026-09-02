@@ -5,9 +5,9 @@
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use serde_json::json;
 
-use astra_runtime::bridge::sse_events::{find_sse_frame_end, parse_sse_json_frame};
 use astra_runtime::prompts::{estimate_str_tokens, estimate_tokens};
 use astra_runtime::text_tokenize::{build_tf, tokenize};
+use astra_turn_core::sse_events::{find_sse_frame_end, parse_sse_json_frame};
 
 // ── Tool Surface: always-load build (hot path, every turn) ──────
 

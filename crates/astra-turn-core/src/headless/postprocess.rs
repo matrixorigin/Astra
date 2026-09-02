@@ -494,9 +494,12 @@ mod tests {
     fn step_timeout_abort_none_under_long_budget() {
         let d = HeadlessStepDeadline::from_scheduling_timeout_ms(60_000);
         let indices = vec![HeadlessRoundToolIdx::ServerToolCall(0)];
-        let r = d.step_timeout_abort(&indices, 0, &[json!({"name":"x","arguments":{}})], |_| {
-            "y".into()
-        });
+        let r = d.step_timeout_abort(
+            &indices,
+            0,
+            &[json!({"id":"call-x","type":"function","function":{"name":"x","arguments":"{}"}})],
+            |_| "y".into(),
+        );
         assert!(r.is_none());
     }
 
@@ -505,7 +508,11 @@ mod tests {
         let d = HeadlessStepDeadline::from_scheduling_timeout_ms(0);
         std::thread::sleep(Duration::from_millis(15));
         let indices = vec![HeadlessRoundToolIdx::ServerToolCall(0)];
-        let server = vec![json!({"name":"read_file","arguments":{}})];
+        let server = vec![json!({
+            "id": "call-read",
+            "type": "function",
+            "function": {"name":"read_file","arguments":"{}"}
+        })];
         let r = d
             .step_timeout_abort(&indices, 0, &server, |_| "edge".into())
             .expect("deadline should elapse");

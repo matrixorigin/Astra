@@ -250,21 +250,35 @@ pub struct ToolResultRequestParts {
     pub tool_result_fields: Option<Map<String, Value>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ToolResultHashParts<'a> {
+    pub session_id: &'a str,
+    pub run_id: &'a str,
+    pub turn_chain_id: &'a str,
+    pub request_id: &'a str,
+    pub edge_agent_id: &'a str,
+    pub status: &'a str,
+    pub output: &'a str,
+    pub duration_ms: u64,
+    pub tool_result_fields: Option<&'a Map<String, Value>>,
+}
+
 impl ToolResultRequest {
     /// Compute the v2 canonical hash for every authority-bearing callback
     /// field. JSON object keys are sorted recursively, so independently
     /// constructed metadata maps produce the same digest.
-    pub fn compute_result_hash(
-        session_id: &str,
-        run_id: &str,
-        turn_chain_id: &str,
-        request_id: &str,
-        edge_agent_id: &str,
-        status: &str,
-        output: &str,
-        duration_ms: u64,
-        tool_result_fields: Option<&Map<String, Value>>,
-    ) -> String {
+    pub fn compute_result_hash(parts: ToolResultHashParts<'_>) -> String {
+        let ToolResultHashParts {
+            session_id,
+            run_id,
+            turn_chain_id,
+            request_id,
+            edge_agent_id,
+            status,
+            output,
+            duration_ms,
+            tool_result_fields,
+        } = parts;
         let payload = serde_json::json!({
             "schema": "astra.tool_result_hash.v2",
             "session_id": session_id,
@@ -297,17 +311,17 @@ impl ToolResultRequest {
             duration_ms,
             tool_result_fields,
         } = parts;
-        let result_hash = Self::compute_result_hash(
-            &session_id,
-            &run_id,
-            &turn_chain_id,
-            &request_id,
-            &edge_agent_id,
-            &status,
-            &output,
+        let result_hash = Self::compute_result_hash(ToolResultHashParts {
+            session_id: &session_id,
+            run_id: &run_id,
+            turn_chain_id: &turn_chain_id,
+            request_id: &request_id,
+            edge_agent_id: &edge_agent_id,
+            status: &status,
+            output: &output,
             duration_ms,
-            tool_result_fields.as_ref(),
-        );
+            tool_result_fields: tool_result_fields.as_ref(),
+        });
         Self {
             session_id,
             run_id,
@@ -1894,9 +1908,8 @@ mod tests {
 
     #[test]
     fn tool_result_status_contract_is_exact_and_closed_world() {
-        for status in ["completed"] {
-            assert_eq!(tool_result_status_is_error(status), Some(false), "{status}");
-        }
+        let status = "completed";
+        assert_eq!(tool_result_status_is_error(status), Some(false), "{status}");
         for status in [
             "failed",
             "partial_failure",
@@ -2012,17 +2025,17 @@ mod tests {
         assert_eq!(decoded.result_hash, first.result_hash);
         assert_eq!(
             decoded.result_hash,
-            ToolResultRequest::compute_result_hash(
-                &decoded.session_id,
-                &decoded.run_id,
-                &decoded.turn_chain_id,
-                &decoded.request_id,
-                &decoded.edge_agent_id,
-                &decoded.status,
-                &decoded.output,
-                decoded.duration_ms,
-                decoded.tool_result_fields.as_ref(),
-            )
+            ToolResultRequest::compute_result_hash(ToolResultHashParts {
+                session_id: &decoded.session_id,
+                run_id: &decoded.run_id,
+                turn_chain_id: &decoded.turn_chain_id,
+                request_id: &decoded.request_id,
+                edge_agent_id: &decoded.edge_agent_id,
+                status: &decoded.status,
+                output: &decoded.output,
+                duration_ms: decoded.duration_ms,
+                tool_result_fields: decoded.tool_result_fields.as_ref(),
+            })
         );
 
         for changed in [

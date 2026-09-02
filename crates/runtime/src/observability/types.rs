@@ -79,7 +79,8 @@ pub struct ObservabilitySession {
     /// what tool-surface surfaces were adjusted (blocked/boosted/widened).
     ///
     /// Reset lazily — it lingers until the next published strategy update.
-    pub last_strategy_application: Option<crate::turn::agentic::stage_bridge::StrategyApplication>,
+    pub last_strategy_application:
+        Option<crate::turn::agentic::strategy_application::StrategyApplication>,
 
     /// Most recent [`GuardrailView`] snapshot published by the auto-reflection
     /// path after adjusting the reflection threshold. Surfaced into the SelfModel
@@ -181,7 +182,7 @@ pub struct QueryBehavior {
 /// Bridge-internal channels (`memoria_prefetch`, `tool_round_guidance`,
 /// `volatile_pending`)
 /// are not in this struct — the CLI receives opaque fingerprints for
-/// those via [`astra_turn_core::chat_turn_sse_dispatch::BridgeInjectionFingerprints`]
+/// those via [`astra_turn_core::chat_turn_sse_dispatch::InjectionFingerprints`]
 /// and observes them with an empty preview (introspect still shows
 /// tag + hash + bytes).
 ///
@@ -194,7 +195,7 @@ pub struct QueryBehavior {
 /// the authoritative hash/bytes while the CLI-side preview stays
 /// empty for that channel.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct BridgeInjectionPreviews<'a> {
+pub struct InjectionPreviews<'a> {
     pub lessons: &'a str,
     pub volatile: &'a str,
     pub memoria_prefetch: &'a str,
@@ -204,7 +205,7 @@ pub struct BridgeInjectionPreviews<'a> {
     pub tool_round_guidance: &'a str,
 }
 
-impl BridgeInjectionPreviews<'_> {
+impl InjectionPreviews<'_> {
     pub const EMPTY: Self = Self {
         lessons: "",
         volatile: "",

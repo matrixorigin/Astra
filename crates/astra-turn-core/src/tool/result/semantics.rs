@@ -1,6 +1,6 @@
 //! Shared interpretation of edge tool outputs and stable tool-call keys (§5.5 dedup).
 //!
-//! Used by CLI `chat_stream` / `stream_render` and available for `bridge_inprocess` or server paths.
+//! Used by CLI `chat_stream` / `stream_render` and available for `server_loop` or server paths.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

@@ -513,6 +513,10 @@ async fn acquire_server_workspace_authority(
         .await
         .map(ServerWorkspaceAuthority::OpaqueWriter)
     } else if name != "bash"
+        // Direct DefaultToolExecutor handlers own this exact lease around
+        // their dispatch. Taking it again here would deadlock mutating git
+        // actions and targeted observers against the same process-local gate.
+        && !astra_tools::executor::is_server_direct_default_executor_tool(name)
         && (astra_tools::executor::is_workspace_mutation_tool(name, args) || strong_observer)
     {
         astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options(
@@ -4366,7 +4370,7 @@ mod tests {
         .unwrap();
         let error = crate::server::tool_invocation_runtime::RuntimeInvocationLedgerError::from(
             astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError::ActionSuperseded {
-                identity,
+                identity: Box::new(identity),
                 user_intent_event_index: 7,
             },
         );
@@ -4391,7 +4395,7 @@ mod tests {
         .unwrap();
         let error = crate::server::tool_invocation_runtime::RuntimeInvocationLedgerError::from(
             astra_services::tool_invocation_ledger::ToolInvocationLedgerStoreError::ActionAlreadyStarted {
-                identity,
+                identity: Box::new(identity),
                 event_index: 3,
             },
         );

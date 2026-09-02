@@ -613,7 +613,9 @@ pub async fn run_duplicate_approval_response_is_idempotent() {
 }
 
 pub async fn run_server_stream_partial_batch_failure() {
-    let b = bootstrap().await;
+    let b = tokio::time::timeout(std::time::Duration::from_secs(10), bootstrap())
+        .await
+        .expect("partial-batch bootstrap exceeded its bounded setup budget");
     let ctx = &b.ctx;
     let ok_output = "partial batch first ok";
     let err_output = "partial batch second failed";
@@ -689,12 +691,13 @@ pub async fn run_server_stream_partial_batch_failure() {
         .header("content-type", "application/json")
         .body(Body::from(payload.to_string()))
         .expect("partial batch stream request");
-    let response = ctx
-        .app
-        .clone()
-        .oneshot(req)
-        .await
-        .expect("chat/stream oneshot");
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        ctx.app.clone().oneshot(req),
+    )
+    .await
+    .expect("partial-batch chat admission did not return an SSE response in 5s")
+    .expect("chat/stream oneshot");
     assert_eq!(
         response.status(),
         StatusCode::OK,
@@ -705,7 +708,22 @@ pub async fn run_server_stream_partial_batch_failure() {
     let mut acc = Vec::new();
     let mut posted_first = false;
     let mut posted_second = false;
-    while let Some(chunk) = stream.next().await {
+    let stream_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(12);
+    loop {
+        let next = tokio::time::timeout_at(stream_deadline, stream.next())
+            .await
+            .unwrap_or_else(|_| {
+                let preview = String::from_utf8_lossy(&acc);
+                panic!(
+                    "partial-batch SSE did not converge in 12s; posted_first={posted_first} \
+                     posted_second={posted_second} bytes={} preview={}",
+                    acc.len(),
+                    &preview[..preview.len().min(1_000)]
+                )
+            });
+        let Some(chunk) = next else {
+            break;
+        };
         let chunk = chunk.expect("partial batch sse chunk");
         acc.extend_from_slice(&chunk);
         let s = String::from_utf8_lossy(&acc);
@@ -719,13 +737,17 @@ pub async fn run_server_stream_partial_batch_failure() {
                 0,
             )
         {
-            let (status, body) = post_json(
-                &ctx.app,
-                "/tools/result",
-                Some(b.auth_header.as_str()),
-                payload,
+            let (status, body) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                post_json(
+                    &ctx.app,
+                    "/tools/result",
+                    Some(b.auth_header.as_str()),
+                    payload,
+                ),
             )
-            .await;
+            .await
+            .expect("first partial tool callback did not settle in 5s");
             assert_eq!(
                 status,
                 StatusCode::OK,
@@ -746,13 +768,17 @@ pub async fn run_server_stream_partial_batch_failure() {
                 0,
             )
         {
-            let (status, body) = post_json(
-                &ctx.app,
-                "/tools/result",
-                Some(b.auth_header.as_str()),
-                payload,
+            let (status, body) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                post_json(
+                    &ctx.app,
+                    "/tools/result",
+                    Some(b.auth_header.as_str()),
+                    payload,
+                ),
             )
-            .await;
+            .await
+            .expect("second partial tool callback did not settle in 5s");
             assert_eq!(
                 status,
                 StatusCode::OK,
@@ -848,16 +874,22 @@ pub async fn run_server_stream_partial_batch_failure() {
         .expect("session_info run_id")
         .to_string();
     for request_id in ["tc-partial-1", "tc-partial-2"] {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM agent_run_events \
-             WHERE user_id = ? AND run_id = ? AND event_type = 'tool_call_end' \
-               AND JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.call_id')) = ?",
+        let count: i64 = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            sqlx::query_scalar(
+                "SELECT COUNT(*) FROM agent_run_events \
+                 WHERE user_id = ? AND run_id = ? AND event_type = 'tool_call_end' \
+                   AND JSON_UNQUOTE(JSON_EXTRACT(payload_json, '$.call_id')) = ?",
+            )
+            .bind(&ctx.user_id)
+            .bind(&run_id)
+            .bind(request_id)
+            .fetch_one(&ctx.pool),
         )
-        .bind(&ctx.user_id)
-        .bind(&run_id)
-        .bind(request_id)
-        .fetch_one(&ctx.pool)
         .await
+        .unwrap_or_else(|_| {
+            panic!("durable callback verification query for {request_id} exceeded 5s")
+        })
         .expect("count durable mixed callback result");
         assert_eq!(
             count, 1,
@@ -865,7 +897,9 @@ pub async fn run_server_stream_partial_batch_failure() {
         );
     }
 
-    ctx.close().await;
+    tokio::time::timeout(std::time::Duration::from_secs(8), ctx.close())
+        .await
+        .expect("partial-batch fixture cleanup did not settle in 8s");
 }
 
 pub async fn run_server_stream_out_of_order_tool_results() {

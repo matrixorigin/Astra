@@ -14,14 +14,14 @@ use astra_turn_core::injection_tracking::{
 };
 
 /// Every channel added in wip-4. When a new injection source is added
-/// to `bridge_inprocess::dynamic_sections`, this list must grow.
+/// to `server_loop::dynamic_sections`, this list must grow.
 const EXPECTED_CHANNELS: &[InjectionChannel] = &[
     // Pre-wip-4 (kept):
     InjectionChannel::RecentFailingTests,
     InjectionChannel::OutcomeBias,
     InjectionChannel::Lessons,
     InjectionChannel::VolatilePending,
-    // wip-4 additions — covering all live bridge_inprocess injections:
+    // wip-4 additions — covering all live server_loop injections:
     InjectionChannel::MemoriaPrefetch,
     InjectionChannel::SelfAwareness,
     InjectionChannel::RecentArgHints,

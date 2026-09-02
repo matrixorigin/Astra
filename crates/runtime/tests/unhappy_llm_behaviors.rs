@@ -17,9 +17,7 @@
 //!   7. Runaway same-tool-call loop detection at exact window boundary.
 //!   8. Rate-limit cooldown blocks then releases after timeout (429 / 503).
 
-use astra_turn_core::bridge_rate_limit_cooldown::{
-    CooldownReason, RateLimitAction, RateLimitCooldown,
-};
+use astra_turn_core::rate_limit_cooldown::{CooldownReason, RateLimitAction, RateLimitCooldown};
 use astra_turn_core::response_guard::{PROMPT_LEAK_FALLBACK, apply_response_guards};
 use astra_turn_core::stall::{SERVER_STALL_WINDOW, detect_server_stall};
 use serde_json::{Value, json};

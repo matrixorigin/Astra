@@ -1,5 +1,4 @@
-//! Phase 2.5 Commit E — HTTP-level e2e for speculative streaming tool
-//! execution (D-9).
+//! HTTP-level authority boundary for streamed tool candidates.
 //!
 //! Deviation from the spec: rather than spin up the full `astra-cli`
 //! chat_stream client end-to-end (which would require replicating auth,
@@ -10,11 +9,11 @@
 //!   • Real axum HTTP server emitting real `text/event-stream` bytes
 //!   • Real `reqwest` client reading the body stream
 //!   • Runtime's `consume_sse_stream` parser + hook dispatch
-//!   • `StreamingToolExecutor` speculative dispatch + harvest
+//!   • an unleased streamed candidate remains inert
 //!
-//! The CLI layer's production wiring (Arc<ToolExecutor>, build_streaming_tool_exec,
-//! harvest_speculation_for_batch) is exercised by the existing offline
-//! unit/integration tests. The HTTP boundary is the new coverage here.
+//! The server's durable `tool_request` is the execution lease. A model-level
+//! `tool_call` can arrive earlier, but must remain descriptive until that
+//! immutable admission exists.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -49,8 +48,7 @@ use tokio::net::TcpListener;
 //   type=turn_complete
 //
 // Timing: tool_call for call_a at T≈0ms, gap of 500ms, tool_call for call_b,
-// then turn_complete. With speculation ON, both tools' backend executors
-// start before the stream finishes.
+// then turn_complete. Neither candidate carries a durable execution lease.
 
 fn sse_frame(obj: Value) -> String {
     format!("data: {}\n\n", serde_json::to_string(&obj).unwrap())
@@ -59,13 +57,19 @@ fn sse_frame(obj: Value) -> String {
 async fn sse_handler() -> impl IntoResponse {
     let tool_a = json!({
         "type": "tool_call",
-        "id": "call_a",
-        "function": { "name": "grep", "arguments": "{\"pattern\":\"foo\"}" }
+        "tool_call": {
+            "id": "call_a",
+            "type": "function",
+            "function": { "name": "grep", "arguments": "{\"pattern\":\"foo\"}" }
+        }
     });
     let tool_b = json!({
         "type": "tool_call",
-        "id": "call_b",
-        "function": { "name": "list_dir", "arguments": "{\"path\":\".\"}" }
+        "tool_call": {
+            "id": "call_b",
+            "type": "function",
+            "function": { "name": "list_dir", "arguments": "{\"path\":\".\"}" }
+        }
     });
     let events: Vec<(Duration, String)> = vec![
         (
@@ -116,13 +120,11 @@ async fn start_mock_server() -> String {
 // ── Host ───────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug)]
-struct ToolTiming {
-    name: String,
-    started_at: Duration,
-}
+struct ToolTiming;
 
 struct SpeculatingHost {
     streaming: Option<Arc<StreamingToolExecutor>>,
+    immutable_server_lease: bool,
     deny_tool: Option<String>,
     #[allow(dead_code)]
     timings: Arc<tokio::sync::Mutex<Vec<ToolTiming>>>,
@@ -192,6 +194,9 @@ impl SseStreamHost for SpeculatingHost {
         if !should_speculate(&name, None, None) {
             return;
         }
+        if !self.immutable_server_lease {
+            return;
+        }
         let _ = exec
             .on_tool_block(call_id, name, tool_call.clone(), index)
             .await;
@@ -201,7 +206,6 @@ impl SseStreamHost for SpeculatingHost {
 fn make_executor(
     invocations: Arc<AtomicUsize>,
     timings: Arc<tokio::sync::Mutex<Vec<ToolTiming>>>,
-    t0: Instant,
     tool_delay: Duration,
 ) -> ToolExecutorFn {
     Arc::new(move |tc: Value| {
@@ -219,12 +223,8 @@ fn make_executor(
             .unwrap_or("")
             .to_string();
         Box::pin(async move {
-            let started_at = t0.elapsed();
             invocations.fetch_add(1, Ordering::SeqCst);
-            timings.lock().await.push(ToolTiming {
-                name: name.clone(),
-                started_at,
-            });
+            timings.lock().await.push(ToolTiming);
             tokio::time::sleep(tool_delay).await;
             (call_id, name, "ok".to_string(), true)
         })
@@ -262,20 +262,19 @@ async fn drive_sse_through_http(url: &str, host: &mut SpeculatingHost) -> Durati
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn happy_speculation_on_starts_tools_mid_stream() {
+async fn unleased_read_only_candidates_do_not_start_mid_stream() {
     let url = start_mock_server().await;
-    let t0 = Instant::now();
     let invocations = Arc::new(AtomicUsize::new(0));
     let timings = Arc::new(tokio::sync::Mutex::new(Vec::<ToolTiming>::new()));
     let streaming = Arc::new(StreamingToolExecutor::new(make_executor(
         Arc::clone(&invocations),
         Arc::clone(&timings),
-        t0,
         Duration::from_millis(300),
     )));
 
     let mut host = SpeculatingHost {
         streaming: Some(Arc::clone(&streaming)),
+        immutable_server_lease: false,
         deny_tool: None,
         timings: Arc::clone(&timings),
     };
@@ -284,48 +283,30 @@ async fn happy_speculation_on_starts_tools_mid_stream() {
     let _ = streaming.wait_all().await;
 
     let timings_snap = timings.lock().await.clone();
-    assert_eq!(
-        invocations.load(Ordering::SeqCst),
-        2,
-        "both read-only tools should speculate: {:?}",
-        timings_snap
-    );
-    // Stream finishes around ~700ms from start. With speculation both tool
-    // futures start well before that and overlap. Serial worst-case would
-    // be stream (~700ms) + 2 * tool_delay (600ms) = 1300ms; speculation
-    // should collapse it.
+    assert_eq!(invocations.load(Ordering::SeqCst), 0);
+    assert!(timings_snap.is_empty());
+    // The transport is not delayed by any hidden execution work.
     assert!(
         elapsed < Duration::from_millis(1100),
-        "speculation-on elapsed {:?} did not overlap",
+        "unleased stream took unexpectedly long: {:?}",
         elapsed
-    );
-    // Tool A should have started before the second tool_call frame (~600ms).
-    let a = timings_snap
-        .iter()
-        .find(|t| t.name == "grep")
-        .expect("grep timing recorded");
-    assert!(
-        a.started_at < Duration::from_millis(500),
-        "grep started too late for speculation: {:?}",
-        a.started_at
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn unhappy_denied_tool_is_not_speculated() {
+async fn permission_classification_does_not_replace_the_server_lease() {
     let url = start_mock_server().await;
-    let t0 = Instant::now();
     let invocations = Arc::new(AtomicUsize::new(0));
     let timings = Arc::new(tokio::sync::Mutex::new(Vec::<ToolTiming>::new()));
     let streaming = Arc::new(StreamingToolExecutor::new(make_executor(
         Arc::clone(&invocations),
         Arc::clone(&timings),
-        t0,
         Duration::from_millis(100),
     )));
 
     let mut host = SpeculatingHost {
         streaming: Some(Arc::clone(&streaming)),
+        immutable_server_lease: false,
         deny_tool: Some("list_dir".to_string()),
         timings: Arc::clone(&timings),
     };
@@ -334,18 +315,8 @@ async fn unhappy_denied_tool_is_not_speculated() {
     let _ = streaming.wait_all().await;
 
     let timings_snap = timings.lock().await.clone();
-    let names: Vec<String> = timings_snap.iter().map(|t| t.name.clone()).collect();
-    assert!(
-        names.iter().any(|n| n == "grep"),
-        "allowed tool should have been speculated: {:?}",
-        names
-    );
-    assert!(
-        names.iter().all(|n| n != "list_dir"),
-        "denied tool must NOT have been speculated: {:?}",
-        names
-    );
-    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    assert!(timings_snap.is_empty());
+    assert_eq!(invocations.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -357,6 +328,7 @@ async fn complex_speculation_off_no_mid_stream_starts() {
     // (mirrors the production path when ASTRA_STREAMING_TOOL_EXEC is unset).
     let mut host = SpeculatingHost {
         streaming: None,
+        immutable_server_lease: false,
         deny_tool: None,
         timings: Arc::clone(&timings),
     };

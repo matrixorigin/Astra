@@ -73,7 +73,7 @@ mod tests {
 
     #[test]
     fn sig_stall_on_three_identical_rounds() {
-        let tc = serde_json::json!({"name":"bash","arguments":{}});
+        let tc = serde_json::json!({"function":{"name":"bash","arguments":{}}});
         let mut turn_sigs = Vec::new();
         let mut turn_tool_names = Vec::new();
         let mut stall_events = Vec::new();
@@ -101,7 +101,8 @@ mod tests {
         let mut stall_events = Vec::new();
         let mut turn_guard = TurnGuard::new();
         for (i, path) in ["a.rs", "b.rs", "c.rs"].iter().enumerate() {
-            let tc = serde_json::json!({"name":"read_file","arguments":{"path": path}});
+            let tc =
+                serde_json::json!({"function":{"name":"read_file","arguments":{"path": path}}});
             apply_cli_agentic_stall_preflight(CliAgenticStallPreflightRequest {
                 turn_index: i as u32,
                 tool_calls_for_guard: std::slice::from_ref(&tc),
@@ -124,8 +125,7 @@ mod tests {
     #[test]
     fn repetition_threshold_on_five_identical_rounds() {
         let tc = serde_json::json!({
-            "name": "bash",
-            "arguments": {"command": "cargo clippy"}
+            "function": {"name": "bash", "arguments": {"command": "cargo clippy"}}
         });
         let mut turn_sigs = Vec::new();
         let mut turn_tool_names = Vec::new();
@@ -156,8 +156,7 @@ mod tests {
     #[test]
     fn four_identical_rounds_stay_below_advisory_threshold() {
         let tc = serde_json::json!({
-            "name": "bash",
-            "arguments": {"command": "cargo clippy"}
+            "function": {"name": "bash", "arguments": {"command": "cargo clippy"}}
         });
         let mut turn_sigs = Vec::new();
         let mut turn_tool_names = Vec::new();
@@ -186,8 +185,8 @@ mod tests {
     /// the streak with a different call resets the counter.
     #[test]
     fn non_consecutive_identicals_do_not_emit_threshold_event() {
-        let a = serde_json::json!({"name":"bash","arguments":{"command":"ls"}});
-        let b = serde_json::json!({"name":"bash","arguments":{"command":"pwd"}});
+        let a = serde_json::json!({"function":{"name":"bash","arguments":{"command":"ls"}}});
+        let b = serde_json::json!({"function":{"name":"bash","arguments":{"command":"pwd"}}});
         let mut turn_sigs = Vec::new();
         let mut turn_tool_names = Vec::new();
         let mut stall_events = Vec::new();
@@ -215,7 +214,7 @@ mod tests {
     /// repetition_threshold entries as the streak continues.
     #[test]
     fn repetition_threshold_event_deduped_across_extra_rounds() {
-        let tc = serde_json::json!({"name":"bash","arguments":{}});
+        let tc = serde_json::json!({"function":{"name":"bash","arguments":{}}});
         let mut turn_sigs = Vec::new();
         let mut turn_tool_names = Vec::new();
         let mut stall_events = Vec::new();

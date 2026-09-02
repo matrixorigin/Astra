@@ -1562,7 +1562,7 @@ mod tests {
                 .unwrap()
                 .expect_err("active turn owns thread authority");
             assert_eq!(failure.code, TURN_CONFLICT_CODE);
-            assert_eq!(failure.committed, false);
+            assert!(!failure.committed);
         }
         let guard = state.lock().await;
         assert_eq!(guard.thread_id.as_deref(), Some("thread-active"));

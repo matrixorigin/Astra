@@ -4,7 +4,7 @@
 //! intentionally limited to the process-wide cooldown registry and the
 //! structured signal used when the selected model must fall back.
 
-use astra_turn_core::bridge_rate_limit_cooldown::{CooldownReason, PerModelCooldown};
+use astra_turn_core::rate_limit_cooldown::{CooldownReason, PerModelCooldown};
 use serde_json::{Value, json};
 use std::sync::OnceLock;
 

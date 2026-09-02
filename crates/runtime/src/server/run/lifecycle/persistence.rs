@@ -540,6 +540,7 @@ impl PostLoopPersistContext {
                 "terminal trace repair authority mismatch: expected status={expected_status} generation={expected_generation}, observed status={status} generation={generation}"
             ));
         }
+        let (turn_started_at, _) = turn_trace_time_bounds(state);
         let deltas = persist_server_loop_trace_events_impl(
             &mut tx,
             &self.user_id,
@@ -551,6 +552,7 @@ impl PostLoopPersistContext {
             None,
             state,
             self.model_name.as_deref(),
+            turn_started_at,
         )
         .await?;
         tx.commit().await.map_err(|error| error.to_string())?;
@@ -734,6 +736,7 @@ async fn verify_canonical_append_evidence(
             state.session_turn,
         )
     });
+    let (turn_started_at, terminal_offset_ms) = turn_trace_time_bounds(state);
     let mut expected_trace = build_server_loop_core_events(
         append.user_id,
         append.session_id,
@@ -746,8 +749,9 @@ async fn verify_canonical_append_evidence(
         append.user_message,
         state,
         append.model_name,
+        turn_started_at,
+        terminal_offset_ms,
     );
-    let (turn_started_at, _) = turn_trace_time_bounds(state);
     expected_trace.extend(build_llm_round_trace_events(
         &trace,
         turn_started_at,
@@ -1111,6 +1115,7 @@ async fn persist_server_loop_canonical_append_inner(
     // `persist_server_loop_core_events_in_tx` now returns `Result`; on Err the
     // transaction is poisoned (partial writes may be staged) and we MUST
     // rollback instead of continuing to write detail events into the same tx.
+    let (turn_started_at, terminal_offset_ms) = turn_trace_time_bounds(state);
     let mut session_event_deltas = match persist_server_loop_core_events_in_tx(
         &mut tx,
         append.user_id,
@@ -1124,6 +1129,8 @@ async fn persist_server_loop_canonical_append_inner(
         append.user_message,
         state,
         append.model_name,
+        turn_started_at,
+        terminal_offset_ms,
     )
     .await
     {
@@ -1159,6 +1166,7 @@ async fn persist_server_loop_canonical_append_inner(
         append.trace_context.clone(),
         state,
         append.model_name,
+        turn_started_at,
     )
     .await
     {
@@ -1923,6 +1931,8 @@ pub(crate) async fn persist_server_loop_core_events_in_tx(
     user_message: &str,
     state: &AgenticLoopState,
     model_name: Option<&str>,
+    turn_started_at: chrono::DateTime<chrono::Utc>,
+    terminal_offset_ms: u64,
 ) -> Result<std::collections::BTreeMap<(String, String), (i64, Option<String>)>, String> {
     persist_server_loop_core_events_impl(
         tx,
@@ -1937,6 +1947,8 @@ pub(crate) async fn persist_server_loop_core_events_in_tx(
         user_message,
         state,
         model_name,
+        turn_started_at,
+        terminal_offset_ms,
     )
     .await
 }
@@ -1954,6 +1966,8 @@ async fn persist_server_loop_core_events_impl(
     user_message: &str,
     state: &AgenticLoopState,
     model_name: Option<&str>,
+    turn_started_at: chrono::DateTime<chrono::Utc>,
+    terminal_offset_ms: u64,
 ) -> Result<std::collections::BTreeMap<(String, String), (i64, Option<String>)>, String> {
     let events = build_server_loop_core_events(
         user_id,
@@ -1967,6 +1981,8 @@ async fn persist_server_loop_core_events_impl(
         user_message,
         state,
         model_name,
+        turn_started_at,
+        terminal_offset_ms,
     );
     if events.is_empty() {
         return Ok(std::collections::BTreeMap::new());
@@ -1999,6 +2015,8 @@ fn build_server_loop_core_events(
     user_message: &str,
     state: &AgenticLoopState,
     model_name: Option<&str>,
+    turn_started_at: chrono::DateTime<chrono::Utc>,
+    terminal_offset_ms: u64,
 ) -> Vec<TraceEvent> {
     if user_message.is_empty()
         && state.final_text.is_empty()
@@ -2009,8 +2027,6 @@ fn build_server_loop_core_events(
 
     let trace = trace_context
         .unwrap_or_else(|| server_trace_context(user_id, session_id, run_id, state.session_turn));
-    let (turn_started_at, terminal_offset_ms) = turn_trace_time_bounds(state);
-
     let user_query_event = server_loop_user_query_event(
         user_id,
         session_id,
@@ -3217,6 +3233,7 @@ pub(crate) async fn persist_server_loop_trace_events_in_tx(
     trace_context: Option<TraceContext>,
     state: &AgenticLoopState,
     model_name: Option<&str>,
+    turn_started_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<std::collections::BTreeMap<(String, String), (i64, Option<String>)>, String> {
     persist_server_loop_trace_events_impl(
         tx,
@@ -3229,6 +3246,7 @@ pub(crate) async fn persist_server_loop_trace_events_in_tx(
         trace_context,
         state,
         model_name,
+        turn_started_at,
     )
     .await
 }
@@ -3244,6 +3262,7 @@ async fn persist_server_loop_trace_events_impl(
     trace_context: Option<TraceContext>,
     state: &AgenticLoopState,
     model_name: Option<&str>,
+    turn_started_at: chrono::DateTime<chrono::Utc>,
 ) -> Result<std::collections::BTreeMap<(String, String), (i64, Option<String>)>, String> {
     let trace = trace_context
         .unwrap_or_else(|| server_trace_context(user_id, session_id, run_id, state.session_turn));
@@ -3251,7 +3270,6 @@ async fn persist_server_loop_trace_events_impl(
     // would collapse the whole turn into the persistence instant. Preserve the
     // producer's wall-clock anchor and reconstruct each event from its monotonic
     // turn offset. The fallback is only for legacy/test states without a buffer.
-    let (turn_started_at, _) = turn_trace_time_bounds(state);
     let mut events = build_llm_round_trace_events(
         &trace,
         turn_started_at,
@@ -5277,6 +5295,15 @@ mod tests {
         .execute(&db)
         .await
         .expect("insert owner session");
+        let store = Arc::new(
+            astra_services::runs::DatabaseRunStateStore::new(pool.clone())
+                .with_owner_pod_id("core-persist-deferred-owner"),
+        );
+        let engine = crate::server::run::engine::RunEngine::new(store);
+        let authority = engine
+            .start_run(&run_id, &user_id, &session_id)
+            .await
+            .expect("start durable run");
 
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.session_turn = 7;
@@ -5332,8 +5359,8 @@ mod tests {
             user_id: user_id.clone(),
             session_id: session_id.clone(),
             run_id: run_id.clone(),
-            expected_owner_generation: None,
-            owner_lease_duration: None,
+            expected_owner_generation: Some(authority.owner_generation),
+            owner_lease_duration: Some(Duration::from_secs(45)),
             agent_id: None,
             model_name: Some("test-model".to_string()),
             user_message: "initial one".to_string(),
@@ -5445,9 +5472,11 @@ mod tests {
                 ("user".to_string(), "initial one".to_string()),
                 ("user".to_string(), "queued two".to_string()),
                 ("user".to_string(), "queued three".to_string()),
+                ("assistant".to_string(), String::new()),
+                ("tool".to_string(), String::new()),
                 ("assistant".to_string(), "assistant final".to_string()),
             ],
-            "transcript remains the ordered user-facing conversation"
+            "transcript preserves the ordered conversation and exact tool evidence"
         );
 
         cleanup_core_persist_fixture_for_owner(&db, &session_id, &user_id).await;
@@ -5538,7 +5567,11 @@ mod tests {
         )
         .await
         .expect_err("stale generation must fail before writing any settlement evidence");
-        assert!(error.contains("lost durable execution authority"));
+        assert!(
+            error.contains("authoritative atomic terminal resolution conflict")
+                && error.contains("run generation mismatch"),
+            "unexpected canonical append error: {error}"
+        );
         let event_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND run_id = ?",
         )
@@ -5690,7 +5723,11 @@ mod tests {
         )
         .await
         .expect_err("terminal precondition conflict must roll back canonical writes");
-        assert!(error.contains("lost durable execution authority"));
+        assert!(
+            error.contains("authoritative atomic terminal resolution conflict")
+                && error.contains("terminal state or usage mismatch"),
+            "unexpected canonical terminal error: {error}"
+        );
 
         let canonical_event_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM agent_events WHERE user_id = ? AND session_id = ? AND run_id = ?",
@@ -6146,6 +6183,15 @@ mod tests {
         .execute(&db)
         .await
         .expect("insert transcript commit session");
+        let store = Arc::new(
+            astra_services::runs::DatabaseRunStateStore::new(pool.clone())
+                .with_owner_pod_id("transcript-commit-owner"),
+        );
+        let engine = crate::server::run::engine::RunEngine::new(store);
+        let authority = engine
+            .start_run(&run_id, &user_id, &session_id)
+            .await
+            .expect("start durable run");
 
         let mut state = crate::turn::agentic_loop::host::make_test_loop_state();
         state.final_text = "identity-backed answer".into();
@@ -6167,8 +6213,8 @@ mod tests {
                 user_id: &user_id,
                 session_id: &session_id,
                 run_id: &run_id,
-                expected_owner_generation: None,
-                owner_lease_duration: None,
+                expected_owner_generation: Some(authority.owner_generation),
+                owner_lease_duration: Some(Duration::from_secs(45)),
                 parent_run_id: Some("parent-run"),
                 parent_event_id: Some("parent-event"),
                 agent_id: Some("child-agent"),

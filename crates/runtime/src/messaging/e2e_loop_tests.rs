@@ -562,8 +562,11 @@ mod tests {
     async fn child_tool_round_records_blocked_permission_denial() {
         let tool_calls = vec![json!({
             "id": "call-bash-perm",
-            "name": "bash",
-            "arguments": r#"{"command": "echo hi"}"#
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": r#"{"command": "echo hi"}"#
+            }
         })];
 
         let permission_context = PermissionSyncContext::shared(InheritedPermissions {
@@ -653,8 +656,11 @@ mod tests {
     async fn plan_mode_blocks_mutating_tools_before_headless_protocol_fallback() {
         let tool_calls = vec![json!({
             "id": "call-write-plan",
-            "name": "write_file",
-            "arguments": r#"{"path":"tmp.txt","content":"hello"}"#
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "arguments": r#"{"path":"tmp.txt","content":"hello"}"#
+            }
         })];
 
         let mut messages = Vec::new();
@@ -738,19 +744,17 @@ mod tests {
         );
     }
 
-    /// Regression test for session 46fd8ed8: kimi-k2.5 returned tool_calls
-    /// with empty id → assistant message had id="" while tool result had a
-    /// UUID → API returned 400 "tool_call_id not found".
-    ///
-    /// After the fix, normalize_tool_call_for_accum generates a synthetic UUID
-    /// for empty ids, so the assistant message and tool result share the same id.
+    /// Provider tool batches are canonical authority input. Missing call ids
+    /// fail the whole batch closed instead of inventing execution identity.
     #[tokio::test]
-    async fn empty_tool_call_id_gets_synthetic_uuid_and_ids_match() {
-        // Tool call with empty id but valid name — simulates kimi-k2.5 behavior
+    async fn empty_tool_call_id_rejects_provider_batch_before_execution() {
         let tool_calls = vec![json!({
             "id": "",
-            "name": "bash",
-            "arguments": r#"{"command":"echo hi"}"#
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": r#"{"command":"echo hi"}"#
+            }
         })];
 
         let mut messages = Vec::new();
@@ -767,7 +771,7 @@ mod tests {
         let edge_callback_outputs = std::collections::HashMap::new();
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
-        let _ = run_agentic_headless_tool_round(HeadlessToolRoundCtx {
+        let outcome = run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index: 0,
             session_turn: 1,
             quiet: true,
@@ -811,27 +815,15 @@ mod tests {
         })
         .await;
 
-        // messages[0] = assistant message with tool_calls
-        // messages[1] = tool result message with tool_call_id
+        assert!(messages.is_empty());
+        assert!(tool_results.is_empty());
+        assert!(tool_call_records.is_empty());
         assert!(
-            messages.len() >= 2,
-            "expected assistant + tool result messages"
-        );
-
-        let assistant_tc_id = messages[0]["tool_calls"][0]["id"]
-            .as_str()
-            .expect("assistant tool_call must have id");
-        let tool_result_id = messages[1]["tool_call_id"]
-            .as_str()
-            .expect("tool result must have tool_call_id");
-
-        assert!(
-            !assistant_tc_id.is_empty(),
-            "assistant tool_call id must not be empty"
-        );
-        assert_eq!(
-            assistant_tc_id, tool_result_id,
-            "assistant tool_call id and tool result tool_call_id must match"
+            outcome
+                .action_admission_error
+                .as_deref()
+                .is_some_and(|error| error.contains("tool call id is missing")),
+            "unexpected admission result: {outcome:?}"
         );
     }
 
@@ -1197,23 +1189,26 @@ mod tests {
         let tool_calls = vec![
             json!({
                 "id": "call-empty-1",
-                "name": "",
-                "arguments": {}
+                "type": "function",
+                "function": { "name": "", "arguments": {} }
             }),
             json!({
                 "id": "call-empty-2",
-                "name": "",
-                "arguments": {}
+                "type": "function",
+                "function": { "name": "", "arguments": {} }
             }),
             json!({
                 "id": "call-empty-3",
-                "name": "",
-                "arguments": {}
+                "type": "function",
+                "function": { "name": "", "arguments": {} }
             }),
             json!({
                 "id": "call-after-burst",
-                "name": "bash",
-                "arguments": r#"{"command":"echo should-not-run"}"#
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "arguments": r#"{"command":"echo should-not-run"}"#
+                }
             }),
         ];
 
@@ -1231,7 +1226,7 @@ mod tests {
         let edge_callback_outputs = std::collections::HashMap::new();
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
-        run_agentic_headless_tool_round(HeadlessToolRoundCtx {
+        let outcome = run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index: 0,
             session_turn: 1,
             quiet: true,
@@ -1275,11 +1270,15 @@ mod tests {
         })
         .await;
 
-        assert_eq!(tool_results.len(), 3);
-        assert_eq!(tool_call_records.len(), 3);
+        assert!(messages.is_empty());
+        assert!(tool_results.is_empty());
+        assert!(tool_call_records.is_empty());
         assert!(
-            tool_call_records.iter().all(|r| r.name.is_empty()),
-            "expected only malformed empty-name calls to be recorded before abort"
+            outcome
+                .action_admission_error
+                .as_deref()
+                .is_some_and(|error| error.contains("tool name is missing")),
+            "unexpected admission result: {outcome:?}"
         );
     }
 
@@ -1343,8 +1342,11 @@ mod tests {
         // Child sends tool call that requires permission
         let tool_calls = vec![json!({
             "id": "call-bash-touch",
-            "name": "bash",
-            "arguments": r#"{"command": "touch astra-permission-approved-test"}"#
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": r#"{"command": "touch astra-permission-approved-test"}"#
+            }
         })];
 
         let mut messages = Vec::new();
@@ -1476,11 +1478,14 @@ mod tests {
 
         let tool_calls = vec![json!({
             "id": "call-bash-denied",
-            "name": "bash",
+            "type": "function",
             // Keep this command non-read-only: Prompt mode now auto-approves
             // read-only bash calls like `echo hi` locally, so they never reach
             // the parent mailbox this test is exercising.
-            "arguments": r#"{"command": "touch astra-permission-denied-test"}"#
+            "function": {
+                "name": "bash",
+                "arguments": r#"{"command": "touch astra-permission-denied-test"}"#
+            }
         })];
 
         let mut messages = Vec::new();
@@ -1564,14 +1569,14 @@ mod tests {
     /// so they don't inflate call_counts and flood the context with 50+ stubs.
     #[tokio::test]
     async fn empty_tool_name_rejected_before_dedup() {
-        // 5 tool calls with empty name — the round should stop after the
-        // malformed-call abort threshold, and none should hit the dedup path.
+        // A malformed member rejects the provider batch atomically, before
+        // dedup or per-call execution can create partial ledger evidence.
         let tool_calls: Vec<Value> = (0..5)
             .map(|i| {
                 json!({
                     "id": format!("call-{i}"),
-                    "name": "",
-                    "arguments": "{}"
+                    "type": "function",
+                    "function": { "name": "", "arguments": "{}" }
                 })
             })
             .collect();
@@ -1590,7 +1595,7 @@ mod tests {
         let edge_callback_outputs = HashMap::new();
         let edge_tool_round: Vec<EdgeToolExecResult> = Vec::new();
 
-        run_agentic_headless_tool_round(HeadlessToolRoundCtx {
+        let outcome = run_agentic_headless_tool_round(HeadlessToolRoundCtx {
             turn_index: 0,
             session_turn: 1,
             quiet: true,
@@ -1634,19 +1639,15 @@ mod tests {
         })
         .await;
 
-        // Only the malformed empty-name calls up to the abort threshold should
-        // be recorded, and each should still produce an immediate tool result.
-        assert_eq!(tool_call_records.len(), 3);
-        assert_eq!(tool_results.len(), 3);
-        // Every record should be unknown_tool, not duplicate_within_turn.
-        for rec in &tool_call_records {
-            assert!(
-                rec.error
-                    .as_deref()
-                    .is_some_and(|e| e.starts_with("unknown_tool")),
-                "expected unknown_tool error, got: {:?}",
-                rec.error
-            );
-        }
+        assert!(messages.is_empty());
+        assert!(tool_results.is_empty());
+        assert!(tool_call_records.is_empty());
+        assert!(
+            outcome
+                .action_admission_error
+                .as_deref()
+                .is_some_and(|error| error.contains("tool name is missing")),
+            "unexpected admission result: {outcome:?}"
+        );
     }
 }

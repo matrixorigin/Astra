@@ -970,9 +970,8 @@ impl RuntimeToolInvocationLedger {
                     observation.result.clone(),
                     completion_source,
                 )
-                .map(|record| {
+                .inspect(|_| {
                     ledger.note_terminal(identity);
-                    record
                 })
                 .map_err(RuntimeInvocationLedgerError::from),
         };

@@ -350,23 +350,21 @@ fn merge_session_durable_metrics(
         // transport failures are never hidden by a zero/partial journal.
         metrics.error_count = metrics.error_count.max(durable.error_count);
     }
-    if let Some(first) = durable.first_at {
-        if metrics
+    if let Some(first) = durable.first_at
+        && metrics
             .first_at
             .as_ref()
             .is_none_or(|current| first.as_str() < current.as_str())
-        {
-            metrics.first_at = Some(first);
-        }
+    {
+        metrics.first_at = Some(first);
     }
-    if let Some(last) = durable.last_at {
-        if metrics
+    if let Some(last) = durable.last_at
+        && metrics
             .last_at
             .as_ref()
             .is_none_or(|current| last.as_str() > current.as_str())
-        {
-            metrics.last_at = Some(last);
-        }
+    {
+        metrics.last_at = Some(last);
     }
 }
 
@@ -1081,10 +1079,9 @@ async fn load_durable_model_names(
                 "/data/resolved_model_selection/model_name",
                 "/data/model_selection/model_name",
             ],
-        ) {
-            if !models.iter().any(|known| known == &model) {
-                models.push(model);
-            }
+        ) && !models.iter().any(|known| known == &model)
+        {
+            models.push(model);
         }
     }
     Ok(models)
@@ -1543,10 +1540,10 @@ async fn load_turn_observed_metrics(
     }
     for (run_id, root_event_id) in root_event_by_run {
         let metrics = by_event.entry(root_event_id).or_default();
-        if let Some((_, model)) = run_started.get(&run_id) {
-            if model.is_some() {
-                metrics.model = model.clone();
-            }
+        if let Some((_, model)) = run_started.get(&run_id)
+            && model.is_some()
+        {
+            metrics.model = model.clone();
         }
         if let (Some((started_at, _)), Some((finished_at, failed, error))) =
             (run_started.get(&run_id), run_finished.get(&run_id))
@@ -3883,8 +3880,7 @@ impl SessionAuditService for DatabaseSessionAuditService {
         // the compatibility journal stopped before it could mirror them.
         // Include the canonical run/transport errors so the error endpoint
         // agrees with the summary instead of reporting an empty session.
-        let durable_error_sql = format!(
-            "SELECT id AS event_id, event_type, \
+        let durable_error_sql = "SELECT id AS event_id, event_type, \
                     CAST(payload_json AS CHAR) AS content, \
                     CAST(JSON_OBJECT('run_id', run_id, 'event_idx', event_idx) AS CHAR) AS metadata, \
                     CAST(created_at AS CHAR) AS created_at \
@@ -3892,9 +3888,8 @@ impl SessionAuditService for DatabaseSessionAuditService {
              WHERE session_id = ? AND user_id = ? \
                AND event_type IN ('run_error', 'tool_transport_failed') \
              ORDER BY created_at ASC, event_idx ASC \
-             LIMIT 200"
-        );
-        let durable_rows = query(&durable_error_sql)
+             LIMIT 200";
+        let durable_rows = query(durable_error_sql)
             .bind(session_id)
             .bind(user_id)
             .fetch_all(&pool)

@@ -636,7 +636,7 @@ mod tests {
             .bind(&user_id)
             .bind(&session_id)
             .bind(run_id)
-            .bind(format!("/{run_id}"))
+            .bind(run_id)
             .execute(pool.get())
             .await
             .unwrap();

@@ -5,8 +5,8 @@ edition.workspace = true
 
 [features]
 default = ["harness"]
-# Enables deterministic edge-callback controls for system-matrix journeys.
-bridge-e2e-hooks = []
+# Enables deterministic provider and edge-callback controls for full-stack tests.
+e2e-hooks = []
 # Enables OTLP trace export via `astra-logging` (build with `--features otel`).
 otel = ["astra-logging/otel"]
 # Observation + verification harness (zero cost when disabled).
@@ -17,7 +17,7 @@ crash-recovery = ["astra-skills/crash-recovery"]
 [[test]]
 name = "system_matrix_http_e2e"
 path = "tests/system_matrix_http_e2e/main.rs"
-required-features = ["bridge-e2e-hooks"]
+required-features = ["e2e-hooks"]
 
 [[bin]]
 name = "astra-server"

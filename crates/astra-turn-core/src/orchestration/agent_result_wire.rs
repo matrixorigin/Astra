@@ -228,8 +228,6 @@ pub fn agent_fanout_result_has_recoverable_issue(value: &Value) -> bool {
         "timed_out",
         "cancelled_by_user",
         "cancelled_by_runtime",
-        // Backward-compatible read of persisted pre-v2 fanout results.
-        "cancelled_by_parent_budget",
         "spawn_rejected",
         "incomplete_results",
     ];
@@ -266,7 +264,6 @@ pub fn fanout_slot_status_is_recoverable_issue(status: &str) -> bool {
             | "cancelled"
             | "cancelled_by_user"
             | "cancelled_by_runtime"
-            | "cancelled_by_parent_budget"
             | "spawn_rejected"
     )
 }
@@ -871,9 +868,6 @@ mod tests {
         assert!(fanout_slot_status_is_recoverable_issue("timed_out"));
         assert!(fanout_slot_status_is_recoverable_issue(
             "cancelled_by_runtime"
-        ));
-        assert!(fanout_slot_status_is_recoverable_issue(
-            "cancelled_by_parent_budget"
         ));
     }
 

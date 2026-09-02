@@ -1032,10 +1032,10 @@ mod tests {
     #[test]
     fn reward_hacking_ignores_same_tool_different_args() {
         let tool_calls = vec![
-            serde_json::json!({"name": "str_replace", "arguments": {"path": "a.rs", "old": "x", "new": "y"}}),
-            serde_json::json!({"name": "str_replace", "arguments": {"path": "b.rs", "old": "x", "new": "y"}}),
-            serde_json::json!({"name": "str_replace", "arguments": {"path": "c.rs", "old": "x", "new": "y"}}),
-            serde_json::json!({"name": "str_replace", "arguments": {"path": "d.rs", "old": "x", "new": "y"}}),
+            serde_json::json!({"function": {"name": "str_replace", "arguments": {"path": "a.rs", "old": "x", "new": "y"}}}),
+            serde_json::json!({"function": {"name": "str_replace", "arguments": {"path": "b.rs", "old": "x", "new": "y"}}}),
+            serde_json::json!({"function": {"name": "str_replace", "arguments": {"path": "c.rs", "old": "x", "new": "y"}}}),
+            serde_json::json!({"function": {"name": "str_replace", "arguments": {"path": "d.rs", "old": "x", "new": "y"}}}),
         ];
         let assessment = assess_reward_hacking(&tool_calls, 0.5, None).unwrap();
         assert!(
@@ -1054,9 +1054,9 @@ mod tests {
     #[test]
     fn reward_hacking_avoid_tools_prefers_repeated_or_exploration_tools() {
         let tool_calls = vec![
-            serde_json::json!({"name": "read_file", "arguments": {"path": "src/lib.rs"}}),
-            serde_json::json!({"name": "read_file", "arguments": {"path": "src/lib.rs"}}),
-            serde_json::json!({"name": "grep", "arguments": {"pattern": "TurnGuard"}}),
+            serde_json::json!({"function": {"name": "read_file", "arguments": {"path": "src/lib.rs"}}}),
+            serde_json::json!({"function": {"name": "read_file", "arguments": {"path": "src/lib.rs"}}}),
+            serde_json::json!({"function": {"name": "grep", "arguments": {"pattern": "TurnGuard"}}}),
         ];
 
         assert_eq!(
@@ -1880,9 +1880,9 @@ mod tests {
     #[test]
     fn reward_hacking_assessment_high_risk_on_identical_calls() {
         let calls = vec![
-            serde_json::json!({"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}),
-            serde_json::json!({"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}),
-            serde_json::json!({"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}),
+            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}}),
+            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}}),
+            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}}),
         ];
         let assessment = assess_reward_hacking(&calls, 0.9, None).unwrap();
         assert!(
@@ -1898,9 +1898,9 @@ mod tests {
     #[test]
     fn no_reward_hacking_on_same_tool_different_args() {
         let calls = vec![
-            serde_json::json!({"name": "str_replace", "arguments": "{\"path\": \"a.rs\", \"old\": \"x\", \"new\": \"y\"}"}),
-            serde_json::json!({"name": "str_replace", "arguments": "{\"path\": \"b.rs\", \"old\": \"x\", \"new\": \"y\"}"}),
-            serde_json::json!({"name": "str_replace", "arguments": "{\"path\": \"c.rs\", \"old\": \"x\", \"new\": \"y\"}"}),
+            serde_json::json!({"function": {"name": "str_replace", "arguments": "{\"path\": \"a.rs\", \"old\": \"x\", \"new\": \"y\"}"}}),
+            serde_json::json!({"function": {"name": "str_replace", "arguments": "{\"path\": \"b.rs\", \"old\": \"x\", \"new\": \"y\"}"}}),
+            serde_json::json!({"function": {"name": "str_replace", "arguments": "{\"path\": \"c.rs\", \"old\": \"x\", \"new\": \"y\"}"}}),
         ];
         let assessment = assess_reward_hacking(&calls, 0.8, None).unwrap();
         assert!(
@@ -1915,8 +1915,8 @@ mod tests {
     #[test]
     fn low_user_feedback_amplifies_reward_hacking_risk() {
         let calls = vec![
-            serde_json::json!({"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}),
-            serde_json::json!({"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}),
+            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}}),
+            serde_json::json!({"function": {"name": "bash", "arguments": "{\"command\": \"echo ok\"}"}}),
         ];
         let without_feedback = assess_reward_hacking(&calls, 0.5, None).unwrap();
         let with_low_feedback = assess_reward_hacking(&calls, 0.5, Some(20)).unwrap();

@@ -60,13 +60,13 @@ async fn collect_full_sse_stream(
 
 /// Stream a chat, wait for the full stream to end, return (status, raw_body).
 async fn stream_chat_full(app: &axum::Router, auth: &str, payload: Value) -> (StatusCode, String) {
-    let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
+    let test_secret = std::env::var("ASTRA_TEST_E2E_SECRET").expect("bridge test secret");
     let req = Request::builder()
         .method("POST")
         .uri("/chat/stream")
         .header("authorization", auth)
         .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", &test_secret)
+        .header("x-astra-e2e-test-secret", &test_secret)
         .body(Body::from(payload.to_string()))
         .expect("stream request");
     collect_full_sse_stream(app, req, 30).await
@@ -1234,13 +1234,13 @@ pub async fn run_stream_root_cancel_settles_slow_fanout_without_late_synthesis()
         }
     });
     let started = tokio::time::Instant::now();
-    let test_secret = std::env::var("ASTRA_TEST_BRIDGE_SECRET").expect("bridge test secret");
+    let test_secret = std::env::var("ASTRA_TEST_E2E_SECRET").expect("bridge test secret");
     let request = Request::builder()
         .method("POST")
         .uri("/chat/stream")
         .header("authorization", auth.as_str())
         .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", test_secret)
+        .header("x-astra-e2e-test-secret", test_secret)
         .body(Body::from(payload.to_string()))
         .expect("root cancellation stream request");
     let response = app
@@ -1486,21 +1486,11 @@ pub async fn run_stream_canonical_work_scheduler_prevents_decorative_plan() {
     let pool = &ctx.pool;
     let user_id = &ctx.user_id;
 
-    let (status, session) = post_json(
-        app,
-        "/sessions",
-        Some(auth.as_str()),
-        json!({
-            "title": "canonical Work scheduler online gate",
-            "metadata": {"suite": "canonical_work_scheduler"}
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED, "create session: {session}");
-    let session_id = session["session_id"]
-        .as_str()
-        .expect("session_id")
-        .to_string();
+    // This journey owns no extra session: the bootstrap fixture already gives
+    // it a fresh, owner-scoped session, and `ctx.close()` is its sole cleanup
+    // owner. The scheduler contract is independent of creating a second
+    // session, while a second lifecycle owner can race fixture teardown.
+    let session_id = ctx.session_id.clone();
 
     let premature_reply = "Both tasks are already complete before the first attempt ran.";
     let second_premature_reply = "The second task is complete before its attempt ran.";
@@ -1752,7 +1742,6 @@ pub async fn run_stream_canonical_work_scheduler_prevents_decorative_plan() {
         "declaring and completing ordered tasks must not construct a child model loop"
     );
 
-    cleanup_session_data(&ctx.shared_pool, user_id, &session_id).await;
     ctx.close().await;
 }
 

@@ -40,12 +40,6 @@ pub enum SessionRunAction {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionRunCapabilityServerRefs {
-    pub mcp: String,
-    pub skills: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRunPermissionFacts {
     pub has_issues: bool,
     pub requests: u32,
@@ -70,8 +64,6 @@ pub struct SessionRunRuntimeFacts {
     pub agent_binding_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_binding_schema_version: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capability_server_refs: Option<SessionRunCapabilityServerRefs>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

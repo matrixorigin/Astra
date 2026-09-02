@@ -1,5 +1,6 @@
 use super::events::{NewWorkEvent, WorkEventKind, WorkEventSeq, retained_from};
 use super::repository::{WorkConflictResource, WorkRepositoryError};
+use astra_core::matrixone_statement_with_null_shape;
 use sqlx::{MySql, Row, Transaction, query};
 
 pub(super) async fn insert_genesis_event(
@@ -198,33 +199,43 @@ async fn insert_event(
     event_seq: WorkEventSeq,
     payload_hash: Option<&super::WorkContentHash>,
 ) -> Result<(), WorkRepositoryError> {
-    query(
+    let insert_sql = matrixone_statement_with_null_shape(
         "INSERT INTO work_events
          (owner_id, work_id, event_seq, branch_id, event_kind, work_revision,
           goal_revision, criterion_set_revision, branch_revision, graph_revision, source_ref,
           payload_hash)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(event.owner_id.as_str())
-    .bind(event.work_id.as_str())
-    .bind(event_seq.get())
-    .bind(event.branch_id.as_ref().map(super::WorkBranchId::as_str))
-    .bind(event.kind.as_str())
-    .bind(event.work_revision.map(|revision| revision.get()))
-    .bind(event.goal_revision.map(|revision| revision.get()))
-    .bind(event.criterion_set_revision.map(|revision| revision.get()))
-    .bind(event.branch_revision.map(|revision| revision.get()))
-    .bind(event.graph_revision.map(|revision| revision.get()))
-    .bind(event.source_ref.as_str())
-    .bind(payload_hash.map(super::WorkContentHash::as_str))
-    .execute(&mut **transaction)
-    .await
-    .map_err(|source| {
-        WorkRepositoryError::insert(
-            "insert Work event",
-            WorkConflictResource::WorkEventIdentity,
-            source,
-        )
-    })?;
+        [
+            event.branch_id.is_some(),
+            event.work_revision.is_some(),
+            event.goal_revision.is_some(),
+            event.criterion_set_revision.is_some(),
+            event.branch_revision.is_some(),
+            event.graph_revision.is_some(),
+            payload_hash.is_some(),
+        ],
+    );
+    query(&insert_sql)
+        .bind(event.owner_id.as_str())
+        .bind(event.work_id.as_str())
+        .bind(event_seq.get())
+        .bind(event.branch_id.as_ref().map(super::WorkBranchId::as_str))
+        .bind(event.kind.as_str())
+        .bind(event.work_revision.map(|revision| revision.get()))
+        .bind(event.goal_revision.map(|revision| revision.get()))
+        .bind(event.criterion_set_revision.map(|revision| revision.get()))
+        .bind(event.branch_revision.map(|revision| revision.get()))
+        .bind(event.graph_revision.map(|revision| revision.get()))
+        .bind(event.source_ref.as_str())
+        .bind(payload_hash.map(super::WorkContentHash::as_str))
+        .execute(&mut **transaction)
+        .await
+        .map_err(|source| {
+            WorkRepositoryError::insert(
+                "insert Work event",
+                WorkConflictResource::WorkEventIdentity,
+                source,
+            )
+        })?;
     Ok(())
 }

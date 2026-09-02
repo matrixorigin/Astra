@@ -83,8 +83,8 @@ fn hallucinated_xml_artifact_tool_name_no_panic() {
 // ─── Malformed tool arguments ────────────────────────────────────────────
 
 /// Contract: a `tool_call_start` with syntactically invalid arguments remains
-/// observable. It must never make the stream accumulator panic or silently
-/// manufacture executable arguments.
+/// observable as a batch-boundary contract violation. It must not manufacture
+/// executable arguments or a partially admitted tool call.
 #[test]
 fn tool_call_with_malformed_args_json_remains_observable() {
     let ev = json!({
@@ -94,11 +94,12 @@ fn tool_call_with_malformed_args_json_remains_observable() {
         "arguments": r#"{"path": "/tmp/x", "content": "unterminated"#, // missing closing quote+brace
     });
     let a = drive_all(&[ev]);
-    assert_eq!(
-        a.tool_calls.len(),
-        1,
-        "malformed args must not drop the tool_call — the repair stage \
-         needs the call captured to attempt recovery"
+    assert!(a.tool_calls.is_empty());
+    assert_eq!(a.error_kind, Some(astra_core::ErrorKind::ContractViolation));
+    assert!(
+        a.error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("arguments are malformed"))
     );
 }
 

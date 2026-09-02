@@ -435,8 +435,8 @@ mod tests {
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
         let tool_calls = vec![
-            json!({"name": "read_file", "arguments": {"path": "src/lib.rs"}}),
-            json!({"name": "read_file", "arguments": {"path": "src/lib.rs"}}),
+            json!({"function": {"name": "read_file", "arguments": {"path": "src/lib.rs"}}}),
+            json!({"function": {"name": "read_file", "arguments": {"path": "src/lib.rs"}}}),
         ];
         turn_guard.record_tool_calls(&tool_calls);
         turn_guard.record_tool_result("read_file", "fn main() {}");
@@ -497,8 +497,8 @@ mod tests {
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
         let tool_calls = vec![
-            json!({"name": "read_file", "arguments": {"path": "src/lib.rs"}}),
-            json!({"name": "read_file", "arguments": {"path": "src/lib.rs"}}),
+            json!({"function": {"name": "read_file", "arguments": {"path": "src/lib.rs"}}}),
+            json!({"function": {"name": "read_file", "arguments": {"path": "src/lib.rs"}}}),
         ];
         turn_guard.record_tool_calls(&tool_calls);
         turn_guard.record_tool_result("read_file", "fn main() {}");
@@ -623,9 +623,9 @@ mod tests {
         let mut last_heavy_checkpoint: Option<StepCheckpoint> = None;
         let mut turn_guard = TurnGuard::new();
         let tool_calls = vec![
-            json!({"name": "agent_fanout", "arguments": {"action": "get_results", "group_id": "review"}}),
-            json!({"name": "agent_fanout", "arguments": {"action": "get_results", "group_id": "review"}}),
-            json!({"name": "agent_fanout", "arguments": {"action": "get_results", "group_id": "review"}}),
+            json!({"function": {"name": "agent_fanout", "arguments": {"action": "get_results", "group_id": "review"}}}),
+            json!({"function": {"name": "agent_fanout", "arguments": {"action": "get_results", "group_id": "review"}}}),
+            json!({"function": {"name": "agent_fanout", "arguments": {"action": "get_results", "group_id": "review"}}}),
         ];
         turn_guard.record_tool_calls(&tool_calls);
 
@@ -691,7 +691,7 @@ mod tests {
             turn_guard.record_tool_result("read_file", "Error: file not found");
         }
 
-        let tool_calls = vec![json!({"name": "bash", "arguments": "{}"})];
+        let tool_calls = vec![json!({"function": {"name": "bash", "arguments": "{}"}})];
         turn_guard.record_tool_calls(&tool_calls);
 
         let out = apply_agentic_post_tool_policy(AgenticPostToolPolicyRequest {

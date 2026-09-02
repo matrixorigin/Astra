@@ -5,10 +5,10 @@ This repository is validated through Rust-first checks, contract tests (fast, ma
 ## Primary Commands
 
 ```bash
-# Full suite: workspace + bridge-e2e-hooks + online #[ignore] Matrix E2E + multi-agent integration (requires MatrixOne + Redis for the online portion)
+# Full suite: workspace + e2e-hooks + online #[ignore] Matrix E2E + multi-agent integration (requires MatrixOne + Redis for the online portion)
 make test
 
-# Workspace + bridge hooks only (no online #[ignore] suites)
+# Workspace + server E2E hooks only (no online #[ignore] suites)
 make test-offline
 
 # Online #[ignore] suites only (exports ASTRA_TEST_DB_IT=1 and ASTRA_TEST_DB_IT=1)
@@ -45,11 +45,11 @@ cargo check --manifest-path Cargo.toml
 
 ```bash
 ASTRA_TEST_DB_IT=1 \
-ASTRA_TEST_BRIDGE_SECRET=system-matrix-e2e-secret \
+ASTRA_TEST_E2E_SECRET=system-matrix-e2e-secret \
 ASTRA_BACKEND_SERVICE_KEY=test-service-key-e2e \
 ASTRA_LLM_RETRY_BASE_MS=10 ASTRA_DEFAULT_RETRY_AFTER_MS=10 ASTRA_BCRYPT_COST=4 \
 RUST_MIN_STACK=16777216 \
-cargo test -p astra-runtime --test system_matrix_http_e2e --features bridge-e2e-hooks -- \
+cargo test -p astra-runtime --test system_matrix_http_e2e --features e2e-hooks -- \
   --ignored --nocapture
 ```
 
@@ -64,7 +64,7 @@ cargo test --manifest-path Cargo.toml -p astra-runtime --test http_contract
 # 2. Core HTTP contract smoke
 make test-contract
 
-# 3. Full workspace + bridge hooks (no online #[ignore] suites)
+# 3. Full workspace + server E2E hooks (no online #[ignore] suites)
 make test-offline
 
 # 4. With MatrixOne + Redis up: add online #[ignore] suites (same as the second half of `make test`)

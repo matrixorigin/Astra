@@ -1792,8 +1792,11 @@ describe("chat existing run stream route", () => {
       'data: {"type":"text_delta","content":"reply"}\n\n',
       'data: {"type":"run_finished","run_id":"run-1","status":"completed"}\n\n',
     ]);
+    const listSessionArtifacts = vi.fn().mockResolvedValue({ artifacts: [] });
     mockRequireRuntimeClient.mockResolvedValue({
-      sdk: {},
+      sdk: {
+        listSessionArtifacts,
+      },
       fetchResponse: vi.fn().mockResolvedValue({
         ok: true,
         headers: backend.headers,
@@ -1824,6 +1827,9 @@ describe("chat existing run stream route", () => {
       }
     }
 
+    expect(listSessionArtifacts).toHaveBeenCalledWith("runtime-session-1", {
+      limit: 50,
+    });
     expect(mockUpdateStreamingAssistantMessage).not.toHaveBeenCalledWith(
       "user-a",
       "web-chat-1",

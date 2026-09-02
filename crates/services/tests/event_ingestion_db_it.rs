@@ -820,7 +820,7 @@ async fn event_ingest_drops_late_events_for_deleted_session_without_recreating_r
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn event_ingest_drops_foreign_owned_session_without_blocking_valid_events() {
+async fn event_ingest_isolates_same_session_id_across_owners_without_blocking_valid_events() {
     let shared = common::setup_pool().await;
     let pool = shared.get().clone();
 
@@ -863,8 +863,8 @@ async fn event_ingest_drops_foreign_owned_session_without_blocking_valid_events(
     .await
     .expect("count test-user events");
     assert_eq!(
-        test_user_event_count, 0,
-        "foreign-owned session must reject test-user event rows"
+        test_user_event_count, 1,
+        "the same logical session id must be independently writable by another owner"
     );
 
     let test_user_session_count: i64 = sqlx::query_scalar(
@@ -876,10 +876,11 @@ async fn event_ingest_drops_foreign_owned_session_without_blocking_valid_events(
     .await
     .expect("count test-user sessions");
     assert_eq!(
-        test_user_session_count, 0,
-        "foreign-owned session must not create a test-user session root"
+        test_user_session_count, 1,
+        "session identity is the owner-scoped (user_id, session_id) pair"
     );
     assert_session_event_count(&pool, &foreign_user_id, &foreign_session_id, 7).await;
+    assert_session_event_count(&pool, TEST_USER_ID, &foreign_session_id, 1).await;
     assert_session_event_count(&pool, TEST_USER_ID, &valid_session_id, 1).await;
 
     let valid_event_count: i64 =
@@ -896,19 +897,13 @@ async fn event_ingest_drops_foreign_owned_session_without_blocking_valid_events(
 
     let stats = stats.lock().expect("stats lock").clone();
     assert_eq!(stats.events_flushed, 2);
-    assert_eq!(stats.events_dropped_permanent, 1);
+    assert_eq!(stats.events_dropped_permanent, 0);
     assert_eq!(stats.flush_count, 1);
-    assert_eq!(stats.errors, 1);
-    assert!(
-        stats
-            .last_error
-            .as_deref()
-            .is_some_and(|error| error.contains("permanently invalid ingestion events")),
-        "unexpected ingestion error: {:?}",
-        stats.last_error
-    );
+    assert_eq!(stats.errors, 0);
+    assert_eq!(stats.last_error, None);
 
     cleanup_session(&pool, &foreign_user_id, &foreign_session_id).await;
+    cleanup_session(&pool, TEST_USER_ID, &foreign_session_id).await;
     cleanup_session(&pool, TEST_USER_ID, &valid_session_id).await;
 }
 

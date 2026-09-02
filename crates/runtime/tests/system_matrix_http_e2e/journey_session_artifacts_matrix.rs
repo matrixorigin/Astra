@@ -297,6 +297,36 @@ fn assert_no_primary_nonstream_fallback(hits: &RawTransportServerHits, message: 
     );
 }
 
+fn is_work_classification_request(request: &str) -> bool {
+    request.contains("Classify goal as JSON")
+}
+
+async fn write_work_classification_response(
+    socket: &mut tokio::net::TcpStream,
+) -> std::io::Result<()> {
+    let decision = json!({
+        "work_lifecycle": "not_required",
+        "workspace_mutation": "read_only",
+        "mutation_completion_scope": "unknown",
+        "execution_topology": "primary",
+        "acceptance_unit_relationship": "single_outcome",
+        "acceptance_units": [{
+            "objective": "exercise provider streaming",
+            "expected_result": "preserve the exact provider outcome"
+        }]
+    })
+    .to_string();
+    let delta = json!({"choices":[{"delta":{"content": decision}}]});
+    let terminal = json!({"choices":[{"delta":{},"finish_reason":"stop"}]});
+    let body = format!("data: {delta}\n\ndata: {terminal}\n\n");
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    socket.write_all(response.as_bytes()).await?;
+    socket.shutdown().await
+}
+
 async fn spawn_raw_partial_transport_server(
     partial_text: &str,
 ) -> (String, RawTransportServerHits) {
@@ -318,6 +348,12 @@ async fn spawn_raw_partial_transport_server(
                 let req = read_full_http_request(&mut socket).await;
                 let is_stream = req.contains("\"stream\":true");
                 if is_stream {
+                    if is_work_classification_request(&req) {
+                        write_work_classification_response(&mut socket)
+                            .await
+                            .expect("write Work classification response");
+                        return;
+                    }
                     hits.record_stream(&req);
                     let partial = format!(
                         "data: {}\n\n",
@@ -374,6 +410,12 @@ async fn spawn_raw_idle_after_progress_server(
                 let req = read_full_http_request(&mut socket).await;
                 let is_stream = req.contains("\"stream\":true");
                 if is_stream {
+                    if is_work_classification_request(&req) {
+                        write_work_classification_response(&mut socket)
+                            .await
+                            .expect("write idle Work classification response");
+                        return;
+                    }
                     hits.record_stream(&req);
                     let partial = format!(
                         "data: {}\n\n",
@@ -429,6 +471,12 @@ async fn spawn_raw_stream_rate_limit_server(
                 let req = read_full_http_request(&mut socket).await;
                 let is_stream = req.contains("\"stream\":true");
                 if is_stream {
+                    if is_work_classification_request(&req) {
+                        write_work_classification_response(&mut socket)
+                            .await
+                            .expect("write rate-limit Work classification response");
+                        return;
+                    }
                     hits.record_stream(&req);
                     let retry_after_header = retry_after
                         .map(|value| format!("Retry-After: {value}\r\n"))
@@ -485,6 +533,12 @@ async fn spawn_raw_stream_rate_limit_then_sse_server(
                 let req = read_full_http_request(&mut socket).await;
                 let is_stream = req.contains("\"stream\":true");
                 if is_stream {
+                    if is_work_classification_request(&req) {
+                        write_work_classification_response(&mut socket)
+                            .await
+                            .expect("write retry Work classification response");
+                        return;
+                    }
                     let stream_ix = hits.stream_hits.fetch_add(1, Ordering::SeqCst);
                     let response = if stream_ix == 0 {
                         let body = r#"{"error":{"message":"rate limit exceeded"}}"#;
@@ -549,17 +603,38 @@ async fn spawn_raw_server_loop_block_parse_server(
                 let req = read_full_http_request(&mut socket).await;
                 let is_stream = req.contains("\"stream\":true");
                 if is_stream {
+                    if is_work_classification_request(&req) {
+                        write_work_classification_response(&mut socket)
+                            .await
+                            .expect("write server-loop Work classification response");
+                        return;
+                    }
                     hits.record_stream(&req);
                     let partial = json!({"choices":[{"delta":{"content": partial_text}}]});
-                    let body = format!("data: {partial}\n\ndata: not-json\n\n");
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
+                    let partial_frame = format!("data: {partial}\n\n");
+                    let malformed_frame = "data: not-json\n\n";
+                    let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+                    socket
+                        .write_all(headers.as_bytes())
+                        .await
+                        .expect("write server-loop block-parse headers");
+                    let partial_chunk =
+                        format!("{:X}\r\n{}\r\n", partial_frame.len(), partial_frame);
+                    socket
+                        .write_all(partial_chunk.as_bytes())
+                        .await
+                        .expect("write server-loop visible partial frame");
+                    socket.flush().await.expect("flush visible partial frame");
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    let malformed_chunk = format!(
+                        "{:X}\r\n{}\r\n0\r\n\r\n",
+                        malformed_frame.len(),
+                        malformed_frame
                     );
                     socket
-                        .write_all(response.as_bytes())
+                        .write_all(malformed_chunk.as_bytes())
                         .await
-                        .expect("write server-loop block-parse stream response");
+                        .expect("write server-loop malformed frame");
                     let _ = socket.shutdown().await;
                 } else {
                     hits.record_nonstream(&req);

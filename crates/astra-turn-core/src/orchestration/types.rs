@@ -32,13 +32,17 @@ impl CancellationOrigin {
             Self::Unverified => "unverified",
         }
     }
+}
 
-    pub fn from_str(value: &str) -> Option<Self> {
+impl std::str::FromStr for CancellationOrigin {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
-            "user" => Some(Self::User),
-            "runtime" => Some(Self::Runtime),
-            "unverified" => Some(Self::Unverified),
-            _ => None,
+            "user" => Ok(Self::User),
+            "runtime" => Ok(Self::Runtime),
+            "unverified" => Ok(Self::Unverified),
+            _ => Err(()),
         }
     }
 }

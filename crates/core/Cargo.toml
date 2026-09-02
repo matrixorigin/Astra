@@ -17,6 +17,7 @@ sqlx.workspace = true
 tokio.workspace = true
 toml = "1.1.2"
 tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 temp-env = "0.3"

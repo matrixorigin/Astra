@@ -154,10 +154,20 @@ pub(crate) struct DurableInferenceAdmissionFailure {
     pub(crate) error: astra_core::ClassifiedError,
 }
 
-#[cfg(not(test))]
-const DETACHED_RECONCILIATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-#[cfg(test)]
-const DETACHED_RECONCILIATION_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
+fn detached_reconciliation_timeout() -> std::time::Duration {
+    #[cfg(not(test))]
+    {
+        std::time::Duration::from_secs(10)
+    }
+    #[cfg(test)]
+    {
+        if std::env::var_os("ASTRA_TEST_DB_IT").is_some() {
+            std::time::Duration::from_secs(10)
+        } else {
+            std::time::Duration::from_millis(50)
+        }
+    }
+}
 const MAX_FOREGROUND_ADMISSION_RECOVERIES: u32 = 1;
 #[cfg(not(test))]
 const DEFAULT_PROVIDER_SETTLEMENT_CAPACITY: usize = 256;
@@ -1714,7 +1724,7 @@ impl ProviderSettlementCoordinator {
             let worker_job = job.clone();
             let result = tokio::spawn(async move {
                 tokio::time::timeout(
-                    DETACHED_RECONCILIATION_TIMEOUT,
+                    detached_reconciliation_timeout(),
                     reconcile_provider_settlement_job(&worker_job.job),
                 )
                 .await
@@ -1766,7 +1776,7 @@ impl ProviderSettlementCoordinator {
                     attempt_number,
                     invocation_id = %job.job.invocation.invocation_id(),
                     task = job.job.task_label(),
-                    timeout_ms = DETACHED_RECONCILIATION_TIMEOUT.as_millis(),
+                    timeout_ms = detached_reconciliation_timeout().as_millis(),
                     "provider settlement debt declaration timed out; retaining bounded owner"
                 ),
                 Err(error) => {
@@ -2735,22 +2745,23 @@ impl DurableInferenceLedger {
                 reservation: Some(settlement_reservation),
             };
             let admission_started = std::time::Instant::now();
-            let admission_future = tokio::time::timeout(
-                DETACHED_RECONCILIATION_TIMEOUT,
-                self.persistence.admit_invocation(&plan),
-            );
-            tokio::pin!(admission_future);
-            let admission = match self.run_authority.as_ref() {
-                Some(authority) => tokio::select! {
-                    biased;
-                    result = &mut admission_future => result,
-                    error = authority.wait_for_local_fence("logical invocation admission") => {
-                        return Err(error);
-                    }
-                },
-                None => admission_future.as_mut().await,
+            let admission = {
+                let admission_future = tokio::time::timeout(
+                    detached_reconciliation_timeout(),
+                    self.persistence.admit_invocation(&plan),
+                );
+                tokio::pin!(admission_future);
+                match self.run_authority.as_ref() {
+                    Some(authority) => tokio::select! {
+                        biased;
+                        result = &mut admission_future => result,
+                        error = authority.wait_for_local_fence("logical invocation admission") => {
+                            return Err(error);
+                        }
+                    },
+                    None => admission_future.as_mut().await,
+                }
             };
-            drop(admission_future);
             // A database result and a local authority fence can become ready in
             // the same scheduler turn.  Re-check after the select so a timeout
             // or late admission ACK cannot outrank cancellation/lease loss and
@@ -2833,7 +2844,7 @@ impl DurableInferenceLedger {
                         invocation_id = %plan.invocation_id(),
                         logical_attempt = plan.logical_attempt(),
                         elapsed_ms = admission_started.elapsed().as_millis(),
-                        timeout_ms = DETACHED_RECONCILIATION_TIMEOUT.as_millis(),
+                        timeout_ms = detached_reconciliation_timeout().as_millis(),
                         "durable inference admission needs foreground ambiguity resolution"
                     );
                     "timeout"
@@ -2842,23 +2853,24 @@ impl DurableInferenceLedger {
 
             let recovery_started = std::time::Instant::now();
             let recovery_terminal = pre_provider_cancelled_terminal();
-            let recovery_future = tokio::time::timeout(
-                DETACHED_RECONCILIATION_TIMEOUT,
-                self.persistence
-                    .settle_uncertain_admission(&plan, &recovery_terminal),
-            );
-            tokio::pin!(recovery_future);
-            let recovery = match self.run_authority.as_ref() {
-                Some(authority) => tokio::select! {
-                    biased;
-                    result = &mut recovery_future => result,
-                    error = authority.wait_for_local_fence("logical invocation admission recovery") => {
-                        return Err(error);
-                    }
-                },
-                None => recovery_future.as_mut().await,
+            let recovery = {
+                let recovery_future = tokio::time::timeout(
+                    detached_reconciliation_timeout(),
+                    self.persistence
+                        .settle_uncertain_admission(&plan, &recovery_terminal),
+                );
+                tokio::pin!(recovery_future);
+                match self.run_authority.as_ref() {
+                    Some(authority) => tokio::select! {
+                        biased;
+                        result = &mut recovery_future => result,
+                        error = authority.wait_for_local_fence("logical invocation admission recovery") => {
+                            return Err(error);
+                        }
+                    },
+                    None => recovery_future.as_mut().await,
+                }
             };
-            drop(recovery_future);
             // Recovery is only an admission fact, not renewed run authority.
             // Preserve the same local fence at the recovery linearization
             // boundary before considering a replacement identity.
@@ -2894,7 +2906,7 @@ impl DurableInferenceLedger {
                         invocation_id = %plan.invocation_id(),
                         logical_attempt = plan.logical_attempt(),
                         elapsed_ms = recovery_started.elapsed().as_millis(),
-                        timeout_ms = DETACHED_RECONCILIATION_TIMEOUT.as_millis(),
+                        timeout_ms = detached_reconciliation_timeout().as_millis(),
                         "foreground admission ambiguity resolution timed out; bounded coordinator retains ownership"
                     );
                     return Err(ledger_timeout_error_for_stage(
@@ -3600,7 +3612,7 @@ impl DurableInferenceInvocation {
         // fallible reads.
         if terminal.status != astra_services::InferenceTerminalStatus::Succeeded {
             match tokio::time::timeout(
-                DETACHED_RECONCILIATION_TIMEOUT,
+                detached_reconciliation_timeout(),
                 self.persistence.declare_settlement(&self.plan, terminal),
             )
             .await
@@ -3615,7 +3627,7 @@ impl DurableInferenceInvocation {
                 }
                 Err(_) => {
                     tracing::warn!(
-                        timeout_ms = DETACHED_RECONCILIATION_TIMEOUT.as_millis(),
+                        timeout_ms = detached_reconciliation_timeout().as_millis(),
                         "logical settlement declaration timed out; transferring its reserved owner"
                     );
                     return self.handoff_logical_settlement(terminal.clone()).await;
@@ -3626,7 +3638,7 @@ impl DurableInferenceInvocation {
         // transaction; non-success established its logical debt above. The
         // bounded mirror may fail without losing the global recovery owner.
         let result = tokio::time::timeout(
-            DETACHED_RECONCILIATION_TIMEOUT,
+            detached_reconciliation_timeout(),
             self.persistence.finish_invocation(&self.plan, terminal),
         )
         .await;
@@ -3909,7 +3921,7 @@ impl DurableProviderAttemptObserver {
         // immediately. A defensive bound prevents a foreign/buggy caller from
         // pinning one task and the logical invocation forever.
         let _ = tokio::time::timeout(
-            DETACHED_RECONCILIATION_TIMEOUT,
+            detached_reconciliation_timeout(),
             self.operations.close_and_wait(),
         )
         .await;

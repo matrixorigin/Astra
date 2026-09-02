@@ -83,7 +83,7 @@ impl StreamJsonEmitter {
         let exchange_id = uuid::Uuid::now_v7().to_string();
         let identity = ExchangeIdentity {
             session_id,
-            bridge_run_id: None,
+            server_run_id: None,
             session_turn,
             round_index,
             exchange_id,
@@ -162,7 +162,7 @@ struct ExchangeIdentity {
     session_id: Option<String>,
     /// Durable run assigned by the Server for this exchange. This is distinct
     /// from the CLI-local execution/turn-chain correlation id.
-    bridge_run_id: Option<String>,
+    server_run_id: Option<String>,
     session_turn: u32,
     round_index: u32,
     exchange_id: String,
@@ -205,17 +205,17 @@ impl StreamJsonExchange {
                 }
                 self.identity.session_id = Some(session_id);
             }
-            if let Some(bridge_run_id) = event.get("run_id").and_then(Value::as_str) {
-                validate_bounded_identity("bridge_run_id", bridge_run_id, 64)?;
-                if let Some(expected) = self.identity.bridge_run_id.as_deref()
-                    && expected != bridge_run_id
+            if let Some(server_run_id) = event.get("run_id").and_then(Value::as_str) {
+                validate_bounded_identity("server_run_id", server_run_id, 64)?;
+                if let Some(expected) = self.identity.server_run_id.as_deref()
+                    && expected != server_run_id
                 {
                     return Err(
-                        "stream-json session_info changed bridge_run_id within one exchange"
+                        "stream-json session_info changed server_run_id within one exchange"
                             .to_string(),
                     );
                 }
-                self.identity.bridge_run_id = Some(bridge_run_id.to_string());
+                self.identity.server_run_id = Some(server_run_id.to_string());
             }
         }
         self.event_seq = self
@@ -249,18 +249,18 @@ impl StreamJsonExchange {
             }
             self.identity.session_id = Some(session_id);
         }
-        let bridge_run_id = accum.run_id.as_deref().ok_or_else(|| {
+        let server_run_id = accum.run_id.as_deref().ok_or_else(|| {
             "stream-json exchange reached [DONE] without a bridge run_id".to_string()
         })?;
-        validate_bounded_identity("bridge_run_id", bridge_run_id, 64)?;
-        if let Some(expected) = self.identity.bridge_run_id.as_deref()
-            && expected != bridge_run_id
+        validate_bounded_identity("server_run_id", server_run_id, 64)?;
+        if let Some(expected) = self.identity.server_run_id.as_deref()
+            && expected != server_run_id
         {
             return Err(
-                "stream-json accumulator changed bridge_run_id within one exchange".to_string(),
+                "stream-json accumulator changed server_run_id within one exchange".to_string(),
             );
         }
-        self.identity.bridge_run_id = Some(bridge_run_id.to_string());
+        self.identity.server_run_id = Some(server_run_id.to_string());
         let usage = accum.has_usage.then(|| {
             json!({
                 "fresh_input_tokens": accum.prompt_tokens,
@@ -279,7 +279,7 @@ impl StreamJsonExchange {
         });
         let mut fields = Map::new();
         fields.insert("event_count".to_string(), json!(self.event_seq));
-        fields.insert("bridge_run_id".to_string(), json!(bridge_run_id));
+        fields.insert("server_run_id".to_string(), json!(server_run_id));
         fields.insert("stream_complete".to_string(), json!(true));
         fields.insert("usage".to_string(), json!(usage));
         fields.insert(
@@ -412,7 +412,7 @@ mod tests {
         assert_eq!(records[1]["event_seq"], 1);
         assert_eq!(records[2]["event_seq"], 2);
         assert_eq!(records[3]["event_count"], 2);
-        assert_eq!(records[3]["bridge_run_id"], "server-run");
+        assert_eq!(records[3]["server_run_id"], "server-run");
         assert_eq!(records[3]["session_id"], "session-canonical");
         assert_eq!(records[4]["execution_id"], "run-execution");
         assert_eq!(records[4]["turn_chain_id"], "run-execution");

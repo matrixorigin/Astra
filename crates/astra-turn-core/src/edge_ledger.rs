@@ -430,7 +430,6 @@ pub fn on_ledger_insert(key: &str) {
 ///
 /// This is deliberately separate from event construction: formatting an SSE
 /// map must not authorize a callback unless the caller will also consume it.
-#[must_use]
 pub fn expect_ledger_entry(
     ledger: &Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
     key: &str,

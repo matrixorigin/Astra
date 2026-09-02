@@ -416,11 +416,10 @@ fn append_history_edit_rollback_error(
 /// Create and bind a fresh server session without owning any presentation.
 /// Both the text CLI and TUI call this transaction; each surface renders its
 /// own acknowledgement after the authoritative `SessionState` rebind lands.
-pub(crate) async fn start_fresh_session(
+async fn create_server_session_identity(
     api: &astra_thin_client::ThinClient,
     profile: Option<&str>,
     token: &str,
-    state: &mut SessionState,
 ) -> Result<String, String> {
     let body = api
         .post_sessions_json(token, &serde_json::json!({}))
@@ -440,6 +439,42 @@ pub(crate) async fn start_fresh_session(
         &session_id,
         "slash_state:clear_starts_fresh_session",
     );
+    Ok(session_id)
+}
+
+/// Bind the first authoritative identity to an otherwise sessionless runtime.
+///
+/// Startup may already have installed long-lived producers (notably the
+/// dynamic-agent spawner) against the pristine session-scoped registries.
+/// Initial identity discovery is not a session transition, so rotating those
+/// registries here would split producers from their consumers. Actual session
+/// transitions continue to go through [`start_fresh_session`].
+pub(crate) async fn bind_initial_session(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    token: &str,
+    state: &mut SessionState,
+) -> Result<String, String> {
+    if state.session_id.is_some()
+        || state.run_id.is_some()
+        || state.turn != 0
+        || !state.history.is_empty()
+    {
+        return Err("initial session identity requires a pristine sessionless runtime".to_string());
+    }
+    let session_id = create_server_session_identity(api, profile, token).await?;
+    state.set_session_id(session_id.clone());
+    crate::cli::session::session_startup::initialize_journal_pub(state, &session_id);
+    Ok(session_id)
+}
+
+pub(crate) async fn start_fresh_session(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    token: &str,
+    state: &mut SessionState,
+) -> Result<String, String> {
+    let session_id = create_server_session_identity(api, profile, token).await?;
     state.prepare_for_session_rebind().await;
     state.reset_for_new_session();
     state.set_session_id(session_id.clone());

@@ -1613,7 +1613,7 @@ mod tests {
         let sid = "test-digest-telemetry-00000000-0000-0000-0000-000000000004";
         fs::write(
             journal_path_for_test(sid),
-            r#"{"type":"llm_round","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":3,"agentic_step":5,"round":0,"tokens_in":100,"tokens_out":20,"duration_ms":50,"tool_calls_returned":1,"metadata":{"source":"bridge_inprocess","run_id":"run-1","finish_reason":"tool_calls","tool_call_names":["bash"]}}
+            r#"{"type":"llm_round","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":3,"agentic_step":5,"round":0,"tokens_in":100,"tokens_out":20,"duration_ms":50,"tool_calls_returned":1,"metadata":{"source":"server_loop","run_id":"run-1","finish_reason":"tool_calls","tool_call_names":["bash"]}}
 {"type":"interruption_recorded","ts":"2026-01-01T00:00:01Z","session_id":"S","turn":3,"agentic_step":5,"metadata":{"interruption":{"kind":"budget_exhausted","resumable":true,"tool_calls_completed":2,"turns_completed":5,"remaining_turns":0}}}
 {"type":"turn","ts":"2026-01-01T00:00:02Z","session_id":"S","turn":3,"tokens_in":100,"tokens_out":20,"duration_ms":500,"user_input":"continue","tool_calls":[{"name":"bash","ok":true,"ms":10}],"llm_rounds":1}
 "#,
@@ -1630,7 +1630,7 @@ mod tests {
         assert_eq!(d.turns[0].llm_round_details.len(), 1);
         let round = &d.turns[0].llm_round_details[0];
         assert_eq!(round.agentic_step, Some(5));
-        assert_eq!(round.source.as_deref(), Some("bridge_inprocess"));
+        assert_eq!(round.source.as_deref(), Some("server_loop"));
         assert_eq!(round.run_id.as_deref(), Some("run-1"));
         assert_eq!(round.finish_reason.as_deref(), Some("tool_calls"));
     }

@@ -2,17 +2,17 @@
 
 This document maps **user-visible capabilities** to **HTTP routes**, **persistence (MatrixOne tables or in-process stores)**, and the **integration tests** that assert them. It complements `router_builder.rs` unit tests (route registration only).
 
-**Layout (system E2E plan):** the integration binary is `crates/runtime/tests/system_matrix_http_e2e/main.rs` with shared **`harness.rs`** (env gate, HTTP, `sqlx`, `bootstrap`) and journey modules such as **`journey_full.rs`**, **`journey_tasks_runs.rs`**, **`journey_extended.rs`**, **`journey_branches_matrix.rs`**, **`journey_delegate_http_matrix.rs`**, **`journey_admin_smoke_matrix.rs`**, and other `journey_*.rs` files. Every active chat admission in this matrix uses one server-owned `POST /chat/stream` loop; edge callbacks are correlated back to that run. `Cargo.toml` names the test target `system_matrix_http_e2e` and enables `bridge-e2e-hooks`.
+**Layout (system E2E plan):** the integration binary is `crates/runtime/tests/system_matrix_http_e2e/main.rs` with shared **`harness.rs`** (env gate, HTTP, `sqlx`, `bootstrap`) and journey modules such as **`journey_full.rs`**, **`journey_tasks_runs.rs`**, **`journey_extended.rs`**, **`journey_branches_matrix.rs`**, **`journey_delegate_http_matrix.rs`**, **`journey_admin_smoke_matrix.rs`**, and other `journey_*.rs` files. Every active chat admission in this matrix uses one server-owned `POST /chat/stream` loop; edge callbacks are correlated back to that run. `Cargo.toml` names the test target `system_matrix_http_e2e` and enables `e2e-hooks`.
 
 ## How to run
 
 ```bash
 ASTRA_TEST_DB_IT=1 \
-ASTRA_TEST_BRIDGE_SECRET=system-matrix-e2e-secret \
+ASTRA_TEST_E2E_SECRET=system-matrix-e2e-secret \
 ASTRA_BACKEND_SERVICE_KEY=test-service-key-e2e \
 ASTRA_LLM_RETRY_BASE_MS=10 ASTRA_DEFAULT_RETRY_AFTER_MS=10 ASTRA_BCRYPT_COST=4 \
 RUST_MIN_STACK=16777216 \
-cargo test -p astra-runtime --test system_matrix_http_e2e --features bridge-e2e-hooks -- \
+cargo test -p astra-runtime --test system_matrix_http_e2e --features e2e-hooks -- \
   --ignored --nocapture
 ```
 
@@ -23,7 +23,7 @@ Requires the same environment as `astra-server`: `MATRIXONE_*`, `ASTRA_JWT_SECRE
 | Variable | Role | Notes |
 |----------|------|--------|
 | `ASTRA_TEST_DB_IT` | **Gate** | Must be `1` or ignored tests panic in `require_system_e2e_env` |
-| `ASTRA_TEST_BRIDGE_SECRET` | Legacy mock-inference hook | Injected before tests that use `context.test_llm_rounds`; this is not route authorization |
+| `ASTRA_TEST_E2E_SECRET` | Deterministic server inference hook | Injected before tests that use `context.test_llm_rounds`; this is test-only request authority |
 | `ASTRA_BACKEND_SERVICE_KEY` | Service-edge fixture | Non-empty test-only key for `/service/edges/status` authentication coverage |
 | `ASTRA_LLM_RETRY_BASE_MS`, `ASTRA_DEFAULT_RETRY_AFTER_MS`, `ASTRA_BCRYPT_COST` | Deterministic test timing | Runner-owned low-latency values; the E2E harness never changes process environment |
 | `RUST_MIN_STACK` | Tokio test worker stack | Set to `16777216` so the E2E runtime matches Astra's production process runtime |
@@ -36,7 +36,7 @@ Requires the same environment as `astra-server`: `MATRIXONE_*`, `ASTRA_JWT_SECRE
 | `ASTRA_JWT_SECRET` | Auth tokens | Default dev string if unset (not for production) |
 | `ASTRA_TOKEN_ENCRYPTION_KEY` | Token encryption | Default dev string if unset |
 | `MEMORIA_EMBEDDING_*` | Embeddings config | `MEMORIA_EMBEDDING_DIM` may be required for unknown models |
-| `ASTRA_BRIDGE_SECRET` | Legacy bridge integration | Only needed by separate legacy bridge/journal coverage, not by the server-owned stream route |
+| `ASTRA_RUNTIME_ROOT_SECRET` | Runtime signature root | Required by the production-shaped server state; artifact and execution-grant keys are purpose-derived from it |
 | `ASTRA_TEST_DB_IT_TEST_THREADS` | Makefile only | Set to `1` to run `system_matrix_http_e2e` with `--test-threads=1` (serial) |
 
 Evaluation **read** routes in the full journey use `x-user-id` without bearer (see `journey_full`). Other authenticated calls use the JWT from `bootstrap`.

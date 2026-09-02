@@ -1186,7 +1186,7 @@ pub(crate) fn assemble_context_pipeline(
             ));
     }
     external
-        .extra_stable_sections
+        .extra_dynamic_sections
         .push(crate::turn::prompt_cache::model_identity_prompt_section(
             input.model_name,
         ));
@@ -2285,8 +2285,8 @@ mod context_cache_contract_tests {
             .and_then(Value::as_str)
             .unwrap_or_default();
         assert!(
-            primary_text.contains("Model: deepseek-v4-pro-official(thinking:high)"),
-            "stable model identity must remain visible without provider routing: {primary_text}"
+            !primary_text.contains("Model: deepseek-v4-pro-official(thinking:high)"),
+            "runtime model identity must stay out of the strict-history prefix: {primary_text}"
         );
         assert!(!primary_text.contains("via openai"));
         assert!(
@@ -2303,17 +2303,30 @@ mod context_cache_contract_tests {
                 && !primary_text.contains("`start_work` is the first tool call"),
             "the prompt must not advertise deferred or Work capabilities absent from the admitted tool surface: {primary_text}"
         );
-        assert_eq!(output.volatile_preamble.len(), 1);
-        assert!(crate::turn::wire_assembly::is_required_runtime_preamble(
-            &output.volatile_preamble[0]
-        ));
         assert_eq!(
-            output.volatile_preamble[0]["role"].as_str(),
+            output.volatile_preamble.len(),
+            1,
+            "strict-history placement suppresses all ordinary dynamic context"
+        );
+        assert!(output.volatile_preamble.iter().all(|message| {
+            !message
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .contains("Model:")
+        }));
+        let required_context = output
+            .volatile_preamble
+            .iter()
+            .find(|message| crate::turn::wire_assembly::is_required_runtime_preamble(message))
+            .expect("required runtime context must remain independently typed");
+        assert_eq!(
+            required_context["role"].as_str(),
             Some("system"),
             "required control policy must remain runtime-owned before provider wire adaptation"
         );
         assert_eq!(
-            output.volatile_preamble[0]["content"].as_str(),
+            required_context["content"].as_str(),
             Some(runtime_policy),
             "required control policy must survive strict-history suppression"
         );

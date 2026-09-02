@@ -178,7 +178,7 @@ pub fn sanitize_canonical_continuation_messages_with_turn_semantics(
             if !keep {
                 return None;
             }
-            astra_turn_types::clear_bridge_turn_message_provenance(&mut message);
+            astra_turn_types::clear_turn_message_provenance(&mut message);
             Some(message)
         })
         .collect::<Vec<_>>();

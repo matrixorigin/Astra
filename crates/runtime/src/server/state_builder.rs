@@ -69,8 +69,17 @@ pub async fn build_server_state(
         runtime::build_runtime_wiring(&settings, &shared_pool, &shared_encryptor, &state).await?;
     let matrix_rt = Arc::clone(&wiring.matrix_rt);
 
+    let artifact_signing_secret =
+        core::derive_runtime_subkey(&settings.runtime_root_secret, b"artifact-signing")
+            .iter()
+            .fold(String::with_capacity(64), |mut encoded, byte| {
+                use std::fmt::Write;
+                write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+                encoded
+            });
+
     let state = state
-        .with_artifact_signing_secret(settings.bridge_secret.clone())
+        .with_artifact_signing_secret(artifact_signing_secret)
         .with_run_lifecycle_service(Arc::new(wiring.run_lifecycle))
         .with_agent_profile_registry(Arc::clone(&wiring.profile_registry))
         .with_delegation_engine(Arc::clone(&wiring.delegation_engine))

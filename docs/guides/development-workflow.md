@@ -158,7 +158,7 @@ The `dev-init` command automatically:
 
 - Generates `ASTRA_TOKEN_ENCRYPTION_KEY` if missing
 - Generates `ASTRA_JWT_SECRET` if missing
-- Generates `ASTRA_BRIDGE_SECRET` if missing or still using the template placeholder
+- Generates `ASTRA_RUNTIME_ROOT_SECRET` if missing or still using the template placeholder
 
 ## Proxy Configuration
 
@@ -189,7 +189,7 @@ Common issues:
 
 - Port 17001 already in use: `lsof -i :17001` and kill the process
 - Dependencies not ready: Wait and retry
-- **Missing JWT secret / bridge secret**: If you see `MissingRequiredKey` for `JWT_SECRET` or `BRIDGE_SECRET`:
+- **Missing JWT secret / runtime root secret**: If you see `MissingRequiredKey` for `JWT_SECRET` or `RUNTIME_ROOT_SECRET`:
   - Run `make dev-init` (auto-generates secrets in `.env`)
   - Or set `ASTRA_ALLOW_INSECURE_DEFAULTS=1` for quick dev (NOT for production)
 

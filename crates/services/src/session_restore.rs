@@ -28,7 +28,6 @@ const STEP_CHECKPOINT_NUMBER_OFFSET: u32 = 1_000_000_000;
 const MAX_CLOUD_RESTORE_CHECKPOINTS: u32 = 200;
 pub const COMPOSITE_SNAPSHOT_INDEX_ARTIFACT_KIND: &str = "composite_snapshot_index";
 pub const COMPOSITE_SNAPSHOT_INDEX_PROJECTION_ID: &str = "projection:composite-snapshot-index";
-const SESSION_STATE_SYNC_METADATA_MARKER: &str = "_session_state_sync";
 const CLOUD_CHECKPOINTS_SELECT_SQL: &str = "\
     SELECT number, turn, title, summary, total_tokens \
     FROM ( \
@@ -122,13 +121,12 @@ pub const PROMPT_HISTORY_TRANSCRIPT_EXISTS_SQL: &str = "\
           OR (r.run_id IS NOT NULL AND r.parent_run_id IS NULL) \
       ) \
     LIMIT 1";
-const PUSH_SESSION_STATE_UPSERT_SQL: &str = "INSERT INTO agent_sessions \
+const PUSH_SESSION_STATE_INSERT_SQL: &str = "INSERT INTO agent_sessions \
              (session_id, user_id, status, metadata, created_at, updated_at, last_active_at) \
-             VALUES (?, ?, 'active', ?, NOW(6), NOW(6), NOW(6)) \
-             ON DUPLICATE KEY UPDATE \
-             metadata = IF(user_id = VALUES(user_id), VALUES(metadata), metadata), \
-             updated_at = IF(user_id = VALUES(user_id), NOW(6), updated_at), \
-             last_active_at = IF(user_id = VALUES(user_id), NOW(6), last_active_at)";
+             VALUES (?, ?, 'active', ?, NOW(6), NOW(6), NOW(6))";
+const PUSH_SESSION_STATE_UPDATE_SQL: &str = "UPDATE agent_sessions \
+             SET metadata = ?, updated_at = NOW(6), last_active_at = NOW(6) \
+             WHERE user_id = ? AND session_id = ?";
 
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
@@ -1568,10 +1566,11 @@ fn reconcile_restored_session_candidates(
         current.title = other.title.clone();
     }
 
-    if same_generation && current.resume_bundle.is_none() {
-        if current.conversation_messages.is_empty() {
-            current.conversation_messages = other.conversation_messages;
-        }
+    if same_generation
+        && current.resume_bundle.is_none()
+        && current.conversation_messages.is_empty()
+    {
+        current.conversation_messages = other.conversation_messages;
     }
 
     Ok(current)
@@ -2211,31 +2210,6 @@ impl SessionRestoreService for HybridRestoreService {
 // ─── MatrixOneSyncService push methods ─────────────────────────────────────
 
 impl crate::state_sync::MatrixOneSyncService {
-    async fn reject_foreign_real_session_for_session_state(
-        &self,
-        session_id: &str,
-        user_id: &str,
-    ) -> Result<(), String> {
-        let rows = sqlx::query(
-            "SELECT CAST(metadata AS CHAR) AS metadata_json \
-             FROM agent_sessions WHERE session_id = ? AND user_id <> ?",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| format!("load foreign session metadata: {e}"))?;
-
-        for row in rows {
-            let metadata_json =
-                mysql_optional_string(&row, "push_session_state_foreign_owner", "metadata_json")?;
-            if !session_state_sync_metadata_marker_present(metadata_json.as_deref())? {
-                return Err("push_session_state: session_id belongs to another owner".to_string());
-            }
-        }
-        Ok(())
-    }
-
     /// Push a checkpoint to MatrixOne for cross-device availability.
     pub async fn push_checkpoint(
         &self,
@@ -2514,32 +2488,7 @@ impl crate::state_sync::MatrixOneSyncService {
         model: Option<&str>,
     ) -> Result<(), String> {
         let started_at = std::time::Instant::now();
-
-        let existing_metadata_row = sqlx::query(
-            "SELECT CAST(metadata AS CHAR) AS metadata_json \
-             FROM agent_sessions WHERE session_id = ? AND user_id = ? LIMIT 1",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| format!("load session metadata: {e}"))?;
-        let existing_metadata_json = existing_metadata_row
-            .as_ref()
-            .map(|row| mysql_optional_string(row, "push_session_state", "metadata_json"))
-            .transpose()?
-            .flatten();
-
-        if existing_metadata_row.is_none() {
-            self.reject_foreign_real_session_for_session_state(session_id, user_id)
-                .await?;
-        }
-
-        let metadata_json =
-            merge_session_state_metadata(existing_metadata_json.as_deref(), git_branch, model)?;
-        let payload_size = metadata_json.len();
-
-        let result: Result<(), String> = async {
+        let result: Result<usize, String> = async {
             let mut tx = self
                 .pool
                 .begin()
@@ -2548,25 +2497,49 @@ impl crate::state_sync::MatrixOneSyncService {
             crate::storage::lock_agent_session_write_fence(&mut tx, session_id, user_id)
                 .await
                 .map_err(|e| format!("push_session_state lifecycle fence: {e}"))?;
-            let result = sqlx::query(PUSH_SESSION_STATE_UPSERT_SQL)
-                .bind(session_id)
-                .bind(user_id)
-                .bind(&metadata_json)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| format!("push_session_state: {e}"))?;
-            if result.rows_affected() == 0 {
-                return Err("push_session_state: session owner mismatch".to_string());
+            let existing_metadata_row = sqlx::query(
+                "SELECT CAST(metadata AS CHAR) AS metadata_json \
+                 FROM agent_sessions WHERE user_id = ? AND session_id = ? FOR UPDATE",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| format!("push_session_state load owner state: {e}"))?;
+            let existing_metadata_json = existing_metadata_row
+                .as_ref()
+                .map(|row| mysql_optional_string(row, "push_session_state", "metadata_json"))
+                .transpose()?
+                .flatten();
+            let metadata_json =
+                merge_session_state_metadata(existing_metadata_json.as_deref(), git_branch, model)?;
+
+            if existing_metadata_row.is_some() {
+                sqlx::query(PUSH_SESSION_STATE_UPDATE_SQL)
+                    .bind(&metadata_json)
+                    .bind(user_id)
+                    .bind(session_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| format!("push_session_state update: {e}"))?;
+            } else {
+                sqlx::query(PUSH_SESSION_STATE_INSERT_SQL)
+                    .bind(session_id)
+                    .bind(user_id)
+                    .bind(&metadata_json)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| format!("push_session_state insert: {e}"))?;
             }
             tx.commit()
                 .await
                 .map_err(|e| format!("push_session_state commit: {e}"))?;
-            Ok(())
+            Ok(metadata_json.len())
         }
         .await;
 
         let (status, error_msg) = match &result {
-            Ok(()) => ("success", None),
+            Ok(_) => ("success", None),
             Err(e) => ("error", Some(e.as_str())),
         };
         log_session_sync(
@@ -2575,14 +2548,14 @@ impl crate::state_sync::MatrixOneSyncService {
                 user_id,
                 session_id,
                 sync_type: "session_state",
-                payload_size,
+                payload_size: result.as_ref().copied().unwrap_or(0),
                 duration_ms: Some(elapsed_ms(started_at)),
                 status,
                 error_msg,
             },
         );
 
-        result
+        result.map(|_| ())
     }
 
     /// Push a structured context-trace signal as a first-class cloud event.
@@ -2807,10 +2780,6 @@ fn merge_session_state_metadata(
     model: Option<&str>,
 ) -> Result<String, String> {
     let mut metadata = session_metadata_object_for_merge(existing_metadata_json)?;
-    metadata.insert(
-        SESSION_STATE_SYNC_METADATA_MARKER.to_string(),
-        serde_json::Value::Bool(true),
-    );
 
     if let Some(branch) = git_branch {
         metadata.insert(
@@ -2831,16 +2800,6 @@ fn merge_session_state_metadata(
     }
 
     Ok(serde_json::Value::Object(metadata).to_string())
-}
-
-fn session_state_sync_metadata_marker_present(
-    existing_metadata_json: Option<&str>,
-) -> Result<bool, String> {
-    let metadata = session_metadata_object_for_merge(existing_metadata_json)?;
-    Ok(metadata
-        .get(SESSION_STATE_SYNC_METADATA_MARKER)
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false))
 }
 
 fn session_metadata_object_for_merge(
@@ -3117,38 +3076,30 @@ mod tests {
     }
 
     #[test]
-    fn push_session_state_upsert_is_atomically_owner_guarded() {
-        let sql = PUSH_SESSION_STATE_UPSERT_SQL;
+    fn push_session_state_writes_only_the_owner_scoped_identity() {
+        let insert = PUSH_SESSION_STATE_INSERT_SQL;
+        let update = PUSH_SESSION_STATE_UPDATE_SQL;
         assert!(
-            sql.contains("VALUES (?, ?, 'active', ?, NOW(6), NOW(6), NOW(6))"),
+            insert.contains("VALUES (?, ?, 'active', ?, NOW(6), NOW(6), NOW(6))"),
             "insert path must target the owner-bound (user_id, session_id) primary key directly"
         );
         assert!(
-            !sql.contains("user_id <>"),
+            !insert.contains("ON DUPLICATE KEY") && !update.contains("ON DUPLICATE KEY"),
+            "the fence-locked owner lookup, not upsert row-count behavior, selects the write path"
+        );
+        assert!(
+            !insert.contains("user_id <>") && !update.contains("user_id <>"),
             "owner-bound sessions must allow different users to persist the same logical session_id independently"
         );
         assert!(
-            !sql.contains("WHERE NOT EXISTS"),
+            !insert.contains("WHERE NOT EXISTS") && !update.contains("WHERE NOT EXISTS"),
             "insert path must not retain the old global-session-id guard"
         );
         assert!(
-            !sql.contains(concat!("ELSE ", "NULL")),
-            "owner mismatch must not rely on NOT NULL constraint failures"
+            update.contains("WHERE user_id = ? AND session_id = ?"),
+            "updates must be scoped by the complete owner identity"
         );
-        assert!(
-            !sql.contains("status ="),
-            "duplicate push must preserve existing session status instead of assigning a no-op"
-        );
-        for assignment in [
-            "metadata = IF(user_id = VALUES(user_id), VALUES(metadata), metadata)",
-            "updated_at = IF(user_id = VALUES(user_id), NOW(6), updated_at)",
-            "last_active_at = IF(user_id = VALUES(user_id), NOW(6), last_active_at)",
-        ] {
-            assert!(
-                sql.contains(assignment),
-                "session-state upsert assignment must be owner-guarded: {assignment}"
-            );
-        }
+        assert!(!update.contains("status ="));
     }
 
     #[test]
@@ -4863,20 +4814,6 @@ mod tests {
         assert_eq!(
             parsed.get("model").and_then(|v| v.as_str()),
             Some("gpt-5.4")
-        );
-        assert_eq!(
-            parsed
-                .get(SESSION_STATE_SYNC_METADATA_MARKER)
-                .and_then(|v| v.as_bool()),
-            Some(true)
-        );
-        assert!(
-            session_state_sync_metadata_marker_present(Some(&merged)).unwrap(),
-            "merged session-state metadata must be recognized as sync-created"
-        );
-        assert!(
-            !session_state_sync_metadata_marker_present(Some(r#"{"owner":true}"#)).unwrap(),
-            "foreign real session metadata must not pass the sync-created marker check"
         );
     }
 

@@ -275,7 +275,7 @@ impl From<Message> for Value {
                 || matches!(
                     k.as_str(),
                     astra_turn_types::USER_TURN_SEMANTICS_FIELD
-                        | astra_turn_types::BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD
+                        | astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD
                 )
             {
                 map.insert(k, v);
@@ -633,7 +633,7 @@ mod tests {
                 "schema_version": 1,
                 "objective_relation": "refine"
             },
-            astra_turn_types::BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD: {
+            astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD: {
                 "schema_version": 1,
                 "turn_chain_id": "chain-1"
             },
@@ -663,7 +663,7 @@ mod tests {
             "stable turn semantics must survive canonical compaction"
         );
         assert!(
-            back.get(astra_turn_types::BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD)
+            back.get(astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD)
                 .is_some(),
             "bridge turn identity must survive context optimization"
         );

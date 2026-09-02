@@ -24,7 +24,7 @@ use astra_runtime::{
     },
     turn::chat_turn_heuristics::infer_task_execution_profile,
     turn::chat_turn_payload::{
-        ChatTurnBasePayloadInput, attach_bridge_turn_identity, chat_turn_base_payload,
+        ChatTurnBasePayloadInput, attach_turn_identity, chat_turn_base_payload,
         merge_edge_profile_extensions, set_payload_tool_results_if_non_empty,
     },
     turn::tool_schema_prune::inject_required_tool_names,
@@ -511,23 +511,15 @@ impl AgenticLoopHost for SubRunHost {
 
         set_payload_tool_results_if_non_empty(&mut payload, &state.tool_results);
 
-        let _ = attach_bridge_turn_identity(
+        let _ = attach_turn_identity(
             &mut payload,
             // A sub-run execution is one conversational turn even when its
             // agentic loop performs several model/tool rounds. Keep the same
-            // bridge turn identity for every round in that execution.
+            // turn-chain identity for every round in that execution.
             state.session_turn.max(1),
             state.canonical_turn_chain_id.as_deref(),
             state.root_user_query_event_id.as_deref(),
         );
-
-        // Sub-runs share the parent's session_id but have no turn_event_buffer.
-        // Tell the bridge not to write llm_round events — the parent's journal
-        // already records delegation results. Without this, the bridge writes
-        // duplicate rounds to the parent's journal file.
-        if let Some(root) = payload.as_object_mut() {
-            root.insert("root_turn_journal_owned".into(), json!(true));
-        }
 
         let server_payload =
             crate::cli::chat_stream::server_loop_admission_payload(&payload, &state.message, false)

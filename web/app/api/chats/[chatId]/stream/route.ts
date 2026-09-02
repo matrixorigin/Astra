@@ -15,6 +15,7 @@ import {
   updateChatWorkspaceSelection,
   updateStreamingAssistantMessage,
 } from "@/lib/api/web-store";
+import { fetchSessionArtifacts } from "@/lib/api/stream-artifacts";
 import {
   applyStreamEvent,
   type StreamEventContext,
@@ -111,6 +112,13 @@ async function readErrorDetail(response: Response) {
   return readRuntimeErrorDetail(response);
 }
 
+function hasMessagesBeforePendingTurn(
+  chat: NonNullable<ReturnType<typeof getChat>>,
+) {
+  const pendingMessageId = chat.pendingTurn?.messageId;
+  return chat.messages.some((message) => message.id !== pendingMessageId);
+}
+
 function lastAssistantMessageId(messages: Array<{ id: string; role: string }>) {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     if (messages[index]?.role === "assistant") {
@@ -174,7 +182,9 @@ function proxyRunStream(params: {
   ownerUserId: string;
   chatId: string;
   sessionId: string | (() => string);
+  runtime: WebRuntimeClient | (() => Promise<WebRuntimeClient>);
   assistantMessageId: string;
+  knownArtifactIds: Set<string>;
   localMessages?: {
     userMessage: unknown;
     assistantMessage: unknown;
@@ -188,11 +198,15 @@ function proxyRunStream(params: {
     ownerUserId,
     chatId,
     sessionId,
+    runtime,
     assistantMessageId,
+    knownArtifactIds,
     localMessages,
   } = params;
   const currentSessionId =
     typeof sessionId === "function" ? sessionId : () => sessionId;
+  const currentRuntime =
+    typeof runtime === "function" ? runtime : () => Promise.resolve(runtime);
 
   let backendReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   let clientCancelled = false;
@@ -430,6 +444,25 @@ function proxyRunStream(params: {
             }
           }
 
+          if (state.lastStatus === "complete") {
+            const runtimeClient = await currentRuntime();
+            const artifacts = (
+              await fetchSessionArtifacts(runtimeClient, currentSessionId())
+            ).filter((artifact) => !knownArtifactIds.has(artifact.id));
+            if (clientCancelled) {
+              return;
+            }
+            if (artifacts.length > 0) {
+              updateStreamingAssistantMessage(
+                ownerUserId,
+                chatId,
+                assistantMessageId,
+                { artifacts },
+              );
+              enqueueFrame({ type: "artifacts", artifacts });
+            }
+          }
+
         } catch (error) {
           if (clientCancelled) {
             return;
@@ -555,6 +588,7 @@ export async function POST(
   }
 
   let runtimeSessionId = chatId;
+  const hasPriorMessages = hasMessagesBeforePendingTurn(chat);
 
   const started = beginStreamingMessage(ownerUserId, chatId, {
     ...body,
@@ -564,6 +598,7 @@ export async function POST(
     return NextResponse.json({ error: "chat not found" }, { status: 404 });
   }
   const backendAbortController = new AbortController();
+  const knownArtifactIds = new Set<string>();
 
   return proxyRunStream({
     backendResponse: async (emit) => {
@@ -606,6 +641,15 @@ export async function POST(
         chat_id: chatId,
         session_id: runtimeSessionId,
       });
+      if (hasPriorMessages) {
+        const existingArtifacts = await fetchSessionArtifacts(
+          runtime,
+          runtimeSessionId,
+        );
+        for (const artifact of existingArtifacts) {
+          knownArtifactIds.add(artifact.id);
+        }
+      }
       return runtime.fetchResponse(PATH_CHAT_STREAM, {
         method: "POST",
         auth: "required",
@@ -649,7 +693,9 @@ export async function POST(
     ownerUserId,
     chatId,
     sessionId: () => runtimeSessionId,
+    runtime: getStreamRuntime,
     assistantMessageId: started.assistantMessage.id,
+    knownArtifactIds,
     localMessages: {
       userMessage: started.userMessage,
       assistantMessage: started.assistantMessage,
@@ -706,6 +752,18 @@ export async function GET(
   }
 
   const sessionId = chat.session?.backendSessionId ?? chatId;
+  const knownArtifactIds = new Set<string>();
+  try {
+    const existingArtifacts = await fetchSessionArtifacts(runtime, sessionId);
+    for (const artifact of existingArtifacts) {
+      knownArtifactIds.add(artifact.id);
+    }
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Failed to load artifacts.";
+    return NextResponse.json({ error: message }, { status: 502 });
+  }
+
   const backendAbortController = new AbortController();
   const lastIndex = normalizedLastIndex(
     request.nextUrl.searchParams.get("last_index"),
@@ -726,6 +784,8 @@ export async function GET(
     ownerUserId,
     chatId,
     sessionId,
+    runtime,
     assistantMessageId,
+    knownArtifactIds,
   });
 }

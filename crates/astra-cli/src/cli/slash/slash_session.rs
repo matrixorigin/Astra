@@ -4359,11 +4359,7 @@ fn handle_session_analyze(arg: &str, state: &SessionState) {
         "  ── Efficiency ─────────────────────────────────────────────".bold()
     );
 
-    let tok_per_tool = if total_tools > 0 {
-        total_tok_in / total_tools as u64
-    } else {
-        0
-    };
+    let tok_per_tool = total_tok_in.checked_div(total_tools).unwrap_or(0);
     eprintln!(
         "  {:<24} {} tokens/tool-call",
         "prompt efficiency:".dim(),
@@ -6149,6 +6145,40 @@ mod resume_tests {
         }
     }
 
+    fn typed_resume_bundle(
+        session_id: &str,
+        turn_count: u32,
+        messages: Vec<serde_json::Value>,
+    ) -> astra_turn_types::ResumeBundleV1 {
+        let sequence = u64::from(turn_count);
+        let cursor = astra_turn_types::SessionCursorV1 {
+            schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
+            owner_id: crate::cli::cli_config::cli_utils::cli_user_id(),
+            session_id: session_id.to_string(),
+            branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.to_string(),
+            completed_turn: turn_count,
+            journal_event_seq: sequence,
+            conversation_seq: sequence,
+            canonical_root_hash: astra_turn_types::canonical_conversation_root(&messages),
+            projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
+            compaction_generation: 0,
+            config_version_id: None,
+        };
+        astra_turn_types::select_resume_bundle(
+            None,
+            [astra_turn_types::ResumeCandidateV1 {
+                source: astra_turn_types::ResumeSourceV1::Checkpoint,
+                cursor,
+                conversation_messages: messages,
+                materialized_conversation_root_hash: None,
+                degraded_reasons: Vec::new(),
+                repair_actions: Vec::new(),
+                projections: Default::default(),
+            }],
+        )
+        .expect("valid test resume bundle")
+    }
+
     fn write_local_resumable_session(session_id: &str, turn_count: u32) {
         let writer = session_journal::JournalWriter::new(session_id).unwrap();
         writer
@@ -6975,7 +7005,8 @@ mod resume_tests {
         assert!(!error.contains("not found or not owned"), "{error}");
     }
     #[tokio::test]
-    async fn apply_restored_session_uses_cloud_fallback_when_local_step_checkpoint_is_invalid() {
+    async fn apply_restored_session_keeps_local_canonical_generation_when_step_checkpoint_is_invalid()
+     {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let session_id = format!("resume-cloud-fallback-{}", uuid::Uuid::new_v4());
         let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
@@ -6991,15 +7022,21 @@ mod resume_tests {
             ),
         );
 
+        let conversation_messages = vec![
+            objective,
+            serde_json::json!({"role": "assistant", "content": "cloud fallback"}),
+        ];
         let restored = RestoredSession {
             session_id: session_id.clone(),
             turn_count: 2,
             model: Some("gpt-5".into()),
             last_status: "active".into(),
-            conversation_messages: vec![
-                objective,
-                serde_json::json!({"role": "assistant", "content": "cloud fallback"}),
-            ],
+            restored_from_cloud: true,
+            resume_bundle: Some(typed_resume_bundle(
+                &session_id,
+                2,
+                conversation_messages.clone(),
+            )),
             interruption: Some(serde_json::json!({
                 "kind": "context_overflow",
                 "resumable": true,
@@ -7018,28 +7055,15 @@ mod resume_tests {
         let mut state = SessionState::default();
         apply_restored_session(None, &api, &mut state, restored)
             .await
-            .expect("cloud fallback should keep resume working");
+            .expect("the canonical local journal should keep resume working");
 
         assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
         let anchor = state.continuation_anchor.as_ref().expect("restored anchor");
-        assert_eq!(
-            anchor.objective_context,
-            vec!["objective: repair session lifecycle"]
-        );
-        let guidance = state.resume_guidance.expect("resume guidance");
-        assert!(
-            guidance.contains("objective: repair session lifecycle"),
-            "{guidance}"
-        );
-        assert!(guidance.contains("3 attempt(s)"), "{guidance}");
-        assert_eq!(
-            state.runtime_compaction_state,
-            Some(serde_json::json!({
-                "attempt_count": 3,
-                "cumulative_tokens_freed": 15000,
-                "last_was_insufficient": true,
-            }))
-        );
+        assert!(anchor.objective_context.is_empty());
+        let guidance = state.resume_guidance.expect("local recovery guidance");
+        assert!(!guidance.contains("objective: repair session lifecycle"));
+        assert!(!guidance.contains("3 attempt(s)"));
+        assert_eq!(state.runtime_compaction_state, None);
     }
 
     #[serial_test::serial]
@@ -7634,6 +7658,14 @@ mod resume_tests {
                 "model": "gpt-5",
                 "restored_from_cloud": true,
                 "workspace": workspace,
+                "resume_bundle": typed_resume_bundle(
+                    &session_id,
+                    3,
+                    vec![
+                        serde_json::json!({"role":"user","content":"continue"}),
+                        serde_json::json!({"role":"assistant","content":"cloud restored"}),
+                    ],
+                ),
             })))
             .mount(&server)
             .await;
@@ -7720,6 +7752,10 @@ mod resume_tests {
         let mut state = SessionState::default();
         let session_id = format!("resume-remote-cache-{}", uuid::Uuid::new_v4());
 
+        let conversation_messages = vec![
+            serde_json::json!({"role":"user","content":"continue"}),
+            serde_json::json!({"role":"assistant","content":"remote restored"}),
+        ];
         let restored = astra_services::session_restore::RestoredSession {
             session_id: session_id.clone(),
             turn_count: 4,
@@ -7729,6 +7765,11 @@ mod resume_tests {
             total_cache_creation_tokens: 11,
             last_status: "active".to_string(),
             restored_from_cloud: true,
+            resume_bundle: Some(typed_resume_bundle(
+                &session_id,
+                4,
+                conversation_messages.clone(),
+            )),
             ..Default::default()
         };
 
@@ -7815,7 +7856,7 @@ mod resume_tests {
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn restore_session_into_state_recovers_journal_model_over_workspace_default() {
+    async fn restore_session_into_state_does_not_promote_workspace_model_into_canonical_resume() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = format!("resume-default-model-{}", uuid::Uuid::new_v4());
@@ -7846,12 +7887,12 @@ mod resume_tests {
             .unwrap();
 
         assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
-        assert_eq!(state.model.as_deref(), Some("gpt-5"));
+        assert_eq!(state.model.as_deref(), None);
     }
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn restore_session_into_state_restores_permission_mode() {
+    async fn restore_session_into_state_does_not_promote_workspace_permission_mode() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = format!("resume-mode-{}", uuid::Uuid::new_v4());
@@ -7880,12 +7921,12 @@ mod resume_tests {
             .unwrap();
 
         assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
-        assert_eq!(state.perm_manager.mode(), PermissionMode::Plan);
+        assert_eq!(state.perm_manager.mode(), PermissionMode::Auto);
     }
 
     #[serial_test::serial]
     #[tokio::test]
-    async fn restore_session_into_state_rejects_invalid_permission_mode_without_rebinding() {
+    async fn restore_session_into_state_ignores_noncanonical_workspace_permission_mode() {
         let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
         let _creds_guard = crate::tests::isolate_credentials();
         let session_id = format!("resume-invalid-mode-{}", uuid::Uuid::new_v4());
@@ -7914,16 +7955,12 @@ mod resume_tests {
         };
         state.perm_manager.set_mode(PermissionMode::Auto);
 
-        let error = restore_session_into_state(&session_id, None, &api, &mut state)
+        restore_session_into_state(&session_id, None, &api, &mut state)
             .await
-            .expect_err("invalid persisted permission mode must fail restore");
+            .expect("workspace metadata is not canonical resume authority");
 
-        assert!(
-            error.contains("invalid persisted permission mode"),
-            "{error}"
-        );
-        assert_eq!(state.session_id.as_deref(), Some("current-session"));
-        assert_eq!(state.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(state.session_id.as_deref(), Some(session_id.as_str()));
+        assert_eq!(state.model.as_deref(), None);
         assert_eq!(state.perm_manager.mode(), PermissionMode::Auto);
     }
 }

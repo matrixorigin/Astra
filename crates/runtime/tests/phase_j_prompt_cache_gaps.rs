@@ -18,7 +18,7 @@
 //! `cache_provider_matrix_e2e.rs` or `mock_llm_prompt_cache_e2e.rs` and was
 //! removed during test-dedup.
 
-#![cfg(feature = "bridge-e2e-hooks")]
+#![cfg(feature = "e2e-hooks")]
 
 use std::sync::{Arc, Mutex};
 
@@ -217,11 +217,11 @@ async fn anthropic_model_change_preserves_prefix_and_surfaces_model_id() {
     let a_visible = non_cacheable_visible_text(&a[0]);
     let b_visible = non_cacheable_visible_text(&b[0]);
     assert!(
-        a_visible.contains("Model: claude-haiku-4.5 (via anthropic)"),
+        a_visible.contains("Model: claude-haiku-4.5"),
         "model id must remain prompt-visible outside the cacheable prefix: {a_visible}"
     );
     assert!(
-        b_visible.contains("Model: claude-sonnet-4.5 (via anthropic)"),
+        b_visible.contains("Model: claude-sonnet-4.5"),
         "model id must remain prompt-visible outside the cacheable prefix: {b_visible}"
     );
     assert_eq!(

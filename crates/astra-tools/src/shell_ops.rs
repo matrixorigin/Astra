@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, ExitStatus, Stdio};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use regex::Regex;
@@ -10,7 +10,6 @@ use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 use uuid::Uuid;
@@ -115,26 +114,19 @@ pub fn validate_bash_background_task_contract(command: &str) -> Result<(), Strin
     Ok(())
 }
 
-/// RAII guard for detach handle lifecycle. Takes ownership on creation,
-/// automatically restores to slot on drop unless explicitly consumed.
-/// This prevents handle leaks on early-return paths (errors, validation failures).
+/// RAII guard for one invocation's detach handle lifecycle.
 ///
 /// Usage pattern:
 /// - Borrow handle via `.get_ref()` for operations
-/// - On success (Detached): call `.take()` to consume
-/// - On error/completed: call `.restore()` to return to slot
-/// - Guard's drop logs error if handle still present (leak detection)
-struct DetachHandleGuard<'a> {
-    slot: Option<&'a Arc<Mutex<Option<DetachShellHandle>>>>,
+/// - On every terminal path, call `.take()` to consume the one-shot pair
+/// - Guard's drop logs error if ownership was not settled explicitly
+struct DetachHandleGuard {
     handle: Option<DetachShellHandle>,
 }
 
-impl<'a> DetachHandleGuard<'a> {
-    fn new(
-        slot: Option<&'a Arc<Mutex<Option<DetachShellHandle>>>>,
-        handle: Option<DetachShellHandle>,
-    ) -> Self {
-        Self { slot, handle }
+impl DetachHandleGuard {
+    fn new(handle: Option<DetachShellHandle>) -> Self {
+        Self { handle }
     }
 
     /// Borrow the handle for use. Returns None if handle was already taken.
@@ -147,29 +139,15 @@ impl<'a> DetachHandleGuard<'a> {
     fn take(&mut self) -> Option<DetachShellHandle> {
         self.handle.take()
     }
-
-    /// Restore handle to slot. Call this on error/completed paths.
-    /// Consumes self and restores the handle to the slot for reuse.
-    async fn restore(mut self) {
-        if let (Some(slot), Some(handle)) = (self.slot.as_ref(), self.handle.take()) {
-            handle.mark_active(false);
-            if !handle.is_blocked() {
-                *slot.lock().await = Some(handle);
-            }
-        }
-    }
 }
 
-impl<'a> Drop for DetachHandleGuard<'a> {
+impl Drop for DetachHandleGuard {
     fn drop(&mut self) {
         // If handle is still present, we leaked it. This should never happen
-        // because callers must either take() or restore() before drop.
+        // because callers must take() it before returning.
         // We can't async-lock in drop, so we just log a warning.
         if self.handle.is_some() {
-            tracing::error!(
-                "DetachHandleGuard dropped without restore/take — handle leaked. \
-                 This is a bug: all paths must explicitly restore or take the handle."
-            );
+            tracing::error!("DetachHandleGuard dropped without settling its one-shot handle");
         }
     }
 }
@@ -1171,7 +1149,10 @@ fn finalize_bash_scope_quarantine(
     scope_ownership: Option<astra_sandbox::ScopeOwnership>,
     command: &str,
 ) {
-    if execution_started && scope_ownership.is_none() {
+    if execution_started
+        && scope_ownership.is_none()
+        && !crate::workspace_observation::bash_command_is_detachable_safe(command)
+    {
         crate::workspace_observation::mark_workspace_observation_unsettled(workspace_root);
         return;
     }
@@ -1330,14 +1311,12 @@ async fn execute_bash_inner(
     let detach_slot = detachable_requested
         .then(|| ctx.detach_shell_handle.as_ref().cloned())
         .flatten();
-    let mut detach_handle_guard = DetachHandleGuard::new(
-        detach_slot.as_ref(),
-        if let Some(slot) = detach_slot.as_ref() {
+    let mut detach_handle_guard =
+        DetachHandleGuard::new(if let Some(slot) = detach_slot.as_ref() {
             slot.lock().await.take()
         } else {
             None
-        },
-    );
+        });
 
     let output = if let Some(handle_ref) = detach_handle_guard.get_ref() {
         handle_ref.mark_active(true);
@@ -1353,8 +1332,9 @@ async fn execute_bash_inner(
         .await
         {
             Ok(BashRunOutcome::Completed(output)) => {
-                // Restore handle to slot for next bash call in this turn.
-                detach_handle_guard.restore().await;
+                if let Some(handle) = detach_handle_guard.take() {
+                    handle.mark_active(false);
+                }
                 output
             }
             Ok(BashRunOutcome::Detached {
@@ -1432,9 +1412,9 @@ async fn execute_bash_inner(
                 return result;
             }
             Err(e) => {
-                // Restore handle on error so subsequent bash calls in this turn
-                // can still use detach. Handle is only consumed on successful Detached.
-                detach_handle_guard.restore().await;
+                if let Some(handle) = detach_handle_guard.take() {
+                    handle.mark_active(false);
+                }
                 return ToolResult::error(e);
             }
         }
@@ -4772,6 +4752,7 @@ fn glob_pattern_fragment(pattern: &str) -> Result<String, String> {
 mod tests {
     use serial_test::serial;
     use tempfile::tempdir;
+    use tokio::sync::Mutex;
 
     use super::*;
     #[cfg(unix)]
@@ -7710,18 +7691,26 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[tokio::test]
-    async fn bash_detach_slot_is_reusable_after_normal_completion() {
+    async fn bash_detach_slot_accepts_fresh_handle_after_normal_completion() {
         let dir = tempdir().unwrap();
         let mut ctx = crate::ToolContext::test(dir.path());
-        let (slot, listener) = crate::detach::new_slot_with_handle();
+        let (slot, first_listener) = crate::detach::new_slot_with_handle();
         ctx.detach_shell_handle = Some(slot.clone());
 
-        let first = execute_bash(&ctx, &serde_json::json!({"command": "printf 'first\\n'"})).await;
+        let first = tokio::time::timeout(
+            Duration::from_secs(2),
+            execute_bash(&ctx, &serde_json::json!({"command": "printf 'first\\n'"})),
+        )
+        .await
+        .expect("first foreground bash must settle promptly");
         assert!(first.output.contains("first"), "{}", first.output);
         assert!(
-            slot.lock().await.is_some(),
-            "normal bash completion must return the detach handle so later bash calls in the same turn can still be backgrounded"
+            slot.lock().await.is_none(),
+            "an invocation-scoped detach handle must be consumed at normal completion"
         );
+        first_listener.retire();
+        let (next_handle, listener) = crate::detach::new_detach_pair();
+        *slot.lock().await = Some(next_handle);
 
         let second = tokio::spawn({
             let ctx = ctx.clone();
@@ -7729,25 +7718,32 @@ printf 'probe.txt:1:needle\n'
                 execute_bash(
                     &ctx,
                     &serde_json::json!({
-                        "command": "sleep 1"
+                        "command": "sleep 30"
                     }),
                 )
                 .await
             }
         });
 
-        tokio::time::sleep(Duration::from_millis(200)).await;
         listener.signal_tx.send(true).expect("detach signal send");
-        let payload = listener
-            .payload_rx
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            slot.lock().await.is_none(),
+            "second bash must take the freshly installed invocation handle"
+        );
+        let payload = tokio::time::timeout(Duration::from_secs(10), listener.payload_rx)
             .await
+            .expect("reused detach listener must receive the live child promptly")
             .expect("listener must receive second bash payload");
         payload
             .adoption_tx
             .send(Ok("bg-shell-second".into()))
             .expect("ack second adoption");
 
-        let second = second.await.expect("second bash task");
+        let second = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("detached second bash must settle promptly")
+            .expect("second bash task");
         assert!(second.output.contains("bash_detached"), "{}", second.output);
         assert!(
             second.output.contains("bg-shell-second"),

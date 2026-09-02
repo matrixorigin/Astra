@@ -81,12 +81,12 @@ use astra_services::{SkillAutoRouteCandidate, SkillAutoRouteJudge, SkillAutoRout
 use astra_turn_core::agent_live_event::{
     AgentLiveEvent, AgentLiveEventKind, AgentLiveSignal, SharedAgentLiveEventSink,
 };
-use astra_turn_core::bridge_rate_limit_cooldown::{
-    CooldownReason, FallbackOutcome, PerModelCooldown, RateLimitAction, try_resolve_fallback,
-};
 use astra_turn_core::chat_turn_sse_dispatch::ChatTurnSseAccum;
 use astra_turn_core::compaction_types::{CompactionEvent, CompactionKind, CompactionTier};
 use astra_turn_core::pipeline_metrics::MetricsRegistry;
+use astra_turn_core::rate_limit_cooldown::{
+    CooldownReason, FallbackOutcome, PerModelCooldown, RateLimitAction, try_resolve_fallback,
+};
 use astra_turn_core::thinking_config::ThinkingConfig;
 use astra_turn_core::tool::schema::tool_schema_name;
 use astra_turn_core::tool_schema_prune::filter_tool_schemas_by_excluded_names;
@@ -1502,12 +1502,12 @@ fn record_full_llm_response_event(
     buf.record(evt);
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
+#[cfg(feature = "e2e-hooks")]
 fn mock_error_kind_from_str(kind: &str) -> astra_core::ErrorKind {
     astra_core::ErrorKind::parse_tag(kind).unwrap_or(astra_core::ErrorKind::Unknown)
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
+#[cfg(feature = "e2e-hooks")]
 fn mock_round_error(round: &Value) -> Option<astra_core::ClassifiedError> {
     let error = round.get("error")?.as_object()?;
     let message = error
@@ -1528,7 +1528,7 @@ fn mock_round_error(round: &Value) -> Option<astra_core::ClassifiedError> {
     }
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
+#[cfg(feature = "e2e-hooks")]
 fn mock_round_partial_text(error: &astra_core::ClassifiedError) -> Option<String> {
     let details = error.details_json.as_deref()?;
     let value: Value = match serde_json::from_str(details) {
@@ -1854,7 +1854,7 @@ async fn resolve_llm_model_for_turn(
 /// assembles before it would call a real provider. Captures enough to
 /// assert on prompt-cache annotations, schema changes, and stable prefix
 /// byte-equality across turns without involving the network.
-#[cfg(feature = "bridge-e2e-hooks")]
+#[cfg(feature = "e2e-hooks")]
 #[derive(Debug, Clone)]
 pub struct CapturedLlmRequest {
     /// 0-based turn index (counts mock-LLM rounds actually executed).
@@ -1902,14 +1902,14 @@ pub struct CapturedLlmRequest {
     pub message_sha256: Vec<String>,
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
+#[cfg(feature = "e2e-hooks")]
 fn value_has_cache_control(v: &Value) -> bool {
     v.get("cache_control")
         .map(|cc| !cc.is_null())
         .unwrap_or(false)
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
+#[cfg(feature = "e2e-hooks")]
 fn count_system_cache_control(primary: &Value) -> usize {
     let Some(content) = primary.get("content") else {
         return 0;
@@ -1920,7 +1920,7 @@ fn count_system_cache_control(primary: &Value) -> usize {
     }
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
+#[cfg(feature = "e2e-hooks")]
 fn cacheable_prefix_text(system_primary: &Value, is_anthropic: bool) -> String {
     let Some(content) = system_primary.get("content") else {
         return String::new();
@@ -1966,7 +1966,7 @@ fn cacheable_prefix_text(system_primary: &Value, is_anthropic: bool) -> String {
 /// `tool_result` block shape the Anthropic adapter sends on the wire, so
 /// "tail marker moved from old tool_result to new tool_result" does not
 /// spuriously look like historical-byte churn in the capture hashes.
-#[cfg(feature = "bridge-e2e-hooks")]
+#[cfg(feature = "e2e-hooks")]
 fn normalize_message_for_cache_hash(m: &Value) -> Value {
     let mut out = m.clone();
     if let Some(obj) = out.as_object_mut() {
@@ -2034,7 +2034,7 @@ fn normalize_message_for_cache_hash(m: &Value) -> Value {
     out
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
+#[cfg(feature = "e2e-hooks")]
 fn strip_cache_control(v: &mut Value) {
     match v {
         Value::Object(map) => {
@@ -2052,7 +2052,7 @@ fn strip_cache_control(v: &mut Value) {
     }
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
+#[cfg(feature = "e2e-hooks")]
 fn sha256_hex(s: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -2060,7 +2060,7 @@ fn sha256_hex(s: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
+#[cfg(feature = "e2e-hooks")]
 #[allow(clippy::too_many_arguments)]
 fn build_captured_llm_request(
     turn_index: usize,
@@ -2435,28 +2435,28 @@ pub struct ServerAgenticLoopHost {
     agent_live_mirror: Option<AgentLiveMirror>,
 
     // ── Test hooks ──
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     test_llm_rounds: std::collections::VecDeque<Value>,
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     test_llm_rounds_wired: bool,
     /// One typed semantic-admission result for a mock-LLM HTTP E2E turn.
     /// Production never accepts this value; it exists so the test path can
     /// exercise both the primary model and the auxiliary topology authority.
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     test_work_admission: Option<astra_services::WorkAdmissionDecision>,
     /// Optional provider hint for the mock path, so cache_control annotations
     /// are exercised as if talking to anthropic/openai/etc. Default (None)
     /// leaves `PromptCacheConfig::default()` behavior (annotations off).
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     mock_provider: Option<(String, String)>,
     /// Per-turn captured payloads for assertion in tests.
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     llm_request_capture: Option<Arc<std::sync::Mutex<Vec<CapturedLlmRequest>>>>,
     /// Per-turn set of already-emitted tool_call id-keys (dedup across multiple
     /// `execute_mock_turn` invocations within the same chat turn). Cleared at
     /// the start of each user-turn in `run_one_mock_turn_for_test` and in
     /// `execute_turn`'s test-hook path.
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     /// Shared across host instances within the same chat turn so that
     /// skill subruns (which construct a second `ServerAgenticLoopHost` via
     /// `run_lifecycle.rs:3465`) reuse the parent host's dedup state instead
@@ -2717,15 +2717,15 @@ pub struct ServerAgenticLoopHostBuilder {
     memoria_client: Option<Arc<dyn crate::turn::cloud::memoria_compact::MemoriaPort>>,
     server_service_tool_catalog_enabled: bool,
     control_plane_tool_catalog_enabled: bool,
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     test_llm_rounds: Vec<Value>,
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     test_llm_rounds_wired: bool,
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     test_work_admission: Option<astra_services::WorkAdmissionDecision>,
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     mock_provider: Option<(String, String)>,
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     llm_request_capture: Option<Arc<std::sync::Mutex<Vec<CapturedLlmRequest>>>>,
     capabilities: astra_turn_core::capability::CapabilitySet,
     work_planning_bound: bool,
@@ -2738,7 +2738,7 @@ pub struct ServerAgenticLoopHostBuilder {
     /// built host shares the same `emitted_tool_call_ids` Arc as the parent
     /// host, preventing duplicate `tool_call` events across host instances
     /// within the same chat turn (e.g. parent + skill subrun).
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     shared_dedup_state: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
     /// Optional fork-prefix store for parent-turn capture (G2).
     prefix_store: Option<std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
@@ -2792,21 +2792,21 @@ impl ServerAgenticLoopHostBuilder {
             ),
             server_service_tool_catalog_enabled: true,
             control_plane_tool_catalog_enabled: true,
-            #[cfg(feature = "bridge-e2e-hooks")]
+            #[cfg(feature = "e2e-hooks")]
             test_llm_rounds: Vec::new(),
-            #[cfg(feature = "bridge-e2e-hooks")]
+            #[cfg(feature = "e2e-hooks")]
             test_llm_rounds_wired: false,
-            #[cfg(feature = "bridge-e2e-hooks")]
+            #[cfg(feature = "e2e-hooks")]
             test_work_admission: None,
-            #[cfg(feature = "bridge-e2e-hooks")]
+            #[cfg(feature = "e2e-hooks")]
             mock_provider: None,
-            #[cfg(feature = "bridge-e2e-hooks")]
+            #[cfg(feature = "e2e-hooks")]
             llm_request_capture: None,
             capabilities: crate::capabilities::full_server_capabilities_for_tests(),
             work_planning_bound: false,
             canonical_work_context_binding: None,
             work_item_attempt_bound: false,
-            #[cfg(feature = "bridge-e2e-hooks")]
+            #[cfg(feature = "e2e-hooks")]
             shared_dedup_state: None,
             prefix_store: None,
             disabled_tool_offers: None,
@@ -2832,7 +2832,7 @@ impl ServerAgenticLoopHostBuilder {
     /// being built, so that skill subruns deduplicate `tool_call` events
     /// against the parent's already-emitted ids. Call this when constructing
     /// a subrun host from `ServerSkillSubRunExecutor`.
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     pub fn with_dedup_state(
         mut self,
         shared: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
@@ -3005,7 +3005,7 @@ impl ServerAgenticLoopHostBuilder {
         self
     }
 
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     pub fn with_test_llm_rounds(mut self, rounds: Vec<Value>) -> Self {
         self.test_llm_rounds_wired = true;
         self.test_llm_rounds = rounds;
@@ -3014,7 +3014,7 @@ impl ServerAgenticLoopHostBuilder {
 
     /// **Test-only.** Supply the auxiliary semantic-admission decision that
     /// authorizes the scripted primary mock response for this one user turn.
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     pub fn with_test_work_admission(
         mut self,
         decision: astra_services::WorkAdmissionDecision,
@@ -3028,7 +3028,7 @@ impl ServerAgenticLoopHostBuilder {
     /// calls. Use e.g. `("anthropic", "claude-sonnet-4")` to exercise
     /// `cache_control` blocks end-to-end, or `("openai", "gpt-4o")` for the
     /// stable-prefix / dynamic-system-message split.
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     pub fn with_mock_provider(
         mut self,
         provider: impl Into<String>,
@@ -3043,7 +3043,7 @@ impl ServerAgenticLoopHostBuilder {
     /// that would be sent to a real LLM (system messages with cache_control
     /// annotations, annotated tool schemas, message cache breakpoint if any,
     /// cache config and a stable hash of the cacheable prefix).
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     pub fn with_llm_request_capture(
         mut self,
         capture: Arc<std::sync::Mutex<Vec<CapturedLlmRequest>>>,
@@ -3394,17 +3394,17 @@ impl ServerAgenticLoopHostBuilder {
             plan_authoring_active: Arc::new(std::sync::RwLock::new(self.plan_authoring_active)),
             memoria_client: self.memoria_client,
             prompt_memory_recall_cache: None,
-            #[cfg(feature = "bridge-e2e-hooks")]
+            #[cfg(feature = "e2e-hooks")]
             test_llm_rounds: std::collections::VecDeque::from(self.test_llm_rounds),
-            #[cfg(feature = "bridge-e2e-hooks")]
+            #[cfg(feature = "e2e-hooks")]
             test_llm_rounds_wired: self.test_llm_rounds_wired,
-            #[cfg(feature = "bridge-e2e-hooks")]
+            #[cfg(feature = "e2e-hooks")]
             test_work_admission: self.test_work_admission,
-            #[cfg(feature = "bridge-e2e-hooks")]
+            #[cfg(feature = "e2e-hooks")]
             mock_provider: self.mock_provider,
-            #[cfg(feature = "bridge-e2e-hooks")]
+            #[cfg(feature = "e2e-hooks")]
             llm_request_capture: self.llm_request_capture,
-            #[cfg(feature = "bridge-e2e-hooks")]
+            #[cfg(feature = "e2e-hooks")]
             emitted_tool_call_ids: self.shared_dedup_state.unwrap_or_else(|| {
                 std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()))
             }),
@@ -6825,7 +6825,7 @@ impl ServerAgenticLoopHost {
     /// **Test-only.** Access collected events without settling a loop result.
     /// Production lifecycle owners must use [`Self::settle_loop_turn`] so a
     /// latched protocol fault cannot be bypassed.
-    #[cfg(any(test, feature = "bridge-e2e-hooks"))]
+    #[cfg(any(test, feature = "e2e-hooks"))]
     pub fn take_emitted_events(&mut self) -> Vec<Value> {
         self.drain_pending_progress_events();
         std::mem::take(&mut self.emitted_events)
@@ -6900,7 +6900,7 @@ impl ServerAgenticLoopHost {
     /// Returns the resulting [`HostTurnResult`]. Increments
     /// `state.llm_rounds_completed` to mirror the real dispatch path so the
     /// next turn observes the correct round index.
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     pub async fn run_one_mock_turn_for_test(
         &mut self,
         state: &mut AgenticLoopState,
@@ -6941,11 +6941,11 @@ impl ServerAgenticLoopHost {
         Ok(result)
     }
 
-    /// Execute a mock LLM turn from `test_llm_rounds` (bridge-e2e-hooks only).
+    /// Execute a mock LLM turn from `test_llm_rounds` (e2e-hooks only).
     ///
     /// Parses the round JSON (same shape as bridge e2e hooks), emits SSE events,
     /// and returns a `HostTurnResult` as if a real LLM responded.
-    /// Execute a mock LLM turn from `test_llm_rounds` (bridge-e2e-hooks only).
+    /// Execute a mock LLM turn from `test_llm_rounds` (e2e-hooks only).
     ///
     /// Parses the round JSON (same shape as bridge e2e hooks), builds the same
     /// cache-annotated system messages, tool schemas and message list that a
@@ -6955,7 +6955,7 @@ impl ServerAgenticLoopHost {
     /// `{ "error": { "message": "...", "kind": "...", "details": { ... } } }`
     /// so HTTP E2E can validate error-path artifact publication without a flaky
     /// real-provider dependency.
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     async fn execute_mock_turn(
         &mut self,
         state: &mut AgenticLoopState,
@@ -7164,7 +7164,7 @@ impl ServerAgenticLoopHost {
         }
 
         let (full_text, reasoning, provider_tool_calls, usage, delay_ms) =
-            astra_turn_core::bridge_e2e_hooks::parse_llm_round(round);
+            astra_turn_core::e2e_hooks::parse_llm_round(round);
         if delay_ms > 0 {
             sleep_ms_or_llm_cancel(delay_ms, llm_cancel_for_state(state)).await?;
         }
@@ -7424,7 +7424,7 @@ impl ServerAgenticLoopHost {
             if !round_seen.insert(key.clone()) {
                 continue;
             }
-            #[cfg(feature = "bridge-e2e-hooks")]
+            #[cfg(feature = "e2e-hooks")]
             {
                 let mut shared =
                     astra_core::sync_poison::recover_mutex_lock(&self.emitted_tool_call_ids);
@@ -7968,8 +7968,7 @@ impl ServerAgenticLoopHost {
                 Ok(entry) => self.classify_shared_edge_approval(tool_call, entry).await,
                 Err(error) => EdgeApprovalWait::FailedClosed(error),
             },
-            approval = &mut approval => match approval {
-                local => {
+            local = &mut approval => {
                     if !self
                         .interaction_sink
                         .as_ref()
@@ -8015,7 +8014,6 @@ impl ServerAgenticLoopHost {
                             },
                         }
                     }
-                }
             },
         }
     }
@@ -9026,7 +9024,7 @@ impl ServerAgenticLoopHost {
                         // (tool_request, etc.) still flow through normally.
                         // Contract locked by:
                         //   `skill_invocation_costs_exactly_two_llm_rounds_today`
-                        #[cfg(feature = "bridge-e2e-hooks")]
+                        #[cfg(feature = "e2e-hooks")]
                         {
                             if event.get("type").and_then(|v| v.as_str()) == Some("tool_call") {
                                 continue;
@@ -10224,7 +10222,7 @@ impl ServerAgenticLoopHost {
     /// Build the turn's system messages via the context pipeline.
     ///
     /// Single source of truth for both the real `execute_turn` path and the
-    /// `bridge-e2e-hooks`-gated `execute_mock_turn` path. Previously the mock
+    /// `e2e-hooks`-gated `execute_mock_turn` path. Previously the mock
     /// that duplicated section assembly AND drifted from production behaviour —
     /// deleted in the same change that introduced this helper.
     ///
@@ -11233,7 +11231,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         let mut request_preparation_recorded_attempts = HashSet::new();
 
         // ── Test hook: mock LLM rounds ──────────────────────────────────
-        #[cfg(feature = "bridge-e2e-hooks")]
+        #[cfg(feature = "e2e-hooks")]
         {
             if let Some(round) = self.test_llm_rounds.pop_front() {
                 // Clear per-*user-turn* dedup state only at the first LLM round
@@ -12197,105 +12195,10 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 let mut pending_live_reasoning = String::new();
                 let mut last_live_reasoning_flush = Instant::now();
                 let mut first_streamed_tool_index = None;
-                let mut on_stream_update = |update: LlmStreamUpdate| match update {
-                    LlmStreamUpdate::Text(content) => {
-                        if !pending_live_reasoning.is_empty() {
-                            let pending = std::mem::take(&mut pending_live_reasoning);
-                            self.emit_progress_event(json!({
-                                "type": "reasoning_delta",
-                                "content": &pending,
-                            }));
-                            streamed_reasoning.push_str(&pending);
-                            last_live_reasoning_flush = Instant::now();
-                        }
-                        let has_visible_text =
-                            crate::turn::llm::client::text_has_actionable_content(&content);
-                        if has_visible_text {
-                            attempt_first_stream_update_ms.get_or_insert_with(|| {
-                                llm_round_start.elapsed().as_millis() as u64
-                            });
-                            first_stream_update_turn_ms
-                                .get_or_insert_with(|| turn_started.elapsed().as_millis() as u64);
-                        }
-                        attempt_text.push_str(&content);
-                        if buffer_root_text_for_active_work {
-                            return;
-                        }
-                        if self.terminal_handoff_window.is_open() {
-                            action_window_updates.push(LlmStreamUpdate::Text(content.clone()));
-                            if has_visible_text {
-                                self.terminal_handoff_window.close();
-                                attempt_first_visible_text_ms.get_or_insert_with(|| {
-                                    llm_round_start.elapsed().as_millis() as u64
-                                });
-                                first_visible_text_turn_ms.get_or_insert_with(|| {
-                                    turn_started.elapsed().as_millis() as u64
-                                });
-                                self.replay_action_window_updates(
-                                    std::mem::take(&mut action_window_updates),
-                                    &mut streamed_text,
-                                    &mut streamed_reasoning,
-                                );
-                            }
-                            return;
-                        }
-                        if has_visible_text {
-                            attempt_first_visible_text_ms.get_or_insert_with(|| {
-                                llm_round_start.elapsed().as_millis() as u64
-                            });
-                            first_visible_text_turn_ms
-                                .get_or_insert_with(|| turn_started.elapsed().as_millis() as u64);
-                        }
-                        if streamed_text.starts_with(&attempt_text) {
-                            return;
-                        }
-                        if let Some(suffix) = attempt_text.strip_prefix(&streamed_text)
-                            && !suffix.is_empty()
-                        {
-                            self.emit_progress_event(json!({
-                                "type": "text_delta",
-                                "content": suffix,
-                            }));
-                            streamed_text.push_str(suffix);
-                        } else if streamed_text.is_empty() {
-                            self.emit_progress_event(json!({
-                                "type": "text_delta",
-                                "content": content,
-                            }));
-                            streamed_text.push_str(&content);
-                        }
-                    }
-                    LlmStreamUpdate::Reasoning(content) => {
-                        if !content.is_empty() {
-                            attempt_first_stream_update_ms.get_or_insert_with(|| {
-                                llm_round_start.elapsed().as_millis() as u64
-                            });
-                            first_stream_update_turn_ms
-                                .get_or_insert_with(|| turn_started.elapsed().as_millis() as u64);
-                        }
-                        attempt_reasoning.push_str(&content);
-                        // Reasoning is an explicitly provisional preview, not
-                        // a durable success claim. Keep it live while Work
-                        // admission or execution is pending; only answer text
-                        // needs the settlement gate. Buffering both made the
-                        // UI silent for the whole inference and then emitted a
-                        // misleading sub-second Thought after completion.
-                        if self.terminal_handoff_window.is_open() {
-                            action_window_updates.push(LlmStreamUpdate::Reasoning(content));
-                            return;
-                        }
-                        if streamed_reasoning.starts_with(&attempt_reasoning) {
-                            return;
-                        }
-                        if let Some(suffix) = attempt_reasoning.strip_prefix(&streamed_reasoning)
-                            && !suffix.is_empty()
-                        {
-                            pending_live_reasoning.clear();
-                            pending_live_reasoning.push_str(suffix);
-                            if streamed_reasoning.is_empty()
-                                || pending_live_reasoning.len() >= 8 * 1024
-                                || last_live_reasoning_flush.elapsed() >= Duration::from_millis(250)
-                            {
+                let provider_result = {
+                    let mut on_stream_update = |update: LlmStreamUpdate| match update {
+                        LlmStreamUpdate::Text(content) => {
+                            if !pending_live_reasoning.is_empty() {
                                 let pending = std::mem::take(&mut pending_live_reasoning);
                                 self.emit_progress_event(json!({
                                     "type": "reasoning_delta",
@@ -12304,131 +12207,259 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                                 streamed_reasoning.push_str(&pending);
                                 last_live_reasoning_flush = Instant::now();
                             }
-                        } else if streamed_reasoning.is_empty() {
-                            self.emit_progress_event(json!({
-                                "type": "reasoning_delta",
-                                "content": content,
-                            }));
-                            streamed_reasoning.push_str(&content);
+                            let has_visible_text =
+                                crate::turn::llm::client::text_has_actionable_content(&content);
+                            if has_visible_text {
+                                attempt_first_stream_update_ms.get_or_insert_with(|| {
+                                    llm_round_start.elapsed().as_millis() as u64
+                                });
+                                first_stream_update_turn_ms.get_or_insert_with(|| {
+                                    turn_started.elapsed().as_millis() as u64
+                                });
+                            }
+                            attempt_text.push_str(&content);
+                            if buffer_root_text_for_active_work {
+                                return;
+                            }
+                            if self.terminal_handoff_window.is_open() {
+                                action_window_updates.push(LlmStreamUpdate::Text(content.clone()));
+                                if has_visible_text {
+                                    self.terminal_handoff_window.close();
+                                    attempt_first_visible_text_ms.get_or_insert_with(|| {
+                                        llm_round_start.elapsed().as_millis() as u64
+                                    });
+                                    first_visible_text_turn_ms.get_or_insert_with(|| {
+                                        turn_started.elapsed().as_millis() as u64
+                                    });
+                                    self.replay_action_window_updates(
+                                        std::mem::take(&mut action_window_updates),
+                                        &mut streamed_text,
+                                        &mut streamed_reasoning,
+                                    );
+                                }
+                                return;
+                            }
+                            if has_visible_text {
+                                attempt_first_visible_text_ms.get_or_insert_with(|| {
+                                    llm_round_start.elapsed().as_millis() as u64
+                                });
+                                first_visible_text_turn_ms.get_or_insert_with(|| {
+                                    turn_started.elapsed().as_millis() as u64
+                                });
+                            }
+                            if streamed_text.starts_with(&attempt_text) {
+                                return;
+                            }
+                            if let Some(suffix) = attempt_text.strip_prefix(&streamed_text)
+                                && !suffix.is_empty()
+                            {
+                                self.emit_progress_event(json!({
+                                    "type": "text_delta",
+                                    "content": suffix,
+                                }));
+                                streamed_text.push_str(suffix);
+                            } else if streamed_text.is_empty() {
+                                self.emit_progress_event(json!({
+                                    "type": "text_delta",
+                                    "content": content,
+                                }));
+                                streamed_text.push_str(&content);
+                            }
                         }
-                    }
-                    LlmStreamUpdate::ToolCall { index, tool_call } => {
-                        if !pending_live_reasoning.is_empty() {
-                            let pending = std::mem::take(&mut pending_live_reasoning);
-                            self.emit_progress_event(json!({
-                                "type": "reasoning_delta",
-                                "content": &pending,
-                            }));
-                            streamed_reasoning.push_str(&pending);
-                            last_live_reasoning_flush = Instant::now();
+                        LlmStreamUpdate::Reasoning(content) => {
+                            if !content.is_empty() {
+                                attempt_first_stream_update_ms.get_or_insert_with(|| {
+                                    llm_round_start.elapsed().as_millis() as u64
+                                });
+                                first_stream_update_turn_ms.get_or_insert_with(|| {
+                                    turn_started.elapsed().as_millis() as u64
+                                });
+                            }
+                            attempt_reasoning.push_str(&content);
+                            // Reasoning is an explicitly provisional preview, not
+                            // a durable success claim. Keep it live while Work
+                            // admission or execution is pending; only answer text
+                            // needs the settlement gate. Buffering both made the
+                            // UI silent for the whole inference and then emitted a
+                            // misleading sub-second Thought after completion.
+                            if self.terminal_handoff_window.is_open() {
+                                action_window_updates.push(LlmStreamUpdate::Reasoning(content));
+                                return;
+                            }
+                            if streamed_reasoning.starts_with(&attempt_reasoning) {
+                                return;
+                            }
+                            if let Some(suffix) =
+                                attempt_reasoning.strip_prefix(&streamed_reasoning)
+                                && !suffix.is_empty()
+                            {
+                                pending_live_reasoning.clear();
+                                pending_live_reasoning.push_str(suffix);
+                                if streamed_reasoning.is_empty()
+                                    || pending_live_reasoning.len() >= 8 * 1024
+                                    || last_live_reasoning_flush.elapsed()
+                                        >= Duration::from_millis(250)
+                                {
+                                    let pending = std::mem::take(&mut pending_live_reasoning);
+                                    self.emit_progress_event(json!({
+                                        "type": "reasoning_delta",
+                                        "content": &pending,
+                                    }));
+                                    streamed_reasoning.push_str(&pending);
+                                    last_live_reasoning_flush = Instant::now();
+                                }
+                            } else if streamed_reasoning.is_empty() {
+                                self.emit_progress_event(json!({
+                                    "type": "reasoning_delta",
+                                    "content": content,
+                                }));
+                                streamed_reasoning.push_str(&content);
+                            }
                         }
-                        if !self.terminal_handoff_window.is_open() {
-                            return;
-                        }
-                        let first_index = *first_streamed_tool_index.get_or_insert(index);
-                        if index != first_index {
-                            return;
-                        }
-                        if matches!(
+                        LlmStreamUpdate::ToolCall { index, tool_call } => {
+                            if !pending_live_reasoning.is_empty() {
+                                let pending = std::mem::take(&mut pending_live_reasoning);
+                                self.emit_progress_event(json!({
+                                    "type": "reasoning_delta",
+                                    "content": &pending,
+                                }));
+                                streamed_reasoning.push_str(&pending);
+                                last_live_reasoning_flush = Instant::now();
+                            }
+                            if !self.terminal_handoff_window.is_open() {
+                                return;
+                            }
+                            let first_index = *first_streamed_tool_index.get_or_insert(index);
+                            if index != first_index {
+                                return;
+                            }
+                            if matches!(
                             crate::turn::terminal_control::classify_complete_streamed_first_tool(
                                 &self.runtime_control_tools,
                                 &tool_call,
                             ),
                             Some(crate::turn::terminal_control::StreamedFirstToolAction::Ordinary)
                         ) {
-                            self.terminal_handoff_window.close();
-                            self.replay_action_window_updates(
-                                std::mem::take(&mut action_window_updates),
-                                &mut streamed_text,
-                                &mut streamed_reasoning,
-                            );
+                                self.terminal_handoff_window.close();
+                                self.replay_action_window_updates(
+                                    std::mem::take(&mut action_window_updates),
+                                    &mut streamed_text,
+                                    &mut streamed_reasoning,
+                                );
+                            }
+                        }
+                    };
+                    let call = LlmCall {
+                        purpose: state.inference_purpose,
+                        messages: attempt_llm_messages,
+                        tools: &final_tools,
+                        cache_capability: llm_cfg.cache_capability,
+                        route: LlmExecutionRoute {
+                            model_name: &llm_cfg.model_name,
+                            wire_model_name: llm_cfg.wire_model_name.as_deref(),
+                            api_key: &llm_cfg.api_key,
+                            base_url: &llm_cfg.base_url,
+                            provider: &llm_cfg.provider,
+                            header_overrides: (!llm_cfg.header_overrides.is_empty())
+                                .then_some(&llm_cfg.header_overrides),
+                            request_body_overrides: llm_cfg.request_body_overrides.as_ref(),
+                            completions_url_override: llm_cfg.completions_url_override.as_deref(),
+                            request_timeout: llm_cfg.request_timeout,
+                        },
+                        max_output_tokens: Some(effective_max_output),
+                        temperature: None,
+                        has_fallback,
+                        thinking: &primary_thinking,
+                    };
+                    // Take the relative duration at the last common boundary before
+                    // invoking the provider. Prompt preparation and durable-attempt
+                    // admission above may await; sampling earlier would replenish
+                    // that elapsed time even though the run deadline is monotonic.
+                    let provider_work_budget = match Self::provider_work_budget_at_client_boundary(
+                        execution_time_budget,
+                        provider_attempt_boundary,
+                    ) {
+                        Ok(budget) => budget,
+                        Err(error) => {
+                            // Durable admission already owns this invocation. If
+                            // the run expired during preparation, terminalize that
+                            // exact identity without sending a provider request.
+                            durable_invocation.finish_error(&error).await?;
+                            return Err(error);
+                        }
+                    };
+                    match (provider_work_budget, use_no_tool_choice) {
+                        (Some(budget), true) => {
+                            call_llm_and_collect_with_stream_callback_and_budget_and_no_tool_choice(
+                                call,
+                                llm_cancel,
+                                Some(&mut on_stream_update),
+                                Some(durable_invocation.attempt_observer()),
+                                budget,
+                            )
+                            .await
+                        }
+                        (Some(budget), false) => {
+                            call_llm_and_collect_with_stream_callback_and_budget(
+                                call,
+                                llm_cancel,
+                                Some(&mut on_stream_update),
+                                Some(durable_invocation.attempt_observer()),
+                                budget,
+                            )
+                            .await
+                        }
+                        (None, true) => {
+                            call_llm_and_collect_with_stream_callback_and_no_tool_choice(
+                                call,
+                                llm_cancel,
+                                Some(&mut on_stream_update),
+                                Some(durable_invocation.attempt_observer()),
+                            )
+                            .await
+                        }
+                        (None, false) => {
+                            // The schema remains on the wire so the provider can
+                            // reuse the prior prefix. The explicit wire-level choice
+                            // asks for text, while the host-owned admission gate
+                            // still prevents a terminal response from executing a
+                            // tool if a provider violates that contract.
+                            call_llm_and_collect_with_stream_callback(
+                                call,
+                                llm_cancel,
+                                Some(&mut on_stream_update),
+                                Some(durable_invocation.attempt_observer()),
+                            )
+                            .await
                         }
                     }
                 };
-                let call = LlmCall {
-                    purpose: state.inference_purpose,
-                    messages: attempt_llm_messages,
-                    tools: &final_tools,
-                    cache_capability: llm_cfg.cache_capability,
-                    route: LlmExecutionRoute {
-                        model_name: &llm_cfg.model_name,
-                        wire_model_name: llm_cfg.wire_model_name.as_deref(),
-                        api_key: &llm_cfg.api_key,
-                        base_url: &llm_cfg.base_url,
-                        provider: &llm_cfg.provider,
-                        header_overrides: (!llm_cfg.header_overrides.is_empty())
-                            .then_some(&llm_cfg.header_overrides),
-                        request_body_overrides: llm_cfg.request_body_overrides.as_ref(),
-                        completions_url_override: llm_cfg.completions_url_override.as_deref(),
-                        request_timeout: llm_cfg.request_timeout,
-                    },
-                    max_output_tokens: Some(effective_max_output),
-                    temperature: None,
-                    has_fallback,
-                    thinking: &primary_thinking,
-                };
-                // Take the relative duration at the last common boundary before
-                // invoking the provider. Prompt preparation and durable-attempt
-                // admission above may await; sampling earlier would replenish
-                // that elapsed time even though the run deadline is monotonic.
-                let provider_work_budget = match Self::provider_work_budget_at_client_boundary(
-                    execution_time_budget,
-                    provider_attempt_boundary,
-                ) {
-                    Ok(budget) => budget,
-                    Err(error) => {
-                        // Durable admission already owns this invocation. If
-                        // the run expired during preparation, terminalize that
-                        // exact identity without sending a provider request.
-                        durable_invocation.finish_error(&error).await?;
-                        return Err(error);
+                // Root answer text stays provisional while Work admission is
+                // unresolved, but a provider failure closes that admission
+                // path. Preserve the exact prefix already delivered by the
+                // provider as an interrupted result instead of dropping it
+                // with this callback scope. This does not grant the text
+                // success authority and must never trigger a replay.
+                if provider_result.is_err()
+                    && buffer_root_text_for_active_work
+                    && crate::turn::llm::client::text_has_actionable_content(&attempt_text)
+                {
+                    if let Some(suffix) = attempt_text.strip_prefix(&streamed_text)
+                        && !suffix.is_empty()
+                    {
+                        self.emit_progress_event(json!({
+                            "type": "text_delta",
+                            "content": suffix,
+                        }));
+                        streamed_text.push_str(suffix);
+                    } else if streamed_text.is_empty() {
+                        self.emit_progress_event(json!({
+                            "type": "text_delta",
+                            "content": &attempt_text,
+                        }));
+                        streamed_text.push_str(&attempt_text);
                     }
-                };
-                let provider_result = match (provider_work_budget, use_no_tool_choice) {
-                    (Some(budget), true) => {
-                        call_llm_and_collect_with_stream_callback_and_budget_and_no_tool_choice(
-                            call,
-                            llm_cancel,
-                            Some(&mut on_stream_update),
-                            Some(durable_invocation.attempt_observer()),
-                            budget,
-                        )
-                        .await
-                    }
-                    (Some(budget), false) => {
-                        call_llm_and_collect_with_stream_callback_and_budget(
-                            call,
-                            llm_cancel,
-                            Some(&mut on_stream_update),
-                            Some(durable_invocation.attempt_observer()),
-                            budget,
-                        )
-                        .await
-                    }
-                    (None, true) => {
-                        call_llm_and_collect_with_stream_callback_and_no_tool_choice(
-                            call,
-                            llm_cancel,
-                            Some(&mut on_stream_update),
-                            Some(durable_invocation.attempt_observer()),
-                        )
-                        .await
-                    }
-                    (None, false) => {
-                        // The schema remains on the wire so the provider can
-                        // reuse the prior prefix. The explicit wire-level choice
-                        // asks for text, while the host-owned admission gate
-                        // still prevents a terminal response from executing a
-                        // tool if a provider violates that contract.
-                        call_llm_and_collect_with_stream_callback(
-                            call,
-                            llm_cancel,
-                            Some(&mut on_stream_update),
-                            Some(durable_invocation.attempt_observer()),
-                        )
-                        .await
-                    }
-                };
+                }
                 if !pending_live_reasoning.is_empty() {
                     let pending = std::mem::take(&mut pending_live_reasoning);
                     self.emit_progress_event(json!({
@@ -14079,15 +14110,17 @@ fn canonical_edge_dispatch_result(
     astra_thin_client::tool_result_status_is_error(&result.status)
         .ok_or_else(|| "durable tool result status is not canonical".to_string())?;
     let expected_hash = astra_thin_client::ToolResultRequest::compute_result_hash(
-        &result.session_id,
-        &result.run_id,
-        &result.turn_chain_id,
-        &result.request_id,
-        &result.edge_agent_id,
-        &result.status,
-        &result.output,
-        result.duration_ms,
-        result.tool_result_fields.as_ref(),
+        astra_thin_client::ToolResultHashParts {
+            session_id: &result.session_id,
+            run_id: &result.run_id,
+            turn_chain_id: &result.turn_chain_id,
+            request_id: &result.request_id,
+            edge_agent_id: &result.edge_agent_id,
+            status: &result.status,
+            output: &result.output,
+            duration_ms: result.duration_ms,
+            tool_result_fields: result.tool_result_fields.as_ref(),
+        },
     );
     if result.result_hash != expected_hash {
         return Err("durable tool result hash does not match its payload".to_string());
@@ -14103,7 +14136,7 @@ mod tests {
     use super::*;
     use crate::turn::agentic_loop::host::ASK_USER_TOOL_NAME;
     use crate::turn::agentic_loop::host::run_agentic_loop_with_host;
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     use astra_services::SessionArtifactStore;
     use astra_turn_core::cloud_summary::SummaryLlmClient;
     use astra_turn_core::edge_ledger::approval_callback_key;
@@ -15019,7 +15052,7 @@ mod tests {
         assert!(admission.rejected.is_empty());
     }
 
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     #[test]
     fn mock_error_kind_uses_the_canonical_tag_parser() {
         assert_eq!(
@@ -19534,7 +19567,6 @@ mod tests {
         );
         let state = create_test_state();
         let tool_calls = vec![
-            json!("malformed-tool-call"),
             json!({
                 "id": "call-offline-headless-bash",
                 "type": "function",
@@ -21347,7 +21379,7 @@ mod tests {
             "u-edge-partial".to_string(),
             "s-edge-partial".to_string(),
         )
-        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_execution_binding_snapshot(cli_edge_ledger_snapshot())
         .build();
         host.install_runtime_tool_schemas(
             vec![json!({
@@ -21448,7 +21480,7 @@ mod tests {
             "u-edge-db-fail".to_string(),
             "s-edge-db-fail".to_string(),
         )
-        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_execution_binding_snapshot(cli_edge_ledger_snapshot())
         .build();
         host.install_runtime_tool_schemas(
             vec![json!({
@@ -21508,7 +21540,7 @@ mod tests {
             "u-edge-recovery".to_string(),
             "s-edge-recovery".to_string(),
         )
-        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_execution_binding_snapshot(cli_edge_ledger_snapshot())
         .build();
         host.install_runtime_tool_schemas(
             vec![json!({
@@ -21568,7 +21600,7 @@ mod tests {
             "u-edge-reattach".to_string(),
             "s-edge-reattach".to_string(),
         )
-        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_execution_binding_snapshot(cli_edge_ledger_snapshot())
         .build();
         host.install_runtime_tool_schemas(
             vec![json!({
@@ -21670,6 +21702,9 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
+        let calls = host
+            .canonical_provider_tool_calls(&calls)
+            .expect("canonical approval batch");
         let started = HashSet::from(["approval-b".to_string()]);
 
         host.close_unstarted_edge_approvals(&calls, &started, "provider batch aborted")
@@ -23964,7 +23999,7 @@ mod tests {
             "u-edge-meta".to_string(),
             "s-edge-meta".to_string(),
         )
-        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
         .build();
         install_in_memory_interaction_sink(&mut host);
         // Register read_file as a valid tool so the edge ledger delivery path admits it.
@@ -24035,7 +24070,7 @@ mod tests {
             "u-edge-cache".to_string(),
             "s-edge-cache".to_string(),
         )
-        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_execution_binding_snapshot(edge_ledger_runtime_snapshot())
         .build();
         install_in_memory_interaction_sink(&mut host);
         host.install_runtime_tool_schemas(
@@ -25889,7 +25924,7 @@ mod tests {
             "s".to_string(),
         )
         .with_edge_tools(sample_edge_tools_with_skill())
-        .with_execution_binding_snapshot(edge_runtime_snapshot())
+        .with_execution_binding_snapshot(cli_edge_ledger_snapshot())
         .build();
         install_in_memory_interaction_sink(&mut host);
         let mut state = create_test_state();
@@ -26706,7 +26741,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     #[tokio::test]
     async fn bridge_mock_usage_is_counted_once_by_the_agentic_loop() {
         let mut host = ServerAgenticLoopHostBuilder::new(
@@ -26742,7 +26777,7 @@ mod tests {
         assert_eq!(last.completion_tokens, 404);
     }
 
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     #[tokio::test]
     async fn server_host_strict_admission_blocks_every_pre_execution_side_effect() {
         let mut host = ServerAgenticLoopHostBuilder::new(
@@ -26803,10 +26838,10 @@ mod tests {
         }));
     }
 
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     #[tokio::test]
-    async fn server_host_flat_and_nested_calls_emit_one_identical_canonical_shape() {
-        async fn emitted_call(tool_call: Value) -> Value {
+    async fn server_host_rejects_flat_calls_and_emits_only_nested_canonical_shape() {
+        async fn emitted_calls(tool_call: Value) -> Vec<Value> {
             let mut host = ServerAgenticLoopHostBuilder::new(
                 mock_matrixone(),
                 mock_encryptor(),
@@ -26840,18 +26875,20 @@ mod tests {
                 .into_iter()
                 .filter(|event| event.get("type").and_then(Value::as_str) == Some("tool_call"))
                 .collect::<Vec<_>>();
-            assert_eq!(calls.len(), 1, "one admitted call must emit exactly once");
-            calls[0]["tool_call"].clone()
+            calls
+                .into_iter()
+                .map(|event| event["tool_call"].clone())
+                .collect()
         }
 
-        let flat = emitted_call(json!({
+        let flat = emitted_calls(json!({
             "id": "shape-call",
             "type": "function",
             "name": "read_file",
             "arguments": {"path": "README.md"}
         }))
         .await;
-        let nested = emitted_call(json!({
+        let nested = emitted_calls(json!({
             "id": "shape-call",
             "type": "function",
             "function": {
@@ -26861,11 +26898,13 @@ mod tests {
         }))
         .await;
 
-        assert_eq!(flat, nested);
-        assert_eq!(flat["function"]["name"], "read_file");
-        assert_eq!(flat["function"]["arguments"], "{\"path\":\"README.md\"}");
-        assert!(flat.get("name").is_none());
-        assert!(flat.get("arguments").is_none());
+        assert!(flat.is_empty(), "flat calls must fail strict admission");
+        assert_eq!(nested.len(), 1, "one admitted call must emit exactly once");
+        let nested = &nested[0];
+        assert_eq!(nested["function"]["name"], "read_file");
+        assert_eq!(nested["function"]["arguments"], "{\"path\":\"README.md\"}");
+        assert!(nested.get("name").is_none());
+        assert!(nested.get("arguments").is_none());
     }
 
     #[tokio::test]
@@ -27418,7 +27457,7 @@ mod tests {
         assert_eq!(llm_main_error_outcome(&error), "error_database");
     }
 
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     #[tokio::test(flavor = "current_thread")]
     async fn mock_turn_persists_local_llm_capture_when_session_capture_enabled() {
         let temp = tempfile::tempdir().unwrap();
@@ -27463,7 +27502,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     #[tokio::test(flavor = "current_thread")]
     async fn mock_terminal_handoff_keeps_reasoning_private_and_skips_tool_delivery() {
         let public_name = "mcp__provider__arbitrary_control_name";
@@ -27547,9 +27586,9 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     #[tokio::test(flavor = "current_thread")]
-    async fn idless_terminal_handoff_uses_one_admission_and_never_reaches_delivery() {
+    async fn idless_terminal_handoff_is_rejected_before_control_or_delivery() {
         let public_name = "mcp__provider__runtime_control";
         let descriptor =
             crate::turn::terminal_control::RuntimeControlToolDescriptor::from_metadata(
@@ -27610,17 +27649,9 @@ mod tests {
             &result.accum.tool_calls,
             Some("tool_calls"),
         );
-        assert_eq!(admission.admitted.len(), 1);
-        assert!(
-            admission.admitted[0]["id"]
-                .as_str()
-                .is_some_and(|id| !id.is_empty())
-        );
-        assert!(admission.rejected.is_empty());
-        assert!(matches!(
-            host.take_terminal_control_outcome(),
-            Some(crate::turn::terminal_control::TerminalControlOutcome::Requested(_))
-        ));
+        assert!(admission.admitted.is_empty());
+        assert_eq!(admission.rejected.len(), 1);
+        assert!(host.take_terminal_control_outcome().is_none());
 
         let delivered = host
             .handle_admitted_tool_calls(&state, &admission.admitted)
@@ -27763,7 +27794,7 @@ mod tests {
         .with_admitted_model_execution(Some(test_gateway_execution(gateway_url, Some(3000))))
         .build();
         host.pending_work_admission_judge = Some(tokio::spawn(async {
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            tokio::time::sleep(Duration::from_millis(1_500)).await;
             Err(astra_services::TurnIntentJudgeError::Transport(
                 "unused test decision".to_string(),
             ))
@@ -28386,7 +28417,7 @@ mod tests {
         server.abort();
     }
 
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     #[tokio::test(flavor = "current_thread")]
     async fn mock_turn_can_inject_error_with_structured_details() {
         let mut host = ServerAgenticLoopHostBuilder::new(
@@ -29821,7 +29852,7 @@ mod tests {
     // These exercise the pure helpers that assemble `CapturedLlmRequest` so we
     // can trust the framework before layering E2E tests on top.
 
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     #[test]
     fn captured_request_counts_anthropic_cache_control_blocks() {
         let primary = json!({
@@ -29838,7 +29869,7 @@ mod tests {
         assert_eq!(super::count_system_cache_control(&primary_openai), 0);
     }
 
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     #[test]
     fn captured_request_prefix_hash_for_anthropic_covers_only_up_to_breakpoint() {
         let primary = json!({
@@ -29856,7 +29887,7 @@ mod tests {
         assert_eq!(super::sha256_hex(&prefix), hex);
     }
 
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     #[test]
     fn captured_request_prefix_hash_for_openai_concatenates_all_text() {
         let primary = json!({
@@ -29867,7 +29898,7 @@ mod tests {
         assert_eq!(prefix, "stable prefix text");
     }
 
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     #[test]
     fn captured_request_openai_prefix_equal_across_turns_drives_cache_hit() {
         // Two turns with identical stable system content → identical hash.
@@ -29883,7 +29914,7 @@ mod tests {
         assert_ne!(h1, h3, "Prefix change must invalidate cache key");
     }
 
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     #[test]
     fn captured_request_detects_last_tool_and_last_message_cache_markers() {
         let tools = vec![
@@ -29928,7 +29959,7 @@ mod tests {
         assert_eq!(captured.turn_index, 0);
     }
 
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     #[test]
     fn normalize_message_for_cache_hash_canonicalizes_tool_content_shapes() {
         let string_tool = json!({

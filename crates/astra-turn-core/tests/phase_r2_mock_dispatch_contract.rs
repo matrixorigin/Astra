@@ -80,11 +80,10 @@ fn mock_llm_tool_call_start_shape_is_captured_by_dispatch() {
     );
 }
 
-/// Flat shape (`name` + `arguments` at top level) — this is what the
-/// normalizer can actually parse today. If the mock were emitting this,
-/// tool_calls would show up.
+/// Durable stream projection has one public adapter shape. A legacy flat
+/// alias must be rejected instead of acquiring execution authority.
 #[test]
-fn flat_tool_call_start_shape_is_captured_by_dispatch() {
+fn flat_tool_call_start_shape_is_rejected_by_dispatch() {
     let event = json!({
         "type": "tool_call_start",
         "call_id": "call-2",
@@ -97,18 +96,17 @@ fn flat_tool_call_start_shape_is_captured_by_dispatch() {
     let mut edge: Vec<ChatTurnEdgePending> = Vec::new();
     let _ = dispatch_chat_turn_sse_event_block(&block, &mut accum, &mut edge);
 
-    assert_eq!(accum.tool_calls.len(), 1);
+    assert!(accum.tool_calls.is_empty());
     assert_eq!(
-        accum.tool_calls[0]
-            .pointer("/function/name")
-            .and_then(Value::as_str),
-        Some("write_file")
+        accum.error_kind,
+        Some(astra_core::ErrorKind::ContractViolation)
     );
 }
 
-/// OpenAI style (`function: {name, arguments}`) — should also be captured.
+/// Provider-native OpenAI shape belongs inside a canonical `tool_call`
+/// payload, not in the durable `tool_call_start` projection.
 #[test]
-fn openai_function_tool_call_shape_is_captured_by_dispatch() {
+fn openai_function_tool_call_start_shape_is_rejected_by_dispatch() {
     let event = json!({
         "type": "tool_call_start",
         "id": "call-3",
@@ -123,12 +121,10 @@ fn openai_function_tool_call_shape_is_captured_by_dispatch() {
     let mut edge: Vec<ChatTurnEdgePending> = Vec::new();
     let _ = dispatch_chat_turn_sse_event_block(&block, &mut accum, &mut edge);
 
-    assert_eq!(accum.tool_calls.len(), 1);
+    assert!(accum.tool_calls.is_empty());
     assert_eq!(
-        accum.tool_calls[0]
-            .pointer("/function/name")
-            .and_then(Value::as_str),
-        Some("write_file")
+        accum.error_kind,
+        Some(astra_core::ErrorKind::ContractViolation)
     );
 }
 
@@ -137,11 +133,10 @@ fn openai_function_tool_call_shape_is_captured_by_dispatch() {
 /// silently drops events whose `tool` is an object. This is the exact
 /// misshape the pre-fix mock-LLM emitted.
 ///
-/// We pin the CURRENT (silent-drop) behaviour as a contract: if dispatch
-/// is ever made lenient to accept this nested shape, this assertion will
-/// fail and both sides should be reviewed together.
+/// The rejection remains observable as a contract violation; malformed
+/// producer data must not disappear as an apparently successful empty turn.
 #[test]
-fn nested_tool_object_shape_is_silently_dropped_regression_anchor() {
+fn nested_tool_object_shape_is_rejected_regression_anchor() {
     let event = json!({
         "type": "tool_call_start",
         "call_id": "call-nested",
@@ -163,6 +158,10 @@ fn nested_tool_object_shape_is_silently_dropped_regression_anchor() {
          drops it. If this suddenly captures 1, the normalizer has become \
          lenient — audit the mock-LLM emit side and any other producers \
          at the same time."
+    );
+    assert_eq!(
+        accum.error_kind,
+        Some(astra_core::ErrorKind::ContractViolation)
     );
 }
 

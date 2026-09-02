@@ -89,13 +89,13 @@ pub fn chat_turn_base_payload(input: ChatTurnBasePayloadInput<'_>) -> Value {
     payload
 }
 
-/// Attach the producer-owned identity for one bridge turn as an atomic tuple.
+/// Attach the producer-owned identity for one turn chain as an atomic tuple.
 ///
 /// The server deliberately rejects partial identity. Keeping that invariant at
 /// the shared payload boundary prevents alternate hosts from forwarding a
 /// chain id without the matching turn number or user-query event id.
 #[must_use]
-pub fn attach_bridge_turn_identity(
+pub fn attach_turn_identity(
     payload: &mut Value,
     session_turn: u32,
     turn_chain_id: Option<&str>,
@@ -322,9 +322,9 @@ mod tests {
     }
 
     #[test]
-    fn bridge_turn_identity_is_attached_only_as_a_complete_tuple() {
+    fn turn_provenance_identity_is_attached_only_as_a_complete_tuple() {
         let mut complete = json!({});
-        assert!(attach_bridge_turn_identity(
+        assert!(attach_turn_identity(
             &mut complete,
             1,
             Some("child-run"),
@@ -341,12 +341,7 @@ mod tests {
             (1, Some(" child-run"), Some("child-query")),
         ] {
             let mut incomplete = json!({"stable": true});
-            assert!(!attach_bridge_turn_identity(
-                &mut incomplete,
-                turn,
-                chain,
-                query
-            ));
+            assert!(!attach_turn_identity(&mut incomplete, turn, chain, query));
             assert_eq!(incomplete, json!({"stable": true}));
         }
     }

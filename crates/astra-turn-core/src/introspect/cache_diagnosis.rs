@@ -316,7 +316,7 @@ pub fn load_session_captures(session_dir: &std::path::Path) -> std::io::Result<V
         if !name.starts_with("llm_capture_t") || !name.ends_with(".json") {
             continue;
         }
-        // Accept both the production name (`llm_capture_t3_r0_bridge_inprocess_success_…`)
+        // Accept both the production name (`llm_capture_t3_r0_server_loop_success_…`)
         // and the scrubbed fixture name (`t3_r0.json`). The `t{N}_r{M}`
         // tokens always appear and fully identify the position.
         let rest = name.trim_start_matches("llm_capture_");
@@ -1822,7 +1822,7 @@ mod tests {
 
     #[test]
     fn load_session_captures_picks_up_both_filename_styles() {
-        // Production files look like `llm_capture_t3_r0_bridge_inprocess_success_12345.json`,
+        // Production files look like `llm_capture_t3_r0_server_loop_success_12345.json`,
         // scrubbed fixture files look like `llm_capture_t3_r0.json` OR even `t3_r0.json`.
         // The loader must recognize the production style at minimum.
         let tmp = std::env::temp_dir().join(format!("astra-cache-test-{}", std::process::id(),));
@@ -1831,7 +1831,7 @@ mod tests {
         for e in std::fs::read_dir(&tmp).unwrap().flatten() {
             let _ = std::fs::remove_file(e.path());
         }
-        let prod_style = tmp.join("llm_capture_t1_r0_bridge_inprocess_success_42.json");
+        let prod_style = tmp.join("llm_capture_t1_r0_server_loop_success_42.json");
         let scrubbed_style = tmp.join("llm_capture_t2_r5_other.json");
         let unrelated = tmp.join("not_a_capture.json");
         for (p, turn, round) in [(&prod_style, 1, 0), (&scrubbed_style, 2, 5)] {

@@ -1,11 +1,11 @@
-#![cfg(feature = "bridge-e2e-hooks")]
+#![cfg(feature = "e2e-hooks")]
 //! Web agent mode E2E tests — incremental SSE streaming, edge tool delivery via ledger.
 //!
 //! These tests exercise the `/chat/stream` → `ServerAgenticLoopHost` path (NOT the bridge),
 //! using `test_llm_rounds` injected into the host to mock LLM responses.
 //!
 //! ```text
-//! cargo test -p astra-runtime --test web_agent_e2e --features bridge-e2e-hooks
+//! cargo test -p astra-runtime --test web_agent_e2e --features e2e-hooks
 //! ```
 
 mod test_support;
@@ -27,10 +27,10 @@ use astra_services::skills::{
     SkillRecord, SkillService, SkillStatusRecord, SkillVersionRecord,
 };
 use astra_services::{
-    AgentBindingCreateRequestData, AgentBindingPayload, AgentBindingService,
-    AuthProviderAuthorizedRequestContext, InMemoryAgentBindingService, ModelCreateRequestData,
-    ModelListItem, ModelRecord, ModelService, ModelUpdateRequestData, ProviderRequestDescriptor,
-    ResolvedActiveLlmModel, ResolvedModelOffering,
+    AgentBindingCreateRequestData, AgentBindingOwnerScope, AgentBindingPayload,
+    AgentBindingService, AuthProviderAuthorizedRequestContext, InMemoryAgentBindingService,
+    ModelCreateRequestData, ModelListItem, ModelRecord, ModelService, ModelUpdateRequestData,
+    ProviderRequestDescriptor, ResolvedActiveLlmModel, ResolvedModelOffering,
 };
 use astra_turn_core::chat_turn_sse_dispatch::{
     ChatTurnSseAccum, dispatch_chat_turn_sse_event_block,
@@ -153,7 +153,7 @@ fn unmatched_tool_result_identity() -> ToolResultIdentity {
 
 fn init_env() {
     SECRET_INIT.get_or_init(|| unsafe {
-        std::env::set_var("ASTRA_TEST_BRIDGE_SECRET", SECRET);
+        std::env::set_var("ASTRA_TEST_E2E_SECRET", SECRET);
     });
 }
 
@@ -785,7 +785,7 @@ async fn chat_stream_collect(app: &Router, payload: Value) -> Vec<Value> {
         .uri("/chat/stream")
         .header("authorization", TOKEN)
         .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", SECRET)
+        .header("x-astra-e2e-test-secret", SECRET)
         .body(Body::from(payload.to_string()))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -806,7 +806,7 @@ async fn provider_chat_stream_collect(app: &Router, payload: Value) -> Vec<Value
         .uri("/chat/stream")
         .header("authorization", PROVIDER_TOKEN)
         .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", SECRET)
+        .header("x-astra-e2e-test-secret", SECRET)
         .body(Body::from(payload.to_string()))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -826,6 +826,24 @@ async fn create_e2e_agent_binding(
 ) -> String {
     AgentBindingService::create_binding(
         service,
+        AgentBindingOwnerScope::from_principal(&AuthPrincipal {
+            user: AuthUserRecord {
+                user_id: "provider_authorized:moi:web-agent-e2e-user".to_string(),
+                username: "web-agent-e2e-user".to_string(),
+                email: String::new(),
+                display_name: None,
+            },
+            session_id: None,
+            origin: AuthPrincipalOrigin::ProviderAuthorizedRequest(
+                AuthProviderAuthorizedRequestContext {
+                    provider_id: "moi".to_string(),
+                    external_subject: "web-agent-e2e-user".to_string(),
+                    provider_scope_id: "web-agent-e2e-workspace".to_string(),
+                    request_authorization_id: "web-agent-e2e-authorization".to_string(),
+                    edge_agent_id: None,
+                },
+            ),
+        }),
         AgentBindingCreateRequestData {
             idempotency_key: format!("web-agent-e2e-{binding_name}"),
             binding: AgentBindingPayload {
@@ -980,7 +998,8 @@ fn agent_binding_chat_payload(
                 "type": "model_gateway",
                 "transport": "http",
                 "endpoint_url": capability_endpoint,
-                "protocol": "openai_chat_completions"
+                "protocol": "openai_chat_completions",
+                "model_context_window": 128000
             },
             "mcp": {
                 "id": "moi-tools",
@@ -1170,7 +1189,7 @@ async fn chat_stream_start(app: &Router, payload: Value) -> axum::response::Resp
         .uri("/chat/stream")
         .header("authorization", TOKEN)
         .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", SECRET)
+        .header("x-astra-e2e-test-secret", SECRET)
         .body(Body::from(payload.to_string()))
         .unwrap();
     app.clone().oneshot(req).await.unwrap()
@@ -1178,7 +1197,7 @@ async fn chat_stream_start(app: &Router, payload: Value) -> axum::response::Resp
 
 async fn inject_test_llm_authority(mut request: Request<Body>, next: Next) -> Response {
     request.headers_mut().insert(
-        "x-mo-bridge-test-secret",
+        "x-astra-e2e-test-secret",
         SECRET.parse().expect("static test secret header"),
     );
     next.run(request).await
@@ -1525,7 +1544,7 @@ async fn web_agent_structured_spawn_waits_for_server_child_before_parent_synthes
 }
 
 #[tokio::test]
-async fn web_agent_parallel_fanout_completes_without_cancelling_siblings() {
+async fn web_agent_parallel_fanout_without_work_authority_fails_closed() {
     init_env();
     let (app, _ledger) = build_test_app();
 
@@ -1583,25 +1602,23 @@ async fn web_agent_parallel_fanout_completes_without_cancelling_siblings() {
         .and_then(|event| event["result"].as_str())
         .and_then(|result| serde_json::from_str::<Value>(result).ok())
         .unwrap_or_else(|| panic!("fanout must return a terminal structured result: {serialized}"));
-    assert_eq!(result["status"], "completed", "{serialized}");
-    assert!(
-        result.to_string().contains("child review completed"),
-        "the aggregate fanout result must retain both child deliverables: {serialized}"
+    assert_eq!(result["status"], "rejected", "{serialized}");
+    assert_eq!(
+        result["error_kind"], "parallel_topology_admission_unavailable",
+        "{serialized}"
     );
     assert!(
         find_events(&events, "text_delta")
             .iter()
             .any(|event| event["content"].as_str() == Some("combined findings from both children")),
-        "the parent must synthesize only after both foreground children complete: {serialized}"
+        "the parent should recover from the rejected fanout without hidden topology: {serialized}"
     );
-    assert_eq!(
-        find_events(&events, "agent_spawned").len(),
-        2,
+    assert!(
+        find_events(&events, "agent_spawned").is_empty(),
         "{serialized}"
     );
-    assert_eq!(
-        find_events(&events, "agent_completed").len(),
-        2,
+    assert!(
+        find_events(&events, "agent_completed").is_empty(),
         "{serialized}"
     );
 }
@@ -1627,7 +1644,7 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
             },
             "executor_binding": {
                 "kind": "edge_agent",
-                "executor_id": "edge-macbook-1",
+                "executor_id": DEFAULT_TEST_EDGE_AGENT_ID,
                 "display_name": "MacBook Pro",
                 "transport": "edge_ledger",
                 "status": "online"
@@ -1753,7 +1770,10 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
         "/Users/xupeng/github/astra"
     );
     assert_eq!(live_output["executor"]["kind"], "edge_agent");
-    assert_eq!(live_output["executor"]["executor_id"], "edge-macbook-1");
+    assert_eq!(
+        live_output["executor"]["executor_id"],
+        DEFAULT_TEST_EDGE_AGENT_ID
+    );
     assert_eq!(live_output["transport"], "edge_ledger");
 
     let spawned = find_event_type(&events, "agent_spawned");
@@ -1764,7 +1784,10 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     assert_eq!(spawned[0]["workspace"]["kind"], "edge_workspace");
     assert_eq!(spawned[0]["workspace"]["cwd"], "/Users/xupeng/github/astra");
     assert_eq!(spawned[0]["executor"]["kind"], "edge_agent");
-    assert_eq!(spawned[0]["executor"]["executor_id"], "edge-macbook-1");
+    assert_eq!(
+        spawned[0]["executor"]["executor_id"],
+        DEFAULT_TEST_EDGE_AGENT_ID
+    );
     assert_eq!(spawned[0]["transport"], "edge_ledger");
     let child_run_id = spawned[0]["run_id"].as_str().expect("agent_spawned run_id");
     assert_eq!(
@@ -1962,7 +1985,7 @@ async fn execute_mock_tool_turn(
 
     let events = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
         .await
-        .expect("stream timed out")
+        .unwrap_or_else(|_| panic!("{case_name}: stream timed out"))
         .expect("reader task failed");
     assert!(
         find_events(&events, "text_delta")
@@ -2040,6 +2063,7 @@ async fn run_mock_tool_scenario(case: MockToolScenario) {
         &app,
         json!({
             "message": &case.message,
+            "interactive_client": case.steps.iter().any(|step| step.requires_approval),
             "context": {
                 "test_llm_rounds": [
                     { "tool_calls": tool_calls },
@@ -3563,6 +3587,7 @@ async fn tool_requiring_approval_emits_approval_event_and_waits() {
     // write_file requires approval before tool_request is emitted.
     let payload = json!({
         "message": "Write a file",
+        "interactive_client": true,
         "context": {
             "test_llm_rounds": [
                 {
@@ -3638,6 +3663,7 @@ async fn approval_batch_does_not_block_earlier_read_only_request() {
 
     let payload = json!({
         "message": "Read first, then write both files",
+        "interactive_client": true,
         "context": {
             "test_llm_rounds": [
                 {
@@ -3768,6 +3794,7 @@ async fn approval_denied_skips_tool_and_continues() {
 
     let payload = json!({
         "message": "Write a file",
+        "interactive_client": true,
         "context": {
             "test_llm_rounds": [
                 {
@@ -4013,7 +4040,7 @@ async fn invalid_auth_token_returns_unauthorized() {
         .uri("/chat/stream")
         .header("authorization", "Bearer invalid-token")
         .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", SECRET)
+        .header("x-astra-e2e-test-secret", SECRET)
         .body(Body::from(json!({"message": "hi"}).to_string()))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -4060,7 +4087,7 @@ async fn missing_message_field_returns_sse_error() {
         .uri("/chat/stream")
         .header("authorization", TOKEN)
         .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", SECRET)
+        .header("x-astra-e2e-test-secret", SECRET)
         .body(Body::from(
             json!({
                 "model_selection": { "offering_id": DEFAULT_MODEL_OFFERING_ID },
@@ -4657,6 +4684,7 @@ async fn approval_allow_session_approves_tool() {
     // Test "allow_session" decision (alternative to "allow").
     let payload = json!({
         "message": "Session-wide approval",
+        "interactive_client": true,
         "context": {
             "test_llm_rounds": [
                 {
@@ -4824,13 +4852,9 @@ async fn a1_run_status_all_fields_text_only() {
         events_count > 0,
         "events_count should be > 0, got {events_count}"
     );
-    assert_eq!(body["workspace"]["kind"].as_str(), Some("none"));
-    assert_eq!(body["executor"]["kind"].as_str(), Some("server_local"));
-    assert_eq!(
-        body["executor"]["executor_id"].as_str(),
-        Some("server-control-plane")
-    );
-    assert_eq!(body["transport"].as_str(), Some("server_local"));
+    assert!(body["workspace"].is_null());
+    assert!(body["executor"].is_null());
+    assert!(body["transport"].is_null());
 }
 
 #[tokio::test]
@@ -5969,8 +5993,12 @@ async fn mock_llm_tool_flow_scenario_matrix() {
         },
     ];
 
-    for case in cases {
-        run_mock_tool_scenario(case).await;
+    // These are independent user/session fixtures. Exercise isolation with
+    // bounded concurrency rather than adding every scenario's latency into
+    // one serial deadline or flooding the shared test executor all at once.
+    // Each scenario retains its own event, stream, and persistence deadlines.
+    for pair in cases.chunks(2) {
+        futures_util::future::join_all(pair.iter().cloned().map(run_mock_tool_scenario)).await;
     }
 }
 

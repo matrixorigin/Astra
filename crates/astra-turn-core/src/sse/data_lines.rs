@@ -1,6 +1,6 @@
 //! Incremental parsing of SSE `data: …` lines into JSON values (OpenAI-style stream).
 //!
-//! [`super::bridge_inprocess`] buffers provider chunks, drains **blank-line** SSE events via
+//! [`super::server_loop`] buffers provider chunks, drains **blank-line** SSE events via
 //! [`super::sse_blocks::drain_complete_sse_event_blocks`], then parses each block with
 //! [`json_events_from_sse_event_block`]. Any trailing bytes fall back to line-oriented
 //! [`drain_sse_data_lines`] / [`finish_sse_data_buffer`] (single-`\n` providers, partial tail).

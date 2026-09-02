@@ -921,6 +921,45 @@ impl ToolHandler<RuntimeToolExecutor> for DefaultExecutorToolHandler {
         }
         context.default_executor.execute(self.name, args).await
     }
+
+    async fn execute_invocation(
+        &self,
+        context: &RuntimeToolExecutor,
+        args: &Value,
+        invocation: astra_tools::tool_engine::ToolInvocationMetadata<'_>,
+        cancel_token: Option<&CancellationToken>,
+    ) -> astra_tools::ToolResult {
+        if cancel_token.is_some_and(CancellationToken::is_cancelled) {
+            return astra_tools::cancelled_tool_result(self.name, false);
+        }
+        let authority = invocation
+            .run_id
+            .filter(|value| !value.trim().is_empty())
+            .zip(
+                invocation
+                    .turn_chain_id
+                    .filter(|value| !value.trim().is_empty()),
+            )
+            .map(|(run_id, turn_chain_id)| {
+                format!("{}:{run_id}:{turn_chain_id}", context.session_id)
+            });
+        let Some(authority) = authority else {
+            return context
+                .default_executor
+                .execute_with_cancel(self.name, args, cancel_token)
+                .await;
+        };
+        context
+            .default_executor
+            .execute_with_workspace_convergence_authority(
+                self.name,
+                args,
+                &context.convergence_tracker,
+                &authority,
+                cancel_token,
+            )
+            .await
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]

@@ -47,9 +47,9 @@ use astra_services::ModelService;
 use astra_services::coordination::{AgentProfile, AgentTier};
 use astra_services::runs::{
     AgentBindingRuntimeRequest, AtomicRunGuidanceAdmission, AtomicRunGuidanceAdmissionRequest,
-    CancelRunRecord, CapabilityServerRefs, ChatRequestData, ChatRunRecord, ChatStreamRecord,
-    DurableRunEventDelta, DurableRunRecord, DurableRunStartClaim, DurableRunStatusKind,
-    DurableRunStatusSnapshot, DurableWorkItemRunBinding, DurableWorkRunBinding, ModelSelectionMode,
+    CancelRunRecord, ChatRequestData, ChatRunRecord, ChatStreamRecord, DurableRunEventDelta,
+    DurableRunRecord, DurableRunStartClaim, DurableRunStatusKind, DurableRunStatusSnapshot,
+    DurableWorkItemRunBinding, DurableWorkRunBinding, ModelSelectionMode,
     RequestedTurnInteractionMode, ResolvedModelSelection, RunContinuationRecord,
     RunLifecycleService, RunListCursor, RunListRecord, RunMutationDisposition, RunMutationRecord,
     RunProjectionCheckpointRecord, RunProjectionRecord, RunStartIdempotency,
@@ -211,7 +211,7 @@ fn settlement_facts_committed(
     terminal_event_count: usize,
     terminal_events_committed: bool,
 ) -> bool {
-    control_terminal_settlement_committed.unwrap_or_else(|| {
+    control_terminal_settlement_committed.unwrap_or({
         durable_status_committed && (terminal_event_count == 0 || terminal_events_committed)
     })
 }
@@ -4315,8 +4315,6 @@ impl DurableAgentReconciler for ServerDurableAgentReconciler {
 #[derive(Clone)]
 struct ResolvedAgentBindingRuntime {
     binding: astra_services::AgentBindingRecord,
-    mcp_server: astra_services::CapabilityServerEndpoint,
-    skill_server: astra_services::CapabilityServerEndpoint,
 }
 
 #[derive(Clone, Default)]
@@ -4378,7 +4376,7 @@ struct ServerSpawnRuntimeContext {
     /// cancellation is generation-scoped; only canonical user lineage may
     /// intentionally cross generations.
     execution_owner_generation: Arc<ExecutionOwnerGenerationSink>,
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     test_child_llm_rounds: Vec<Value>,
     #[cfg(feature = "harness")]
     harness_sink: Option<Arc<dyn astra_harness::SnapshotSink>>,
@@ -6454,7 +6452,7 @@ impl AgenticRunLifecycleService {
                 pause_flag,
                 cancel_token,
                 execution_owner_generation: Arc::new(ExecutionOwnerGenerationSink::preparing(0)),
-                #[cfg(feature = "bridge-e2e-hooks")]
+                #[cfg(feature = "e2e-hooks")]
                 test_child_llm_rounds: request
                     .context
                     .as_ref()
@@ -9362,14 +9360,6 @@ impl AgenticRunLifecycleService {
         request: &AgentBindingRuntimeRequest,
     ) -> Result<ResolvedAgentBindingRuntime, (StatusCode, Json<ErrorResponse>)> {
         exact_runtime_id("agent_binding.id", &request.id)?;
-        exact_runtime_id(
-            "agent_binding.capability_server_refs.mcp",
-            &request.capability_server_refs.mcp,
-        )?;
-        exact_runtime_id(
-            "agent_binding.capability_server_refs.skills",
-            &request.capability_server_refs.skills,
-        )?;
         let binding = self
             .agent_binding_service
             .get_binding(scope.clone(), request.id.clone())
@@ -9392,51 +9382,7 @@ impl AgenticRunLifecycleService {
             }
         }
 
-        let mcp = binding
-            .capability_servers
-            .iter()
-            .find(|server| server.id == request.capability_server_refs.mcp)
-            .cloned()
-            .ok_or_else(|| {
-                error_response_coded(
-                    StatusCode::BAD_REQUEST,
-                    "agent_binding.capability_server_refs.mcp does not exist in binding",
-                    "agent_binding_capability_ref_missing",
-                )
-            })?;
-        if mcp.server_type != astra_services::CapabilityServerType::Mcp {
-            return Err(error_response_coded(
-                StatusCode::BAD_REQUEST,
-                "agent_binding.capability_server_refs.mcp does not reference an mcp server",
-                "agent_binding_capability_ref_invalid",
-            ));
-        }
-
-        let skills = binding
-            .capability_servers
-            .iter()
-            .find(|server| server.id == request.capability_server_refs.skills)
-            .cloned()
-            .ok_or_else(|| {
-                error_response_coded(
-                    StatusCode::BAD_REQUEST,
-                    "agent_binding.capability_server_refs.skills does not exist in binding",
-                    "agent_binding_capability_ref_missing",
-                )
-            })?;
-        if skills.server_type != astra_services::CapabilityServerType::Skill {
-            return Err(error_response_coded(
-                StatusCode::BAD_REQUEST,
-                "agent_binding.capability_server_refs.skills does not reference a skill server",
-                "agent_binding_capability_ref_invalid",
-            ));
-        }
-
-        Ok(ResolvedAgentBindingRuntime {
-            binding,
-            mcp_server: mcp,
-            skill_server: skills,
-        })
+        Ok(ResolvedAgentBindingRuntime { binding })
     }
 
     fn requested_agent_bindings(
@@ -9470,7 +9416,6 @@ impl AgenticRunLifecycleService {
     fn agent_binding_runtime_descriptor<'a>(
         label: &'static str,
         descriptor: Option<&'a astra_services::runs::RuntimeCapabilityDescriptorRequest>,
-        expected_id: &str,
         expected_type: &str,
     ) -> Result<
         &'a astra_services::runs::RuntimeCapabilityDescriptorRequest,
@@ -9487,13 +9432,6 @@ impl AgenticRunLifecycleService {
             descriptor,
             expected_type,
         )?;
-        if descriptor.id != expected_id {
-            return Err(error_response_coded(
-                StatusCode::BAD_REQUEST,
-                format!("{label}.id does not match the Agent Binding capability server"),
-                "agent_binding_capability_descriptor_mismatch",
-            ));
-        }
         Ok(descriptor)
     }
 
@@ -9553,30 +9491,15 @@ impl AgenticRunLifecycleService {
                 "provider_runtime_context_required",
             )
         })?;
-        let primary = resolved
-            .last()
-            .expect("non-empty Agent Binding request must resolve at least one binding");
-        if resolved.iter().any(|binding| {
-            binding.mcp_server.id != primary.mcp_server.id
-                || binding.skill_server.id != primary.skill_server.id
-        }) {
-            return Err(error_response_coded(
-                StatusCode::BAD_REQUEST,
-                "ordered Agent Bindings must select the same runtime capability servers",
-                "agent_binding_set_capability_mismatch",
-            ));
-        }
         let mcp_descriptor = Self::agent_binding_runtime_descriptor(
             "capability_descriptors.mcp",
             descriptors.mcp.as_ref(),
-            &primary.mcp_server.id,
             "mcp",
         )?;
         let mcp_endpoint_url = mcp_descriptor.endpoint_url.clone();
         let skill_descriptor = Self::agent_binding_runtime_descriptor(
             "capability_descriptors.skills",
             descriptors.skills.as_ref(),
-            &primary.skill_server.id,
             "skills",
         )?;
         let skill_endpoint_url = skill_descriptor.endpoint_url.clone();
@@ -9765,7 +9688,6 @@ impl AgenticRunLifecycleService {
         }
 
         if let Some(binding_context) = runtime_capabilities.agent_binding.as_ref() {
-            let binding_requests = Self::requested_agent_bindings(request)?;
             let discovered_tools = runtime_capabilities
                 .mcp_bundle
                 .as_ref()
@@ -9780,8 +9702,7 @@ impl AgenticRunLifecycleService {
                 binding_context
                     .bindings
                     .iter()
-                    .zip(binding_requests)
-                    .map(|(binding, binding_request)| {
+                    .map(|binding| {
                         let discovered_skills = skill_catalogs
                             .get(binding.id.as_str())
                             .into_iter()
@@ -9802,11 +9723,6 @@ impl AgenticRunLifecycleService {
                             "binding_name": &binding.binding_name,
                             "binding_schema_version": &binding.binding_schema_version,
                             "agent_md": &binding.agent_md,
-                            "runtime_policy": &binding.runtime_policy,
-                            "selected_capability_server_refs": {
-                                "mcp": &binding_request.capability_server_refs.mcp,
-                                "skills": &binding_request.capability_server_refs.skills,
-                            },
                             "discovered_skills": discovered_skills,
                         })
                     })
@@ -10484,7 +10400,7 @@ impl AgenticRunLifecycleService {
                 .with_provider_allowed_tools(shared_tes.provider_allowed_tools_handle());
         }
         // Wire test LLM rounds from request context (E2E test hook).
-        #[cfg(feature = "bridge-e2e-hooks")]
+        #[cfg(feature = "e2e-hooks")]
         if let Some(rounds) = request
             .context
             .as_ref()
@@ -10494,7 +10410,7 @@ impl AgenticRunLifecycleService {
         {
             builder = builder.with_test_llm_rounds(rounds);
         }
-        #[cfg(feature = "bridge-e2e-hooks")]
+        #[cfg(feature = "e2e-hooks")]
         if let Some(decision) = request
             .context
             .as_ref()
@@ -10861,40 +10777,19 @@ impl AgenticRunLifecycleService {
         let runtime_turn_ceiling = astra_config::runtime_config::RuntimeConfig::cached()
             .runtime_limits
             .resolve_turn_ceiling(is_plan_subtask_from_chat_context(&request.context));
-        let mut requested_budget = request.execution_budget.as_ref().map(|budget| {
+        let requested_budget = request.execution_budget.as_ref().map(|budget| {
             astra_turn_core::chat_turn_heuristics::AgenticTurnBudgetOverride {
                 initial_turns: budget.initial_turns.map(|value| value as usize),
                 hard_turn_limit: budget.hard_turn_limit.map(|value| value as usize),
             }
         });
-        let agent_binding_max_steps = agent_binding_context.and_then(|context| {
-            context
-                .bindings
-                .iter()
-                .filter_map(|binding| binding.runtime_policy.max_steps)
-                .min()
-        });
-        if let Some(max_steps) = agent_binding_max_steps {
-            let max_steps = max_steps as usize;
-            let initial_turns = requested_budget
-                .as_ref()
-                .and_then(|budget| budget.initial_turns)
-                .map(|initial| initial.min(max_steps));
-            requested_budget = Some(
-                astra_turn_core::chat_turn_heuristics::AgenticTurnBudgetOverride {
-                    initial_turns,
-                    hard_turn_limit: Some(max_steps),
-                },
-            );
-        }
         let agentic_turn_budget =
             astra_turn_core::chat_turn_heuristics::resolve_agentic_turn_budget(
                 task_profile,
                 runtime_turn_ceiling,
                 requested_budget,
             );
-        let budget_is_explicit =
-            request.execution_budget.is_some() || agent_binding_max_steps.is_some();
+        let budget_is_explicit = request.execution_budget.is_some();
         let max_turns = agentic_turn_budget.initial_turns;
         // Use edge profile's git_root/cwd if available; fall back to provisioned
         // server workspace so web-agent sessions still load stop-hooks.yaml.
@@ -13371,7 +13266,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let bg_llm_cancel_token = llm_cancel_token.clone();
         let bg_execution_lease_lost = execution_lease_lost.clone();
         let mut bg_root_runtime_context_guard = root_runtime_context_guard;
-        #[cfg(feature = "bridge-e2e-hooks")]
+        #[cfg(feature = "e2e-hooks")]
         let bg_test_post_loop_settlement_delay_ms = request
             .context
             .as_ref()
@@ -13599,7 +13494,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                     execution_owner_generation,
                 )
                 .await;
-                #[cfg(feature = "bridge-e2e-hooks")]
+                #[cfg(feature = "e2e-hooks")]
                 if bg_test_post_loop_settlement_delay_ms > 0 {
                     run_engine
                         .append_event(
@@ -15121,7 +15016,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         let host_event_gap = server_loop_host::HostEventGapTracker::default();
         let bridge_gap = host_event_gap.clone();
         let host_event_bridge_tx = event_tx.clone();
-        let host_event_bridge_run_id = run_id.clone();
+        let host_event_server_run_id = run_id.clone();
         let mut host_event_bridge = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -15131,7 +15026,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         if dropped > 0
                             && host_event_bridge_tx
                                 .send(stream_delivery_gap_event(
-                                    &host_event_bridge_run_id,
+                                    &host_event_server_run_id,
                                     dropped,
                                 ))
                                 .await
@@ -15148,7 +15043,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
                         if dropped > 0
                             && host_event_bridge_tx
                                 .send(stream_delivery_gap_event(
-                                    &host_event_bridge_run_id,
+                                    &host_event_server_run_id,
                                     dropped,
                                 ))
                                 .await
@@ -15163,7 +15058,7 @@ impl RunLifecycleService for AgenticRunLifecycleService {
             if dropped > 0 {
                 let _ = host_event_bridge_tx
                     .send(stream_delivery_gap_event(
-                        &host_event_bridge_run_id,
+                        &host_event_server_run_id,
                         dropped,
                     ))
                     .await;
@@ -17660,15 +17555,15 @@ impl RunLifecycleService for AgenticRunLifecycleService {
         if has_buffered_terminal_completion(&durable.events) {
             let status_updated = self
                 .run_engine
-                .persist_status_if_current(
-                    &user_id,
-                    &durable.session_id,
-                    &run_id,
-                    &[durable_status.as_str()],
-                    STATUS_COMPLETED,
-                    None,
-                    None,
-                )
+                .persist_status_if_current(astra_services::runs::RunStatusCasRequest {
+                    user_id: &user_id,
+                    expected_session_id: &durable.session_id,
+                    run_id: &run_id,
+                    expected_statuses: &[durable_status.as_str()],
+                    status: STATUS_COMPLETED,
+                    waiting_for: None,
+                    error_message: None,
+                })
                 .await
                 .map_err(|error| Self::durable_persist_error("resume completed status", error))?;
             if !status_updated {
@@ -18451,7 +18346,7 @@ impl ServerSpawnAgentExecutor {
             pause_flag: Some(pause_flag),
             cancel_token: Some(cancel_token),
             execution_owner_generation,
-            #[cfg(feature = "bridge-e2e-hooks")]
+            #[cfg(feature = "e2e-hooks")]
             test_child_llm_rounds: parent.test_child_llm_rounds.clone(),
             #[cfg(feature = "harness")]
             harness_sink: parent.harness_sink.clone(),
@@ -19494,7 +19389,7 @@ impl SpawnAgentExecutor for ServerSpawnAgentExecutor {
             context.admitted_model_execution.as_ref(),
             child_runtime_context.edge_tools.clone(),
         );
-        #[cfg(feature = "bridge-e2e-hooks")]
+        #[cfg(feature = "e2e-hooks")]
         let executor = if !context.test_child_llm_rounds.is_empty() {
             executor.with_test_llm_rounds(context.test_child_llm_rounds.clone())
         } else {
@@ -19644,7 +19539,7 @@ pub struct ServerSubRunExecutor {
     edge_tools: Arc<Vec<Value>>,
     /// Shared ToolExecutionService so executors share the same disabled_tool_offers set.
     pub tool_execution_service: Option<ToolExecutionService>,
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     test_llm_rounds: Vec<Value>,
 }
 
@@ -19674,7 +19569,7 @@ impl ServerSubRunExecutor {
             client_tool_delivery_tx: None,
             edge_tools: Arc::new(Vec::new()),
             tool_execution_service: None,
-            #[cfg(feature = "bridge-e2e-hooks")]
+            #[cfg(feature = "e2e-hooks")]
             test_llm_rounds: Vec::new(),
         }
     }
@@ -19781,7 +19676,7 @@ impl ServerSubRunExecutor {
         self
     }
 
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     pub fn with_test_llm_rounds(mut self, rounds: Vec<Value>) -> Self {
         self.test_llm_rounds = rounds;
         self
@@ -20966,7 +20861,7 @@ impl SubRunExecutor for ServerSubRunExecutor {
         if let Some(snapshot) = execution_bindings.as_ref() {
             builder = builder.with_execution_binding_snapshot(snapshot.clone());
         }
-        #[cfg(feature = "bridge-e2e-hooks")]
+        #[cfg(feature = "e2e-hooks")]
         if !self.test_llm_rounds.is_empty() {
             builder = builder.with_test_llm_rounds(self.test_llm_rounds.clone());
         }

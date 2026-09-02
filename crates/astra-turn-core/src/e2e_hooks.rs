@@ -1,13 +1,10 @@
-//! Opt-in **compile-time** hooks for full-stack bridge tests without a real LLM or MatrixOne model row.
+//! Opt-in compile-time hooks for deterministic full-stack tests without a real LLM.
 //!
-//! Enable with crate feature `bridge-e2e-hooks`. At runtime, set `ASTRA_TEST_BRIDGE_SECRET` to a
-//! non-empty value and send the same value as header `x-mo-bridge-test-secret` on `POST /chat/turn`
-//! (forwarded to the in-process bridge). Body field `test_llm_rounds` is a JSON array of objects:
-//! `{ "full_text"?, "reasoning"?, "tool_calls"?, "usage"?, "delay_ms"? }` — same shape as the
-//! internal `_inprocess_summary` payload, plus optional deterministic test delay. For
-//! streaming-failure E2E, body field `test_llm_stream_blocks` may contain raw SSE blocks
-//! (strings) that are fed directly into the bridge's in-process stream parser. **Never** enable
-//! the feature or set the env var in production.
+//! Enable with crate feature `e2e-hooks`. At runtime, set `ASTRA_TEST_E2E_SECRET` to a
+//! non-empty value and send the same value as header `x-astra-e2e-test-secret` on the
+//! server-owned chat endpoint. `test_llm_rounds` carries deterministic provider rounds with
+//! optional text, reasoning, tool calls, usage, and delay. `test_llm_stream_blocks` carries raw
+//! provider SSE blocks for failure-path tests. Never enable the feature or secret in production.
 
 use axum::http::HeaderMap;
 use serde_json::{Map, Value};
@@ -21,13 +18,13 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 pub fn authorized(headers: &HeaderMap) -> bool {
-    let Ok(expected) = std::env::var("ASTRA_TEST_BRIDGE_SECRET") else {
+    let Ok(expected) = std::env::var("ASTRA_TEST_E2E_SECRET") else {
         return false;
     };
     if expected.is_empty() {
         return false;
     }
-    header_str(headers, "x-mo-bridge-test-secret").as_deref() == Some(expected.as_str())
+    header_str(headers, "x-astra-e2e-test-secret").as_deref() == Some(expected.as_str())
 }
 
 pub fn parse_llm_round(v: &Value) -> (String, String, Vec<Value>, Map<String, Value>, u64) {

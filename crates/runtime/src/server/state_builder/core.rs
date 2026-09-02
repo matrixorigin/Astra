@@ -5,6 +5,17 @@ use crate::server::deployment_tool_policy::{
 use crate::server::tool_transport::ToolExecutionService;
 use astra_services::ExternalAuthProviderConfig;
 
+pub(super) fn derive_runtime_subkey(root_secret: &str, purpose: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    let mut key = Sha256::new();
+    key.update(b"astra.runtime-root.v1\0");
+    key.update(purpose);
+    key.update(b"\0");
+    key.update(root_secret.as_bytes());
+    key.finalize().into()
+}
+
 pub(super) fn build_auth_service(
     settings: &AppSettings,
     shared_pool: &SharedPool,
@@ -60,14 +71,10 @@ pub(super) fn build_core_state(
     shared_encryptor: &Arc<FernetTokenEncryptor>,
     auth_service: Arc<dyn AuthService>,
 ) -> AppState {
-    use sha2::{Digest, Sha256};
-
-    let mut execution_grant_key = Sha256::new();
-    execution_grant_key.update(b"astra.execution-grant.server-key.v1\0");
-    execution_grant_key.update(settings.bridge_secret.as_bytes());
-    let execution_grant_signer =
-        astra_services::ExecutionGrantSigner::new(execution_grant_key.finalize().as_slice())
-            .expect("SHA-256 derived execution grant key has the required length");
+    let execution_grant_key =
+        derive_runtime_subkey(&settings.runtime_root_secret, b"execution-grant");
+    let execution_grant_signer = astra_services::ExecutionGrantSigner::new(execution_grant_key)
+        .expect("derived execution grant key has the required length");
 
     let session_context_coordinator: Arc<dyn astra_services::SessionContextCoordinator> = Arc::new(
         astra_services::DatabaseSessionContextCoordinator::new(shared_pool.clone()),

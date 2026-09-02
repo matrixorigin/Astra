@@ -145,22 +145,6 @@ pub fn render_sse_json(event: serde_json::Value) -> Vec<u8> {
     }
 }
 
-pub fn parse_bridge_state_frame(
-    frame: &[u8],
-) -> Option<serde_json::Map<String, serde_json::Value>> {
-    parse_sse_json_frame(frame)
-        .and_then(|payload| payload.as_object().cloned())
-        .filter(|payload| {
-            payload.get("type").and_then(serde_json::Value::as_str) == Some("bridge_state")
-        })
-        .map(|mut payload| {
-            payload.remove("type");
-            payload.remove("protocol_version");
-            payload.remove("session_id");
-            payload
-        })
-}
-
 pub fn parse_sse_json_frame(frame: &[u8]) -> Option<serde_json::Value> {
     // Delegate to the resilient parser which attempts recovery on malformed frames.
     parse_sse_json_frame_resilient(frame).ok()
@@ -445,20 +429,5 @@ mod tests {
         assert_eq!(event["turn_chain_id"], "turn-1");
         assert_eq!(event["user_query_event_id"], "query-1");
         assert!(event["event_id"].as_str().is_some());
-    }
-
-    #[test]
-    fn parse_bridge_state_frame_strips_protocol_envelope() {
-        let frame = b"data: {\"type\":\"bridge_state\",\"session_id\":\"s1\",\"protocol_version\":1000,\"tail_full_text\":\"hello\"}\n\n";
-        let parsed = parse_bridge_state_frame(frame).expect("bridge_state frame");
-        assert_eq!(
-            parsed
-                .get("tail_full_text")
-                .and_then(serde_json::Value::as_str),
-            Some("hello")
-        );
-        assert!(!parsed.contains_key("type"));
-        assert!(!parsed.contains_key("session_id"));
-        assert!(!parsed.contains_key("protocol_version"));
     }
 }

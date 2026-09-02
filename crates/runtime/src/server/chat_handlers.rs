@@ -1598,11 +1598,7 @@ mod chat_stream_lifecycle_tests {
                             "message": "hi",
                             "model_selection": {"offering_id": "offer-gpt-4o-mini"},
                             "agent_binding": {
-                                "id": "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391",
-                                "capability_server_refs": {
-                                    "mcp": "tools",
-                                    "skills": "skills"
-                                }
+                                "id": "ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391"
                             },
                             "runtime_auth": {
                                 "authorization": "Bearer abc"

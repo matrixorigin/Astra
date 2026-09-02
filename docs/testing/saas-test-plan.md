@@ -111,10 +111,10 @@ Cloud 每一 server-owned stream admission 必须完成（非简单 LLM 代理�
 **自动化：**
 ```bash
 # CLI+Server / Server / Edge+Server（确定性 provider hooks，无真实 LLM）
-cargo test -p astra-runtime --test web_agent_e2e --features bridge-e2e-hooks
+cargo test -p astra-runtime --test web_agent_e2e --features e2e-hooks
 
 # 在线 Matrix E2E（含 server-owned chat/stream、callback、并发隔离）
-ASTRA_TEST_DB_IT=1 cargo test -p astra-runtime --test system_matrix_http_e2e --features bridge-e2e-hooks -- --ignored
+ASTRA_TEST_DB_IT=1 cargo test -p astra-runtime --test system_matrix_http_e2e --features e2e-hooks -- --ignored
 ```
 
 ### 4.2 Edge 回调与 Agent 注册
@@ -457,7 +457,7 @@ make test-offline                                      # 快速回归
 make test-online                                       # Matrix E2E 全矩阵
 make test-harness FORCE_MODEL=<主模型> PARALLEL=4    # Harness P0
 ASTRA_SDK_E2E=1 npm test --prefix packages/sdk       # SDK SaaS 客户端
-cargo test -p astra-runtime --test web_agent_e2e --features bridge-e2e-hooks
+cargo test -p astra-runtime --test web_agent_e2e --features e2e-hooks
 cargo test -p astra-services --test services_db_integration -- --ignored  # 服务层 DB
 ```
 

@@ -23,8 +23,8 @@ jobs:
       ASTRA_AUTO_CREATE_DATABASE: "1"
       ASTRA_JWT_SECRET: ci-jwt-secret-key-at-least-32-chars-long
       ASTRA_TOKEN_ENCRYPTION_KEY: ci-token-encryption-key-at-least-32-chars
-      ASTRA_TEST_BRIDGE_SECRET: ci-chat-turn-bridge-secret-at-least-32-chars
-      ASTRA_BRIDGE_SECRET: ci-chat-turn-bridge-secret-at-least-32-chars
+      ASTRA_TEST_E2E_SECRET: ci-server-e2e-secret-at-least-32-chars
+      ASTRA_RUNTIME_ROOT_SECRET: ci-runtime-root-secret-at-least-32-chars
       MEMORIA_BASE_URL: http://localhost:8100
       MEMORIA_MASTER_KEY: ci-test-master-key
       MEMORIA_EMBEDDING_PROVIDER: mock
@@ -63,10 +63,10 @@ jobs:
           FILTER="${TEST_NAME_FILTER:-}"
           if [ -n "$FILTER" ]; then
             cargo test --manifest-path Cargo.toml -p astra-runtime --test system_matrix_http_e2e \
-              --features bridge-e2e-hooks -- "$FILTER" --ignored --nocapture
+              --features e2e-hooks -- "$FILTER" --ignored --nocapture
           else
             cargo test --manifest-path Cargo.toml -p astra-runtime --test system_matrix_http_e2e \
-              --features bridge-e2e-hooks -- --ignored --nocapture
+              --features e2e-hooks -- --ignored --nocapture
           fi
 
       - name: Dump dependency logs

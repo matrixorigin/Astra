@@ -2394,14 +2394,13 @@ impl ExternalEffectFingerprint {
             .ok()?;
         let fingerprint = self.clone();
         let ownership = ownership.map(str::to_owned);
-        let result = tokio::task::spawn_blocking(move || {
+        tokio::task::spawn_blocking(move || {
             let _permit = permit;
             fingerprint.changed_receipt(ownership.as_deref())
         })
         .await
         .ok()
-        .flatten();
-        result
+        .flatten()
     }
 }
 
@@ -5634,7 +5633,8 @@ mod tests {
         let inotify_before = inotify_fd_count();
         let starting_line = Arc::new(tokio::sync::Barrier::new(roots.len() + 1));
         let mut acquisitions = tokio::task::JoinSet::new();
-        for root in roots.iter().cloned() {
+        for root in &roots {
+            let root = root.clone();
             let starting_line = starting_line.clone();
             acquisitions.spawn(async move {
                 starting_line.wait().await;

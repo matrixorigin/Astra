@@ -1283,7 +1283,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.jsonl");
         std::fs::write(&path, concat!(
-            r#"{"type":"llm_round","ts":"2026-01-01T00:00:00Z","session_id":"s1","turn":2,"agentic_step":4,"round":1,"tool_calls_returned":2,"metadata":{"source":"bridge_inprocess","run_id":"run-7","finish_reason":"tool_calls"}}"#, "\n",
+            r#"{"type":"llm_round","ts":"2026-01-01T00:00:00Z","session_id":"s1","turn":2,"agentic_step":4,"round":1,"tool_calls_returned":2,"metadata":{"source":"server_loop","run_id":"run-7","finish_reason":"tool_calls"}}"#, "\n",
             r#"{"type":"interruption_recorded","ts":"2026-01-01T00:00:01Z","session_id":"s1","turn":2,"agentic_step":4,"metadata":{"interruption":{"kind":"budget_exhausted","resumable":true,"tool_calls_completed":3,"turns_completed":4,"remaining_turns":0}}}"#, "\n",
             r#"{"type":"turn","ts":"2026-01-01T00:01:00Z","session_id":"s1","turn":2,"user_input":"continue","assistant_output":"done","tool_count":2,"tokens_in":100,"tokens_out":50,"duration_ms":5000,"visible_tools":[],"tools_used":["bash","grep"],"budget_used":0,"budget_pressure":0.0,"ttft_ms":1000}"#, "\n",
         )).unwrap();
@@ -1293,7 +1293,7 @@ mod tests {
         assert_eq!(turns[0].llm_rounds[0].agentic_step, Some(4));
         assert_eq!(
             turns[0].llm_rounds[0].source.as_deref(),
-            Some("bridge_inprocess")
+            Some("server_loop")
         );
         assert_eq!(turns[0].interruptions.len(), 1);
         assert_eq!(turns[0].interruptions[0].kind, "budget_exhausted");

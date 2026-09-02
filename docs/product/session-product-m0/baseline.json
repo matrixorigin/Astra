@@ -59,7 +59,7 @@
           "evidence": [
             {"kind": "source", "path": "crates/services/src/work/branch_creation_operation.rs", "claim": "durable Work branch creation operation exists"},
             {"kind": "source", "path": "crates/services/src/work/branch_comparison.rs", "claim": "typed deterministic branch comparison exists"},
-            {"kind": "test", "path": "crates/services/src/session_fork_coordinator.rs", "symbol": "million_token_scale_fork_stays_constant_size_and_within_latency_budget", "command": "ASTRA_TEST_DB_IT=1 cargo nextest run -p astra-services million_token_scale_fork_stays_constant_size_and_within_latency_budget --run-ignored all", "claim": "database fork stays constant-size at million-token scale"}
+            {"kind": "test", "path": "crates/services/src/session_fork_coordinator.rs", "symbol": "million_token_scale_fork_stays_constant_size", "command": "ASTRA_TEST_DB_IT=1 cargo nextest run -p astra-services million_token_scale_fork_stays_constant_size --run-ignored all", "claim": "database fork stays constant-size at million-token scale"}
           ],
           "gaps": ["embedded Work branch creation is not integrated", "full snapshot/compaction boundary matrix is not one repeatable product proof", "durable fork DB proof is not a default release gate"]
         },
@@ -143,7 +143,7 @@
           "levels": {"implemented": true, "integrated": true, "user_usable": true, "proven": false},
           "evidence": [
             {"kind": "source", "path": "crates/runtime/src/server/server_loop_host.rs", "claim": "the Server owns the multi-round loop"},
-            {"kind": "test", "path": "crates/runtime/tests/web_agent_e2e.rs", "symbol": "cli_thin_client_single_admission_completes_server_owned_multi_round_loop", "command": "cargo nextest run -p astra-runtime --features bridge-e2e-hooks --test web_agent_e2e cli_thin_client_single_admission_completes_server_owned_multi_round_loop", "claim": "a real thin client completes one Server-owned multi-round admission"}
+            {"kind": "test", "path": "crates/runtime/tests/web_agent_e2e.rs", "symbol": "cli_thin_client_single_admission_completes_server_owned_multi_round_loop", "command": "cargo nextest run -p astra-runtime --features e2e-hooks --test web_agent_e2e cli_thin_client_single_admission_completes_server_owned_multi_round_loop", "claim": "a real thin client completes one Server-owned multi-round admission"}
           ],
           "gaps": ["embedded execution is not implemented", "legacy task and plan authorities remain", "remote/embedded cutover rehearsal is not available"]
         }

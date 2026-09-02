@@ -37,16 +37,17 @@ use astra_services::{
     AcquireWriterOutcome, AdminAuditFilter, AdminAuditReader, ContextService,
     DatabaseAdminAuditReader, DatabaseContextManifestStore, DatabaseContextService,
     DatabaseDecisionService, DatabaseEventService, DatabaseIntrospectionService,
-    DatabaseMarketplaceService, DatabaseMarketplaceStatsService, DatabaseReflectService,
-    DatabaseReplayService, DatabaseSessionArtifactStore, DatabaseSessionContextCoordinator,
-    DatabaseSessionService, DatabaseSkillService, DatabaseStateProjectionStore,
-    DecisionCreateRequestData, DecisionListFilter, DecisionService, EventCreateRequestData,
-    EventListFilter, EventService, IntrospectionService, MAX_API_LIST_LIMIT, MarketplaceService,
-    MarketplaceStatsService, MatrixOneSyncService, ReflectService, ReplayService,
-    ReserveTurnOutcome, RetrievalStage, SessionArtifactJsonStore, SessionArtifactReference,
-    SessionArtifactReferenceKind, SessionArtifactStore, SessionArtifactStoreError,
-    SessionContextCoordinator, SessionContextCoordinatorError, SessionListFilter, SessionService,
-    SkillSearchQuery, SkillService, SnapshotCreateRequestData, SnapshotListFilter,
+    DatabaseMarketplaceService, DatabaseMarketplaceStatsService, DatabasePersonalSkillStore,
+    DatabaseReflectService, DatabaseReplayService, DatabaseSessionArtifactStore,
+    DatabaseSessionContextCoordinator, DatabaseSessionService, DatabaseSkillService,
+    DatabaseStateProjectionStore, DecisionCreateRequestData, DecisionListFilter, DecisionService,
+    EventCreateRequestData, EventListFilter, EventService, IntrospectionService,
+    MAX_API_LIST_LIMIT, MarketplaceService, MarketplaceStatsService, MatrixOneSyncService,
+    ReflectService, ReplayService, ReserveTurnOutcome, RetrievalStage, SessionArtifactJsonStore,
+    SessionArtifactReference, SessionArtifactReferenceKind, SessionArtifactStore,
+    SessionArtifactStoreError, SessionContextCoordinator, SessionContextCoordinatorError,
+    SessionListFilter, SessionService, SkillSearchQuery, SkillService, SnapshotCreateRequestData,
+    SnapshotListFilter, SubmitUserSkillVersion,
 };
 use astra_turn_types::{
     ActorContextV1, ActorKindV1, AuthorityEpochsV1, SessionKeyV1, SessionSurfaceV1,
@@ -1543,9 +1544,10 @@ async fn add_agent_session_event_count_or_create_is_owner_bound_delta_upsert() {
     tx.commit().await.expect("commit owner session delta tx");
 
     let row = sqlx::query(
-        "SELECT user_id, status, event_count, last_event_id FROM agent_sessions WHERE session_id = ?",
+        "SELECT user_id, status, event_count, last_event_id FROM agent_sessions WHERE session_id = ? AND user_id = ?",
     )
     .bind(&session_id)
+    .bind(&owner_user_id)
     .fetch_one(&pool)
     .await
     .expect("load owner session count");
@@ -1570,19 +1572,25 @@ async fn add_agent_session_event_count_or_create_is_owner_bound_delta_upsert() {
     );
 
     let mut tx = pool.begin().await.expect("begin foreign owner tx");
-    let foreign_owner = astra_services::storage::add_agent_session_event_count_or_create(
+    astra_services::storage::add_agent_session_event_count_or_create(
         &mut tx,
         &session_id,
         &other_user_id,
         1,
         Some("event-other"),
     )
-    .await;
-    tx.rollback().await.expect("rollback foreign owner tx");
-    assert!(
-        matches!(foreign_owner, Err(sqlx::Error::RowNotFound)),
-        "existing session_id owned by another user must fail closed: {foreign_owner:?}"
-    );
+    .await
+    .expect("the second owner has an independent session identity");
+    tx.commit().await.expect("commit second owner tx");
+    let other_count: i64 = sqlx::query_scalar(
+        "SELECT event_count FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(&other_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load second owner session count");
+    assert_eq!(other_count, 1);
 
     let mut tx = pool.begin().await.expect("begin negative delta tx");
     let negative_delta = astra_services::storage::add_agent_session_event_count_or_create(
@@ -1600,9 +1608,10 @@ async fn add_agent_session_event_count_or_create_is_owner_bound_delta_upsert() {
     );
 
     let row = sqlx::query(
-        "SELECT user_id, event_count, last_event_id FROM agent_sessions WHERE session_id = ?",
+        "SELECT user_id, event_count, last_event_id FROM agent_sessions WHERE session_id = ? AND user_id = ?",
     )
     .bind(&session_id)
+    .bind(&owner_user_id)
     .fetch_one(&pool)
     .await
     .expect("load unchanged owner session count");
@@ -1621,7 +1630,12 @@ async fn add_agent_session_event_count_or_create_is_owner_bound_delta_upsert() {
         Some("event-2".to_string())
     );
 
-    cleanup_restore_fixture_for_owner(&pool, &owner_user_id, &[session_id]).await;
+    cleanup_restore_fixture_for_owners(
+        &pool,
+        std::slice::from_ref(&session_id),
+        &[&owner_user_id, &other_user_id],
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -4598,7 +4612,8 @@ async fn sync_audit_no_longer_persists_session_sync_log_on_live_matrixone() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn remote_workspace_artifact_restores_without_local_workspace_on_live_matrixone() {
+async fn remote_workspace_artifact_restores_picker_metadata_without_runtime_authority_on_live_matrixone()
+ {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
 
@@ -4718,31 +4733,17 @@ async fn remote_workspace_artifact_restores_without_local_workspace_on_live_matr
         restored.total_tokens_out,
         expected_workspace.total_tokens_out
     );
-    let expected_tools = expected_workspace
-        .last_context_trace
-        .as_ref()
-        .and_then(|trace| trace.tool_surface.as_ref())
-        .map(|surface| surface.visible_tools.clone())
-        .unwrap_or_default();
-    assert_eq!(restored.recent_tools, expected_tools);
+    assert!(
+        restored.recent_tools.is_empty(),
+        "an unversioned workspace artifact cannot grant prompt-facing tool history"
+    );
     assert_eq!(
         restored.git_branch.as_deref(),
         expected_workspace.git_branch.as_deref()
     );
-    assert_eq!(
-        restored.model.as_deref(),
-        expected_workspace.model.as_deref()
-    );
-    assert_eq!(
-        restored
-            .last_context_trace
-            .as_ref()
-            .map(|trace| trace.turn_id.as_str()),
-        expected_workspace
-            .last_context_trace
-            .as_ref()
-            .map(|trace| trace.turn_id.as_str())
-    );
+    assert!(restored.model.is_none());
+    assert!(restored.last_context_trace.is_none());
+    assert!(restored.workspace.is_none());
 
     cleanup_restore_fixture_for_owner(&pool, &user_id, &[session_id]).await;
 }
@@ -4794,7 +4795,7 @@ async fn concurrent_remote_composite_snapshot_indexes_merge_without_local_index_
     .await
     .expect("push checkpoint");
 
-    let build_index = |label: &str, branch: &str, git_commit: &str| {
+    let build_index = |label: &str, branch: &str, git_commit: &str, created_at: &str| {
         let data_snapshot = astra_services::DataSnapshotRef {
             snapshot_name: format!("snapshot-{session_id}-{label}"),
             databases: vec!["app_db".into()],
@@ -4809,6 +4810,7 @@ async fn concurrent_remote_composite_snapshot_indexes_merge_without_local_index_
                 .git_commit(git_commit)
                 .workspace_state(&session_id)
                 .build();
+        composite_snapshot.created_at = created_at.into();
         let mut index = astra_services::CompositeSnapshotIndex::default();
         index
             .append(&mut composite_snapshot)
@@ -4822,11 +4824,13 @@ async fn concurrent_remote_composite_snapshot_indexes_merge_without_local_index_
         "remote-composite-old",
         "feature/remote-composite-old",
         old_git_commit,
+        "2026-09-08T09:59:59Z",
     );
     let (new_index, new_snapshot, new_data_snapshot) = build_index(
         "remote-composite-new",
         "feature/remote-composite-new",
         new_git_commit,
+        "2026-09-08T10:00:00Z",
     );
 
     let artifact_store = DatabaseSessionArtifactStore::new(settings.clone()).with_pool(shared);
@@ -5746,8 +5750,8 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
         stats.last_error.clone()
     };
     assert!(
-        ingestion_error.is_some(),
-        "non-owner event for an existing owner session must fail closed instead of mutating session state"
+        ingestion_error.is_none(),
+        "the other owner must be able to create its own same-named session"
     );
 
     let session_after_non_owner_end = sqlx::query(
@@ -5770,7 +5774,27 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
             .try_get::<i64, _>("event_count")
             .expect("decode event_count"),
         1,
-        "non-owner ingestion failure must not change owner event_count"
+        "the other owner's ingestion must not change owner event_count"
+    );
+    let other_session = sqlx::query(
+        "SELECT status, event_count FROM agent_sessions WHERE session_id = ? AND user_id = ?",
+    )
+    .bind(&session_id)
+    .bind(&other_user_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load independently created same-named session");
+    assert_eq!(
+        other_session
+            .try_get::<String, _>("status")
+            .expect("decode other status"),
+        "ended"
+    );
+    assert_eq!(
+        other_session
+            .try_get::<i64, _>("event_count")
+            .expect("decode other event_count"),
+        1
     );
 
     cleanup_agent_sessions_and_events_for_owner(
@@ -5793,7 +5817,7 @@ async fn event_service_binds_session_event_reads_and_counts_to_owner_on_live_mat
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn session_owned_services_reject_non_owner_side_effects_on_live_matrixone() {
+async fn session_owned_services_isolate_same_session_id_across_owners_on_live_matrixone() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
 
@@ -5888,18 +5912,15 @@ async fn session_owned_services_reject_non_owner_side_effects_on_live_matrixone(
 
     let flusher = astra_services::state_sync::spawn_audit_flusher(pool.clone());
     let sync_service = MatrixOneSyncService::new(pool.clone(), flusher.writer.clone());
-    let sync_result = sync_service
+    sync_service
         .push_session_state(
             &session_id,
             &other_user_id,
-            Some("non-owner-branch"),
+            Some("other-owner-branch"),
             Some("gpt-5.4"),
         )
-        .await;
-    assert!(
-        sync_result.is_err(),
-        "non-owner cannot push session restore metadata"
-    );
+        .await
+        .expect("the other owner creates independent restore metadata");
 
     sync_service
         .push_checkpoint(
@@ -5923,9 +5944,9 @@ async fn session_owned_services_reject_non_owner_side_effects_on_live_matrixone(
         restore
             .restore_session(&other_user_id, &session_id)
             .await
-            .expect("non-owner restore should not error")
-            .is_none(),
-        "non-owner cannot restore another user's session"
+            .expect("other owner restore should not error")
+            .is_some(),
+        "the other owner restores only its independently created session"
     );
     assert!(
         restore
@@ -5933,7 +5954,7 @@ async fn session_owned_services_reject_non_owner_side_effects_on_live_matrixone(
             .await
             .expect("non-owner checkpoint list should not error")
             .is_empty(),
-        "non-owner cannot list another user's checkpoints"
+        "the other owner's new session has no checkpoints yet"
     );
     assert_eq!(
         restore
@@ -5943,26 +5964,23 @@ async fn session_owned_services_reject_non_owner_side_effects_on_live_matrixone(
             .len(),
         1
     );
-    let non_owner_checkpoint_result = sync_service
+    sync_service
         .push_checkpoint(
             &session_id,
             &other_user_id,
             &astra_services::session_checkpoint::Checkpoint {
                 number: 1,
                 turn: 99,
-                title: "non-owner-checkpoint".into(),
-                summary: "must not overwrite".into(),
+                title: "other-owner-checkpoint".into(),
+                summary: "must remain owner isolated".into(),
                 tools_used: vec!["other_tool".into()],
                 total_tokens: 999,
                 had_stalls: true,
                 error_count: 9,
             },
         )
-        .await;
-    assert!(
-        non_owner_checkpoint_result.is_err(),
-        "non-owner cannot overwrite owner checkpoint"
-    );
+        .await
+        .expect("the other owner writes an independent same-numbered checkpoint");
     let checkpoint_row = sqlx::query(
         "SELECT user_id, title, total_tokens FROM session_checkpoints \
          WHERE user_id = ? AND session_id = ? AND number = 1",
@@ -5991,6 +6009,16 @@ async fn session_owned_services_reject_non_owner_side_effects_on_live_matrixone(
             .expect("checkpoint tokens"),
         10
     );
+    let other_checkpoint_owner: String = sqlx::query_scalar(
+        "SELECT user_id FROM session_checkpoints \
+         WHERE user_id = ? AND session_id = ? AND number = 1",
+    )
+    .bind(&other_user_id)
+    .bind(&session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load other owner's isolated checkpoint");
+    assert_eq!(other_checkpoint_owner, other_user_id);
 
     let snapshot_count =
         sqlx::query("SELECT COUNT(*) AS c FROM ctx_snapshots WHERE session_id = ? AND user_id = ?")
@@ -6033,7 +6061,7 @@ async fn session_owned_services_reject_non_owner_side_effects_on_live_matrixone(
             .get("branch")
             .and_then(serde_json::Value::as_str),
         Some("main"),
-        "rejected non-owner session sync must not mutate owner metadata"
+        "same-named session sync must not mutate owner metadata"
     );
 
     cleanup_restore_fixture_for_owner(&pool, &owner_user_id, std::slice::from_ref(&session_id))
@@ -7808,7 +7836,7 @@ async fn sync_outbox_late_event_cannot_recreate_deleted_session_live_matrixone()
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn sync_outbox_create_event_rejects_foreign_session_owner_live_matrixone() {
+async fn sync_outbox_create_event_isolates_same_session_id_across_owners_live_matrixone() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
 
@@ -7839,7 +7867,7 @@ async fn sync_outbox_create_event_rejects_foreign_session_owner_live_matrixone()
         .expect("stable sync outbox event id");
     let event_service = DatabaseEventService::new(settings).with_pool(shared);
 
-    let error = event_service
+    let created = event_service
         .create_event(
             other_user_id.clone(),
             EventCreateRequestData {
@@ -7861,8 +7889,9 @@ async fn sync_outbox_create_event_rejects_foreign_session_owner_live_matrixone()
             },
         )
         .await
-        .expect_err("foreign owner must not append to an existing session");
-    assert_eq!(error.0, axum::http::StatusCode::CONFLICT);
+        .expect("other owner creates an isolated same-named session event");
+    assert_eq!(created.record.user_id, other_user_id);
+    assert_eq!(created.record.session_id, session_id);
 
     let owner_rows: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM agent_sessions WHERE session_id = ? AND user_id = ?",
@@ -7888,14 +7917,22 @@ async fn sync_outbox_create_event_rejects_foreign_session_owner_live_matrixone()
             .await
             .expect("count foreign event rows");
     assert_eq!(owner_rows, 1);
-    assert_eq!(foreign_rows, 0);
-    assert_eq!(foreign_events, 0);
+    assert_eq!(foreign_rows, 1);
+    assert_eq!(foreign_events, 1);
 
     cleanup_agent_sessions_and_events_for_owner(
         &pool,
         &owner_user_id,
         std::slice::from_ref(&session_id),
         &[],
+        &[],
+    )
+    .await;
+    cleanup_agent_sessions_and_events_for_owner(
+        &pool,
+        &other_user_id,
+        std::slice::from_ref(&session_id),
+        &[event_id],
         &[],
     )
     .await;
@@ -8072,12 +8109,26 @@ async fn event_count_delta_service_context_state_paths_live_matrixone() {
 
     let state_projection_store = DatabaseStateProjectionStore::new(shared.clone());
     let active_skill_name = format!("active-skill-{}", Uuid::new_v4());
+    let personal_skill_store = DatabasePersonalSkillStore::new(shared.clone());
+    let active_skill_version = personal_skill_store
+        .submit_version(
+            &user_id,
+            &active_skill_name,
+            SubmitUserSkillVersion {
+                version: "1.0.0".into(),
+                manifest_json: serde_json::json!({"name": &active_skill_name}),
+                content_markdown: "# Active skill\n\nCanonical published fixture.".into(),
+                status: Some("published".into()),
+            },
+        )
+        .await
+        .expect("publish personal skill version fixture");
     state_projection_store
         .activate_personal_skill_from_ui_with_probe(
             &user_id,
             &state_session,
             &active_skill_name,
-            "version-it",
+            &active_skill_version.version_id,
             None,
         )
         .await
@@ -8118,6 +8169,14 @@ async fn event_count_delta_service_context_state_paths_live_matrixone() {
     .bind(&active_skill_name)
     .execute(&pool)
     .await;
+    let _ = sqlx::query("DELETE FROM user_skill_versions WHERE version_id = ?")
+        .bind(&active_skill_version.version_id)
+        .execute(&pool)
+        .await;
+    let _ = sqlx::query("DELETE FROM user_skill_sources WHERE source_id = ?")
+        .bind(&active_skill_version.source_id)
+        .execute(&pool)
+        .await;
     cleanup_agent_sessions_and_events_for_owner(
         &pool,
         &user_id,

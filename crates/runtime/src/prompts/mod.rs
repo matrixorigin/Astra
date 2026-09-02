@@ -142,8 +142,17 @@ mod tests {
         let p = build_main_system_prompt(&["read_file", "bash", "memory", "github", "git"], "");
         assert!(
             p.len() < 13000,
-            "compressed prompt should be under 13000 chars, got {}",
-            p.len()
+            "compressed prompt should be under 13000 chars, got {}; sections={:?}",
+            p.len(),
+            build_system_prompt_sections(&["read_file", "bash", "memory", "github", "git"], "")
+                .iter()
+                .enumerate()
+                .map(|(index, section)| (
+                    index,
+                    section.text.lines().next().unwrap_or_default(),
+                    section.text.len()
+                ))
+                .collect::<Vec<_>>()
         );
     }
 

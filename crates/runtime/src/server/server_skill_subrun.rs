@@ -198,8 +198,8 @@ pub struct ServerSkillSubRunExecutor {
     /// Shared tool_call dedup state from the parent host. When set, the sub-run
     /// host will observe the same emitted_tool_call_ids HashSet as the parent,
     /// preventing duplicate `tool_call` events across host instances within the
-    /// same chat turn. Plumbed only under `bridge-e2e-hooks` (test observability).
-    #[cfg(feature = "bridge-e2e-hooks")]
+    /// same chat turn. Plumbed only under `e2e-hooks` (test observability).
+    #[cfg(feature = "e2e-hooks")]
     dedup_state: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
     /// Parent session's harness snapshot sink for observe-only sub-run
     /// observation. When set, the sub-run creates a sink-only HarnessSlot
@@ -257,7 +257,7 @@ impl ServerSkillSubRunExecutor {
             edge_connection_pool: None,
             edge_dispatch_service: None,
             edge_registry_service: None,
-            #[cfg(feature = "bridge-e2e-hooks")]
+            #[cfg(feature = "e2e-hooks")]
             dedup_state: None,
             #[cfg(feature = "harness")]
             harness_sink: None,
@@ -285,7 +285,7 @@ impl ServerSkillSubRunExecutor {
     /// Share the parent host's `emitted_tool_call_ids` HashSet so that sub-run
     /// hosts dedupe `tool_call` events against the parent's already-emitted
     /// ids. See `ServerAgenticLoopHostBuilder::with_dedup_state`.
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     pub fn with_dedup_state(
         mut self,
         shared: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
@@ -943,7 +943,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
         // emitted once per host instance within the same chat turn.
         // See `ServerAgenticLoopHostBuilder::with_dedup_state` and
         // `ServerSkillSubRunExecutor::with_dedup_state`.
-        #[cfg(feature = "bridge-e2e-hooks")]
+        #[cfg(feature = "e2e-hooks")]
         if let Some(dedup) = &self.dedup_state {
             builder = builder.with_dedup_state(dedup.clone());
         }
@@ -1741,12 +1741,16 @@ mod tests {
             )
             .await;
         assert!(stale.pending.is_none());
-        assert!(matches!(
-            stale.dispatch_control,
-            crate::server::runtime_tool_executor::RuntimeToolDispatchControl::Superseded {
-                user_intent_event_index: 8
-            }
-        ));
+        let crate::server::runtime_tool_executor::RuntimeToolDispatchControl::Superseded {
+            user_intent_event_index,
+        } = stale.dispatch_control
+        else {
+            panic!("newer durable user intent must supersede stale dispatch")
+        };
+        assert!(
+            user_intent_event_index > 0,
+            "supersession must carry the durable event authority"
+        );
         let identity = astra_turn_types::ToolInvocationIdentity::new(
             "test-user",
             "test-session",

@@ -986,8 +986,39 @@ async fn insert_recovered_model_request_terminal_tx(
         .checked_add(terminal.cache_read_tokens)
         .and_then(|total| total.checked_add(terminal.cache_creation_tokens))
         .ok_or_else(|| sqlx::Error::Protocol("recovered input token total overflow".to_string()))?;
-    let inserted = sqlx::query(
-        "INSERT IGNORE INTO model_request_context_events
+    let existing_terminal = sqlx::query(
+        "SELECT event_json FROM model_request_context_events
+         WHERE event_id = ? FOR UPDATE",
+    )
+    .bind(&event_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+    if let Some(existing_terminal) = existing_terminal {
+        let existing_json = existing_terminal.try_get::<String, _>("event_json")?;
+        let existing_event = serde_json::from_str::<ModelRequestContextEvent>(&existing_json)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        let exact_usage = existing_event.usage.as_ref().is_some_and(|existing| {
+            existing.input.fresh_input_tokens == fresh_input_tokens
+                && existing.input.cache_read_tokens == cache_read_tokens
+                && existing.input.cache_creation_tokens == cache_creation_tokens
+                && existing.output_tokens == output_tokens
+        });
+        let exact_terminal = existing_event.stage == ModelRequestEventStage::Terminal
+            && existing_event.terminal_status.as_deref() == Some(terminal.status.as_str())
+            && existing_event.usage_status.as_deref() == Some(terminal.usage_status.as_str())
+            && existing_event.identity.provider_response_id == terminal.provider_response_id
+            && existing_event.error_kind == terminal.error_kind
+            && exact_usage;
+        return if exact_terminal {
+            Ok(())
+        } else {
+            Err(sqlx::Error::Protocol(format!(
+                "recovered model request terminal {event_id} conflicts with its append-only event"
+            )))
+        };
+    }
+    sqlx::query(
+        "INSERT INTO model_request_context_events
          (event_id, user_id, attempt_id, invocation_id, session_id, run_id, harness_run_id,
           event_stage, terminal_status, topology, provider, model_family, purpose,
           input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
@@ -1013,9 +1044,6 @@ async fn insert_recovered_model_request_terminal_tx(
     .bind(event_json)
     .execute(&mut *connection)
     .await?;
-    if inserted.rows_affected() == 0 {
-        return Ok(());
-    }
     sqlx::query(
         "INSERT INTO model_request_metric_shards
          (metric_shard, topology, provider, model_family, purpose, terminal_status,
@@ -1930,9 +1958,9 @@ async fn insert_inference_provider_attempt_admission(
         "INSERT INTO inference_provider_attempts
          (attempt_id, invocation_id, user_id, session_id, run_id, harness_run_id, attempt_index,
           provider, admission_token, provider_protocol, provider_wire_hash, provider_wire_bytes,
-          status, started_at, terminal_at)
+          status, usage_status, started_at, terminal_at)
          SELECT ?, invocation_id, user_id, session_id, run_id, harness_run_id,
-                ?, ?, ?, ?, ?, ?, 'started', NOW(6), NULL
+                ?, ?, ?, ?, ?, ?, 'started', 'unavailable', NOW(6), NULL
          FROM inference_invocations
          WHERE user_id = ? AND invocation_id = ? AND status = 'admitted'
            AND NOT EXISTS (
@@ -2471,14 +2499,16 @@ async fn record_successful_attempt_debt_if_needed(
     if terminal.status == InferenceTerminalStatus::Succeeded {
         record_inference_settlement_debt(
             db,
-            &attempt.user_id,
-            &attempt.invocation_id,
-            &attempt.owner_token,
-            attempt.owner_generation,
-            terminal_state,
-            Some(&attempt.attempt_id),
-            ProviderDeliveryState::DeliveryAuthorized,
-            SettlementDebtMode::RequireQuiescent,
+            InferenceSettlementDebtRequest {
+                user_id: &attempt.user_id,
+                invocation_id: &attempt.invocation_id,
+                owner_token: &attempt.owner_token,
+                owner_generation: attempt.owner_generation,
+                terminal: terminal_state,
+                provider_attempt_id: Some(&attempt.attempt_id),
+                provider_delivery_state: ProviderDeliveryState::DeliveryAuthorized,
+                mode: SettlementDebtMode::RequireQuiescent,
+            },
         )
         .await?;
     }
@@ -2529,6 +2559,17 @@ pub async fn finish_inference_provider_attempt(
     let terminal_state = DurableInferenceTerminal::from_terminal(terminal, fingerprint.clone())?;
     let provider_wire_bytes = checked_i64(attempt.wire.provider_wire_bytes, "provider_wire_bytes")?;
     let db = pool.get();
+    if let Some(persisted) = load_provider_attempt_fact(db, attempt).await?
+        && classify_persisted_provider_terminal(
+            &persisted,
+            attempt,
+            provider_wire_bytes,
+            terminal,
+            &fingerprint,
+        )? == PersistedProviderTerminalMatch::ExactTerminal
+    {
+        return Ok(());
+    }
     let update = sqlx::query(
         "UPDATE inference_provider_attempts
          SET status = ?, terminal_fingerprint = ?, provider_response_id = ?,
@@ -3173,17 +3214,32 @@ enum SettlementDebtMode {
     FenceOpenAttempts,
 }
 
-async fn record_inference_settlement_debt(
-    db: &sqlx::Pool<sqlx::MySql>,
-    user_id: &str,
-    invocation_id: &str,
-    owner_token: &str,
+#[derive(Clone, Copy, Debug)]
+struct InferenceSettlementDebtRequest<'a> {
+    user_id: &'a str,
+    invocation_id: &'a str,
+    owner_token: &'a str,
     owner_generation: u64,
-    terminal: &DurableInferenceTerminal,
-    provider_attempt_id: Option<&str>,
+    terminal: &'a DurableInferenceTerminal,
+    provider_attempt_id: Option<&'a str>,
     provider_delivery_state: ProviderDeliveryState,
     mode: SettlementDebtMode,
+}
+
+async fn record_inference_settlement_debt(
+    db: &sqlx::Pool<sqlx::MySql>,
+    request: InferenceSettlementDebtRequest<'_>,
 ) -> ServiceResult<()> {
+    let InferenceSettlementDebtRequest {
+        user_id,
+        invocation_id,
+        owner_token,
+        owner_generation,
+        terminal,
+        provider_attempt_id,
+        provider_delivery_state,
+        mode,
+    } = request;
     let mut tx = db.begin().await.map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
@@ -3377,14 +3433,16 @@ pub async fn declare_inference_settlement(
     let terminal = DurableInferenceTerminal::from_terminal(terminal, fingerprint)?;
     record_inference_settlement_debt(
         pool.get(),
-        &plan.input.user_id,
-        &plan.invocation_id,
-        &plan.owner_token,
-        plan.owner_generation,
-        &terminal,
-        None,
-        ProviderDeliveryState::Unknown,
-        SettlementDebtMode::FenceOpenAttempts,
+        InferenceSettlementDebtRequest {
+            user_id: &plan.input.user_id,
+            invocation_id: &plan.invocation_id,
+            owner_token: &plan.owner_token,
+            owner_generation: plan.owner_generation,
+            terminal: &terminal,
+            provider_attempt_id: None,
+            provider_delivery_state: ProviderDeliveryState::Unknown,
+            mode: SettlementDebtMode::FenceOpenAttempts,
+        },
     )
     .await
 }
@@ -3419,14 +3477,16 @@ pub async fn declare_inference_attempt_settlement(
     let terminal = DurableInferenceTerminal::from_terminal(terminal, fingerprint)?;
     record_inference_settlement_debt(
         pool.get(),
-        &plan.input.user_id,
-        &plan.invocation_id,
-        &plan.owner_token,
-        plan.owner_generation,
-        &terminal,
-        Some(&attempt.attempt_id),
-        provider_delivery_state.into(),
-        SettlementDebtMode::FenceOpenAttempts,
+        InferenceSettlementDebtRequest {
+            user_id: &plan.input.user_id,
+            invocation_id: &plan.invocation_id,
+            owner_token: &plan.owner_token,
+            owner_generation: plan.owner_generation,
+            terminal: &terminal,
+            provider_attempt_id: Some(&attempt.attempt_id),
+            provider_delivery_state: provider_delivery_state.into(),
+            mode: SettlementDebtMode::FenceOpenAttempts,
+        },
     )
     .await
 }
@@ -3937,12 +3997,26 @@ async fn reconcile_inference_settlement_debt(
             )
             .await
         {
+            let quarantine_reason = match &error {
+                sqlx::Error::Protocol(message)
+                    if message.contains("has no accepted request-context event") =>
+                {
+                    Some("exact provider attempt is missing accepted request-context evidence")
+                }
+                sqlx::Error::Protocol(_) => {
+                    Some("exact provider attempt has malformed request-context evidence")
+                }
+                _ => None,
+            };
+            let Some(quarantine_reason) = quarantine_reason else {
+                return Err(error);
+            };
             quarantine_inference_settlement_debt(
                 db,
                 user_id,
                 invocation_id,
                 &fingerprint,
-                "exact provider attempt is missing accepted request-context evidence",
+                quarantine_reason,
             )
             .await?;
             tracing::error!(
@@ -4569,14 +4643,16 @@ pub async fn finish_inference_invocation(
     // failure, this is a durable declaration that retry policy has finished.
     record_inference_settlement_debt(
         db,
-        &plan.input.user_id,
-        &plan.invocation_id,
-        &plan.owner_token,
-        plan.owner_generation,
-        &terminal_state,
-        None,
-        ProviderDeliveryState::Unknown,
-        SettlementDebtMode::RequireQuiescent,
+        InferenceSettlementDebtRequest {
+            user_id: &plan.input.user_id,
+            invocation_id: &plan.invocation_id,
+            owner_token: &plan.owner_token,
+            owner_generation: plan.owner_generation,
+            terminal: &terminal_state,
+            provider_attempt_id: None,
+            provider_delivery_state: ProviderDeliveryState::Unknown,
+            mode: SettlementDebtMode::RequireQuiescent,
+        },
     )
     .await?;
 

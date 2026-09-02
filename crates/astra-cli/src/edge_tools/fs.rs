@@ -5663,7 +5663,7 @@ type Handler interface {
 
         // Verify content on disk
         let on_disk = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(on_disk, "updated content");
+        assert_eq!(on_disk, "updated content\n");
     }
 
     /// After read_file, str_replace should succeed.

@@ -350,7 +350,7 @@ struct WsConnection {
     /// external-session origin so WS chat can use the same provider
     /// runtime-context injection path as HTTP `/chat` and `/chat/stream`.
     principal: AuthPrincipal,
-    /// Normalized bearer header captured during WS auth and replayed on bridge fallback.
+    /// Normalized bearer header captured during WS auth and reused for server requests.
     authorization: String,
     /// Inbound handshake headers eligible for remote skill forwarding.
     /// Header names are normalized to lowercase.
@@ -362,9 +362,6 @@ struct WsConnection {
     pending_session_id: Option<String>,
     /// Active run ID (if any). Used for cancel/approval routing.
     active_run_id: Option<String>,
-    /// Prepared bridge-local run ID used before the upstream stream reports a real one.
-    #[cfg_attr(not(test), allow(dead_code))]
-    bridge_prepared_run_id: Option<String>,
 }
 
 // ─── Handler ─────────────────────────────────────────────────────────────────
@@ -578,7 +575,6 @@ async fn authenticate_with_token(
                 session_id: None,
                 pending_session_id: session_id,
                 active_run_id: None,
-                bridge_prepared_run_id: None,
             })
         }
         Err((_status, error)) => {
@@ -742,8 +738,7 @@ async fn message_loop(socket: &mut WebSocket, state: &AppState, mut conn: WsConn
 /// Handle a chat message: run agentic loop via RunLifecycleService and stream
 /// events back as WS frames.
 ///
-/// Prefers RunLifecycleService (server-side agentic loop). Falls back to bridge
-/// if the lifecycle service returns NOT_IMPLEMENTED (unconfigured).
+/// Runs the single server-owned agentic lifecycle and streams its typed events.
 async fn handle_chat_message(
     socket: &mut WebSocket,
     state: &AppState,
@@ -1249,54 +1244,6 @@ async fn handle_shared_user_prompt_response(
         }
     }
 }
-#[cfg(test)]
-fn build_bridge_chat_payload(
-    session_id: Option<String>,
-    content: &str,
-    agent_id: Option<String>,
-    model: Option<String>,
-    skill_search: Option<astra_core::SkillSearchSettings>,
-    allow_skills: Option<Vec<String>>,
-    allow_skill_sources: Option<Vec<String>>,
-    allow_tools: Option<Vec<String>>,
-    context: Option<serde_json::Map<String, serde_json::Value>>,
-    execution_budget: Option<astra_services::runs::ExecutionBudget>,
-    explain: bool,
-    interaction_mode: Option<astra_services::runs::RequestedTurnInteractionMode>,
-) -> Value {
-    let allow_skills = normalize_bridge_allowlist(allow_skills.as_deref());
-    let allow_skill_sources = normalize_bridge_allowlist(allow_skill_sources.as_deref());
-    let allow_tools = normalize_bridge_allowlist(allow_tools.as_deref());
-    serde_json::json!({
-        "session_id": session_id,
-        "agent_id": agent_id,
-        "model": model,
-        "skill_search": skill_search,
-        "allow_skills": allow_skills,
-        "allow_skill_sources": allow_skill_sources,
-        "allow_tools": allow_tools,
-        "context": context,
-        "execution_budget": execution_budget,
-        "explain": explain,
-        "interaction_mode": interaction_mode,
-        "messages": [{
-            "role": "user",
-            "content": content
-        }]
-    })
-}
-
-#[cfg(test)]
-fn normalize_bridge_allowlist(entries: Option<&[String]>) -> Option<Vec<String>> {
-    entries.map(|entries| {
-        let mut normalized = std::collections::BTreeSet::new();
-        for entry in entries {
-            normalized.insert(entry.trim().to_ascii_lowercase());
-        }
-        normalized.into_iter().collect()
-    })
-}
-
 fn build_ws_chat_request(
     content: &str,
     user_intent: Option<String>,
@@ -1368,30 +1315,6 @@ fn ws_forward_headers(conn: &WsConnection) -> std::collections::HashMap<String, 
     let mut headers = conn.forward_headers.clone();
     headers.insert("authorization".to_string(), conn.authorization.clone());
     headers
-}
-
-#[cfg(test)]
-async fn resolve_bridge_payload_session_id(
-    state: &AppState,
-    user: &AuthUserRecord,
-    request_session_id: Option<String>,
-    request_session_id_is_trusted: bool,
-) -> (Option<String>, Option<String>) {
-    let Some(session_id) = request_session_id else {
-        return (None, None);
-    };
-    if !request_session_id_is_trusted {
-        return (Some(session_id), None);
-    }
-
-    match state
-        .session_service
-        .get_session(session_id.clone(), user.user_id.clone())
-        .await
-    {
-        Err(error) if is_session_service_unconfigured_error(&error) => (None, Some(session_id)),
-        _ => (Some(session_id), None),
-    }
 }
 
 fn chat_request_session_id(
@@ -2153,248 +2076,10 @@ async fn stream_run_over_websocket(
     }
 }
 
-#[cfg(test)]
-fn should_adopt_stream_run_id(conn: &WsConnection, run_id: &str) -> bool {
-    conn.active_run_id.is_none()
-        || (conn.bridge_prepared_run_id.as_deref() == conn.active_run_id.as_deref()
-            && conn.active_run_id.as_deref() != Some(run_id))
-}
-
-#[cfg(test)]
-fn sync_conn_state_from_stream_event(
-    conn: &mut WsConnection,
-    event: &Value,
-) -> Option<(String, bool)> {
-    let event_type = event
-        .get("type")
-        .or_else(|| event.get("event_type"))
-        .and_then(Value::as_str);
-
-    if event_type == Some("session_info") {
-        if let Some(session_id) = event.get("session_id").and_then(Value::as_str) {
-            conn.session_id = Some(session_id.to_string());
-            conn.pending_session_id = None;
-        }
-    }
-
-    if matches!(
-        event_type,
-        Some(
-            "session_info"
-                | "run_started"
-                | "run_paused"
-                | "run_waiting"
-                | "run_resumed"
-                | "run_cancellation_requested"
-                | "run_cancelled"
-                | "run_finished"
-        )
-    ) && let Some(run_id) = event.get("run_id").and_then(Value::as_str)
-        && should_adopt_stream_run_id(conn, run_id)
-    {
-        conn.active_run_id = Some(run_id.to_string());
-        return Some((run_id.to_string(), event_type == Some("session_info")));
-    }
-    None
-}
-
-#[cfg(test)]
-fn synthetic_bridge_run_started(
-    conn: &WsConnection,
-    adopted_run_id: Option<(String, bool)>,
-    explain: Option<&Value>,
-) -> Option<WsServerMessage> {
-    // `sync_conn_state_from_stream_event` only returns an adopted session_info run_id
-    // for the first fresh bridge run or when an upstream run_id replaces the prepared
-    // placeholder, so emitting here preserves the one-shot run_started contract.
-    let (run_id, synthesize_run_started) = adopted_run_id?;
-    if !synthesize_run_started {
-        return None;
-    }
-    let session_id = conn.session_id.clone()?;
-    Some(WsServerMessage::RunStarted {
-        run_id,
-        session_id,
-        explain: explain.cloned(),
-    })
-}
-
-#[cfg(test)]
-fn bridge_run_started_explain(explain: bool) -> Option<Value> {
-    explain.then(|| serde_json::json!({"mode": "background"}))
-}
-
 fn session_info_message(session_id: String, run_id: Option<String>) -> WsServerMessage {
     WsServerMessage::SessionInfo { session_id, run_id }
 }
 
-#[cfg(test)]
-fn bind_prepared_bridge_identity(
-    conn: &mut WsConnection,
-    trusted_session_id: Option<&str>,
-    turn_chain_id: Option<&str>,
-) -> Option<(String, String)> {
-    let session_id = trusted_session_id?.to_string();
-    conn.session_id = Some(session_id.clone());
-    conn.pending_session_id = None;
-
-    let run_id = turn_chain_id?.to_string();
-    conn.active_run_id = Some(run_id.clone());
-    conn.bridge_prepared_run_id = Some(run_id.clone());
-    Some((session_id, run_id))
-}
-
-#[cfg(test)]
-fn bridge_run_started_message(
-    session_id: String,
-    run_id: String,
-    explain: Option<&Value>,
-) -> WsServerMessage {
-    WsServerMessage::RunStarted {
-        run_id,
-        session_id,
-        explain: explain.cloned(),
-    }
-}
-
-#[cfg(test)]
-fn bridge_success_preamble_messages(
-    conn: &mut WsConnection,
-    trusted_session_id: Option<&str>,
-    turn_chain_id: Option<&str>,
-    explain: Option<&Value>,
-) -> Vec<WsServerMessage> {
-    if let Some((session_id, run_id)) =
-        bind_prepared_bridge_identity(conn, trusted_session_id, turn_chain_id)
-    {
-        vec![
-            session_info_message(session_id.clone(), Some(run_id.clone())),
-            bridge_run_started_message(session_id, run_id, explain),
-        ]
-    } else {
-        Vec::new()
-    }
-}
-
-#[cfg(test)]
-fn bridge_forward_error_messages(
-    conn: &mut WsConnection,
-    trusted_session_id: Option<&str>,
-    turn_chain_id: Option<&str>,
-    explain: Option<&Value>,
-    status: StatusCode,
-    error_message: String,
-) -> Vec<WsServerMessage> {
-    let mut messages =
-        bridge_success_preamble_messages(conn, trusted_session_id, turn_chain_id, explain);
-    if let Some(run_id) = conn.active_run_id.clone() {
-        messages.push(ws_error_from_status(status, error_message.clone()));
-        messages.push(WsServerMessage::RunFinished {
-            run_id,
-            status: STATUS_FAILED.to_string(),
-            error: Some(error_message),
-        });
-        messages
-    } else if let Some(session_id) = trusted_session_id {
-        conn.session_id = Some(session_id.to_string());
-        conn.pending_session_id = None;
-        vec![
-            session_info_message(session_id.to_string(), None),
-            ws_error_from_status(status, error_message),
-        ]
-    } else {
-        vec![ws_error_from_status(status, error_message)]
-    }
-}
-
-#[cfg(test)]
-fn should_suppress_initial_bridge_session_info(
-    suppress_session_info: &mut bool,
-    event: &Value,
-) -> bool {
-    if *suppress_session_info && event.get("type").and_then(Value::as_str) == Some("session_info") {
-        *suppress_session_info = false;
-        true
-    } else {
-        false
-    }
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum BridgeWsTerminalStatus {
-    Completed,
-    #[allow(dead_code)] // reserved for future WS lifecycle tests
-    Cancelled,
-    Failed(Option<String>),
-    #[allow(dead_code)] // reserved for future WS lifecycle tests
-    Disconnected,
-}
-
-#[cfg(test)]
-fn bridge_ws_terminal_status(
-    saw_turn_complete: bool,
-    terminal_error: Option<String>,
-) -> BridgeWsTerminalStatus {
-    if terminal_error.is_some() {
-        BridgeWsTerminalStatus::Failed(terminal_error)
-    } else if saw_turn_complete {
-        BridgeWsTerminalStatus::Completed
-    } else {
-        BridgeWsTerminalStatus::Failed(Some("Bridge stream ended before turn_complete".to_string()))
-    }
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-struct ProcessedBridgeStreamEvent {
-    pre_messages: Vec<WsServerMessage>,
-    raw_event: Option<Value>,
-}
-
-#[cfg(test)]
-fn process_bridge_stream_event(
-    conn: &mut WsConnection,
-    event: Value,
-    run_started_explain: Option<&Value>,
-    suppress_initial_session_info: &mut bool,
-    saw_turn_complete: &mut bool,
-    terminal_error: &mut Option<String>,
-) -> ProcessedBridgeStreamEvent {
-    if should_suppress_initial_bridge_session_info(suppress_initial_session_info, &event) {
-        return ProcessedBridgeStreamEvent {
-            pre_messages: Vec::new(),
-            raw_event: None,
-        };
-    }
-
-    let adopted_run_id = sync_conn_state_from_stream_event(conn, &event);
-    let mut pre_messages = Vec::new();
-    if let Some(run_started) =
-        synthetic_bridge_run_started(conn, adopted_run_id, run_started_explain)
-    {
-        pre_messages.push(run_started);
-    }
-
-    match event.get("type").and_then(Value::as_str) {
-        Some("turn_complete") => *saw_turn_complete = true,
-        Some("error") => {
-            *terminal_error = event
-                .get("message")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .or_else(|| Some("Bridge returned error event".to_string()));
-        }
-        _ => {}
-    }
-
-    ProcessedBridgeStreamEvent {
-        pre_messages,
-        raw_event: Some(event),
-    }
-}
-
-/// Send a typed server message as a WebSocket text frame.
 async fn send_msg(socket: &mut WebSocket, msg: &WsServerMessage) {
     if let Ok(json) = serde_json::to_string(msg) {
         let _ = socket.send(Message::Text(json.into())).await;
@@ -2406,132 +2091,13 @@ async fn send_msg(socket: &mut WebSocket, msg: &WsServerMessage) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-    use axum::{Json, http::StatusCode};
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
-
-    use crate::{
-        AppState, ErrorResponse, HealthChecker, ServiceInfo, SessionActivityRecord,
-        SessionCreateRequestData, SessionListFilter, SessionListRecord, SessionRecord,
-        SessionService, SessionUpdateRequestData,
-    };
     use astra_services::{
         AuthPrincipal, AuthRefreshRequestData, AuthRegisterRequestData, AuthService,
         AuthTokenRecord,
     };
     use astra_tools::{AskUserGate, ToolApprovalGate};
-
-    #[derive(Clone)]
-    struct StubHealthChecker;
-
-    #[async_trait]
-    impl HealthChecker for StubHealthChecker {
-        async fn database_healthy(&self) -> bool {
-            true
-        }
-    }
-
-    #[derive(Clone, Default)]
-    struct RecordingSessionService {
-        get_calls: Arc<Mutex<Vec<(String, String)>>>,
-    }
-
-    impl RecordingSessionService {
-        async fn get_calls(&self) -> Vec<(String, String)> {
-            self.get_calls.lock().await.clone()
-        }
-    }
-
-    #[async_trait]
-    impl SessionService for RecordingSessionService {
-        async fn create_session(
-            &self,
-            user_id: String,
-            request: SessionCreateRequestData,
-        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
-            Ok(SessionRecord {
-                session_id: "created-session".to_string(),
-                user_id,
-                agent_id: request.agent_id,
-                title: None,
-                metadata: request.metadata.unwrap_or_default(),
-                status: "active".to_string(),
-                event_count: 0,
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
-                ended_at: None,
-            })
-        }
-
-        async fn list_sessions(
-            &self,
-            _filter: SessionListFilter,
-        ) -> Result<SessionListRecord, (StatusCode, Json<ErrorResponse>)> {
-            Ok(SessionListRecord {
-                sessions: Vec::new(),
-                total: Some(0),
-                limit: 20,
-                next_cursor: None,
-            })
-        }
-
-        async fn get_session(
-            &self,
-            session_id: String,
-            user_id: String,
-        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
-            self.get_calls
-                .lock()
-                .await
-                .push((session_id.clone(), user_id.clone()));
-            Ok(SessionRecord {
-                session_id,
-                user_id,
-                agent_id: None,
-                title: Some("Existing".to_string()),
-                metadata: serde_json::Map::new(),
-                status: "active".to_string(),
-                event_count: 0,
-                created_at: "2026-01-01T00:00:00Z".to_string(),
-                updated_at: Some("2026-01-01T00:00:00Z".to_string()),
-                ended_at: None,
-            })
-        }
-
-        async fn update_session(
-            &self,
-            session_id: String,
-            user_id: String,
-            _request: SessionUpdateRequestData,
-        ) -> Result<SessionRecord, (StatusCode, Json<ErrorResponse>)> {
-            self.get_session(session_id, user_id).await
-        }
-
-        async fn delete_session(
-            &self,
-            _session_id: String,
-            _user_id: String,
-        ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-            Ok(())
-        }
-
-        async fn get_session_activity(
-            &self,
-            _session_id: String,
-            _user_id: String,
-            _limit: u32,
-            _cursor: Option<astra_services::auth::SessionActivityCursor>,
-        ) -> Result<SessionActivityRecord, (StatusCode, Json<ErrorResponse>)> {
-            Ok(SessionActivityRecord {
-                session_id: String::new(),
-                activities: Vec::new(),
-                total: 0,
-                limit: 20,
-                next_cursor: None,
-            })
-        }
-    }
+    use async_trait::async_trait;
+    use axum::http::StatusCode;
 
     fn test_user() -> AuthUserRecord {
         AuthUserRecord {
@@ -2680,89 +2246,6 @@ mod tests {
     }
 
     #[test]
-    fn bridge_payload_preserves_runtime_request_fields() {
-        let mut context = serde_json::Map::new();
-        context.insert("edge_tools".into(), serde_json::json!([{"name": "bash"}]));
-        context.insert("mode".into(), serde_json::json!("headless"));
-
-        let payload = build_bridge_chat_payload(
-            Some("session-1".into()),
-            "hello",
-            Some("agent-1".into()),
-            Some("gpt-5.4".into()),
-            Some(astra_core::SkillSearchSettings {
-                dynamic_surface: false,
-                min_catalog_size: 12,
-                surface_cap: 20,
-            }),
-            Some(vec!["plan".into()]),
-            Some(vec!["database".into()]),
-            Some(vec!["bash".into()]),
-            Some(context.clone()),
-            Some(astra_services::runs::ExecutionBudget {
-                initial_turns: Some(3),
-                hard_turn_limit: Some(7),
-            }),
-            true,
-            Some(astra_services::runs::RequestedTurnInteractionMode::Auto),
-        );
-
-        assert_eq!(payload["session_id"], "session-1");
-        assert_eq!(payload["agent_id"], "agent-1");
-        assert_eq!(payload["model"], "gpt-5.4");
-        assert_eq!(payload["skill_search"]["dynamic_surface"], false);
-        assert_eq!(payload["skill_search"]["min_catalog_size"], 12);
-        assert_eq!(payload["skill_search"]["surface_cap"], 20);
-        assert_eq!(payload["allow_skills"], serde_json::json!(["plan"]));
-        assert_eq!(
-            payload["allow_skill_sources"],
-            serde_json::json!(["database"])
-        );
-        assert_eq!(payload["allow_tools"], serde_json::json!(["bash"]));
-        assert_eq!(payload["context"], serde_json::Value::Object(context));
-        assert_eq!(payload["execution_budget"]["initial_turns"], 3);
-        assert_eq!(payload["execution_budget"]["hard_turn_limit"], 7);
-        assert_eq!(payload["explain"], true);
-        assert_eq!(payload["interaction_mode"], "auto");
-        assert_eq!(payload["messages"][0]["role"], "user");
-        assert_eq!(payload["messages"][0]["content"], "hello");
-    }
-
-    #[test]
-    fn bridge_payload_normalizes_allowlists() {
-        let payload = build_bridge_chat_payload(
-            Some("session-1".into()),
-            "hello",
-            Some("agent-1".into()),
-            Some("gpt-5.4".into()),
-            None,
-            Some(vec![" plan ".into(), "PLAN".into(), "analyze".into()]),
-            Some(vec![" local ".into(), "MCP".into(), "local".into()]),
-            Some(vec![" bash ".into(), "BASH".into(), "read_file".into()]),
-            None,
-            Some(astra_services::runs::ExecutionBudget {
-                initial_turns: Some(3),
-                hard_turn_limit: Some(6),
-            }),
-            true,
-            None,
-        );
-
-        assert_eq!(
-            payload["allow_skills"],
-            serde_json::json!(["analyze", "plan"])
-        );
-        assert_eq!(
-            payload["allow_skill_sources"],
-            serde_json::json!(["local", "mcp"])
-        );
-        assert_eq!(
-            payload["allow_tools"],
-            serde_json::json!(["bash", "read_file"])
-        );
-    }
-
-    #[test]
     fn ws_chat_request_preserves_runtime_request_fields() {
         let request = build_ws_chat_request(
             "hello",
@@ -2859,7 +2342,6 @@ mod tests {
             session_id: None,
             pending_session_id: None,
             active_run_id: None,
-            bridge_prepared_run_id: None,
         };
 
         let headers = ws_forward_headers(&conn);
@@ -2871,47 +2353,6 @@ mod tests {
         assert_eq!(headers.get("x-catalog-tenant"), Some(&"tenant-a".into()));
     }
 
-    #[tokio::test]
-    async fn resolve_bridge_payload_session_id_omits_trusted_session_when_service_unconfigured() {
-        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker));
-
-        let (payload_session_id, trusted_session_id_override) = resolve_bridge_payload_session_id(
-            &state,
-            &test_user(),
-            Some("bound-session".into()),
-            true,
-        )
-        .await;
-
-        assert_eq!(payload_session_id, None);
-        assert_eq!(
-            trusted_session_id_override.as_deref(),
-            Some("bound-session")
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_bridge_payload_session_id_keeps_trusted_session_when_service_configured() {
-        let session_service = RecordingSessionService::default();
-        let state = AppState::new(ServiceInfo::default(), Arc::new(StubHealthChecker))
-            .with_session_service(Arc::new(session_service.clone()));
-
-        let (payload_session_id, trusted_session_id_override) = resolve_bridge_payload_session_id(
-            &state,
-            &test_user(),
-            Some("bound-session".into()),
-            true,
-        )
-        .await;
-
-        assert_eq!(payload_session_id.as_deref(), Some("bound-session"));
-        assert_eq!(trusted_session_id_override, None);
-        assert_eq!(
-            session_service.get_calls().await,
-            vec![("bound-session".to_string(), "u1".to_string())]
-        );
-    }
-
     #[test]
     fn chat_request_session_id_prefers_requested_value_without_mutating_connection() {
         let conn = WsConnection {
@@ -2921,7 +2362,6 @@ mod tests {
             session_id: Some("bound-session".into()),
             pending_session_id: Some("handshake-session".into()),
             active_run_id: None,
-            bridge_prepared_run_id: None,
         };
 
         let session_id = chat_request_session_id(&conn, Some("requested-session".into()));
@@ -2943,7 +2383,6 @@ mod tests {
             session_id: Some("bound-session".into()),
             pending_session_id: None,
             active_run_id: None,
-            bridge_prepared_run_id: None,
         };
 
         let session_id = chat_request_session_id(&conn, None);
@@ -2960,7 +2399,6 @@ mod tests {
             session_id: Some("bound-session".into()),
             pending_session_id: Some("handshake-session".into()),
             active_run_id: None,
-            bridge_prepared_run_id: None,
         };
 
         let session_id = chat_request_session_id(&conn, None);
@@ -2977,7 +2415,6 @@ mod tests {
             session_id: Some("bound-session".into()),
             pending_session_id: None,
             active_run_id: None,
-            bridge_prepared_run_id: None,
         };
         let pending_conn = WsConnection {
             principal: AuthPrincipal::internal(test_user()),
@@ -2986,7 +2423,6 @@ mod tests {
             session_id: Some("bound-session".into()),
             pending_session_id: Some("handshake-session".into()),
             active_run_id: None,
-            bridge_prepared_run_id: None,
         };
 
         assert!(chat_request_session_id_is_trusted(&trusted_conn, &None));
@@ -3254,574 +2690,6 @@ mod tests {
                 })
             ]
         );
-    }
-
-    #[test]
-    fn bridge_ws_terminal_status_prefers_error_and_incomplete_failure() {
-        assert_eq!(
-            bridge_ws_terminal_status(true, None),
-            BridgeWsTerminalStatus::Completed
-        );
-        assert_eq!(
-            bridge_ws_terminal_status(true, Some("boom".into())),
-            BridgeWsTerminalStatus::Failed(Some("boom".into()))
-        );
-        assert_eq!(
-            bridge_ws_terminal_status(false, None),
-            BridgeWsTerminalStatus::Failed(Some("Bridge stream ended before turn_complete".into()))
-        );
-    }
-
-    #[test]
-    fn bridge_success_preamble_messages_emit_session_info_before_run_started() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: None,
-            pending_session_id: Some("pending-session".into()),
-            active_run_id: None,
-            bridge_prepared_run_id: None,
-        };
-        let explain = bridge_run_started_explain(true);
-
-        let messages = bridge_success_preamble_messages(
-            &mut conn,
-            Some("sess-1"),
-            Some("run-1"),
-            explain.as_ref(),
-        );
-
-        assert_eq!(conn.session_id.as_deref(), Some("sess-1"));
-        assert_eq!(conn.pending_session_id, None);
-        assert_eq!(conn.active_run_id.as_deref(), Some("run-1"));
-        assert_eq!(conn.bridge_prepared_run_id.as_deref(), Some("run-1"));
-        assert_eq!(messages.len(), 2);
-        assert!(matches!(
-            &messages[0],
-            WsServerMessage::SessionInfo {
-                session_id,
-                run_id
-            } if session_id == "sess-1" && run_id.as_deref() == Some("run-1")
-        ));
-        assert!(matches!(
-            &messages[1],
-            WsServerMessage::RunStarted {
-                run_id,
-                session_id,
-                explain
-            } if run_id == "run-1"
-                && session_id == "sess-1"
-                && explain == &Some(serde_json::json!({"mode": "background"}))
-        ));
-    }
-
-    #[test]
-    fn bridge_forward_error_messages_preserve_trusted_run_identity() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: None,
-            pending_session_id: Some("pending-session".into()),
-            active_run_id: None,
-            bridge_prepared_run_id: None,
-        };
-        let trusted_session_id = "sess-1";
-        let trusted_run_id = "run-1";
-        let explain = bridge_run_started_explain(true);
-
-        let messages = bridge_forward_error_messages(
-            &mut conn,
-            Some(trusted_session_id),
-            Some(trusted_run_id),
-            explain.as_ref(),
-            StatusCode::BAD_GATEWAY,
-            "Bridge error: boom".into(),
-        );
-
-        assert_eq!(conn.session_id.as_deref(), Some("sess-1"));
-        assert_eq!(conn.pending_session_id, None);
-        assert_eq!(conn.active_run_id.as_deref(), Some("run-1"));
-        assert_eq!(conn.bridge_prepared_run_id.as_deref(), Some("run-1"));
-        assert_eq!(messages.len(), 4);
-        match &messages[0] {
-            WsServerMessage::SessionInfo { session_id, run_id } => {
-                assert_eq!(session_id, "sess-1");
-                assert_eq!(run_id.as_deref(), Some("run-1"));
-            }
-            other => panic!("expected SessionInfo, got {other:?}"),
-        }
-        match &messages[1] {
-            WsServerMessage::RunStarted {
-                run_id,
-                session_id,
-                explain,
-            } => {
-                assert_eq!(run_id, "run-1");
-                assert_eq!(session_id, "sess-1");
-                assert_eq!(explain, &Some(serde_json::json!({"mode": "background"})));
-            }
-            other => panic!("expected RunStarted, got {other:?}"),
-        }
-        match &messages[2] {
-            WsServerMessage::Error {
-                message,
-                code,
-                retryable,
-            } => {
-                assert_eq!(message, "Bridge error: boom");
-                assert_eq!(code, "INTERNAL_ERROR");
-                assert!(*retryable);
-            }
-            other => panic!("expected Error, got {other:?}"),
-        }
-        match &messages[3] {
-            WsServerMessage::RunFinished {
-                run_id,
-                status,
-                error,
-            } => {
-                assert_eq!(run_id, "run-1");
-                assert_eq!(status, STATUS_FAILED);
-                assert_eq!(error.as_deref(), Some("Bridge error: boom"));
-            }
-            other => panic!("expected RunFinished, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn bridge_forward_error_messages_without_run_id_only_emit_error() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: None,
-            pending_session_id: Some("pending-session".into()),
-            active_run_id: None,
-            bridge_prepared_run_id: None,
-        };
-        let messages = bridge_forward_error_messages(
-            &mut conn,
-            Some("sess-1"),
-            None,
-            None,
-            StatusCode::BAD_GATEWAY,
-            "Bridge error: boom".into(),
-        );
-
-        assert_eq!(conn.session_id.as_deref(), Some("sess-1"));
-        assert_eq!(conn.pending_session_id, None);
-        assert_eq!(conn.active_run_id, None);
-        assert_eq!(conn.bridge_prepared_run_id, None);
-        assert_eq!(messages.len(), 2);
-        match &messages[0] {
-            WsServerMessage::SessionInfo { session_id, run_id } => {
-                assert_eq!(session_id, "sess-1");
-                assert!(run_id.is_none());
-            }
-            other => panic!("expected SessionInfo, got {other:?}"),
-        }
-        assert!(matches!(messages[1], WsServerMessage::Error { .. }));
-    }
-
-    #[test]
-    fn suppress_initial_bridge_session_info_only_once() {
-        let mut suppress = true;
-        let session_info = serde_json::json!({
-            "type": "session_info",
-            "session_id": "sess-1",
-            "run_id": "run-1"
-        });
-        let text_delta = serde_json::json!({
-            "type": "text_delta",
-            "content": "hi"
-        });
-
-        assert!(should_suppress_initial_bridge_session_info(
-            &mut suppress,
-            &session_info,
-        ));
-        assert!(!suppress);
-        assert!(!should_suppress_initial_bridge_session_info(
-            &mut suppress,
-            &session_info,
-        ));
-        assert!(!should_suppress_initial_bridge_session_info(
-            &mut suppress,
-            &text_delta,
-        ));
-    }
-
-    #[test]
-    fn process_bridge_stream_event_suppresses_initial_tail_session_info() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: Some("sess-1".into()),
-            pending_session_id: None,
-            active_run_id: Some("run-1".into()),
-            bridge_prepared_run_id: Some("run-1".into()),
-        };
-        let mut suppress = true;
-        let mut saw_turn_complete = false;
-        let mut terminal_error = None;
-
-        let processed = process_bridge_stream_event(
-            &mut conn,
-            serde_json::json!({
-                "type": "session_info",
-                "session_id": "upstream-sess",
-                "run_id": "run-1"
-            }),
-            None,
-            &mut suppress,
-            &mut saw_turn_complete,
-            &mut terminal_error,
-        );
-
-        assert!(processed.pre_messages.is_empty());
-        assert!(processed.raw_event.is_none());
-        assert!(!suppress);
-        assert!(!saw_turn_complete);
-        assert_eq!(terminal_error, None);
-        assert_eq!(conn.session_id.as_deref(), Some("sess-1"));
-        assert_eq!(conn.active_run_id.as_deref(), Some("run-1"));
-    }
-
-    #[test]
-    fn process_bridge_stream_event_synthesizes_run_started_for_tail_session_info() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: None,
-            pending_session_id: Some("pending-session".into()),
-            active_run_id: None,
-            bridge_prepared_run_id: None,
-        };
-        let mut suppress = false;
-        let mut saw_turn_complete = false;
-        let mut terminal_error = None;
-        let explain = bridge_run_started_explain(true);
-
-        let processed = process_bridge_stream_event(
-            &mut conn,
-            serde_json::json!({
-                "type": "session_info",
-                "session_id": "sess-42",
-                "run_id": "run-9"
-            }),
-            explain.as_ref(),
-            &mut suppress,
-            &mut saw_turn_complete,
-            &mut terminal_error,
-        );
-
-        match processed.pre_messages.as_slice() {
-            [
-                WsServerMessage::RunStarted {
-                    run_id,
-                    session_id,
-                    explain,
-                },
-            ] => {
-                assert_eq!(run_id, "run-9");
-                assert_eq!(session_id, "sess-42");
-                assert_eq!(explain, &Some(serde_json::json!({"mode": "background"})));
-            }
-            other => panic!("expected synthesized RunStarted, got {other:?}"),
-        }
-        assert_eq!(
-            processed.raw_event,
-            Some(serde_json::json!({
-                "type": "session_info",
-                "session_id": "sess-42",
-                "run_id": "run-9"
-            }))
-        );
-        assert!(!saw_turn_complete);
-        assert_eq!(terminal_error, None);
-        assert_eq!(conn.session_id.as_deref(), Some("sess-42"));
-        assert_eq!(conn.active_run_id.as_deref(), Some("run-9"));
-    }
-
-    #[test]
-    fn process_bridge_stream_event_emits_run_started_before_tail_session_info() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: None,
-            pending_session_id: Some("pending-session".into()),
-            active_run_id: None,
-            bridge_prepared_run_id: None,
-        };
-        let mut suppress = false;
-        let mut saw_turn_complete = false;
-        let mut terminal_error = None;
-        let explain = bridge_run_started_explain(true);
-
-        let processed = process_bridge_stream_event(
-            &mut conn,
-            serde_json::json!({
-                "type": "session_info",
-                "session_id": "sess-42",
-                "run_id": "run-9"
-            }),
-            explain.as_ref(),
-            &mut suppress,
-            &mut saw_turn_complete,
-            &mut terminal_error,
-        );
-
-        let mut frames: Vec<serde_json::Value> = processed
-            .pre_messages
-            .iter()
-            .map(|message| serde_json::to_value(message).expect("server message should serialize"))
-            .collect();
-        if let Some(raw_event) = processed.raw_event {
-            frames.push(raw_event);
-        }
-
-        assert_eq!(
-            frames,
-            vec![
-                serde_json::json!({
-                    "type": "run_started",
-                    "run_id": "run-9",
-                    "session_id": "sess-42",
-                    "explain": {"mode": "background"}
-                }),
-                serde_json::json!({
-                    "type": "session_info",
-                    "session_id": "sess-42",
-                    "run_id": "run-9"
-                }),
-            ]
-        );
-        assert!(!saw_turn_complete);
-        assert_eq!(terminal_error, None);
-    }
-
-    #[test]
-    fn process_bridge_stream_event_preserves_turn_complete_assistant_text() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: Some("sess-42".into()),
-            pending_session_id: None,
-            active_run_id: Some("run-9".into()),
-            bridge_prepared_run_id: None,
-        };
-        let mut suppress = false;
-        let mut saw_turn_complete = false;
-        let mut terminal_error = None;
-
-        let processed = process_bridge_stream_event(
-            &mut conn,
-            serde_json::json!({
-                "type": "turn_complete",
-                "assistant_text": "recovered final text",
-                "has_tool_calls": false
-            }),
-            None,
-            &mut suppress,
-            &mut saw_turn_complete,
-            &mut terminal_error,
-        );
-
-        assert!(processed.pre_messages.is_empty());
-        assert_eq!(
-            processed.raw_event,
-            Some(serde_json::json!({
-                "type": "turn_complete",
-                "assistant_text": "recovered final text",
-                "has_tool_calls": false
-            }))
-        );
-        assert!(saw_turn_complete);
-        assert_eq!(terminal_error, None);
-    }
-
-    #[test]
-    fn session_info_stream_event_updates_connection_state() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: None,
-            pending_session_id: Some("pending-session".into()),
-            active_run_id: None,
-            bridge_prepared_run_id: None,
-        };
-
-        let adopted = sync_conn_state_from_stream_event(
-            &mut conn,
-            &serde_json::json!({
-                "type": "session_info",
-                "session_id": "sess-42",
-                "run_id": "run-9"
-            }),
-        );
-
-        assert_eq!(adopted, Some(("run-9".into(), true)));
-        assert_eq!(conn.session_id.as_deref(), Some("sess-42"));
-        assert_eq!(conn.pending_session_id, None);
-        assert_eq!(conn.active_run_id.as_deref(), Some("run-9"));
-    }
-
-    #[test]
-    fn session_info_stream_event_upgrades_prepared_bridge_run_id() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: Some("sess-1".into()),
-            pending_session_id: Some("pending-session".into()),
-            active_run_id: Some("prepared-run".into()),
-            bridge_prepared_run_id: Some("prepared-run".into()),
-        };
-
-        let adopted = sync_conn_state_from_stream_event(
-            &mut conn,
-            &serde_json::json!({
-                "type": "session_info",
-                "session_id": "sess-2",
-                "run_id": "upstream-run"
-            }),
-        );
-
-        assert_eq!(adopted, Some(("upstream-run".into(), true)));
-        assert_eq!(conn.session_id.as_deref(), Some("sess-2"));
-        assert_eq!(conn.pending_session_id, None);
-        assert_eq!(conn.active_run_id.as_deref(), Some("upstream-run"));
-    }
-
-    #[test]
-    fn session_info_stream_event_without_prepared_run_id_synthesizes_run_started() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: None,
-            pending_session_id: Some("pending-session".into()),
-            active_run_id: None,
-            bridge_prepared_run_id: None,
-        };
-
-        let adopted = sync_conn_state_from_stream_event(
-            &mut conn,
-            &serde_json::json!({
-                "type": "session_info",
-                "session_id": "sess-42",
-                "run_id": "run-9"
-            }),
-        );
-        let explain = bridge_run_started_explain(true);
-
-        match synthetic_bridge_run_started(&conn, adopted, explain.as_ref()) {
-            Some(WsServerMessage::RunStarted {
-                run_id,
-                session_id,
-                explain,
-            }) => {
-                assert_eq!(run_id, "run-9");
-                assert_eq!(session_id, "sess-42");
-                assert_eq!(explain, Some(serde_json::json!({"mode": "background"})));
-            }
-            other => panic!("expected synthesized RunStarted, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn session_info_stream_event_does_not_override_real_active_run_id() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: Some("sess-1".into()),
-            pending_session_id: Some("pending-session".into()),
-            active_run_id: Some("real-run".into()),
-            bridge_prepared_run_id: Some("prepared-run".into()),
-        };
-
-        let adopted = sync_conn_state_from_stream_event(
-            &mut conn,
-            &serde_json::json!({
-                "type": "session_info",
-                "session_id": "sess-2",
-                "run_id": "upstream-run"
-            }),
-        );
-
-        assert_eq!(adopted, None);
-        assert_eq!(conn.session_id.as_deref(), Some("sess-2"));
-        assert_eq!(conn.pending_session_id, None);
-        assert_eq!(conn.active_run_id.as_deref(), Some("real-run"));
-    }
-
-    #[test]
-    fn repeated_session_info_without_prepared_run_id_does_not_resynthesize_run_started() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: Some("sess-42".into()),
-            pending_session_id: None,
-            active_run_id: Some("run-9".into()),
-            bridge_prepared_run_id: None,
-        };
-
-        let adopted = sync_conn_state_from_stream_event(
-            &mut conn,
-            &serde_json::json!({
-                "type": "session_info",
-                "session_id": "sess-42",
-                "run_id": "run-9"
-            }),
-        );
-        let explain = bridge_run_started_explain(true);
-
-        assert_eq!(adopted, None);
-        assert!(synthetic_bridge_run_started(&conn, adopted, explain.as_ref()).is_none());
-    }
-
-    #[test]
-    fn run_started_stream_event_upgrades_prepared_bridge_run_id_without_synthetic_start() {
-        let mut conn = WsConnection {
-            principal: AuthPrincipal::internal(test_user()),
-            authorization: "Bearer test-token".into(),
-            forward_headers: std::collections::HashMap::new(),
-            session_id: Some("sess-1".into()),
-            pending_session_id: None,
-            active_run_id: Some("prepared-run".into()),
-            bridge_prepared_run_id: Some("prepared-run".into()),
-        };
-
-        let adopted = sync_conn_state_from_stream_event(
-            &mut conn,
-            &serde_json::json!({
-                "type": "run_started",
-                "run_id": "upstream-run"
-            }),
-        );
-        let explain = bridge_run_started_explain(true);
-
-        assert_eq!(adopted, Some(("upstream-run".into(), false)));
-        assert_eq!(conn.active_run_id.as_deref(), Some("upstream-run"));
-        assert!(synthetic_bridge_run_started(&conn, adopted, explain.as_ref()).is_none());
-    }
-
-    #[test]
-    fn bridge_run_started_explain_matches_lifecycle_shape() {
-        assert_eq!(
-            bridge_run_started_explain(true),
-            Some(serde_json::json!({"mode": "background"}))
-        );
-        assert_eq!(bridge_run_started_explain(false), None);
     }
 
     #[test]

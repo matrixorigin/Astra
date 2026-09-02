@@ -7,7 +7,7 @@
 //! explicitly. We do NOT use substring `.contains()` on rendered text;
 //! we parse and count fields.
 
-#![cfg(feature = "bridge-e2e-hooks")]
+#![cfg(feature = "e2e-hooks")]
 
 use std::sync::Arc;
 

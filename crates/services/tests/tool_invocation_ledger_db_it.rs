@@ -1009,14 +1009,11 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
             .iter()
             .filter(|result| matches!(
                 result,
-                Err(ToolInvocationLedgerStoreError::StateMismatch {
-                    actual: ToolInvocationState::Dispatched,
-                    ..
-                })
+                Err(ToolInvocationLedgerStoreError::ActionAlreadyStarted { .. })
             ))
             .count(),
         1,
-        "the losing worker must observe the authoritative dispatched state: {race_results:?}"
+        "the losing worker must observe the authoritative started-action fact: {race_results:?}"
     );
     let winning_owner = race_results
         .iter()
@@ -1104,10 +1101,7 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
                 dispatch_admission(),
             )
             .await,
-        Err(ToolInvocationLedgerStoreError::StateMismatch {
-            actual: ToolInvocationState::OutcomeUnknown,
-            ..
-        })
+        Err(ToolInvocationLedgerStoreError::ActionAlreadyStarted { .. })
     ));
 
     let dispatched = ledger
@@ -1119,10 +1113,7 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
         ledger
             .claim_dispatch(&first, "worker-other", 90_000, dispatch_admission())
             .await,
-        Err(ToolInvocationLedgerStoreError::StateMismatch {
-            actual: ToolInvocationState::Dispatched,
-            ..
-        })
+        Err(ToolInvocationLedgerStoreError::ActionAlreadyStarted { .. })
     ));
 
     ledger
@@ -1133,7 +1124,7 @@ async fn invocation_identity_conflict_and_state_cas_hold_on_live_matrixone() {
         ledger
             .claim_dispatch(&first, "worker-other", 90_000, dispatch_admission())
             .await,
-        Err(ToolInvocationLedgerStoreError::StateMismatch { .. })
+        Err(ToolInvocationLedgerStoreError::ActionAlreadyStarted { .. })
     ));
     let reconciled = ledger
         .compare_and_complete(

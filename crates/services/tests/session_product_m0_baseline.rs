@@ -514,6 +514,8 @@ fn m0_evidence_cleanup_and_ia_references_cannot_silently_rot() {
 fn m2_removed_conversation_authorities_are_physically_absent() {
     let root = repository_root();
     for relative in [
+        "crates/runtime/src/bridge/mod.rs",
+        "crates/runtime/src/bridge/side_effects.rs",
         "crates/runtime/src/turn/bridge/mod.rs",
         "crates/runtime/src/turn/bridge/inprocess.rs",
         "crates/services/src/session_fork.rs",

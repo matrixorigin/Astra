@@ -1026,15 +1026,12 @@ mod tests {
         let (status, Json(body)) = error_response_coded_with_metadata(
             StatusCode::CONFLICT,
             "mismatch",
-            "bridge_session_turn_mismatch",
+            "session_turn_mismatch",
             serde_json::json!({"expected_session_turn": 2}),
         );
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body.detail, "mismatch");
-        assert_eq!(
-            body.error_code.as_deref(),
-            Some("bridge_session_turn_mismatch")
-        );
+        assert_eq!(body.error_code.as_deref(), Some("session_turn_mismatch"));
         assert_eq!(
             body.metadata
                 .as_ref()

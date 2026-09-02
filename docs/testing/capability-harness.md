@@ -67,7 +67,7 @@ edit:
 ```bash
 ASTRA_TEST_DB_IT=1 \
 cargo test -p astra-runtime --test system_matrix_http_e2e \
-  --features bridge-e2e-hooks --ignored e2e_matrix_cli_bridge_session_views_remain_consistent
+  --features e2e-hooks --ignored e2e_matrix_cli_bridge_session_views_remain_consistent
 ```
 
 Nightly/PR matrix tests remain the authority for auth, persistence, HTTP

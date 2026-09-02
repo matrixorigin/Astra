@@ -65,7 +65,7 @@ select optional tools separately.
 - `ASTRA_JWT_ACCESS_TTL_MINUTES` (default `10080` in code; production should override)
 - `ASTRA_JWT_REFRESH_TTL_DAYS` (default `7`)
 - `ASTRA_TOKEN_ENCRYPTION_KEY` (Fernet key)
-- `ASTRA_BRIDGE_SECRET`
+- `ASTRA_RUNTIME_ROOT_SECRET`
 
 ### Provider Request Auth
 
@@ -158,7 +158,7 @@ Server-loop Memoria observer and post-loop memory cleanup are fixed internal asy
 
 ### Testing
 
-- `ASTRA_TEST_DB_IT`, `ASTRA_TEST_DB_IT_TEST_THREADS`, `ASTRA_TEST_BRIDGE_SECRET`
+- `ASTRA_TEST_DB_IT`, `ASTRA_TEST_DB_IT_TEST_THREADS`, `ASTRA_TEST_E2E_SECRET`
 - `ASTRA_TEST_PROMPT_CACHE_DISABLED`, `ASTRA_TEST_DB_URL`
 - `ASTRA_TEST_SDK_E2E`, `ASTRA_TEST_SDK_ONLINE_E2E`, `ASTRA_TEST_SDK_BASE_URL`
 

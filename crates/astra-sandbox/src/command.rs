@@ -448,7 +448,15 @@ fn workspace_out_write_target(command: &str, workspace_root: Option<&Path>) -> O
         return Some(target);
     }
 
-    let commands = super::bash_ast::parse_plain_bash_commands(command)?;
+    let Some(commands) = super::bash_ast::parse_plain_bash_commands(command) else {
+        if super::bash_ast::contains_command_named(
+            command,
+            &["cp", "mv", "touch", "mkdir", "install", "tee", "rsync"],
+        ) {
+            return Some("dynamic write target".to_string());
+        }
+        return None;
+    };
     for words in commands {
         let Some((executable, arguments)) = effective_mutation_command(&words) else {
             continue;

@@ -346,6 +346,24 @@ fn ws_request(
     request
 }
 
+fn edge_capabilities(edge_agent_id: &str) -> serde_json::Value {
+    let registry = astra_runtime_env::ToolRegistry::builtins();
+    let binding = astra_runtime_env::RunBinding::resolve(
+        astra_runtime_env::WorkspaceBinding::edge_workspace(
+            "/home/test/project",
+            astra_runtime_env::WorkspaceAuthority::ReadWrite,
+        ),
+        astra_runtime_env::ExecutorBinding::edge_agent(edge_agent_id),
+        astra_runtime_env::RuntimeBinding::host_process(format!("edge-host:{edge_agent_id}")),
+        astra_runtime_env::PolicyIntent::local_developer(),
+        &registry,
+    );
+    serde_json::to_value(astra_runtime_env::RuntimeEnvironmentAdvertisement::new(
+        binding,
+    ))
+    .expect("test edge capabilities serialize")
+}
+
 async fn ws_auth(
     addr: std::net::SocketAddr,
     edge_id: &str,
@@ -358,8 +376,10 @@ async fn ws_auth(
     let auth_msg = json!({
         "type": "edge_auth",
         "edge_agent_id": edge_id,
+        "interaction_api_major": astra_server_types::AGENT_INTERACTION_API_MAJOR,
         "hostname": hostname,
-        "workspace_dir": "/home/test/project"
+        "workspace_dir": "/home/test/project",
+        "capabilities": edge_capabilities(edge_id)
     });
     ws.send(Message::Text(auth_msg.to_string().into()))
         .await
@@ -1082,8 +1102,10 @@ async fn edge_auth_result(addr: std::net::SocketAddr, edge_id: &str) -> serde_js
     let auth_msg = json!({
         "type": "edge_auth",
         "edge_agent_id": edge_id,
+        "interaction_api_major": astra_server_types::AGENT_INTERACTION_API_MAJOR,
         "hostname": "host",
-        "workspace_dir": "/home/test/project"
+        "workspace_dir": "/home/test/project",
+        "capabilities": edge_capabilities(edge_id)
     });
     ws.send(Message::Text(auth_msg.to_string().into()))
         .await
@@ -1288,8 +1310,10 @@ async fn edge_ws_close_during_registration_rolls_back_without_pool_commit() {
         json!({
             "type": "edge_auth",
             "edge_agent_id": "edge-registration-close",
+            "interaction_api_major": astra_server_types::AGENT_INTERACTION_API_MAJOR,
             "hostname": "host",
-            "workspace_dir": "/workspace"
+            "workspace_dir": "/workspace",
+            "capabilities": edge_capabilities("edge-registration-close")
         })
         .to_string()
         .into(),
@@ -1362,8 +1386,10 @@ async fn edge_ws_auth_ok_precedes_claim_release_wait() {
         json!({
             "type": "edge_auth",
             "edge_agent_id": "edge-auth-order",
+            "interaction_api_major": astra_server_types::AGENT_INTERACTION_API_MAJOR,
             "hostname": "host",
-            "workspace_dir": "/workspace"
+            "workspace_dir": "/workspace",
+            "capabilities": edge_capabilities("edge-auth-order")
         })
         .to_string()
         .into(),
@@ -1425,8 +1451,10 @@ async fn claim_loss_after_pool_commit_removes_the_unpublished_connection() {
         json!({
             "type": "edge_auth",
             "edge_agent_id": "edge-claim-loss",
+            "interaction_api_major": astra_server_types::AGENT_INTERACTION_API_MAJOR,
             "hostname": "host",
-            "workspace_dir": "/workspace"
+            "workspace_dir": "/workspace",
+            "capabilities": edge_capabilities("edge-claim-loss")
         })
         .to_string()
         .into(),
@@ -1540,8 +1568,10 @@ async fn edge_ws_rejects_connection_when_db_registration_fails() {
         json!({
             "type": "edge_auth",
             "edge_agent_id": "edge-b2",
+            "interaction_api_major": astra_server_types::AGENT_INTERACTION_API_MAJOR,
             "hostname": "host",
-            "workspace_dir": "/workspace"
+            "workspace_dir": "/workspace",
+            "capabilities": edge_capabilities("edge-b2")
         })
         .to_string()
         .into(),

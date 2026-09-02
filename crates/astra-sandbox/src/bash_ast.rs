@@ -77,6 +77,36 @@ pub fn parse_plain_bash_commands(command: &str) -> Option<Vec<Vec<String>>> {
     (!commands.is_empty()).then_some(commands)
 }
 
+/// Return whether the parsed shell contains an actual invocation of one of
+/// `names`. Unlike substring matching, quoted data and comments cannot mint a
+/// command. This is used only to fail closed when dynamic shell syntax makes
+/// literal argv reconstruction impossible.
+pub fn contains_command_named(command: &str, names: &[&str]) -> bool {
+    let Some(tree) = parse_bash(command) else {
+        return false;
+    };
+    let root = tree.root_node();
+    if root.has_error() {
+        return false;
+    }
+    let ctx = RiskCtx::new(command);
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "command" | "simple_command")
+            && command_name(node, &ctx).is_some_and(|name| {
+                names
+                    .iter()
+                    .any(|candidate| name.eq_ignore_ascii_case(candidate))
+            })
+        {
+            return true;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    false
+}
+
 /// A backslash-newline is removed by Bash before tokenization. Tree-sitter can
 /// expose the two source fragments as separate words, which means reconstructing
 /// argv from its nodes would authorize different arguments than Bash executes.

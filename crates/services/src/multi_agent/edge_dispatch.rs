@@ -1628,8 +1628,7 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    static EDGE_DISPATCH_DB: tokio::sync::OnceCell<astra_core::SharedPool> =
-        tokio::sync::OnceCell::const_new();
+    static EDGE_DISPATCH_SCHEMA: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
 
     async fn setup_edge_dispatch_db_it() -> astra_core::SharedPool {
         assert_eq!(
@@ -1637,20 +1636,19 @@ mod tests {
             Ok("1"),
             "set ASTRA_TEST_DB_IT=1 for ignored integration tests"
         );
-        EDGE_DISPATCH_DB
+        let settings = astra_core::MatrixOneSettings::from_env();
+        EDGE_DISPATCH_SCHEMA
             .get_or_init(|| async {
-                let settings = astra_core::MatrixOneSettings::from_env();
                 let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
                     .unwrap_or_else(|_| "mysql".to_string());
                 crate::storage::ensure_core_schema(&settings, &catalog)
                     .await
                     .expect("ensure_core_schema");
-                astra_core::SharedPool::new(&settings)
-                    .await
-                    .expect("SharedPool::new")
             })
+            .await;
+        astra_core::SharedPool::new(&settings)
             .await
-            .clone()
+            .expect("SharedPool::new")
     }
 
     async fn cleanup_edge_dispatch_fixture(

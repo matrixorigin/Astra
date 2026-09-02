@@ -4,8 +4,9 @@ use std::sync::{
 };
 
 use astra_services::{
-    BubbleUpTarget, COMPACTION_INVARIANT_SQL, DatabaseRunStateStore, DatabaseStateProjectionStore,
-    DelegationProjectionUpsert, SkillActivationLlmProbe, StateProjectionError,
+    BubbleUpTarget, COMPACTION_INVARIANT_SQL, DatabasePersonalSkillStore, DatabaseRunStateStore,
+    DatabaseStateProjectionStore, DelegationProjectionUpsert, SkillActivationLlmProbe,
+    StateProjectionError, SubmitUserSkillVersion,
 };
 use serde_json::json;
 use sqlx::Row;
@@ -52,6 +53,27 @@ async fn insert_session(pool: &astra_core::SharedPool, session_id: &str, user_id
     .execute(pool.get())
     .await
     .unwrap();
+}
+
+async fn publish_personal_skill_version(
+    pool: &astra_core::SharedPool,
+    user_id: &str,
+    skill_name: &str,
+) -> String {
+    DatabasePersonalSkillStore::new(pool.clone())
+        .submit_version(
+            user_id,
+            skill_name,
+            SubmitUserSkillVersion {
+                version: format!("1.0.0-{}", Uuid::new_v4()),
+                manifest_json: json!({"name": skill_name}),
+                content_markdown: format!("# {skill_name}\n\nPublished phase-4 fixture."),
+                status: Some("published".into()),
+            },
+        )
+        .await
+        .expect("publish personal skill version fixture")
+        .version_id
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -781,7 +803,7 @@ async fn l2_41_personal_skill_activation_pins_frozen_version_id() {
     let pool = setup_pool().await;
     let (session_id, user_id, _) = ids();
     insert_session(&pool, &session_id, &user_id).await;
-    let version_id = format!("version-{}", Uuid::new_v4());
+    let version_id = publish_personal_skill_version(&pool, &user_id, "review_changes").await;
     DatabaseStateProjectionStore::new(pool.clone())
         .activate_personal_skill_from_ui(&user_id, &session_id, "review_changes", &version_id)
         .await
@@ -814,12 +836,13 @@ async fn l2_42_skill_activation_is_ui_structured_event_not_llm_turn() {
         }
     }
     let probe = CountingLlmProbe::default();
+    let version_id = publish_personal_skill_version(&pool, &user_id, "debugger").await;
     DatabaseStateProjectionStore::new(pool.clone())
         .activate_personal_skill_from_ui_with_probe(
             &user_id,
             &session_id,
             "debugger",
-            "version-fixed",
+            &version_id,
             Some(&probe),
         )
         .await

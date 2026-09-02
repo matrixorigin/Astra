@@ -32,7 +32,7 @@
 //! | Scope | Meaning | Serialised positions |
 //! |---|---|---|
 //! | `Global` | Never changes across sessions (core rules, safety guardrails) | Always at the prefix |
-//! | `Session` | Stable within a session (version, cwd, date, user, branch, model identity) | Middle, before the breakpoint |
+//! | `Session` | Stable within a session (version, cwd, date, user, branch) | Middle, before the breakpoint |
 //! | `None` | Per-turn/non-cacheable runtime facts (memory, retrieval, runtime policy) | After the breakpoint |
 //!
 //! `CacheScope` implements `Ord` such that `Global < Session < None`, guaranteeing stable
@@ -124,9 +124,9 @@ pub(crate) fn model_identity_prompt_text(model_id: &str) -> String {
 }
 
 pub(crate) fn model_identity_prompt_section(model_id: &str) -> prompts::PromptSection {
-    prompts::PromptSection::stable(
+    prompts::PromptSection::dynamic(
         model_identity_prompt_text(model_id),
-        prompts::CacheScope::Session,
+        prompts::PromptTokenBucket::Environment,
     )
 }
 
@@ -450,7 +450,7 @@ pub(crate) fn assemble_ephemeral_pipeline_outcome_with_messages(
     // (user doesn't toggle styles mid-session). Route to stable lane.
     let mut stable = extra_stable_sections.to_vec();
     let mut volatile = extra_volatile_sections.to_vec();
-    stable.push(model_identity_prompt_section(model_id));
+    volatile.push(model_identity_prompt_section(model_id));
     if let Some(style) = astra_text_utils::output_style::current_output_style()
         && !style.prompt.is_empty()
     {
@@ -1721,8 +1721,8 @@ mod tests {
             .unwrap_or_default();
 
         assert!(
-            primary_text.contains("Model: deepseek-v4-pro"),
-            "stable model identity must remain visible without provider routing: {primary_text}"
+            !primary_text.contains("Model: deepseek-v4-pro"),
+            "runtime model identity must stay out of the reusable prefix: {primary_text}"
         );
         assert!(!primary_text.contains("via openai"));
         assert!(
@@ -1740,8 +1740,8 @@ mod tests {
             "pipeline keeps volatile content in the dynamic lane until wire assembly: {dynamic_text}"
         );
         assert!(
-            !dynamic_text.contains("Model:"),
-            "model identity must not be duplicated into the dynamic prompt lane: {dynamic_text}"
+            dynamic_text.contains("Model: deepseek-v4-pro"),
+            "runtime model identity must remain visible in the dynamic lane: {dynamic_text}"
         );
         assert!(
             !dynamic_text.contains("## Tool Availability Protocol"),
@@ -1784,19 +1784,19 @@ mod tests {
             "surface-versioned guidance must be carried in the reusable prefix: {primary_text}"
         );
         assert!(
-            primary_text.contains("Model: claude-sonnet-4-6"),
-            "stable model identity must remain in the cacheable system prompt: {primary_text}"
+            !primary_text.contains("Model: claude-sonnet-4-6"),
+            "runtime model identity must stay outside the cacheable system prompt: {primary_text}"
         );
         assert!(!primary_text.contains("via bedrock"));
         assert!(
-            dynamic.as_ref().is_none_or(|message| {
-                !message
+            dynamic.as_ref().is_some_and(|message| {
+                message
                     .get("content")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
-                    .contains("Model:")
+                    .contains("Model: claude-sonnet-4-6")
             }),
-            "model identity must not be duplicated into dynamic system context"
+            "runtime model identity must remain visible in dynamic system context"
         );
         assert!(
             content.iter().any(|b| b.get("cache_control").is_some()),
@@ -1892,20 +1892,19 @@ mod tests {
             "primary system message must be non-empty"
         );
         assert!(
-            primary_text.contains("Model: gpt-4o"),
-            "stable model identity must remain in the reusable prefix: {primary_text}"
+            !primary_text.contains("Model: gpt-4o"),
+            "runtime model identity must stay out of the reusable prefix: {primary_text}"
         );
         assert!(!primary_text.contains("via openai"));
-        // Dynamic may or may not be present depending on whether any None-scoped
-        // section was emitted. Model identity must remain stable either way.
-        if let Some(d) = dynamic {
-            let dtext = d.get("content").and_then(Value::as_str).unwrap_or_default();
-            assert!(!dtext.is_empty(), "if dynamic present, must be non-empty");
-            assert!(
-                !dtext.contains("Model:"),
-                "model identity must not enter the dynamic prompt lane: {dtext}"
-            );
-        }
+        let dynamic_text = dynamic
+            .as_ref()
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            dynamic_text.contains("Model: gpt-4o"),
+            "runtime model identity must remain visible in the dynamic prompt lane: {dynamic_text}"
+        );
     }
 
     /// The ephemeral's escape-hatch use case: pre-built session anchor + feedback

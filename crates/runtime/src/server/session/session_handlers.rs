@@ -1848,7 +1848,7 @@ pub(crate) async fn session_device_events_handler(
             ));
         }
     };
-    bridge::sse_stream_response(StatusCode::OK, Body::from_stream(stream))
+    crate::server::http_helpers::sse_stream_response(StatusCode::OK, Body::from_stream(stream))
 }
 
 pub(crate) async fn delete_session_handler(

@@ -395,9 +395,43 @@ impl DatabaseSessionService {
                 )
             })?;
 
-        let hard_delete = hard_delete_session(pool, session_id, user_id)
-            .await
-            .map_err(internal_error)?;
+        let hard_delete = match hard_delete_session(pool, session_id, user_id).await {
+            Ok(outcome) => outcome,
+            // The owner check above and the delete transaction are necessarily
+            // separate. A concurrent owner delete may therefore win before
+            // this request marks the session or after both requests have
+            // marked it but before this request locks the delete fence. Both
+            // are missing-resource outcomes, never internal-server errors.
+            Err(error)
+                if error
+                    == "delete_session.mark_deleting: session not found or not owned by user" =>
+            {
+                return Err(error_response(
+                    StatusCode::NOT_FOUND,
+                    format!("Session {session_id} 不存在"),
+                ));
+            }
+            Err(error)
+                if error
+                    == "delete_session.lock_lifecycle_fence: pending delete fence not found" =>
+            {
+                // A missing fence is only the expected concurrent-delete race
+                // when the owning session disappeared with it. Preserve a
+                // genuine lifecycle inconsistency as an internal error.
+                if self
+                    .fetch_session_for_user(pool, session_id, user_id)
+                    .await?
+                    .is_none()
+                {
+                    return Err(error_response(
+                        StatusCode::NOT_FOUND,
+                        format!("Session {session_id} 不存在"),
+                    ));
+                }
+                return Err(internal_error(error));
+            }
+            Err(error) => return Err(internal_error(error)),
+        };
 
         Ok(SessionDeletionOutcome {
             session: existing,

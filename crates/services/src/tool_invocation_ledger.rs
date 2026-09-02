@@ -115,7 +115,7 @@ impl DatabaseToolInvocationLedger {
             if !record.fingerprint.same_tool_and_arguments(fingerprint) {
                 rollback(tx, "prepare identity conflict").await;
                 return Err(ToolInvocationLedgerStoreError::IdentityConflict {
-                    identity: identity.clone(),
+                    identity: Box::new(identity.clone()),
                 });
             }
             tx.commit().await?;
@@ -131,7 +131,7 @@ impl DatabaseToolInvocationLedger {
                     Ok(Some(record)) => {
                         if !record.fingerprint.same_tool_and_arguments(fingerprint) {
                             Err(ToolInvocationLedgerStoreError::IdentityConflict {
-                                identity: identity.clone(),
+                                identity: Box::new(identity.clone()),
                             })
                         } else {
                             Ok(ToolInvocationPrepareOutcome::Existing(record))
@@ -175,7 +175,7 @@ impl DatabaseToolInvocationLedger {
         if !record.fingerprint.same_tool_and_arguments(fingerprint) {
             rollback(tx, "prepare identity conflict").await;
             return Err(ToolInvocationLedgerStoreError::IdentityConflict {
-                identity: identity.clone(),
+                identity: Box::new(identity.clone()),
             });
         }
         tx.commit().await?;
@@ -961,7 +961,7 @@ impl DatabaseToolInvocationLedger {
             Err(reason) => {
                 rollback(tx, "tool dispatch action admission failed").await;
                 return Err(ToolInvocationLedgerStoreError::ActionAdmissionFailed {
-                    identity: identity.clone(),
+                    identity: Box::new(identity.clone()),
                     reason,
                 });
             }
@@ -971,7 +971,7 @@ impl DatabaseToolInvocationLedger {
             crate::runs::TransactionalRunActionAdmission::AlreadyStarted { event_index } => {
                 rollback(tx, "tool dispatch action was already started").await;
                 return Err(ToolInvocationLedgerStoreError::ActionAlreadyStarted {
-                    identity: identity.clone(),
+                    identity: Box::new(identity.clone()),
                     event_index,
                 });
             }
@@ -1040,7 +1040,7 @@ impl DatabaseToolInvocationLedger {
                 .await
                 .map_err(
                     |source| ToolInvocationLedgerStoreError::ActionAdmissionFailed {
-                        identity: identity.clone(),
+                        identity: Box::new(identity.clone()),
                         reason: format!("persist superseded not-dispatched closure: {source}"),
                     },
                 )?
@@ -1054,12 +1054,12 @@ impl DatabaseToolInvocationLedger {
                     rollback(tx, "superseded tool dispatch closure mismatch").await;
                     if is_exact_guidance_rejection(&actual, &outcome, &completion_source) {
                         return Err(ToolInvocationLedgerStoreError::ActionSuperseded {
-                            identity: identity.clone(),
+                            identity: Box::new(identity.clone()),
                             user_intent_event_index,
                         });
                     }
                     return Err(ToolInvocationLedgerStoreError::ActionAdmissionFailed {
-                        identity: identity.clone(),
+                        identity: Box::new(identity.clone()),
                         reason: format!(
                             "superseded closure conflicts with durable invocation state {:?}",
                             actual.state
@@ -1077,17 +1077,17 @@ impl DatabaseToolInvocationLedger {
                             )
                     ) {
                         return Err(ToolInvocationLedgerStoreError::ActionSuperseded {
-                            identity: identity.clone(),
+                            identity: Box::new(identity.clone()),
                             user_intent_event_index,
                         });
                     }
                     return Err(ToolInvocationLedgerStoreError::ActionAdmissionFailed {
-                        identity: identity.clone(),
+                        identity: Box::new(identity.clone()),
                         reason: format!("commit superseded not-dispatched closure: {source}"),
                     });
                 }
                 return Err(ToolInvocationLedgerStoreError::ActionSuperseded {
-                    identity: identity.clone(),
+                    identity: Box::new(identity.clone()),
                     user_intent_event_index,
                 });
             }
@@ -1207,7 +1207,7 @@ impl DatabaseToolInvocationLedger {
         .await
         .map_err(
             |reason| ToolInvocationLedgerStoreError::ActionAdmissionFailed {
-                identity: identity.clone(),
+                identity: Box::new(identity.clone()),
                 reason: format!("recover dispatch commit acknowledgement: {reason}"),
             },
         )?;
@@ -1263,7 +1263,7 @@ impl DatabaseToolInvocationLedger {
                 )
                 .await;
                 return Err(ToolInvocationLedgerStoreError::ActionAdmissionFailed {
-                    identity: identity.clone(),
+                    identity: Box::new(identity.clone()),
                     reason: format!(
                         "dispatch commit acknowledgement was lost and current run authority is {other:?}: {original_commit_error}"
                     ),
@@ -1277,7 +1277,7 @@ impl DatabaseToolInvocationLedger {
         }) else {
             rollback(tx, "dispatch commit acknowledgement recovery mismatch").await;
             return Err(ToolInvocationLedgerStoreError::ActionAdmissionFailed {
-                identity: identity.clone(),
+                identity: Box::new(identity.clone()),
                 reason: format!(
                     "dispatch commit acknowledgement was lost and exact live claim could not be recovered: {original_commit_error}"
                 ),
@@ -1285,7 +1285,7 @@ impl DatabaseToolInvocationLedger {
         };
         tx.commit().await.map_err(|recovery_error| {
             ToolInvocationLedgerStoreError::ActionAdmissionFailed {
-                identity: identity.clone(),
+                identity: Box::new(identity.clone()),
                 reason: format!(
                     "dispatch commit acknowledgement recovery commit failed after {original_commit_error}: {recovery_error}"
                 ),
@@ -1929,7 +1929,9 @@ pub enum ToolInvocationLedgerStoreError {
         source: serde_json::Error,
     },
     #[error("tool invocation identity conflicts with its durable fingerprint: {identity:?}")]
-    IdentityConflict { identity: ToolInvocationIdentity },
+    IdentityConflict {
+        identity: Box<ToolInvocationIdentity>,
+    },
     #[error("tool invocation run {run_id} was not found for user {user_id}")]
     RunNotFound { user_id: String, run_id: String },
     #[error(
@@ -1962,19 +1964,19 @@ pub enum ToolInvocationLedgerStoreError {
         "tool invocation action was superseded by user intent at event {user_intent_event_index}: {identity:?}"
     )]
     ActionSuperseded {
-        identity: ToolInvocationIdentity,
+        identity: Box<ToolInvocationIdentity>,
         user_intent_event_index: i64,
     },
     #[error(
         "tool invocation action already has a durable admission at event {event_index}: {identity:?}"
     )]
     ActionAlreadyStarted {
-        identity: ToolInvocationIdentity,
+        identity: Box<ToolInvocationIdentity>,
         event_index: i64,
     },
     #[error("tool invocation action admission failed for {identity:?}: {reason}")]
     ActionAdmissionFailed {
-        identity: ToolInvocationIdentity,
+        identity: Box<ToolInvocationIdentity>,
         reason: String,
     },
     #[error("tool invocation run {run_id} is not terminal while status is {status}")]

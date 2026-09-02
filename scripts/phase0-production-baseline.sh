@@ -126,7 +126,7 @@ export ASTRA_PHASE0_EDGE_BIN="$phase0_target_dir/debug/astra-edge"
 cargo test \
     -p astra-runtime \
     --test system_matrix_http_e2e \
-    --features bridge-e2e-hooks \
+    --features e2e-hooks \
     e2e_matrix_phase0_external_production_topologies \
     -- \
     --ignored \

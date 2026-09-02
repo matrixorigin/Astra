@@ -47,8 +47,8 @@ pub fn require_system_e2e_env() {
         "set ASTRA_TEST_DB_IT=1 to run this ignored test"
     );
     assert!(
-        std::env::var("ASTRA_TEST_BRIDGE_SECRET").is_ok_and(|secret| !secret.trim().is_empty()),
-        "set ASTRA_TEST_BRIDGE_SECRET explicitly; system E2E never mutates process environment"
+        std::env::var("ASTRA_TEST_E2E_SECRET").is_ok_and(|secret| !secret.trim().is_empty()),
+        "set ASTRA_TEST_E2E_SECRET explicitly; system E2E never mutates process environment"
     );
     let required_stack = astra_core::process_runtime::PROCESS_WORKER_STACK_BYTES;
     let configured_stack = std::env::var("RUST_MIN_STACK")

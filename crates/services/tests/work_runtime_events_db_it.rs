@@ -51,7 +51,6 @@ fn work_run(
         agent_binding_schema_version: None,
         model_offering_id: None,
         resolved_model_name: None,
-        capability_server_refs_json: None,
         runtime_profile: None,
         start_request_fingerprint: None,
         work_binding: Some(DurableWorkRunBinding::new(

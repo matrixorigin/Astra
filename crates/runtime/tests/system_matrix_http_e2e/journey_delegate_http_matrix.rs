@@ -75,7 +75,7 @@ pub async fn run_delegate_http_boundaries() {
     .await;
     assert_eq!(
         st_del,
-        StatusCode::BAD_REQUEST,
+        StatusCode::UNPROCESSABLE_ENTITY,
         "delegate should fail validation: {del_j}"
     );
 

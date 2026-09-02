@@ -3154,6 +3154,8 @@ fn run_shell_output_with_config(
     config: ShellRunConfig,
 ) -> Result<ScopedShellOutput, ShellRunError> {
     let effective_command = effective_shell_command(&config);
+    #[cfg(all(test, target_os = "linux"))]
+    let uses_supervisor_test_helper = config.supervisor_test_helper.is_some();
 
     let mut target_args = Vec::new();
     if config.program == "bash" && astra_tools::shell_ops::should_enable_pipefail(&config.command) {
@@ -3313,6 +3315,21 @@ fn run_shell_output_with_config(
     }
     if let Some(h) = stderr_handle.as_mut() {
         final_drain_stderr(h, &mut stderr_buf, read_timeout, &progress_sink);
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    if uses_supervisor_test_helper {
+        // The libtest re-exec is only a fixture entrypoint for the real
+        // invocation supervisor. Its own prelude is not target-command
+        // stdout and must not change predicate or empty-output semantics.
+        for prelude in [
+            b"\nrunning 1 test\n".as_slice(),
+            b"running 1 test\n".as_slice(),
+        ] {
+            if stdout_buf.starts_with(prelude) {
+                stdout_buf.drain(..prelude.len());
+                break;
+            }
+        }
     }
 
     Ok(ScopedShellOutput {
@@ -7198,7 +7215,8 @@ mod tests {
 
     #[test]
     fn bash_timeout_kills_process() {
-        let executor = test_executor();
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
         let result = executor.bash(&serde_json::json!({"command": "sleep 10", "timeout": 0.2}));
         assert!(result.contains("timed out"), "got: {result}");
     }
@@ -7261,16 +7279,17 @@ mod tests {
     fn bash_timeout_kills_child_process_tree() {
         // Spawn a parent bash that starts a child sleep.
         // After timeout, verify the child is also killed via process group.
-        let executor = test_executor();
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
         // Use a unique marker file to detect if the child survived
-        let marker = format!("/tmp/mo_test_pgid_{}", std::process::id());
-        let cmd = format!("bash -c 'sleep 10 && touch {marker}' & wait");
+        let marker = dir.path().join("child-survived");
+        let cmd = format!("bash -c 'sleep 10 && touch {}' & wait", marker.display());
         let result = executor.bash(&serde_json::json!({"command": cmd, "timeout": 0.3}));
         assert!(result.contains("timed out"), "got: {result}");
         // Give a moment for any surviving child to act
         std::thread::sleep(Duration::from_millis(200));
         assert!(
-            !std::path::Path::new(&marker).exists(),
+            !marker.exists(),
             "child process survived timeout — process group kill failed"
         );
     }
@@ -7281,7 +7300,8 @@ mod tests {
         // We can't easily test the actual timeout value used internally,
         // but we verify the logic by checking that fast commands complete
         // well within their 5s tier without hitting the 30s default.
-        let executor = test_executor();
+        let dir = tempfile::tempdir().unwrap();
+        let executor = test_executor_in(dir.path());
 
         // Tier 1 (5s): instant commands
         let start = std::time::Instant::now();

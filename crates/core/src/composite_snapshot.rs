@@ -783,10 +783,7 @@ impl CompositeSnapshotBuilder {
             "{}-t{}-{}",
             &self.session_id[..8.min(self.session_id.len())],
             self.turn,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0)
+            uuid::Uuid::now_v7()
         );
         let created_at = chrono::Utc::now().to_rfc3339();
         CompositeSnapshot {
@@ -908,6 +905,14 @@ mod tests {
         assert!(!snap.has_memory_snapshot());
         assert!(!snap.has_git_commit());
         assert_eq!(snap.refs.len(), 1);
+    }
+
+    #[test]
+    fn builder_identity_is_unique_for_same_session_turn_and_clock_tick() {
+        let first = CompositeSnapshotBuilder::new("same-session", 7).build();
+        let second = CompositeSnapshotBuilder::new("same-session", 7).build();
+
+        assert_ne!(first.snapshot_id, second.snapshot_id);
     }
 
     #[test]

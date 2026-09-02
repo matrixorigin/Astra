@@ -30,16 +30,17 @@ use axum::body::Bytes;
 use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
 use crate::prompts;
 #[cfg(test)]
 use astra_text_utils::output_style::current_output_style;
-use astra_turn_core::bridge_rate_limit_cooldown::{
+use astra_turn_core::cache_placement::{CacheCapability, VolatilePlacement};
+use astra_turn_core::rate_limit_cooldown::{
     RateLimitAction, is_overload_status, is_rate_limit_status, parse_retry_after_ms,
 };
-use astra_turn_core::cache_placement::{CacheCapability, VolatilePlacement};
 use astra_turn_core::sse_blocks::SseBlankLineUtf8Buf;
 use astra_turn_core::sse_data_lines::{
     json_events_from_sse_event_block, validate_sse_event_block_json,
@@ -1174,14 +1175,14 @@ pub(crate) async fn sleep_ms_or_llm_cancel(
 
 /// Per-chunk idle watchdog (pre-progress): no SSE JSON for this long → treat as stalled.
 /// Production delegates to the canonical timeout in `sse_stream_host`; tests may
-/// override it through unit-test locals or the `bridge-e2e-hooks` integration hook.
+/// override it through unit-test locals or the `e2e-hooks` integration hook.
 pub(crate) fn stream_idle_timeout() -> std::time::Duration {
     #[cfg(test)]
     if let Some(d) = TEST_STREAM_IDLE_TIMEOUT.with(|c| *c.borrow()) {
         return d;
     }
-    #[cfg(feature = "bridge-e2e-hooks")]
-    if let Some(d) = bridge_e2e_stream_idle_timeout_override() {
+    #[cfg(feature = "e2e-hooks")]
+    if let Some(d) = e2e_stream_idle_timeout_override() {
         return d;
     }
     astra_turn_core::sse_stream_host::stream_idle_timeout()
@@ -1190,14 +1191,14 @@ pub(crate) fn stream_idle_timeout() -> std::time::Duration {
 /// Per-chunk idle watchdog (post-progress): once at least one SSE chunk has been
 /// received, allow a longer idle window to accommodate thinking/reasoning pauses.
 /// Production delegates to the canonical timeout in `sse_stream_host`; tests may
-/// override it through unit-test locals or the `bridge-e2e-hooks` integration hook.
+/// override it through unit-test locals or the `e2e-hooks` integration hook.
 pub(crate) fn stream_idle_timeout_after_progress() -> std::time::Duration {
     #[cfg(test)]
     if let Some(d) = TEST_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS.with(|c| *c.borrow()) {
         return d;
     }
-    #[cfg(feature = "bridge-e2e-hooks")]
-    if let Some(d) = bridge_e2e_stream_idle_timeout_after_progress_override() {
+    #[cfg(feature = "e2e-hooks")]
+    if let Some(d) = e2e_stream_idle_timeout_after_progress_override() {
         return d;
     }
     astra_turn_core::sse_stream_host::stream_idle_timeout_after_progress()
@@ -1211,74 +1212,72 @@ pub(crate) fn stream_terminal_drain_timeout(
     ))
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
-static BRIDGE_E2E_STREAM_IDLE_TIMEOUT_MS: std::sync::atomic::AtomicU64 =
+#[cfg(feature = "e2e-hooks")]
+static E2E_STREAM_IDLE_TIMEOUT_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-#[cfg(feature = "bridge-e2e-hooks")]
-static BRIDGE_E2E_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS: std::sync::atomic::AtomicU64 =
+#[cfg(feature = "e2e-hooks")]
+static E2E_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-#[cfg(feature = "bridge-e2e-hooks")]
-pub(crate) struct BridgeE2eStreamIdleTimeoutGuard {
+#[cfg(feature = "e2e-hooks")]
+pub(crate) struct E2eStreamIdleTimeoutGuard {
     prev_pre_ms: u64,
     prev_post_ms: u64,
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
-impl Drop for BridgeE2eStreamIdleTimeoutGuard {
+#[cfg(feature = "e2e-hooks")]
+impl Drop for E2eStreamIdleTimeoutGuard {
     fn drop(&mut self) {
-        restore_bridge_e2e_stream_idle_timeouts_for_test(self.prev_pre_ms, self.prev_post_ms);
+        restore_e2e_stream_idle_timeouts_for_test(self.prev_pre_ms, self.prev_post_ms);
     }
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
+#[cfg(feature = "e2e-hooks")]
 fn duration_override(ms: u64) -> Option<std::time::Duration> {
     (ms > 0).then(|| std::time::Duration::from_millis(ms))
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
-fn bridge_e2e_stream_idle_timeout_override() -> Option<std::time::Duration> {
-    duration_override(BRIDGE_E2E_STREAM_IDLE_TIMEOUT_MS.load(std::sync::atomic::Ordering::SeqCst))
+#[cfg(feature = "e2e-hooks")]
+fn e2e_stream_idle_timeout_override() -> Option<std::time::Duration> {
+    duration_override(E2E_STREAM_IDLE_TIMEOUT_MS.load(std::sync::atomic::Ordering::SeqCst))
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
-fn bridge_e2e_stream_idle_timeout_after_progress_override() -> Option<std::time::Duration> {
+#[cfg(feature = "e2e-hooks")]
+fn e2e_stream_idle_timeout_after_progress_override() -> Option<std::time::Duration> {
     duration_override(
-        BRIDGE_E2E_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS.load(std::sync::atomic::Ordering::SeqCst),
+        E2E_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS.load(std::sync::atomic::Ordering::SeqCst),
     )
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
-pub(crate) fn set_bridge_e2e_stream_idle_timeouts_for_test(
+#[cfg(feature = "e2e-hooks")]
+pub(crate) fn set_e2e_stream_idle_timeouts_for_test(
     pre_ms: u64,
     post_ms: u64,
-) -> BridgeE2eStreamIdleTimeoutGuard {
+) -> E2eStreamIdleTimeoutGuard {
     assert!(pre_ms > 0, "pre-progress idle timeout must be positive");
     assert!(post_ms > 0, "post-progress idle timeout must be positive");
-    let prev_pre_ms =
-        BRIDGE_E2E_STREAM_IDLE_TIMEOUT_MS.swap(pre_ms, std::sync::atomic::Ordering::SeqCst);
-    let prev_post_ms = BRIDGE_E2E_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS
+    let prev_pre_ms = E2E_STREAM_IDLE_TIMEOUT_MS.swap(pre_ms, std::sync::atomic::Ordering::SeqCst);
+    let prev_post_ms = E2E_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS
         .swap(post_ms, std::sync::atomic::Ordering::SeqCst);
-    BridgeE2eStreamIdleTimeoutGuard {
+    E2eStreamIdleTimeoutGuard {
         prev_pre_ms,
         prev_post_ms,
     }
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
-pub(crate) fn restore_bridge_e2e_stream_idle_timeouts_for_test(pre_ms: u64, post_ms: u64) {
-    BRIDGE_E2E_STREAM_IDLE_TIMEOUT_MS.store(pre_ms, std::sync::atomic::Ordering::SeqCst);
-    BRIDGE_E2E_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS
-        .store(post_ms, std::sync::atomic::Ordering::SeqCst);
+#[cfg(feature = "e2e-hooks")]
+pub(crate) fn restore_e2e_stream_idle_timeouts_for_test(pre_ms: u64, post_ms: u64) {
+    E2E_STREAM_IDLE_TIMEOUT_MS.store(pre_ms, std::sync::atomic::Ordering::SeqCst);
+    E2E_STREAM_IDLE_TIMEOUT_AFTER_PROGRESS_MS.store(post_ms, std::sync::atomic::Ordering::SeqCst);
 }
 
-#[cfg(feature = "bridge-e2e-hooks")]
-pub(crate) fn current_bridge_e2e_stream_idle_timeouts_for_test()
+#[cfg(feature = "e2e-hooks")]
+pub(crate) fn current_e2e_stream_idle_timeouts_for_test()
 -> (Option<std::time::Duration>, Option<std::time::Duration>) {
     (
-        bridge_e2e_stream_idle_timeout_override(),
-        bridge_e2e_stream_idle_timeout_after_progress_override(),
+        e2e_stream_idle_timeout_override(),
+        e2e_stream_idle_timeout_after_progress_override(),
     )
 }
 
@@ -1403,18 +1402,18 @@ pub(crate) fn text_has_actionable_content(text: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamYieldState {
     Deliberating {
-        last_semantic_activity_at: Instant,
+        last_semantic_activity_at: TokioInstant,
         semantic_activity_observed: bool,
     },
     Delivering {
-        last_semantic_activity_at: Instant,
+        last_semantic_activity_at: TokioInstant,
         actionable_delivery_observed: bool,
     },
     Terminal,
 }
 
 impl StreamYieldState {
-    pub(crate) fn new(now: Instant) -> Self {
+    pub(crate) fn new(now: TokioInstant) -> Self {
         Self::Deliberating {
             last_semantic_activity_at: now,
             semantic_activity_observed: false,
@@ -1435,7 +1434,7 @@ impl StreamYieldState {
         )
     }
 
-    pub(crate) fn deadline(self, timeout: std::time::Duration) -> Option<Instant> {
+    pub(crate) fn deadline(self, timeout: std::time::Duration) -> Option<TokioInstant> {
         match self {
             Self::Deliberating {
                 last_semantic_activity_at,
@@ -1449,12 +1448,12 @@ impl StreamYieldState {
         }
     }
 
-    pub(crate) fn timed_out(self, now: Instant, timeout: std::time::Duration) -> bool {
+    pub(crate) fn timed_out(self, now: TokioInstant, timeout: std::time::Duration) -> bool {
         self.deadline(timeout)
             .is_some_and(|deadline| now >= deadline)
     }
 
-    pub(crate) fn observe_text(&mut self, text: &str, now: Instant) {
+    pub(crate) fn observe_text(&mut self, text: &str, now: TokioInstant) {
         if text_has_actionable_content(text) && !self.is_terminal() {
             *self = Self::Delivering {
                 last_semantic_activity_at: now,
@@ -1465,7 +1464,7 @@ impl StreamYieldState {
 
     /// Reasoning is liveness evidence, not an externally actionable yield.
     /// Empty/whitespace chunks intentionally do not refresh the watchdog.
-    pub(crate) fn observe_reasoning_activity(&mut self, reasoning: &str, now: Instant) {
+    pub(crate) fn observe_reasoning_activity(&mut self, reasoning: &str, now: TokioInstant) {
         if !text_has_actionable_content(reasoning) || self.is_terminal() {
             return;
         }
@@ -1490,7 +1489,7 @@ impl StreamYieldState {
         name: &str,
         authorized_tool_names: Option<&HashSet<String>>,
         fragment_advanced: bool,
-        now: Instant,
+        now: TokioInstant,
     ) {
         let Some(name) = canonical_valid_tool_name(name) else {
             return;
@@ -2579,8 +2578,7 @@ fn bedrock_messages_contain_tool_blocks(messages: &[Value]) -> bool {
 /// `reasoningContent.text` block but no `signature`. Incremented by
 /// [`assert_bedrock_thinking_signature_contract`] whenever the invariant is
 /// violated. Exposed as a `pub static` so health/metric handlers can surface
-/// it without plumbing a handle through every call site — matches the
-/// convention used by `PERSIST_FAIL_COUNT` / `PERSIST_OK_COUNT`.
+/// it without plumbing a handle through every call site.
 ///
 /// Any non-zero value in production means at least one turn will 400 at
 /// Bedrock; on-call should page and check `astra_core::agent_warn!` logs
@@ -3195,7 +3193,7 @@ fn strip_internal_runtime_markers(messages: &mut [Value]) {
         if let Some(object) = message.as_object_mut() {
             object.remove(astra_turn_types::RUNTIME_MESSAGE_PROVENANCE_FIELD);
             object.remove(astra_turn_types::USER_TURN_SEMANTICS_FIELD);
-            object.remove(astra_turn_types::BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD);
+            object.remove(astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD);
             object.remove("_compact_boundary");
             // These fields are compaction/checkpoint bookkeeping. They are
             // useful in runtime history, but are not part of the provider
@@ -5135,7 +5133,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
     let mut finish_reason: Option<String> = None;
     let mut accumulated_bytes: usize = 0;
     let mut made_progress = false;
-    let mut yield_state = StreamYieldState::new(Instant::now());
+    let mut yield_state = StreamYieldState::new(TokioInstant::now());
     let mut hidden_reasoning_state = HiddenReasoningStreamState::default();
     let partial_result = |response_id: &Option<String>,
                           full_text: &String,
@@ -5195,7 +5193,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                 ),
             });
         }
-        if yield_state.timed_out(Instant::now(), semantic_progress_timeout) {
+        if yield_state.timed_out(TokioInstant::now(), semantic_progress_timeout) {
             return Err(StreamCollectError::SemanticProgressTimeout {
                 elapsed_ms: semantic_progress_timeout.as_millis() as u64,
                 made_semantic_progress: yield_state.has_actionable_yield(),
@@ -5217,7 +5215,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
         };
         let yield_deadline = yield_state
             .deadline(semantic_progress_timeout)
-            .unwrap_or(provider_work_deadline);
+            .unwrap_or_else(|| TokioInstant::from_std(provider_work_deadline));
         let item = tokio::select! {
             biased;
             _ = wait_llm_cancel(cancel) => {
@@ -5250,9 +5248,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                     ),
                 });
             },
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
-                yield_deadline
-            )), if !yield_state.is_terminal() => {
+            _ = tokio::time::sleep_until(yield_deadline), if !yield_state.is_terminal() => {
                 return Err(StreamCollectError::SemanticProgressTimeout {
                     elapsed_ms: semantic_progress_timeout.as_millis() as u64,
                     made_semantic_progress: yield_state.has_actionable_yield(),
@@ -5386,13 +5382,13 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                 }
                 if is_reasoning {
                     reasoning.push_str(&chunk);
-                    yield_state.observe_reasoning_activity(&chunk, Instant::now());
+                    yield_state.observe_reasoning_activity(&chunk, TokioInstant::now());
                     if let Some(callback) = stream_callback.as_deref_mut() {
                         callback(LlmStreamUpdate::Reasoning(chunk));
                     }
                 } else {
                     full_text.push_str(&chunk);
-                    yield_state.observe_text(&chunk, Instant::now());
+                    yield_state.observe_text(&chunk, TokioInstant::now());
                     if let Some(callback) = stream_callback.as_deref_mut() {
                         callback(LlmStreamUpdate::Text(chunk));
                     }
@@ -5422,7 +5418,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                 });
             }
             reasoning.push_str(r);
-            yield_state.observe_reasoning_activity(r, Instant::now());
+            yield_state.observe_reasoning_activity(r, TokioInstant::now());
             if let Some(callback) = stream_callback.as_deref_mut() {
                 callback(LlmStreamUpdate::Reasoning(r.to_string()));
             }
@@ -5517,7 +5513,7 @@ async fn collect_llm_stream_with_semantic_progress_deadline_and_surface(
                         name,
                         authorized_tool_names,
                         fragment_advanced,
-                        Instant::now(),
+                        TokioInstant::now(),
                     );
                 }
                 if let Some(callback) = stream_callback.as_deref_mut() {
@@ -5717,7 +5713,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
     let mut finish_reason: Option<String> = None;
     let mut accumulated_bytes: usize = 0;
     let mut made_progress = false;
-    let mut yield_state = StreamYieldState::new(Instant::now());
+    let mut yield_state = StreamYieldState::new(TokioInstant::now());
     let partial_result = |response_id: &Option<String>,
                           full_text: &String,
                           reasoning: &String,
@@ -5779,7 +5775,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                 ),
             });
         }
-        if yield_state.timed_out(Instant::now(), semantic_progress_timeout) {
+        if yield_state.timed_out(TokioInstant::now(), semantic_progress_timeout) {
             return Err(StreamCollectError::SemanticProgressTimeout {
                 elapsed_ms: semantic_progress_timeout.as_millis() as u64,
                 made_semantic_progress: yield_state.has_actionable_yield(),
@@ -5802,7 +5798,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
         };
         let yield_deadline = yield_state
             .deadline(semantic_progress_timeout)
-            .unwrap_or(provider_work_deadline);
+            .unwrap_or_else(|| TokioInstant::from_std(provider_work_deadline));
         let item = tokio::select! {
             biased;
             _ = wait_llm_cancel(cancel) => {
@@ -5837,9 +5833,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                     ),
                 });
             },
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
-                yield_deadline
-            )), if !yield_state.is_terminal() => {
+            _ = tokio::time::sleep_until(yield_deadline), if !yield_state.is_terminal() => {
                 return Err(StreamCollectError::SemanticProgressTimeout {
                     elapsed_ms: semantic_progress_timeout.as_millis() as u64,
                     made_semantic_progress: yield_state.has_actionable_yield(),
@@ -5969,7 +5963,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                         name,
                         authorized_tool_names,
                         initial_arguments_advanced,
-                        Instant::now(),
+                        TokioInstant::now(),
                     );
                     if let Some(callback) = stream_callback.as_deref_mut()
                         && let Some(tool_call) = tool_calls_map.get(&index)
@@ -6007,7 +6001,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                                 });
                             }
                             full_text.push_str(text);
-                            yield_state.observe_text(text, Instant::now());
+                            yield_state.observe_text(text, TokioInstant::now());
                             if let Some(callback) = stream_callback.as_deref_mut() {
                                 callback(LlmStreamUpdate::Text(text.to_string()));
                             }
@@ -6034,7 +6028,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                                 });
                             }
                             reasoning.push_str(text);
-                            yield_state.observe_reasoning_activity(text, Instant::now());
+                            yield_state.observe_reasoning_activity(text, TokioInstant::now());
                             if let Some(callback) = stream_callback.as_deref_mut() {
                                 callback(LlmStreamUpdate::Reasoning(text.to_string()));
                             }
@@ -6103,7 +6097,7 @@ async fn collect_anthropic_llm_stream_with_semantic_progress_deadline_and_surfac
                                 name,
                                 authorized_tool_names,
                                 !args.is_empty(),
-                                Instant::now(),
+                                TokioInstant::now(),
                             );
                         }
                         if let Some(callback) = stream_callback.as_deref_mut()
@@ -6921,10 +6915,10 @@ mod tests {
         Guard
     }
 
-    #[cfg(feature = "bridge-e2e-hooks")]
+    #[cfg(feature = "e2e-hooks")]
     #[test]
-    fn bridge_e2e_stream_idle_timeout_override_is_visible_to_runtime_paths() {
-        let _guard = set_bridge_e2e_stream_idle_timeouts_for_test(123, 456);
+    fn e2e_stream_idle_timeout_override_is_visible_to_runtime_paths() {
+        let _guard = set_e2e_stream_idle_timeouts_for_test(123, 456);
         assert_eq!(stream_idle_timeout(), std::time::Duration::from_millis(123));
         assert_eq!(
             stream_idle_timeout_after_progress(),
@@ -8317,7 +8311,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn continuous_anthropic_reasoning_refreshes_liveness_until_delivery() {
         let source = Box::pin(async_stream::stream! {
             for _ in 0..4 {
@@ -8355,7 +8349,7 @@ mod tests {
         assert_eq!(result.reasoning, "thinkingthinkingthinkingthinking");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn continuous_reasoning_refreshes_liveness_without_becoming_delivery() {
         let source = Box::pin(async_stream::stream! {
             for _ in 0..4 {
@@ -8606,7 +8600,7 @@ mod tests {
 
     #[test]
     fn stream_yield_state_has_deliberating_delivering_and_terminal_deadlines() {
-        let start = Instant::now();
+        let start = TokioInstant::now();
         let timeout = std::time::Duration::from_millis(20);
         let authorized = HashSet::from(["bash".to_string()]);
         let mut state = StreamYieldState::new(start);
@@ -12496,7 +12490,7 @@ mod tests {
             "schema_version": 1,
             "objective_relation": "continue"
         });
-        runtime[astra_turn_types::BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD] = json!({
+        runtime[astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD] = json!({
             "schema_version": 1,
             "turn_chain_id": "chain-current"
         });
@@ -12520,7 +12514,7 @@ mod tests {
         );
         assert!(
             out[0]
-                .get(astra_turn_types::BRIDGE_TURN_MESSAGE_PROVENANCE_FIELD)
+                .get(astra_turn_types::TURN_MESSAGE_PROVENANCE_FIELD)
                 .is_none()
         );
         assert!(out[0].get("_compact_boundary").is_none());

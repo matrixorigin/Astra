@@ -227,15 +227,17 @@ fn validate_tool_result_request(
         return Err("tool result status is invalid");
     }
     let expected_hash = astra_thin_client::ToolResultRequest::compute_result_hash(
-        &body.session_id,
-        &body.run_id,
-        &body.turn_chain_id,
-        &body.request_id,
-        &body.edge_agent_id,
-        &body.status,
-        &body.output,
-        body.duration_ms,
-        body.tool_result_fields.as_ref(),
+        astra_thin_client::ToolResultHashParts {
+            session_id: &body.session_id,
+            run_id: &body.run_id,
+            turn_chain_id: &body.turn_chain_id,
+            request_id: &body.request_id,
+            edge_agent_id: &body.edge_agent_id,
+            status: &body.status,
+            output: &body.output,
+            duration_ms: body.duration_ms,
+            tool_result_fields: body.tool_result_fields.as_ref(),
+        },
     );
     if body.result_hash != expected_hash {
         return Err("tool result result_hash does not match payload");
@@ -316,15 +318,17 @@ pub(crate) async fn post_tool_result_handler(
         }
     }
     safe_body.result_hash = astra_thin_client::ToolResultRequest::compute_result_hash(
-        &safe_body.session_id,
-        &safe_body.run_id,
-        &safe_body.turn_chain_id,
-        &safe_body.request_id,
-        &safe_body.edge_agent_id,
-        &safe_body.status,
-        &safe_body.output,
-        safe_body.duration_ms,
-        safe_body.tool_result_fields.as_ref(),
+        astra_thin_client::ToolResultHashParts {
+            session_id: &safe_body.session_id,
+            run_id: &safe_body.run_id,
+            turn_chain_id: &safe_body.turn_chain_id,
+            request_id: &safe_body.request_id,
+            edge_agent_id: &safe_body.edge_agent_id,
+            status: &safe_body.status,
+            output: &safe_body.output,
+            duration_ms: safe_body.duration_ms,
+            tool_result_fields: safe_body.tool_result_fields.as_ref(),
+        },
     );
     let identity = astra_services::multi_agent::EdgeDispatchIdentity::new(
         &user.user_id,
@@ -4082,15 +4086,17 @@ mod edge_callback_insert_tests {
         );
         body.status = "AWS_SECRET_KEY=abcdefghijklmnopqrstuvwxyz0123456789".to_string();
         body.result_hash = astra_thin_client::ToolResultRequest::compute_result_hash(
-            &body.session_id,
-            &body.run_id,
-            &body.turn_chain_id,
-            &body.request_id,
-            &body.edge_agent_id,
-            &body.status,
-            &body.output,
-            body.duration_ms,
-            body.tool_result_fields.as_ref(),
+            astra_thin_client::ToolResultHashParts {
+                session_id: &body.session_id,
+                run_id: &body.run_id,
+                turn_chain_id: &body.turn_chain_id,
+                request_id: &body.request_id,
+                edge_agent_id: &body.edge_agent_id,
+                status: &body.status,
+                output: &body.output,
+                duration_ms: body.duration_ms,
+                tool_result_fields: body.tool_result_fields.as_ref(),
+            },
         );
         assert_eq!(
             super::validate_tool_result_request(&body),

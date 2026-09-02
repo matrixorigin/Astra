@@ -246,6 +246,22 @@ fn turn_phase_receipt_from_server_event(event: &Value) -> Option<Value> {
     {
         return None;
     }
+    const ALLOWED_KEYS: [&str; 7] = [
+        "type",
+        "schema_version",
+        "phase",
+        "round_index",
+        "attempt_index",
+        "outcome",
+        "duration_ms",
+    ];
+    if event
+        .as_object()?
+        .keys()
+        .any(|key| !ALLOWED_KEYS.contains(&key.as_str()))
+    {
+        return None;
+    }
     let mut payload = serde_json::Map::from_iter([
         (
             "schema_version".to_string(),
@@ -4707,7 +4723,14 @@ impl SseStreamHost for CliSseStreamHost<'_> {
             } else {
                 let _pending_tool_request_guard =
                     crate::cli::edge_lifecycle::PendingToolRequestGuard::acquire();
+                let invocation_identity = self.tool_result_identity(request_id);
                 let invocation = astra_tools::tool_engine::ToolInvocationMetadata {
+                    run_id: invocation_identity
+                        .as_ref()
+                        .map(|identity| identity.run_id.as_str()),
+                    turn_chain_id: invocation_identity
+                        .as_ref()
+                        .map(|identity| identity.turn_chain_id.as_str()),
                     tool_call_id: Some(request_id),
                     ..Default::default()
                 };
@@ -5522,6 +5545,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     let tool = req.tool.clone();
                     let args = req.args.clone();
                     let request_id = req.request_id.clone();
+                    let run_id = req.run_id.clone();
+                    let turn_chain_id = req.turn_chain_id.clone();
                     let now_unix_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -5627,6 +5652,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                             );
                         };
                         let invocation = astra_tools::tool_engine::ToolInvocationMetadata {
+                            run_id: Some(&run_id),
+                            turn_chain_id: Some(&turn_chain_id),
                             tool_call_id: Some(&request_id),
                             ..Default::default()
                         };
@@ -5872,6 +5899,8 @@ impl SseStreamHost for CliSseStreamHost<'_> {
                     tool.clone(),
                     args,
                     astra_tools::tool_engine::ToolInvocationMetadata {
+                        run_id: Some(&req.run_id),
+                        turn_chain_id: Some(&req.turn_chain_id),
                         tool_call_id: Some(&req.request_id),
                         ..Default::default()
                     },
@@ -8830,12 +8859,22 @@ mod tests {
             "schema_version": 1,
             "phase": "turn_intent_admission",
             "round_index": 0,
+            "attempt_index": 0,
             "outcome": "decided",
             "duration_ms": 5_021,
             "internal_model": "must not cross the Explain boundary",
         });
+        assert!(turn_phase_receipt_from_server_event(&event).is_none());
         assert_eq!(
-            turn_phase_receipt_from_server_event(&event),
+            turn_phase_receipt_from_server_event(&serde_json::json!({
+                "type": astra_server_types::TURN_PHASE_EVENT_TYPE,
+                "schema_version": 1,
+                "phase": "turn_intent_admission",
+                "round_index": 0,
+                "attempt_index": 0,
+                "outcome": "decided",
+                "duration_ms": 5_021,
+            })),
             Some(serde_json::json!({
                 "type": astra_server_types::TURN_PHASE_EVENT_TYPE,
                 "schema_version": 1,
@@ -8852,6 +8891,7 @@ mod tests {
                 "schema_version": 1,
                 "phase": "unknown",
                 "round_index": 0,
+                "attempt_index": 0,
                 "outcome": "decided",
                 "duration_ms": 1,
             }))
@@ -8863,6 +8903,7 @@ mod tests {
                 "schema_version": 1,
                 "phase": "model_inference",
                 "round_index": 0,
+                "attempt_index": 0,
                 "outcome": "decided",
                 "duration_ms": 1,
             }))
@@ -12119,6 +12160,19 @@ mod tests {
             false,
         );
         host.last_bound_run_id = Some("run-1".to_string());
+        for request_id in [
+            "write-1", "write-2", "write-3", "write-4", "write-5", "write-6", "write-7", "write-8",
+        ] {
+            host.tool_result_identities.insert(
+                request_id.to_string(),
+                ToolResultIdentity {
+                    session_id: "session-1".to_string(),
+                    run_id: "run-1".to_string(),
+                    turn_chain_id: "turn-1".to_string(),
+                    request_id: request_id.to_string(),
+                },
+            );
+        }
 
         let round_one = provider_round_feedback_event("session-1", "run-1", 1, Some("request-1"));
         host.on_accepted_sse_event(&round_one)
@@ -12134,8 +12188,8 @@ mod tests {
         let first = host.execute_tool("write-1", "write_file", &args).await;
         let second = host.execute_tool("write-2", "write_file", &args).await;
         let third = host.execute_tool("write-3", "write_file", &args).await;
-        assert_eq!(first.status, "completed");
-        assert_eq!(second.status, "completed");
+        assert_eq!(first.status, "completed", "{}", first.output);
+        assert_eq!(second.status, "completed", "{}", second.output);
         assert_eq!(third.status, "failed");
         assert!(third.output.contains("Duplicate call skipped"));
 

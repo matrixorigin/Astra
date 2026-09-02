@@ -615,7 +615,7 @@ pub enum FallbackOutcome<T> {
 /// available one via the caller-supplied async `resolve` closure.
 ///
 /// This is the shared logic behind both `server_loop_host` and
-/// `bridge_inprocess` fallback handling — extracted to eliminate duplication.
+/// `server_loop` fallback handling — extracted to eliminate duplication.
 pub async fn try_resolve_fallback<T, F, Fut>(
     cooldown: &PerModelCooldown,
     chain: &[String],

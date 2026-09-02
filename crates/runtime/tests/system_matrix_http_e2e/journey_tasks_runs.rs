@@ -58,7 +58,6 @@ async fn seed_orphan_cancel_race_run(
             agent_binding_schema_version: None,
             model_offering_id: None,
             resolved_model_name: None,
-            capability_server_refs_json: None,
             runtime_profile: None,
             start_request_fingerprint: None,
             work_binding: Some(DurableWorkRunBinding::new(
@@ -532,7 +531,6 @@ pub async fn run_paused_accounting_generation_fence_http() {
             agent_binding_schema_version: None,
             model_offering_id: None,
             resolved_model_name: None,
-            capability_server_refs_json: None,
             runtime_profile: None,
             start_request_fingerprint: None,
             work_binding: None,

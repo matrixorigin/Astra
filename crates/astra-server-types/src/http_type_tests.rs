@@ -164,14 +164,8 @@ fn chat_request_all_fields() {
         "context": {"key": "value"},
         "stable_runtime_system_prompt": "Extension instructions take precedence on semantic overlap.",
         "agent_bindings": [
-            {
-                "id": "binding-foundation",
-                "capability_server_refs": {"mcp": "tools", "skills": "skills"}
-            },
-            {
-                "id": "binding-extension",
-                "capability_server_refs": {"mcp": "tools", "skills": "skills"}
-            }
+            {"id": "binding-foundation"},
+            {"id": "binding-extension"}
         ],
         "execution_budget": {"initial_turns": 10, "hard_turn_limit": 18},
         "execution_policy": {
@@ -212,11 +206,6 @@ fn chat_request_all_fields() {
     );
     assert_eq!(req.agent_bindings.len(), 2);
     assert_eq!(req.agent_bindings[0].id, "binding-foundation");
-    assert_eq!(req.agent_bindings[0].capability_server_refs.mcp, "tools");
-    assert_eq!(
-        req.agent_bindings[0].capability_server_refs.skills,
-        "skills"
-    );
     assert_eq!(req.agent_bindings[1].id, "binding-extension");
     assert_eq!(
         req.execution_budget,
@@ -300,27 +289,20 @@ fn chat_request_rejects_runtime_auth_credentials_map() {
 }
 
 #[test]
-fn chat_request_agent_binding_capability_refs_are_strict() {
+fn chat_request_rejects_removed_agent_binding_capability_refs() {
     let result = serde_json::from_str::<ChatRequest>(
         r#"{"message":"hello","model_selection":{"offering_id":"offer-gpt-4"},"agent_binding":{"id":"ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391","capability_server_refs":{"mcp":"tools","skills":"skills","models":"models"}}}"#,
     );
     assert!(
         result.is_err(),
-        "agent_binding.capability_server_refs must reject undeclared server kinds"
+        "agent_binding.capability_server_refs must be rejected"
     );
     let err = result.err().unwrap();
     assert!(
-        err.to_string().contains("unknown field `models`"),
+        err.to_string()
+            .contains("unknown field `capability_server_refs`"),
         "unexpected error: {err}"
     );
-
-    let request = serde_json::from_str::<ChatRequest>(
-        r#"{"message":"hello","model_selection":{"offering_id":"offer-gpt-4"},"agent_binding":{"id":"ab_018f05f5-c7dd-7f43-83e6-93d56d9d7391","capability_server_refs":{"mcp":"tools","skills":"skills"}}}"#,
-    )
-    .expect("logical MCP and skill server refs are the canonical runtime binding shape");
-    let binding = request.agent_binding.expect("agent binding");
-    assert_eq!(binding.capability_server_refs.mcp, "tools");
-    assert_eq!(binding.capability_server_refs.skills, "skills");
 }
 
 #[test]
@@ -595,8 +577,6 @@ fn health_response_serializes() {
         status: "ok".into(),
         database: "connected".into(),
         memoria: "connected".into(),
-        persist_ok: 42,
-        persist_fail: 1,
         interaction_api_major: AGENT_INTERACTION_API_MAJOR.to_string(),
         build_git_sha: "a".repeat(40),
     };
@@ -604,8 +584,8 @@ fn health_response_serializes() {
     assert_eq!(v["status"], "ok");
     assert_eq!(v["database"], "connected");
     assert_eq!(v["memoria"], "connected");
-    assert_eq!(v["persist_ok"], 42);
-    assert_eq!(v["persist_fail"], 1);
+    assert!(v.get("persist_ok").is_none());
+    assert!(v.get("persist_fail").is_none());
     assert_eq!(v["interaction_api_major"], AGENT_INTERACTION_API_MAJOR);
 }
 

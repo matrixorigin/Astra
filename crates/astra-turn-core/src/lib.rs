@@ -106,8 +106,11 @@ pub mod turn_metrics;
 pub mod working_memory;
 pub mod xml_tool_call_fallback;
 
-pub mod bridge;
+pub mod circuit_breaker;
 pub mod contracts;
+pub mod e2e_hooks;
+pub mod rate_limit_cooldown;
+pub mod sse_events;
 pub mod stream_events;
 pub mod turn_guard;
 pub mod ws_approval_gate;
@@ -233,12 +236,6 @@ pub use sse::blocks as sse_blocks;
 pub use sse::data_lines as sse_data_lines;
 pub use sse::edge_stderr_lines as sse_edge_stderr_lines;
 pub use sse::stream_host as sse_stream_host;
-
-// Re-exports: bridge_* → bridge::*
-pub use bridge::circuit_breaker as bridge_circuit_breaker;
-pub use bridge::e2e_hooks as bridge_e2e_hooks;
-pub use bridge::rate_limit_cooldown as bridge_rate_limit_cooldown;
-pub use bridge::sse_events as bridge_sse_events;
 
 // Re-exports: stop_hooks_* → stop_hooks::*
 pub use stop_hooks::stop_hooks_yaml;

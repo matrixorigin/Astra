@@ -100,12 +100,8 @@ async fn wait_for_full_capture_events(user_id: &str, session_id: &str) -> Vec<Va
 }
 
 pub async fn run_stream_session_metadata_enables_full_llm_exchange_journaling() {
-    let Some(test_secret) = std::env::var("ASTRA_TEST_BRIDGE_SECRET").ok() else {
-        // Bridge journal test requires ASTRA_TEST_BRIDGE_SECRET == ASTRA_BRIDGE_SECRET.
-        // Without it the bridge auth fails and no journal is written.
-        panic!(
-            "ASTRA_TEST_BRIDGE_SECRET not set — set it to the same value as ASTRA_BRIDGE_SECRET to run this test"
-        );
+    let Some(test_secret) = std::env::var("ASTRA_TEST_E2E_SECRET").ok() else {
+        panic!("ASTRA_TEST_E2E_SECRET not set — deterministic inference is fail-closed");
     };
     let temp = tempdir().expect("tempdir");
     let _guard = ProcessJournalDirGuard::new(temp.path());
@@ -138,7 +134,7 @@ pub async fn run_stream_session_metadata_enables_full_llm_exchange_journaling() 
         "context": {
             "test_llm_stream_blocks": [
                 "data: {\"type\":\"text_delta\",\"content\":\"Matrix capture verified.\"}\n\n",
-                "data: {\"type\":\"_inprocess_summary\",\"full_text\":\"Matrix capture verified.\",\"reasoning\":\"\",\"tool_calls\":[],\"usage\":{\"prompt\":10,\"completion\":4,\"total\":14},\"model_used\":\"bridge-e2e-mock\"}\n\n"
+                "data: {\"type\":\"_inprocess_summary\",\"full_text\":\"Matrix capture verified.\",\"reasoning\":\"\",\"tool_calls\":[],\"usage\":{\"prompt\":10,\"completion\":4,\"total\":14},\"model_used\":\"server-e2e-mock\"}\n\n"
             ]
         }
     });
@@ -147,7 +143,7 @@ pub async fn run_stream_session_metadata_enables_full_llm_exchange_journaling() 
         .uri("/chat/stream")
         .header("authorization", auth)
         .header("content-type", "application/json")
-        .header("x-mo-bridge-test-secret", &test_secret)
+        .header("x-astra-e2e-test-secret", &test_secret)
         .body(Body::from(payload.to_string()))
         .expect("stream request");
     let (status, body) = collect_full_sse_stream(app, req, 30).await;

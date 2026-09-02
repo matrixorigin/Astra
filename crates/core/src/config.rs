@@ -338,8 +338,8 @@ pub struct AuthConfig {
     pub access_ttl_minutes: Option<u64>,
     /// Refresh token TTL in days.
     pub refresh_ttl_days: Option<u64>,
-    /// Bridge HMAC secret (required in production).
-    pub bridge_secret: Option<String>,
+    /// Root secret for purpose-separated runtime signatures (required in production).
+    pub runtime_root_secret: Option<String>,
     /// Fernet key for encrypting LLM API keys.
     pub token_encryption_key: Option<String>,
     /// Local authentication rules for provider-originated API calls.
@@ -443,8 +443,8 @@ impl fmt::Debug for AuthConfig {
             .field("access_ttl_minutes", &self.access_ttl_minutes)
             .field("refresh_ttl_days", &self.refresh_ttl_days)
             .field(
-                "bridge_secret",
-                &self.bridge_secret.as_ref().map(|_| "[REDACTED]"),
+                "runtime_root_secret",
+                &self.runtime_root_secret.as_ref().map(|_| "[REDACTED]"),
             )
             .field(
                 "token_encryption_key",
@@ -464,7 +464,7 @@ impl AuthConfig {
             other,
             jwt_secret,
             jwt_algorithm,
-            bridge_secret,
+            runtime_root_secret,
             token_encryption_key
         );
         merge_option_copy_fields!(self, other, access_ttl_minutes, refresh_ttl_days);
@@ -490,7 +490,7 @@ impl AuthConfig {
         apply_env_override_str(&mut self.jwt_algorithm, "ASTRA_JWT_ALGORITHM");
         apply_env_override(&mut self.access_ttl_minutes, "ASTRA_JWT_ACCESS_TTL_MINUTES");
         apply_env_override(&mut self.refresh_ttl_days, "ASTRA_JWT_REFRESH_TTL_DAYS");
-        apply_env_override_str(&mut self.bridge_secret, "ASTRA_BRIDGE_SECRET");
+        apply_env_override_str(&mut self.runtime_root_secret, "ASTRA_RUNTIME_ROOT_SECRET");
         apply_env_override_str(&mut self.token_encryption_key, "ASTRA_TOKEN_ENCRYPTION_KEY");
         for request_auth in &mut self.provider_request_auth {
             apply_env_override_placeholder(&mut request_auth.key);
@@ -966,7 +966,7 @@ pub struct AppSettings {
     pub jwt: JwtSettings,
     pub api: ApiSettings,
     pub memoria: MemoriaSettings,
-    pub bridge_secret: String,
+    pub runtime_root_secret: String,
     pub token_encryption_key: Option<String>,
     pub provider_request_auth: Vec<ProviderRequestAuthConfig>,
     pub edge_token_auth: EdgeTokenAuthConfig,
@@ -988,7 +988,7 @@ impl fmt::Debug for AppSettings {
             .field("jwt", &self.jwt)
             .field("api", &self.api)
             .field("memoria", &self.memoria)
-            .field("bridge_secret", &"[REDACTED]")
+            .field("runtime_root_secret", &"[REDACTED]")
             .field(
                 "token_encryption_key",
                 &self.token_encryption_key.as_ref().map(|_| "[REDACTED]"),
@@ -1030,7 +1030,7 @@ impl AppSettings {
                 "ASTRA_JWT_ALGORITHM" => sc.auth.jwt_algorithm.clone(),
                 "ASTRA_JWT_ACCESS_TTL_MINUTES" => sc.auth.access_ttl_minutes.map(|v| v.to_string()),
                 "ASTRA_JWT_REFRESH_TTL_DAYS" => sc.auth.refresh_ttl_days.map(|v| v.to_string()),
-                "ASTRA_BRIDGE_SECRET" => sc.auth.bridge_secret.clone(),
+                "ASTRA_RUNTIME_ROOT_SECRET" => sc.auth.runtime_root_secret.clone(),
                 "ASTRA_TOKEN_ENCRYPTION_KEY" => sc.auth.token_encryption_key.clone(),
                 // API
                 "ASTRA_API_HOST" => Some(sc.api.host().to_string()),
@@ -1134,10 +1134,10 @@ impl AppSettings {
                 base_url: value_or_default(&lookup, "MEMORIA_BASE_URL", DEFAULT_MEMORIA_URL),
                 master_key: lookup("MEMORIA_MASTER_KEY"),
             },
-            bridge_secret: required_value(
+            runtime_root_secret: required_value(
                 &lookup,
-                "ASTRA_BRIDGE_SECRET",
-                "dev-bridge-secret-change-me",
+                "ASTRA_RUNTIME_ROOT_SECRET",
+                "dev-runtime-root-secret-change-me",
             )?,
             token_encryption_key: lookup("ASTRA_TOKEN_ENCRYPTION_KEY"),
             provider_request_auth: Vec::new(),
@@ -1790,8 +1790,10 @@ mod tests {
 
     #[test]
     fn matrixone_settings_reject_database_identifiers_over_mysql_limit() {
-        let mut settings = MatrixOneSettings::default();
-        settings.database = "a".repeat(64);
+        let mut settings = MatrixOneSettings {
+            database: "a".repeat(64),
+            ..MatrixOneSettings::default()
+        };
         assert!(settings.validate().is_ok());
         settings.database = "select-db".into();
         assert!(settings.validate().is_ok());
@@ -1811,8 +1813,8 @@ mod tests {
             "memoria master_key should be redacted: {debug_str}"
         );
         assert!(
-            !debug_str.contains("dev-bridge-secret-change-me"),
-            "bridge_secret should be redacted: {debug_str}"
+            !debug_str.contains("dev-runtime-root-secret-change-me"),
+            "runtime_root_secret should be redacted: {debug_str}"
         );
     }
 
@@ -1873,7 +1875,10 @@ mod tests {
             "ASTRA_JWT_SECRET".into(),
             "my-test-jwt-secret-key-at-least-32-chars--".into(),
         );
-        m.insert("ASTRA_BRIDGE_SECRET".into(), "bridge-secret".into());
+        m.insert(
+            "ASTRA_RUNTIME_ROOT_SECRET".into(),
+            "runtime-root-secret".into(),
+        );
         let result = AppSettings::from_map(&m);
         assert!(result.is_ok(), "explicit values should parse: {:?}", result);
         let settings = result.unwrap();
@@ -1884,7 +1889,7 @@ mod tests {
                 .starts_with("my-test-jwt-secret-key-at-least")
         );
         assert_eq!(settings.matrixone.password, "testpw");
-        assert_eq!(settings.bridge_secret, "bridge-secret");
+        assert_eq!(settings.runtime_root_secret, "runtime-root-secret");
     }
 
     #[test]
@@ -1977,7 +1982,7 @@ mod settings_contract_tests {
         matrixone_user: String,
         matrixone_password: String,
         matrixone_database: String,
-        bridge_secret: String,
+        runtime_root_secret: String,
     }
 
     fn load_contract() -> SettingsContract {
@@ -1995,7 +2000,7 @@ mod settings_contract_tests {
             matrixone_user: settings.matrixone.user,
             matrixone_password: settings.matrixone.password,
             matrixone_database: settings.matrixone.database,
-            bridge_secret: settings.bridge_secret,
+            runtime_root_secret: settings.runtime_root_secret,
         }
     }
 
@@ -2059,7 +2064,7 @@ jwt_secret = "my-secret-key"
 jwt_algorithm = "HS512"
 access_ttl_minutes = 1440
 refresh_ttl_days = 7
-bridge_secret = "bridge-secret"
+runtime_root_secret = "runtime-root-secret"
 token_encryption_key = "fernet-key"
 
 [api]
@@ -2077,7 +2082,10 @@ cors_origins = ["http://localhost:3000", "https://example.com"]
         assert_eq!(config.auth.jwt_algorithm.as_deref(), Some("HS512"));
         assert_eq!(config.auth.access_ttl_minutes, Some(1440));
         assert_eq!(config.auth.refresh_ttl_days, Some(7));
-        assert_eq!(config.auth.bridge_secret.as_deref(), Some("bridge-secret"));
+        assert_eq!(
+            config.auth.runtime_root_secret.as_deref(),
+            Some("runtime-root-secret")
+        );
         assert_eq!(
             config.auth.token_encryption_key.as_deref(),
             Some("fernet-key")
@@ -2240,15 +2248,15 @@ auth_mode = "legacy"
         temp_env::with_vars(
             [
                 ("ASTRA_JWT_SECRET", Some("env-jwt-secret")),
-                ("ASTRA_BRIDGE_SECRET", Some("env-bridge-secret")),
+                ("ASTRA_RUNTIME_ROOT_SECRET", Some("env-runtime-root-secret")),
             ],
             || {
                 let mut config = ServerConfig::default();
                 config.apply_env_overrides();
                 assert_eq!(config.auth.jwt_secret.as_deref(), Some("env-jwt-secret"));
                 assert_eq!(
-                    config.auth.bridge_secret.as_deref(),
-                    Some("env-bridge-secret")
+                    config.auth.runtime_root_secret.as_deref(),
+                    Some("env-runtime-root-secret")
                 );
             },
         );
@@ -2422,7 +2430,7 @@ auth_mode = "legacy"
             sc.api.host = Some("127.0.0.1".to_string());
             sc.api.port = Some(9000);
             sc.auth.jwt_secret = Some("toml-jwt-secret-which-is-long-enough-32".to_string());
-            sc.auth.bridge_secret = Some("toml-bridge-secret".to_string());
+            sc.auth.runtime_root_secret = Some("toml-runtime-root-secret".to_string());
 
             let settings = AppSettings::from_server_config(&sc).unwrap();
             assert_eq!(settings.matrixone.db_pool_max_connections, 30);
@@ -2487,7 +2495,7 @@ auth_mode = "legacy"
         let toml_str = r#"
             [auth]
             jwt_secret = "test-jwt-secret-that-is-long-enough-123456"
-            bridge_secret = "test-bridge-secret"
+            runtime_root_secret = "test-runtime-root-secret"
 
             [deployment]
             disabled_tool_offers = ["web_fetch@server-builtin"]
@@ -2633,8 +2641,8 @@ auth_mode = "legacy"
             "my-test-jwt-secret-key-at-least-32-chars--".to_string(),
         );
         values.insert(
-            "ASTRA_BRIDGE_SECRET".to_string(),
-            "bridge-secret".to_string(),
+            "ASTRA_RUNTIME_ROOT_SECRET".to_string(),
+            "runtime-root-secret".to_string(),
         );
         values.insert(
             "ASTRA_DISABLED_TOOL_OFFERS".to_string(),

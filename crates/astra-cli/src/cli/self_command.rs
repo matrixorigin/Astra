@@ -1669,11 +1669,54 @@ mod tests {
         }
     }
 
+    fn typed_resume_bundle(
+        session_id: &str,
+        turn_count: u32,
+        messages: Vec<serde_json::Value>,
+    ) -> astra_turn_types::ResumeBundleV1 {
+        let sequence = u64::from(turn_count);
+        let cursor = astra_turn_types::SessionCursorV1 {
+            schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
+            owner_id: crate::cli::cli_config::cli_utils::cli_user_id(),
+            session_id: session_id.to_string(),
+            branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.to_string(),
+            completed_turn: turn_count,
+            journal_event_seq: sequence,
+            conversation_seq: sequence,
+            canonical_root_hash: astra_turn_types::canonical_conversation_root(&messages),
+            projection_schema: astra_turn_types::CONVERSATION_PROJECTION_SCHEMA_VERSION,
+            compaction_generation: 0,
+            config_version_id: None,
+        };
+        astra_turn_types::select_resume_bundle(
+            None,
+            [astra_turn_types::ResumeCandidateV1 {
+                source: astra_turn_types::ResumeSourceV1::Checkpoint,
+                cursor,
+                conversation_messages: messages,
+                materialized_conversation_root_hash: None,
+                degraded_reasons: Vec::new(),
+                repair_actions: Vec::new(),
+                projections: Default::default(),
+            }],
+        )
+        .expect("valid test resume bundle")
+    }
+
     async fn mock_cloud_resume(
         server: &MockServer,
         session_id: &str,
         restored: &astra_services::session_restore::RestoredSession,
     ) {
+        let mut restored = restored.clone();
+        if restored.resume_bundle.is_none() {
+            restored.resume_bundle = Some(typed_resume_bundle(
+                session_id,
+                restored.turn_count,
+                restored.conversation_messages.clone(),
+            ));
+        }
+        restored.conversation_messages.clear();
         Mock::given(method("POST"))
             .and(path(format!("/sessions/{session_id}/resume")))
             .respond_with(ResponseTemplate::new(200).set_body_json(restored))

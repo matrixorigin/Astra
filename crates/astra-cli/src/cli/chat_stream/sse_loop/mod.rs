@@ -513,7 +513,7 @@ pub(crate) async fn stream_chat_sse(
             },
         })?;
     if let Some(current) = messages.last_mut() {
-        astra_turn_types::mark_bridge_turn_message(current, &parent_turn_run_id);
+        astra_turn_types::mark_turn_message(current, &parent_turn_run_id);
     }
     // Only the fresh user suffix starts this root execution transcript. The
     // preceding prompt history is inherited context, not a new conversation

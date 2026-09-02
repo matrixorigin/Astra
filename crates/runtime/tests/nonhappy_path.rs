@@ -1,7 +1,7 @@
 //! Non-happy-path integration tests proving control mechanisms actually work.
 
 mod circuit_breaker_integration {
-    use astra_runtime::bridge::circuit_breaker::CircuitBreaker;
+    use astra_turn_core::circuit_breaker::CircuitBreaker;
     use std::time::Duration;
 
     /// Proves CB fast-rejects after threshold failures (as wired in forward())

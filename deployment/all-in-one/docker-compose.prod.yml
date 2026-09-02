@@ -76,7 +76,7 @@ services:
       - ASTRA_JWT_ACCESS_TTL_MINUTES=${ASTRA_JWT_ACCESS_TTL_MINUTES:-60}
       - ASTRA_JWT_REFRESH_TTL_DAYS=${ASTRA_JWT_REFRESH_TTL_DAYS:-7}
       - ASTRA_TOKEN_ENCRYPTION_KEY=${ASTRA_TOKEN_ENCRYPTION_KEY}
-      - ASTRA_BRIDGE_SECRET=${ASTRA_BRIDGE_SECRET}
+      - ASTRA_RUNTIME_ROOT_SECRET=${ASTRA_RUNTIME_ROOT_SECRET}
 
       # LLM models are configured server-side (infra_llm_models table) via
       # `astra admin model add/check`; no env vars needed.

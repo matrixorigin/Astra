@@ -175,7 +175,7 @@ pub(super) async fn ensure_interactive_session_identity(
     if let Some(session_id) = state.session_id.clone() {
         return Ok(session_id);
     }
-    crate::cli::slash::slash_state::start_fresh_session(api, profile, token, state).await
+    crate::cli::slash::slash_state::bind_initial_session(api, profile, token, state).await
 }
 
 async fn ensure_default_turn_model(

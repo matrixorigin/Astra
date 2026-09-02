@@ -9,6 +9,7 @@ use std::time::Instant;
 
 use futures_util::StreamExt;
 use serde_json::json;
+use tokio::time::Instant as TokioInstant;
 
 use crate::turn::bedrock::eventstream::FrameDecoder;
 use crate::turn::bedrock::stream::{BedrockStreamAccumulator, BedrockStreamEvent};
@@ -152,7 +153,7 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
                 .into_result(model_name, started.elapsed().as_millis() as u64),
         })?;
     let mut byte_stream = response.bytes_stream();
-    let mut yield_state = StreamYieldState::new(Instant::now());
+    let mut yield_state = StreamYieldState::new(TokioInstant::now());
     let mut delivered_tool_arguments = HashMap::<u64, String>::new();
     let provider_work_deadline = started + provider_work_budget;
     let partial = |accum: &BedrockStreamAccumulator| {
@@ -176,7 +177,7 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
                 partial: partial(&accum),
             });
         }
-        if yield_state.timed_out(Instant::now(), semantic_progress_timeout) {
+        if yield_state.timed_out(TokioInstant::now(), semantic_progress_timeout) {
             return Err(BedrockStreamError::SemanticProgressTimeout {
                 elapsed_ms: semantic_progress_timeout.as_millis() as u64,
                 made_semantic_progress: yield_state.has_actionable_yield(),
@@ -191,7 +192,7 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
         };
         let yield_deadline = yield_state
             .deadline(semantic_progress_timeout)
-            .unwrap_or(provider_work_deadline);
+            .unwrap_or_else(|| TokioInstant::from_std(provider_work_deadline));
         let next = tokio::select! {
             biased;
             _ = crate::turn::llm::client::wait_llm_cancel(cancel) => {
@@ -210,9 +211,7 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
                     partial: partial(&accum),
                 });
             },
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(
-                yield_deadline
-            )), if !yield_state.is_terminal() => {
+            _ = tokio::time::sleep_until(yield_deadline), if !yield_state.is_terminal() => {
                 return Err(BedrockStreamError::SemanticProgressTimeout {
                     elapsed_ms: semantic_progress_timeout.as_millis() as u64,
                     made_semantic_progress: yield_state.has_actionable_yield(),
@@ -270,13 +269,13 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
             for ev in events {
                 match &ev {
                     BedrockStreamEvent::TextDelta(text) => {
-                        yield_state.observe_text(text, Instant::now());
+                        yield_state.observe_text(text, TokioInstant::now());
                         if let Some(callback) = stream_callback.as_deref_mut() {
                             callback(LlmStreamUpdate::Text(text.clone()));
                         }
                     }
                     BedrockStreamEvent::ReasoningDelta(text) => {
-                        yield_state.observe_reasoning_activity(text, Instant::now());
+                        yield_state.observe_reasoning_activity(text, TokioInstant::now());
                         if let Some(callback) = stream_callback.as_deref_mut() {
                             callback(LlmStreamUpdate::Reasoning(text.clone()));
                         }
@@ -286,7 +285,7 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
                             name,
                             authorized_tool_names,
                             false,
-                            Instant::now(),
+                            TokioInstant::now(),
                         );
                     }
                     BedrockStreamEvent::ToolCallDelta {
@@ -304,7 +303,7 @@ async fn collect_bedrock_stream_with_semantic_progress_deadline_and_surface(
                             name,
                             authorized_tool_names,
                             fragment_advanced,
-                            Instant::now(),
+                            TokioInstant::now(),
                         );
                         if let Some(callback) = stream_callback.as_deref_mut() {
                             callback(LlmStreamUpdate::ToolCall {

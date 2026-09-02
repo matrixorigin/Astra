@@ -2243,7 +2243,7 @@ mod tests {
     }
 
     #[test]
-    fn external_sources_runtime_volatile_text_accepts_single_string() {
+    fn external_sources_runtime_volatile_text_rejects_non_array_shape() {
         let mut ep = serde_json::Map::new();
         ep.insert(
             astra_turn_core::chat_turn_edge_profile::EDGE_PROFILE_KEY_RUNTIME_VOLATILE_TEXTS.into(),
@@ -2262,7 +2262,8 @@ mod tests {
             sources
                 .extra_dynamic_sections
                 .iter()
-                .any(|section| section.text.contains("\"mode\":\"single\""))
+                .all(|section| !section.text.contains("\"mode\":\"single\"")),
+            "the canonical multi-producer lane requires an array"
         );
     }
 

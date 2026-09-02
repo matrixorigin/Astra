@@ -4,7 +4,7 @@
 //! [`super::sse_data_lines`] (OpenAI-style `data:` per `\n` without requiring `\n\n`).
 //!
 //! [`SseBlankLineUtf8Buf`] is the shared incremental buffer used by [`super::chat_turn_sse_dispatch::ChatTurnSseFramer`]
-//! and [`super::bridge_inprocess`] for streaming HTTP bodies.
+//! and [`super::server_loop`] for streaming HTTP bodies.
 
 use std::fmt;
 

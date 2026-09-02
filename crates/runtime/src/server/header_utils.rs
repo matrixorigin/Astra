@@ -30,12 +30,12 @@ fn normalize_connection_tokens(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// Header allow-list predicate: only headers explicitly required for bridge
+/// Header allow-list predicate: only headers explicitly required for upstream
 /// routing and authentication are forwarded to upstream providers.
 ///
 /// Strategy: allow-list (default-deny) rather than denylist (default-allow).
-/// Every new header forwarded to the bridge must be explicitly approved here.
-pub(super) fn is_allowed_bridge_header(name: &str) -> bool {
+/// Every new header forwarded upstream must be explicitly approved here.
+pub(super) fn is_allowed_forward_header(name: &str) -> bool {
     // Authentication token — required by all upstream providers.
     if name == "authorization" {
         return true;
@@ -54,9 +54,9 @@ pub(super) fn is_allowed_bridge_header(name: &str) -> bool {
     false
 }
 
-/// Collect headers to forward to the bridge using an allow-list strategy.
+/// Collect headers to forward upstream using an allow-list strategy.
 ///
-/// Only headers that pass `is_allowed_bridge_header` are collected.
+/// Only headers that pass `is_allowed_forward_header` are collected.
 /// Hop-by-hop headers declared in the `Connection` header value are also
 /// removed from the set even if they would otherwise pass the allow-list.
 pub(super) fn collect_forward_headers(headers: &HeaderMap) -> HashMap<String, String> {
@@ -83,7 +83,7 @@ pub(super) fn collect_forward_headers(headers: &HeaderMap) -> HashMap<String, St
             }
 
             // Default-deny: only forward explicitly allow-listed headers.
-            if !is_allowed_bridge_header(&name) {
+            if !is_allowed_forward_header(&name) {
                 continue;
             }
 
@@ -108,46 +108,46 @@ mod tests {
 
     #[test]
     fn allows_authorization() {
-        assert!(is_allowed_bridge_header("authorization"));
+        assert!(is_allowed_forward_header("authorization"));
     }
 
     #[test]
     fn allows_x_mo_headers() {
-        assert!(is_allowed_bridge_header("x-mo-session-id"));
-        assert!(is_allowed_bridge_header("x-mo-user-id"));
-        assert!(is_allowed_bridge_header("x-mo-routing-meta-b64"));
+        assert!(is_allowed_forward_header("x-mo-session-id"));
+        assert!(is_allowed_forward_header("x-mo-user-id"));
+        assert!(is_allowed_forward_header("x-mo-routing-meta-b64"));
     }
 
     #[test]
     fn allows_workspace_and_user_context() {
-        assert!(is_allowed_bridge_header("x-workspace-id"));
-        assert!(is_allowed_bridge_header("x-user-id"));
+        assert!(is_allowed_forward_header("x-workspace-id"));
+        assert!(is_allowed_forward_header("x-user-id"));
     }
 
     #[test]
     fn blocks_arbitrary_headers() {
-        assert!(!is_allowed_bridge_header("cookie"));
-        assert!(!is_allowed_bridge_header("set-cookie"));
-        assert!(!is_allowed_bridge_header("host"));
-        assert!(!is_allowed_bridge_header("x-forwarded-for"));
-        assert!(!is_allowed_bridge_header("x-real-ip"));
-        assert!(!is_allowed_bridge_header("origin"));
-        assert!(!is_allowed_bridge_header("referer"));
-        assert!(!is_allowed_bridge_header("content-type"));
-        assert!(!is_allowed_bridge_header("x-api-key"));
-        assert!(!is_allowed_bridge_header("x-auth-token"));
+        assert!(!is_allowed_forward_header("cookie"));
+        assert!(!is_allowed_forward_header("set-cookie"));
+        assert!(!is_allowed_forward_header("host"));
+        assert!(!is_allowed_forward_header("x-forwarded-for"));
+        assert!(!is_allowed_forward_header("x-real-ip"));
+        assert!(!is_allowed_forward_header("origin"));
+        assert!(!is_allowed_forward_header("referer"));
+        assert!(!is_allowed_forward_header("content-type"));
+        assert!(!is_allowed_forward_header("x-api-key"));
+        assert!(!is_allowed_forward_header("x-auth-token"));
     }
 
     #[test]
     fn blocks_prefix_spoof() {
         // "x-mobile" starts with "x-mo" but not "x-mo-"
-        assert!(!is_allowed_bridge_header("x-mobile"));
-        assert!(is_allowed_bridge_header("x-mo-"));
+        assert!(!is_allowed_forward_header("x-mobile"));
+        assert!(is_allowed_forward_header("x-mo-"));
     }
 
     #[test]
     fn blocks_synthetic_connection_tokens_header() {
-        assert!(!is_allowed_bridge_header(CONNECTION_HEADER_TOKENS_KEY));
+        assert!(!is_allowed_forward_header(CONNECTION_HEADER_TOKENS_KEY));
     }
 
     #[test]

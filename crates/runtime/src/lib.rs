@@ -30,10 +30,6 @@ use serde::{Deserialize, Serialize};
 use sqlx::{mysql::MySqlPoolOptions, query};
 use uuid::Uuid;
 
-use crate::bridge::{
-    InMemoryTurnReflectionStateStore, NoopTurnObserverWorker, NoopTurnReflectionLessonWriter,
-};
-
 // ── Internal modules: HTTP handlers (crate-visible only) ─────────────────────
 
 pub mod config_admin;
@@ -77,7 +73,6 @@ pub(crate) use data_layer::storage::{
 mod app_state;
 pub mod auto_invoke_handler;
 pub mod bash_intent;
-pub mod bridge;
 pub mod capabilities;
 pub(crate) mod capability_endpoint_pool;
 pub mod capability_registry;
@@ -245,14 +240,6 @@ pub use app_state::{
     MemoriaHealth, NoopMemoriaForwarder, ReqwestMemoriaForwarder, ServiceInfo,
 };
 
-// ── Re-exports: bridge ───────────────────────────────────────────────────────
-
-pub use bridge::{
-    CooldownReason, DatabaseTurnObserverWorker, DatabaseTurnReflectionLessonWriter,
-    RateLimitAction, RateLimitCooldown, RateLimitMetrics, RateLimitState,
-    side_effects::{PERSIST_FAIL_COUNT, PERSIST_OK_COUNT},
-};
-
 // ── Re-exports: evaluation & introspection ───────────────────────────────────
 
 pub use evaluation::{DatabaseEvaluationService, EvaluationService, UnconfiguredEvaluationService};
@@ -290,7 +277,8 @@ pub use astra_turn_core::contracts::{
 
 pub use turn::services::{
     DatabaseTraceEventWriter, DatabaseTurnAuxiliaryEventWriter, DatabaseTurnCoreEventWriter,
-    DatabaseTurnHookDbWriter, DatabaseTurnSessionActivityWriter, DatabaseTurnToolEventWriter,
+    DatabaseTurnHookDbWriter, DatabaseTurnObserverWorker, DatabaseTurnReflectionLessonWriter,
+    DatabaseTurnSessionActivityWriter, DatabaseTurnToolEventWriter,
 };
 
 pub use astra_turn_core::{
@@ -328,7 +316,7 @@ pub use astra_turn_core::{
         detect_divergence, detect_server_stall, record_server_tool_signatures,
         server_tool_call_signature,
     },
-    state::{new_session_entry, normalize_bridge_cache_entry, resolve_turn_identifiers},
+    state::{new_session_entry, resolve_turn_identifiers},
     stream_events::{
         build_approval_required_event, build_edge_tool_call_event, build_firewall_warning_event,
         build_runtime_error_event, build_stream_error_event, build_tool_request_event,

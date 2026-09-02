@@ -3107,7 +3107,7 @@ pub struct AgenticLoopState {
     /// rate-limit error (429 / TPM / RPM), it records it here so subsequent
     /// turns can wait or reject early instead of immediately re-hitting the
     /// limit.  Shared across all turns within a single agentic loop invocation.
-    pub rate_limit_cooldown: crate::bridge::RateLimitCooldown,
+    pub rate_limit_cooldown: astra_turn_core::rate_limit_cooldown::RateLimitCooldown,
 
     // ── Liquid (within-turn tactical adaptation) ──
     /// Optional tactical adapter for step-level adaptation within a turn.
@@ -3446,7 +3446,7 @@ impl AgenticLoopState {
     /// erase the current-turn boundary.
     pub fn push_prompt_history_message(&mut self, mut message: Value) {
         if let Some(turn_chain_id) = self.canonical_turn_chain_id.as_deref() {
-            astra_turn_types::mark_bridge_turn_message(&mut message, turn_chain_id);
+            astra_turn_types::mark_turn_message(&mut message, turn_chain_id);
         }
         self.messages.push(message.clone());
         self.record_prompt_history_messages(std::iter::once(message));
@@ -3458,7 +3458,7 @@ impl AgenticLoopState {
         let start = start.min(self.messages.len());
         if let Some(turn_chain_id) = self.canonical_turn_chain_id.as_deref() {
             for message in &mut self.messages[start..] {
-                astra_turn_types::mark_bridge_turn_message(message, turn_chain_id);
+                astra_turn_types::mark_turn_message(message, turn_chain_id);
             }
         }
         let appended = self.messages[start..].to_vec();
@@ -4432,7 +4432,7 @@ mod synthesise_finish_reason_tests {
 }
 
 /// **Test-only.** Build a minimal [`AgenticLoopState`] suitable for driving
-/// the mock-LLM path in integration tests (feature `bridge-e2e-hooks`).
+/// the mock-LLM path in integration tests (feature `e2e-hooks`).
 ///
 /// All fields use safe defaults; tests should mutate the returned state
 /// directly (e.g. push into `messages`, set `llm_rounds_completed`).
@@ -5114,7 +5114,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn bridge_turn_identity_covers_all_append_paths_without_text_matching() {
+    fn turn_provenance_identity_covers_all_append_paths_without_text_matching() {
         let mut state = make_test_loop_state();
         state.canonical_turn_chain_id = Some("chain-current".into());
         state.begin_run_transcript_capture(std::iter::empty());
@@ -5136,7 +5136,7 @@ pub(crate) mod tests {
         state.record_appended_prompt_history_from(direct_start);
 
         assert!(state.messages.iter().all(|message| {
-            astra_turn_types::bridge_turn_message_provenance(message)
+            astra_turn_types::turn_message_provenance(message)
                 .unwrap()
                 .is_some_and(|provenance| provenance.turn_chain_id == "chain-current")
         }));
@@ -6325,7 +6325,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn strict_admission_gives_flat_and_nested_calls_one_canonical_execution_shape() {
+    async fn strict_admission_rejects_flat_calls_and_executes_only_canonical_nested_calls() {
         let calls = server_tool_result(
             vec![
                 json!({
@@ -6360,8 +6360,8 @@ pub(crate) mod tests {
         assert_eq!(state.final_text, "done");
         assert_eq!(host.admitted_tool_call_batches.len(), 1);
         let admitted = &host.admitted_tool_call_batches[0];
-        assert_eq!(admitted.len(), 2);
-        assert_eq!(admitted[0]["function"], admitted[1]["function"]);
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0]["id"], "call-nested");
         assert!(
             admitted.iter().all(|call| call.get("name").is_none()),
             "execution receives only the canonical nested representation"
@@ -7546,6 +7546,9 @@ pub(crate) mod tests {
         ])
         .with_valid_tools(&["bash", "git_diff"]);
         let mut state = make_state();
+        state.turn_intent = Some(TurnIntent::default().with_workspace_mutation(
+            astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+        ));
         state.max_turns = 2;
         state.remaining_turns = 2;
         state.final_text = "stale success from a previous turn".to_string();
@@ -7554,7 +7557,11 @@ pub(crate) mod tests {
 
         assert!(outcome.is_ok());
         assert_eq!(host.current_turn, 3);
-        assert!(state.interruption.is_none());
+        assert!(
+            state.interruption.is_none(),
+            "unexpected interruption: {:?}",
+            state.interruption
+        );
         assert_eq!(state.final_text, "bounded final synthesis");
         assert!(
             !state.final_text.contains("stale success")
@@ -7576,12 +7583,11 @@ pub(crate) mod tests {
             2,
             "adaptive renewal must preserve both completed evidence calls"
         );
-        // After folding, each tool result should be well below the original 50 000-char payloads.
-        // The observed folded sizes are ~922–1096 chars (FOLD_KEEP_CHARS=200 plus annotation
-        // and line-boundary overhead).  Using 1500 as a generous ceiling keeps the assertion
-        // coupled to realistic folding output rather than the old 18_500 that would silently
-        // pass even if folding regressed entirely.
-        const FOLD_BOUND_CHARS: usize = 1_500;
+        // After folding, each result stays inside the canonical read-result
+        // presentation budget plus bounded compaction annotations, rather
+        // than replaying either original 50 000-character payload.
+        const FOLD_BOUND_CHARS: usize =
+            astra_turn_core::tool_result_sanitize::READ_FILE_MODEL_RESULT_CHARS + 1_000;
         assert!(
             tool_contents
                 .iter()
@@ -8746,7 +8752,7 @@ pub(crate) mod tests {
 
         let mut registry = AgentProfileRegistry::new();
         let _ = registry.register(AgentProfile::new(
-            "orchestrator",
+            "main",
             "Orchestrator",
             AgentTier::Orchestrator,
         ));
@@ -8936,7 +8942,8 @@ pub(crate) mod tests {
             .messages
             .push(json!({"role": "user", "content": "review and list files"}));
         state.current_run_id = Some("run-mix".to_string());
-        state.delegation_engine = Some(make_test_delegation_engine("run-mix", "unknown").await);
+        state.delegation_engine =
+            Some(make_test_delegation_engine("run-mix", "test-session").await);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -8966,7 +8973,8 @@ pub(crate) mod tests {
         state
             .messages
             .push(json!({"role": "user", "content": "delegate something"}));
-        state.delegation_engine = Some(make_test_delegation_engine("unknown", "unknown").await);
+        state.delegation_engine =
+            Some(make_test_delegation_engine("unknown", "test-session").await);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -9013,7 +9021,8 @@ pub(crate) mod tests {
             .messages
             .push(json!({"role": "user", "content": "implement and review"}));
         state.current_run_id = Some("run-fanout".to_string());
-        state.delegation_engine = Some(make_test_delegation_engine("run-fanout", "unknown").await);
+        state.delegation_engine =
+            Some(make_test_delegation_engine("run-fanout", "test-session").await);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -9028,7 +9037,7 @@ pub(crate) mod tests {
             .unwrap_or("");
         assert!(
             result_content.contains("coder"),
-            "result should mention coder agent"
+            "result should mention coder agent: {result_content}"
         );
         assert!(
             result_content.contains("reviewer"),
@@ -9086,7 +9095,7 @@ pub(crate) mod tests {
             .push(json!({"role": "user", "content": "write and review auth"}));
         state.current_run_id = Some("run-adversarial".to_string());
         state.delegation_engine =
-            Some(make_test_delegation_engine("run-adversarial", "unknown").await);
+            Some(make_test_delegation_engine("run-adversarial", "test-session").await);
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
         assert!(outcome.is_ok());
@@ -9107,7 +9116,8 @@ pub(crate) mod tests {
         state
             .messages
             .push(json!({"role": "user", "content": "list files"}));
-        state.delegation_engine = Some(make_test_delegation_engine("unknown", "unknown").await);
+        state.delegation_engine =
+            Some(make_test_delegation_engine("unknown", "test-session").await);
 
         let _ = run_agentic_loop_with_host(&mut host, &mut state).await;
 
@@ -10386,11 +10396,13 @@ pub(crate) mod tests {
             state.final_text.contains("Why stopped:"),
             "the preserved candidate must be labelled as a partial response"
         );
+        assert_eq!(host.terminal_tool_records.len(), 1);
         assert_eq!(
-            host.terminal_tool_records.len(),
-            0,
-            "dropped post-wrapup tool calls must never reach the executor"
+            host.terminal_tool_records[0].disposition,
+            Some(astra_services::session_journal::ToolCallDisposition::Rejected),
+            "a dropped post-wrapup call must close as rejected without reaching the executor"
         );
+        assert!(!host.terminal_tool_records[0].was_executed());
     }
 
     #[tokio::test]
@@ -10416,6 +10428,9 @@ pub(crate) mod tests {
         .with_valid_tools(&["bash", "read_file"])
         .with_interaction_mode(TurnInteractionMode::Auto);
         let mut state = make_state();
+        state.turn_intent = Some(TurnIntent::default().with_workspace_mutation(
+            astra_config::user_profile::WorkspaceMutationIntent::ReadOnly,
+        ));
         state.max_turn_input_tokens = 0;
         state.agentic_turn_budget =
             astra_turn_core::chat_turn_heuristics::AgenticTurnBudget::new(2, 2, 0, 0);
@@ -10428,7 +10443,11 @@ pub(crate) mod tests {
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
 
         assert!(outcome.is_ok());
-        assert!(state.interruption.is_none());
+        assert!(
+            state.interruption.is_none(),
+            "unexpected interruption: {:?}",
+            state.interruption
+        );
         assert_eq!(state.final_text, "Done — summary of progress.");
         assert_eq!(host.current_turn, 3);
     }
@@ -11884,29 +11903,20 @@ print(json.dumps({'context': 'user said: ' + msg}))
         // After iteration 1, the tool results from iteration 1 should be
         // compacted before iteration 2's LLM call.
         let big_output = "x".repeat(1000);
+        let edge_batch = |round: usize| {
+            (0..3)
+                .map(|index| {
+                    let mut tool = make_edge_tool("read_file", &big_output);
+                    tool.request_id = format!("req-read-file-{round}-{index}");
+                    tool
+                })
+                .collect()
+        };
         let mut host = MockHost::new(vec![
             // Iteration 1: 3 edge tool calls with large output
-            edge_tool_result(
-                vec![
-                    make_edge_tool("read_file", &big_output),
-                    make_edge_tool("read_file", &big_output),
-                    make_edge_tool("read_file", &big_output),
-                ],
-                100,
-                50,
-                Some(30),
-            ),
+            edge_tool_result(edge_batch(1), 100, 50, Some(30)),
             // Iteration 2: 3 more edge tool calls
-            edge_tool_result(
-                vec![
-                    make_edge_tool("read_file", &big_output),
-                    make_edge_tool("read_file", &big_output),
-                    make_edge_tool("read_file", &big_output),
-                ],
-                100,
-                50,
-                Some(30),
-            ),
+            edge_tool_result(edge_batch(2), 100, 50, Some(30)),
             // Iteration 3: final text
             text_result("Done.", 50, 20, None),
         ]);
@@ -11916,7 +11926,7 @@ print(json.dumps({'context': 'user said: ' + msg}))
             .push(json!({"role": "user", "content": "review"}));
 
         let outcome = run_agentic_loop_with_host(&mut host, &mut state).await;
-        assert!(outcome.is_ok());
+        assert!(outcome.is_ok(), "loop failed: {outcome:?}");
 
         // After completion, some old tool results should have been compacted.
         // The messages contain tool results from iterations 1 and 2.
