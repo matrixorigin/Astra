@@ -53,6 +53,8 @@ Wait for both release workflows to pass, then verify:
 
 - The GitHub Release points to the intended commit and has all four CLI
   archives, their individual checksums, `checksums.txt`, and its checksum.
+- Each CLI archive contains the `astra` executable and the Apache-2.0
+  `LICENSE` file at its root.
 - Generated release notes group the included pull requests accurately.
 - A downloaded archive matches its published SHA-256 value.
 - The Docker version tag resolves to both `linux/amd64` and `linux/arm64`.

@@ -156,10 +156,14 @@ jobs:
           }
 
           mkdir -p dist
+          package_dir="${RUNNER_TEMP}/${BINARY}-package"
+          mkdir -p "${package_dir}"
+          install -m 0755 \
+            "target/${{ matrix.target }}/release/${BINARY}" \
+            "${package_dir}/${BINARY}"
+          install -m 0644 LICENSE "${package_dir}/LICENSE"
           archive="${BINARY}-v${{ needs.version.outputs.value }}-${{ matrix.suffix }}.tar.gz"
-          tar -czf "dist/${archive}" \
-            -C "target/${{ matrix.target }}/release" \
-            "${BINARY}"
+          tar -czf "dist/${archive}" -C "${package_dir}" "${BINARY}" LICENSE
           (cd dist && checksum_file "${archive}" | tee "${archive}.sha256" > /dev/null)
 
       - name: Upload artifact
