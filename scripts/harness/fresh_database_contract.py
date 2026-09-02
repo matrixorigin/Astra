@@ -293,12 +293,13 @@ def _validate_closed_schema_counts(
     }
     if contaminated:
         raise ContractError(f"database contains non-bootstrap state: {contaminated}")
+    # Registry cardinality is source-owned and evolves with the canonical
+    # baseline. _validate_boot_metadata performs the stricter exact-row check
+    # (including cardinality and digest), so do not duplicate it as a literal.
     expected_boot_counts = {
         "astra_schema_contracts": 1,
         "infra_llm_models": 1,
         "maintenance_sweep_cursors": 1,
-        "preview_template_registry": 37,
-        "raw_ref_scheme_registry": 9,
         "sweeper_leases": 1,
     }
     for table, expected in expected_boot_counts.items():

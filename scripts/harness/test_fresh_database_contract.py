@@ -589,7 +589,9 @@ class FreshDatabaseContractTests(unittest.TestCase):
                     broker.LifecycleLease.acquire(identity, 17013)
 
     def test_schema_inventory_is_closed_and_all_non_boot_tables_are_empty(self):
-        canonical = contract._canonical_schema_inventory(MODULE_PATH.parents[2])
+        repo = MODULE_PATH.parents[2]
+        canonical = contract._canonical_schema_inventory(repo)
+        registries = contract._canonical_baseline_registry_rows(repo)
         self.assertIn("plans", canonical)
         self.assertIn("workspace_records", canonical)
         self.assertIn("session_checkpoints", canonical)
@@ -600,8 +602,12 @@ class FreshDatabaseContractTests(unittest.TestCase):
         # default user role plus the one bootstrap admin role.
         counts["auth_roles"] = 2
         counts["auth_user_roles"] = 2
-        counts["raw_ref_scheme_registry"] = 9
-        counts["preview_template_registry"] = 37
+        counts["raw_ref_scheme_registry"] = len(
+            registries["raw_ref_scheme_registry"]
+        )
+        counts["preview_template_registry"] = len(
+            registries["preview_template_registry"]
+        )
         contract._validate_closed_schema_counts(canonical, canonical, counts)
         changed_bootstrap_auth = {**counts, "auth_users": 2}
         with self.assertRaisesRegex(contract.ContractError, "auth_users"):
@@ -640,6 +646,7 @@ class FreshDatabaseContractTests(unittest.TestCase):
             },
         )
         actual = canonical - conditional
+        registries = contract._canonical_baseline_registry_rows(repo)
         counts = {table: 0 for table in actual}
         counts.update(
             {
@@ -647,8 +654,12 @@ class FreshDatabaseContractTests(unittest.TestCase):
                 "astra_schema_table_contracts": 1,
                 "infra_llm_models": 1,
                 "maintenance_sweep_cursors": 1,
-                "preview_template_registry": 37,
-                "raw_ref_scheme_registry": 9,
+                "preview_template_registry": len(
+                    registries["preview_template_registry"]
+                ),
+                "raw_ref_scheme_registry": len(
+                    registries["raw_ref_scheme_registry"]
+                ),
                 "sweeper_leases": 1,
             }
         )
@@ -707,8 +718,14 @@ class FreshDatabaseContractTests(unittest.TestCase):
 
         with mock.patch.object(contract, "_mysql_rows", side_effect=rows):
             sealed = contract._validate_baseline_registry_rows("fresh", repo)
-        self.assertEqual(sealed["raw_ref_scheme_registry_count"], 9)
-        self.assertEqual(sealed["preview_template_registry_count"], 37)
+        self.assertEqual(
+            sealed["raw_ref_scheme_registry_count"],
+            len(expected["raw_ref_scheme_registry"]),
+        )
+        self.assertEqual(
+            sealed["preview_template_registry_count"],
+            len(expected["preview_template_registry"]),
+        )
         self.assertRegex(sealed["raw_ref_scheme_registry_sha256"], r"^[0-9a-f]{64}$")
         self.assertRegex(sealed["preview_template_registry_sha256"], r"^[0-9a-f]{64}$")
 
