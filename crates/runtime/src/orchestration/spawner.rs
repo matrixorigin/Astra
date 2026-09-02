@@ -1941,12 +1941,14 @@ impl DynamicAgentSpawner {
         let owner_changed = job.owner_changed.clone();
         let capacity = self.cancellation_capacity();
         #[cfg(test)]
-        let _global_capacity = if let Some(waiting) = self
-            .cancellation_capacity_waiting_hook
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-        {
+        let capacity_waiting_hook = {
+            self.cancellation_capacity_waiting_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        };
+        #[cfg(test)]
+        let _global_capacity = if let Some(waiting) = capacity_waiting_hook {
             // Poll once so the test observes the real semaphore-contention
             // boundary, not a proxy such as task scheduling or queue dequeue.
             let acquire = capacity.acquire_owned();
