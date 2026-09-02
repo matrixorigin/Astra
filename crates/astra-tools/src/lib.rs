@@ -1,7 +1,7 @@
 #![allow(unstable_name_collisions)]
 //! # astra-tools
 //!
-//! Extracted tool execution library for astra-engine. This crate contains the
+//! Extracted tool execution library for Astra. This crate contains the
 //! pure tool logic (file I/O, shell, git, code intelligence, etc.) decoupled
 //! from CLI-specific concerns (terminal rendering, MCP dispatch, passive LSP).
 //!

@@ -1,4 +1,4 @@
-# astra-engine - All-in-One Docker Compose
+# Astra - All-in-One Docker Compose
 #
 # Starts MatrixOne, Memoria, and astra-server with one compose stack.
 # Development deps still use docker-compose.deps.yml via `make dev-deps-*`.

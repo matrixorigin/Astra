@@ -6,7 +6,7 @@ A second file at `.claude/CLAUDE.md` is also loaded — it carries the MANDATORY
 
 ## Project Overview
 
-`astra-engine` — a Rust-first agent platform for auditable chat runs, session history, replay, skills, admin operations, and MatrixOne-backed state. The flagship binary is `astra-server` (Axum HTTP API); the operator-facing surfaces are the `astra` CLI (interactive TUI + scripting + admin operations), and a Next.js admin dashboard under `web/`.
+`Astra` is a Rust-first agent platform for auditable chat runs, session history, replay, skills, admin operations, and MatrixOne-backed state. The flagship binary is `astra-server` (Axum HTTP API); the operator-facing surfaces are the `astra` CLI (interactive TUI + scripting + admin operations), and a Next.js admin dashboard under `web/`.
 
 ## Cargo Workspace Lives At Repo Root
 

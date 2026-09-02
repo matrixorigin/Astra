@@ -1,4 +1,4 @@
-//! Unified error classification for the astra-engine runtime.
+//! Unified error classification for the Astra runtime.
 //!
 //! Every internal error should be classified exactly once at its source into an
 //! [`ErrorKind`]. Downstream code should pattern-match on the kind instead of

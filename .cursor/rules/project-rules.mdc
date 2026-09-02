@@ -1,9 +1,9 @@
 ---
-description: mo-agent-runtime — Rust (astra-*) development, testing, and conventions
+description: Astra — Rust development, testing, and conventions
 alwaysApply: true
 ---
 
-# mo-agent-runtime Development & Testing Guide
+# Astra Development & Testing Guide
 
 You are working on **Astra**, a Rust-first agent platform (workspace crates `astra-core`, `astra-cli`, `astra-runtime`, etc.). Primary focus: development, testing, and debugging.
 

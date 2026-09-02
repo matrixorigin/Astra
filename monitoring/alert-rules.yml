@@ -1,4 +1,4 @@
-# Prometheus Alert Rules for astra-engine
+# Prometheus alert rules for Astra
 
 groups:
   - name: mo_astra_runtime_alerts
@@ -62,7 +62,7 @@ groups:
           severity: critical
         annotations:
           summary: "Service is down"
-          description: "astra-engine service is not responding"
+          description: "Astra service is not responding"
       
       # High memory usage
       - alert: HighMemoryUsage

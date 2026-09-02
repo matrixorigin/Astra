@@ -1,8 +1,8 @@
-# astra-engine Makefile
+# Astra Makefile
 
 .PHONY: help
 help:
-	@echo "astra-engine Development Commands"
+	@echo "Astra Development Commands"
 	@echo "=================================="
 	@echo ""
 	@echo "Quick Start:"
@@ -181,7 +181,7 @@ dev-init: setup install-dev-deps
 
 .PHONY: setup
 setup:
-	@echo "Setting up astra-engine development environment..."
+	@echo "Setting up Astra development environment..."
 	@if [ ! -f .env ]; then \
 		cp .env.example .env; \
 		echo "✅ Created .env file (please review and customize)"; \

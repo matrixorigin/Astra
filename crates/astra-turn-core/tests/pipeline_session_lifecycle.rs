@@ -283,7 +283,7 @@ fn full_lifecycle_with_emergent_and_latches() {
     };
     let session = make_session_context();
     let external = ExternalSources {
-        memory_entries: vec![MemoryEntry::new("User works on astra-engine.")],
+        memory_entries: vec![MemoryEntry::new("User works on Astra.")],
         spill_dir: None,
         ..Default::default()
     };

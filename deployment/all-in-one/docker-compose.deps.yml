@@ -1,4 +1,4 @@
-# astra-engine — Dev Dependencies
+# Astra — Dev Dependencies
 #
 # Starts MatrixOne + Memoria (memory service).
 # Used by: make dev-deps

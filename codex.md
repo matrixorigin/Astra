@@ -1,6 +1,6 @@
-# astra-engine Development & Testing Guide
+# Astra Development & Testing Guide
 
-You are working on astra-engine, a Rust-first agent platform. Your primary tasks are development, testing, and debugging.
+You are working on Astra, a Rust-first agent platform. Your primary tasks are development, testing, and debugging.
 
 ## Quick Reference
 
