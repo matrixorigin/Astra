@@ -53,8 +53,11 @@ RUN set -eux; \
 
 COPY target/x86_64-unknown-linux-gnu/release/astra-server /usr/local/bin/astra-server
 COPY target/x86_64-unknown-linux-gnu/release/astra        /usr/local/bin/astra
+COPY LICENSE /usr/share/licenses/astra/LICENSE
 
-RUN chown root:appgroup /app && chmod 0770 /app
+RUN chown root:appgroup /app && \
+    chmod 0770 /app && \
+    chmod 0444 /usr/share/licenses/astra/LICENSE
 
 USER appuser
 

@@ -118,9 +118,12 @@ RUN set -eux; \
     useradd --system --create-home --home-dir /home/appuser --shell /usr/sbin/nologin -g appgroup appuser
 COPY --from=builder /out/astra-server /usr/local/bin/astra-server
 COPY --from=builder /out/astra /usr/local/bin/astra
+COPY LICENSE /usr/share/licenses/astra/LICENSE
 # WORKDIR writable for appgroup; K8s runAsUser overrides should add supplementalGroups: [appgroup GID].
 # Prefer mounted volumes for real data rather than writing to /app at runtime.
-RUN chown root:appgroup /app && chmod 0770 /app
+RUN chown root:appgroup /app && \
+    chmod 0770 /app && \
+    chmod 0444 /usr/share/licenses/astra/LICENSE
 USER appuser
 
 EXPOSE 17001
