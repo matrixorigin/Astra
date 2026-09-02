@@ -1994,15 +1994,6 @@ mod tests {
         let second = exec.execute("bash", &args).await;
 
         assert!(!first.is_error, "first failed: {}", first.output);
-        assert!(!second.is_error, "second failed: {}", second.output);
-        // Counter file went to 2 — proof that the second call really
-        // re-executed. Before the classifier, the cache would return
-        // the first call's output and the file would stay at 1.
-        assert_eq!(
-            std::fs::read_to_string(_tmp.path().join("dedup-count")).unwrap(),
-            "tick\ntick\n",
-            "compound command must re-execute both times — never cache shell pipelines"
-        );
         assert_ne!(
             second
                 .metadata
@@ -2012,6 +2003,25 @@ mod tests {
             Some(true),
             "second call must NOT be marked cached"
         );
+        let counter = std::fs::read_to_string(_tmp.path().join("dedup-count")).unwrap();
+        if second.is_error {
+            // A host with only weak process-group ownership must quarantine
+            // after the first opaque writer.  Refusing the second execution is
+            // the secure outcome and still proves no result was replayed.
+            assert!(
+                second.output.contains("workspace coordination lock"),
+                "unexpected second failure: {}",
+                second.output
+            );
+            assert_eq!(counter, "tick\n");
+        } else {
+            // With authoritative process ownership both calls may execute;
+            // the counter proves the unsafe command was never cached.
+            assert_eq!(
+                counter, "tick\ntick\n",
+                "compound command must re-execute both times when the host can prove ownership"
+            );
+        }
     }
 
     #[tokio::test]

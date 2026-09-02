@@ -339,6 +339,23 @@ impl DatabaseWorkPatchCommitService {
             transaction.commit().await?;
             return Ok(operation);
         }
+        // Lock the aggregate root first, then resolve the target and source
+        // resources by their complete owner-scoped identities.  Besides giving
+        // every same-Work commit admission one deterministic lock order, this
+        // avoids relying on a five-way `FOR UPDATE` join whose aliases may be
+        // remapped by MatrixOne's join-order optimizer.
+        let work_exists: Option<i8> = sqlx::query_scalar(
+            "SELECT 1 FROM works
+             WHERE owner_id = ? AND work_id = ? AND archived_at IS NULL
+             LIMIT 1 FOR UPDATE",
+        )
+        .bind(request.owner_id.as_str())
+        .bind(request.work_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if work_exists.is_none() {
+            return Err(WorkPatchCommitError::NotFound);
+        }
         let pending: Option<i8> = sqlx::query_scalar(
             "SELECT 1 FROM work_patch_commit_operations
              WHERE owner_id = ? AND work_id = ? AND target_branch_id = ?
@@ -354,38 +371,61 @@ impl DatabaseWorkPatchCommitService {
                 WorkPatchCommitConflict::TargetOperation,
             ));
         }
-        let row = query(
-            "SELECT target.branch_revision, target.current_graph_revision,
-                    subject.subject_record_revision, subject.branch_revision AS subject_branch_revision,
-                    subject.graph_revision AS subject_graph_revision, subject.subject_ref,
-                    subject.subject_revision, patch.branch_id AS source_branch_id,
-                    patch.base_subject_revision, patch.result_subject_revision, patch.payload_hash
-             FROM works w
-             JOIN work_branches target
-               ON target.owner_id = w.owner_id AND target.work_id = w.work_id
-              AND target.branch_id = ? AND target.archived_at IS NULL
-             JOIN work_branches source
-               ON source.owner_id = w.owner_id AND source.work_id = w.work_id
-              AND source.archived_at IS NULL
-             JOIN work_branch_subjects subject
-               ON subject.owner_id = target.owner_id AND subject.work_id = target.work_id
-              AND subject.branch_id = target.branch_id
-             JOIN work_patch_artifacts patch
-               ON patch.owner_id = source.owner_id AND patch.work_id = source.work_id
-              AND patch.branch_id = source.branch_id AND patch.patch_artifact_id = ?
-             WHERE w.owner_id = ? AND w.work_id = ? AND w.archived_at IS NULL
-             FOR UPDATE",
+        let target = query(
+            "SELECT branch_revision, current_graph_revision
+             FROM work_branches
+             WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND archived_at IS NULL
+             LIMIT 1 FOR UPDATE",
         )
-        .bind(request.target_branch_id.as_str())
-        .bind(request.patch_artifact_id.as_str())
         .bind(request.owner_id.as_str())
         .bind(request.work_id.as_str())
+        .bind(request.target_branch_id.as_str())
         .fetch_optional(&mut *transaction)
         .await?
         .ok_or(WorkPatchCommitError::NotFound)?;
-        let branch_revision = WorkBranchRevision::new(row.try_get("branch_revision")?)
+        let subject = query(
+            "SELECT subject_record_revision, branch_revision AS subject_branch_revision,
+                    graph_revision AS subject_graph_revision, subject_ref, subject_revision
+             FROM work_branch_subjects
+             WHERE owner_id = ? AND work_id = ? AND branch_id = ?
+             LIMIT 1 FOR UPDATE",
+        )
+        .bind(request.owner_id.as_str())
+        .bind(request.work_id.as_str())
+        .bind(request.target_branch_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(WorkPatchCommitError::NotFound)?;
+        let patch = query(
+            "SELECT patch.branch_id AS source_branch_id, patch.base_subject_revision,
+                    patch.result_subject_revision, patch.payload_hash
+             FROM work_patch_artifacts patch
+             WHERE patch.owner_id = ? AND patch.work_id = ? AND patch.patch_artifact_id = ?
+             LIMIT 1 FOR UPDATE",
+        )
+        .bind(request.owner_id.as_str())
+        .bind(request.work_id.as_str())
+        .bind(request.patch_artifact_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(WorkPatchCommitError::NotFound)?;
+        let source_branch_id = patch.try_get::<String, _>("source_branch_id")?;
+        let source_exists: Option<i8> = sqlx::query_scalar(
+            "SELECT 1 FROM work_branches
+             WHERE owner_id = ? AND work_id = ? AND branch_id = ? AND archived_at IS NULL
+             LIMIT 1 FOR UPDATE",
+        )
+        .bind(request.owner_id.as_str())
+        .bind(request.work_id.as_str())
+        .bind(source_branch_id.as_str())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        if source_exists.is_none() {
+            return Err(WorkPatchCommitError::NotFound);
+        }
+        let branch_revision = WorkBranchRevision::new(target.try_get("branch_revision")?)
             .map_err(|error| repair(error.to_string()))?;
-        let graph_revision = GraphRevision::new(row.try_get("current_graph_revision")?)
+        let graph_revision = GraphRevision::new(target.try_get("current_graph_revision")?)
             .map_err(|error| repair(error.to_string()))?;
         if branch_revision != request.expected_target_branch_revision {
             return Err(WorkPatchCommitError::Conflict(
@@ -398,15 +438,15 @@ impl DatabaseWorkPatchCommitService {
             ));
         }
         let subject_branch_revision =
-            WorkBranchRevision::new(row.try_get("subject_branch_revision")?)
+            WorkBranchRevision::new(subject.try_get("subject_branch_revision")?)
                 .map_err(|error| repair(error.to_string()))?;
-        let subject_graph_revision = GraphRevision::new(row.try_get("subject_graph_revision")?)
+        let subject_graph_revision = GraphRevision::new(subject.try_get("subject_graph_revision")?)
             .map_err(|error| repair(error.to_string()))?;
         let result_subject_revision =
-            WorkContentHash::parse(row.try_get::<String, _>("result_subject_revision")?)
+            WorkContentHash::parse(patch.try_get::<String, _>("result_subject_revision")?)
                 .map_err(|error| repair(error.to_string()))?;
         let current_subject_revision =
-            WorkContentHash::parse(row.try_get::<String, _>("subject_revision")?)
+            WorkContentHash::parse(subject.try_get::<String, _>("subject_revision")?)
                 .map_err(|error| repair(error.to_string()))?;
         if subject_branch_revision != branch_revision
             || subject_graph_revision != graph_revision
@@ -438,16 +478,16 @@ impl DatabaseWorkPatchCommitService {
         .bind(request.request_id.as_str())
         .bind(digest)
         .bind(request.patch_artifact_id.as_str())
-        .bind(row.try_get::<String, _>("source_branch_id")?)
+        .bind(source_branch_id)
         .bind(request.target_branch_id.as_str())
         .bind(request.target_branch_id.as_str())
         .bind(branch_revision.get())
         .bind(graph_revision.get())
-        .bind(row.try_get::<i64, _>("subject_record_revision")?)
-        .bind(row.try_get::<String, _>("subject_ref")?)
-        .bind(row.try_get::<String, _>("base_subject_revision")?)
+        .bind(subject.try_get::<i64, _>("subject_record_revision")?)
+        .bind(subject.try_get::<String, _>("subject_ref")?)
+        .bind(patch.try_get::<String, _>("base_subject_revision")?)
         .bind(result_subject_revision.as_str())
-        .bind(row.try_get::<String, _>("payload_hash")?)
+        .bind(patch.try_get::<String, _>("payload_hash")?)
         .bind(&request.message)
         .bind(&request.author_name)
         .bind(&request.author_email)

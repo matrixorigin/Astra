@@ -677,10 +677,21 @@ impl MatrixE2eCtx {
     /// across subsequent journeys in the same system-E2E binary.
     pub async fn close(&self) {
         self.stop_fixture_heartbeat().await;
-        let _ = self
+        // Mirror the production shutdown contract: passive drain owns normal
+        // completion and checkpoint persistence; forced stop is only the
+        // bounded fallback. Calling stop directly violates its documented
+        // precondition and can abort a finalizer while it still owns a pooled
+        // database connection.
+        if !self
             .app_state
-            .stop_background_runs(std::time::Duration::from_secs(2))
-            .await;
+            .drain_background_runs(std::time::Duration::from_secs(2))
+            .await
+        {
+            let _ = self
+                .app_state
+                .stop_background_runs(std::time::Duration::from_secs(2))
+                .await;
+        }
         cleanup_session_data(&self.shared_pool, &self.user_id, &self.session_id).await;
         cleanup_edge_registry(&self.pool, &self.user_id, &self.edge_agent_id).await;
         // Each bootstrap creates an isolated mock Offering. Remove it before

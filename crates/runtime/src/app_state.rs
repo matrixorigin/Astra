@@ -838,9 +838,17 @@ impl AppState {
         }
     }
 
-    /// Stop server-owned run tasks before removing their durable resources or
-    /// closing database pools. Returns whether the lifecycle reported a clean
-    /// drain/stop within `timeout`.
+    /// Passively drain server-owned run tasks before removing their durable
+    /// resources or closing database pools.
+    pub async fn drain_background_runs(&self, timeout: std::time::Duration) -> bool {
+        self.execution
+            .run_lifecycle_service
+            .drain_background_tasks(timeout)
+            .await
+    }
+
+    /// Abort server-owned run tasks after a preceding passive drain could not
+    /// settle them before shutdown.
     pub async fn stop_background_runs(&self, timeout: std::time::Duration) -> bool {
         self.execution
             .run_lifecycle_service

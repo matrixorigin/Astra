@@ -141,7 +141,8 @@ async fn unsupported_session_state_actions_are_rejected_on_cli_edge_executor() {
 
 #[tokio::test]
 async fn consolidated_github_create_issue_error_does_not_leak_helper_style_name() {
-    let executor = test_executor();
+    let mut executor = test_executor();
+    executor.github_token = Some("owner-scoped-test-token".to_string());
 
     let result = executor
         .execute(

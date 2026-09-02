@@ -861,7 +861,13 @@ pub fn bash_scope_requires_attribution_quarantine(
     command: &str,
     ownership: Option<astra_sandbox::ScopeOwnership>,
 ) -> bool {
-    !crate::workspace_observation::bash_command_is_detachable_safe(command)
+    // The union is the audited, fail-closed set of commands known not to
+    // mutate: cache-safe foreground reads plus the narrower harmless builtin /
+    // sleep shapes. Cache safety alone would conflate non-cacheability with
+    // mutation potential; detachable safety alone would reject ordinary
+    // foreground reads such as `ls`, `cat`, and `git log`.
+    !(crate::bash_cache_safety::bash_command_is_cache_safe(command)
+        || crate::workspace_observation::bash_command_is_detachable_safe(command))
         && ownership.is_some_and(|ownership| !ownership.is_authoritative())
 }
 
@@ -2224,7 +2230,7 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
         {
             ToolResult::text(target)
         } else {
-            ToolResult::text("No files found".into())
+            search_process_result("No files found".into(), 1, false, false)
         };
     }
 
@@ -2282,13 +2288,16 @@ pub async fn glob(ctx: &crate::ToolContext, args: &Value) -> ToolResult {
     sort_search_paths(&mut files, workspace_root, sort_mode);
 
     if files.is_empty() {
-        return ToolResult::text(no_visible_results_message(
-            "files",
+        // `rg --files -g <pattern>` may report process success even when its
+        // filtered output is empty.  The public tool contract still treats
+        // that domain outcome as a typed empty result.
+        let semantic_exit_code = if timed_out || cancelled { exit_code } else { 1 };
+        return search_process_result(
+            no_visible_results_message("files", timed_out, cancelled, stdout_capped, stderr.trim()),
+            semantic_exit_code,
             timed_out,
             cancelled,
-            stdout_capped,
-            stderr.trim(),
-        ));
+        );
     }
 
     let total_files = files.len();
@@ -5903,6 +5912,12 @@ printf 'probe.txt:1:needle\n'
             "printf harmless",
             weak
         ));
+        for command in ["ls", "cat README.md", "git log --oneline -1", "sleep 0.01"] {
+            assert!(
+                !bash_scope_requires_attribution_quarantine(command, weak),
+                "audited foreground reads must not poison later workspace operations: {command}"
+            );
+        }
         assert!(bash_scope_requires_attribution_quarantine(
             "python3 worker.py",
             weak

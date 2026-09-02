@@ -8951,7 +8951,8 @@ mod tests {
 
     #[tokio::test]
     async fn tool_search_select_github_resolves_on_cli_path() {
-        let executor = test_executor();
+        let mut executor = test_executor();
+        executor.github_token = Some("owner-scoped-test-token".to_string());
         let out = executor
             .execute(
                 "tool_search",

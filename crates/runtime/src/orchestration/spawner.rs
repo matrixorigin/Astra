@@ -1385,6 +1385,8 @@ pub struct DynamicAgentSpawner {
     #[cfg(test)]
     cancellation_capacity_override: Arc<std::sync::RwLock<Option<Arc<tokio::sync::Semaphore>>>>,
     #[cfg(test)]
+    cancellation_capacity_waiting_hook: Arc<std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>>,
+    #[cfg(test)]
     cancellation_retry_panic_after_dequeue: Arc<std::sync::atomic::AtomicBool>,
     /// Completion notifiers: `agent(action='get_result')` awaits these instead of polling.
     completion_notifiers: Arc<RwLock<HashMap<String, Arc<tokio::sync::Notify>>>>,
@@ -1584,6 +1586,8 @@ impl DynamicAgentSpawner {
             #[cfg(test)]
             cancellation_capacity_override: Arc::new(std::sync::RwLock::new(None)),
             #[cfg(test)]
+            cancellation_capacity_waiting_hook: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
             cancellation_retry_panic_after_dequeue: Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
             )),
@@ -1660,6 +1664,17 @@ impl DynamicAgentSpawner {
             .cancellation_capacity_override
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(capacity);
+    }
+
+    #[cfg(test)]
+    fn set_cancellation_capacity_waiting_hook_for_test(
+        &self,
+        waiting: Option<Arc<tokio::sync::Notify>>,
+    ) {
+        *self
+            .cancellation_capacity_waiting_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = waiting;
     }
 
     fn cancellation_capacity(&self) -> Arc<tokio::sync::Semaphore> {
@@ -1925,6 +1940,56 @@ impl DynamicAgentSpawner {
     ) -> DurableCancellationAttempt {
         let owner_changed = job.owner_changed.clone();
         let capacity = self.cancellation_capacity();
+        #[cfg(test)]
+        let _global_capacity = if let Some(waiting) = self
+            .cancellation_capacity_waiting_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            // Poll once so the test observes the real semaphore-contention
+            // boundary, not a proxy such as task scheduling or queue dequeue.
+            let acquire = capacity.acquire_owned();
+            tokio::pin!(acquire);
+            let first_poll =
+                std::future::poll_fn(|cx| match std::future::Future::poll(acquire.as_mut(), cx) {
+                    std::task::Poll::Ready(result) => std::task::Poll::Ready(Some(result)),
+                    std::task::Poll::Pending => {
+                        waiting.notify_one();
+                        std::task::Poll::Ready(None)
+                    }
+                })
+                .await;
+            match first_poll {
+                Some(permit) => {
+                    permit.expect("process-wide cancellation retry capacity must remain open")
+                }
+                None => tokio::select! {
+                    _ = self.background_task_shutdown.cancelled() => {
+                        return DurableCancellationAttempt::Shutdown;
+                    }
+                    _ = owner_changed.cancelled() => {
+                        return DurableCancellationAttempt::OwnerChanged;
+                    }
+                    permit = &mut acquire => {
+                        permit.expect("process-wide cancellation retry capacity must remain open")
+                    }
+                },
+            }
+        } else {
+            tokio::select! {
+                _ = self.background_task_shutdown.cancelled() => {
+                    return DurableCancellationAttempt::Shutdown;
+                }
+                _ = owner_changed.cancelled() => {
+                    return DurableCancellationAttempt::OwnerChanged;
+                }
+                permit = capacity.acquire_owned() => {
+                    permit.expect("process-wide cancellation retry capacity must remain open")
+                }
+            }
+        };
+        #[cfg(not(test))]
         let _global_capacity = tokio::select! {
             _ = self.background_task_shutdown.cancelled() => {
                 return DurableCancellationAttempt::Shutdown;
@@ -5659,6 +5724,10 @@ impl DynamicAgentSpawner {
             #[cfg(test)]
             cancellation_capacity_override: Arc::clone(&self.cancellation_capacity_override),
             #[cfg(test)]
+            cancellation_capacity_waiting_hook: Arc::clone(
+                &self.cancellation_capacity_waiting_hook,
+            ),
+            #[cfg(test)]
             cancellation_retry_panic_after_dequeue: Arc::clone(
                 &self.cancellation_retry_panic_after_dequeue,
             ),
@@ -8953,6 +9022,8 @@ mod tests {
         let shared_capacity = Arc::new(tokio::sync::Semaphore::new(1));
         first.set_cancellation_capacity_for_test(Arc::clone(&shared_capacity));
         second.set_cancellation_capacity_for_test(shared_capacity);
+        let second_waiting = Arc::new(tokio::sync::Notify::new());
+        second.set_cancellation_capacity_waiting_hook_for_test(Some(Arc::clone(&second_waiting)));
         for _ in 0..12 {
             let _ = launch_pending_child(&first, ROOT_RUN_ID).await;
         }
@@ -8982,7 +9053,9 @@ mod tests {
                 .await,
             1
         );
-        tokio::task::yield_now().await;
+        tokio::time::timeout(Duration::from_secs(1), second_waiting.notified())
+            .await
+            .expect("later session must reach the shared capacity queue");
         assert_eq!(
             second_executor
                 .started
