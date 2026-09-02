@@ -3,8 +3,10 @@
 # be reused.
 ARG RUST_VERSION=1.97.0-bookworm
 ARG CARGO_CHEF_VERSION=0.1.77
-ARG CARGO_REGISTRY=sparse+https://mirrors.ustc.edu.cn/crates.io-index/
-ARG DEBIAN_MIRROR=https://mirrors.aliyun.com
+# Optional build accelerators for restricted or regional networks. Public
+# builds use the upstream Cargo and Debian sources by default.
+ARG CARGO_REGISTRY
+ARG DEBIAN_MIRROR
 
 FROM rust:${RUST_VERSION} AS chef
 
