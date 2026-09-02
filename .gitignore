@@ -64,9 +64,16 @@ Thumbs.db
 
 # Env and secrets
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+!.env.*.example
+.npmrc
+.pypirc
+.netrc
 *.pem
+*.key
+*.p12
+*.pfx
 .secrets*
 *.yaml.bak
 
