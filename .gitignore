@@ -3,8 +3,11 @@
 
 .astra/
 
-# Kiro local state (MCP config + per-machine permission cache)
-.kiro/
+# Kiro project steering is tracked; ignore per-machine state and caches.
+.kiro/*
+!.kiro/steering/
+.kiro/steering/*
+!.kiro/steering/project-rules.md
 
 # Docker volumes (local data)
 deployment/all-in-one/data/
