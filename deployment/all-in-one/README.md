@@ -138,7 +138,10 @@ docker compose up -d
 | `matrixone`       | `26001`   | MatrixOne MySQL-compatible endpoint |
 | `matrixone` debug | `26060`   | MatrixOne debug/health endpoint     |
 
-`ASTRA_API_PORT` in `.env` controls the host-facing published port. The API container itself listens on `17001`.
+All published ports bind to `127.0.0.1` by default. `ASTRA_BIND_ADDRESS` changes
+that interface, and `ASTRA_API_PORT` controls the host-facing API port. The API
+container itself listens on `17001`. Do not use a non-loopback bind with the
+development credentials on an untrusted network.
 
 ## Images
 

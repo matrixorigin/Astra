@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ .Release.Name }}-api
-  namespace: {{ .Values.namespace }}
+  namespace: {{ .Release.Namespace }}
   labels:
     app: astra
     component: api
@@ -22,15 +22,24 @@ spec:
         app: astra
         component: api
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.api.podSecurityContext | nindent 8 }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       containers:
       - name: api
-        image: "{{ .Values.api.image.repository }}:{{ .Values.api.image.tag }}"
+        {{- if .Values.api.image.digest }}
+        image: "{{ .Values.api.image.repository }}@{{ .Values.api.image.digest }}"
+        {{- else }}
+        image: "{{ .Values.api.image.repository }}:{{ .Values.api.image.tag | default .Chart.AppVersion }}"
+        {{- end }}
         imagePullPolicy: {{ .Values.api.image.pullPolicy }}
         command: ["astra-server"]
+        securityContext:
+          {{- toYaml .Values.api.securityContext | nindent 10 }}
         ports:
         - containerPort: {{ .Values.api.port }}
           name: http
@@ -39,30 +48,24 @@ spec:
           value: "0.0.0.0"
         - name: ASTRA_API_PORT
           value: "{{ .Values.api.port }}"
-        {{- if .Values.matrixone.enabled }}
-        - name: MATRIXONE_HOST
-          value: "{{ .Release.Name }}-matrixone.{{ .Values.namespace }}.svc.cluster.local"
-        {{- else }}
-        - name: MATRIXONE_HOST
-          value: "{{ .Values.matrixone.external.host }}"
-        {{- end }}
-        - name: MATRIXONE_PORT
-          value: "{{ .Values.matrixone.external.port | default .Values.matrixone.port }}"
         {{- range $key, $val := .Values.api.env }}
         - name: {{ $key }}
           value: "{{ $val }}"
         {{- end }}
+        envFrom:
+        - secretRef:
+            name: {{ required "api.existingSecret is required" .Values.api.existingSecret }}
         resources:
           {{- toYaml .Values.api.resources | nindent 10 }}
         readinessProbe:
           httpGet:
-            path: /health
+            path: /ready
             port: http
           initialDelaySeconds: 5
           periodSeconds: 10
         livenessProbe:
           httpGet:
-            path: /health
+            path: /live
             port: http
           initialDelaySeconds: 15
           periodSeconds: 30
@@ -88,7 +91,7 @@ apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
   name: {{ .Release.Name }}-api-hpa
-  namespace: {{ .Values.namespace }}
+  namespace: {{ .Release.Namespace }}
 spec:
   scaleTargetRef:
     apiVersion: apps/v1

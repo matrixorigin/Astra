@@ -1,5 +1,9 @@
 # Production Deployment
 
+Production deployments run Astra Server against externally managed MatrixOne
+and Memoria services. Do not promote the development All-in-One stack, its
+embedded database credentials, or a mutable `latest` image into production.
+
 ## Before You Deploy
 
 ```bash
@@ -7,34 +11,51 @@ make check
 make test
 ```
 
-## All-in-One Compose
+Use an immutable Astra release tag or image digest and replace every
+`CHANGE_ME_*` value in `.env.production.example`. Inject the populated values
+through your deployment platform; never commit the resulting file.
+
+## Single Host
+
+The production Compose profile runs Astra Server behind Nginx. It does not
+start databases or memory services:
 
 ```bash
-make stack-env
-make stack-up-server-only
+cp .env.production.example .env.production
+# Edit .env.production and set external MatrixOne, Memoria, CORS, and secrets.
+
+cd deployment/all-in-one
+docker compose --env-file ../../.env.production \
+  -f docker-compose.prod.yml config --quiet
+docker compose --env-file ../../.env.production \
+  -f docker-compose.prod.yml up -d --scale api=3
 ```
 
-For host-local workspace tools in Web sessions:
+The API containers are reachable only through the Nginx service, so scaling
+does not create conflicting host ports. Terminate TLS at a trusted external
+load balancer or extend `nginx.conf` with your managed certificate before
+exposing the endpoint to users.
 
-```bash
-astra login
-ASTRA_EDGE_WORKSPACE_DIR=/path/to/repo make stack-up-server-edge
-```
+## Kubernetes
 
-For Kubernetes, install the API chart as server-only, then connect `astra-edge`
-as a separate provider process only for the workspaces or networks that should
-be exposed.
+The [Kubernetes guide](../../deployment/kubernetes/README.md) deploys the same
+Server-only boundary. It requires an existing namespace Secret for runtime
+configuration and does not install placeholder dependencies.
 
 ## Required Configuration
 
+- an immutable `ASTRA_IMAGE`
 - `ASTRA_TOKEN_ENCRYPTION_KEY`
 - `ASTRA_JWT_SECRET`
 - `ASTRA_RUNTIME_ROOT_SECRET`
-- `ASTRA_CORS_ORIGINS`
-- MatrixOne connection settings
-- `MEMORIA_BASE_URL` and `MEMORIA_MASTER_KEY`
-- any model/provider secrets you actually use
+- an explicit `ASTRA_CORS_ORIGINS`
+- external MatrixOne host, user, password, and database
+- external `MEMORIA_BASE_URL` and `MEMORIA_MASTER_KEY`
+- any model/provider credentials actually used
 
-Use `.env.production.example` as the starting point. Replace every
-`CHANGE_ME_*` value and inject secrets through your deployment platform rather
-than committing the populated file.
+## User Runners
+
+Keep workspace and private-network execution outside the Server deployment.
+Connect `astra-edge` as a separate User Runner only for the workspaces or
+networks that should be exposed, using a dedicated identity and token for each
+Runner boundary.

@@ -40,8 +40,8 @@ services:
     entrypoint: /entrypoint.sh
     command: []
     ports:
-      - "${MATRIXONE_PORT:-26001}:6001"
-      - "${MATRIXONE_DEBUG_HTTP_PORT:-26060}:6060"
+      - "${ASTRA_BIND_ADDRESS:-127.0.0.1}:${MATRIXONE_PORT:-26001}:6001"
+      - "${ASTRA_BIND_ADDRESS:-127.0.0.1}:${MATRIXONE_DEBUG_HTTP_PORT:-26060}:6060"
     volumes:
       - matrixone-data:/mo-data
       - ${MATRIXONE_LOG_DIR:-./data/matrixone/logs}:/mo-logs
@@ -68,7 +68,7 @@ services:
     hostname: memoria
     user: "${UID:-1000}:${GID:-1000}"
     ports:
-      - "${MEMORIA_PORT:-8100}:8100"
+      - "${ASTRA_BIND_ADDRESS:-127.0.0.1}:${MEMORIA_PORT:-8100}:8100"
     volumes:
       - ${MEMORIA_LOG_DIR:-./data/logs/memoria}:/var/log/memoria
     environment:
@@ -121,7 +121,7 @@ services:
     env_file: *astra-env-files
     ports:
       # ASTRA_API_PORT is the host-facing port. The container listens on 17001.
-      - "${ASTRA_API_PORT:-17001}:17001"
+      - "${ASTRA_BIND_ADDRESS:-127.0.0.1}:${ASTRA_API_PORT:-17001}:17001"
     environment:
       RUST_LOG: ${ASTRA_RUST_LOG:-info}
       ASTRA_API_HOST: 0.0.0.0

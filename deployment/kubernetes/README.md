@@ -1,124 +1,120 @@
 # Kubernetes Deployment
 
-Production deployment with Helm. All components except API are optional.
+The Helm chart deploys Astra Server as a stateless Kubernetes workload. It
+expects MatrixOne, Memoria, and provider credentials to be managed outside the
+chart and injected through an existing Kubernetes Secret.
 
-## Runtime Profiles
+This boundary is intentional: the chart installs only resources it actually
+owns. It does not create placeholder database, cache, inference, or worker
+services without corresponding workloads.
 
-The Kubernetes chart deploys the server runtime only. That is the right default
-for Web agent backbone features such as memory, planning, MCP, introspection,
-trace, audit, and server-service tools. It does not implicitly provide a
-workspace or process executor.
+## Runtime Profile
 
-Use server+edge only when Web sessions need capacity owned by a specific
-workspace or network boundary, such as local files, shell, git, private network
-access, or hardware attached to an edge host. Run `astra-edge` as a separate
-provider process with its own token and workspace binding, and point it at the
-cluster API endpoint. Do not hide it inside the API deployment; edge capacity is
-part of the provider set, not part of the server backbone.
+The chart is Server-only. Web agent, memory, planning, MCP, introspection,
+trace, audit, and server-service tools can run in this profile, but the Server
+does not gain implicit access to user files, shell, Git, private networks, or
+attached hardware.
 
-## Quick Start
+Connect `astra-edge` separately when a workspace needs a User Runner. Give each
+Runner its own identity, token, workspace binding, and network boundary; do not
+hide it inside the Server deployment.
 
-```bash
-# Server-only: API only (external DB + Redis)
-helm install astra ./chart \
-  --set matrixone.enabled=false \
-  --set matrixone.external.host=db.prod.internal \
-  --set redis.enabled=false \
-  --set redis.external.url=redis://redis.prod.internal:6379
+## Prerequisites
 
-# Server-only with in-cluster dependencies
-helm install astra ./chart
+- a currently supported Kubernetes cluster
+- Helm 3 or newer
+- reachable MatrixOne and Memoria services
+- an Astra runtime image accessible from the cluster
+- a namespace-scoped Secret containing runtime configuration
+
+## Create Runtime Configuration
+
+Create a local env file outside the repository and populate at least:
+
+```dotenv
+MATRIXONE_HOST=db.example.internal
+MATRIXONE_PORT=6001
+MATRIXONE_USER=astra
+MATRIXONE_PASSWORD=...
+ASTRA_DATABASE=astra_runtime
+ASTRA_JWT_SECRET=...
+ASTRA_TOKEN_ENCRYPTION_KEY=...
+ASTRA_RUNTIME_ROOT_SECRET=...
+ASTRA_CORS_ORIGINS=https://astra.example.com
+MEMORIA_BASE_URL=https://memoria.example.internal
+MEMORIA_MASTER_KEY=...
 ```
 
-## Components
+Create the namespace and Secret without committing that file:
 
-| Component | Default | Flag | Description |
-|-----------|---------|------|-------------|
-| API | ✅ Required | — | REST API, HPA 2-10 pods |
-| MatrixOne | [opt] | `matrixone.enabled` | In-cluster DB, or use external |
-| Redis | [opt] | `redis.enabled` | In-cluster Redis, or use external |
-| Model Server | [opt] | `modelServer.enabled` | Shared inference for platform-trained small models (NOT LLMs) |
-| Skill Worker | [opt] | `skillWorker.enabled` | K8s Jobs for heavy skills |
-| GPU | [opt] | `skillWorker.gpu.enabled` | GPU node selector + tolerations |
-| Ray | [opt] | `ray.enabled` | Distributed compute cluster |
+```bash
+kubectl create namespace astra
+kubectl -n astra create secret generic astra-runtime \
+  --from-env-file=/secure/path/astra-runtime.env
+```
 
-## Helm Values
+Model/provider configuration remains server-managed through `astra admin model
+add` and `astra admin model check` after the Server is available.
 
-See `chart/values.yaml` for all options. Key settings:
+## Install
+
+```bash
+helm upgrade --install astra ./chart \
+  --namespace astra \
+  --set api.existingSecret=astra-runtime
+```
+
+The default image is `matrixorigin/astra:<Chart.appVersion>`. Override the
+repository and tag for a private registry or pinned internal build:
+
+```bash
+helm upgrade --install astra ./chart \
+  --namespace astra \
+  --set api.existingSecret=astra-runtime \
+  --set api.image.repository=registry.example.com/platform/astra \
+  --set api.image.tag=0.1.0
+```
+
+For an immutable deployment, set `api.image.digest` to a `sha256:...` digest;
+when present, it takes precedence over the tag.
+
+Use `imagePullSecrets` when the registry requires authentication. Keep
+non-sensitive overrides in `api.env`; credentials belong in the existing
+Secret.
+
+## Verify
+
+```bash
+kubectl -n astra rollout status deployment/astra-api
+kubectl -n astra port-forward service/astra-api 17001:17001
+curl http://127.0.0.1:17001/health
+curl http://127.0.0.1:17001/live
+curl http://127.0.0.1:17001/ready
+```
+
+The liveness probe uses dependency-free `/live`; the readiness probe uses
+`/ready`, so dependency failures stop traffic without restarting a healthy
+Server process. `/health` remains the aggregate diagnostic view.
+
+## Scale
+
+The chart enables a CPU-based HorizontalPodAutoscaler by default, with two to
+ten replicas. Adjust its bounds in a values file:
 
 ```yaml
 api:
-  replicas: 2
   hpa:
-    enabled: true
-    maxReplicas: 10
-  resources:
-    requests:
-      cpu: "500m"
-      memory: "512Mi"
-
-matrixone:
-  enabled: true           # false → use external
-  external:
-    host: ""
-    port: 6001
-
-redis:
-  enabled: true           # false → use external
-  external:
-    url: ""
-
-modelServer:
-  enabled: false
-  replicas: 1
-
-skillWorker:
-  enabled: false
-  gpu:
-    enabled: false
-    nodeSelector:
-      accelerator: nvidia-gpu
-
-ray:
-  enabled: false
-  workers:
-    gpu:
-      replicas: 0
-    cpu:
-      minReplicas: 1
-      maxReplicas: 8
+    minReplicas: 3
+    maxReplicas: 20
+    targetCPUUtilization: 70
 ```
 
-## Examples
+Disable the HPA before controlling replicas directly:
 
 ```bash
-# Dev cluster: all in-cluster, no GPU
-helm install astra ./chart
-
-# Staging: external DB, model server enabled
-helm install astra ./chart \
-  --set matrixone.enabled=false \
-  --set matrixone.external.host=mo-staging.rds.internal \
-  --set modelServer.enabled=true
-
-# Production: external DB + Redis, GPU training, Ray
-helm install astra ./chart \
-  --set matrixone.enabled=false \
-  --set matrixone.external.host=mo-prod.rds.internal \
-  --set redis.enabled=false \
-  --set redis.external.url=redis://redis-prod.internal:6379 \
-  --set modelServer.enabled=true \
-  --set skillWorker.enabled=true \
-  --set skillWorker.gpu.enabled=true \
-  --set ray.enabled=true
-```
-
-## Scaling
-
-```bash
-# Scale API manually
-kubectl scale deployment astra-api --replicas=5
-
-# Or let HPA handle it (default: CPU 70%)
-# HPA auto-scales 2-10 pods based on CPU utilization
+helm upgrade astra ./chart \
+  --namespace astra \
+  --reuse-values \
+  --set api.hpa.enabled=false \
+  --set api.replicas=3
 ```

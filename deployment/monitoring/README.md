@@ -19,6 +19,7 @@ open http://localhost:3000  # Grafana
 ### Prometheus
 
 - **Port**: 9091
+- **Default bind address**: `127.0.0.1`
 - **Config**: `prometheus.yml`
 - **Data**: Stored in `prometheus-data` volume
 
@@ -31,6 +32,7 @@ open http://localhost:3000  # Grafana
 ### Grafana
 
 - **Port**: 3000
+- **Default bind address**: `127.0.0.1`
 - **Credentials**: `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD` from `.env`
 - **Dashboards**: Pre-configured in `dashboards/`
 
@@ -41,7 +43,7 @@ open http://localhost:3000  # Grafana
 
 ### Node Exporter
 
-- **Port**: 9100
+- **Network access**: internal to the monitoring Compose network
 - **Metrics**: System-level metrics (CPU, memory, disk, network)
 
 ## Configuration
@@ -176,7 +178,7 @@ curl http://localhost:17001/metrics
 
 ```bash
 # Check Grafana logs
-docker logs grafana
+docker compose logs grafana
 
 # Verify datasource connection
 # Grafana → Configuration → Data Sources → Prometheus → Test
@@ -198,7 +200,8 @@ docker compose up -d --scale prometheus=1 --memory=2g
 2. **Backup**: Regularly backup Prometheus data
 3. **Retention**: Set appropriate retention period (default: 15d)
 4. **Alerting**: Configure Alertmanager for critical alerts
-5. **Security**: Enable authentication and HTTPS
+5. **Security**: Keep the default loopback bindings, or place Prometheus and
+   Grafana behind an authenticated HTTPS reverse proxy before exposing them
 6. **High Availability**: Run multiple Prometheus instances
 
 ## See Also

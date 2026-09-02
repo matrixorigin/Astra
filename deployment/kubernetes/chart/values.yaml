@@ -1,12 +1,22 @@
-# ─── API Server (Required) ──────────────────────────────────
+# Astra Server image. An empty tag uses Chart.appVersion.
 api:
   replicas: 2
   image:
-    repository: astra-engine
-    tag: latest
+    repository: matrixorigin/astra
+    tag: ""
+    digest: ""
     pullPolicy: IfNotPresent
   port: 17001
-  workers: 2
+
+  # Name of an existing Secret whose keys are exposed to astra-server as
+  # environment variables. See deployment/kubernetes/README.md for the
+  # required keys. The chart deliberately does not create or store secrets.
+  existingSecret: ""
+
+  # Non-sensitive environment overrides only. Put credentials in
+  # api.existingSecret instead of committing them to values files.
+  env: {}
+
   resources:
     requests:
       cpu: "500m"
@@ -14,129 +24,26 @@ api:
     limits:
       cpu: "2"
       memory: "2Gi"
+
   hpa:
     enabled: true
     minReplicas: 2
     maxReplicas: 10
     targetCPUUtilization: 70
-  env: {}
-  # Extra env vars, e.g.:
-  #   JWT_SECRET: "change-me"
+
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop:
+        - ALL
+
   serverConfig:
     enabled: false
     content: ""
 
-# ─── MatrixOne [opt] ───────────────────────────────────────
-matrixone:
-  enabled: true
-  image:
-    repository: matrixorigin/matrixone
-    tag: latest
-  port: 6001
-  storage:
-    size: 100Gi
-    storageClass: ""
-  resources:
-    requests:
-      cpu: "2"
-      memory: "4Gi"
-    limits:
-      cpu: "8"
-      memory: "16Gi"
-  external:
-    host: ""
-    port: 6001
-    user: root
-    password: "111"
-    database: astra_runtime
-
-# ─── Redis [opt] ───────────────────────────────────────────
-redis:
-  enabled: true
-  image:
-    repository: redis
-    tag: 7.2-alpine
-  port: 6379
-  storage:
-    size: 10Gi
-    storageClass: ""
-  external:
-    url: ""
-
-# ─── Model Server [opt] ───────────────────────────────────
-modelServer:
-  enabled: false
-  replicas: 1
-  image:
-    repository: astra-engine
-    tag: infer
-  port: 9527
-  resources:
-    requests:
-      cpu: "1"
-      memory: "1Gi"
-    limits:
-      cpu: "4"
-      memory: "4Gi"
-  modelCache:
-    size: 10Gi
-    storageClass: ""
-
-# ─── Skill Worker [opt] ───────────────────────────────────
-skillWorker:
-  enabled: false
-  image:
-    repository: astra-engine
-    tag: train-gpu
-  gpu:
-    enabled: false
-    nodeSelector:
-      accelerator: nvidia-gpu
-    tolerations:
-      - key: "nvidia.com/gpu"
-        operator: "Exists"
-        effect: "NoSchedule"
-  resources:
-    requests:
-      cpu: "4"
-      memory: "8Gi"
-    limits:
-      cpu: "8"
-      memory: "16Gi"
-  # Job defaults
-  backoffLimit: 2
-  activeDeadlineSeconds: 7200
-
-# ─── Ray Cluster [opt] ────────────────────────────────────
-ray:
-  enabled: false
-  head:
-    resources:
-      cpu: "2"
-      memory: "4Gi"
-  workers:
-    gpu:
-      replicas: 0
-      resources:
-        cpu: "4"
-        memory: "8Gi"
-        nvidia.com/gpu: "1"
-    cpu:
-      minReplicas: 1
-      maxReplicas: 8
-      resources:
-        cpu: "2"
-        memory: "4Gi"
-
-# ─── Ingress [opt] ────────────────────────────────────────
-ingress:
-  enabled: false
-  className: nginx
-  host: astra.example.com
-  tls:
-    enabled: false
-    secretName: astra-tls
-
-# ─── Common ───────────────────────────────────────────────
-namespace: astra
 imagePullSecrets: []

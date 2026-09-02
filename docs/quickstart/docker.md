@@ -69,15 +69,16 @@ MEMORIA_EMBEDDING_API_KEY=...
 MEMORIA_EMBEDDING_BASE_URL=...
 
 # Host ports
+ASTRA_BIND_ADDRESS=127.0.0.1
 ASTRA_API_PORT=17001
 MEMORIA_PORT=8100
 MATRIXONE_PORT=26001
 MATRIXONE_DEBUG_HTTP_PORT=26060
 ```
 
-`ASTRA_API_PORT` is the public host port for the all-in-one stack. The API
-container itself listens on `17001`, so changing this value remaps the host port
-without changing the in-container listener.
+Development ports bind to loopback by default. `ASTRA_BIND_ADDRESS` selects the
+host interface, and `ASTRA_API_PORT` remaps the API port without changing the
+in-container listener on `17001`.
 
 See [Configuration Reference](../reference/configuration.md) for all options.
 
@@ -191,22 +192,11 @@ docker compose up -d
 
 ## Production Considerations
 
-### Resource Limits
+### Production Profile
 
-Add resource limits in `docker-compose.prod.yml`:
-
-```yaml
-services:
-  api:
-    deploy:
-      resources:
-        limits:
-          cpus: '2'
-          memory: 4G
-        reservations:
-          cpus: '1'
-          memory: 2G
-```
+Do not promote the development stack directly. The production Compose profile
+uses published images, includes resource limits, and requires external
+MatrixOne and Memoria services. See the [production guide](production.md).
 
 ### Persistent Data
 

@@ -9,7 +9,7 @@ scrape_configs:
   # astra API metrics
   - job_name: 'astra-api'
     static_configs:
-      - targets: ['host.docker.internal:9090']
+      - targets: ['host.docker.internal:17001']
         labels:
           service: 'api'
     metrics_path: '/metrics'

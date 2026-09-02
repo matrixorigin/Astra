@@ -7,7 +7,7 @@ Interactive docs: `http://localhost:17001/docs` (Swagger UI) | `http://localhost
 ## Authentication
 
 All protected endpoints require a JWT. The public authentication exceptions
-are `/health`, `/auth/register`, `/auth/login`, `/auth/refresh`, and
+are `/live`, `/ready`, `/health`, `/auth/register`, `/auth/login`, `/auth/refresh`, and
 `/auth/logout` (refresh/logout authenticate the supplied refresh token):
 
 ```
@@ -251,10 +251,38 @@ Full audit: decision + linked context snapshot + source events.
 
 ## Health
 
-### GET /health
+### GET /live
+
+Dependency-free process liveness. Returns `200` while the Server process can
+serve HTTP, even when an external dependency is unavailable.
 
 ```json
-{"status": "healthy", "database": "connected"}
+{"status": "alive"}
+```
+
+### GET /ready
+
+Traffic readiness. Returns `200` when the database is healthy and `503` when
+the replica should be removed from service routing.
+
+```json
+{"status": "ready", "database": "connected"}
+```
+
+### GET /health
+
+Aggregate diagnostic state, including optional Memoria degradation and build
+identity. This endpoint is for observation; use `/live` and `/ready` for
+orchestrator probes.
+
+```json
+{
+  "status": "healthy",
+  "database": "connected",
+  "memoria": "available",
+  "interaction_api_major": "3",
+  "build_git_sha": "0123456789abcdef0123456789abcdef01234567"
+}
 ```
 
 ## Error Format
