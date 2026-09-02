@@ -21,6 +21,11 @@ ARG IMAGE_BRANCH=unknown
 
 LABEL org.opencontainers.image.title="Astra" \
       org.opencontainers.image.description="Astra API server and CLI runtime image (prebuilt)" \
+      org.opencontainers.image.url="https://github.com/matrixorigin/Astra" \
+      org.opencontainers.image.source="https://github.com/matrixorigin/Astra" \
+      org.opencontainers.image.documentation="https://github.com/matrixorigin/Astra#readme" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.vendor="MatrixOrigin" \
       org.opencontainers.image.version="${IMAGE_VERSION}" \
       org.opencontainers.image.revision="${IMAGE_REVISION}" \
       org.opencontainers.image.ref.name="${IMAGE_BRANCH}"
