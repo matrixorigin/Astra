@@ -1,11 +1,16 @@
 # Context and prompt
 
 > Status: target design contract.
-> Last updated: 2026-07-07.
+> Last updated: 2026-09-02.
 
 Context and prompt owns context assembly, prompt-cache stability, dynamic state blocks, compaction, and memory injection boundaries. It does not own provider routing or tool execution.
 
 This document defines the target behavior that implementation should converge toward.
+
+The database-inspired foundation for this design is described in
+[ContextPipe: Database-Inspired Context Assembly for Long-Horizon
+Agents](https://arxiv.org/abs/2609.00749), accepted at
+[ADS 2026](https://vldb-ads.top/#program), co-located with VLDB 2026.
 
 ## Principle
 

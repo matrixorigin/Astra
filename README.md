@@ -8,7 +8,8 @@
 
 [![Test Suite](https://github.com/matrixorigin/astra/actions/workflows/test.yml/badge.svg)](https://github.com/matrixorigin/astra/actions/workflows/test.yml)
 [![Static Checks](https://github.com/matrixorigin/astra/actions/workflows/static-checks.yml/badge.svg)](https://github.com/matrixorigin/astra/actions/workflows/static-checks.yml)
-[![VLDB ADS](https://img.shields.io/badge/VLDB_ADS-Accepted-6F42C1)](#research-and-benchmarks)
+[![VLDB ADS](https://img.shields.io/badge/VLDB_ADS-Accepted-6F42C1)](https://vldb-ads.top/)
+[![arXiv](https://img.shields.io/badge/arXiv-2609.00749-B31B1B?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2609.00749)
 [![Terminal-Bench](https://img.shields.io/badge/Terminal--Bench-Results_coming_soon-0A7EA4)](#research-and-benchmarks)
 [![Rust 1.97](https://img.shields.io/badge/Rust-1.97-000000?logo=rust)](rust-toolchain.toml)
 [![TypeScript](https://img.shields.io/badge/SDK-TypeScript-3178C6?logo=typescript&logoColor=white)](packages/sdk)
@@ -317,9 +318,10 @@ The Runner contributes bounded capacity, not a second agent brain:
 
 ### Context Pipeline
 
-The Context Pipeline is a core Astra kernel contribution and a central subject
-of the Astra paper. It treats context as a governed, recoverable data
-pipeline—not one indefinitely growing prompt string.
+The Context Pipeline is a core Astra kernel contribution described in
+[ContextPipe](https://arxiv.org/abs/2609.00749), Astra's systems paper accepted
+at ADS 2026, co-located with VLDB 2026. It treats context as a governed,
+recoverable data pipeline—not one indefinitely growing prompt string.
 
 ```text
 System contract ──────────┐
@@ -444,20 +446,21 @@ enterprise products.
 
 ## Research and benchmarks
 
-Astra's agent kernel is the subject of a systems research paper accepted at
-**VLDB ADS**. The paper describes durable agent execution, the Context
-Pipeline, and the separation of shared agent semantics from execution capacity.
+Astra's Context Pipeline is presented in
+**[ContextPipe: Database-Inspired Context Assembly for Long-Horizon
+Agents](https://arxiv.org/abs/2609.00749)**. ContextPipe applies database-system
+ideas to agent context assembly through a five-phase pipeline—Plan, Bind,
+Optimize, Execute, and Feedback—with structured data sources, deterministic
+cache-aware optimization, and an EXPLAIN ANALYZE trace.
 
-| Publication | Venue | Status | Links |
+| Authors | Venue | Status | Paper |
 | --- | --- | --- | --- |
-| Astra agent kernel paper *(title to be added)* | VLDB ADS | **Accepted** | Paper coming soon · Conference page coming soon |
+| Peng Xu, Zuyu Zhang, Yuze Sun, Feng Tian, Long Wang, Chen Zhang | [ADS 2026](https://vldb-ads.top/), co-located with VLDB 2026 | **[Accepted — official program](https://vldb-ads.top/#program)** | [arXiv abstract](https://arxiv.org/abs/2609.00749) · [PDF](https://arxiv.org/pdf/2609.00749) |
 
-<!--
-Research placeholders:
-- ASTRA_PAPER_TITLE
-- ASTRA_PAPER_URL
-- VLDB_ADS_URL
--->
+In a preliminary evaluation on the SWE-bench Pro Qutebrowser subset,
+ContextPipe reduced total token volume by **31%**, LLM calls by **23%**, and
+response time by **9%** compared with append-only context construction, with a
+lower KV cache-hit ratio as the measured tradeoff.
 
 ### Terminal-Bench
 
