@@ -5,7 +5,7 @@
 > **范围**：认证与租户隔离、Cloud 运行时、资源治理、Admin 运维、多客户端协议、部署拓扑、可观测性与安全。
 >
 > **说明**：本文聚焦 **SaaS 发布质量验证**，不涉及 CI 流水线或 PR 门禁；**专门刻画 SaaS 形态下的必测项**。
-> **相关文档**：[部署架构](../design/deployment-architecture.md) · [Edge-Cloud 分执行](../design/edge-cloud-execution.md) · [多 Agent Cloud Runtime](../design/multi-agent-cloud-runtime.md) · [信任与安全](../design/trust-and-safety.md) · [系统 E2E 矩阵](./system-e2e-matrix.md)
+> **相关文档**：[客户端与部署](../design/client-surfaces-and-deployment.md) · [Edge-Cloud 分执行](../design/edge-cloud-execution.md) · [多 Agent Runtime](../design/multi-agent-runtime.md) · [信任与安全](../design/trust-and-safety.md) · [系统 E2E 矩阵](./system-e2e-matrix.md)
 
 ---
 
@@ -149,7 +149,7 @@ SaaS 必须支持 **无终端后台任务**（Thin Client 只发 HTTP）：
 | 断网后重连 | 增量补齐；无 duplicate events |
 | 跨设备恢复 Session | Cloud 为 source of truth |
 
-详见 [sync_protocol.md](../sync_protocol.md)。
+详见 [Edge-Cloud 同步架构](../architecture/edge-cloud-sync-architecture.md)。
 
 ---
 

@@ -659,5 +659,5 @@ and their migration status towards TUI-native panels.
 ## See Also
 
 - [CLI Commands Reference](./cli-commands.md) — `astra` and `astra admin` CLI commands
-- [Skill Development Guide](../guides/skill-development.md) — Creating custom skills
-- [MCP Integration](../guides/mcp-integration.md) — Adding MCP servers
+- [Skills and tools](../design/skills-and-tools.md) — Skill structure and tool boundaries
+- [Capability provider runtime](../design/capability-provider-runtime.md) — Built-in, Edge, and MCP provider contracts

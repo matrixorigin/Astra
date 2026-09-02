@@ -28,7 +28,7 @@ This document catalogs **what** we care to verify and **how** we verify it witho
 | Code path | Uses `tryRefreshToken` on 401? | Offline | Online |
 |-----------|-------------------------------|---------|--------|
 | `this.fetch` / `post` / `put` (JSON) | Yes | `client.test.ts` ("auto-refresh on 401"), `real-world-scenarios` (`getSession`) | `getMe` with `ASTRA_SDK_ACCESS_TOKEN` or after login |
-| `getRunEvents` (buffered run stream) | Yes — custom `fetch` + retry in [`client.ts`](../src/client.ts) | Scenario: 401 → refresh → second 200 with SSE body | Optional: same against live API when token expires (hard to force; use refresh path offline) |
+| `getRunEvents` (buffered run stream) | Yes — custom `fetch` + retry in [`client.ts`](src/client.ts) | Scenario: 401 → refresh → second 200 with SSE body | Optional: same against live API when token expires (hard to force; use refresh path offline) |
 | `streamChat` / `SSEClient` | **No** auto-refresh in current SDK | Do not test 401 refresh on stream; document only | N/A until product adds it |
 
 ---
