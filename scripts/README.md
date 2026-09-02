@@ -152,3 +152,6 @@ Keep installer behavior there so the public install path, documentation, and rel
 
 ### `scripts/ops/*.sh`
 Operational helpers for health checks, backup/restore, and deployment.
+`deploy.sh [api-replicas]` validates and starts the canonical production
+Compose profile using root `.env.production` (override the path with
+`ASTRA_PRODUCTION_ENV_FILE`).

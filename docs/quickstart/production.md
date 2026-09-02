@@ -31,6 +31,13 @@ docker compose --env-file ../../.env.production \
   -f docker-compose.prod.yml up -d --scale api=3
 ```
 
+From the repository root, the checked-in helper performs the same validation
+and startup without parsing the environment file in the shell:
+
+```bash
+./scripts/ops/deploy.sh 3
+```
+
 The API containers are reachable only through the Nginx service, so scaling
 does not create conflicting host ports. Terminate TLS at a trusted external
 load balancer or extend `nginx.conf` with your managed certificate before

@@ -1,41 +1,41 @@
-#!/bin/bash
-# Production deployment script
+#!/usr/bin/env bash
+# Deploy the production Compose profile from the repository's canonical assets.
 
-set -e
+set -euo pipefail
 
-echo "🚀 Deploying Agent Engine API..."
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+COMPOSE_FILE="${REPO_ROOT}/deployment/all-in-one/docker-compose.prod.yml"
+ENV_FILE="${ASTRA_PRODUCTION_ENV_FILE:-${REPO_ROOT}/.env.production}"
+API_REPLICAS="${1:-${ASTRA_API_REPLICAS:-1}}"
 
-# 1. Check environment
-if [ ! -f .env.production ]; then
-    echo "❌ Error: .env.production not found"
-    echo "   Copy .env.production.example and configure it"
+if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
+    echo "Error: Docker with the Compose plugin is required." >&2
     exit 1
 fi
 
-# 2. Load environment
-export $(cat .env.production | grep -v '^#' | xargs)
-
-# 3. Run tests
-echo "Running repository validation..."
-if command -v cargo >/dev/null 2>&1 && [ -f Cargo.toml ]; then
-    make check && make test || {
-        echo "❌ Validation failed. Aborting deployment."
-        exit 1
-    }
-else
-    echo "⚠️  cargo not available on this host; ensure artifacts were validated in CI before deployment."
+if [ ! -f "${ENV_FILE}" ]; then
+    echo "Error: production environment file not found: ${ENV_FILE}" >&2
+    echo "Create it with: cp ${REPO_ROOT}/.env.production.example ${REPO_ROOT}/.env.production" >&2
+    exit 1
 fi
 
-# 4. Database migration (if needed)
-echo "Checking database..."
-# Add migration logic here if needed
+case "${API_REPLICAS}" in
+    ''|*[!0-9]*|0)
+        echo "Error: API replica count must be a positive integer (got: ${API_REPLICAS})." >&2
+        exit 1
+        ;;
+esac
 
-# 5. Start API server
-echo "Starting API server..."
-echo "  Host: ${ASTRA_API_HOST:-0.0.0.0}"
-echo "  Port: ${ASTRA_API_PORT:-17001}"
+compose() {
+    docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" "$@"
+}
 
-ASTRA_API_HOST="${ASTRA_API_HOST:-0.0.0.0}" ASTRA_API_PORT="${ASTRA_API_PORT:-17001}" \
-    astra-server
+echo "Validating production configuration..."
+compose config --quiet
 
-echo "✅ Deployment complete!"
+echo "Starting Astra Server behind Nginx (${API_REPLICAS} API replica(s))..."
+compose up -d --scale api="${API_REPLICAS}"
+
+echo "Deployment started. Inspect it with:"
+echo "  docker compose --env-file ${ENV_FILE} -f ${COMPOSE_FILE} ps"
