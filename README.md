@@ -10,12 +10,12 @@
 [![Static Checks](https://github.com/matrixorigin/astra/actions/workflows/static-checks.yml/badge.svg)](https://github.com/matrixorigin/astra/actions/workflows/static-checks.yml)
 [![VLDB ADS](https://img.shields.io/badge/VLDB_ADS-Accepted-6F42C1)](https://vldb-ads.top/)
 [![arXiv](https://img.shields.io/badge/arXiv-2609.00749-B31B1B?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2609.00749)
-[![Terminal-Bench](https://img.shields.io/badge/Terminal--Bench-Results_coming_soon-0A7EA4)](#research-and-benchmarks)
+[![Terminal-Bench](https://img.shields.io/badge/Terminal--Bench_2.1-67.4%25-0A7EA4)](#terminal-bench-21)
 [![Rust 1.97](https://img.shields.io/badge/Rust-1.97-000000?logo=rust)](rust-toolchain.toml)
 [![TypeScript](https://img.shields.io/badge/SDK-TypeScript-3178C6?logo=typescript&logoColor=white)](packages/sdk)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-[Why Astra](#why-astra) · [Quick start](#quick-start) · [Architecture](#architecture) · [Enterprise](#enterprise-agents-by-design) · [Runner](#runner-and-private-enterprise-it) · [Research](#research-and-benchmarks) · [Docs](#documentation)
+[Why Astra](#why-astra) · [Research](#research-and-benchmarks) · [Quick start](#quick-start) · [Architecture](#architecture) · [Runner](#runner-and-private-enterprise-it) · [Comparison](#how-astra-differs-from-coding-agents) · [Docs](#documentation)
 
 </div>
 
@@ -92,6 +92,45 @@ tools, data, network, and credentials.
 If your use case is one stateless model call, a direct LLM API is usually
 simpler. Astra is designed for the point where state, tools, permissions,
 recovery, collaboration, or operational control become part of the product.
+
+## Research and benchmarks
+
+### ContextPipe
+
+**[ContextPipe: Database-Inspired Context Assembly for Long-Horizon
+Agents](https://arxiv.org/abs/2609.00749)** presents Astra's Context Pipeline as
+a five-phase system—Plan, Bind, Optimize, Execute, and Feedback—with structured
+data sources, deterministic cache-aware optimization, and an EXPLAIN ANALYZE
+trace.
+
+Peng Xu, Zuyu Zhang, Yuze Sun, Feng Tian, Long Wang, and Chen Zhang ·
+**[Accepted at ADS 2026](https://vldb-ads.top/#program)**, co-located with VLDB
+2026 · [arXiv](https://arxiv.org/abs/2609.00749) ·
+[PDF](https://arxiv.org/pdf/2609.00749)
+
+In a preliminary evaluation on the SWE-bench Pro Qutebrowser subset,
+ContextPipe reduced total token volume by **31%**, LLM calls by **23%**, and
+response time by **9%** compared with append-only context construction, with a
+lower KV cache-hit ratio as the measured tradeoff.
+
+### Terminal-Bench 2.1
+
+[Terminal-Bench](https://github.com/harbor-framework/terminal-bench) evaluates
+agents on difficult, realistic terminal tasks. Across its 89 tasks, **Astra
+ranks first with 60 verifier-passing results (67.42%)**.
+
+> **Model:** GLM-5.2 for every agent in the comparison.
+
+| Agent | Overall | Easy | Medium | Hard |
+| --- | ---: | ---: | ---: | ---: |
+| **Astra** | **60 / 89 (67.42%)** | 4 / 4 (100%) | **42 / 55 (76.36%)** | 14 / 30 (46.67%) |
+| Pi | 54 / 89 (60.67%) | 4 / 4 (100%) | 36 / 55 (65.45%) | 14 / 30 (46.67%) |
+| Hermes | 51 / 89 (57.30%) | 4 / 4 (100%) | 32 / 55 (58.18%) | **15 / 30 (50.00%)** |
+| DeepSeek Harness (DSH) | 48 / 89 (53.93%) | 4 / 4 (100%) | 31 / 55 (56.36%) | 13 / 30 (43.33%) |
+
+Astra's lead is clearest on the 55 medium-difficulty tasks: it passes six more
+than Pi, ten more than Hermes, and eleven more than DSH. On hard tasks, Astra
+ties Pi, finishes one task behind Hermes, and one ahead of DSH.
 
 ## Quick start
 
@@ -257,14 +296,10 @@ Durable facts
   MatrixOne · Memoria · transcript · artifacts · checkpoints · trace · audit
 ```
 
-The architecture has one runtime and four cooperating system planes:
-
-| Plane | Responsibility | Astra components |
-| --- | --- | --- |
-| **Intelligence** | Assemble the right task and enterprise context | Context Pipeline, memory, artifacts, provider state, compression |
-| **Control** | Own durable Work and decide what is allowed | Server, Agent Kernel, identity, Policy, provider admission |
-| **Execution** | Perform actions in the environment that owns the capability | Server capacity, User Runners deployed CLI-local or at Edge, MCP, sandbox |
-| **Evidence** | Preserve facts and turn them into operational understanding | Trace, Introspect, Explain, Reflect, Audit |
+One lifecycle connects four system planes: **Intelligence** assembles context,
+**Control** owns durable Work and policy, **Execution** supplies bounded
+capacity, and **Evidence** preserves facts and turns them into operational
+understanding.
 
 ### One runtime from CLI to Server to Edge
 
@@ -305,29 +340,40 @@ erasing the session, plan, memory, or server-side Work. Read the
 [agent-backbone contract](docs/design/agent-backbone-capacity-provider.md) for
 the complete design.
 
-## Enterprise agents, by design
+## How Astra differs from coding agents
 
-An enterprise agent is not a personal copilot moved onto a company server. It
-must operate across users, teams, applications, data domains, and execution
-environments while preserving identity, policy, evidence, and operational
-control. Astra separates durable coordination from concrete execution so each
-can live in the right trust boundary.
+[Claude Code](https://code.claude.com/docs/en/getting-started),
+[Codex](https://developers.openai.com/codex),
+[Pi](https://pi.dev/docs/latest), and
+[DeepSeek Harness](https://www.deepseek.com/harness/en/) are strong systems for
+interactive coding or composing an agent harness. Astra expands the boundary
+from one coding loop to an enterprise-owned runtime across users, applications,
+private environments, and trust boundaries.
 
-> **Centralize control. Distribute execution. Preserve evidence.**
+> **Models decide. Runners act. Astra governs and traces the entire loop.**
 
-| Enterprise requirement | Astra design |
-| --- | --- |
-| Durable business work | Sessions, Work, task graphs, checkpoints, artifacts, and typed terminal states survive client disconnects |
-| Governed intelligence | Context assembly, model routing, provider health, credentials, pricing, fallback, and usage policy are managed independently of Work state |
-| Private IT execution | User Runners bring bounded execution to existing workspaces, enterprise networks, tools, and data without giving the Server ambient machine authority |
-| Identity and human control | Scoped identities, permissions, plan mode, approvals, pause, resume, cancel, and explicit blocked states keep people in control |
-| Enterprise integration | MCP, request-scoped providers, HTTP, SSE, WebSocket, and the TypeScript SDK join the same runtime semantics |
-| Accountability and resilience | Trace, audit, retries, reconnects, degraded states, health checks, and OpenTelemetry support production operation |
+| System | Primary design center | Astra's distinction |
+| --- | --- | --- |
+| Claude Code | Developer-facing coding agent across terminal, IDE, tools, and enterprise model endpoints | Astra makes the durable enterprise runtime—not one coding surface—the system of record |
+| Codex | Coding agent across local, cloud, IDE, automation, and integration surfaces | Astra is model-provider independent and centers self-hosted backbone state, User Runners, and governed providers |
+| Pi | Minimal terminal coding harness extended through TypeScript packages, skills, prompts, and themes | Astra centers a distributed Server/Runner architecture, durable Work, enterprise identity, and operations |
+| DeepSeek Harness | Plugin-first harness with composable capabilities, runtime modes, and a traceable session log | Astra centers canonical lifecycle state, cross-user control, provider decisions, and user-bound execution |
+| **Astra** | **Enterprise context-to-execution runtime** | **One durable backbone connecting governed context to execution across Web, CLI, Server, Edge, MCP, sandboxes, and User Runners** |
 
-This lets an enterprise own one agent runtime without centralizing every tool,
-credential, dataset, and execution environment. Context and governance remain
-coherent at the Server, execution authority stays with the environment that
-owns the capability, and the resulting facts return to one durable Trace.
+The distinction is architectural:
+
+- **The enterprise owns durable Work** — identity, tasks, model routes, policy,
+  trace, and audit live in an operable system of record.
+- **Context is a pipeline** — structured inputs are assembled, budgeted,
+  compressed, traced, and recovered as runtime state.
+- **Execution follows authority** — Server, User Runner, MCP, and sandbox
+  capacity is explicitly bound, admitted, routed, and governed.
+- **Every surface shares semantics** — Web, TUI, SDK, and Runner-backed
+  sessions use the same lifecycle, failure, and evidence model.
+
+Coding is an important Astra workload, but it is not the product boundary.
+Astra is designed to be self-hosted, embedded, extended, and exposed through
+enterprise products.
 
 ## Core runtime systems
 
@@ -409,18 +455,11 @@ Each decision considers identity, mode, side-effect class, permission scope,
 workspace authority, provider binding and health, runtime location, fallback
 policy, and result quality. The outcome drives the model-visible tool surface,
 execution route, user diagnostics, trace, and audit.
-
-| Outcome | Meaning |
-| --- | --- |
-| `Ready` | The provider is bound, healthy, and admitted now |
-| `PolicyBlocked` | The capability exists, but current policy or mode rejects the call |
-| `MissingRuntimeBinding` | A provider contract exists, but no executable runtime is attached |
-| `ProviderOffline` | The selected User Runner or provider is disconnected |
-| `Unsupported` | No provider owns the requested capability in this deployment |
-| `FallbackSelected` | Policy approved a different provider and recorded why |
-
-A narrow capability failure blocks that action rather than erasing the whole
-session or pretending the capability never existed.
+Ready, policy-blocked, unbound, offline, unsupported, and fallback outcomes are
+explicit runtime facts. A narrow capability failure blocks that action rather
+than erasing the session or pretending the capability never existed. See the
+[capability contract](docs/design/capability-system.md) for the full state
+model.
 
 ### Runner and private enterprise IT
 
@@ -469,15 +508,11 @@ remain explicit deployment and policy choices.
 
 The Runner contributes bounded execution capacity, not a second agent brain:
 
-- registration and dispatch remain bound to user, Runner, and workspace identity;
-- advertised capabilities replace implicit server access to the user's machine;
-- permissions and safety checks remain enforced at the execution boundary;
-- private tools and systems can be reached through the capabilities already
-  available within that environment;
-- heartbeat, reconnect, journals, and result reconciliation make disconnects
-  observable and recoverable;
-- results join the same transcript, task, trace, audit, and checkpoint model as
-  server and MCP providers.
+- registration and dispatch stay bound to user, Runner, and workspace identity;
+- explicit capabilities replace implicit Server access to the user's machine;
+- permissions remain enforced where execution occurs;
+- heartbeats, journals, reconnects, and reconciliation make results observable,
+  recoverable, and part of the same transcript, trace, audit, and checkpoints.
 
 ### Trace, Introspect, Explain, Reflect, and Audit
 
@@ -502,102 +537,6 @@ Policy decisions ───┴─────────────► Audit
 Reflection cannot rewrite runtime truth, Explain does not expose private
 chain-of-thought, and debug output is not automatically an audit record.
 
-## How Astra differs from coding agents
-
-[Claude Code](https://code.claude.com/docs/en/getting-started),
-[Codex](https://developers.openai.com/codex),
-[Pi](https://pi.dev/docs/latest), and
-[DeepSeek Harness](https://www.deepseek.com/harness/en/) are strong systems for
-interactive coding or composing an agent harness. Astra expands the design
-boundary from one interactive coding loop to an enterprise-owned runtime
-across agents, users, applications, and environments. It starts with a
-different question:
-
-> **How can an enterprise own and operate durable agents across users,
-> applications, private IT environments, and trust boundaries—from context to
-> execution?**
-
-> **Models decide. Runners act. Astra governs and traces the entire loop.**
-
-| System | Primary design center | Astra's distinction |
-| --- | --- | --- |
-| Claude Code | Developer-facing coding agent across terminal, IDE, tools, and enterprise model endpoints | Astra makes the durable enterprise runtime—not one coding surface—the system of record |
-| Codex | Coding agent across local, cloud, IDE, automation, and integration surfaces | Astra is model-provider independent and centers self-hosted backbone state, User Runners, and governed providers |
-| Pi | Minimal terminal coding harness extended through TypeScript packages, skills, prompts, and themes | Astra centers a distributed Server/Runner architecture, durable Work, enterprise identity, and operations |
-| DeepSeek Harness | Plugin-first harness with composable capabilities, runtime modes, and a traceable session log | Astra centers canonical lifecycle state, cross-user control, provider decisions, and user-bound execution |
-| **Astra** | **Enterprise context-to-execution runtime** | **One durable backbone connecting governed context to execution across Web, CLI, Server, Edge, MCP, sandboxes, and User Runners** |
-
-The comparison is about architectural emphasis, not whether another system can
-implement an individual feature. Astra's durable distinctions are:
-
-- **The enterprise owns the runtime** — identity, Work, tasks, provider
-  bindings, model routes, trace, and audit live in an operable system.
-- **Context is a pipeline, not accumulated prompt history** — structured inputs
-  are assembled, budgeted, compressed, traced, and recovered as runtime state.
-- **Work is more than chat history** — goals, attempts, verification, delivery,
-  checkpoints, and resumability are canonical state.
-- **Execution follows authority** — User Runner, Server, MCP, and sandbox
-  capacity is explicitly bound, admitted, routed, and governed; Runners bring
-  actions to private environments without turning the Server into an ambient
-  superuser.
-- **Every surface shares semantics** — Web, TUI, SDK, and Runner-backed sessions
-  see the same lifecycle, failure, and evidence model.
-- **Models are replaceable; governance is not** — model routes can change
-  without changing identity, Work history, policy, or evidence.
-
-Coding is an important Astra workload, but it is not the product boundary.
-Astra is designed to be self-hosted, embedded, extended, and exposed through
-enterprise products.
-
-## Research and benchmarks
-
-Astra's Context Pipeline is presented in
-**[ContextPipe: Database-Inspired Context Assembly for Long-Horizon
-Agents](https://arxiv.org/abs/2609.00749)**. ContextPipe applies database-system
-ideas to agent context assembly through a five-phase pipeline—Plan, Bind,
-Optimize, Execute, and Feedback—with structured data sources, deterministic
-cache-aware optimization, and an EXPLAIN ANALYZE trace.
-
-| Authors | Venue | Status | Paper |
-| --- | --- | --- | --- |
-| Peng Xu, Zuyu Zhang, Yuze Sun, Feng Tian, Long Wang, Chen Zhang | [ADS 2026](https://vldb-ads.top/), co-located with VLDB 2026 | **[Accepted — official program](https://vldb-ads.top/#program)** | [arXiv abstract](https://arxiv.org/abs/2609.00749) · [PDF](https://arxiv.org/pdf/2609.00749) |
-
-In a preliminary evaluation on the SWE-bench Pro Qutebrowser subset,
-ContextPipe reduced total token volume by **31%**, LLM calls by **23%**, and
-response time by **9%** compared with append-only context construction, with a
-lower KV cache-hit ratio as the measured tradeoff.
-
-### Terminal-Bench
-
-[Terminal-Bench](https://github.com/harbor-framework/terminal-bench) evaluates
-agents on difficult, realistic terminal tasks. Astra has a first-party Harbor
-adapter and a scored-run contract designed for reproducible comparisons.
-
-| Harness | Version / commit | Model snapshot | Benchmark release | Score | Artifacts |
-| --- | --- | --- | --- | ---: | --- |
-| **Astra** | Coming soon | Coming soon | Coming soon | **Coming soon** | Report · trajectories · logs coming soon |
-| Claude Code | Coming soon | Coming soon | Coming soon | Coming soon | Coming soon |
-| Codex | Coming soon | Coming soon | Coming soon | Coming soon | Coming soon |
-| Pi | Coming soon | Coming soon | Coming soon | Coming soon | Coming soon |
-| DeepSeek Harness | Coming soon | Coming soon | Coming soon | Coming soon | Coming soon |
-
-<!--
-Terminal-Bench placeholders:
-- TERMINAL_BENCH_REPORT_URL / TERMINAL_BENCH_RELEASE
-- ASTRA_RESULT / ASTRA_COMMIT / ASTRA_MODEL / ASTRA_ARTIFACT_URL
-- CLAUDE_CODE_RESULT / VERSION / MODEL / ARTIFACT_URL
-- CODEX_RESULT / VERSION / MODEL / ARTIFACT_URL
-- PI_RESULT / VERSION / MODEL / ARTIFACT_URL
-- DEEPSEEK_HARNESS_RESULT / VERSION / MODEL / ARTIFACT_URL
--->
-
-Scored runs require a clean tracked checkout, a newly owned server, exact
-source/binary revision checks, a fresh benchmark database, sealed model and
-Harbor configuration, controlled network mode, and durable result provenance.
-The canonical entry points are the
-[scored-run launcher](scripts/harness/run_terminal_bench_current.sh) and
-[Harbor adapter](crates/astra-test-harness/harbor_adapter.py).
-
 ## Deploy and operate
 
 Astra supports local source development, all-in-one Compose, Kubernetes, and
@@ -613,16 +552,9 @@ Runtime and model configuration are intentionally separate:
 - [`config/server.toml.example`](config/server.toml.example) is the file-based
   server baseline; `ASTRA_*` environment variables take precedence.
 
-Server logs use `tracing` and can export OTLP traces. CLI diagnostics remain on
-stderr or in a dedicated JSONL file so machine-readable stdout stays clean.
-
-```bash
-RUST_LOG=info ASTRA_LOG_FORMAT=pretty make dev-api-start
-ASTRA_DIAGNOSTIC_LOG=1 astra chat -m "hello"
-ASTRA_LOG_FILE=/tmp/astra.jsonl astra doctor
-```
-
-See the [configuration reference](docs/reference/configuration.md),
+Server observability uses structured logs and optional OTLP export, while CLI
+diagnostics stay separate from machine-readable output. See the
+[configuration reference](docs/reference/configuration.md),
 [production guide](docs/quickstart/production.md), and
 [troubleshooting guide](docs/guides/troubleshooting.md).
 
