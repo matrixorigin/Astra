@@ -89,7 +89,9 @@ Delegation requires a configured **delegation engine** on the server; otherwise 
 
 ### Streaming (SSE)
 
-`streamChat` uses **`POST /chat/stream`** with a **JSON body** (same contract as the Next.js BFF example in `web/hooks/use-chat-stream.ts`).
+`streamChat` uses **`POST /chat/stream`** with a **JSON body** (the Web
+dashboard's typed BFF integration lives in
+`web/app/api/chats/[chatId]/stream/route.ts`).
 
 ```typescript
 const stream = client.streamChat(

@@ -77,7 +77,10 @@ Ignored tests in `system_matrix_http_e2e` avoid overlap with the full journey (e
 | `e2e_matrix_delegate_http_boundaries` | `journey_delegate_http_matrix.rs` | `POST /chat` → `run_id`; `GET /chat/runs/{id}/delegations`; `POST .../delegate` validation `400` |
 | `e2e_matrix_saas_admin_tokens_rbac_smoke` | `journey_saas_platform_matrix.rs` | `GET /admin/tokens`: `403` → grant `astra_admin` → `200` JSON array |
 
-Shared helpers: `tests/system_matrix_http_e2e/harness.rs` (`bootstrap`, `grant_astra_admin_role`, `revoke_astra_admin_role`, HTTP helpers, `cleanup_*`, row getters, SSE helpers, `wait_for_agent_event_types` — polls `agent_events` after server-owned `chat/stream` instead of a fixed sleep).
+Shared helpers: `crates/runtime/tests/system_matrix_http_e2e/harness.rs`
+(`bootstrap`, `grant_astra_admin_role`, `revoke_astra_admin_role`, HTTP helpers,
+`cleanup_*`, row getters, SSE helpers, `wait_for_agent_event_types` — polls
+`agent_events` after server-owned `chat/stream` instead of a fixed sleep).
 
 ## Database isolation
 
