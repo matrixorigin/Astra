@@ -130,10 +130,11 @@ CLI_RELEASE_FLAGS ?= --no-default-features
 IMAGE_NAME ?= matrixorigin/astra
 DOCKER_BUILD_ARGS ?=
 DOCKER_PROXY_BUILD_ARGS := --build-arg http_proxy --build-arg https_proxy --build-arg no_proxy --build-arg HTTP_PROXY --build-arg HTTPS_PROXY --build-arg NO_PROXY
-IMAGE_VERSION ?= $(if $(VERSION),$(VERSION),dev)
-IMAGE_REVISION ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+IMAGE_VERSION ?= $(if $(VERSION),$(patsubst v%,%,$(VERSION)),dev)
+IMAGE_REVISION ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+IMAGE_SOURCE_DIRTY ?= $(shell test -z "$$(git status --porcelain=v1 --untracked-files=no 2>/dev/null)" && echo false || echo true)
 IMAGE_BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
-DOCKER_METADATA_BUILD_ARGS := --build-arg IMAGE_VERSION=$(IMAGE_VERSION) --build-arg IMAGE_REVISION=$(IMAGE_REVISION) --build-arg IMAGE_BRANCH=$(IMAGE_BRANCH)
+DOCKER_METADATA_BUILD_ARGS := --build-arg IMAGE_VERSION=$(IMAGE_VERSION) --build-arg IMAGE_REVISION=$(IMAGE_REVISION) --build-arg IMAGE_SOURCE_DIRTY=$(IMAGE_SOURCE_DIRTY) --build-arg IMAGE_BRANCH=$(IMAGE_BRANCH)
 # Project-wide default for every API server mode. Compose may remap the
 # host-facing port, but the container listens on this value.
 DEFAULT_API_PORT := 17001
@@ -377,7 +378,7 @@ dev-api-status:
 dev-sdk-deps:
 	@if [ ! -x packages/sdk/node_modules/.bin/tsup ]; then \
 		echo "Installing local @astra/sdk dependencies..."; \
-		cd packages/sdk && npm install --no-audit --no-fund; \
+		cd packages/sdk && npm ci --no-audit --no-fund; \
 	else \
 		echo "✅ Local @astra/sdk dependencies ready"; \
 	fi
@@ -392,7 +393,7 @@ dev-sdk-deps:
 dev-web-deps: dev-sdk-deps
 	@if [ ! -f web/node_modules/next/dist/bin/next ]; then \
 		echo "Installing web UI dependencies..."; \
-		cd web && npm install --no-audit --no-fund; \
+		cd web && npm ci --no-audit --no-fund; \
 	else \
 		echo "✅ Web UI dependencies ready"; \
 	fi
@@ -518,12 +519,25 @@ release-docker:
 		echo "   Run: make release-docker VERSION=$(VERSION) CONFIRM=yes"; \
 		exit 1; \
 	fi
-	@echo "Building Docker image $(IMAGE_NAME):latest..."
-	@docker build $(DOCKER_PROXY_BUILD_ARGS) $(DOCKER_METADATA_BUILD_ARGS) $(DOCKER_BUILD_ARGS) -t $(IMAGE_NAME):latest .
-	@if [ -n "$(VERSION)" ]; then docker tag $(IMAGE_NAME):latest $(IMAGE_NAME):$(VERSION); fi
-	@docker push $(IMAGE_NAME):latest
-	@if [ -n "$(VERSION)" ]; then docker push $(IMAGE_NAME):$(VERSION); fi
-	@echo "✅ Pushed Docker image $(IMAGE_NAME)"
+	@scripts/validate-release-version.sh "$(VERSION)"
+	@if [ "$(IMAGE_SOURCE_DIRTY)" != "false" ]; then \
+		echo "❌ Refusing to publish from a dirty tracked worktree"; \
+		exit 1; \
+	fi
+	@if [ "$$(git rev-parse HEAD)" != "$$(git rev-list -n 1 "v$(IMAGE_VERSION)" 2>/dev/null)" ]; then \
+		echo "❌ HEAD must be the commit tagged v$(IMAGE_VERSION)"; \
+		exit 1; \
+	fi
+	@echo "Building Docker image $(IMAGE_NAME):$(IMAGE_VERSION)..."
+	@docker build $(DOCKER_PROXY_BUILD_ARGS) $(DOCKER_METADATA_BUILD_ARGS) $(DOCKER_BUILD_ARGS) -t "$(IMAGE_NAME):$(IMAGE_VERSION)" .
+	@docker push "$(IMAGE_NAME):$(IMAGE_VERSION)"
+	@if echo "$(IMAGE_VERSION)" | grep -q -- '-'; then \
+		echo "Pre-release $(IMAGE_VERSION): leaving latest unchanged"; \
+	else \
+		docker tag "$(IMAGE_NAME):$(IMAGE_VERSION)" "$(IMAGE_NAME):latest"; \
+		docker push "$(IMAGE_NAME):latest"; \
+	fi
+	@echo "✅ Pushed Docker image $(IMAGE_NAME):$(IMAGE_VERSION)"
 
 # ============================================================================
 # Compose Stack Deployment
@@ -1281,7 +1295,7 @@ test-saas:
 	if [ "$$HEALTH" = "200" ]; then \
 		if command -v npm >/dev/null 2>&1; then \
 			echo "Running @astra/sdk SaaS remote (http://127.0.0.1:$$API_PORT)..."; \
-			cd packages/sdk && npm install --no-audit --no-fund --ignore-scripts && \
+			cd packages/sdk && npm ci --no-audit --no-fund --ignore-scripts && \
 			ASTRA_SDK_BASE_URL="http://127.0.0.1:$$API_PORT" npm run test:integration:saas \
 			|| { echo "❌ test-saas failed (SDK)"; exit 1; }; \
 		else \
@@ -1372,7 +1386,7 @@ test-live-llm:
 .PHONY: test-sdk-offline
 test-sdk-offline:
 	@echo "Running @astra/sdk offline (typecheck, Jest with coverage + Mode A E2E, build)..."
-	@cd packages/sdk && npm install --no-audit --no-fund --ignore-scripts
+	@cd packages/sdk && npm ci --no-audit --no-fund --ignore-scripts
 	@cd packages/sdk && npm run typecheck
 	@cd packages/sdk && ASTRA_SDK_E2E=1 npm run test:coverage
 	@cd packages/sdk && npm run build
@@ -1387,7 +1401,7 @@ test-web-offline: test-sdk-offline
 .PHONY: test-sdk-online
 test-sdk-online:
 	@echo "Running @astra/sdk online (Jest integration + test:online) — ensure API is up (e.g. make dev-start)..."
-	@cd packages/sdk && npm install --no-audit --no-fund --ignore-scripts
+	@cd packages/sdk && npm ci --no-audit --no-fund --ignore-scripts
 	@bash -ec 'set -a; [ -f "$(CURDIR)/.env" ] && . "$(CURDIR)/.env"; set +a; \
 		export ASTRA_SDK_E2E=1; \
 		export ASTRA_SDK_BASE_URL="$${ASTRA_SDK_BASE_URL:-http://127.0.0.1:$${ASTRA_API_PORT:-$(DEFAULT_API_PORT)}}"; \

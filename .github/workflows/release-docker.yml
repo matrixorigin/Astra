@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Docker tag to publish (defaults to <YYYYMMDD>-<short-commit>)'
+        description: 'Snapshot Docker tag (defaults to <YYYYMMDD>-<short-commit>; semver requires a Git tag)'
         required: false
         default: ''
         type: string
@@ -60,6 +60,12 @@ jobs:
               image_version="$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
             fi
             architecture="${INPUT_ARCHITECTURE:-all}"
+
+            if [[ "${image_version}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "Semantic-version Docker tags are release-only." >&2
+              echo "Push the matching Git tag so source and manifest versions are validated." >&2
+              exit 1
+            fi
           else
             image_version="${GITHUB_REF_NAME#v}"
             architecture=all
@@ -181,6 +187,7 @@ jobs:
           build-args: |
             IMAGE_VERSION=${{ needs.version.outputs.image_version }}
             IMAGE_REVISION=${{ github.sha }}
+            IMAGE_SOURCE_DIRTY=false
             IMAGE_BRANCH=${{ github.ref_name }}
           # Registry caches are shared across release tags/branches and do not
           # compete with Rust/sccache for the repository's Actions cache quota.

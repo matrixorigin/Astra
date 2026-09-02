@@ -18,7 +18,7 @@ providers are connected.
 - Git and Make
 - Docker with Docker Compose
 - Rust via `rustup` (the repository pins the required toolchain)
-- Node.js 20 or newer
+- Node.js 24 (pinned in [`.nvmrc`](../../.nvmrc))
 - OpenSSL command-line tools
 - An embedding API and at least one supported LLM endpoint
 

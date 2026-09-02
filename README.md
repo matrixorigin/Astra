@@ -143,7 +143,7 @@ Docker and production paths, use the
 - Git and Make
 - Docker with Docker Compose
 - Rust via `rustup` (the repository pins Rust 1.97)
-- Node.js 20 or newer and OpenSSL command-line tools
+- Node.js 24 (pinned in `.nvmrc`) and OpenSSL command-line tools
 - An embedding API and at least one supported LLM endpoint
 
 ### 1. Initialize

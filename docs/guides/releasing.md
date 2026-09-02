@@ -43,9 +43,11 @@ git tag -a v0.2.0 -m "Astra v0.2.0"
 git push origin v0.2.0
 ```
 
-Do not move or reuse a published version tag. The manual workflow inputs exist
-for recovery and targeted builds; a normal release starts from the Git tag so
-the source, binaries, and container image identify the same commit.
+Do not move or reuse a published version tag. The binary workflow's manual
+input can rebuild an existing tagged source for recovery. Manual Docker runs
+publish snapshot tags only; semantic-version Docker releases must start from
+the matching Git tag so the source, binaries, and container image identify the
+same commit.
 
 ## Verify the release
 

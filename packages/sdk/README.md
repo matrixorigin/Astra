@@ -4,7 +4,10 @@ TypeScript SDK for the Astra agent runtime: JWT auth, sessions, runs, **run list
 
 Supported paths match the currently registered Rust runtime routes and [`astra-thin-client`](../../crates/astra-thin-client/src/paths.rs) (no `/api` prefix by default). Use `pathPrefix` if your gateway mounts the API under a prefix (for example `/api` → `https://host/api/auth/login`). Legacy task/plan/agent-job helpers remain in the clients for source compatibility with older servers, but the current runtime intentionally returns `404` for those routes and they are not runtime capabilities.
 
-**Distribution:** This package is versioned in the Astra monorepo and consumed via `file:../packages/sdk` (see `web/package.json`). Publishing to the public npm registry is optional; set `repository` / `publishConfig` when you are ready to release.
+**Distribution:** This package is versioned in the Astra monorepo and configured
+as a public scoped npm package. Publishing remains an explicit release action;
+no repository workflow publishes it automatically. The Web app consumes the
+workspace copy via `file:../packages/sdk` (see `web/package.json`).
 
 ## Installation
 
@@ -12,7 +15,8 @@ Supported paths match the currently registered Rust runtime routes and [`astra-t
 npm install @astra/sdk
 ```
 
-(From a checkout, depend on `file:../packages/sdk` or your pack tarball.)
+Before the first npm release, consume `file:../packages/sdk` from a checkout or
+install a locally generated pack tarball.
 
 ## Quick start
 
