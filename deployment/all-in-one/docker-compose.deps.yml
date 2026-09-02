@@ -108,8 +108,5 @@ volumes:
   # Override ${MATRIXONE_DATA_VOLUME} (default: matrixone-data) to point at a
   # pre-existing Docker volume — e.g., to share state across compose projects.
   # The `name:` field sets the literal Docker volume name (no project prefix).
-  #
-  # NOTE: the legacy ${MATRIXONE_DATA_DIR} env var no longer affects this
-  # stack. It is still honored by docker-compose.yml and docker-compose.memoria.yml.
   matrixone-data:
     name: ${MATRIXONE_DATA_VOLUME:-matrixone-data}
