@@ -4,7 +4,7 @@
  * Uses global fetch only (no SDK build). Mirrors env vars for Vitest Mode B.
  *
  * Usage:
- *   ASTRA_SDK_BASE_URL=http://127.0.0.1:8080 node scripts/sdk-online-smoke.mjs
+ *   ASTRA_SDK_BASE_URL=http://127.0.0.1:17001 node scripts/sdk-online-smoke.mjs
  *   ASTRA_SDK_BASE_URL=... ASTRA_SDK_ACCESS_TOKEN=... node scripts/sdk-online-smoke.mjs
  *   ASTRA_SDK_PATH_PREFIX=/api ...  # prepended to /auth/*, /sessions, /chat/...
  */

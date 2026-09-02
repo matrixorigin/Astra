@@ -25,7 +25,7 @@ install a locally generated pack tarball.
 ```typescript
 import { AstraClient } from '@astra/sdk';
 
-const client = new AstraClient({ baseUrl: 'http://localhost:8080' });
+const client = new AstraClient({ baseUrl: 'http://localhost:17001' });
 
 const auth = await client.login('alice', 'password');
 // auth: access_token, refresh_token, token_type, expires_in
@@ -114,7 +114,7 @@ The runtime exposes **`/chat/ws`** (not under `/api` unless you set `pathPrefix`
 import { AstraWebSocket } from '@astra/sdk';
 
 const ws = new AstraWebSocket({
-  url: 'ws://localhost:8080/chat/ws',
+  url: 'ws://localhost:17001/chat/ws',
   token: auth.access_token,
 });
 
@@ -150,7 +150,7 @@ import { useAstraChat } from '@astra/sdk/react';
 import { AstraClient } from '@astra/sdk';
 
 const client = new AstraClient({
-  baseUrl: 'http://localhost:8080',
+  baseUrl: 'http://localhost:17001',
   accessToken: token,
 });
 

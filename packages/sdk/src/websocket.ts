@@ -18,7 +18,7 @@ type Listener<T> = (data: T) => void;
 // ─── Options ────────────────────────────────────────────────────────
 
 export type AstraWebSocketOptions = {
-  /** WebSocket URL (e.g. `ws://localhost:8000/api/chat/ws`). */
+  /** WebSocket URL (e.g. `ws://localhost:17001/chat/ws`). */
   url: string;
   /** JWT access token for authentication. */
   token?: string;
@@ -51,7 +51,7 @@ export type ToolApproval = {
  *
  * @example Event emitter pattern
  * ```ts
- * const ws = new AstraWebSocket({ url: 'ws://localhost:8000/api/chat/ws', token });
+ * const ws = new AstraWebSocket({ url: 'ws://localhost:17001/chat/ws', token });
  * ws.on('tool_approval_request', (event) => {
  *   ws.approveToolCall({ callId: event.request_id, approved: true });
  * });
