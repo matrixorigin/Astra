@@ -667,7 +667,7 @@ pub struct ApiConfig {
 
 impl ApiConfig {
     pub fn host(&self) -> &str {
-        self.host.as_deref().unwrap_or("0.0.0.0")
+        self.host.as_deref().unwrap_or("127.0.0.1")
     }
     pub fn port(&self) -> u16 {
         self.port.unwrap_or(DEFAULT_API_PORT)
@@ -1126,7 +1126,7 @@ impl AppSettings {
             ),
             jwt: JwtSettings::from_lookup(&lookup)?,
             api: ApiSettings {
-                host: value_or_default(&lookup, "ASTRA_API_HOST", "0.0.0.0"),
+                host: value_or_default(&lookup, "ASTRA_API_HOST", "127.0.0.1"),
                 port: parse_or_default(&lookup, "ASTRA_API_PORT", DEFAULT_API_PORT)?,
                 cors_origins: lookup("ASTRA_CORS_ORIGINS"),
             },
@@ -2046,7 +2046,7 @@ port = 9000
             DEFAULT_DB_POOL_MIN_CONNECTIONS
         );
         assert_eq!(config.api.port, Some(9000));
-        assert_eq!(config.api.host(), "0.0.0.0");
+        assert_eq!(config.api.host(), "127.0.0.1");
     }
 
     #[test]

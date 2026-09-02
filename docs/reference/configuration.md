@@ -31,6 +31,10 @@ Use these files as the canonical configuration references:
 
 - `ASTRA_API_HOST`, `ASTRA_API_PORT`, `ASTRA_CORS_ORIGINS`
 
+`ASTRA_API_HOST` defaults to `127.0.0.1`. Container deployments set
+`0.0.0.0` explicitly inside the container and control external exposure at the
+Compose, Kubernetes Service, or ingress boundary.
+
 `ASTRA_API_PORT` defaults to `17001` across source, Docker API, and all-in-one
 stack modes. In the all-in-one compose stack, this value controls the
 host-facing published port; the API container listens on port `17001`.

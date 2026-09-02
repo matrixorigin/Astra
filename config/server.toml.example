@@ -30,6 +30,6 @@ min_connections = 1           # Min idle connections (env: ASTRA_DB_POOL_MIN_CON
 
 # ── HTTP API Server ──────────────────────────────────────────────────────────
 [api]
-host = "0.0.0.0"               # Listen address (env: ASTRA_API_HOST)
+host = "127.0.0.1"             # Loopback by default; use 0.0.0.0 only behind controlled ingress
 port = 17001                    # Listen port (env: ASTRA_API_PORT)
 # cors_origins = []            # Allowed CORS origins (empty = no restriction)
