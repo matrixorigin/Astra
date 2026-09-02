@@ -26,16 +26,9 @@ LABEL org.opencontainers.image.title="Astra" \
       org.opencontainers.image.ref.name="${IMAGE_BRANCH}"
 
 ARG DEBIAN_MIRROR
-ARG http_proxy
-ARG https_proxy
-ARG no_proxy
-ARG HTTP_PROXY
-ARG HTTPS_PROXY
-ARG NO_PROXY
-# Proxy vars are intentionally kept as build-time ARGs only (used by apt/curl
-# during build). They are NOT promoted to ENV to avoid baking proxy URLs —
-# which may contain credentials — into the image layers. Inject proxy settings
-# at runtime via docker run -e or Kubernetes pod env if needed.
+# Docker exposes standard proxy build arguments to RUN instructions without an
+# ARG declaration. Keeping them out of ARG and ENV prevents proxy credentials
+# from being persisted in image metadata or the final runtime configuration.
 
 WORKDIR /app
 

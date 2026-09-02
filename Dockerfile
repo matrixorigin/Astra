@@ -11,21 +11,10 @@ FROM rust:${RUST_VERSION} AS chef
 ARG CARGO_CHEF_VERSION
 ARG CARGO_REGISTRY
 ARG DEBIAN_MIRROR
-ARG http_proxy
-ARG https_proxy
-ARG no_proxy
-ARG HTTP_PROXY
-ARG HTTPS_PROXY
-ARG NO_PROXY
 
-# Promote proxy build args to environment variables so apt, cargo, and git can
-# consume them in this base stage and all stages derived from it.
-ENV http_proxy=${http_proxy}
-ENV https_proxy=${https_proxy}
-ENV no_proxy=${no_proxy}
-ENV HTTP_PROXY=${HTTP_PROXY}
-ENV HTTPS_PROXY=${HTTPS_PROXY}
-ENV NO_PROXY=${NO_PROXY}
+# Docker exposes standard proxy build arguments to RUN instructions without an
+# ARG declaration. Do not redeclare or promote them to ENV: proxy URLs may
+# contain credentials, and declared values can persist in build metadata.
 
 WORKDIR /app
 
@@ -89,19 +78,8 @@ LABEL org.opencontainers.image.title="Astra" \
       org.opencontainers.image.ref.name="${IMAGE_BRANCH}"
 
 ARG DEBIAN_MIRROR
-ARG http_proxy
-ARG https_proxy
-ARG no_proxy
-ARG HTTP_PROXY
-ARG HTTPS_PROXY
-ARG NO_PROXY
-
-ENV http_proxy=${http_proxy}
-ENV https_proxy=${https_proxy}
-ENV no_proxy=${no_proxy}
-ENV HTTP_PROXY=${HTTP_PROXY}
-ENV HTTPS_PROXY=${HTTPS_PROXY}
-ENV NO_PROXY=${NO_PROXY}
+# Standard proxy build arguments remain available to apt during RUN without
+# being copied into the final image configuration.
 
 WORKDIR /app
 RUN set -eux; \
