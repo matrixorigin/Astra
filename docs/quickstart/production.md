@@ -29,8 +29,12 @@ be exposed.
 
 - `ASTRA_TOKEN_ENCRYPTION_KEY`
 - `ASTRA_JWT_SECRET`
+- `ASTRA_RUNTIME_ROOT_SECRET`
+- `ASTRA_CORS_ORIGINS`
 - MatrixOne connection settings
-- Memoria connection/settings
+- `MEMORIA_BASE_URL` and `MEMORIA_MASTER_KEY`
 - any model/provider secrets you actually use
 
-Use `.env.example` as the starting point.
+Use `.env.production.example` as the starting point. Replace every
+`CHANGE_ME_*` value and inject secrets through your deployment platform rather
+than committing the populated file.
