@@ -31,7 +31,7 @@ jobs:
       MEMORIA_EMBEDDING_DIM: "384"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Prepare dependency env
         run: |
           cp .env.example .env
