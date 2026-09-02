@@ -3,6 +3,7 @@ name = "astra-sync-protocol"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "Versioned edge/cloud sync wire contract"
 
 [dependencies]

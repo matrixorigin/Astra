@@ -3,6 +3,7 @@ name = "astra-tools"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "Tool execution library shared by the Astra CLI and server"
 
 [dependencies]

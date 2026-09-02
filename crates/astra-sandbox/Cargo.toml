@@ -3,6 +3,7 @@ name = "astra-sandbox"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "Security boundary enforcement for Astra agent tool execution"
 
 [dependencies]

@@ -3,6 +3,7 @@ name = "astra-server-types"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "Server request and response types for astra runtime"
 
 [features]

@@ -3,6 +3,7 @@ name = "astra-pipeline"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "Astra agent learning pipeline — calibration, routing, patterns"
 
 [features]

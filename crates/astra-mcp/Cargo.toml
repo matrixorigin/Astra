@@ -3,6 +3,7 @@ name = "astra-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "Shared MCP client library for Astra CLI and runtime"
 
 [dependencies]

@@ -3,6 +3,7 @@ name = "astra-plan"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "Plan decomposition engine — breaks complex goals into subtasks"
 
 [dependencies]

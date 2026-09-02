@@ -3,6 +3,7 @@ name = "astra-skills"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "Skill framework types and providers for Astra"
 
 [dependencies]

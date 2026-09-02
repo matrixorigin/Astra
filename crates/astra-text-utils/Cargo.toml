@@ -3,6 +3,7 @@ name = "astra-text-utils"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 dirs = "6.0.0"
