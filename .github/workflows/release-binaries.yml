@@ -186,16 +186,7 @@ jobs:
           tag_name: ${{ needs.version.outputs.source_tag }}
           draft: false
           prerelease: ${{ needs.version.outputs.prerelease }}
-          generate_release_notes: false
-          body: |
-            Astra v${{ needs.version.outputs.value }}.
-
-            Assets:
-            - astra-v${{ needs.version.outputs.value }}-linux-amd64.tar.gz
-            - astra-v${{ needs.version.outputs.value }}-linux-arm64.tar.gz
-            - astra-v${{ needs.version.outputs.value }}-darwin-amd64.tar.gz
-            - astra-v${{ needs.version.outputs.value }}-darwin-arm64.tar.gz
-            - checksums.txt
+          generate_release_notes: true
           make_latest: ${{ needs.version.outputs.prerelease == 'false' }}
           files: dist/*
           fail_on_unmatched_files: true

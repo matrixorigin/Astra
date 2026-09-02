@@ -1,0 +1,26 @@
+changelog:
+  exclude:
+    labels:
+      - kind/duplicate
+      - kind/invalid
+      - kind/question
+      - kind/wontfix
+  categories:
+    - title: Features
+      labels:
+        - kind/feature
+        - kind/enhancement
+    - title: Fixes
+      labels:
+        - bug
+        - kind/bug
+    - title: Documentation
+      labels:
+        - documentation
+        - kind/docs
+    - title: Improvements
+      labels:
+        - improvement
+    - title: Other changes
+      labels:
+        - "*"

@@ -24,9 +24,11 @@ rolling tags.
 3. Confirm that the version matches the intended tag without the leading `v`.
 4. Summarize user-visible changes, compatibility impact, and migration steps in
    the pull request.
-5. Run `make check`, `make test-offline`, and any integration lane required by
+5. Apply the most specific `kind/*`, `documentation`, or `improvement` label to
+   each included pull request so the generated release notes are categorized.
+6. Run `make check`, `make test-offline`, and any integration lane required by
    the affected boundaries.
-6. Merge only after required CI and review pass on the exact release commit.
+7. Merge only after required CI and review pass on the exact release commit.
 
 ## Publish
 
@@ -49,6 +51,7 @@ Wait for both release workflows to pass, then verify:
 
 - The GitHub Release points to the intended commit and has all four CLI
   archives, their individual checksums, `checksums.txt`, and its checksum.
+- Generated release notes group the included pull requests accurately.
 - A downloaded archive matches its published SHA-256 value.
 - The Docker version tag resolves to both `linux/amd64` and `linux/arm64`.
 - The binary reports the expected version and completes a basic CLI health
