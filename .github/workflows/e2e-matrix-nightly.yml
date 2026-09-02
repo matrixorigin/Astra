@@ -2,6 +2,9 @@
 # See `docs/testing/system-e2e-matrix.md` for env ↔ test mapping.
 name: E2E Matrix (manual)
 
+permissions:
+  contents: read
+
 on:
   workflow_dispatch:
     inputs:

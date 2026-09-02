@@ -1,5 +1,8 @@
 name: Release Astra CLI Binaries
 
+permissions:
+  contents: read
+
 on:
   push:
     tags:
