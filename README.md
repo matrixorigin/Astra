@@ -2,9 +2,9 @@
 
 # Astra
 
-### A durable runtime for enterprise agents that do real work
+### The context-to-execution runtime for enterprise agents
 
-**One agent backbone. Many capacity providers.**
+**Right context. Governed actions. Runners where your IT lives. End-to-end traceability.**
 
 [![Test Suite](https://github.com/matrixorigin/astra/actions/workflows/test.yml/badge.svg)](https://github.com/matrixorigin/astra/actions/workflows/test.yml)
 [![Static Checks](https://github.com/matrixorigin/astra/actions/workflows/static-checks.yml/badge.svg)](https://github.com/matrixorigin/astra/actions/workflows/static-checks.yml)
@@ -13,29 +13,30 @@
 [![Terminal-Bench](https://img.shields.io/badge/Terminal--Bench-Results_coming_soon-0A7EA4)](#research-and-benchmarks)
 [![Rust 1.97](https://img.shields.io/badge/Rust-1.97-000000?logo=rust)](rust-toolchain.toml)
 [![TypeScript](https://img.shields.io/badge/SDK-TypeScript-3178C6?logo=typescript&logoColor=white)](packages/sdk)
-[![License](https://img.shields.io/badge/License-Apache%202.0-red.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-[Why Astra](#why-astra) · [Quick start](#quick-start) · [Architecture](#architecture) · [User Runner](#user-runner) · [Enterprise](#enterprise-agents-by-design) · [Research](#research-and-benchmarks) · [Docs](#documentation)
+[Why Astra](#why-astra) · [Quick start](#quick-start) · [Architecture](#architecture) · [Enterprise](#enterprise-agents-by-design) · [Runner](#runner-and-private-enterprise-it) · [Research](#research-and-benchmarks) · [Docs](#documentation)
 
 </div>
 
 ---
 
-Astra is a Rust-first agent kernel and runtime for complex, multi-step
-enterprise work. It brings models, tools, memory, durable Work, planning,
-permissions, and observability into one system so an agent can keep moving
-toward an outcome—not just answer one prompt.
+Astra is an open-source runtime for durable agent work across real enterprise
+systems. It connects what an agent knows to where its work happens: the
+[Context Pipeline](#context-pipeline) assembles the right information, Policy
+governs each action, Runners execute inside the environment that owns the tools
+and data, and Trace records what actually happened.
 
-The same session, run, turn, task, context, checkpoint, trace, and audit
-semantics are shared across Web, CLI/TUI, SDK clients, and User Runners.
-Different environments contribute different capabilities without creating
-different agents.
+> **Context decides what the agent knows. Policy decides what it may do. The
+> Runner carries out the action where the relevant systems live. Trace makes
+> the result explainable and accountable.**
 
-> **Astra unifies CLI, Server, and User Runner execution through one durable
-> backbone, with a research-backed Context Pipeline, governed execution, and a
-> native observation plane.**
+**Research-backed:** Astra's Context Pipeline is presented in
+**[ContextPipe: Database-Inspired Context Assembly for Long-Horizon
+Agents](https://arxiv.org/abs/2609.00749)**, accepted at
+[ADS 2026](https://vldb-ads.top/), co-located with VLDB 2026.
 
-> [!IMPORTANT]
+> [!NOTE]
 > Astra is under active development and public interfaces may change before
 > 1.0. Documents in [`docs/design/`](docs/design/) define target contracts and
 > may lead the implementation on a given branch. Current behavior is guarded by
@@ -43,37 +44,60 @@ different agents.
 
 ## Why Astra
 
-Most agent applications begin as a model plus tools. Enterprise work quickly
-adds harder requirements: state that survives requests, local data boundaries,
-approvals, retries, reconnects, recovery, and evidence explaining what
-happened. Astra makes those concerns part of the runtime.
+A model plus tools is a useful starting point. Enterprise work adds longer time
+horizons and fragmented environments: private repositories, internal APIs,
+databases, local tools, user credentials, approval boundaries, and systems that
+cannot simply be exposed to a hosted agent. The hard problem is no longer just
+generating the next answer. It is carrying governed Work from context to
+execution and retaining evidence of the result.
 
-| Core capability | What it gives you |
-| --- | --- |
-| **Durable Agent Kernel** | Sessions, runs, turns, canonical Work, task graphs, checkpoints, replay facts, recovery, and explicit lifecycle states |
-| **One Backbone, Three Runtime Profiles** | CLI + Server, Server-only, and Server + User Runner use one agent implementation with different capacity |
-| **User Runner** | User-bound workspace, file, shell, Git, build/test, network, and local MCP execution without ambient server authority |
-| **Context Pipeline** | Governed assembly of system contract, Work state, provider state, memory, artifacts, compression, and prompt-cache-safe context |
-| **Governed Execution** | One decision path for identity, policy, permission, side effects, provider admission, routing, fallback, and result quality |
-| **Native Observation Plane** | Trace records facts; Introspect reads state; Explain presents causes; Reflect proposes changes; Audit preserves accountability |
+Astra makes that full loop part of the runtime:
 
-### One backbone, three runtime profiles
-
-| Runtime profile | Execution shape | Best suited for |
+| Runtime responsibility | Enterprise question | Astra system |
 | --- | --- | --- |
-| **CLI + Server** | The Server backbone plus CLI/TUI interaction and CLI-local workspace capacity | Developers, operators, automation, and terminal-first work |
-| **Server-only** | Web, SDK, or enterprise apps use durable server state, server-safe tools, memory, and request-scoped providers | Central services, knowledge work, and controlled business workflows |
-| **Server + User Runner** | The Server dispatches admitted local work to a user-bound Runner | Hybrid cloud/local work, source code, private data, and user-owned environments |
+| **Durable Work** | How does work survive requests, reconnects, retries, and handoffs? | Agent Kernel: Session, Run, Turn, Work, task graphs, checkpoints, and recovery |
+| **Context** | What should the agent know right now? | [Context Pipeline](#context-pipeline): governed assembly, precedence, provenance, budgets, compression, and cache-stable structure |
+| **Control** | What is this identity allowed to do? | Policy and provider admission: permission, side effects, routing, fallback, and result quality |
+| **Execution** | Where should the action happen? | Server providers, User Runners deployed through CLI or Edge, MCP, and managed sandboxes |
+| **Evidence** | What happened, why, and what should happen next? | Trace, Introspect, Explain, Reflect, and Audit |
 
-These are capacity profiles, not separate agents. Changing the surface or
-Runner availability does not create a new memory, policy, lifecycle, or
-evidence model.
+### From context to execution
+
+```text
+Context Pipeline
+      │  assemble task, enterprise, runtime, and memory state
+      ▼
+Model decision
+      │
+      ▼
+Policy + provider admission
+      │  bind identity, capability, permission, and execution route
+      ▼
+Runner inside the owning environment
+      │  tools · workspace · private network · enterprise systems
+      ▼
+Trace ──► Introspect ──► Explain / Reflect
+      │
+      └──► durable Work and future context
+```
+
+Models and tools can change. Astra preserves the context, execution boundary,
+lifecycle, provider decision, and evidence model around them.
+
+Astra uses the same backbone across **CLI + Server**, **Server-only**, and
+**Server + Edge / User Runner** deployments. In private environments, the
+Server coordinates while the Runner acts alongside the systems that own the
+tools, data, network, and credentials.
 
 If your use case is one stateless model call, a direct LLM API is usually
 simpler. Astra is designed for the point where state, tools, permissions,
 recovery, collaboration, or operational control become part of the product.
 
 ## Quick start
+
+The path below builds Astra from source and starts the Server-only profile. For
+Docker and production paths, use the
+[getting-started guide](docs/quickstart/README.md).
 
 ### Prerequisites
 
@@ -82,9 +106,6 @@ recovery, collaboration, or operational control become part of the product.
 - Rust via `rustup` (the repository pins Rust 1.97)
 - Node.js 20 or newer and OpenSSL command-line tools
 - An embedding API and at least one supported LLM endpoint
-
-For Docker-only and production paths, start with the
-[getting-started guide](docs/quickstart/README.md).
 
 ### 1. Initialize
 
@@ -204,40 +225,77 @@ long-lived newline-delimited JSON-RPC app-server for parent processes. See the
 
 ## Architecture
 
+Astra has one durable agent backbone and multiple bounded capacity providers.
+Interfaces do not own separate agent loops; each environment contributes the
+capabilities it can safely execute.
+
 ```text
-Interaction surfaces
+Experience
   Web dashboard · CLI/TUI · TypeScript SDK · API clients
-                         │
-                         ▼
-Shared agent backbone
-  Durable Kernel · Context Pipeline · Policy · Observation Plane
-                         │
-                         │ admitted capability + execution route
-                         ▼
-Capacity providers
-  Server/cloud · User Runner · MCP/request-scoped · managed sandbox
-                         │
-                         │ typed result + provider status + evidence
-                         ▼
-Durable state and records
+        │
+        ▼
+Durable control backbone
+  Server · Session/Run/Work · identity · orchestration · checkpoints
+        │
+        ▼
+Context Pipeline ──► model decision ──► Policy + provider decision
+        ▲                                      │
+        │                                      ▼
+        │                            Execution capacity
+        │                  ┌─────────────┼───────────────┐
+        │                  ▼             ▼               ▼
+        │           Server provider  User Runner     MCP / sandbox
+        │                            CLI or Edge      scoped runtime
+        │                               │
+        │                               ▼
+        │                    Private enterprise IT
+        │                 workspace · network · tools · data
+        │                               │
+        └──── Trace · Introspect · Explain · Reflect · Audit
+
+Durable facts
   MatrixOne · Memoria · transcript · artifacts · checkpoints · trace · audit
 ```
 
-The central rule is:
+The architecture has one runtime and four cooperating system planes:
+
+| Plane | Responsibility | Astra components |
+| --- | --- | --- |
+| **Intelligence** | Assemble the right task and enterprise context | Context Pipeline, memory, artifacts, provider state, compression |
+| **Control** | Own durable Work and decide what is allowed | Server, Agent Kernel, identity, Policy, provider admission |
+| **Execution** | Perform actions in the environment that owns the capability | Server capacity, User Runners deployed CLI-local or at Edge, MCP, sandbox |
+| **Evidence** | Preserve facts and turn them into operational understanding | Trace, Introspect, Explain, Reflect, Audit |
+
+### One runtime from CLI to Server to Edge
+
+| Runtime profile | Execution shape | Best suited for |
+| --- | --- | --- |
+| **CLI + Server** | Server backbone, CLI/TUI interaction, and CLI-local workspace capacity | Developers, operators, automation, and terminal-first work |
+| **Server-only** | Web, SDK, or enterprise apps use durable Server state and governed Server-side providers | Central services, knowledge work, and controlled business workflows |
+| **Server + Edge / User Runner** | Server dispatches admitted work to a Runner inside a user or enterprise environment | Hybrid cloud/private execution, source code, internal systems, and user-owned environments |
+
+These profiles change available capacity, not agent identity. CLI is an
+interaction surface with optional local execution; Server is the durable
+orchestration and control backbone; Edge places Runner capacity close to
+private IT. All three share one context, policy, lifecycle, and evidence model.
+
+The central invariant is:
 
 ```text
-agent behavior = backbone semantics + context state + provider decisions + model output
+enterprise agent = durable Work + governed context + authorized execution + verifiable evidence
 ```
 
-The backbone owns lifecycle, context assembly, checkpoints, recovery, tool
-protocol, permissions, and observation. Capacity providers declare what they
-can do, where they execute, whether they are available, and which policy
-applies.
+The backbone owns lifecycle and runtime truth. The Context Pipeline determines
+what enters the model boundary. Policy and provider admission determine which
+capabilities are visible and where they may execute. Runners and other capacity
+providers declare what they can do, where they execute, whether they are
+available, and which trust boundary applies. Their results return to the same
+Work, trace, audit, and context lifecycle.
 
 | Provider | Typical capacity | Trust boundary |
 | --- | --- | --- |
 | Server | Shared state, memory, configured network access, reports, control-plane tools | Hosted runtime |
-| User Runner / CLI | Files, shell, Git, builds, tests, local network, local MCP | User identity and user-owned workspace |
+| User Runner (CLI-local or Edge) | Files, shell, Git, builds, tests, local network, local MCP, and access to existing private IT through locally available tools | User or enterprise identity, workspace, network, and runtime |
 | MCP | Business APIs, databases, knowledge bases, ticketing, approvals | MCP server and request binding |
 | Sandbox / managed runtime | Isolated scripts and provisioned workspace execution | Explicit runtime binding |
 
@@ -246,6 +304,30 @@ erasing the session, plan, memory, or server-side Work. Read the
 [architecture overview](docs/design/ARCHITECTURE.md) and
 [agent-backbone contract](docs/design/agent-backbone-capacity-provider.md) for
 the complete design.
+
+## Enterprise agents, by design
+
+An enterprise agent is not a personal copilot moved onto a company server. It
+must operate across users, teams, applications, data domains, and execution
+environments while preserving identity, policy, evidence, and operational
+control. Astra separates durable coordination from concrete execution so each
+can live in the right trust boundary.
+
+> **Centralize control. Distribute execution. Preserve evidence.**
+
+| Enterprise requirement | Astra design |
+| --- | --- |
+| Durable business work | Sessions, Work, task graphs, checkpoints, artifacts, and typed terminal states survive client disconnects |
+| Governed intelligence | Context assembly, model routing, provider health, credentials, pricing, fallback, and usage policy are managed independently of Work state |
+| Private IT execution | User Runners bring bounded execution to existing workspaces, enterprise networks, tools, and data without giving the Server ambient machine authority |
+| Identity and human control | Scoped identities, permissions, plan mode, approvals, pause, resume, cancel, and explicit blocked states keep people in control |
+| Enterprise integration | MCP, request-scoped providers, HTTP, SSE, WebSocket, and the TypeScript SDK join the same runtime semantics |
+| Accountability and resilience | Trace, audit, retries, reconnects, degraded states, health checks, and OpenTelemetry support production operation |
+
+This lets an enterprise own one agent runtime without centralizing every tool,
+credential, dataset, and execution environment. Context and governance remain
+coherent at the Server, execution authority stays with the environment that
+owns the capability, and the resulting facts return to one durable Trace.
 
 ## Core runtime systems
 
@@ -285,59 +367,37 @@ queued → running → completed
              └── failed
 ```
 
-### User Runner
-
-A **User Runner** is Astra's user-bound execution plane. The shared backbone
-plans, routes, observes, and persists Work; the Runner executes approved
-operations inside a user-controlled workspace. Today this role is provided by
-`astra-edge` and the CLI-local runtime.
-
-```text
-User / app
-    │ submit durable Work
-    ▼
-Astra backbone ── identity · policy · provider decision
-    │ admitted tool call
-    ▼
-User Runner ── workspace and permission boundary
-    │
-    ▼
-User workspace ── file · shell · Git · build · local MCP
-    │
-    └──── typed result + execution identity + evidence ────► backbone
-```
-
-The Runner contributes bounded capacity, not a second agent brain:
-
-- registration and dispatch remain bound to user, Runner, and workspace identity;
-- advertised capabilities replace implicit server access to the user's machine;
-- permissions and safety checks remain enforced at the execution boundary;
-- heartbeat, reconnect, journals, and result reconciliation make disconnects
-  observable and recoverable;
-- results join the same transcript, task, trace, audit, and checkpoint model as
-  server and MCP providers.
-
 ### Context Pipeline
 
 The Context Pipeline is a core Astra kernel contribution described in
 [ContextPipe](https://arxiv.org/abs/2609.00749), Astra's systems paper accepted
-at ADS 2026, co-located with VLDB 2026. It treats context as a governed,
-recoverable data pipeline—not one indefinitely growing prompt string.
+at ADS 2026, co-located with VLDB 2026. It is the intelligence plane between
+durable enterprise state and each model decision. Context is treated as a
+governed, recoverable data pipeline—not one indefinitely growing prompt string
+and not a one-time retrieval step.
 
 ```text
-System contract ──────────┐
-Session · Run · Work ─────┤
-Provider · policy state ──┤──► assemble ─► select/budget/compress ─► model
-Memory · artifacts ───────┘                                      │
-                                                                 ▼
-                                              trace · checkpoint · usage
+System contract ─────────────┐
+Session · Run · Work ────────┤
+Memory · enterprise facts ───┤
+Artifacts · tool results ────┤──► assemble ─► select/budget/compress ─► model
+Runner · provider · policy ──┤                                      │
+Trace · reflection ──────────┘                                      ▼
+                                              decision · usage · checkpoint
+                                                        │
+                                                        └──► future context
 ```
 
-It provides stable prompt-cache-friendly contracts, typed dynamic state,
-explicit precedence and provenance, budget-aware selection, semantic
+At every model boundary, the pipeline turns the current Work, memory,
+artifacts, runtime availability, policy state, and prior execution facts into a
+bounded context for the next decision. Runner results and Trace then become
+inputs to future turns, closing the loop between knowing and acting.
+
+The pipeline provides stable prompt-cache-friendly contracts, typed dynamic
+state, explicit precedence and provenance, budget-aware selection, semantic
 compression, and reconstruction from checkpoints and durable facts.
 
-### Governed execution
+### Policy and governed execution
 
 Tool visibility and tool execution use the same lifecycle:
 
@@ -362,6 +422,63 @@ execution route, user diagnostics, trace, and audit.
 A narrow capability failure blocks that action rather than erasing the whole
 session or pretending the capability never existed.
 
+### Runner and private enterprise IT
+
+A **Runner** is Astra's deployable execution boundary: the place where an
+admitted action becomes real work. A **User Runner** binds that execution to a
+specific user and workspace. Today this role is provided by `astra-edge` and
+the CLI-local runtime.
+
+> **The Server coordinates. The Runner acts.**
+
+| Term | Meaning |
+| --- | --- |
+| **Runner** | The execution contract that supplies bounded capabilities to the shared agent backbone |
+| **User Runner** | A Runner bound to a user's identity, workspace, tools, network, and permission boundary |
+| **Edge** | A deployment topology that places Runner capacity near the private systems where work must happen |
+
+Runner and Edge are therefore not synonyms: Runner describes the execution
+boundary; Edge describes where that boundary is deployed. A User Runner
+describes who owns and authorizes it.
+
+```text
+User / app
+    │ submit durable Work
+    ▼
+Astra Server ── durable Work · identity · context · policy · provider decision
+    │ admitted tool call
+    ▼
+User Runner ── inside the user or enterprise trust boundary
+    │
+    ▼
+Private enterprise IT
+    file · shell · Git · builds · private network · local MCP
+    │
+    └──── typed result + execution identity + evidence ────► backbone
+```
+
+This is the last-mile integration layer between an agent and the systems where
+enterprise work already lives. Instead of exposing every internal system to a
+hosted agent or granting the Server ambient machine access, an enterprise can
+place Runner capacity alongside its existing workspace, network, tools, and
+identity controls.
+
+Runner placement controls execution locality; it does not by itself guarantee
+data residency. Model endpoints, context disclosure, and tool-result handling
+remain explicit deployment and policy choices.
+
+The Runner contributes bounded execution capacity, not a second agent brain:
+
+- registration and dispatch remain bound to user, Runner, and workspace identity;
+- advertised capabilities replace implicit server access to the user's machine;
+- permissions and safety checks remain enforced at the execution boundary;
+- private tools and systems can be reached through the capabilities already
+  available within that environment;
+- heartbeat, reconnect, journals, and result reconciliation make disconnects
+  observable and recoverable;
+- results join the same transcript, task, trace, audit, and checkpoint model as
+  server and MCP providers.
+
 ### Trace, Introspect, Explain, Reflect, and Audit
 
 The observation plane is part of the agent contract, not an after-the-fact log
@@ -385,39 +502,22 @@ Policy decisions ───┴─────────────► Audit
 Reflection cannot rewrite runtime truth, Explain does not expose private
 chain-of-thought, and debug output is not automatically an audit record.
 
-## Enterprise agents, by design
-
-An enterprise agent is not a personal copilot moved onto a company server. It
-must operate across users, teams, applications, data domains, and execution
-environments while preserving identity, policy, evidence, and operational
-control.
-
-| Enterprise requirement | Astra design |
-| --- | --- |
-| Durable business work | Sessions, Work, task graphs, checkpoints, artifacts, and typed terminal states survive client disconnects |
-| Identity and isolation | User-, session-, workspace-, provider-, and execution-scoped identities travel through admission, dispatch, persistence, and audit |
-| User-owned execution | User Runners expose bounded local capacity without granting the Server ambient access to user machines |
-| Governed side effects | Tool visibility, permission, provider admission, route, fallback, and result handling share one decision path |
-| Human control | Plan mode, approvals, pause, resume, cancel, blocked states, and explicit continuation paths keep people in control |
-| Enterprise integration | MCP, request-scoped providers, HTTP, SSE, WebSocket, and the TypeScript SDK join the same runtime semantics |
-| Model governance | Model identity, endpoint, credentials, health, pricing, routing, fallback, and usage policy are managed independently of Work state |
-| Accountability and resilience | Trace, audit, retries, reconnects, degraded states, health checks, and OpenTelemetry support production operation |
-
-This lets an enterprise centralize governance and durable state while keeping
-execution authority in the environment that owns the data, credentials,
-network access, and side effects.
-
 ## How Astra differs from coding agents
 
 [Claude Code](https://code.claude.com/docs/en/getting-started),
 [Codex](https://developers.openai.com/codex),
 [Pi](https://pi.dev/docs/latest), and
 [DeepSeek Harness](https://www.deepseek.com/harness/en/) are strong systems for
-interactive coding or composing an agent harness. Astra starts from a different
-question:
+interactive coding or composing an agent harness. Astra expands the design
+boundary from one interactive coding loop to an enterprise-owned runtime
+across agents, users, applications, and environments. It starts with a
+different question:
 
 > **How can an enterprise own and operate durable agents across users,
-> applications, execution environments, and trust boundaries?**
+> applications, private IT environments, and trust boundaries—from context to
+> execution?**
+
+> **Models decide. Runners act. Astra governs and traces the entire loop.**
 
 | System | Primary design center | Astra's distinction |
 | --- | --- | --- |
@@ -425,17 +525,21 @@ question:
 | Codex | Coding agent across local, cloud, IDE, automation, and integration surfaces | Astra is model-provider independent and centers self-hosted backbone state, User Runners, and governed providers |
 | Pi | Minimal terminal coding harness extended through TypeScript packages, skills, prompts, and themes | Astra centers a distributed Server/Runner architecture, durable Work, enterprise identity, and operations |
 | DeepSeek Harness | Plugin-first harness with composable capabilities, runtime modes, and a traceable session log | Astra centers canonical lifecycle state, cross-user control, provider decisions, and user-bound execution |
-| **Astra** | **Enterprise agent kernel and runtime** | **One durable backbone across custom Web apps, CLI/TUI, SDKs, cloud services, MCP, sandboxes, and User Runners** |
+| **Astra** | **Enterprise context-to-execution runtime** | **One durable backbone connecting governed context to execution across Web, CLI, Server, Edge, MCP, sandboxes, and User Runners** |
 
 The comparison is about architectural emphasis, not whether another system can
 implement an individual feature. Astra's durable distinctions are:
 
 - **The enterprise owns the runtime** — identity, Work, tasks, provider
   bindings, model routes, trace, and audit live in an operable system.
+- **Context is a pipeline, not accumulated prompt history** — structured inputs
+  are assembled, budgeted, compressed, traced, and recovered as runtime state.
 - **Work is more than chat history** — goals, attempts, verification, delivery,
   checkpoints, and resumability are canonical state.
-- **Execution follows authority** — local, server, MCP, and sandbox capacity is
-  explicitly bound and governed.
+- **Execution follows authority** — User Runner, Server, MCP, and sandbox
+  capacity is explicitly bound, admitted, routed, and governed; Runners bring
+  actions to private environments without turning the Server into an ambient
+  superuser.
 - **Every surface shares semantics** — Web, TUI, SDK, and Runner-backed sessions
   see the same lifecycle, failure, and evidence model.
 - **Models are replaceable; governance is not** — model routes can change
@@ -497,7 +601,7 @@ The canonical entry points are the
 ## Deploy and operate
 
 Astra supports local source development, all-in-one Compose, Kubernetes, and
-Server + User Runner topologies. Start with the
+Server + Edge / User Runner topologies. Start with the
 [deployment overview](deployment/README.md).
 
 Runtime and model configuration are intentionally separate:
@@ -594,6 +698,6 @@ Astra is licensed under the [Apache License, Version 2.0](LICENSE).
 
 <div align="center">
 
-**Astra is not another chat window. It is the runtime that helps an agent carry work to a verifiable outcome.**
+**Astra connects enterprise context to governed execution across CLI, Server, and Edge—with traceability built in.**
 
 </div>
