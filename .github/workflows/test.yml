@@ -179,11 +179,11 @@ jobs:
       ASTRA_RUNTIME_ROOT_SECRET: ci-runtime-root-secret-at-least-32-chars
       MEMORIA_BASE_URL: http://localhost:8100
       MEMORIA_MASTER_KEY: ci-test-master-key
-      MEMORIA_EMBEDDING_PROVIDER: openai
+      MEMORIA_EMBEDDING_PROVIDER: ${{ secrets.EMBEDDING_API_KEY != '' && 'openai' || 'mock' }}
       MEMORIA_EMBEDDING_API_KEY: ${{ secrets.EMBEDDING_API_KEY }}
-      MEMORIA_EMBEDDING_BASE_URL: ${{ vars.EMBEDDING_BASE_URL }}
-      MEMORIA_EMBEDDING_MODEL: ${{ vars.EMBEDDING_MODEL }}
-      MEMORIA_EMBEDDING_DIM: ${{ vars.EMBEDDING_DIM }}
+      MEMORIA_EMBEDDING_BASE_URL: ${{ vars.EMBEDDING_BASE_URL || '' }}
+      MEMORIA_EMBEDDING_MODEL: ${{ vars.EMBEDDING_MODEL || 'BAAI/bge-m3' }}
+      MEMORIA_EMBEDDING_DIM: ${{ vars.EMBEDDING_DIM || '1024' }}
       ASTRA_ONLINE_LANE: ${{ matrix.lane }}
     steps:
       - uses: actions/checkout@v4
