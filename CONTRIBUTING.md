@@ -4,6 +4,9 @@ Thank you for helping improve Astra. This guide defines the shortest path from
 an idea to a reviewable pull request. Detailed setup, testing, and architecture
 documentation remains in [`docs/`](docs/README.md).
 
+Participation in this project is governed by our
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## Before you start
 
 - Search existing issues before opening a new one.
