@@ -21,7 +21,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Validate Terminal-Bench harness contracts
         run: |
           bash -n scripts/harness/local_gateway_contract.sh scripts/harness/test_local_gateway_contract.sh scripts/harness/run_terminal_bench_current.sh
@@ -35,7 +35,7 @@ jobs:
         run: make lint
       - name: Check formatting
         run: make format-check
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2
         with:
           tool: cargo-audit@0.22.1
       - name: Fetch RustSec advisory DB
@@ -49,8 +49,8 @@ jobs:
     name: "@astra/sdk (typecheck, test+coverage, build)"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version-file: .nvmrc
           cache: npm
@@ -67,8 +67,8 @@ jobs:
     name: "web (typecheck, test, build)"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version-file: .nvmrc
           cache: npm

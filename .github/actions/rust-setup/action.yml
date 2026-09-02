@@ -43,7 +43,7 @@ runs:
       shell: bash
       run: rustc --version
 
-    - uses: taiki-e/install-action@nextest
+    - uses: taiki-e/install-action@7c6f5444541685720fe90ed47f7fa10f12f790f5 # nextest
       if: ${{ inputs.install-nextest == 'true' }}
 
     - name: Install mold linker
@@ -62,7 +62,7 @@ runs:
     - name: Install sccache
       id: install_sccache
       if: ${{ inputs.use-sccache == 'true' }}
-      uses: mozilla-actions/sccache-action@v0.0.10
+      uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       # Compiler caching is an optimization. A transient GitHub API or action
       # distribution failure must not suppress the actual compile/test gates.
       continue-on-error: true
@@ -84,7 +84,7 @@ runs:
         echo "::warning::sccache setup failed; continuing with uncached Rust compilation"
         echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
 
-    - uses: Swatinem/rust-cache@v2
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       with:
         workspaces: .
         shared-key: ${{ inputs.shared-key }}-${{ github.base_ref || github.ref_name }}
