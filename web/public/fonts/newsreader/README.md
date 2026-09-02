@@ -9,4 +9,5 @@ Bundled variable serif font used for Astra's English text rendering.
 - Axes used by the UI: `opsz`, `wght`
 - License: SIL Open Font License 1.1, see `OFL.txt`
 
-The CSS intentionally restricts `unicode-range` to Latin and common punctuation so Chinese glyphs continue to render through `FZ PingXian YaSong`.
+The CSS intentionally restricts `unicode-range` to Latin and common punctuation
+so Chinese glyphs continue to render through the user's system CJK serif fonts.

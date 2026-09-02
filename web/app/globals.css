@@ -2,15 +2,6 @@
 @import "katex/dist/katex.min.css";
 
 @font-face {
-  font-family: "FZ PingXian YaSong";
-  font-style: normal;
-  font-display: swap;
-  font-weight: 400;
-  src: url("/fonts/fz-pingxian-yasong/FZPingXianYaSong.ttf") format("truetype");
-  unicode-range: U+4E00-9FFF, U+3000-303F, U+FF00-FFEF, U+2000-206F;
-}
-
-@font-face {
   font-family: "Newsreader";
   src: url("/fonts/newsreader/Newsreader-opsz-wght.ttf") format("truetype");
   font-weight: 400 700;
@@ -89,7 +80,8 @@
   --font-ui: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI",
     "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   --font-sans: var(--font-ui);
-  --font-serif: "Newsreader", "FZ PingXian YaSong", "PingFang SC", serif;
+  --font-serif: "Newsreader", "Noto Serif CJK SC", "Source Han Serif SC",
+    "Songti SC", "STSong", "SimSun", serif;
   --font-mono: "Inconsolata", "SF Mono", "Menlo", ui-monospace, monospace;
   --body-font: var(--font-sans);
   --body-size: 16px;
