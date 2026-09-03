@@ -348,6 +348,31 @@ jobs:
             exit 1
           fi
 
+          expected_platforms="$(jq -r '.include[].platform' <<< "${BUILD_MATRIX_JSON}" | sort)"
+          image_platform_set() {
+            docker buildx imagetools inspect "$1" --format '{{json .Image}}' |
+              jq -r '
+                if .os? == "linux" and (.architecture? | type) == "string" then
+                  "\(.os)/\(.architecture)"
+                else
+                  to_entries[]
+                  | select(.value.os == "linux" and (.value.architecture | type) == "string")
+                  | "\(.value.os)/\(.value.architecture)"
+                end
+              ' |
+              sort -u
+          }
+          actual_platforms="$(
+            for source in "${sources[@]}"; do
+              image_platform_set "${source}"
+            done | sort -u
+          )"
+          if [ "${actual_platforms}" != "${expected_platforms}" ]; then
+            echo "Candidate platform set does not match the release build matrix" >&2
+            diff <(printf '%s\n' "${expected_platforms}") <(printf '%s\n' "${actual_platforms}") || true
+            exit 1
+          fi
+
           docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
 
   promote:
@@ -382,7 +407,25 @@ jobs:
             --tag "${IMAGE_NAME}:${ROLLING_VERSION}" \
             --tag "${IMAGE_NAME}:latest" \
             "${IMAGE_NAME}:${IMAGE_VERSION}"
-          docker buildx imagetools inspect "${IMAGE_NAME}:latest" >/dev/null
+
+          platform_manifest_set() {
+            docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' |
+              jq -r '.manifests[] | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64")) | "\(.platform.os)/\(.platform.architecture)=\(.digest)"' |
+              sort
+          }
+          expected_platforms="$(platform_manifest_set "${IMAGE_NAME}:${IMAGE_VERSION}")"
+          if [ -z "${expected_platforms}" ]; then
+            echo "Verified version manifest has no Linux AMD64/ARM64 images" >&2
+            exit 1
+          fi
+          for target in "${ROLLING_VERSION}" latest; do
+            actual_platforms="$(platform_manifest_set "${IMAGE_NAME}:${target}")"
+            if [ "${actual_platforms}" != "${expected_platforms}" ]; then
+              echo "Promoted tag ${target} does not match ${IMAGE_VERSION}" >&2
+              diff <(printf '%s\n' "${expected_platforms}") <(printf '%s\n' "${actual_platforms}") || true
+              exit 1
+            fi
+          done
 
   registry-mirror:
     name: Publish Registry Mirror

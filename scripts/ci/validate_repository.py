@@ -118,13 +118,23 @@ def main() -> None:
             errors.append(
                 ".github/workflows/release-docker.yml: candidate digests must be verified through the all-in-one runtime"
             )
-        if "- smoke" not in merge_job or "type=raw,value=latest" in merge_job:
+        if (
+            "- smoke" not in merge_job
+            or "type=raw,value=latest" in merge_job
+            or "actual_platforms" not in merge_job
+            or "expected_platforms" not in merge_job
+        ):
             errors.append(
-                ".github/workflows/release-docker.yml: version manifest must depend on smoke and exclude rolling tags"
+                ".github/workflows/release-docker.yml: version manifest must depend on smoke and validate its platform set"
             )
-        if "- merge" not in promote_job or '--tag "${IMAGE_NAME}:latest"' not in promote_job:
+        if (
+            "- merge" not in promote_job
+            or '--tag "${IMAGE_NAME}:latest"' not in promote_job
+            or "expected_platforms" not in promote_job
+            or "actual_platforms" not in promote_job
+        ):
             errors.append(
-                ".github/workflows/release-docker.yml: latest promotion must depend on the verified version manifest"
+                ".github/workflows/release-docker.yml: rolling promotion must depend on and match the verified manifest"
             )
 
     design_index = Path("docs/design/README.md").read_text(encoding="utf-8")

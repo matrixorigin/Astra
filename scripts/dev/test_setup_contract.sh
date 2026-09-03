@@ -133,6 +133,16 @@ if [[ "$(grep -c '^[[:space:]]*memoria-init:' "$compose_file")" -lt 2 ]] ||
     echo "setup contract failed: Memoria log ownership is not initialized before startup" >&2
     exit 1
 fi
+if [[ "$(grep -c -- '--no-dereference' "$compose_file")" -ne 2 ]] ||
+    [[ "$(grep -c 'must be a regular file' "$compose_file")" -ne 2 ]]; then
+    echo "setup contract failed: privileged ownership initialization can follow unsafe persistent paths" >&2
+    exit 1
+fi
+if [[ "$(grep -c 'HOST_UID:.*UID' "$compose_file")" -ne 2 ]] ||
+    [[ "$(grep -c 'UID must be numeric' "$compose_file")" -ne 2 ]]; then
+    echo "setup contract failed: privileged ownership initialization accepts an unvalidated UID" >&2
+    exit 1
+fi
 
 set_env_value "$stack_env" "MEMORIA_EMBEDDING_PROVIDER" "openai"
 set_env_value "$stack_env" "MEMORIA_EMBEDDING_API_KEY" " # still empty"

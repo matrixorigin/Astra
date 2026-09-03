@@ -48,6 +48,16 @@ http_request() {
     printf '%s' "$response"
 }
 
+# Feed the master key to curl over stdin so it never appears in the curl
+# process arguments on a shared development host.
+memoria_request() {
+    local stage="$1"
+    local url="$2"
+    shift 2
+    printf 'Authorization: Bearer %s\n' "$memoria_key" |
+        http_request "$stage" "$url" --header @- "$@"
+}
+
 ready_response="$(http_request "Astra readiness" "$api_url/ready" --max-time 15)"
 printf '%s' "$ready_response" | python3 -c '
 import json
@@ -93,8 +103,7 @@ cleanup_memory() {
     if [[ -z "$memory_id" ]]; then
         return
     fi
-    if ! http_request "smoke memory cleanup" "$memoria_url/v1/memories/purge" --max-time 15 \
-        -H "Authorization: Bearer ${memoria_key}" \
+    if ! memoria_request "smoke memory cleanup" "$memoria_url/v1/memories/purge" --max-time 15 \
         -H "X-User-Id: ${test_user}" \
         -H 'Content-Type: application/json' \
         --data "{\"memory_ids\":[\"${memory_id}\"],\"reason\":\"all-in-one verification cleanup\"}" \
@@ -105,8 +114,7 @@ cleanup_memory() {
 trap cleanup_memory EXIT
 
 store_response="$(
-    http_request "memory store" "$memoria_url/v1/memories" --max-time 30 \
-        -H "Authorization: Bearer ${memoria_key}" \
+    memoria_request "memory store" "$memoria_url/v1/memories" --max-time 30 \
         -H "X-User-Id: ${test_user}" \
         -H 'Content-Type: application/json' \
         --data "{\"content\":\"${content}\",\"memory_type\":\"semantic\",\"session_id\":\"${test_session}\"}"
@@ -129,8 +137,7 @@ print(memory_id)
 echo "✅ Memory store: returned an ID"
 
 retrieve_response="$(
-    http_request "memory retrieval" "$memoria_url/v1/memories/retrieve" --max-time 30 \
-        -H "Authorization: Bearer ${memoria_key}" \
+    memoria_request "memory retrieval" "$memoria_url/v1/memories/retrieve" --max-time 30 \
         -H "X-User-Id: ${test_user}" \
         -H 'Content-Type: application/json' \
         --data "{\"query\":\"violet cedar ${nonce} embedding\",\"top_k\":10,\"session_id\":\"${test_session}\",\"session_scope\":\"only\"}"
@@ -157,8 +164,7 @@ if not any(
 echo "✅ Memory retrieval: exact stored ID and content returned"
 
 purge_response="$(
-    http_request "memory cleanup" "$memoria_url/v1/memories/purge" --max-time 15 \
-        -H "Authorization: Bearer ${memoria_key}" \
+    memoria_request "memory cleanup" "$memoria_url/v1/memories/purge" --max-time 15 \
         -H "X-User-Id: ${test_user}" \
         -H 'Content-Type: application/json' \
         --data "{\"memory_ids\":[\"${memory_id}\"],\"reason\":\"all-in-one verification cleanup\"}"
