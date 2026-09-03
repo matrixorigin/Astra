@@ -6,8 +6,8 @@
 
 **Right context. Governed actions. Runners where your IT lives. End-to-end traceability.**
 
-[![Test Suite](https://github.com/matrixorigin/astra/actions/workflows/test.yml/badge.svg)](https://github.com/matrixorigin/astra/actions/workflows/test.yml)
-[![Static Checks](https://github.com/matrixorigin/astra/actions/workflows/static-checks.yml/badge.svg)](https://github.com/matrixorigin/astra/actions/workflows/static-checks.yml)
+[![Test Suite](https://github.com/matrixorigin/Astra/actions/workflows/test.yml/badge.svg)](https://github.com/matrixorigin/Astra/actions/workflows/test.yml)
+[![Static Checks](https://github.com/matrixorigin/Astra/actions/workflows/static-checks.yml/badge.svg)](https://github.com/matrixorigin/Astra/actions/workflows/static-checks.yml)
 [![VLDB ADS](https://img.shields.io/badge/VLDB_ADS-Accepted-6F42C1)](https://vldb-ads.top/)
 [![arXiv](https://img.shields.io/badge/arXiv-2609.00749-B31B1B?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2609.00749)
 [![Terminal-Bench](https://img.shields.io/badge/Terminal--Bench_2.1-67.4%25-0A7EA4)](#terminal-bench-21)
@@ -161,8 +161,8 @@ Docker and production paths, use the
 ### 1. Initialize
 
 ```bash
-git clone https://github.com/matrixorigin/astra.git
-cd astra
+git clone https://github.com/matrixorigin/Astra.git
+cd Astra
 
 cp .models.yaml.example .models.yaml
 make dev-init
@@ -695,9 +695,43 @@ Issues and pull requests are welcome. Before submitting a change:
 For substantial behavior changes, open an issue first so the runtime contract
 and implementation can evolve together.
 
+## Citation
+
+If Astra or the Context Pipeline is useful in your research, please cite the
+ContextPipe paper:
+
+```bibtex
+@inproceedings{xu2026contextpipe,
+  title         = {ContextPipe: Database-Inspired Context Assembly for Long-Horizon Agents},
+  author        = {Xu, Peng and Zhang, Zuyu and Sun, Yuze and Tian, Feng and Wang, Long and Zhang, Chen},
+  booktitle     = {Applied Data Science Track (ADS 2026), co-located with VLDB 2026},
+  year          = {2026},
+  eprint        = {2609.00749},
+  archivePrefix = {arXiv},
+  url           = {https://arxiv.org/abs/2609.00749}
+}
+```
+
+[`CITATION.cff`](CITATION.cff) also lets GitHub generate APA and BibTeX entries
+for the software itself through **Cite this repository**.
+
 ## License
 
 Astra is licensed under the [Apache License, Version 2.0](LICENSE).
+
+## Star history
+
+<div align="center">
+
+<a href="https://star-history.com/#matrixorigin/Astra&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=matrixorigin/Astra&type=Date&theme=dark">
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=matrixorigin/Astra&type=Date">
+    <img alt="Star history chart for matrixorigin/Astra" src="https://api.star-history.com/svg?repos=matrixorigin/Astra&type=Date" width="600">
+  </picture>
+</a>
+
+</div>
 
 ---
 

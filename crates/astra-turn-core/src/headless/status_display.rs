@@ -985,9 +985,9 @@ mod tests {
     fn tool_call_detail_github_repo_arg_shows_repo_and_number() {
         let detail = tool_call_detail(
             "github",
-            &json!({"action": "get_issue", "repo": "matrixorigin/astra", "issue_number": 147}),
+            &json!({"action": "get_issue", "repo": "matrixorigin/Astra", "issue_number": 147}),
         );
-        assert_eq!(detail.as_deref(), Some("matrixorigin/astra#147"));
+        assert_eq!(detail.as_deref(), Some("matrixorigin/Astra#147"));
     }
 
     #[test]
@@ -996,13 +996,13 @@ mod tests {
             "github",
             &json!({
                 "action": "create_issue",
-                "repo": "matrixorigin/astra",
+                "repo": "matrixorigin/Astra",
                 "title": "Fix renderer drift"
             }),
         );
         assert_eq!(
             detail.as_deref(),
-            Some(r#"matrixorigin/astra: "Fix renderer drift""#)
+            Some(r#"matrixorigin/Astra: "Fix renderer drift""#)
         );
     }
 

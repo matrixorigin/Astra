@@ -25,8 +25,8 @@ providers are connected.
 ### Initialize and start
 
 ```bash
-git clone https://github.com/matrixorigin/astra.git
-cd astra
+git clone https://github.com/matrixorigin/Astra.git
+cd Astra
 
 cp .models.yaml.example .models.yaml
 make dev-init

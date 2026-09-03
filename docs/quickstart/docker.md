@@ -6,8 +6,8 @@ Run Astra with the all-in-one Docker Compose stack.
 
 ```bash
 # 1. Clone repository
-git clone https://github.com/matrixorigin/astra.git
-cd astra
+git clone https://github.com/matrixorigin/Astra.git
+cd Astra
 
 # 2. Create stack environment
 make stack-env

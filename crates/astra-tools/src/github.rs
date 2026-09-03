@@ -2006,19 +2006,19 @@ mod tests {
     #[test]
     fn omitted_repo_uses_first_non_empty_preferred_repo() {
         let preferred = vec![
-            "matrixorigin/astra".to_string(),
+            "matrixorigin/Astra".to_string(),
             "matrixorigin/memoria".to_string(),
         ];
 
         assert_eq!(
             resolve_github_repo_argument(&json!({"action": "list_prs"}), &preferred).unwrap(),
-            "matrixorigin/astra"
+            "matrixorigin/Astra"
         );
     }
 
     #[test]
     fn explicit_repo_wins_over_preferred_repo_and_blank_values_are_absent() {
-        let preferred = vec!["matrixorigin/astra".to_string()];
+        let preferred = vec!["matrixorigin/Astra".to_string()];
 
         assert_eq!(
             resolve_github_repo_argument(
@@ -2031,7 +2031,7 @@ mod tests {
         assert_eq!(
             resolve_github_repo_argument(&json!({"action": "list_prs", "repo": "  "}), &preferred)
                 .unwrap(),
-            "matrixorigin/astra"
+            "matrixorigin/Astra"
         );
     }
 
