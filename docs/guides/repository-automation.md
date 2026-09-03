@@ -9,8 +9,9 @@ for merge behavior.
 
 Astra uses a serial, in-place Mergify queue with GitHub's strict branch
 protection enabled. A pull request enters the queue only after the required
-checks and owner approval pass. Mergify then updates it with the current
-`main`, reruns the required checks on that exact head, and squash-merges it.
+checks and owner approval pass. If `main` advanced, Mergify updates the pull
+request and waits for the required checks on the resulting head. If it is
+already current, Mergify can reuse its passed checks before squash-merging it.
 
 The queue settings are explicit rather than relying on service defaults:
 
@@ -18,8 +19,9 @@ The queue settings are explicit rather than relying on service defaults:
   `max_parallel_checks: 1` keep validation on the original pull request.
 - `update_method: merge` updates eligible fork branches without rewriting
   their history.
-- Branch-protection requirements are injected by Mergify, so the required
-  check list remains owned by GitHub.
+- `branch_protection_injection_mode: queue` makes Mergify enforce GitHub's
+  branch-protection requirements when a pull request enters the queue and when
+  it merges, while the required check list remains owned by GitHub.
 
 Do not add a separate rule that automatically updates every open pull request.
 The queue already updates an approved pull request when necessary. Updating
@@ -30,7 +32,8 @@ all stale branches creates avoidable CI runs and writes to contributor forks.
 Mergify requests a fixed permission set for its products. Do not trim that set
 to this table: these are the permissions most directly involved in Astra's
 queue path. The installation must include `matrixorigin/Astra` in its selected
-repository access and retain Mergify's requested permissions, including:
+repository access—or cover all organization repositories—and retain Mergify's
+requested permissions, including:
 
 | Permission | Access | Why |
 | --- | --- | --- |
@@ -81,9 +84,10 @@ gh api repos/matrixorigin/Astra/branches/main/protection \
                     .permissions]}'
 ```
 
-The result must show `strict: true` and `workflows: "write"`. Requeue one
-approved, behind pull request after any permission change to exercise the same
-path external contributors use.
+The result must show `strict: true`; the Mergify permissions must include
+`administration: "read"` plus `checks`, `contents`, `pull_requests`, and
+`workflows` set to `"write"`. Requeue one approved, behind pull request after
+any permission change to exercise the same path external contributors use.
 
 ## Failure diagnosis
 
