@@ -33,6 +33,21 @@ versions = {
 with (root / "packages/sdk/package.json").open(encoding="utf-8") as package:
     versions["TypeScript SDK"] = json.load(package)["version"]
 
+with (root / "web/package.json").open(encoding="utf-8") as package:
+    versions["Web application"] = json.load(package)["version"]
+
+with (root / "packages/sdk/package-lock.json").open(encoding="utf-8") as package:
+    versions["TypeScript SDK lockfile"] = json.load(package)["version"]
+
+with (root / "web/package-lock.json").open(encoding="utf-8") as package:
+    versions["Web application lockfile"] = json.load(package)["version"]
+
+with (root / "Cargo.lock").open("rb") as lockfile:
+    locked_packages = tomllib.load(lockfile)["package"]
+for package in locked_packages:
+    if package["name"].startswith("astra-") and "source" not in package:
+        versions[f"Cargo.lock {package['name']}"] = package["version"]
+
 def yaml_scalar(path: Path, key: str) -> str:
     pattern = re.compile(rf"^{re.escape(key)}:\s*[\"']?([^\"'#\s]+)")
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -50,7 +65,7 @@ versions["Helm appVersion"] = yaml_scalar(
 
 mismatches = {name: value for name, value in versions.items() if value != expected}
 if mismatches:
-    for name, value in mismatches.items():
+    for name, value in sorted(mismatches.items()):
         print(
             f"release version {expected} does not match {name} version {value}",
             file=sys.stderr,

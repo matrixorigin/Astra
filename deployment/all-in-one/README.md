@@ -94,7 +94,7 @@ This stack ships `astra-server` but not the `astra` CLI binary. Install the
 prebuilt CLI if you are not building from source:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install-astra.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh
 ```
 
 ```bash

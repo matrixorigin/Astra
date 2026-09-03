@@ -24,7 +24,7 @@ make stack-up
 make stack-verify
 
 # 5. Install the prebuilt CLI (no Rust toolchain needed)
-curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install-astra.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh
 
 # 6. Bootstrap the admin account and register a model
 astra admin register --username admin --password '<password>'

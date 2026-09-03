@@ -110,7 +110,7 @@ help:
 	@echo "  make dev-start-docker   - Start deps + API in Docker"
 	@echo "  make dev-api-docker-up  - Start API server in Docker"
 	@echo "  make dev-api-docker-down - Stop API server Docker container"
-	@echo "  make release-docker     - Build and push Docker image (VERSION=..., CONFIRM=yes)"
+	@echo "  make release-check      - Validate release metadata (VERSION=...)"
 
 # ============================================================================
 # Variables
@@ -512,31 +512,23 @@ dev-api-docker-scale:
 	@cd deployment/all-in-one && docker compose --env-file ../../.env up -d --no-deps --scale api=$(REPLICAS) api
 	@echo "✅ Scaled to $(REPLICAS) replicas"
 
-.PHONY: release-docker
-release-docker:
+.PHONY: release-check
+release-check:
 	@if [ -z "$(VERSION)" ]; then \
-		echo "❌ VERSION is required, for example: make release-docker VERSION=0.1.0 CONFIRM=yes"; \
-		exit 1; \
-	fi
-	@if [ "$(CONFIRM)" != "yes" ]; then \
-		echo "❌ Refusing to push Docker image without explicit confirmation."; \
-		echo "   Run: make release-docker VERSION=$(VERSION) CONFIRM=yes"; \
+		echo "❌ VERSION is required, for example: make release-check VERSION=0.1.0"; \
 		exit 1; \
 	fi
 	@scripts/validate-release-version.sh "$(VERSION)"
 	@if [ "$(IMAGE_SOURCE_DIRTY)" != "false" ]; then \
-		echo "❌ Refusing to publish from a dirty tracked worktree"; \
+		echo "❌ Release source has uncommitted tracked changes"; \
 		exit 1; \
 	fi
 	@if [ "$$(git rev-parse HEAD)" != "$$(git rev-list -n 1 "v$(IMAGE_VERSION)" 2>/dev/null)" ]; then \
 		echo "❌ HEAD must be the commit tagged v$(IMAGE_VERSION)"; \
 		exit 1; \
 	fi
-	@echo "Building Docker image $(IMAGE_NAME):$(IMAGE_VERSION)..."
-	@docker build $(DOCKER_PROXY_BUILD_ARGS) $(DOCKER_METADATA_BUILD_ARGS) $(DOCKER_BUILD_ARGS) -t "$(IMAGE_NAME):$(IMAGE_VERSION)" .
-	@docker push "$(IMAGE_NAME):$(IMAGE_VERSION)"
-	@echo "✅ Pushed Docker image $(IMAGE_NAME):$(IMAGE_VERSION)"
-	@echo "   Rolling and latest tags are promoted only by the release workflow after multi-platform runtime verification."
+	@echo "✅ Release metadata and tagged source are consistent"
+	@echo "   Push v$(IMAGE_VERSION) to run the verified binary and multi-platform image workflows."
 
 # ============================================================================
 # Compose Stack Deployment

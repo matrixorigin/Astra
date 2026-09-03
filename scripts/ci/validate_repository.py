@@ -62,6 +62,7 @@ def main() -> None:
     contract_scripts = [
         Path("scripts/dev/test_setup_contract.sh"),
         Path("scripts/ops/test_production_env_contract.sh"),
+        Path("scripts/ci/test_release_contract.sh"),
     ]
     for contract_script in contract_scripts:
         result = subprocess.run(
@@ -135,6 +136,57 @@ def main() -> None:
         ):
             errors.append(
                 ".github/workflows/release-docker.yml: rolling promotion must depend on and match the verified manifest"
+            )
+
+    binary_release_workflow = Path(".github/workflows/release-binaries.yml").read_text(
+        encoding="utf-8"
+    )
+    for forbidden in (
+        "ASTRA_SUITE_PAT",
+        "RELEASE_MIRROR_REPOSITORY",
+        "repository: ${{",
+        "\n  mirror:",
+    ):
+        if forbidden in binary_release_workflow:
+            errors.append(
+                ".github/workflows/release-binaries.yml: releases must remain owned by the current repository "
+                f"(found {forbidden.strip()})"
+            )
+    for required in (
+        "permissions:\n      contents: write",
+        "git merge-base --is-ancestor",
+        "scripts/verify-release-artifacts.sh",
+        "fail_on_unmatched_files: true",
+    ):
+        if required not in binary_release_workflow:
+            errors.append(
+                ".github/workflows/release-binaries.yml: missing current-repository release guard "
+                f"({required})"
+            )
+
+    installer = Path("scripts/install-astra.sh").read_text(encoding="utf-8")
+    if 'REPOSITORY="matrixorigin/Astra"' not in installer:
+        errors.append("scripts/install-astra.sh: installer must download from matrixorigin/Astra")
+    if (
+        "failed to download the required checksum" not in installer
+        or "checksum mismatch" not in installer
+    ):
+        errors.append(
+            "scripts/install-astra.sh: release checksum verification must be mandatory"
+        )
+
+    release_version_validator = Path("scripts/validate-release-version.sh").read_text(
+        encoding="utf-8"
+    )
+    for version_source in (
+        "packages/sdk/package.json",
+        "web/package.json",
+        "CITATION.cff",
+        "deployment/kubernetes/chart/Chart.yaml",
+    ):
+        if version_source not in release_version_validator:
+            errors.append(
+                f"scripts/validate-release-version.sh: missing release version source {version_source}"
             )
 
     design_index = Path("docs/design/README.md").read_text(encoding="utf-8")

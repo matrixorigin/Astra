@@ -1,8 +1,8 @@
 //! Stdio app-server for long-lived gateway integrations.
 //!
-//! The protocol intentionally mirrors the subset of Codex app-server that
-//! `astra-suite` already knows how to pool: JSON-RPC lines on stdin/stdout,
-//! with turn progress emitted as notifications.
+//! The protocol intentionally mirrors the subset of Codex app-server used by
+//! long-lived gateway integrations: JSON-RPC lines on stdin/stdout, with turn
+//! progress emitted as notifications.
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -30,7 +30,6 @@ jobs:
     timeout-minutes: 15
     outputs:
       value: ${{ steps.resolve.outputs.value }}
-      mirror_tag: ${{ steps.resolve.outputs.mirror_tag }}
       source_tag: ${{ steps.resolve.outputs.source_tag }}
       prerelease: ${{ steps.resolve.outputs.prerelease }}
     steps:
@@ -61,7 +60,6 @@ jobs:
           fi
 
           echo "value=${value}" >> "${GITHUB_OUTPUT}"
-          echo "mirror_tag=astra-cli-v${value}" >> "${GITHUB_OUTPUT}"
           echo "source_tag=v${value}" >> "${GITHUB_OUTPUT}"
           echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
 
@@ -73,6 +71,20 @@ jobs:
 
       - name: Validate manifest version
         run: scripts/validate-release-version.sh "${{ steps.resolve.outputs.value }}"
+
+      - name: Require a release commit from the default branch
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin \
+            "refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+          if ! git merge-base --is-ancestor HEAD "origin/${DEFAULT_BRANCH}"; then
+            echo "Release tag ${{ steps.resolve.outputs.source_tag }} is not reachable from ${DEFAULT_BRANCH}." >&2
+            echo "Merge the release commit before publishing its tag." >&2
+            exit 1
+          fi
 
   build:
     name: Build ${{ matrix.target }}
@@ -180,6 +192,8 @@ jobs:
         with:
           name: bins-${{ matrix.suffix }}
           path: dist/
+          if-no-files-found: error
+          retention-days: 1
 
   release:
     name: Create Release
@@ -192,18 +206,20 @@ jobs:
       contents: write
 
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ needs.version.outputs.source_tag }}
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: bins-*
           path: dist
           merge-multiple: true
 
-      - name: Create checksums
+      - name: Verify release artifacts and create checksum manifest
         shell: bash
-        run: |
-          cd dist
-          cat astra-v*.tar.gz.sha256 > checksums.txt
-          sha256sum checksums.txt | tee checksums.txt.sha256
+        run: scripts/verify-release-artifacts.sh "${{ needs.version.outputs.value }}" dist
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
@@ -215,48 +231,5 @@ jobs:
           prerelease: ${{ needs.version.outputs.prerelease }}
           generate_release_notes: true
           make_latest: ${{ needs.version.outputs.prerelease == 'false' }}
-          files: dist/*
-          fail_on_unmatched_files: true
-
-  mirror:
-    name: Mirror Release
-    if: ${{ vars.RELEASE_MIRROR_REPOSITORY != '' }}
-    needs:
-      - version
-      - build
-      - release
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          pattern: bins-*
-          path: dist
-          merge-multiple: true
-
-      - name: Create checksums
-        shell: bash
-        run: |
-          cd dist
-          cat astra-v*.tar.gz.sha256 > checksums.txt
-          sha256sum checksums.txt | tee checksums.txt.sha256
-
-      - name: Mirror GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          repository: ${{ vars.RELEASE_MIRROR_REPOSITORY }}
-          token: ${{ secrets.ASTRA_SUITE_PAT }}
-          name: Astra CLI v${{ needs.version.outputs.value }}
-          tag_name: ${{ needs.version.outputs.mirror_tag }}
-          target_commitish: main
-          draft: false
-          prerelease: ${{ needs.version.outputs.prerelease }}
-          generate_release_notes: false
-          body: |
-            Astra CLI v${{ needs.version.outputs.value }}.
-
-            Source release: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ needs.version.outputs.source_tag }}.
-          make_latest: false
           files: dist/*
           fail_on_unmatched_files: true

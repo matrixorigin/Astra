@@ -201,14 +201,24 @@ python3 scripts/render_readme_demo.py
 Keep the flow explicitly labeled as illustrative so the asset explains Astra's
 runtime contract without being mistaken for a captured live session.
 
-### Public CLI Installer
-The published `astra` CLI installer is owned by the public `matrixorigin/astra-suite` repository:
+### `scripts/install-astra.sh`
+Installs a checksum-verified `astra` CLI archive from this repository's GitHub Releases:
 
 ```sh
-curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install-astra.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh
 ```
 
-Keep installer behavior there so the public install path, documentation, and release assets stay in one repository.
+The installer, source tag, release assets, and user documentation deliberately
+live in the same repository. Checksums are mandatory; a missing or mismatched
+checksum fails the installation.
+
+### `scripts/validate-release-version.sh` and `scripts/verify-release-artifacts.sh`
+The release workflows use these scripts as shared, locally testable gates.
+The first requires every versioned workspace surface to match the Git tag. The
+second requires the complete four-platform CLI archive set, verifies every
+checksum and archive layout, and creates the aggregate checksum manifest.
+`scripts/ci/test_release_contract.sh` exercises the success and tampering paths
+without compiling binaries or publishing artifacts.
 
 ### `scripts/ops/*.sh`
 Operational helpers for health checks, backup/restore, and deployment.

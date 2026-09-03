@@ -234,7 +234,7 @@ The stack ships `astra-server`, not the CLI. Install the prebuilt `astra`
 binary to drive it — Linux and macOS, `amd64` and `arm64`:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install-astra.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh
 astra health
 ```
 
