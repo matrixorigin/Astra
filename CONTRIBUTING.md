@@ -66,6 +66,21 @@ for the correct lane. Pull requests from forks must remain testable without
 repository secrets, so live-provider coverage must have a deterministic
 offline path or stay in an explicitly optional lane.
 
+CI routes required checks by the files changed in a pull request:
+
+| Change area | Heavy checks selected |
+| --- | --- |
+| Documentation and repository governance | Lightweight repository contracts only |
+| Rust crates | Workspace static checks plus affected offline shards; shared runtime paths also select online tests |
+| `packages/sdk/` | SDK and Web (the local SDK consumer) |
+| `web/` | Web |
+| Terminal-Bench harness scripts | Harness contracts |
+| CI routing, workflows, or an unavailable diff | All checks (fail-safe) |
+
+Required check names remain present when their heavy work is skipped, so this
+routing is compatible with branch protection and the merge queue. The routing
+contract and its tests live in [`scripts/ci/`](scripts/ci/).
+
 ## Open a pull request
 
 1. Rebase the feature branch on the current `main` branch.
