@@ -18,38 +18,73 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  scope:
+    name: Determine static-check scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.scope.outputs.rust }}
+      sdk: ${{ steps.scope.outputs.sdk }}
+      web: ${{ steps.scope.outputs.web }}
+      harness: ${{ steps.scope.outputs.harness }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # A PR merge commit plus both parents is enough for the path diff.
+          # Detection falls back to all scopes if a longer push range is absent.
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Classify changed paths
+        id: scope
+        run: python3 scripts/ci/ci_scope.py
+
   check:
+    needs: scope
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+      - name: Validate repository metadata and documentation
+        run: python3 scripts/ci/validate_repository.py
+      - name: Test CI scope routing
+        run: python3 scripts/ci/test_ci_scope.py
       - name: Validate Terminal-Bench harness contracts
+        if: ${{ needs.scope.result != 'success' || needs.scope.outputs.harness == 'true' }}
         run: |
           bash -n scripts/harness/local_gateway_contract.sh scripts/harness/test_local_gateway_contract.sh scripts/harness/run_terminal_bench_current.sh
           bash scripts/harness/test_local_gateway_contract.sh
       - uses: ./.github/actions/rust-setup
+        if: ${{ needs.scope.result != 'success' || needs.scope.outputs.rust == 'true' }}
         with:
           shared-key: ci-check
           save-cache: ${{ github.event_name == 'push' }}
           install-nextest: false
       - name: Run clippy
+        if: ${{ needs.scope.result != 'success' || needs.scope.outputs.rust == 'true' }}
         run: make lint
       - name: Check formatting
+        if: ${{ needs.scope.result != 'success' || needs.scope.outputs.rust == 'true' }}
         run: make format-check
       - uses: taiki-e/install-action@e67fa11c4b9316fa714ddf0abed07a0c3143b95b # v2
+        if: ${{ needs.scope.result != 'success' || needs.scope.outputs.rust == 'true' }}
         with:
           tool: cargo-audit@0.22.1
       - name: Fetch RustSec advisory DB
+        if: ${{ needs.scope.result != 'success' || needs.scope.outputs.rust == 'true' }}
         run: |
           rm -rf "$HOME/.cargo/advisory-db"
           git clone --depth 1 https://github.com/RustSec/advisory-db "$HOME/.cargo/advisory-db"
       - name: cargo audit (RustSec advisory DB)
+        if: ${{ needs.scope.result != 'success' || needs.scope.outputs.rust == 'true' }}
         run: make audit
 
   sdk:
     name: "@astra/sdk (typecheck, test+coverage, build)"
+    needs: scope
+    if: ${{ always() && (needs.scope.result != 'success' || needs.scope.outputs.sdk == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -71,6 +106,8 @@ jobs:
 
   web:
     name: "web (typecheck, test, build)"
+    needs: scope
+    if: ${{ always() && (needs.scope.result != 'success' || needs.scope.outputs.web == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
