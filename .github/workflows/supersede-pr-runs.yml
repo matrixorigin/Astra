@@ -1,0 +1,40 @@
+name: Supersede stale PR runs
+
+on:
+  pull_request_target:
+    branches: [main, develop]
+    types: [synchronize]
+
+# This controller runs from the trusted base revision. It must never check out
+# or execute the pull request head while holding permission to cancel runs.
+permissions:
+  actions: write
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: supersede-pr-runs-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  cancel-stale-runs:
+    name: Cancel superseded PR runs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Cancel runs for earlier PR heads
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+        run: >-
+          python3 scripts/ci/cancel_stale_pr_runs.py
+          --repository "$REPOSITORY"
+          --pr-number "$PR_NUMBER"
+          --event-head-sha "$EVENT_HEAD_SHA"

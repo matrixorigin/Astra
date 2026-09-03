@@ -87,6 +87,14 @@ Required check names remain present when their heavy work is skipped, so this
 routing is compatible with branch protection and the merge queue. The routing
 contract and its tests live in [`scripts/ci/`](scripts/ci/).
 
+For fork pull requests, an update may require maintainer approval before the
+replacement test run can enter the normal concurrency group. A separate
+base-revision controller cancels active runs for earlier heads immediately. The
+controller never checks out or executes pull request code; the test workflows
+remain low-privilege `pull_request` workflows. Normal concurrency groups use the
+pull request number, so identically named branches in different forks remain
+isolated.
+
 ## Open a pull request
 
 1. Rebase the feature branch on the current `main` branch.

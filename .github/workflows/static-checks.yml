@@ -10,7 +10,7 @@ on:
     branches: [main, develop]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -51,7 +51,7 @@ jobs:
       - name: Validate repository metadata and documentation
         run: python3 scripts/ci/validate_repository.py
       - name: Test CI scope routing
-        run: python3 scripts/ci/test_ci_scope.py
+        run: python3 -m unittest discover -s scripts/ci -p 'test_*.py'
       - name: Validate Terminal-Bench harness contracts
         if: ${{ needs.scope.result != 'success' || needs.scope.outputs.harness == 'true' }}
         run: |
