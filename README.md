@@ -638,7 +638,7 @@ documentation is organized by reader goal:
 | I want to... | Start here | Continue with |
 | --- | --- | --- |
 | **Try and use Astra** | [Getting started](docs/quickstart/README.md) | [CLI commands](docs/reference/cli-commands.md) and [TUI slash commands](docs/reference/slash-commands.md) |
-| **Build an application** | [TypeScript SDK](packages/sdk/README.md) | [HTTP API](docs/reference/api-reference.md) and [examples](examples/README.md) |
+| **Build an application** | [TypeScript SDK](packages/sdk/README.md) | [HTTP API](docs/reference/api-reference.md) and [configuration](docs/reference/configuration.md) |
 | **Deploy and operate** | [Deployment overview](deployment/README.md) | [Configuration](docs/reference/configuration.md) and [troubleshooting](docs/guides/troubleshooting.md) |
 | **Get help or report a problem** | [Support](SUPPORT.md) | [Questions, bug reports, documentation issues, and feature requests](https://github.com/matrixorigin/Astra/issues/new/choose) |
 | **Develop and contribute** | [Contributing guide](CONTRIBUTING.md) | [Developer setup](docs/quickstart/development.md), [workflow](docs/guides/development-workflow.md), [testing](docs/guides/testing.md), and [Make targets](docs/reference/makefile-commands.md) |
