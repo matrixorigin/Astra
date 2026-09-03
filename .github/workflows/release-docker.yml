@@ -103,6 +103,10 @@ jobs:
             fi
           }
           validate_tag "${image_version}"
+          if [[ ! "${image_version}" =~ ^snapshot-[0-9A-Za-z_][0-9A-Za-z_.-]*$ ]]; then
+            echo "Snapshot tags must start with snapshot-: ${image_version}" >&2
+            exit 1
+          fi
           if [[ "${image_version}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "Semantic versions are owned by the unified Release workflow." >&2
             exit 1
@@ -120,6 +124,10 @@ jobs:
 
           case "${INPUT_ARCHITECTURE}" in
             all)
+              if [[ "${image_version}" == *-amd64 || "${image_version}" == *-arm64 ]]; then
+                echo "Multi-platform snapshot tag ${image_version} must not use a single-architecture suffix." >&2
+                exit 1
+              fi
               matrix='{"include":[{"platform":"linux/amd64","runner":"ubuntu-latest","slug":"linux-amd64"},{"platform":"linux/arm64","runner":"ubuntu-24.04-arm","slug":"linux-arm64"}]}'
               ;;
             amd64)

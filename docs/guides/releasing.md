@@ -175,9 +175,10 @@ prereleases when resolving `latest`, and rolling Docker tags remain unchanged:
 
 The separate **Publish Astra Docker Snapshot** workflow is for immutable,
 non-semantic snapshots from the current `main` head. It rejects feature-branch
-source, semantic versions, rolling tags, and attempts to overwrite a different
-snapshot. Re-running the same source and name succeeds only when the published
-platform digests match exactly.
+source, semantic versions, rolling tags, names outside the `snapshot-*`
+namespace, misleading architecture suffixes, and attempts to overwrite a
+different snapshot. Re-running the same source and name succeeds only when the
+published platform digests match exactly.
 
 ## Verify the release
 

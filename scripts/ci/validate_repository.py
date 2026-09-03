@@ -183,6 +183,7 @@ def main() -> None:
     for required in (
         "workflow_dispatch:",
         "Official Docker snapshots cannot publish unreviewed feature-branch source",
+        "Snapshot tags must start with snapshot-",
         "Semantic versions are owned by the unified Release workflow",
         "Require Docker publication credentials",
         "ASTRA_SNAPSHOT_ENVIRONMENT_GUARD",
