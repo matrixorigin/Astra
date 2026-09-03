@@ -4,7 +4,7 @@
 
 ### The self-hosted runtime for agents that must act inside private systems
 
-**Work survives. Access stays local. Every action is traceable.**
+**Durable work on fewer tokens. Agent changes you can trace and roll back. Work that moves with you.**
 
 [![Test Suite](https://github.com/matrixorigin/Astra/actions/workflows/test.yml/badge.svg)](https://github.com/matrixorigin/Astra/actions/workflows/test.yml)
 [![Static Checks](https://github.com/matrixorigin/Astra/actions/workflows/static-checks.yml/badge.svg)](https://github.com/matrixorigin/Astra/actions/workflows/static-checks.yml)
@@ -23,27 +23,28 @@
 
 Astra is not another coding agent or a library for wrapping one model call. It
 is the open-source, self-hosted runtime behind CLI, Web, and application agents
-that must keep working across requests and reconnects, act inside private
-environments under the right user or enterprise identity, and leave verifiable
-evidence of every action.
+that must keep long-running Work alive without replaying an ever-growing
+context, make captured changes inspectable and reversible, and reconnect Work
+to authorized execution wherever the relevant tools and private systems live.
 
-| Work survives | Access stays local | Every action is traceable |
+| Durable work on fewer tokens | Agent changes you can trace and roll back | Work that moves with you |
 | --- | --- | --- |
-| Durable Work, checkpoints, retries, and handoffs outlive any request or chat connection. | The Server coordinates; a User Runner executes beside private repositories, tools, data, network, and credentials. | Policy admits each action before execution; Trace and Audit preserve its route, result, and evidence afterward. |
+| ContextPipe budgets and compresses context while checkpoints keep long-running Work resumable. | Trace links captured file, session, and database changes to evidence and scoped rollback. | The Server keeps the Work; a user-bound Runner reconnects it to private repositories, tools, credentials, and networks. |
 
 Astra includes the Server, CLI/TUI, Web dashboard, APIs, and TypeScript SDK. You
 bring the LLM and embedding endpoints, then connect tools and data through a
 Runner or MCP.
 
 **Codex starts with the agent experience. DeepSeek Harness starts with the
-plugin graph. Astra starts with durable enterprise Work, then routes each
-admitted action to the identity and environment allowed to perform it.**
+plugin graph. Astra starts with durable enterprise Work: context is budgeted,
+captured changes carry rollback evidence, and execution reconnects to the
+identity and environment allowed to perform it.**
 
 <div align="center">
-  <img alt="Illustrative 20-second Astra flow: a request becomes durable Work on the Server, context and policy determine an execution route, a user-bound Runner acts inside a private environment, and the result returns with trace and audit evidence." src="docs/assets/astra-cli-demo.gif" width="900">
+  <img alt="Illustrative 20-second Astra flow: ContextPipe keeps durable Work within a smaller token budget, a user-bound Runner makes a captured change inside a private environment, and Astra traces and rolls the change back before the Work continues." src="docs/assets/astra-cli-demo.gif" width="900">
 </div>
 
-<p align="center"><sub>The Server keeps the Work. The Runner keeps private access local. Policy governs the boundary. Trace preserves the evidence.</sub></p>
+<p align="center"><sub>Less context to carry. Changes you can recover from. The same Work wherever you continue.</sub></p>
 
 ### Pick the layer you need
 

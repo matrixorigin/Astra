@@ -143,22 +143,22 @@ def draw_frame(frame_number: int) -> Image.Image:
     for index, color in enumerate((ERROR, WARN, SUCCESS)):
         x = 58 + index * 27
         draw.ellipse((x, 45, x + 11, 56), fill=color)
-    draw.text((527, 38), "ASTRA · CONTEXT TO EXECUTION", font=SMALL, fill=MUTED)
+    draw.text((548, 38), "ASTRA · DURABLE WORKFLOW", font=SMALL, fill=MUTED)
     draw.rounded_rectangle((1045, 39, 1217, 64), radius=12, outline=BORDER, width=1)
     draw.text((1064, 42), "ILLUSTRATIVE FLOW", font=LABEL, fill=MUTED)
 
-    draw.text((64, 100), "One Work item crosses a trust boundary without giving the Server ambient access.", font=BODY, fill=TEXT)
+    draw.text((64, 100), "Less context. Reversible changes. The same Work in every environment.", font=BODY, fill=TEXT)
 
     # Request surface.
     request_intensity = fade(elapsed, 0.4)
     card(draw, (64, 186, 316, 494), request_intensity)
     draw.text((86, 208), "CLI · WEB · SDK", font=LABEL, fill=blend(ACCENT, request_intensity, SURFACE))
-    draw.text((86, 253), "Review release", font=TITLE, fill=blend(TEXT, request_intensity, SURFACE))
-    draw.text((86, 286), "readiness", font=TITLE, fill=blend(TEXT, request_intensity, SURFACE))
+    draw.text((86, 253), "Update release", font=TITLE, fill=blend(TEXT, request_intensity, SURFACE))
+    draw.text((86, 286), "configuration", font=TITLE, fill=blend(TEXT, request_intensity, SURFACE))
     draw.line((86, 335, 294, 335), fill=blend(BORDER, request_intensity, SURFACE), width=1)
     draw.text((86, 356), "submitted once", font=SMALL, fill=blend(MUTED, request_intensity, SURFACE))
     draw.text((86, 385), "client may disconnect", font=SMALL, fill=blend(MUTED, request_intensity, SURFACE))
-    request_status = "result delivered" if elapsed >= 17 else "request accepted"
+    request_status = "Work continues" if elapsed >= 17 else "request accepted"
     request_status_color = SUCCESS if elapsed >= 17 else ACCENT
     draw.text((86, 442), "●", font=SMALL, fill=blend(request_status_color, request_intensity, SURFACE))
     draw.text((111, 442), request_status, font=SMALL, fill=blend(request_status_color, request_intensity, SURFACE))
@@ -175,11 +175,11 @@ def draw_frame(frame_number: int) -> Image.Image:
     work_status = "completed" if elapsed >= 16.8 else "running · durable"
     work_color = SUCCESS if elapsed >= 16.8 else GUTTER
     draw.text((632, 251), work_status, font=SMALL, fill=blend(work_color, work_intensity, SURFACE))
-    draw.text((400, 279), "survives requests · reconnects · handoffs", font=LABEL, fill=blend(MUTED, work_intensity, SURFACE))
+    draw.text((400, 279), "survives requests · moves across environments", font=LABEL, fill=blend(MUTED, work_intensity, SURFACE))
 
-    stage_row(draw, 334, "CONTEXT", "task + memory + evidence", ACCENT, fade(elapsed, 4.4))
-    stage_row(draw, 378, "POLICY", "read_repo → user runner", WARN, fade(elapsed, 6.6))
-    stage_row(draw, 422, "TRACE", "model · route · tool · result", GUTTER, fade(elapsed, 14.6))
+    stage_row(draw, 334, "CONTEXT", "31% fewer tokens", ACCENT, fade(elapsed, 4.4))
+    stage_row(draw, 378, "POLICY", "write_repo → user runner", WARN, fade(elapsed, 6.6))
+    stage_row(draw, 422, "TRACE", "change · receipt · rollback", GUTTER, fade(elapsed, 14.6))
 
     result_intensity = fade(elapsed, 16.0)
     draw.rounded_rectangle(
@@ -189,14 +189,16 @@ def draw_frame(frame_number: int) -> Image.Image:
         outline=blend(SUCCESS, result_intensity, SURFACE),
         width=1,
     )
-    draw.text((400, 489), "✓ 2 release blockers found", font=BODY_BOLD, fill=blend(SUCCESS, result_intensity, SURFACE))
-    draw.text((400, 515), "result delivered · evidence retained", font=LABEL, fill=blend(MUTED, result_intensity, SURFACE))
+    result_title = "↶ change rolled back" if elapsed >= 17.0 else "✓ 2 files changed · rollback ready"
+    result_detail = "Work continues · evidence retained" if elapsed >= 17.0 else "pre-images captured · receipt r_72c1"
+    draw.text((400, 489), result_title, font=BODY_BOLD, fill=blend(SUCCESS, result_intensity, SURFACE))
+    draw.text((400, 515), result_detail, font=LABEL, fill=blend(MUTED, result_intensity, SURFACE))
 
     # Private execution environment and its local authority.
     boundary_intensity = fade(elapsed, 7.8)
     dashed_boundary(draw, (862, 124, 1216, 566), blend(SUCCESS, boundary_intensity))
-    draw.text((884, 139), "PRIVATE ENVIRONMENT", font=LABEL, fill=blend(SUCCESS, boundary_intensity, PANEL))
-    draw.text((884, 164), "credentials and network stay here", font=SMALL, fill=blend(MUTED, boundary_intensity, PANEL))
+    draw.text((884, 139), "USER ENVIRONMENT", font=LABEL, fill=blend(SUCCESS, boundary_intensity, PANEL))
+    draw.text((884, 164), "private access stays here", font=SMALL, fill=blend(MUTED, boundary_intensity, PANEL))
 
     card(draw, (884, 210, 1194, 350), boundary_intensity, SUCCESS)
     draw.text((906, 231), "USER RUNNER", font=BODY_BOLD, fill=blend(SUCCESS, boundary_intensity, SURFACE))
@@ -222,9 +224,10 @@ def draw_frame(frame_number: int) -> Image.Image:
         resource_x += width + 12
 
     action_intensity = fade(elapsed, 11.2)
+    action_label = "rollback_file_edits" if elapsed >= 17.0 else "edit_release_config"
     draw.text((884, 460), "●", font=BODY, fill=blend(SUCCESS, action_intensity, PANEL))
-    draw.text((912, 460), "read_repository", font=BODY, fill=blend(TEXT, action_intensity, PANEL))
-    draw.text((884, 494), "bounded result + execution identity", font=SMALL, fill=blend(MUTED, action_intensity, PANEL))
+    draw.text((912, 460), action_label, font=BODY, fill=blend(TEXT, action_intensity, PANEL))
+    draw.text((884, 494), "captured change + execution identity", font=SMALL, fill=blend(MUTED, action_intensity, PANEL))
 
     # Animated request, admitted tool call, and typed result.
     arrow(draw, (316, 274), (356, 274), fade(elapsed, 1.7, 0.8), ACCENT)
@@ -234,12 +237,12 @@ def draw_frame(frame_number: int) -> Image.Image:
     arrow(draw, (862, 372), (822, 372), fade(elapsed, 12.7, 1.1), SUCCESS)
     draw.text((831, 382), "evidence", font=LABEL, fill=blend(SUCCESS, fade(elapsed, 12.7), PANEL))
 
-    # Outcome: the three properties Astra owns around the model/tool loop.
+    # Outcome: the three product promises illustrated by the flow.
     draw.rounded_rectangle((64, 608, 1216, 680), radius=12, fill=PANEL_TOP, outline=BORDER, width=1)
-    item_x = 112
-    item_x = outcome_item(draw, item_x, "WORK SURVIVES", GUTTER, fade(elapsed, 2.8))
-    item_x = outcome_item(draw, item_x, "ACCESS STAYS LOCAL", SUCCESS, fade(elapsed, 9.2))
-    outcome_item(draw, item_x, "EVERY ACTION IS TRACEABLE", ACCENT, fade(elapsed, 15.2))
+    item_x = 82
+    item_x = outcome_item(draw, item_x, "DURABLE WORK ON FEWER TOKENS", GUTTER, fade(elapsed, 4.4))
+    item_x = outcome_item(draw, item_x, "AGENT CHANGES YOU CAN TRACE AND ROLL BACK", SUCCESS, fade(elapsed, 14.6))
+    outcome_item(draw, item_x, "WORK THAT MOVES WITH YOU", ACCENT, fade(elapsed, 8.6))
 
     return image
 

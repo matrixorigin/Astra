@@ -65,6 +65,7 @@ def main() -> None:
         Path("scripts/ci/test_interactive_setup_contract.sh"),
         Path("scripts/ops/test_production_env_contract.sh"),
         Path("scripts/ci/test_release_contract.sh"),
+        Path("scripts/ci/test_sccache_fallback.sh"),
     ]
     for contract_script in contract_scripts:
         result = subprocess.run(

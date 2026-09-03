@@ -40,6 +40,11 @@ The repository validator covers local documentation links, JSON and shell
 syntax, pinned GitHub Actions, mirrored agent instructions, accidental tracked
 artifacts, executable script modes, and monitoring metric references.
 
+Rust CI uses `scripts/ci/configure-sccache.sh` to probe the optional compiler
+cache before enabling it. Backend startup failures fall back to direct `rustc`,
+and sccache's native I/O fallback covers interruptions after startup. The
+offline fault-injection contract is included in `validate_repository.py`.
+
 The remaining Harness tests exercise Harbor integration contracts and require
 the benchmark environment. Run the complete suite there with
 `python3 -m unittest discover -s scripts/harness -p 'test_*.py'`.
