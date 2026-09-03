@@ -68,7 +68,7 @@ select optional tools separately.
 - `ASTRA_JWT_ALGORITHM` (default `HS256`)
 - `ASTRA_JWT_ACCESS_TTL_MINUTES` (default `10080` in code; production should override)
 - `ASTRA_JWT_REFRESH_TTL_DAYS` (default `7`)
-- `ASTRA_TOKEN_ENCRYPTION_KEY` (Fernet key)
+- `ASTRA_TOKEN_ENCRYPTION_KEY` (high-entropy secret from which Astra derives Fernet encryption; changing it makes existing provider credentials undecryptable)
 - `ASTRA_RUNTIME_ROOT_SECRET`
 
 ### Provider Request Auth

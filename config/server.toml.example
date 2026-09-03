@@ -22,7 +22,7 @@ min_connections = 1           # Min idle connections (env: ASTRA_DB_POOL_MIN_CON
 # access_ttl_minutes = 10080            # Access token TTL (default: 7 days)
 # refresh_ttl_days = 30                 # Refresh token TTL
 # runtime_root_secret = "CHANGE-ME"           # Runtime root secret (≥32 chars)
-# token_encryption_key = ""             # Fernet key for LLM API key encryption
+# token_encryption_key = ""             # Secret used to derive Fernet encryption for LLM API keys
 # provider_request_auth = [
 #   { provider = "moi", type = "hmac", key = "${ASTRA_PROVIDER_HMAC_KEY}" }
 # ]

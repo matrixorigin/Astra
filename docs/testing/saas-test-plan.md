@@ -405,7 +405,7 @@ helm install astra deployment/kubernetes/chart \
 | 项 | 要求 |
 |----|------|
 | TLS | 生产强制 HTTPS |
-| JWT Secret / Fernet Key | 非默认值；轮换流程文档化 |
+| JWT Secret / encryption secret | 非默认值；轮换流程文档化 |
 | LLM Key | 不出 Cloud；Edge 日志无 Key |
 | Edge 信任边界 | tool_result 标记 `source: edge` |
 | CORS / CSRF | Web 客户端策略正确 |

@@ -156,8 +156,9 @@ dashboard, or to change Astra itself. For production topologies, use the
 | [Docker](#docker) | MatrixOne, Memoria, and `astra-server` from published images — the HTTP API | Docker Compose and OpenSSL |
 | [From source](#build-from-source) | The same backbone plus the `astra` CLI/TUI, the Web dashboard, and CLI-local Runner capacity | Rust 1.97 and Node.js 24, both pinned in the repository |
 
-Both paths need Git, Make, an embedding API, and at least one supported LLM
-endpoint.
+Both paths need Git, Make, and at least one supported LLM endpoint. Semantic
+memory needs an embedding API; deterministic mock embeddings are also available
+for local evaluation and tests.
 
 ### Docker
 
@@ -169,8 +170,11 @@ make stack-env
 ```
 
 `make stack-env` creates `deployment/all-in-one/.env` and generates the local
-stack secrets. Fill in `MEMORIA_EMBEDDING_API_KEY` and
-`MEMORIA_EMBEDDING_BASE_URL`, then start the stack:
+stack secrets. For semantic memory, configure `MEMORIA_EMBEDDING_API_KEY` and
+`MEMORIA_EMBEDDING_BASE_URL`. For a no-credential local evaluation, set
+`MEMORIA_EMBEDDING_PROVIDER=mock` and leave both blank. Mock embeddings are
+deterministic and intended for evaluation or tests, not production retrieval.
+Then start the stack:
 
 ```bash
 make stack-up
@@ -206,9 +210,9 @@ cp .models.yaml.example .models.yaml
 make dev-init
 ```
 
-Set `MEMORIA_EMBEDDING_API_KEY` and `MEMORIA_EMBEDDING_BASE_URL` in `.env`,
-then configure at least one provider in `.models.yaml`. Never commit either
-local file.
+Configure a real embedding endpoint in `.env` for semantic memory, or set
+`MEMORIA_EMBEDDING_PROVIDER=mock` for local evaluation. Then configure at least
+one model provider in `.models.yaml`. Never commit either local file.
 
 #### 2. Build and start Server-only
 

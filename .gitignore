@@ -97,6 +97,8 @@ trustmem_cloud_v1/data/
 feedback_export.jsonl
 /backups/
 
+# Local reviews and task plans may contain private investigation details.
+# Keep durable, shareable decisions in docs/ instead.
 review/
 /plans/
 

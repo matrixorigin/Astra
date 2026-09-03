@@ -37,7 +37,7 @@ cargo check --manifest-path Cargo.toml
 - `crates/services/tests/` — service-layer tests (e.g. `multi_agent_integration` with live DB when `ASTRA_TEST_DB_IT=1`).
 - `fixtures/contracts/` — JSON fixtures for contract tests that load shared request/response shapes.
 - Capability ↔ route ↔ E2E mapping: [`docs/testing/system-e2e-matrix.md`](../testing/system-e2e-matrix.md).
-- SaaS 能力测试计划：[`docs/testing/saas-test-plan.md`](../testing/saas-test-plan.md)（`make test-saas`；含 Rust HTTP E2E + 可选 `@astra/sdk` 远程）
+- SaaS capability test plan: [`docs/testing/saas-test-plan.md`](../testing/saas-test-plan.md) (`make test-saas`; Rust HTTP E2E plus optional remote `@astra/sdk` coverage).
 - Coverage matrix (what replaced stub tests, large-binary audit): [`docs/testing/coverage-matrix.md`](../testing/coverage-matrix.md).
 
 ## Live MatrixOne system E2E

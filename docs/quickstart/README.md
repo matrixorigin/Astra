@@ -20,7 +20,8 @@ providers are connected.
 - Rust via `rustup` (the repository pins the required toolchain)
 - Node.js 24 (pinned in [`.nvmrc`](../../.nvmrc))
 - OpenSSL command-line tools
-- An embedding API and at least one supported LLM endpoint
+- At least one supported LLM endpoint, plus either an embedding API for semantic
+  memory or deterministic mock embeddings for local evaluation
 
 ### Initialize and start
 
@@ -32,9 +33,10 @@ cp .models.yaml.example .models.yaml
 make dev-init
 ```
 
-Set `MEMORIA_EMBEDDING_API_KEY` and `MEMORIA_EMBEDDING_BASE_URL` in `.env`,
-then add the credentials for at least one model endpoint to `.models.yaml`.
-Never commit either local file.
+Configure `MEMORIA_EMBEDDING_API_KEY` and `MEMORIA_EMBEDDING_BASE_URL` in
+`.env` for semantic memory, or set `MEMORIA_EMBEDDING_PROVIDER=mock` for local
+evaluation. Then add credentials for at least one model endpoint to
+`.models.yaml`. Never commit either local file.
 
 ```bash
 make build

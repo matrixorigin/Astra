@@ -141,7 +141,7 @@ STACK_DIR := deployment/all-in-one
 STACK_ENV := $(STACK_DIR)/.env
 STACK_COMPOSE := cd $(STACK_DIR) && docker compose --env-file $(abspath $(STACK_ENV))
 STACK_SECRET_ENV := ASTRA_JWT_SECRET ASTRA_TOKEN_ENCRYPTION_KEY ASTRA_RUNTIME_ROOT_SECRET MEMORIA_MASTER_KEY
-STACK_REQUIRED_ENV := $(STACK_SECRET_ENV) MEMORIA_EMBEDDING_API_KEY MEMORIA_EMBEDDING_BASE_URL
+STACK_EMBEDDING_ENV := MEMORIA_EMBEDDING_API_KEY MEMORIA_EMBEDDING_BASE_URL
 
 # Per-test-case hard budget. Any case running longer than the budget is
 # killed and counted as FAIL. Nextest has no CLI override for slow-timeout
@@ -609,7 +609,7 @@ stack-env:
 	ensure_secret ASTRA_TOKEN_ENCRYPTION_KEY; \
 	ensure_secret ASTRA_RUNTIME_ROOT_SECRET; \
 	ensure_secret MEMORIA_MASTER_KEY; \
-	echo "Edit required embedding config before running: make stack-up"
+	echo "Configure a real embedding endpoint, or set MEMORIA_EMBEDDING_PROVIDER=mock for local evaluation, before running: make stack-up"
 
 .PHONY: stack-check-env
 stack-check-env:
@@ -618,8 +618,13 @@ stack-check-env:
 		echo "   Run: make stack-env"; \
 		exit 1; \
 	fi
-	@missing=""; \
-	for key in $(STACK_REQUIRED_ENV); do \
+	@embedding_provider="$$(sed -n 's/^[[:space:]]*MEMORIA_EMBEDDING_PROVIDER[[:space:]]*=[[:space:]]*//p' "$(STACK_ENV)" | tail -n 1 | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"; \
+	required="$(STACK_SECRET_ENV)"; \
+	if [ "$${embedding_provider:-openai}" != "mock" ]; then \
+		required="$$required $(STACK_EMBEDDING_ENV)"; \
+	fi; \
+	missing=""; \
+	for key in $$required; do \
 		if ! awk -v key="$$key" ' \
 			/^[[:space:]]*#/ { next } \
 			{ \
@@ -639,7 +644,7 @@ stack-check-env:
 	done; \
 	if [ -n "$$missing" ]; then \
 		echo "❌ Missing or insecure required config in $(STACK_ENV):$$missing"; \
-		echo "   Run make stack-env to generate secrets, then fill embedding config."; \
+		echo "   Run make stack-env to generate secrets. For non-mock embeddings, fill the API key and base URL."; \
 		exit 1; \
 	fi
 

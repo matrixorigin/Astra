@@ -11,9 +11,11 @@ cd Astra
 
 # 2. Create stack environment
 make stack-env
-# Edit deployment/all-in-one/.env and fill:
+# For semantic memory, edit deployment/all-in-one/.env and fill:
 #   MEMORIA_EMBEDDING_API_KEY
 #   MEMORIA_EMBEDDING_BASE_URL
+# Or, for deterministic local evaluation without embedding credentials:
+#   MEMORIA_EMBEDDING_PROVIDER=mock
 
 # 3. Start all services
 make stack-up
@@ -31,7 +33,8 @@ Uses published images by default:
 ```bash
 cd deployment/all-in-one
 cp .env.example .env
-# Edit required embedding configuration.
+# Configure a real embedding endpoint, or set MEMORIA_EMBEDDING_PROVIDER=mock
+# for deterministic local evaluation.
 
 docker compose up -d
 docker compose logs -f api
@@ -64,9 +67,12 @@ make dev-api-docker-down
 Create `deployment/all-in-one/.env` with:
 
 ```bash
-# Required
+# Required for non-mock embeddings
 MEMORIA_EMBEDDING_API_KEY=...
 MEMORIA_EMBEDDING_BASE_URL=...
+
+# Alternative for local evaluation and tests (not production retrieval)
+# MEMORIA_EMBEDDING_PROVIDER=mock
 
 # Host ports
 ASTRA_BIND_ADDRESS=127.0.0.1

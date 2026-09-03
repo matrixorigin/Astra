@@ -13,10 +13,14 @@ make stack-env
 ```
 
 `make stack-env` creates `deployment/all-in-one/.env` and generates local
-stack secrets. Fill the required embedding configuration:
+stack secrets. For semantic memory, fill the embedding configuration:
 
 - `MEMORIA_EMBEDDING_API_KEY`
 - `MEMORIA_EMBEDDING_BASE_URL`
+
+For a no-credential local evaluation, set `MEMORIA_EMBEDDING_PROVIDER=mock`
+and leave both values blank. Mock embeddings are deterministic and suitable for
+evaluation or tests, not production retrieval.
 
 Then start the stack:
 
@@ -24,7 +28,8 @@ Then start the stack:
 make stack-up
 ```
 
-`make stack-up` fails before starting containers if any required value is empty.
+`make stack-up` fails before starting containers if a required secret is empty,
+or if a non-mock embedding provider is missing its API key or base URL.
 
 ## Runtime Startup Profiles
 
@@ -100,6 +105,9 @@ Required for startup:
 - `ASTRA_TOKEN_ENCRYPTION_KEY`
 - `ASTRA_RUNTIME_ROOT_SECRET`
 - `MEMORIA_MASTER_KEY`
+
+For non-mock embeddings, also configure:
+
 - `MEMORIA_EMBEDDING_API_KEY`
 - `MEMORIA_EMBEDDING_BASE_URL`
 
@@ -120,8 +128,11 @@ Fill the required configuration in `.env`:
 - `ASTRA_TOKEN_ENCRYPTION_KEY`
 - `ASTRA_RUNTIME_ROOT_SECRET`
 - `MEMORIA_MASTER_KEY`
-- `MEMORIA_EMBEDDING_API_KEY`
-- `MEMORIA_EMBEDDING_BASE_URL`
+
+For semantic memory, configure `MEMORIA_EMBEDDING_API_KEY` and
+`MEMORIA_EMBEDDING_BASE_URL`. Alternatively, set
+`MEMORIA_EMBEDDING_PROVIDER=mock` for deterministic local evaluation and leave
+both values blank.
 
 Then start the stack:
 
