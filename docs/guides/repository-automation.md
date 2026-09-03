@@ -16,8 +16,8 @@ The queue settings are explicit rather than relying on service defaults:
 
 - `batch_size: 1`, `max_checks_retries: 0`, `mode: serial`, and
   `max_parallel_checks: 1` keep validation on the original pull request.
-- `update_method: merge` works for branches in forks without rewriting their
-  history.
+- `update_method: merge` updates eligible fork branches without rewriting
+  their history.
 - Branch-protection requirements are injected by Mergify, so the required
   check list remains owned by GitHub.
 
@@ -27,8 +27,10 @@ all stale branches creates avoidable CI runs and writes to contributor forks.
 
 ## Required GitHub App access
 
-The Mergify installation on `matrixorigin/Astra` must retain these repository
-permissions:
+Mergify requests a fixed permission set for its products. Do not trim that set
+to this table: these are the permissions most directly involved in Astra's
+queue path. The installation must include `matrixorigin/Astra` in its selected
+repository access and retain Mergify's requested permissions, including:
 
 | Permission | Access | Why |
 | --- | --- | --- |
@@ -37,6 +39,9 @@ permissions:
 | Checks | Read and write | Publish queue and rule results |
 | Workflows | Read and write | Update a Git ref when the incoming `main` commits include `.github/workflows/*` |
 | Administration | Read | Read branch-protection requirements |
+
+The current full permission set and its feature-level rationale are maintained
+in [Mergify's security reference](https://docs.mergify.com/security/#github-app-required-permissions).
 
 `Workflows: read and write` does not make workflow changes part of a
 documentation pull request. GitHub checks the complete ref update: if `main`
@@ -47,6 +52,13 @@ GitHub rejects that ref update unless the app has the Workflows permission.
 When Mergify requests new permissions, an organization owner must approve the
 installation update. Selecting the permission in the app UI is not sufficient
 until the organization installation reports the new effective access.
+
+For a pull request from a personal fork, the author must also select **Allow
+edits from maintainers**. GitHub labels this **Allow edits and access to secrets
+by maintainers** when the fork contains Actions workflows. This is the author's
+security choice; if it is disabled, ask the author to update the branch instead
+of bypassing protection. See [GitHub's fork collaboration
+guide](https://docs.github.com/en/pull-requests/how-tos/work-with-forks/allowing-changes-to-a-pull-request-branch-created-from-a-fork).
 
 ## Protection settings
 
@@ -80,9 +92,12 @@ before rerunning CI:
 
 1. A message naming `.github/workflows/...` and missing `workflows` permission
    is an installation-permission failure, not a test failure.
-2. A merge conflict requires the contributor or maintainer to resolve the
+2. A message saying the fork branch cannot be updated without a missing app
+   permission can mean maintainer edits are disabled; the author must update
+   the branch or opt in.
+3. A merge conflict requires the contributor or maintainer to resolve the
    branch; increasing app permissions does not help.
-3. A required check failure after Mergify updates the branch is a real CI
+4. A required check failure after Mergify updates the branch is a real CI
    result on the current `main` integration and should be debugged normally.
 
 This separation prevents permission failures from being treated as flaky CI
