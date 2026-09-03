@@ -70,14 +70,7 @@ runs:
     - name: Configure sccache
       if: ${{ inputs.use-sccache == 'true' && steps.install_sccache.outcome == 'success' }}
       shell: bash
-      run: |
-        {
-          echo "SCCACHE_GHA_ENABLED=true"
-          echo "SCCACHE_CACHE_SIZE=5G"
-          # Keep compiler caching fail-open. The wrapper retries with rustc and
-          # disables sccache for the job if the remote cache backend fails.
-          echo "RUSTC_WRAPPER=${GITHUB_WORKSPACE}/scripts/ci/rustc-sccache-fallback.sh"
-        } >> "$GITHUB_ENV"
+      run: scripts/ci/configure-sccache.sh
 
     - name: Report sccache fallback
       if: ${{ always() && inputs.use-sccache == 'true' && steps.install_sccache.outcome != 'success' }}
@@ -87,6 +80,10 @@ runs:
         echo "RUSTC_WRAPPER=" >> "$GITHUB_ENV"
 
     - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      # Restoring build artifacts is also an optimization. Every caller runs a
+      # compiler/test gate afterwards, so cache-service failures remain visible
+      # as slower builds rather than false CI failures.
+      continue-on-error: true
       with:
         workspaces: .
         shared-key: ${{ inputs.shared-key }}-${{ github.base_ref || github.ref_name }}

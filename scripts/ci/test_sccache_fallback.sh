@@ -2,7 +2,7 @@
 set -euo pipefail
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-wrapper="${script_dir}/rustc-sccache-fallback.sh"
+configure="${script_dir}/configure-sccache.sh"
 fixture_dir="$(mktemp -d)"
 trap 'rm -rf -- "${fixture_dir}"' EXIT
 
@@ -11,7 +11,10 @@ mkdir -p "${fixture_dir}/bin"
 cat > "${fixture_dir}/bin/sccache" <<'EOF'
 #!/usr/bin/env bash
 printf 'called\n' >> "${FAKE_SCCACHE_CALLS}"
-exit "${FAKE_SCCACHE_STATUS}"
+if [[ "${FAKE_SCCACHE_STATUS}" != "0" ]]; then
+  exit "${FAKE_SCCACHE_STATUS}"
+fi
+exec "$@"
 EOF
 
 cat > "${fixture_dir}/bin/rustc" <<'EOF'
@@ -42,46 +45,61 @@ assert_count() {
   fi
 }
 
+assert_env_line() {
+  local expected="$1"
+  if ! grep -Fxq -- "${expected}" "${GITHUB_ENV}"; then
+    echo "missing environment line: ${expected}" >&2
+    exit 1
+  fi
+}
+
 export PATH="${fixture_dir}/bin:${PATH}"
+export SCCACHE_PATH="${fixture_dir}/bin/sccache"
 export FAKE_SCCACHE_CALLS="${fixture_dir}/sccache-calls"
 export FAKE_RUSTC_CALLS="${fixture_dir}/rustc-calls"
 
-# A cache backend failure is retried directly, then disables caching for all
-# later compiler invocations in the same job.
-export RUNNER_TEMP="${fixture_dir}/cache-failure"
-export FAKE_SCCACHE_STATUS=2
+# A healthy backend enables the installed sccache binary and native I/O
+# fallback without invoking rustc outside the cache probe.
+export GITHUB_ENV="${fixture_dir}/healthy.env"
+export FAKE_SCCACHE_STATUS=0
 export FAKE_RUSTC_STATUS=0
-mkdir -p "${RUNNER_TEMP}"
-"${wrapper}" "${fixture_dir}/bin/rustc" --version
-[[ -f "${RUNNER_TEMP}/astra-sccache-disabled" ]]
+"${configure}"
+assert_env_line "SCCACHE_GHA_ENABLED=true"
+assert_env_line "SCCACHE_CACHE_SIZE=5G"
+assert_env_line "SCCACHE_IGNORE_SERVER_IO_ERROR=1"
+assert_env_line "RUSTC_WRAPPER=${SCCACHE_PATH}"
 assert_count 1 "${FAKE_SCCACHE_CALLS}"
 assert_count 1 "${FAKE_RUSTC_CALLS}"
 
-"${wrapper}" "${fixture_dir}/bin/rustc" --version
-assert_count 1 "${FAKE_SCCACHE_CALLS}"
+# A backend startup failure is confirmed against direct rustc and then leaves
+# the rest of the job uncached.
+export GITHUB_ENV="${fixture_dir}/cache-failure.env"
+export FAKE_SCCACHE_STATUS=2
+"${configure}"
+assert_env_line "RUSTC_WRAPPER="
+assert_count 2 "${FAKE_SCCACHE_CALLS}"
 assert_count 2 "${FAKE_RUSTC_CALLS}"
 
-# A genuine compiler failure remains fatal and must not disable the cache.
-export RUNNER_TEMP="${fixture_dir}/compiler-failure"
-export FAKE_RUSTC_STATUS=1
-mkdir -p "${RUNNER_TEMP}"
-if "${wrapper}" "${fixture_dir}/bin/rustc" --version; then
-  echo "expected direct compiler failure to remain fatal" >&2
+# A broken compiler remains fatal rather than being mislabeled as a cache-only
+# failure.
+export GITHUB_ENV="${fixture_dir}/compiler-failure.env"
+export FAKE_SCCACHE_STATUS=0
+export FAKE_RUSTC_STATUS=42
+if "${configure}"; then
+  echo "expected compiler failure to remain fatal" >&2
+  exit 1
+else
+  status=$?
+fi
+if [[ "${status}" != "42" ]]; then
+  echo "expected compiler status 42, found ${status}" >&2
   exit 1
 fi
-[[ ! -e "${RUNNER_TEMP}/astra-sccache-disabled" ]]
-assert_count 2 "${FAKE_SCCACHE_CALLS}"
-assert_count 3 "${FAKE_RUSTC_CALLS}"
-
-# Healthy cache invocations do not call rustc directly or create fallback
-# state.
-export RUNNER_TEMP="${fixture_dir}/cache-success"
-export FAKE_SCCACHE_STATUS=0
-export FAKE_RUSTC_STATUS=0
-mkdir -p "${RUNNER_TEMP}"
-"${wrapper}" "${fixture_dir}/bin/rustc" --version
-[[ ! -e "${RUNNER_TEMP}/astra-sccache-disabled" ]]
 assert_count 3 "${FAKE_SCCACHE_CALLS}"
-assert_count 3 "${FAKE_RUSTC_CALLS}"
+assert_count 4 "${FAKE_RUSTC_CALLS}"
+if grep -Fq "RUSTC_WRAPPER=" "${GITHUB_ENV}"; then
+  echo "compiler failure must not emit a successful cache configuration" >&2
+  exit 1
+fi
 
 echo "sccache fallback contract: ok"
