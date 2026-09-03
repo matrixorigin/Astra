@@ -52,6 +52,7 @@ operators, and kernel contributors to the level of detail they need.
 | [Testing guide](guides/testing.md) | Offline, contract, online, and system test lanes |
 | [Makefile reference](reference/makefile-commands.md) | Build, validation, test, and development targets |
 | [Dependencies](reference/dependencies.md) | Required and optional development tools |
+| [Repository automation](guides/repository-automation.md) | Maintainer contract for Mergify, branch protection, and external-fork delivery |
 | [Release guide](guides/releasing.md) | Maintainer workflow for versioned CLI and container releases |
 | [System E2E matrix](testing/system-e2e-matrix.md) | Cross-surface runtime behavior and coverage obligations |
 | [Capability harness](testing/capability-harness.md) | Capability-provider and model/tool test contract |

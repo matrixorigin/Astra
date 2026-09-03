@@ -1,5 +1,10 @@
 queue_rules:
   - name: main
+    # Keep checks in place so GitHub's strict up-to-date protection and the
+    # queue validate the same PR head. See docs/guides/repository-automation.md.
+    batch_size: 1
+    max_checks_retries: 0
+    update_method: merge
     merge_conditions: []
     checks_timeout: 4h
     merge_method: squash
@@ -30,11 +35,6 @@ pull_request_rules:
       queue:
         name: main
 
-  - name: Auto update branch
-    conditions:
-      - created-at>=00:10 ago
-    actions:
-      update:
-
 merge_queue:
+  mode: serial
   max_parallel_checks: 1
