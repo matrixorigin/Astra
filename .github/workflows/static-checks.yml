@@ -41,7 +41,7 @@ jobs:
 
   check:
     needs: scope
-    if: ${{ always() }}
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -50,7 +50,7 @@ jobs:
           persist-credentials: false
       - name: Validate repository metadata and documentation
         run: python3 scripts/ci/validate_repository.py
-      - name: Test CI scope routing
+      - name: Test CI contracts
         run: python3 -m unittest discover -s scripts/ci -p 'test_*.py'
       - name: Validate Terminal-Bench harness contracts
         if: ${{ needs.scope.result != 'success' || needs.scope.outputs.harness == 'true' }}
@@ -95,7 +95,7 @@ jobs:
   sdk:
     name: "@astra/sdk (typecheck, test+coverage, build)"
     needs: scope
-    if: ${{ always() && (needs.scope.result != 'success' || needs.scope.outputs.sdk == 'true') }}
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.sdk == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -118,7 +118,7 @@ jobs:
   web:
     name: "web (typecheck, test, build)"
     needs: scope
-    if: ${{ always() && (needs.scope.result != 'success' || needs.scope.outputs.web == 'true') }}
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.web == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
