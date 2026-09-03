@@ -21,7 +21,7 @@ tracing = { workspace = true }
 
 # AST parsing for bash safety
 tree-sitter = "0.24"
-tree-sitter-bash = "0.23"
+tree-sitter-bash = "0.25"
 
 # UUID for isolation namespaces
 uuid = { workspace = true }
