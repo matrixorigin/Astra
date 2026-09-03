@@ -6762,7 +6762,7 @@ pub(crate) mod tests {
     async fn off_target_final_after_successful_tool_is_preserved_without_guard_retry() {
         let bad_answer = "Session context was unavailable or incomplete in this runtime \
             (degraded resume — no prior prompt-facing history restored). Workspace is bound \
-            and ready at /Users/xupeng/github/astra with the executor online.\n\n\
+            and ready at /workspace/astra with the executor online.\n\n\
             Awaiting your next instruction.";
         let mut host = MockHost::new(vec![
             edge_tool_result(

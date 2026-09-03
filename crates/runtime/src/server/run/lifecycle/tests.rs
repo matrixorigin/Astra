@@ -11948,9 +11948,9 @@ fn request_execution_bindings_keep_edge_workspace_without_server_reroute() {
     request.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
         kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
         display_name: Some("MacBook Pro".to_string()),
-        root: Some("/Users/xupeng/github/astra".to_string()),
+        root: Some("/workspace/astra".to_string()),
         source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
-            path: "/Users/xupeng/github/astra".to_string(),
+            path: "/workspace/astra".to_string(),
         }),
         authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
     });
@@ -11967,7 +11967,7 @@ fn request_execution_bindings_keep_edge_workspace_without_server_reroute() {
 
     assert_eq!(workspace.kind, WorkspaceBindingKind::EdgeWorkspace);
     assert_eq!(workspace.display_name, "MacBook Pro");
-    assert_eq!(workspace.cwd.as_deref(), Some("/Users/xupeng/github/astra"));
+    assert_eq!(workspace.cwd.as_deref(), Some("/workspace/astra"));
     assert_eq!(executor.kind, ExecutorBindingKind::EdgeAgent);
     assert_eq!(executor.executor_id, "edge-macbook-1");
     assert_eq!(executor.transport, ToolTransportKind::EdgeWs);
@@ -12000,7 +12000,7 @@ fn workspace_binding_request_rejects_cwd_alias_and_unknown_fields() {
 #[test]
 fn edge_profile_does_not_infer_execution_bindings() {
     let mut edge_profile = Map::new();
-    edge_profile.insert("cwd".to_string(), json!("/Users/xupeng/github/astra"));
+    edge_profile.insert("cwd".to_string(), json!("/workspace/astra"));
     edge_profile.insert("edge_agent_id".to_string(), json!("edge-macbook-1"));
     edge_profile.insert("hostname".to_string(), json!("MacBook Pro"));
 
@@ -17751,9 +17751,9 @@ async fn create_run_persists_edge_binding_into_run_started_event() {
     req.workspace_binding = Some(astra_services::runs::WorkspaceBindingRequest {
         kind: astra_services::runs::WorkspaceBindingRequestKind::EdgeWorkspace,
         display_name: Some("MacBook Pro".to_string()),
-        root: Some("/Users/xupeng/github/astra".to_string()),
+        root: Some("/workspace/astra".to_string()),
         source: Some(astra_services::runs::WorkspaceSourceRequest::EdgePath {
-            path: "/Users/xupeng/github/astra".to_string(),
+            path: "/workspace/astra".to_string(),
         }),
         authority: Some(astra_services::runs::WorkspaceAuthorityRequest::ReadWrite),
     });
@@ -17779,7 +17779,7 @@ async fn create_run_persists_edge_binding_into_run_started_event() {
     );
     assert_eq!(
         durable.events[0]["data"]["workspace"]["cwd"],
-        "/Users/xupeng/github/astra"
+        "/workspace/astra"
     );
     assert_eq!(durable.events[0]["data"]["executor"]["kind"], "edge_agent");
     assert_eq!(
@@ -17794,7 +17794,7 @@ async fn create_run_persists_edge_binding_into_run_started_event() {
     assert_eq!(status.workspace.as_ref().unwrap()["kind"], "edge_workspace");
     assert_eq!(
         status.workspace.as_ref().unwrap()["cwd"],
-        "/Users/xupeng/github/astra"
+        "/workspace/astra"
     );
     assert_eq!(status.executor.as_ref().unwrap()["kind"], "edge_agent");
     assert_eq!(

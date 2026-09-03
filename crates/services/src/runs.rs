@@ -30718,7 +30718,7 @@ mod tests {
                     json!({
                         "tool_call_id": "c1", "name": "bash", "output": "ok", "success": true,
                         "duration_ms": 42,
-                        "workspace": {"kind": "edge_workspace", "cwd": "/Users/xupeng/github/astra"},
+                        "workspace": {"kind": "edge_workspace", "cwd": "/workspace/astra"},
                         "executor": {"kind": "edge_agent", "executor_id": "edge-1", "transport": "edge_ws"},
                         "transport": "edge_ws"
                     }),

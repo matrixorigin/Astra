@@ -425,7 +425,7 @@ describe("AstraClient — Runs", () => {
       workspace: {
         kind: "edge_workspace",
         display_name: "MacBook Pro",
-        cwd: "/Users/xupeng/github/astra",
+        cwd: "/workspace/astra",
         authority: "read_write",
         fallback_policy: "disabled",
       },
@@ -461,7 +461,7 @@ describe("AstraClient — Runs", () => {
     });
     expect(projection.recent_events).toHaveLength(1);
     expect(projection.workspace?.kind).toBe("edge_workspace");
-    expect(projection.workspace?.cwd).toBe("/Users/xupeng/github/astra");
+    expect(projection.workspace?.cwd).toBe("/workspace/astra");
     expect(projection.executor?.executor_id).toBe("edge-1");
     expect(projection.transport).toBe("edge_ws");
     expect(projection.fallback_policy).toBe("disabled");

@@ -92,7 +92,7 @@ describe('work surface reducer', () => {
         workspace: {
           kind: 'edge_workspace',
           display_name: 'MacBook Pro',
-          cwd: '/Users/xupeng/github/astra',
+          cwd: '/workspace/astra',
           authority: 'read_write',
           fallback_policy: 'disabled',
         },
@@ -127,7 +127,7 @@ describe('work surface reducer', () => {
         workspace: {
           kind: 'edge_workspace',
           display_name: 'MacBook Pro',
-          cwd: '/Users/xupeng/github/astra',
+          cwd: '/workspace/astra',
           authority: 'read_write',
           fallback_policy: 'disabled',
         },
@@ -147,7 +147,7 @@ describe('work surface reducer', () => {
 
     expect(state.workspace).toMatchObject({
       kind: 'edge_workspace',
-      cwd: '/Users/xupeng/github/astra',
+      cwd: '/workspace/astra',
     });
     expect(state.executor).toMatchObject({
       kind: 'edge_agent',
@@ -206,7 +206,7 @@ describe('work surface reducer', () => {
           workspace: {
             kind: 'edge_workspace',
             display_name: 'MacBook Pro',
-            cwd: '/Users/xupeng/github/astra',
+            cwd: '/workspace/astra',
             authority: 'read_write',
             fallback_policy: 'disabled',
           },
@@ -227,7 +227,7 @@ describe('work surface reducer', () => {
     expect(state.runStatus).toBe('cancelled');
     expect(state.workspace).toMatchObject({
       kind: 'edge_workspace',
-      cwd: '/Users/xupeng/github/astra',
+      cwd: '/workspace/astra',
     });
     expect(state.executor).toMatchObject({
       kind: 'edge_agent',
@@ -940,7 +940,7 @@ describe('work surface reducer', () => {
       workspace: {
         kind: 'edge_workspace',
         display_name: 'MacBook Pro',
-        cwd: '/Users/xupeng/github/astra',
+        cwd: '/workspace/astra',
         authority: 'read_write',
         fallback_policy: 'disabled',
       },
@@ -984,7 +984,7 @@ describe('work surface reducer', () => {
       tool: 'bash',
       workspace: {
         kind: 'edge_workspace',
-        cwd: '/Users/xupeng/github/astra',
+        cwd: '/workspace/astra',
       },
       executor: {
         kind: 'edge_agent',
@@ -1020,7 +1020,7 @@ describe('work surface reducer', () => {
       workspace: {
         kind: 'edge_workspace',
         display_name: 'MacBook Pro',
-        cwd: '/Users/xupeng/github/astra',
+        cwd: '/workspace/astra',
         authority: 'read_write',
         fallback_policy: 'disabled',
       },
@@ -1048,7 +1048,7 @@ describe('work surface reducer', () => {
       tool: 'bash',
       workspace: {
         kind: 'edge_workspace',
-        cwd: '/Users/xupeng/github/astra',
+        cwd: '/workspace/astra',
       },
       executor: {
         kind: 'edge_agent',
@@ -1082,7 +1082,7 @@ describe('work surface reducer', () => {
       workspace: {
         kind: 'edge_workspace',
         display_name: 'MacBook Pro',
-        cwd: '/Users/xupeng/github/astra',
+        cwd: '/workspace/astra',
         authority: 'read_write',
         fallback_policy: 'disabled',
       },
@@ -1120,7 +1120,7 @@ describe('work surface reducer', () => {
       workspace: {
         kind: 'edge_workspace',
         display_name: 'MacBook Pro',
-        cwd: '/Users/xupeng/github/astra',
+        cwd: '/workspace/astra',
         authority: 'read_write',
         fallback_policy: 'disabled',
       },
@@ -1142,7 +1142,7 @@ describe('work surface reducer', () => {
         'Execution environment is offline. Reconnect it or choose another environment.',
       workspace: {
         kind: 'edge_workspace',
-        cwd: '/Users/xupeng/github/astra',
+        cwd: '/workspace/astra',
       },
       executor: {
         kind: 'edge_agent',
@@ -1243,7 +1243,7 @@ describe('work surface reducer', () => {
       workspace: {
         kind: 'edge_workspace',
         display_name: 'MacBook Pro',
-        cwd: '/Users/xupeng/github/astra',
+        cwd: '/workspace/astra',
         authority: 'read_write',
         fallback_policy: 'disabled',
       },
@@ -1267,7 +1267,7 @@ describe('work surface reducer', () => {
       fallbackPolicy: 'disabled',
       workspace: {
         kind: 'edge_workspace',
-        cwd: '/Users/xupeng/github/astra',
+        cwd: '/workspace/astra',
       },
       executor: {
         kind: 'edge_agent',
@@ -1428,7 +1428,7 @@ describe('work surface reducer', () => {
       workspace: {
         kind: 'edge_workspace',
         display_name: 'MacBook Pro',
-        cwd: '/Users/xupeng/github/astra',
+        cwd: '/workspace/astra',
         authority: 'read_write',
         fallback_policy: 'disabled',
       },
@@ -1548,7 +1548,7 @@ describe('work surface reducer', () => {
       workspace: {
         kind: 'edge_workspace',
         display_name: 'MacBook Pro',
-        cwd: '/Users/xupeng/github/astra',
+        cwd: '/workspace/astra',
         authority: 'read_write',
         fallback_policy: 'disabled',
       },
@@ -1577,7 +1577,7 @@ describe('work surface reducer', () => {
       status: 'completed',
       workspace: {
         kind: 'edge_workspace',
-        cwd: '/Users/xupeng/github/astra',
+        cwd: '/workspace/astra',
       },
       executor: {
         kind: 'edge_agent',
@@ -1600,7 +1600,7 @@ describe('work surface reducer', () => {
       workspace: {
         kind: 'edge_workspace',
         display_name: 'MacBook Pro',
-        cwd: '/Users/xupeng/github/astra',
+        cwd: '/workspace/astra',
         authority: 'read_write',
         fallback_policy: 'disabled',
       },
@@ -1621,7 +1621,7 @@ describe('work surface reducer', () => {
       workspace: {
         kind: 'edge_workspace',
         display_name: 'MacBook Pro',
-        cwd: '/Users/xupeng/github/astra',
+        cwd: '/workspace/astra',
         authority: 'read_write',
         fallback_policy: 'disabled',
       },
@@ -1642,7 +1642,7 @@ describe('work surface reducer', () => {
       reason: 'executor_offline',
       workspace: {
         kind: 'edge_workspace',
-        cwd: '/Users/xupeng/github/astra',
+        cwd: '/workspace/astra',
       },
       executor: {
         kind: 'edge_agent',
@@ -1672,7 +1672,7 @@ describe('work surface reducer', () => {
       workspace: {
         kind: 'edge_workspace',
         display_name: 'MacBook Pro',
-        cwd: '/Users/xupeng/github/astra',
+        cwd: '/workspace/astra',
         authority: 'read_write',
         fallback_policy: 'disabled',
       },
@@ -1752,7 +1752,7 @@ describe('work surface reducer', () => {
           description: 'Audit changes',
           workspace: {
             kind: 'edge_workspace',
-            cwd: '/Users/xupeng/github/astra',
+            cwd: '/workspace/astra',
             fallback_policy: 'disabled',
           },
           executor: {
@@ -1787,7 +1787,7 @@ describe('work surface reducer', () => {
       durationMs: 42,
       workspace: {
         kind: 'edge_workspace',
-        cwd: '/Users/xupeng/github/astra',
+        cwd: '/workspace/astra',
       },
       executor: {
         kind: 'edge_agent',

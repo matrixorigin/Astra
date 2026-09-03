@@ -447,7 +447,7 @@ describe("WorkSurfacePanel", () => {
       workspace: {
         kind: "edge_workspace",
         display_name: "MacBook Pro",
-        cwd: "/Users/xupeng/github/astra",
+        cwd: "/workspace/astra",
         authority: "read_write",
         fallback_policy: "disabled",
       },
@@ -528,7 +528,7 @@ describe("WorkSurfacePanel", () => {
     expect(screen.getAllByText("MacBook Pro").length).toBeGreaterThan(0);
     expect(screen.getByText("Files")).toBeInTheDocument();
     expect(
-      screen.getAllByText("/Users/xupeng/github/astra").length,
+      screen.getAllByText("/workspace/astra").length,
     ).toBeGreaterThan(0);
     expect(screen.getByText("Connection")).toBeInTheDocument();
     expect(screen.getByText("edge ws")).toBeInTheDocument();

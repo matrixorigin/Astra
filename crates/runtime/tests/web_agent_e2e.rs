@@ -1635,10 +1635,10 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
             "workspace_binding": {
                 "kind": "edge_workspace",
                 "display_name": "MacBook Pro",
-                "root": "/Users/xupeng/github/astra",
+                "root": "/workspace/astra",
                 "source": {
                     "kind": "edge_path",
-                    "path": "/Users/xupeng/github/astra"
+                    "path": "/workspace/astra"
                 },
                 "authority": "read_write",
             },
@@ -1680,7 +1680,7 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
                             tool_call(
                                 "call-child-read-file",
                                 "read_file",
-                                json!({"path": "/Users/xupeng/github/astra/src/lib.rs"})
+                                json!({"path": "/workspace/astra/src/lib.rs"})
                             )
                         ]
                     },
@@ -1738,7 +1738,7 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
     let workspace = find_event(&events, "workspace_bound")
         .unwrap_or_else(|| panic!("expected workspace_bound event: {serialized}"));
     assert_eq!(workspace["workspace"]["kind"], "edge_workspace");
-    assert_eq!(workspace["workspace"]["cwd"], "/Users/xupeng/github/astra");
+    assert_eq!(workspace["workspace"]["cwd"], "/workspace/astra");
     assert_eq!(workspace["executor"]["kind"], "edge_agent");
     assert_eq!(workspace["transport"], "edge_ledger");
 
@@ -1765,10 +1765,7 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
             panic!("edge-bound dynamic spawn should stream child output into agent_live_event: {serialized}")
         });
     assert_eq!(live_output["workspace"]["kind"], "edge_workspace");
-    assert_eq!(
-        live_output["workspace"]["cwd"],
-        "/Users/xupeng/github/astra"
-    );
+    assert_eq!(live_output["workspace"]["cwd"], "/workspace/astra");
     assert_eq!(live_output["executor"]["kind"], "edge_agent");
     assert_eq!(
         live_output["executor"]["executor_id"],
@@ -1782,7 +1779,7 @@ async fn web_agent_dynamic_spawn_inherits_edge_workspace_binding() {
         "edge-bound dynamic spawn should emit agent_spawned progress: {serialized}"
     );
     assert_eq!(spawned[0]["workspace"]["kind"], "edge_workspace");
-    assert_eq!(spawned[0]["workspace"]["cwd"], "/Users/xupeng/github/astra");
+    assert_eq!(spawned[0]["workspace"]["cwd"], "/workspace/astra");
     assert_eq!(spawned[0]["executor"]["kind"], "edge_agent");
     assert_eq!(
         spawned[0]["executor"]["executor_id"],
@@ -2324,10 +2321,10 @@ async fn edge_executor_offline_blocks_run_before_next_llm_round() {
             "workspace_binding": {
                 "kind": "edge_workspace",
                 "display_name": "MacBook Pro",
-                "root": "/Users/xupeng/github/astra",
+                "root": "/workspace/astra",
                 "source": {
                     "kind": "edge_path",
-                    "path": "/Users/xupeng/github/astra"
+                    "path": "/workspace/astra"
                 },
                 "authority": "read_write",
             },
@@ -2393,10 +2390,10 @@ async fn edge_executor_offline_child_returns_actionable_wait_to_structured_paren
             "workspace_binding": {
                 "kind": "edge_workspace",
                 "display_name": "MacBook Pro",
-                "root": "/Users/xupeng/github/astra",
+                "root": "/workspace/astra",
                 "source": {
                     "kind": "edge_path",
-                    "path": "/Users/xupeng/github/astra"
+                    "path": "/workspace/astra"
                 },
                 "authority": "read_write",
             },

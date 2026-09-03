@@ -5,6 +5,9 @@ global:
     cluster: 'astra'
     environment: 'production'
 
+rule_files:
+  - /etc/prometheus/alert-rules.yml
+
 scrape_configs:
   # astra API metrics
   - job_name: 'astra-api'

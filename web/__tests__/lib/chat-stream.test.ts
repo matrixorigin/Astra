@@ -557,7 +557,7 @@ describe('streamChatMessage cancellation semantics', () => {
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       body: sseBody([
-        'data: {"type":"run_started","run_id":"run-123","session_id":"session-123","workspace":{"kind":"edge_workspace","display_name":"MacBook Pro","cwd":"/Users/xupeng/github/astra","authority":"read_write","fallback_policy":"disabled"},"executor":{"kind":"edge_agent","executor_id":"edge-macbook-1","display_name":"MacBook Pro","transport":"edge_ws","status":"online"},"transport":"edge_ws","fallback_policy":"disabled"}\n\n',
+        'data: {"type":"run_started","run_id":"run-123","session_id":"session-123","workspace":{"kind":"edge_workspace","display_name":"MacBook Pro","cwd":"/workspace/astra","authority":"read_write","fallback_policy":"disabled"},"executor":{"kind":"edge_agent","executor_id":"edge-macbook-1","display_name":"MacBook Pro","transport":"edge_ws","status":"online"},"transport":"edge_ws","fallback_policy":"disabled"}\n\n',
         'data: {"type":"run_finished","run_id":"run-123","status":"completed"}\n\n',
       ]),
     });

@@ -1989,7 +1989,7 @@ mod tests {
                         "workspace": {
                             "kind": "edge_workspace",
                             "display_name": "MacBook Pro",
-                            "cwd": "/Users/xupeng/github/astra",
+                            "cwd": "/workspace/astra",
                             "authority": "read_write"
                         },
                         "executor": {
@@ -2109,7 +2109,7 @@ mod tests {
         );
         assert_eq!(
             json.pointer("/workspace/cwd"),
-            Some(&json!("/Users/xupeng/github/astra"))
+            Some(&json!("/workspace/astra"))
         );
         assert_eq!(json.pointer("/executor/kind"), Some(&json!("edge_agent")));
         assert_eq!(

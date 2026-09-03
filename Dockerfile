@@ -121,17 +121,17 @@ RUN set -eux; \
     fi; \
     apt-get install -y --no-install-recommends curl libssl3; \
     rm -rf /var/lib/apt/lists/*; \
-    groupadd -r appgroup; \
-    useradd --system --create-home --home-dir /home/appuser --shell /usr/sbin/nologin -g appgroup appuser
+    groupadd --gid 10001 appgroup; \
+    useradd --uid 10001 --gid 10001 --create-home --home-dir /home/appuser --shell /usr/sbin/nologin appuser
 COPY --from=builder /out/astra-server /usr/local/bin/astra-server
 COPY --from=builder /out/astra /usr/local/bin/astra
 COPY LICENSE /usr/share/licenses/astra/LICENSE
-# WORKDIR writable for appgroup; K8s runAsUser overrides should add supplementalGroups: [appgroup GID].
+# WORKDIR is writable by the fixed non-root runtime identity.
 # Prefer mounted volumes for real data rather than writing to /app at runtime.
 RUN chown root:appgroup /app && \
     chmod 0770 /app && \
     chmod 0444 /usr/share/licenses/astra/LICENSE
-USER appuser
+USER 10001:10001
 
 EXPOSE 17001
 ENV HOME=/home/appuser

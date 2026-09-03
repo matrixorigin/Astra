@@ -3568,7 +3568,7 @@ mod tests {
             "workspace": {
                 "kind": "edge_workspace",
                 "display_name": "MacBook Pro",
-                "cwd": "/Users/xupeng/github/astra",
+                "cwd": "/workspace/astra",
                 "authority": "read_write"
             },
             "executor": {

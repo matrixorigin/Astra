@@ -393,7 +393,7 @@ test('activity tool cards show runtime files and connection', async ({ page }) =
           workspace: {
             kind: 'edge_workspace',
             display_name: 'MacBook Pro',
-            cwd: '/Users/xupeng/github/astra',
+            cwd: '/workspace/astra',
             authority: 'read_write',
             fallback_policy: 'disabled',
           },
@@ -420,7 +420,7 @@ test('activity tool cards show runtime files and connection', async ({ page }) =
           workspace: {
             kind: 'edge_workspace',
             display_name: 'MacBook Pro',
-            cwd: '/Users/xupeng/github/astra',
+            cwd: '/workspace/astra',
             authority: 'read_write',
             fallback_policy: 'disabled',
           },
@@ -442,7 +442,7 @@ test('activity tool cards show runtime files and connection', async ({ page }) =
 
   await expect(surface.getByRole('heading', { name: 'bash' })).toBeVisible();
   await expect(surface.getByText('MacBook Pro').first()).toBeVisible();
-  await expect(surface.getByText('/Users/xupeng/github/astra').first()).toBeVisible();
+  await expect(surface.getByText('/workspace/astra').first()).toBeVisible();
   await expect(surface.getByText('Connection', { exact: true })).toBeVisible();
   await expect(surface.getByText('edge ledger', { exact: true })).toBeVisible();
   await expect(surface.getByText('Policy', { exact: true })).toBeVisible();
@@ -462,7 +462,7 @@ test('activity shows actionable execution-environment blocked state', async ({ p
           workspace: {
             kind: 'edge_workspace',
             display_name: 'MacBook Pro',
-            cwd: '/Users/xupeng/github/astra',
+            cwd: '/workspace/astra',
             authority: 'read_write',
             fallback_policy: 'disabled',
           },
@@ -489,7 +489,7 @@ test('activity shows actionable execution-environment blocked state', async ({ p
           workspace: {
             kind: 'edge_workspace',
             display_name: 'MacBook Pro',
-            cwd: '/Users/xupeng/github/astra',
+            cwd: '/workspace/astra',
             authority: 'read_write',
             fallback_policy: 'disabled',
           },
@@ -511,7 +511,7 @@ test('activity shows actionable execution-environment blocked state', async ({ p
   await expect(
     surface.getByText('Execution environment is offline. Reconnect it or choose another environment.'),
   ).toBeVisible();
-  await expect(surface.getByText('/Users/xupeng/github/astra').first()).toBeVisible();
+  await expect(surface.getByText('/workspace/astra').first()).toBeVisible();
   await expect(surface.getByText('policy disabled')).toBeVisible();
 });
 
@@ -528,7 +528,7 @@ test('activity distinguishes transport disconnect from executor offline', async 
           workspace: {
             kind: 'edge_workspace',
             display_name: 'MacBook Pro',
-            cwd: '/Users/xupeng/github/astra',
+            cwd: '/workspace/astra',
             authority: 'read_write',
             fallback_policy: 'disabled',
           },
@@ -555,7 +555,7 @@ test('activity distinguishes transport disconnect from executor offline', async 
           workspace: {
             kind: 'edge_workspace',
             display_name: 'MacBook Pro',
-            cwd: '/Users/xupeng/github/astra',
+            cwd: '/workspace/astra',
             authority: 'read_write',
             fallback_policy: 'disabled',
           },
@@ -585,7 +585,7 @@ test('agent cards expand into live child run details with runtime metadata', asy
   const workspace = {
     kind: 'edge_workspace',
     display_name: 'MacBook Pro',
-    cwd: '/Users/xupeng/github/astra',
+    cwd: '/workspace/astra',
     authority: 'read_write',
     fallback_policy: 'disabled',
   };
@@ -673,7 +673,7 @@ test('agent cards expand into live child run details with runtime metadata', asy
   await expect(surface.getByText('Running bash').first()).toBeVisible();
   await expect(surface.getByText('child bash output: inspected src/lib.rs')).toBeVisible();
   await expect(surface.getByText('live child review finding')).toBeVisible();
-  await expect(surface.getByText('/Users/xupeng/github/astra').first()).toBeVisible();
+  await expect(surface.getByText('/workspace/astra').first()).toBeVisible();
   await expect(surface.getByText('MacBook Pro').first()).toBeVisible();
   await expect(surface.getByText('Connection', { exact: true }).first()).toBeVisible();
   await expect(surface.getByText('edge ws').first()).toBeVisible();

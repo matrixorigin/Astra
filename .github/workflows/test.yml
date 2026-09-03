@@ -110,17 +110,15 @@ jobs:
         run: |
           cargo nextest run --manifest-path Cargo.toml -p astra-runtime --profile ci --test http_contract --test admin_contract
           cargo nextest run --manifest-path Cargo.toml -p astra-core --profile ci --lib -E 'test(/settings_contract/)'
-      - name: Comment contract failure on PR
-        if: failure() && github.event_name == 'pull_request'
-        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
-        with:
-          script: |
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: `## Regression Gate\n\n❌ Contract tests failed — see [shard-b logs](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) for details.`
-            });
+      - name: Summarize contract failure
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo "## Regression gate"
+            echo
+            echo "Contract tests failed. Inspect the preceding shard-b steps for the failing contract."
+          } >> "${GITHUB_STEP_SUMMARY}"
 
   shard-c:
     name: "Test: turn-core + services + plan"

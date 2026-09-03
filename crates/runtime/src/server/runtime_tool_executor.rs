@@ -11316,7 +11316,7 @@ esac
         );
         assert!(
             server_sandbox_local_path_mismatch(
-                "cd /Users/xupeng/github/astra && git status",
+                "cd /workspace/astra && git status",
                 workspace_root,
                 &workspace,
             )
@@ -11367,7 +11367,7 @@ esac
         assert!(
             server_sandbox_tool_path_mismatch(
                 "read_file",
-                &json!({"path": "/Users/xupeng/github/astra/src/lib.rs"}),
+                &json!({"path": "/workspace/astra/src/lib.rs"}),
                 workspace_root,
                 &workspace,
             )
@@ -11404,7 +11404,7 @@ esac
         assert!(
             server_sandbox_tool_path_mismatch(
                 "grep",
-                &json!({"pattern": "/Users/xupeng/github/astra"}),
+                &json!({"pattern": "/workspace/astra"}),
                 workspace_root,
                 &workspace,
             )
@@ -11414,7 +11414,7 @@ esac
         assert!(
             server_sandbox_tool_path_mismatch(
                 "grep",
-                &json!({"pattern": "needle", "path": "/Users/xupeng/github/astra"}),
+                &json!({"pattern": "needle", "path": "/workspace/astra"}),
                 workspace_root,
                 &workspace,
             )
@@ -11423,7 +11423,7 @@ esac
         assert!(
             server_sandbox_tool_path_mismatch(
                 "glob",
-                &json!({"pattern": "/Users/xupeng/github/astra/**/*.rs"}),
+                &json!({"pattern": "/workspace/astra/**/*.rs"}),
                 workspace_root,
                 &workspace,
             )
@@ -11441,7 +11441,7 @@ esac
         assert!(
             server_sandbox_tool_path_mismatch(
                 "git",
-                &json!({"action": "file_history", "file": "/Users/xupeng/github/astra/src/lib.rs"}),
+                &json!({"action": "file_history", "file": "/workspace/astra/src/lib.rs"}),
                 workspace_root,
                 &workspace,
             )
@@ -11516,7 +11516,7 @@ esac
             .execute_with_metadata(
                 "read_file",
                 &json!({
-                    "path": "/Users/xupeng/github/astra/src/lib.rs",
+                    "path": "/workspace/astra/src/lib.rs",
                     "_tool_call_id": "call-read-local-path"
                 }),
             )

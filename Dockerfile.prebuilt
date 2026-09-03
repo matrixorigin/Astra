@@ -47,9 +47,9 @@ RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates curl libssl3; \
     rm -rf /var/lib/apt/lists/*; \
-    groupadd -r appgroup; \
-    useradd --system --create-home --home-dir /home/appuser \
-            --shell /usr/sbin/nologin -g appgroup appuser
+    groupadd --gid 10001 appgroup; \
+    useradd --uid 10001 --gid 10001 --create-home --home-dir /home/appuser \
+            --shell /usr/sbin/nologin appuser
 
 COPY target/x86_64-unknown-linux-gnu/release/astra-server /usr/local/bin/astra-server
 COPY target/x86_64-unknown-linux-gnu/release/astra        /usr/local/bin/astra
@@ -59,7 +59,7 @@ RUN chown root:appgroup /app && \
     chmod 0770 /app && \
     chmod 0444 /usr/share/licenses/astra/LICENSE
 
-USER appuser
+USER 10001:10001
 
 EXPOSE 17001
 ENV HOME=/home/appuser

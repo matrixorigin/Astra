@@ -8526,7 +8526,7 @@ mod tests {
         context.execution_metadata = Some(serde_json::json!({
             "workspace": {
                 "kind": "edge_workspace",
-                "cwd": "/Users/xupeng/github/astra"
+                "cwd": "/workspace/astra"
             },
             "executor": {
                 "kind": "edge_agent",
@@ -12014,7 +12014,7 @@ mod tests {
         context.execution_metadata = Some(serde_json::json!({
             "workspace": {
                 "kind": "edge_workspace",
-                "cwd": "/Users/xupeng/github/astra"
+                "cwd": "/workspace/astra"
             },
             "executor": {
                 "kind": "edge_agent",
@@ -12054,7 +12054,7 @@ mod tests {
             }
             let metadata = event.metadata.as_ref().expect("execution metadata");
             assert_eq!(metadata["workspace"]["kind"], "edge_workspace");
-            assert_eq!(metadata["workspace"]["cwd"], "/Users/xupeng/github/astra");
+            assert_eq!(metadata["workspace"]["cwd"], "/workspace/astra");
             assert_eq!(metadata["executor"]["kind"], "edge_agent");
             assert_eq!(metadata["executor"]["executor_id"], "edge-macbook-1");
             assert_eq!(metadata["transport"], "edge_ws");

@@ -24,10 +24,14 @@ open http://localhost:3000  # Grafana
 - **Data**: Stored in `prometheus-data` volume
 
 **Metrics collected:**
-- API request rate and latency
-- Database connection pool
-- LLM request metrics
-- System metrics (CPU, memory, disk)
+
+- Astra runtime capacity and admission
+- run control, durable event ingestion, and Edge dispatch health
+- LLM provider admission and rate-limit state
+- host CPU, memory, disk, and network metrics through Node Exporter
+
+Prometheus loads the repository's `monitoring/alert-rules.yml` automatically.
+Those rules use metric names exported by Astra's `/metrics` endpoint.
 
 ### Grafana
 
@@ -37,9 +41,9 @@ open http://localhost:3000  # Grafana
 - **Dashboards**: Pre-configured in `dashboards/`
 
 **Available dashboards:**
+
 - API Overview
-- Database Performance
-- System Metrics
+- Runtime Capacity
 
 ### Node Exporter
 
@@ -69,37 +73,17 @@ scrape_configs:
 
 ## Metrics Reference
 
-### API Metrics
+### Runtime Metrics
 
 ```promql
-# Request rate
-rate(http_requests_total[5m])
+# Run admission rate
+rate(astra_run_admission_attempts_total[5m])
 
-# Response time (p95)
-histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))
+# Event ingestion errors
+rate(astra_event_ingestion_errors_total[5m])
 
-# Error rate
-rate(http_requests_total{status=~"5.."}[5m])
-```
-
-### Database Metrics
-
-```promql
-# Active connections
-db_connections_active
-
-# Query duration
-rate(db_query_duration_seconds_sum[5m]) / rate(db_query_duration_seconds_count[5m])
-```
-
-### LLM Metrics
-
-```promql
-# LLM request rate
-rate(llm_requests_total[5m])
-
-# LLM cost
-rate(llm_cost_total[5m])
+# Edge dispatch backlog
+astra_edge_dispatch_pending_rows
 ```
 
 ## Alerting
@@ -135,32 +119,9 @@ alertmanager:
     - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml
 ```
 
-### Create Alert Rules
-
-Create `alerts.yml`:
-
-```yaml
-groups:
-  - name: astra
-    rules:
-      - alert: HighErrorRate
-        expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.05
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "High error rate detected"
-          description: "Error rate is {{ $value }} (threshold: 0.05)"
-
-      - alert: HighResponseTime
-        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 1
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High response time"
-          description: "P95 response time is {{ $value }}s"
-```
+The bundled alert rules are evaluated by Prometheus. To route notifications,
+add Alertmanager and configure Prometheus with its endpoint; Prometheus alone
+records alert state but does not send notifications.
 
 ## Troubleshooting
 

@@ -2,25 +2,28 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ .Release.Name }}-api
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ .Release.Namespace | quote }}
   labels:
-    app: astra
-    component: api
+    app.kubernetes.io/name: astra
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/component: server
 spec:
   replicas: {{ .Values.api.replicas }}
   selector:
     matchLabels:
-      app: astra
-      component: api
+      app.kubernetes.io/name: astra
+      app.kubernetes.io/instance: {{ .Release.Name | quote }}
+      app.kubernetes.io/component: server
   template:
     metadata:
       {{- if .Values.api.serverConfig.enabled }}
       annotations:
-        checksum/server-config: {{ .Values.api.serverConfig.content | sha256sum }}
+        checksum/server-config: {{ .Values.api.serverConfig.content | sha256sum | quote }}
       {{- end }}
       labels:
-        app: astra
-        component: api
+        app.kubernetes.io/name: astra
+        app.kubernetes.io/instance: {{ .Release.Name | quote }}
+        app.kubernetes.io/component: server
     spec:
       automountServiceAccountToken: false
       securityContext:
@@ -32,11 +35,11 @@ spec:
       containers:
       - name: api
         {{- if .Values.api.image.digest }}
-        image: "{{ .Values.api.image.repository }}@{{ .Values.api.image.digest }}"
+        image: {{ printf "%s@%s" .Values.api.image.repository .Values.api.image.digest | quote }}
         {{- else }}
-        image: "{{ .Values.api.image.repository }}:{{ .Values.api.image.tag | default .Chart.AppVersion }}"
+        image: {{ printf "%s:%s" .Values.api.image.repository (.Values.api.image.tag | default .Chart.AppVersion) | quote }}
         {{- end }}
-        imagePullPolicy: {{ .Values.api.image.pullPolicy }}
+        imagePullPolicy: {{ .Values.api.image.pullPolicy | quote }}
         command: ["astra-server"]
         securityContext:
           {{- toYaml .Values.api.securityContext | nindent 10 }}
@@ -49,12 +52,12 @@ spec:
         - name: ASTRA_API_PORT
           value: "{{ .Values.api.port }}"
         {{- range $key, $val := .Values.api.env }}
-        - name: {{ $key }}
-          value: "{{ $val }}"
+        - name: {{ $key | quote }}
+          value: {{ $val | quote }}
         {{- end }}
         envFrom:
         - secretRef:
-            name: {{ required "api.existingSecret is required" .Values.api.existingSecret }}
+            name: {{ required "api.existingSecret is required" .Values.api.existingSecret | quote }}
         resources:
           {{- toYaml .Values.api.resources | nindent 10 }}
         readinessProbe:
@@ -91,7 +94,11 @@ apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
   name: {{ .Release.Name }}-api-hpa
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    app.kubernetes.io/name: astra
+    app.kubernetes.io/instance: {{ .Release.Name | quote }}
+    app.kubernetes.io/component: server
 spec:
   scaleTargetRef:
     apiVersion: apps/v1

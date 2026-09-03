@@ -131,7 +131,7 @@ DOCKER_BUILD_ARGS ?=
 DOCKER_PROXY_BUILD_ARGS := --build-arg http_proxy --build-arg https_proxy --build-arg no_proxy --build-arg HTTP_PROXY --build-arg HTTPS_PROXY --build-arg NO_PROXY
 IMAGE_VERSION ?= $(if $(VERSION),$(patsubst v%,%,$(VERSION)),dev)
 IMAGE_REVISION ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
-IMAGE_SOURCE_DIRTY ?= $(shell test -z "$$(git status --porcelain=v1 --untracked-files=no 2>/dev/null)" && echo false || echo true)
+IMAGE_SOURCE_DIRTY ?= $(shell if git rev-parse --is-inside-work-tree >/dev/null 2>&1 && test -z "$$(git status --porcelain=v1 --untracked-files=no 2>/dev/null)"; then echo false; else echo true; fi)
 IMAGE_BRANCH ?= $(shell git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)
 DOCKER_METADATA_BUILD_ARGS := --build-arg IMAGE_VERSION=$(IMAGE_VERSION) --build-arg IMAGE_REVISION=$(IMAGE_REVISION) --build-arg IMAGE_SOURCE_DIRTY=$(IMAGE_SOURCE_DIRTY) --build-arg IMAGE_BRANCH=$(IMAGE_BRANCH)
 # Project-wide default for every API server mode. Compose may remap the

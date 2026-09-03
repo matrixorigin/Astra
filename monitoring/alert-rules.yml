@@ -1,105 +1,78 @@
-# Prometheus alert rules for Astra
+# Prometheus alert rules for metrics exported by Astra's `/metrics` endpoint.
 
 groups:
-  - name: mo_astra_runtime_alerts
+  - name: astra-runtime
     interval: 30s
     rules:
-      # High error rate
-      - alert: HighErrorRate
-        expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.05
-        for: 5m
-        labels:
-          severity: critical
-        annotations:
-          summary: "High error rate detected"
-          description: "Error rate is {{ $value | humanizePercentage }} (threshold: 5%)"
-      
-      # Slow response time
-      - alert: SlowResponseTime
-        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 2
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Slow response time"
-          description: "P95 response time is {{ $value }}s (threshold: 2s)"
-      
-      # High LLM cost
-      - alert: HighLLMCost
-        expr: rate(llm_cost_total[1h]) * 3600 > 10
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "High LLM cost"
-          description: "LLM cost is ${{ $value }}/hour (threshold: $10/hour)"
-      
-      # Database connection pool exhausted
-      - alert: DatabasePoolExhausted
-        expr: db_connections_active >= db_connections_max * 0.9
-        for: 2m
-        labels:
-          severity: critical
-        annotations:
-          summary: "Database connection pool near exhaustion"
-          description: "{{ $value }} connections active (90% of max)"
-      
-      # Low cache hit rate
-      - alert: LowCacheHitRate
-        expr: rate(cache_hits_total[5m]) / (rate(cache_hits_total[5m]) + rate(cache_misses_total[5m])) < 0.5
-        for: 10m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Low cache hit rate"
-          description: "Cache hit rate is {{ $value | humanizePercentage }} (threshold: 50%)"
-      
-      # Service down
-      - alert: ServiceDown
-        expr: up{job="astra-engine"} == 0
+      - alert: AstraServiceDown
+        expr: up{job="astra-api"} == 0
         for: 1m
         labels:
           severity: critical
         annotations:
-          summary: "Service is down"
-          description: "Astra service is not responding"
-      
-      # High memory usage
-      - alert: HighMemoryUsage
-        expr: process_resident_memory_bytes / 1024 / 1024 / 1024 > 2
-        for: 5m
+          summary: Astra service is down
+          description: Prometheus has been unable to scrape Astra for more than one minute.
+
+      - alert: AstraEventIngestionErrors
+        expr: sum(increase(astra_event_ingestion_errors_total[5m])) > 0
         labels:
           severity: warning
         annotations:
-          summary: "High memory usage"
-          description: "Memory usage is {{ $value }}GB (threshold: 2GB)"
-      
-      # Skill execution failures
-      - alert: SkillExecutionFailures
-        expr: rate(skill_executions_total{status="failed"}[5m]) > 0.1
-        for: 5m
+          summary: Astra event ingestion is failing
+          description: "{{ $value }} event ingestion errors occurred in the last five minutes."
+
+      - alert: AstraEventIngestionDrops
+        expr: sum(increase(astra_event_ingestion_events_dropped_permanent_total[5m])) + sum(increase(astra_event_ingestion_events_dropped_before_acceptance_total[5m])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: Astra is dropping durable events
+          description: "{{ $value }} events were dropped in the last five minutes."
+
+      - alert: AstraEventIngestionQueueOverflow
+        expr: sum(increase(astra_event_ingestion_enqueue_overflows_total[5m])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: Astra event ingestion queue overflowed
+          description: "{{ $value }} enqueue attempts overflowed in the last five minutes."
+
+      - alert: AstraEdgeDispatchFailures
+        expr: sum(increase(astra_edge_dispatch_failed_total[5m])) > 0
         labels:
           severity: warning
         annotations:
-          summary: "High skill execution failure rate"
-          description: "Skill failure rate is {{ $value | humanizePercentage }}"
-      
-      # Context assembly slow
-      - alert: SlowContextAssembly
-        expr: histogram_quantile(0.95, rate(context_assembly_duration_seconds_bucket[5m])) > 0.5
-        for: 5m
+          summary: Astra Edge dispatch is failing
+          description: "{{ $value }} Edge dispatches failed in the last five minutes."
+
+      - alert: AstraEdgeDispatchTimeouts
+        expr: sum(increase(astra_edge_dispatch_wait_result_timeouts_total[5m])) > 0
         labels:
           severity: warning
         annotations:
-          summary: "Slow context assembly"
-          description: "P95 context assembly time is {{ $value }}s (threshold: 0.5s)"
-      
-      # Replay failures
-      - alert: ReplayFailures
-        expr: rate(replay_executions_total{status="failed"}[10m]) > 0
-        for: 5m
+          summary: Astra Edge dispatches are timing out
+          description: "{{ $value }} Edge result waits timed out in the last five minutes."
+
+      - alert: AstraTaskLeaseRenewalFailures
+        expr: sum(increase(astra_task_lease_renewal_failure_total[5m])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: Astra task lease renewal is failing
+          description: "{{ $value }} task lease renewals failed in the last five minutes."
+
+      - alert: AstraMultiAgentEventOverflow
+        expr: sum(increase(astra_multi_agent_event_overflow_total[5m])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: Astra multi-agent event buffer overflowed
+          description: "{{ $value }} multi-agent events overflowed in the last five minutes."
+
+      - alert: AstraRunControlPollErrors
+        expr: sum(increase(astra_run_control_poll_errors_total[5m])) > 0
         labels:
           severity: warning
         annotations:
-          summary: "Replay execution failures detected"
-          description: "Replay failure rate: {{ $value }}"
+          summary: Astra run-control polling is failing
+          description: "{{ $value }} run-control poll errors occurred in the last five minutes."
