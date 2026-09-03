@@ -18,6 +18,28 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  scope:
+    name: Determine test scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      test_cli: ${{ steps.scope.outputs.test_cli }}
+      test_runtime: ${{ steps.scope.outputs.test_runtime }}
+      test_services: ${{ steps.scope.outputs.test_services }}
+      test_core: ${{ steps.scope.outputs.test_core }}
+      online_core: ${{ steps.scope.outputs.online_core }}
+      online_integration: ${{ steps.scope.outputs.online_integration }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # A PR merge commit plus both parents is enough for the path diff.
+          # Detection falls back to all scopes if a longer push range is absent.
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Classify changed paths
+        id: scope
+        run: python3 scripts/ci/ci_scope.py
+
   # All shards start immediately. A previous compile-only job added a ~20 minute
   # barrier, but rust-cache intentionally removes workspace binaries before
   # saving, so the shards still had to compile and link their own test targets.
@@ -40,8 +62,12 @@ jobs:
 
   shard-a:
     name: "Test: astra-cli (${{ matrix.segment }})"
+    needs: scope
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      RUN_TESTS: ${{ needs.scope.result != 'success' || needs.scope.outputs.test_cli == 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -63,17 +89,23 @@ jobs:
             command_timeout: 25m
 
     steps:
+      - name: Skip unaffected test segment
+        if: env.RUN_TESTS != 'true'
+        run: echo "No astra-cli test impact detected."
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: env.RUN_TESTS == 'true'
         with:
           persist-credentials: false
       - uses: ./.github/actions/rust-setup
+        if: env.RUN_TESTS == 'true'
         with:
           shared-key: ci-test
           save-cache: ${{ github.event_name == 'push' && matrix.segment == 'non-edge' }}
       - name: Prebuild mock MCP server
-        if: matrix.segment == 'non-edge'
+        if: env.RUN_TESTS == 'true' && matrix.segment == 'non-edge'
         run: cargo build --manifest-path Cargo.toml -p astra-cli --bin mock_mcp_server
       - name: "Test astra-cli (${{ matrix.segment }})"
+        if: env.RUN_TESTS == 'true'
         env:
           NEXTEST_FILTER: ${{ matrix.filter }}
         run: >-
@@ -81,18 +113,20 @@ jobs:
           --manifest-path Cargo.toml -p astra-cli
           --profile ci --lib --bins -E "$NEXTEST_FILTER"
       - name: Test astra-cli runtime profile guardrail
-        if: matrix.segment == 'non-edge'
+        if: env.RUN_TESTS == 'true' && matrix.segment == 'non-edge'
         run: >-
           timeout ${{ matrix.command_timeout }} cargo nextest run
           --manifest-path Cargo.toml -p astra-cli
           --profile ci --lib
           -E 'test(/local_cli_catalog_exposes_the_root_work_lifecycle/)'
       - name: Dump processes on failure
-        if: failure()
+        if: failure() && env.RUN_TESTS == 'true'
         run: ps -ef | grep -E 'cargo|nextest|astra|bash|sleep' || true
 
   shard-b:
     name: "Test: astra-runtime"
+    needs: scope
+    if: ${{ always() && (needs.scope.result != 'success' || needs.scope.outputs.test_runtime == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -122,6 +156,8 @@ jobs:
 
   shard-c:
     name: "Test: turn-core + services + plan"
+    needs: scope
+    if: ${{ always() && (needs.scope.result != 'success' || needs.scope.outputs.test_services == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -140,6 +176,8 @@ jobs:
 
   shard-d:
     name: "Test: core crates + bridge hooks"
+    needs: scope
+    if: ${{ always() && (needs.scope.result != 'success' || needs.scope.outputs.test_core == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 35
     steps:
@@ -170,6 +208,8 @@ jobs:
   # two jobs share test-binary link and live-DB work more evenly.
   test-online:
     name: "Test: online (${{ matrix.lane }})"
+    needs: scope
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
@@ -177,6 +217,10 @@ jobs:
       matrix:
         lane: [core, integration]
     env:
+      RUN_TESTS: >-
+        ${{ needs.scope.result != 'success' ||
+            (matrix.lane == 'core' && needs.scope.outputs.online_core == 'true') ||
+            (matrix.lane == 'integration' && needs.scope.outputs.online_integration == 'true') }}
       MATRIXONE_HOST: localhost
       MATRIXONE_PORT: "6001"
       MATRIXONE_USER: root
@@ -195,10 +239,15 @@ jobs:
       MEMORIA_EMBEDDING_DIM: ${{ vars.EMBEDDING_DIM || '1024' }}
       ASTRA_ONLINE_LANE: ${{ matrix.lane }}
     steps:
+      - name: Skip unaffected online lane
+        if: env.RUN_TESTS != 'true'
+        run: echo "No online-test impact detected."
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: env.RUN_TESTS == 'true'
         with:
           persist-credentials: false
       - name: Prepare dependency env
+        if: env.RUN_TESTS == 'true'
         run: |
           cp .env.example .env
           {
@@ -210,20 +259,24 @@ jobs:
             echo "MEMORIA_EMBEDDING_DIM=${MEMORIA_EMBEDDING_DIM}"
           } >> .env
       - name: Start dependencies
+        if: env.RUN_TESTS == 'true'
         run: make dev-deps-up
       - uses: ./.github/actions/rust-setup
+        if: env.RUN_TESTS == 'true'
         with:
           shared-key: ci-test
       - name: Wait for dependencies
+        if: env.RUN_TESTS == 'true'
         run: make dev-deps-wait
       - name: Run online tests
+        if: env.RUN_TESTS == 'true'
         env:
           ASTRA_TEST_DB_IT: "1"
           ASTRA_TEST_DB_IT_TEST_THREADS: "1"
         run: make test-online NEXTEST_ONLINE_PROFILE=strict-online-ci
       - name: Dump dependency logs
-        if: failure()
+        if: failure() && env.RUN_TESTS == 'true'
         run: make dev-deps-logs-once
       - name: Stop dependencies
-        if: always()
+        if: always() && env.RUN_TESTS == 'true'
         run: make dev-deps-down
