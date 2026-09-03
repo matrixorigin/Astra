@@ -89,6 +89,7 @@ ownership boundaries.
 | `design/` | Normative architecture and target behavior |
 | `architecture/` | Cross-domain architecture views |
 | `testing/` | Test strategy, matrices, and coverage contracts |
+| `product/` | Versioned product acceptance baselines; not current user guidance |
 
 ## Documentation rules
 

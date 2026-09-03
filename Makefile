@@ -1384,7 +1384,7 @@ test-live-llm:
 # @astra/sdk — no real HTTP API (Mode A in-process runs via ASTRA_SDK_E2E=1 in test:coverage)
 .PHONY: test-sdk-offline
 test-sdk-offline:
-	@echo "Running @astra/sdk offline (typecheck, Jest with coverage + Mode A E2E, build)..."
+	@echo "Running @astra/sdk offline (typecheck, Vitest with coverage + Mode A E2E, build)..."
 	@cd packages/sdk && npm ci --no-audit --no-fund --ignore-scripts
 	@cd packages/sdk && npm run typecheck
 	@cd packages/sdk && ASTRA_SDK_E2E=1 npm run test:coverage
@@ -1396,10 +1396,10 @@ test-web-offline: test-sdk-offline
 	@cd web && npm ci
 	@cd web && npm run ci
 
-# @astra/sdk — Jest Mode B (ASTRA_SDK_BASE_URL) + sdk-online-smoke; requires astra-server (e.g. make dev-start)
+# @astra/sdk — Vitest Mode B (ASTRA_SDK_BASE_URL) + sdk-online-smoke; requires astra-server (e.g. make dev-start)
 .PHONY: test-sdk-online
 test-sdk-online:
-	@echo "Running @astra/sdk online (Jest integration + test:online) — ensure API is up (e.g. make dev-start)..."
+	@echo "Running @astra/sdk online (Vitest integration + test:online) — ensure API is up (e.g. make dev-start)..."
 	@cd packages/sdk && npm ci --no-audit --no-fund --ignore-scripts
 	@bash -ec 'set -a; [ -f "$(CURDIR)/.env" ] && . "$(CURDIR)/.env"; set +a; \
 		export ASTRA_SDK_E2E=1; \

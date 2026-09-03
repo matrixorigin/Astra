@@ -144,8 +144,8 @@ make dev-stop
 ### Clean Slate
 
 ```bash
-# Nuclear option: delete everything
-make dev-clean          # Will prompt for confirmation
+# Destructive local reset: stop services and remove local dependency data
+make dev-clean          # Prompts for confirmation
 
 # Reinitialize
 make dev-init
@@ -189,7 +189,7 @@ Common issues:
 
 - Port 17001 already in use: `lsof -i :17001` and kill the process
 - Dependencies not ready: Wait and retry
-- **Missing JWT secret / runtime root secret**: If you see `MissingRequiredKey` for `JWT_SECRET` or `RUNTIME_ROOT_SECRET`:
+- **Missing JWT secret / runtime root secret**: If you see `MissingRequiredKey` for `ASTRA_JWT_SECRET` or `ASTRA_RUNTIME_ROOT_SECRET`:
   - Run `make dev-init` (auto-generates secrets in `.env`)
   - Or set `ASTRA_ALLOW_INSECURE_DEFAULTS=1` for quick dev (NOT for production)
 

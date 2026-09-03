@@ -1,7 +1,7 @@
 # Runtime tool boundary
 
 > Status: target design contract.
-> Last updated: 2026-07-07.
+> Last updated: 2026-09-03.
 
 Runtime tool boundary defines what may execute in which authority domain. It is narrower than provider routing: routing decides where a tool goes; this boundary defines what each runtime is allowed to do once selected.
 
@@ -104,6 +104,21 @@ error_kind
 ```
 
 Raw bytes should not be blindly streamed into UI, prompt, trace, or learning data.
+
+## Network and proxy boundary
+
+Edge network access remains inside the selected provider's authority. When an
+outbound proxy is configured, the runtime must:
+
+- honor explicit proxy-bypass rules before connecting;
+- keep proxy credentials out of logs, traces, errors, and persisted runtime
+  configuration;
+- bound connect, tunnel negotiation, and protocol-upgrade time;
+- reject unsupported proxy schemes instead of silently weakening transport
+  security.
+
+Proxy routing does not expand workspace, identity, or private-network
+authority; it only changes transport for an already-admitted operation.
 
 ## Required invariants
 

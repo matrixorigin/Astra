@@ -34,9 +34,6 @@ htmlcov/
 .models.yaml*
 !.models.yaml.example
 
-# Poetry
-# poetry.lock is tracked — required for reproducible CI builds and Docker images.
-
 # Node
 node_modules/
 coverage/
@@ -103,8 +100,6 @@ feedback_export.jsonl
 review/
 /plans/
 
-# VCR cassettes (optional - commit them for CI)
-# fixtures/vcr_cassettes/*.yaml
 *.spec
 .mo-session/
 budget-app/
