@@ -1188,6 +1188,10 @@ mod tests {
     #[test]
     fn local_workspace_path_mentions_preserve_spaces_and_parentheses() {
         assert_eq!(
+            extract_local_workspace_path_mentions("cd /home/example/astra && git status"),
+            vec!["/home/example/astra"]
+        );
+        assert_eq!(
             extract_local_workspace_path_mentions("fix /Users/test/project (v2)/src/main.rs"),
             vec!["/Users/test/project (v2)/src/main.rs"]
         );

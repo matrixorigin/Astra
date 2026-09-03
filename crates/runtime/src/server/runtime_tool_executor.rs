@@ -11316,7 +11316,7 @@ esac
         );
         assert!(
             server_sandbox_local_path_mismatch(
-                "cd /workspace/astra && git status",
+                "cd /home/example/astra && git status",
                 workspace_root,
                 &workspace,
             )
