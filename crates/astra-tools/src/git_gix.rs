@@ -772,6 +772,23 @@ fn tool_output_limit() -> usize {
     super::tool_output_limit()
 }
 
+// `show(stat_only: true)` is a summary operation. Reserve most of its bounded
+// output for the diff statistics and changed paths rather than letting an
+// unusually long commit body hide the information the caller requested.
+const STAT_ONLY_COMMIT_MESSAGE_MAX_BYTES: usize = 4 * 1024;
+
+fn append_show_commit_message(out: &mut String, message: &str, byte_limit: usize) {
+    let message = message.trim();
+    if message.len() <= byte_limit {
+        out.push_str(&format!("\n    {message}\n"));
+        return;
+    }
+
+    let end = message.floor_char_boundary(byte_limit);
+    out.push_str(&format!("\n    {}\n", &message[..end]));
+    out.push_str("[commit message truncated to preserve show statistics]\n");
+}
+
 /// Scale a base output limit by budget pressure.
 /// pressure=0.0 → 100% of base, pressure=0.6 → 70%, pressure=0.9 → 46%.
 /// Never goes below 40% of base — aggressive truncation on git diffs
@@ -1048,8 +1065,13 @@ pub fn show(project_root: &Path, args: &Value, pressure: f64, aggregate_bytes: u
         out.push_str(&format!("Author: {name} <{email}>\nDate:   {date}\n"));
     }
 
-    let message = String::from_utf8_lossy(commit.message_raw_sloppy()).into_owned();
-    out.push_str(&format!("\n    {}\n", message.trim()));
+    let message = String::from_utf8_lossy(commit.message_raw_sloppy());
+    let message_limit = if stat_only {
+        STAT_ONLY_COMMIT_MESSAGE_MAX_BYTES.min(limit.saturating_div(4))
+    } else {
+        usize::MAX
+    };
+    append_show_commit_message(&mut out, &message, message_limit);
 
     // Merge commits: gix first-parent diff produces useless tree-level output,
     // and `git show --first-parent` can legitimately return only the commit
@@ -3806,6 +3828,36 @@ mod tests {
         assert!(
             result.contains("files changed") || result.contains("[root commit]"),
             "should show stats or root: {result}"
+        );
+    }
+
+    #[test]
+    fn git_action_show_stat_only_preserves_stats_after_long_commit_message() {
+        let dir = init_temp_repo();
+        let root = dir.path();
+        std::fs::write(root.join("tracked.txt"), "long-message change\n")
+            .expect("write tracked file");
+        run_git(root, &["add", "tracked.txt"]);
+        let message = "x".repeat(tool_output_limit().saturating_add(1_024));
+        run_git(root, &["commit", "-m", &message]);
+
+        let result = show(
+            root,
+            &json!({"revision": "HEAD", "stat_only": true}),
+            0.0,
+            0,
+        );
+        assert!(
+            result.contains("1 files changed"),
+            "stat_only must retain the change summary: {result}"
+        );
+        assert!(
+            result.contains("[commit message truncated to preserve show statistics]"),
+            "long commit message must be explicitly bounded: {result}"
+        );
+        assert!(
+            result.len() <= tool_output_limit(),
+            "stat_only must keep the normal tool output cap"
         );
     }
 
