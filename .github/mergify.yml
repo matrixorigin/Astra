@@ -1,0 +1,33 @@
+queue_rules:
+  - name: main
+    merge_conditions: []
+    checks_timeout: 4h
+    merge_method: squash
+    commit_message_template: >
+      {{ title }} (#{{ number }})
+
+
+      {{ body | trim | get_section("## Summary") }}
+
+
+      Approved by: @{{ approved_reviews_by | join(', @') }}
+
+pull_request_rules:
+  - name: Automatic queue on approval for main
+    conditions:
+      - "#changes-requested-reviews-by<=0"
+      - label!=do-not-merge/wip
+      - base=main
+      - approved-reviews-by=XuPeng-SH
+    actions:
+      queue:
+        name: main
+
+  - name: Auto update branch
+    conditions:
+      - created-at>=00:10 ago
+    actions:
+      update:
+
+merge_queue:
+  max_parallel_checks: 1

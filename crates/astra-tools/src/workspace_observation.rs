@@ -505,7 +505,7 @@ impl GenerationTamperWatch {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (lock_paths, binding_paths);
+            let _ = (lock_paths, binding_paths, cancel_token);
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "workspace generation tamper watch is unavailable",
@@ -1209,6 +1209,13 @@ struct WorkspacePathIdentity {
     file_type: u32,
 }
 
+/// File-type bits of `st_mode`. `libc::S_IFMT` is `u16` on macOS/BSD and
+/// `u32` on Linux, while `MetadataExt::mode` is always `u32`, so the cast is
+/// required on some targets and a no-op on others.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
+const FILE_TYPE_MASK: u32 = libc::S_IFMT as u32;
+
 impl WorkspacePathIdentity {
     fn capture(path: PathBuf) -> Option<Self> {
         let metadata = fs::symlink_metadata(&path).ok()?;
@@ -1219,7 +1226,7 @@ impl WorkspacePathIdentity {
                 path,
                 device: metadata.dev(),
                 inode: metadata.ino(),
-                file_type: metadata.mode() & libc::S_IFMT,
+                file_type: metadata.mode() & FILE_TYPE_MASK,
             })
         }
         #[cfg(not(unix))]
@@ -1238,7 +1245,7 @@ impl WorkspacePathIdentity {
             use std::os::unix::fs::MetadataExt;
             metadata.dev() == self.device
                 && metadata.ino() == self.inode
-                && metadata.mode() & libc::S_IFMT == self.file_type
+                && metadata.mode() & FILE_TYPE_MASK == self.file_type
         }
         #[cfg(not(unix))]
         {
