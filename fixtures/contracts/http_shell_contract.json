@@ -3,7 +3,7 @@
     "status": 200,
     "json": {
       "name": "Agent Engine API",
-      "version": "0.1.0",
+      "version": "<dynamic-package-version>",
       "docs": ""
     }
   },

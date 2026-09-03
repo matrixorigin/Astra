@@ -8,7 +8,7 @@ use crate::turn::services::{
 use astra_services::auth;
 
 const DEFAULT_NAME: &str = "Agent Engine API";
-const DEFAULT_VERSION: &str = "0.1.0";
+const DEFAULT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_DOCS: &str = "";
 
 #[async_trait]

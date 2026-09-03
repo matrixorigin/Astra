@@ -23,6 +23,24 @@ from pathlib import Path
 root = Path(sys.argv[1])
 expected = sys.argv[2]
 
+core, separator, prerelease = expected.partition("-")
+core_identifiers = core.split(".")
+if len(core_identifiers) != 3 or any(
+    not identifier.isdigit()
+    or (len(identifier) > 1 and identifier.startswith("0"))
+    for identifier in core_identifiers
+):
+    raise SystemExit(f"invalid semantic release version: {expected}")
+if separator:
+    prerelease_identifiers = prerelease.split(".")
+    if any(
+        not identifier
+        or re.fullmatch(r"[0-9A-Za-z-]+", identifier) is None
+        or (identifier.isdigit() and len(identifier) > 1 and identifier.startswith("0"))
+        for identifier in prerelease_identifiers
+    ):
+        raise SystemExit(f"invalid semantic prerelease version: {expected}")
+
 with (root / "Cargo.toml").open("rb") as manifest:
     document = tomllib.load(manifest)
 
@@ -40,7 +58,18 @@ with (root / "packages/sdk/package-lock.json").open(encoding="utf-8") as package
     versions["TypeScript SDK lockfile"] = json.load(package)["version"]
 
 with (root / "web/package-lock.json").open(encoding="utf-8") as package:
-    versions["Web application lockfile"] = json.load(package)["version"]
+    web_lock = json.load(package)
+    versions["Web application lockfile"] = web_lock["version"]
+    local_sdk_versions = {
+        entry["version"]
+        for entry in web_lock["packages"].values()
+        if entry.get("name") == "@astra/sdk" and "version" in entry
+    }
+    if len(local_sdk_versions) != 1:
+        raise SystemExit(
+            "web/package-lock.json: expected one version for the linked @astra/sdk package"
+        )
+    versions["Web lockfile linked SDK"] = local_sdk_versions.pop()
 
 with (root / "Cargo.lock").open("rb") as lockfile:
     locked_packages = tomllib.load(lockfile)["package"]
@@ -62,6 +91,31 @@ versions["Helm chart"] = yaml_scalar(
 versions["Helm appVersion"] = yaml_scalar(
     root / "deployment/kubernetes/chart/Chart.yaml", "appVersion"
 )
+
+def env_value(path: Path, key: str) -> str:
+    pattern = re.compile(rf"^{re.escape(key)}=(.*)$")
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if match := pattern.match(line):
+            return match.group(1).strip()
+    raise SystemExit(f"{path}: missing {key}")
+
+stack_env = root / "deployment/all-in-one/.env.example"
+versions["All-in-one Astra image"] = env_value(stack_env, "ASTRA_IMAGE").removeprefix(
+    "matrixorigin/astra:"
+)
+versions["Production Astra image"] = env_value(
+    root / ".env.production.example", "ASTRA_IMAGE"
+).removeprefix("matrixorigin/astra:")
+
+for key, repository in (
+    ("MEMORIA_IMAGE", "matrixorigin/memoria"),
+    ("MATRIXONE_IMAGE", "matrixorigin/matrixone"),
+):
+    value = env_value(stack_env, key)
+    if re.fullmatch(rf"{re.escape(repository)}@sha256:[0-9a-f]{{64}}", value) is None:
+        raise SystemExit(
+            f"{stack_env}: {key} must pin {repository} by a full sha256 manifest digest"
+        )
 
 mismatches = {name: value for name, value in versions.items() if value != expected}
 if mismatches:

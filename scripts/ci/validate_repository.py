@@ -11,7 +11,11 @@ import subprocess
 
 
 def tracked_files() -> list[Path]:
-    output = subprocess.check_output(["git", "ls-files", "-z"])
+    # Include untracked, non-ignored files so a local preflight validates newly
+    # added workflows and documentation before they are staged or committed.
+    output = subprocess.check_output(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"]
+    )
     return [Path(item.decode("utf-8")) for item in output.split(b"\0") if item]
 
 
@@ -65,6 +69,7 @@ def main() -> None:
         Path("scripts/ci/test_interactive_setup_contract.sh"),
         Path("scripts/ops/test_production_env_contract.sh"),
         Path("scripts/ci/test_release_contract.sh"),
+        Path("scripts/ci/test_release_manifest_contract.sh"),
         Path("scripts/ci/test_sccache_fallback.sh"),
     ]
     for contract_script in contract_scripts:
@@ -94,51 +99,111 @@ def main() -> None:
             if not pinned_action.fullmatch(action):
                 errors.append(f"{source}: action must be pinned to a full commit SHA ({action})")
 
-    release_workflow = Path(".github/workflows/release-docker.yml").read_text(encoding="utf-8")
-    build_start = release_workflow.find("\n  build:")
-    smoke_start = release_workflow.find("\n  smoke:")
-    merge_start = release_workflow.find("\n  merge:")
-    promote_start = release_workflow.find("\n  promote:")
-    mirror_start = release_workflow.find("\n  registry-mirror:")
-    if not 0 <= build_start < smoke_start < merge_start < promote_start < mirror_start:
+    static_checks = Path(".github/workflows/static-checks.yml").read_text(
+        encoding="utf-8"
+    )
+    if "github.com/rhysd/actionlint/cmd/actionlint@v1.7.12" not in static_checks:
         errors.append(
-            ".github/workflows/release-docker.yml: release jobs must smoke untagged digests, "
-            "publish the verified manifest, and only then promote rolling tags"
+            ".github/workflows/static-checks.yml: CI must validate workflow semantics "
+            "with the repository-pinned actionlint version"
         )
-    else:
-        build_job = release_workflow[build_start:smoke_start]
-        smoke_job = release_workflow[smoke_start:merge_start]
-        merge_job = release_workflow[merge_start:promote_start]
-        promote_job = release_workflow[promote_start:mirror_start]
-        if "push-by-digest=true" not in build_job or "name-canonical=true" not in build_job:
+
+    release_controller = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
+    container_candidates = Path(
+        ".github/workflows/release-container-candidates.yml"
+    ).read_text(encoding="utf-8")
+    snapshot_workflow = Path(".github/workflows/release-docker.yml").read_text(
+        encoding="utf-8"
+    )
+
+    for forbidden in ("push:\n    tags:", "on:\n  push:"):
+        if forbidden in release_controller:
             errors.append(
-                ".github/workflows/release-docker.yml: candidate builds must be pushed by digest without a tag"
+                ".github/workflows/release.yml: releases must start from the protected "
+                "default-branch control plane, not an arbitrary tag's historical workflow"
             )
-        if "type=raw,value=" in smoke_job or "- merge" in smoke_job:
+    for required in (
+        "workflow_dispatch:",
+        "recover_existing_tag:",
+        'GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}',
+        "release-binaries.yml",
+        "release-container-candidates.yml",
+        "environment: release",
+        "ASTRA_RELEASE_ENVIRONMENT_GUARD",
+        "Require Docker publication credentials",
+        "Reject an existing Docker version before candidate builds",
+        "Reject conflicting Docker version before creating the tag",
+        "Resolve publication continuation state",
+        "Release-Run:",
+        "Recovery cannot adopt manual or legacy tags",
+        "Recovery will not trust an unverifiable release owner",
+        'run.get("path", "")',
+        "Create or validate the immutable release tag",
+        "Stage GitHub Release and verified assets",
+        "Create or verify the immutable Docker version manifest",
+        "scripts/reconcile-docker-manifest.sh",
+        "Publish GitHub Release",
+        "Promote stable rolling Docker tags",
+    ):
+        if required not in release_controller:
             errors.append(
-                ".github/workflows/release-docker.yml: smoke job must verify build digests before any tag is published"
+                f".github/workflows/release.yml: missing unified release contract ({required})"
             )
-        if "- build" not in smoke_job or "@sha256:" not in smoke_job or "make stack-verify" not in smoke_job:
+
+    docker_manifest = release_controller.find(
+        "Create or verify the immutable Docker version manifest"
+    )
+    github_publish = release_controller.find("Publish GitHub Release")
+    rolling_promotion = release_controller.find("Promote stable rolling Docker tags")
+    if not 0 <= docker_manifest < github_publish < rolling_promotion:
+        errors.append(
+            ".github/workflows/release.yml: version artifacts must be reconciled before "
+            "the GitHub Release and rolling Docker tags become public"
+        )
+
+    for required in (
+        "workflow_call:",
+        "push-by-digest=true",
+        "name-canonical=true",
+        "@sha256:",
+        "make stack-up",
+        "make stack-verify",
+        "release-digest-",
+        "Write container candidate summary",
+    ):
+        if required not in container_candidates:
             errors.append(
-                ".github/workflows/release-docker.yml: candidate digests must be verified through the all-in-one runtime"
+                ".github/workflows/release-container-candidates.yml: missing untagged "
+                f"candidate or runtime-smoke contract ({required})"
             )
-        if (
-            "- smoke" not in merge_job
-            or "type=raw,value=latest" in merge_job
-            or "actual_platforms" not in merge_job
-            or "expected_platforms" not in merge_job
-        ):
+
+    for required in (
+        "workflow_dispatch:",
+        "Official Docker snapshots cannot publish unreviewed feature-branch source",
+        "Semantic versions are owned by the unified Release workflow",
+        "Require Docker publication credentials",
+        "ASTRA_SNAPSHOT_ENVIRONMENT_GUARD",
+        "release-container-candidates.yml",
+        "scripts/reconcile-docker-manifest.sh",
+    ):
+        if required not in snapshot_workflow:
             errors.append(
-                ".github/workflows/release-docker.yml: version manifest must depend on smoke and validate its platform set"
+                f".github/workflows/release-docker.yml: missing immutable snapshot guard ({required})"
             )
-        if (
-            "- merge" not in promote_job
-            or '--tag "${IMAGE_NAME}:latest"' not in promote_job
-            or "expected_platforms" not in promote_job
-            or "actual_platforms" not in promote_job
-        ):
+
+    manifest_reconciler = Path("scripts/reconcile-docker-manifest.sh").read_text(
+        encoding="utf-8"
+    )
+    for required in (
+        "candidate platforms do not match the requested build matrix",
+        "already exists and will not be overwritten",
+        "published manifest",
+        "does not match the verified candidates",
+    ):
+        if required not in manifest_reconciler:
             errors.append(
-                ".github/workflows/release-docker.yml: rolling promotion must depend on and match the verified manifest"
+                "scripts/reconcile-docker-manifest.sh: missing immutable platform "
+                f"reconciliation contract ({required})"
             )
 
     binary_release_workflow = Path(".github/workflows/release-binaries.yml").read_text(
@@ -156,32 +221,33 @@ def main() -> None:
                 f"(found {forbidden.strip()})"
             )
     for required in (
-        "permissions:\n      contents: write",
-        "fetch-depth: 0",
-        "git merge-base --is-ancestor",
-        "EVENT_SOURCE_SHA",
+        "workflow_call:",
+        "Execute client candidates",
+        "--locked",
         "source_sha",
         "astra-edge",
         "scripts/verify-release-artifacts.sh",
-        "fail_on_unmatched_files: true",
+        "release-client-assets",
     ):
         if required not in binary_release_workflow:
             errors.append(
-                ".github/workflows/release-binaries.yml: missing current-repository release guard "
+                ".github/workflows/release-binaries.yml: missing verified client candidate contract "
                 f"({required})"
             )
 
-    for required in (
-        "fetch-depth: 0",
-        "EVENT_SOURCE_SHA",
-        "source_sha",
-        "EXPECTED_TAG_OBJECT",
-    ):
-        if required not in release_workflow:
-            errors.append(
-                ".github/workflows/release-docker.yml: missing immutable release source guard "
-                f"({required})"
-            )
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+    if "cargo chef cook --release --locked" not in dockerfile \
+        or "cargo build --release --locked" not in dockerfile:
+        errors.append("Dockerfile: release builds must not update Cargo.lock resolution")
+
+    runtime_versions = {
+        Path("crates/astra-cli/src/cli/slash/slash_info.rs"): 'format!("  astra version {} (Rust)", env!("CARGO_PKG_VERSION"))',
+        Path("crates/runtime/src/app_state.rs"): 'const DEFAULT_VERSION: &str = env!("CARGO_PKG_VERSION")',
+        Path("crates/runtime/src/server/runtime_tool_executor.rs"): 'concat!("astra-server/", env!("CARGO_PKG_VERSION"))',
+    }
+    for source, required in runtime_versions.items():
+        if required not in source.read_text(encoding="utf-8"):
+            errors.append(f"{source}: runtime identity must derive from the Cargo package version")
 
     installer = Path("scripts/install-astra.sh").read_text(encoding="utf-8")
     if 'REPOSITORY="matrixorigin/Astra"' not in installer:
@@ -202,14 +268,35 @@ def main() -> None:
         "web/package.json",
         "CITATION.cff",
         "deployment/kubernetes/chart/Chart.yaml",
+        "deployment/all-in-one/.env.example",
+        ".env.production.example",
     ):
         if version_source not in release_version_validator:
             errors.append(
                 f"scripts/validate-release-version.sh: missing release version source {version_source}"
             )
 
+    for dependency_image in ("MEMORIA_IMAGE", "MATRIXONE_IMAGE", "@sha256:"):
+        if dependency_image not in release_version_validator:
+            errors.append(
+                "scripts/validate-release-version.sh: all-in-one release dependencies "
+                f"must be immutable ({dependency_image})"
+            )
+
+    stack_compose = Path("deployment/all-in-one/docker-compose.yml").read_text(
+        encoding="utf-8"
+    )
+    for image_variable in ("ASTRA_IMAGE", "MEMORIA_IMAGE", "MATRIXONE_IMAGE"):
+        if f"${{{image_variable}:-" in stack_compose:
+            errors.append(
+                "deployment/all-in-one/docker-compose.yml: released stack must require "
+                f"the compatibility pin for {image_variable} instead of silently falling back"
+            )
+
     makefile = Path("Makefile").read_text(encoding="utf-8")
     for required in (
+        "release-prepare:",
+        'scripts/prepare-release-version.py "$(VERSION)"',
         "stack-start: stack-env",
         "$(MAKE) stack-up",
         "$(MAKE) stack-verify",

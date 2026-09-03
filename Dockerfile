@@ -59,7 +59,7 @@ WORKDIR /app
 COPY --from=planner /app/recipe.json recipe.json
 # Runtime image intentionally ships the API server plus the single public CLI.
 # Test-only mock_mcp_server and the standalone astra-edge daemon are excluded.
-RUN cargo chef cook --release --no-default-features --recipe-path recipe.json \
+RUN cargo chef cook --release --locked --no-default-features --recipe-path recipe.json \
         -p astra-runtime --bin astra-server \
         -p astra-cli --bin astra
 
@@ -67,7 +67,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 RUN ASTRA_BUILD_SOURCE_GIT_SHA="${IMAGE_REVISION}" \
     ASTRA_BUILD_SOURCE_GIT_DIRTY="${IMAGE_SOURCE_DIRTY}" \
-    cargo build --release --no-default-features \
+    cargo build --release --locked --no-default-features \
         -p astra-runtime --bin astra-server \
         -p astra-cli --bin astra && \
     mkdir -p /out && \

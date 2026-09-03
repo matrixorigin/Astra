@@ -39,7 +39,11 @@ start and verify the complete published stack in one command from the
 repository root:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh -s -- --dir "$HOME/.local/bin"
+export PATH="$HOME/.local/bin:$PATH"
+ASTRA_VERSION="$(astra --version | awk '{print $2}')"
+git clone --branch "v${ASTRA_VERSION}" --depth 1 https://github.com/matrixorigin/Astra.git "Astra-${ASTRA_VERSION}"
+cd "Astra-${ASTRA_VERSION}"
 MEMORIA_EMBEDDING_PROVIDER=mock make stack-start
 ```
 
@@ -47,6 +51,8 @@ MEMORIA_EMBEDDING_PROVIDER=mock make stack-start
 `astra-server`, waits for readiness, and verifies a memory round trip. It does
 not connect a local filesystem/process provider. Use a real embedding endpoint
 instead of mock mode for semantic-memory evaluation or production.
+The checked-out release pins all three service images to one tested
+compatibility set.
 
 On later starts, `make stack-up` reuses the generated secrets. Repeat any
 process-level embedding settings, or persist them in the stack `.env` file

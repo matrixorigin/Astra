@@ -208,17 +208,20 @@ One checksum-verified archive installs both the `astra` CLI and the
 `astra-edge` User Runner — Linux and macOS, `amd64` and `arm64`:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh -s -- --dir "$HOME/.local/bin"
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
 #### 2. Run the guided setup
 
-Clone Astra and follow one guided flow from embedding configuration through the
-first administrator and model:
+Use the same version for the client and Server deployment, then follow one
+guided flow from embedding configuration through the first administrator and
+model. The installer prints these version-matched next steps as well:
 
 ```bash
-git clone https://github.com/matrixorigin/Astra.git
-cd Astra
+ASTRA_VERSION="$(astra --version | awk '{print $2}')"
+git clone --branch "v${ASTRA_VERSION}" --depth 1 https://github.com/matrixorigin/Astra.git "Astra-${ASTRA_VERSION}"
+cd "Astra-${ASTRA_VERSION}"
 make stack-setup
 ```
 
@@ -230,9 +233,8 @@ leave-for-inspection choices before the administrator/model wizard begins.
 API keys are hidden while typing and the local `.env` is owner-only. Choose mock
 embeddings for deterministic evaluation; use a real OpenAI-compatible endpoint
 for production retrieval. The wizard never deletes persistent volumes.
-It runs in Linux/macOS terminals and Windows WSL or Git Bash; on a restricted
-Windows shell, use the scripted stack targets and run `astra admin setup`
-directly.
+The released clients and full guided path support Linux, macOS, and Windows
+through WSL. Native Windows and Git Bash are not release targets yet.
 
 For a non-interactive local evaluation, use deterministic mock embeddings:
 
@@ -253,8 +255,8 @@ and `make stack-verify` explicitly.
 
 #### 3. Confirm the CLI and service
 
-The stack ships `astra-server`; the prebuilt `astra` binary installed in step 1
-drives it:
+The versioned stack ships the matching `astra-server`; the prebuilt `astra`
+binary installed in step 1 drives it:
 
 ```bash
 astra health
@@ -263,8 +265,10 @@ astra health
 The CLI defaults to `http://127.0.0.1:17001`, which is where the stack binds,
 so no extra configuration is needed. If you remapped `ASTRA_API_PORT`, set
 `ASTRA_API_URL` or pass `--api-url` to each command. Pass `-v <version>` to the
-installer, and set `ASTRA_IMAGE` before `make stack-up`, when you need a pinned
-CLI and server pair.
+installer to select an older or prerelease client; always use its matching Git
+tag for the deployment checkout. MatrixOne and Memoria are pinned to the
+compatibility set exercised by that Astra release instead of floating on
+`latest`.
 
 For scripted or advanced environments, replace the guided account/model phase
 with the following two operations.

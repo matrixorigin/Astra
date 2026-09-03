@@ -142,6 +142,28 @@ fn assert_health_contract_json(
     assert_contract_json(actual, &resolved_expected, label);
 }
 
+fn assert_root_contract_json(actual: &serde_json::Value, expected: &serde_json::Value) {
+    let expected_version = expected
+        .as_object()
+        .and_then(|object| object.get("version"))
+        .and_then(serde_json::Value::as_str);
+    assert_eq!(
+        expected_version,
+        Some("<dynamic-package-version>"),
+        "root contract must use the dynamic package version sentinel"
+    );
+
+    let mut resolved_expected = expected.clone();
+    resolved_expected
+        .as_object_mut()
+        .expect("root contract should be a JSON object")
+        .insert(
+            "version".to_string(),
+            serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()),
+        );
+    assert_contract_json(actual, &resolved_expected, "root");
+}
+
 fn build_request(
     method: &str,
     path: &str,
@@ -165,7 +187,7 @@ async fn root_matches_shared_contract() {
     let (status, json) = read_json(build_test_app(true), "/").await;
 
     assert_eq!(status.as_u16(), contract.root.status);
-    assert_contract_json(&json, &contract.root.json, "root");
+    assert_root_contract_json(&json, &contract.root.json);
 }
 
 #[tokio::test]

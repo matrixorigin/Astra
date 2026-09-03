@@ -11,8 +11,17 @@ The development flow is separate and still uses `docker-compose.deps.yml` throug
 Install the released client binaries if they are not already available:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh -s -- --dir "$HOME/.local/bin"
+export PATH="$HOME/.local/bin:$PATH"
 ```
+
+Use this directory from the matching `vX.Y.Z` source checkout. The installer
+prints the exact clone command after resolving the latest stable release. The
+checked-in `.env.example` pins Astra, MatrixOne, and Memoria to the release's
+tested compatibility set; advancing only one image makes the deployment an
+intentional compatibility test rather than the supported default.
+The canonical Compose file requires those image variables and fails before a
+pull if `.env` is missing, rather than silently substituting mutable images.
 
 From the repository root, the recommended first-run path is guided:
 
@@ -25,9 +34,9 @@ before starting Compose. It inventories an existing stack, reuses healthy
 services, repairs disconnected containers without deleting volumes, verifies a
 memory round trip, and then launches `astra admin setup`. Startup failures offer
 repair/retry, stop-and-preserve, and leave-for-inspection choices. API keys are
-hidden and the local `.env` is owner-only. The wizard works in Linux/macOS
-terminals and Windows WSL or Git Bash; restricted Windows shells can use the
-explicit targets and `astra admin setup`.
+hidden and the local `.env` is owner-only. The released clients and full
+guided path support Linux, macOS, and Windows through WSL. Native Windows and
+Git Bash are not release targets yet.
 Loopback embedding probes bypass HTTP proxies; other endpoints honor the host
 proxy configuration and suggest `NO_PROXY` when a private URL is intercepted.
 
@@ -221,18 +230,22 @@ development credentials on an untrusted network.
 
 ## Images
 
-By default the stack pulls:
+The release's `.env.example` selects one tested compatibility set:
 
-- `matrixorigin/astra:latest`
-- `matrixorigin/memoria:latest`
-- `matrixorigin/matrixone:latest`
+- an exact semantic Astra version;
+- immutable multi-platform Memoria and MatrixOne manifest digests.
 
-Override image tags in `.env`, for example:
+`make stack-env` copies those selections into the local `.env`. Upgrading the
+source checkout does not silently rewrite an existing deployment. To perform a
+deliberate compatibility test, change one or more image references in `.env`,
+for example:
 
 ```dotenv
-ASTRA_IMAGE=matrixorigin/astra:0.1.0
-MEMORIA_IMAGE=matrixorigin/memoria:latest
+ASTRA_IMAGE=matrixorigin/astra:0.2.0-rc.1
 ```
+
+Avoid floating `latest` tags in reproducibility reports and production-like
+evaluations; always record the exact image references used.
 
 ## Operations
 

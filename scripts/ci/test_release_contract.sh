@@ -51,6 +51,9 @@ printf '%s\n' \
     '    *) url="$1"; shift ;;' \
     '  esac' \
     'done' \
+    'case "$url" in' \
+    '  */releases/latest) printf '\''{"tag_name":"v0.1.0"}\n'\''; exit 0 ;;' \
+    'esac' \
     'cp "${ASTRA_TEST_RELEASE_DIR}/${url##*/}" "$destination"' \
     > "${fake_bin_dir}/curl"
 chmod 0755 "${fake_bin_dir}/curl"
@@ -60,6 +63,59 @@ PATH="${fake_bin_dir}:${PATH}" \
     "${repo_root}/scripts/install-astra.sh" --version 0.1.0 >/dev/null
 [[ "$("${install_dir}/astra" --version)" = "astra 0.1.0" ]]
 [[ "$("${install_dir}/astra-edge" --version)" = "astra-edge 0.1.0" ]]
+
+latest_output="$(
+    PATH="${fake_bin_dir}:${PATH}" \
+        ASTRA_TEST_RELEASE_DIR="$dist_dir" \
+        ASTRA_INSTALL_DIR="$install_dir" \
+        "${repo_root}/scripts/install-astra.sh" --dry-run
+)"
+grep -Fq "Release: v0.1.0" <<< "$latest_output"
+grep -Fq "git clone --branch v0.1.0 --depth 1" <<< "$latest_output"
+grep -Fq "make stack-setup" <<< "$latest_output"
+
+for invalid_version in 01.0.0 0.1.0-01 0.1.0-rc..1; do
+    if "${repo_root}/scripts/install-astra.sh" \
+        --version "${invalid_version}" --dry-run >/dev/null 2>&1; then
+        echo "installer accepted invalid semantic version ${invalid_version}" >&2
+        exit 1
+    fi
+done
+
+# If replacing the second binary fails, the installer must restore the previous
+# matching CLI/Runner pair instead of leaving a mixed installation behind.
+rollback_install_dir="${fixture_root}/rollback-installed"
+rollback_marker="${fixture_root}/fail-cli-move-once"
+mkdir -p "$rollback_install_dir"
+printf '%s\n' '#!/bin/sh' 'echo "astra old"' > "${rollback_install_dir}/astra"
+printf '%s\n' '#!/bin/sh' 'echo "astra-edge old"' > "${rollback_install_dir}/astra-edge"
+chmod 0755 "${rollback_install_dir}/astra" "${rollback_install_dir}/astra-edge"
+real_mv="$(command -v mv)"
+cat > "${fake_bin_dir}/mv" <<'SH'
+#!/bin/sh
+set -eu
+case "${2:-}" in
+    */.astra-install.*/astra)
+        if [ ! -e "${ASTRA_TEST_MV_MARKER}" ]; then
+            : > "${ASTRA_TEST_MV_MARKER}"
+            exit 1
+        fi
+        ;;
+esac
+exec "${ASTRA_TEST_REAL_MV}" "$@"
+SH
+chmod 0755 "${fake_bin_dir}/mv"
+if PATH="${fake_bin_dir}:${PATH}" \
+    ASTRA_TEST_RELEASE_DIR="$dist_dir" \
+    ASTRA_INSTALL_DIR="$rollback_install_dir" \
+    ASTRA_TEST_MV_MARKER="$rollback_marker" \
+    ASTRA_TEST_REAL_MV="$real_mv" \
+    "${repo_root}/scripts/install-astra.sh" --version 0.1.0 >/dev/null 2>&1; then
+    echo "installer unexpectedly succeeded after a simulated commit failure" >&2
+    exit 1
+fi
+[[ "$("${rollback_install_dir}/astra" --version)" = "astra old" ]]
+[[ "$("${rollback_install_dir}/astra-edge" --version)" = "astra-edge old" ]]
 
 # A checksum sidecar is one exact record, not a file whose first line happens
 # to be valid.

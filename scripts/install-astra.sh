@@ -62,7 +62,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-for command_name in awk curl grep install mktemp sort tar; do
+for command_name in awk cp curl grep install mktemp mv sort tar; do
     command -v "$command_name" >/dev/null 2>&1 || fail "${command_name} is required"
 done
 
@@ -85,8 +85,8 @@ curl_download() {
 if [ -z "$VERSION" ]; then
     info "Resolving the latest stable Astra release"
     release_json=$(curl_download -sS "https://api.github.com/repos/${REPOSITORY}/releases/latest") \
-        || fail "no stable Astra GitHub Release is available"
-    tag=$(printf '%s\n' "$release_json" | sed -n 's/^[[:space:]]*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
+        || fail "no stable Astra GitHub Release is available; see https://github.com/${REPOSITORY}/releases"
+    tag=$(printf '%s\n' "$release_json" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)
     [ -n "$tag" ] || fail "the latest GitHub Release did not contain a tag"
     VERSION=${tag#v}
 else
@@ -94,7 +94,26 @@ else
     tag="v${VERSION}"
 fi
 
-if ! printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+if ! printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
+    || ! awk -v version="$VERSION" '
+        BEGIN {
+            separator = index(version, "-")
+            core = separator ? substr(version, 1, separator - 1) : version
+            if (split(core, identifiers, ".") != 3) exit 1
+            for (i = 1; i <= 3; i++) {
+                if (identifiers[i] != "0" && identifiers[i] ~ /^0/) exit 1
+            }
+            if (!separator) exit 0
+            prerelease = substr(version, separator + 1)
+            count = split(prerelease, identifiers, ".")
+            for (i = 1; i <= count; i++) {
+                if (identifiers[i] == "") exit 1
+                if (identifiers[i] ~ /^[0-9]+$/ \
+                    && identifiers[i] != "0" \
+                    && identifiers[i] ~ /^0/) exit 1
+            }
+        }
+    ' </dev/null; then
     fail "invalid release version: ${VERSION}"
 fi
 [ "$tag" = "v${VERSION}" ] || fail "unsupported release tag: ${tag}"
@@ -118,16 +137,50 @@ info "Release: ${tag} (${target})"
 info "Source:  ${archive_url}"
 info "Target:  ${INSTALL_DIR}/astra and ${INSTALL_DIR}/astra-edge"
 
+show_next_steps() {
+    printf '\n'
+    info "Next: start the matching Astra Server stack"
+    printf '%s\n' \
+        "  git clone --branch ${tag} --depth 1 https://github.com/${REPOSITORY}.git Astra-${VERSION}" \
+        "  cd Astra-${VERSION}" \
+        "  make stack-setup"
+    info "Already have a Server? Run: astra login"
+}
+
 if [ "$DRY_RUN" = true ]; then
+    show_next_steps
     exit 0
 fi
 
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/astra-install.XXXXXX")
 install_stage=""
+backup_stage=""
+installation_started=false
+installation_committed=false
 cleanup() {
+    if [ "$installation_started" = true ] && [ "$installation_committed" != true ]; then
+        restore_failed=false
+        for binary in $BINARIES; do
+            if [ -e "${backup_stage}/${binary}" ] || [ -L "${backup_stage}/${binary}" ]; then
+                mv -f "${backup_stage}/${binary}" "${INSTALL_DIR}/${binary}" \
+                    || restore_failed=true
+            else
+                rm -f "${INSTALL_DIR}/${binary}" || restore_failed=true
+            fi
+        done
+        if [ "$restore_failed" = true ]; then
+            printf '%s\n' \
+                "error: installation failed and automatic rollback was incomplete; inspect ${INSTALL_DIR}/astra and ${INSTALL_DIR}/astra-edge" >&2
+        else
+            printf '%s\n' "error: installation failed; previous Astra clients were restored" >&2
+        fi
+    fi
     rm -rf "$tmp_dir"
     if [ -n "$install_stage" ]; then
         rm -rf "$install_stage"
+    fi
+    if [ -n "$backup_stage" ]; then
+        rm -rf "$backup_stage"
     fi
 }
 trap cleanup EXIT
@@ -175,15 +228,26 @@ if [ ! -w "$INSTALL_DIR" ]; then
     fail "${INSTALL_DIR} is not writable; choose a writable directory with --dir"
 fi
 install_stage=$(mktemp -d "${INSTALL_DIR}/.astra-install.XXXXXX")
+backup_stage=$(mktemp -d "${INSTALL_DIR}/.astra-backup.XXXXXX")
 for binary in $BINARIES; do
     install -m 0755 "${tmp_dir}/${binary}" "${install_stage}/${binary}"
+    destination="${INSTALL_DIR}/${binary}"
+    if [ -e "$destination" ] || [ -L "$destination" ]; then
+        if [ ! -f "$destination" ] && [ ! -L "$destination" ]; then
+            fail "${destination} exists but is not a regular file or symlink"
+        fi
+        cp -pP "$destination" "${backup_stage}/${binary}"
+    fi
 done
+installation_started=true
 mv -f "${install_stage}/astra-edge" "${INSTALL_DIR}/astra-edge"
 # Move the CLI last so a visible new `astra` always has its matching Runner.
 mv -f "${install_stage}/astra" "${INSTALL_DIR}/astra"
+installation_committed=true
 info "Installed astra and astra-edge ${VERSION} to ${INSTALL_DIR}"
 
 case ":${PATH}:" in
     *":${INSTALL_DIR}:"*) ;;
     *) info "Add ${INSTALL_DIR} to PATH before invoking Astra" ;;
 esac
+show_next_steps

@@ -2007,7 +2007,10 @@ pub(crate) async fn handle_info_command(
         }
 
         "/version" => {
-            eprintln!("{}", "  astra version 0.1.0 (Rust)".bold());
+            eprintln!(
+                "{}",
+                format!("  astra version {} (Rust)", env!("CARGO_PKG_VERSION")).bold()
+            );
         }
 
         "/info" | "/whoami" => {

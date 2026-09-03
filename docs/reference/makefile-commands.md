@@ -59,6 +59,18 @@
 | `make stack-down` | Stop the stack while preserving its data |
 | `make stack-clean` | Immediately delete the stack and its persisted data (destructive; no confirmation prompt) |
 
+## Release maintenance
+
+| Command | Description |
+| --- | --- |
+| `make release-prepare VERSION=X.Y.Z` | Safely synchronize release versions without committing, tagging, building, or publishing |
+| `make release-check VERSION=X.Y.Z` | Read-only preflight for synchronized versions, installer/archive unhappy paths, repository workflow contracts, and documentation links |
+
+Publication itself is owned by the protected **Release Astra** GitHub workflow;
+neither Make target creates a tag or publishes an artifact. `release-prepare`
+refuses to overwrite existing version-file edits and leaves MatrixOne/Memoria
+digest changes for deliberate maintainer review.
+
 ## Memoria
 
 | Command | Description |

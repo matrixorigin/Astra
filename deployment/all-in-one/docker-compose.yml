@@ -9,7 +9,7 @@ x-env-files: &astra-env-files
 
 services:
   matrixone-init:
-    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
+    image: ${MATRIXONE_IMAGE:?Set MATRIXONE_IMAGE in deployment/all-in-one/.env}
     user: root
     environment:
       HOST_UID: ${UID:-1000}
@@ -42,7 +42,7 @@ services:
     restart: "no"
 
   matrixone:
-    image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
+    image: ${MATRIXONE_IMAGE:?Set MATRIXONE_IMAGE in deployment/all-in-one/.env}
     hostname: matrixone
     user: "${UID:-1000}:${GID:-1000}"
     depends_on:
@@ -75,7 +75,7 @@ services:
         max-file: "3"
 
   memoria-init:
-    image: ${MEMORIA_IMAGE:-matrixorigin/memoria:latest}
+    image: ${MEMORIA_IMAGE:?Set MEMORIA_IMAGE in deployment/all-in-one/.env}
     user: root
     environment:
       HOST_UID: ${UID:-1000}
@@ -113,7 +113,7 @@ services:
     restart: "no"
 
   memoria:
-    image: ${MEMORIA_IMAGE:-matrixorigin/memoria:latest}
+    image: ${MEMORIA_IMAGE:?Set MEMORIA_IMAGE in deployment/all-in-one/.env}
     hostname: memoria
     user: "${UID:-1000}:${GID:-1000}"
     ports:
@@ -166,7 +166,7 @@ services:
         max-file: "3"
 
   api:
-    image: ${ASTRA_IMAGE:-matrixorigin/astra:latest}
+    image: ${ASTRA_IMAGE:?Set ASTRA_IMAGE in deployment/all-in-one/.env}
     hostname: api
     command: ["astra-server"]
     env_file: *astra-env-files

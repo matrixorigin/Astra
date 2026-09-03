@@ -752,7 +752,7 @@ impl RuntimeToolExecutor {
             &workspace_root,
             user_id.clone(),
             session_id.clone(),
-            "astra-server/0.1.0",
+            concat!("astra-server/", env!("CARGO_PKG_VERSION")),
             Duration::from_secs(15),
         );
         let capabilities = crate::capabilities::full_server_capabilities_for_tests();

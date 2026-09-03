@@ -1,115 +1,27 @@
-name: Release Astra Client Binaries
+name: Build Astra Client Release Candidates
 
 permissions:
   contents: read
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
-  workflow_dispatch:
+  workflow_call:
     inputs:
       version:
-        description: "Release version to publish, e.g. 0.1.0 or v0.1.0"
+        description: Release version without the leading v
+        required: true
+        type: string
+      source_sha:
+        description: Immutable source commit selected by the release controller
         required: true
         type: string
 
-concurrency:
-  group: release-binaries
-  # Never cancel a run that may already be publishing immutable artifacts.
-  cancel-in-progress: false
-
 env:
-  CROSS_REVISION: 8c1a8aa4b661711f4b7b6ac07c2e8929ce2f7d27 # upstream main, 2026-08-19
+  RELEASE_VERSION: ${{ inputs.version }}
+  RELEASE_SOURCE_SHA: ${{ inputs.source_sha }}
 
 jobs:
-  version:
-    name: Resolve Version
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    outputs:
-      value: ${{ steps.resolve.outputs.value }}
-      source_tag: ${{ steps.resolve.outputs.source_tag }}
-      source_sha: ${{ steps.source.outputs.source_sha }}
-      tag_object: ${{ steps.source.outputs.tag_object }}
-      prerelease: ${{ steps.resolve.outputs.prerelease }}
-    steps:
-      - name: Resolve release version
-        id: resolve
-        shell: bash
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-
-          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            version="${INPUT_VERSION}"
-          else
-            version="${GITHUB_REF_NAME}"
-          fi
-
-          if [[ ! "${version}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "Invalid release version: ${version}" >&2
-            echo "Expected format: 0.1.0, v0.1.0, or 0.1.0-rc.1" >&2
-            exit 1
-          fi
-
-          value="${version#v}"
-          prerelease=false
-          if [[ "${value}" == *-* ]]; then
-            prerelease=true
-          fi
-
-          echo "value=${value}" >> "${GITHUB_OUTPUT}"
-          echo "source_tag=v${value}" >> "${GITHUB_OUTPUT}"
-          echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
-
-      - name: Check out release source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          ref: ${{ steps.resolve.outputs.source_tag }}
-
-      - name: Validate manifest version
-        run: scripts/validate-release-version.sh "${{ steps.resolve.outputs.value }}"
-
-      - name: Validate immutable release source
-        id: source
-        shell: bash
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          EVENT_SOURCE_SHA: ${{ github.event.after }}
-          SOURCE_TAG: ${{ steps.resolve.outputs.source_tag }}
-        run: |
-          set -euo pipefail
-          tag_object="$(git rev-parse "refs/tags/${SOURCE_TAG}")"
-          if [ "$(git cat-file -t "refs/tags/${SOURCE_TAG}")" != "tag" ]; then
-            echo "Release tag ${SOURCE_TAG} must be annotated." >&2
-            exit 1
-          fi
-          source_sha="$(git rev-list -n 1 "refs/tags/${SOURCE_TAG}")"
-          if [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${source_sha}" != "${EVENT_SOURCE_SHA}" ]; then
-            echo "Release tag ${SOURCE_TAG} no longer points to the commit that triggered this workflow." >&2
-            exit 1
-          fi
-          if [ "$(git rev-parse HEAD)" != "${source_sha}" ]; then
-            echo "Checked-out source does not match ${SOURCE_TAG}." >&2
-            exit 1
-          fi
-          git fetch --no-tags origin \
-            "refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
-          if ! git merge-base --is-ancestor "${source_sha}" "origin/${DEFAULT_BRANCH}"; then
-            echo "Release tag ${{ steps.resolve.outputs.source_tag }} is not reachable from ${DEFAULT_BRANCH}." >&2
-            echo "Merge the release commit before publishing its tag." >&2
-            exit 1
-          fi
-          echo "source_sha=${source_sha}" >> "${GITHUB_OUTPUT}"
-          echo "tag_object=${tag_object}" >> "${GITHUB_OUTPUT}"
-
   build:
     name: Build ${{ matrix.target }}
-    needs: version
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
     strategy:
@@ -119,92 +31,85 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             suffix: linux-amd64
-            use-cross: false
             features: astra-cli/release-vendored-openssl
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
             suffix: linux-arm64
-            use-cross: true
             features: astra-cli/release-vendored-openssl
           - os: macos-15-intel
             target: x86_64-apple-darwin
             suffix: darwin-amd64
-            use-cross: false
             features: ""
           - os: macos-15
             target: aarch64-apple-darwin
             suffix: darwin-arm64
-            use-cross: false
             features: ""
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-          ref: ${{ needs.version.outputs.source_sha }}
+          ref: ${{ env.RELEASE_SOURCE_SHA }}
 
-      - name: Cache cargo registry
+      - name: Cache Cargo registry
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/cache
             ~/.cargo/registry/index
             ~/.cargo/git/db
-          key: cargo-registry-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          key: release-cargo-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-registry-${{ runner.os }}-${{ matrix.target }}-
+            release-cargo-${{ runner.os }}-${{ matrix.target }}-
 
-      - name: Install pinned Rust toolchain and target
+      - name: Install pinned Rust target
         shell: bash
         run: |
+          set -euo pipefail
           rustc --version
           rustup target add "${{ matrix.target }}"
 
-      - name: Install musl build deps
-        if: ${{ matrix.target == 'x86_64-unknown-linux-musl' }}
+      - name: Install musl build dependencies
+        if: ${{ contains(matrix.target, 'unknown-linux-musl') }}
+        shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends musl-tools
 
-      - name: Install cross
-        if: ${{ matrix.use-cross }}
-        run: >-
-          cargo install cross
-          --git https://github.com/cross-rs/cross
-          --rev "${CROSS_REVISION}"
-          --locked
-
-      - name: Build with cross
-        if: ${{ matrix.use-cross }}
+      - name: Build client candidates
+        shell: bash
         env:
           RELEASE_FEATURES: ${{ matrix.features }}
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: |
           set -euo pipefail
           feature_args=()
           if [ -n "${RELEASE_FEATURES}" ]; then
             feature_args=(--features "${RELEASE_FEATURES}")
           fi
-          cross build --release --no-default-features "${feature_args[@]}" \
+          cargo build --release --locked --no-default-features "${feature_args[@]}" \
             --manifest-path Cargo.toml --target "${{ matrix.target }}" \
             -p astra-cli --bin astra \
             -p astra-edge --bin astra-edge
 
-      - name: Build native
-        if: ${{ !matrix.use-cross }}
-        env:
-          RELEASE_FEATURES: ${{ matrix.features }}
+      - name: Execute client candidates
+        shell: bash
         run: |
           set -euo pipefail
-          feature_args=()
-          if [ -n "${RELEASE_FEATURES}" ]; then
-            feature_args=(--features "${RELEASE_FEATURES}")
-          fi
-          cargo build --release --no-default-features "${feature_args[@]}" \
-            --manifest-path Cargo.toml --target "${{ matrix.target }}" \
-            -p astra-cli --bin astra \
-            -p astra-edge --bin astra-edge
+          for binary in astra astra-edge; do
+            candidate="target/${{ matrix.target }}/release/${binary}"
+            reported_version="$("${candidate}" --version)"
+            expected_version="${binary} ${RELEASE_VERSION}"
+            if [ "${reported_version}" != "${expected_version}" ]; then
+              echo "${binary} reports '${reported_version}', expected '${expected_version}'" >&2
+              exit 1
+            fi
+            "${candidate}" --help >/dev/null
+          done
 
-      - name: Package archive
+      - name: Package client archive
         shell: bash
         run: |
           set -euo pipefail
@@ -226,69 +131,57 @@ jobs:
               "${package_dir}/${binary}"
           done
           install -m 0644 LICENSE "${package_dir}/LICENSE"
-          archive="astra-v${{ needs.version.outputs.value }}-${{ matrix.suffix }}.tar.gz"
+          archive="astra-v${RELEASE_VERSION}-${{ matrix.suffix }}.tar.gz"
           tar -czf "dist/${archive}" -C "${package_dir}" astra astra-edge LICENSE
-          (cd dist && checksum_file "${archive}" | tee "${archive}.sha256" > /dev/null)
+          (cd dist && checksum_file "${archive}" > "${archive}.sha256")
 
-      - name: Upload artifact
+      - name: Upload client candidate
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: bins-${{ matrix.suffix }}
+          name: client-${{ matrix.suffix }}
           path: dist/
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 3
 
-  release:
-    name: Create Release
-    needs:
-      - version
-      - build
+  verify:
+    name: Verify Complete Client Set
+    needs: build
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: write
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-          ref: ${{ needs.version.outputs.source_sha }}
+          ref: ${{ env.RELEASE_SOURCE_SHA }}
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: bins-*
+          pattern: client-*
           path: dist
           merge-multiple: true
 
-      - name: Verify release artifacts and create checksum manifest
+      - name: Verify archives and create aggregate checksums
         shell: bash
-        run: scripts/verify-release-artifacts.sh "${{ needs.version.outputs.value }}" dist
+        run: scripts/verify-release-artifacts.sh "${RELEASE_VERSION}" dist
 
-      - name: Require the original immutable release tag
+      - name: Write client candidate summary
         shell: bash
-        env:
-          EXPECTED_TAG_OBJECT: ${{ needs.version.outputs.tag_object }}
-          SOURCE_TAG: ${{ needs.version.outputs.source_tag }}
         run: |
-          set -euo pipefail
-          remote_tag_object="$(
-            git ls-remote origin "refs/tags/${SOURCE_TAG}" |
-              awk 'NR == 1 { print $1 }'
-          )"
-          if [ -z "${remote_tag_object}" ] || [ "${remote_tag_object}" != "${EXPECTED_TAG_OBJECT}" ]; then
-            echo "Release tag ${SOURCE_TAG} was deleted or moved during the build." >&2
-            exit 1
-          fi
+          {
+            echo "## Verified Astra client candidates"
+            echo
+            echo "Source: \`${RELEASE_SOURCE_SHA}\`"
+            echo
+            echo '```text'
+            cat dist/checksums.txt
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+      - name: Upload verified client release set
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          token: ${{ github.token }}
-          name: Astra v${{ needs.version.outputs.value }}
-          tag_name: ${{ needs.version.outputs.source_tag }}
-          draft: false
-          prerelease: ${{ needs.version.outputs.prerelease }}
-          generate_release_notes: true
-          make_latest: ${{ needs.version.outputs.prerelease == 'false' }}
-          files: dist/*
-          fail_on_unmatched_files: true
+          name: release-client-assets
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7

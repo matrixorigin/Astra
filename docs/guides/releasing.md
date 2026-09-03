@@ -1,135 +1,215 @@
 # Releasing Astra
 
-This guide describes the maintainer workflow for publishing Astra from the
-`matrixorigin/Astra` repository. Releases use semantic versions and immutable
-Git tags; the GitHub Release, installer, source, and release automation all
-live here. Docker images are published as `matrixorigin/astra` on Docker Hub.
+This guide defines the maintainer workflow for publishing Astra from the
+`matrixorigin/Astra` repository. One protected workflow owns the source tag,
+GitHub Release, client archives, public server image, rolling Docker tags, and
+optional registry mirror. A release is selected once, verified as one candidate
+set, and only then made visible to users.
 
-## Release contract
-
-A tag named `vX.Y.Z` triggers both release workflows:
-
-- `release-binaries.yml` publishes archives containing the `astra` CLI and
-  `astra-edge` User Runner for Linux and macOS on AMD64 and ARM64, plus
-  SHA-256 checksum files, to a GitHub Release.
-- `release-docker.yml` publishes the multi-architecture
-  `matrixorigin/astra:X.Y.Z` image to Docker Hub.
+## What one release contains
 
 | Runtime role | Published form | User entrypoint |
 | --- | --- | --- |
-| CLI | GitHub Release archive | `astra` |
-| Edge / User Runner | The same GitHub Release archive | `astra-edge` |
-| Server | Verified multi-platform Docker image | `matrixorigin/astra:X.Y.Z` |
+| CLI | Checksum-verified GitHub Release archive | `astra` |
+| Edge / User Runner | The same client archive | `astra-edge` |
+| Server | Verified multi-platform image | `matrixorigin/astra:X.Y.Z` |
+| Local dependencies | Versioned compatibility pins | all-in-one `.env.example` |
 | Web dashboard | Source checkout for now | development workflow |
 
-The Docker workflow first starts each untagged platform image by its immutable
-digest through the documented all-in-one deployment, then verifies API health
-plus an exact memory write/retrieval. Only after every platform passes does the
-workflow publish the `X.Y.Z` manifest. A stable release then updates `X.Y` and
-`latest`; a prerelease such as `v0.2.0-rc.1` is marked as a GitHub prerelease
-and does not update those rolling tags. A failed candidate therefore changes no
-user-facing Docker tag.
+The client set covers Linux and macOS on AMD64 and ARM64. Each build executes
+both binaries before packaging them. The server set covers Linux AMD64 and
+ARM64; each untagged digest is started through the documented all-in-one stack
+and must pass API readiness, dependency health, and an exact memory
+write/retrieval/cleanup round trip.
 
-Both workflows require an annotated tag, bind every build to its peeled commit
-SHA, reject a commit that is not reachable from the default branch, and verify
-that the remote tag was neither moved nor deleted before publication. They run
-independently so a failed platform does not conceal a successful one, but a
-release is complete only when both are green. The binary workflow needs only
-the repository-provided `GITHUB_TOKEN`; there is no cross-repository release
-token or secondary release mirror.
+Stable releases update the Docker `X.Y` and `latest` tags only after the
+versioned Docker manifest and GitHub Release are both available. A prerelease
+such as `0.2.0-rc.1` publishes only its exact version and is marked as a GitHub
+prerelease.
 
-## Repository configuration
+## Why publication starts from a workflow, not a tag push
 
-The Docker workflow requires these repository secrets:
+Tag-triggered workflows execute release logic stored with the tagged commit.
+Allowing any historical commit reachable from `main` to initiate publication
+therefore lets obsolete automation become the release control plane.
 
-- `DOCKERHUB_USERNAME`
-- `DOCKERHUB_TOKEN`
+The **Release Astra** workflow is manually dispatched from the protected
+default branch instead. It selects the current `main` commit, validates the
+complete version and release contract, builds every candidate, and creates the
+annotated tag only after all candidates pass. GitHub does not start a second
+workflow for a tag created with `GITHUB_TOKEN`, so one run remains the sole
+release owner.
 
-Protect `refs/tags/v*` with an active GitHub tag ruleset. Restrict create,
-update, and delete operations to release maintainers and disallow force
-updates. Workflow checks detect mutation after a run starts; the repository
-ruleset controls who may start a release in the first place.
+Publication is deliberately ordered:
 
-The optional private registry mirror runs only when both
+1. validate the exact source and version;
+2. build and execute all client candidates;
+3. build untagged server digests and smoke every platform;
+4. create or validate the immutable annotated tag;
+5. create or verify the exact Docker version manifest;
+6. stage and publish the GitHub Release with verified client assets;
+7. update stable rolling Docker tags;
+8. copy the already-public manifest to an optional private mirror.
+
+The GitHub Release is not published until the exact Docker version exists. If
+a late step fails, rerun the failed jobs from the same Actions run so its
+verified artifacts are reused. The annotated tag records its owning Actions
+run, so that run can continue idempotently without allowing a different run to
+claim it. The workflow also has an explicit recovery mode for an existing tag;
+it refuses to move the tag or overwrite a different versioned Docker manifest.
+
+## Required repository configuration
+
+Create a GitHub Environment named `release`:
+
+- require approval from release maintainers;
+- allow deployments only from `main`;
+- add the Environment secret `ASTRA_RELEASE_ENVIRONMENT_GUARD=configured`;
+- use this as the single publication gate after every candidate is green.
+
+Create a second Environment named `release-snapshot` for reviewed snapshot
+publishing. It should have its own approval policy and the Environment secret
+`ASTRA_SNAPSHOT_ENVIRONMENT_GUARD=configured`. These guard values are deliberate
+fail-closed markers, not credentials: if GitHub creates a referenced but
+unconfigured Environment automatically, publication stops before changing a
+tag or manifest.
+
+Provide `DOCKERHUB_USERNAME` and a least-privilege `DOCKERHUB_TOKEN`, capable
+of writing only `matrixorigin/astra`, as repository or organization Actions
+secrets. Candidate jobs use them to push untagged digests for runtime smoke;
+only the environment-gated publication job gives those digests a user-visible
+tag. Keep `IDC_REGISTRY_USERNAME` and `IDC_REGISTRY_PASSWORD` as repository or
+organization secrets when the optional mirror is enabled.
+
+After migration, remove the unused `ASTRA_SUITE_PAT` secret and
+`RELEASE_MIRROR_REPOSITORY` variable once a repository search confirms that no
+workflow still references them.
+
+Protect `refs/tags/v*` with an active tag ruleset:
+
+- restrict updates and deletions, and disallow force updates;
+- if creation is restricted too, grant bypass only to the automation identity
+  used by **Release Astra** and verify that a release rehearsal can create its
+  annotated tag;
+- do not grant a broad bypass to ordinary repository writers.
+
+A manually created tag cannot publish anything and cannot be adopted by
+recovery, but it will reserve that version until an administrator removes it.
+
+Repository Actions should default to read-only permissions. The release
+controller grants `contents: write` only to the publication job that creates
+the tag and GitHub Release.
+
+The optional registry mirror is enabled only when both
 `CONTAINER_MIRROR_REGISTRY` and `CONTAINER_MIRROR_IMAGE` repository variables
-are set. It additionally uses `IDC_REGISTRY_USERNAME` and
-`IDC_REGISTRY_PASSWORD`; proxy and runner variables are documented inline in
-`release-docker.yml`. These settings copy an already verified Docker manifest
-and do not own the public GitHub Release.
+are set. Proxy and runner variables are documented in `release.yml`. Mirror
+failure is reported without invalidating a public release that has already
+completed.
 
-The source tree also versions the public `@astra/sdk` package and the Helm
-chart, but the tag workflows do not publish either to npm or a chart registry.
-Until dedicated publication gates exist, treat those as explicit maintainer
-actions and do not advertise them as tag-produced artifacts.
+The source tree versions `@astra/sdk` and the Helm chart, but the workflow does
+not yet publish either to npm or a chart registry. Treat them as explicit
+maintainer actions until dedicated verification and provenance gates exist.
 
-## Prepare the release
+Legacy releases in `matrixorigin/astra-suite` and the existing `v0.0.x` tags
+are historical inputs, not publication fallbacks. The current installer reads
+only GitHub Releases owned by `matrixorigin/Astra`, and recovery accepts only
+annotated tags created by this unified workflow. For the first repository-owned
+release, choose a new version whose tag and Docker version do not exist; until
+that release is complete, latest-release installation will fail explicitly
+instead of silently installing a legacy package.
 
-1. Open a release pull request from a feature branch.
-2. Update the release version in `Cargo.toml`, `packages/sdk/package.json`, its
-   package lock, `web/package.json`, its package lock, `CITATION.cff`, and both
-   `version` and `appVersion` in `deployment/kubernetes/chart/Chart.yaml`.
-   Update `Cargo.lock` when the workspace version changes.
-3. Confirm that the version matches the intended tag without the leading `v`.
-   Both tag-triggered release workflows reject a mismatched workspace version
-   before building or publishing artifacts.
-4. Summarize user-visible changes, compatibility impact, and migration steps in
-   the pull request.
-5. Apply the most specific `kind/*`, `documentation`, or `improvement` label to
-   each included pull request so the generated release notes are categorized.
-6. Run `scripts/validate-release-version.sh X.Y.Z`, `make check`,
-   `make test-offline`, and any integration lane required by
-   the affected boundaries.
-7. Merge only after required CI and review pass on the exact release commit.
+## Prepare a release
+
+1. Open a release pull request from a non-default feature branch.
+2. Synchronize the workspace, client, Web, lockfile, citation, Helm, all-in-one,
+   and production-template Astra versions in one reviewable change:
+
+   ```bash
+   make release-prepare VERSION=0.2.0
+   ```
+
+   The command refuses to overwrite uncommitted edits to version files,
+   requires the old metadata to be internally consistent, writes the new files
+   atomically, and validates the resulting version set. It does not commit,
+   tag, build, or publish anything.
+3. Deliberately review the pinned MatrixOne and Memoria manifest digests. Change
+   them only when that compatibility set has been tested.
+4. Summarize user-visible changes, migrations, compatibility impact, and known
+   limitations in the release pull request.
+5. Apply accurate `kind/*`, `documentation`, or `improvement` labels so
+   generated release notes remain useful.
+6. Run the read-only local preflight:
+
+   ```bash
+   make release-check VERSION=0.2.0
+   ```
+
+7. Run `make check`, `make test-offline`, and the integration lanes required by
+   the changed boundaries.
+8. Merge only after required CI and review pass on the exact version commit.
+
+`make release-check` validates synchronized versions, installer and archive
+unhappy paths, repository release contracts, workflow ownership, and
+documentation links. It accepts a working-tree diff so it can run before the
+release commit; it does not modify files, create tags, or publish data.
 
 ## Publish
 
-Create an annotated tag on the reviewed commit. Run the read-only preflight
-after creating it, then push only that tag:
+1. Open **Actions → Release Astra → Run workflow**.
+2. Select `main` in the branch selector.
+3. Enter the version without a leading `v`, for example `0.2.0`.
+4. Leave **recover existing tag** disabled for a new release.
+5. Wait for the client and server candidate matrices to pass.
+6. Review the preflight summary and approve the single `release` Environment
+   gate for the publication job.
 
-```bash
-git switch main
-git pull --ff-only
-git tag -a v0.2.0 -m "Astra v0.2.0"
-make release-check VERSION=0.2.0
-git push origin v0.2.0
+Do not create the tag manually. The workflow creates `vX.Y.Z` as an annotated
+tag on the source SHA after all candidate verification succeeds.
+
+For a public rehearsal, publish an `rc` version first. The installer ignores
+prereleases when resolving `latest`, and rolling Docker tags remain unchanged:
+
+```text
+0.2.0-rc.1
 ```
 
-`make release-check` is deliberately read-only: it verifies version metadata,
-the clean tracked worktree, the annotated tag, and its commit relationship. It
-never builds or pushes an image. Do not move or reuse a published version tag.
-The client workflow's manual input is for recovering a failed publication from
-an existing tag, not for selecting unreviewed source. Manual Docker runs publish
-snapshot tags only; semantic-version Docker releases must start from the
-matching Git tag so the source, binaries, and container image identify the same
-commit.
+The separate **Publish Astra Docker Snapshot** workflow is for immutable,
+non-semantic snapshots from the current `main` head. It rejects feature-branch
+source, semantic versions, rolling tags, and attempts to overwrite a different
+snapshot. Re-running the same source and name succeeds only when the published
+platform digests match exactly.
 
 ## Verify the release
 
-Wait for both release workflows to pass, then verify:
+Verify all of the following before announcing it:
 
-- The GitHub Release points to the intended commit and has all four client
-  archives, their individual checksums, `checksums.txt`, and its checksum.
-- Each client archive contains the `astra` and `astra-edge` executables and the
-  Apache-2.0 `LICENSE` file at its root.
-- Generated release notes group the included pull requests accurately.
-- A downloaded archive matches its published SHA-256 value.
-- The documented installer downloads from `matrixorigin/Astra`, rejects a
-  missing checksum, and reports the expected version from `astra --version`.
-- The Docker version tag resolves to both `linux/amd64` and `linux/arm64`.
-- The Docker runtime smoke passed on every built platform, including the
-  all-in-one health and memory round-trip checks.
-- Both binaries report the expected version, and the CLI completes a basic
-  health check.
-- For a stable release, the `X.Y` and `latest` tags resolve to the new manifest;
-  for a prerelease, they remain unchanged.
+- the GitHub Release points to the workflow-selected SHA;
+- all four client archives, their sidecars, `checksums.txt`, and its checksum
+  are present;
+- a clean Linux and macOS machine can run the documented installer;
+- `astra --version`, `astra-edge --version`, and `astra --help` work;
+- the exact Docker version resolves to Linux AMD64 and ARM64;
+- the all-in-one source checkout at `vX.Y.Z` uses the same Astra version plus
+  the tested MatrixOne and Memoria digests;
+- `make stack-setup` reaches the first successful CLI turn;
+- stable `X.Y` and `latest` tags resolve to the version manifest, while a
+  prerelease leaves them unchanged.
 
-Finally, run the documented install command on one clean Linux or macOS host.
-The installer must resolve this repository's latest stable Release, verify the
-platform checksum, install both client binaries, and complete a real CLI turn.
+## Recover or correct a release
 
-## Correct a bad release
+Prefer **Re-run failed jobs** on the original Actions run. This reuses the
+candidate artifacts that already passed verification.
 
-Do not rewrite the Git tag or replace release assets in place. Fix the problem
-through the normal pull request workflow and publish a new patch version. If an
-artifact is unsafe to use, mark its GitHub Release as a prerelease and state the
-replacement version prominently while the fix is prepared.
+Use **recover existing tag** only when a previous **Release Astra** run created
+the annotated tag but its original run can no longer be resumed. Recovery
+rejects manual and legacy tags, verifies the recorded owner is a real
+**Release Astra** run from the default branch at the same source SHA, then
+validates the unchanged tag, checksums, and any existing versioned Docker
+manifest. It never moves a tag or silently replaces different immutable
+output. If the recorded Actions run is no longer available, publish a patch
+version instead of weakening ownership checks.
+
+Do not rewrite a tag or replace a completed release in place. Fix product or
+packaging defects through a normal pull request and publish a patch version. If
+an existing artifact is unsafe, mark the release as a prerelease and identify
+the replacement version prominently while preparing the patch.

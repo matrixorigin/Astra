@@ -112,7 +112,10 @@ help:
 	@echo "  make dev-start-docker   - Start deps + API in Docker"
 	@echo "  make dev-api-docker-up  - Start API server in Docker"
 	@echo "  make dev-api-docker-down - Stop API server Docker container"
-	@echo "  make release-check      - Validate release metadata (VERSION=...)"
+	@echo ""
+	@echo "Release maintenance:"
+	@echo "  make release-prepare    - Synchronize release versions (VERSION=...)"
+	@echo "  make release-check      - Run the read-only release preflight (VERSION=...)"
 
 # ============================================================================
 # Variables
@@ -514,6 +517,14 @@ dev-api-docker-scale:
 	@cd deployment/all-in-one && docker compose --env-file ../../.env up -d --no-deps --scale api=$(REPLICAS) api
 	@echo "✅ Scaled to $(REPLICAS) replicas"
 
+.PHONY: release-prepare
+release-prepare:
+	@if [ -z "$(VERSION)" ]; then \
+		echo "❌ VERSION is required, for example: make release-prepare VERSION=0.2.0"; \
+		exit 1; \
+	fi
+	@scripts/prepare-release-version.py "$(VERSION)"
+
 .PHONY: release-check
 release-check:
 	@if [ -z "$(VERSION)" ]; then \
@@ -521,20 +532,9 @@ release-check:
 		exit 1; \
 	fi
 	@scripts/validate-release-version.sh "$(VERSION)"
-	@if [ "$(IMAGE_SOURCE_DIRTY)" != "false" ]; then \
-		echo "❌ Release source has uncommitted tracked changes"; \
-		exit 1; \
-	fi
-	@if [ "$$(git rev-parse HEAD)" != "$$(git rev-list -n 1 "v$(IMAGE_VERSION)" 2>/dev/null)" ]; then \
-		echo "❌ HEAD must be the commit tagged v$(IMAGE_VERSION)"; \
-		exit 1; \
-	fi
-	@if [ "$$(git cat-file -t "v$(IMAGE_VERSION)" 2>/dev/null)" != "tag" ]; then \
-		echo "❌ v$(IMAGE_VERSION) must be an annotated tag"; \
-		exit 1; \
-	fi
-	@echo "✅ Release metadata and tagged source are consistent"
-	@echo "   Push v$(IMAGE_VERSION) to run the verified binary and multi-platform image workflows."
+	@python3 scripts/ci/validate_repository.py
+	@echo "✅ Release metadata, installer, artifacts, and workflow contracts are consistent"
+	@echo "   Commit and merge the reviewed version changes, then run Release Astra from main."
 
 # ============================================================================
 # Compose Stack Deployment

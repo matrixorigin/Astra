@@ -1,21 +1,18 @@
-name: Release Docker Image
+name: Publish Astra Docker Snapshot
 
 permissions:
   contents: read
 
 on:
-  push:
-    tags:
-      - 'v*.*.*'
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Snapshot Docker tag (defaults to <YYYYMMDD>-<short-commit>; semver requires a Git tag)'
+      snapshot_tag:
+        description: Optional immutable tag (defaults to snapshot-<UTC date>-<short SHA>)
         required: false
-        default: ''
+        default: ""
         type: string
       architecture:
-        description: 'Architecture to build (single-architecture tags get an architecture suffix)'
+        description: Architecture to build
         required: true
         default: all
         type: choice
@@ -25,315 +22,171 @@ on:
           - arm64
 
 concurrency:
-  group: release-docker
-  # Never cancel a run that may already have pushed a platform image.
+  group: release-docker-snapshot
   cancel-in-progress: false
 
-env:
-  IMAGE_NAME: matrixorigin/astra
-
 jobs:
-  version:
-    name: Resolve Image Settings
+  settings:
+    name: Validate Snapshot Source
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     outputs:
-      image_version: ${{ steps.release.outputs.image_version }}
-      rolling_version: ${{ steps.release.outputs.rolling_version }}
-      latest: ${{ steps.release.outputs.latest }}
-      matrix: ${{ steps.release.outputs.matrix }}
+      image_version: ${{ steps.resolve.outputs.image_version }}
+      matrix: ${{ steps.resolve.outputs.matrix }}
       source_sha: ${{ steps.source.outputs.source_sha }}
-      tag_object: ${{ steps.source.outputs.tag_object }}
 
     steps:
-      - name: Resolve image tag and build matrix
-        id: release
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require Docker publication credentials
         shell: bash
         env:
-          INPUT_VERSION: ${{ inputs.version }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "${DOCKERHUB_USERNAME}" ] || missing+=(DOCKERHUB_USERNAME)
+          [ -n "${DOCKERHUB_TOKEN}" ] || missing+=(DOCKERHUB_TOKEN)
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "Missing repository or organization Actions secrets: ${missing[*]}" >&2
+            echo "Configure the Docker Hub publisher credentials before building snapshot candidates." >&2
+            exit 1
+          fi
+
+      - name: Require the protected default-branch source
+        id: source
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}" ]; then
+            echo "Select ${DEFAULT_BRANCH} in the Run workflow dialog." >&2
+            echo "Official Docker snapshots cannot publish unreviewed feature-branch source." >&2
+            exit 1
+          fi
+          git fetch --no-tags origin \
+            "refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+          source_sha="$(git rev-parse HEAD)"
+          default_sha="$(git rev-parse "origin/${DEFAULT_BRANCH}")"
+          if [ "${source_sha}" != "${default_sha}" ]; then
+            echo "Selected source ${source_sha} is not the current ${DEFAULT_BRANCH} head ${default_sha}." >&2
+            echo "Refresh the workflow page and start a new run." >&2
+            exit 1
+          fi
+          echo "source_sha=${source_sha}" >> "${GITHUB_OUTPUT}"
+
+      - name: Resolve immutable snapshot tag and platform matrix
+        id: resolve
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.snapshot_tag }}
           INPUT_ARCHITECTURE: ${{ inputs.architecture }}
         run: |
           set -euo pipefail
-
-          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            if [ -n "${INPUT_VERSION}" ]; then
-              image_version="${INPUT_VERSION}"
-            else
-              image_version="$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
-            fi
-            architecture="${INPUT_ARCHITECTURE:-all}"
-
-            if [[ "${image_version}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-              echo "Semantic-version Docker tags are release-only." >&2
-              echo "Push the matching Git tag so source and manifest versions are validated." >&2
-              exit 1
-            fi
+          if [ -n "${INPUT_TAG}" ]; then
+            image_version="${INPUT_TAG}"
           else
-            image_version="${GITHUB_REF_NAME#v}"
-            architecture=all
-          fi
-
-          # Keep the previous behavior for semantic versions while preserving
-          # a leading "v" on non-semver custom tags.
-          if [[ "${image_version}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)$ ]]; then
-            image_version="${BASH_REMATCH[1]}"
+            image_version="snapshot-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"
           fi
 
           validate_tag() {
             local tag="$1"
             if [[ ! "${tag}" =~ ^[0-9A-Za-z_][0-9A-Za-z_.-]{0,127}$ ]]; then
-              echo "Invalid Docker tag: ${tag}" >&2
-              echo "A tag must start with a letter, digit, or underscore; contain only letters, digits, underscores, periods, and dashes; and be at most 128 characters." >&2
+              echo "Invalid Docker snapshot tag: ${tag}" >&2
+              echo "Tags must be at most 128 characters and use Docker tag characters." >&2
               exit 1
             fi
           }
           validate_tag "${image_version}"
-
+          if [[ "${image_version}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Semantic versions are owned by the unified Release workflow." >&2
+            exit 1
+          fi
           case "${image_version}" in
-            latest|buildcache|buildcache-*)
+            latest|buildcache|buildcache-*|snapshot)
               echo "Reserved Docker tag: ${image_version}" >&2
               exit 1
               ;;
           esac
           if [[ "${image_version}" =~ ^[0-9]+\.[0-9]+$ ]]; then
-            echo "Reserved rolling-version tag: ${image_version}" >&2
+            echo "Rolling release tags are reserved: ${image_version}" >&2
             exit 1
           fi
 
-          rolling_version=""
-          latest=false
-
-          case "${architecture}" in
+          case "${INPUT_ARCHITECTURE}" in
             all)
               matrix='{"include":[{"platform":"linux/amd64","runner":"ubuntu-latest","slug":"linux-amd64"},{"platform":"linux/arm64","runner":"ubuntu-24.04-arm","slug":"linux-arm64"}]}'
-              if [[ "${image_version}" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]]; then
-                rolling_version="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
-                latest=true
-              fi
               ;;
             amd64)
-              if [[ "${image_version}" != *-amd64 ]]; then
-                image_version="${image_version}-amd64"
+              if [[ "${image_version}" == *-arm64 ]]; then
+                echo "Snapshot tag ${image_version} conflicts with the requested AMD64 architecture." >&2
+                exit 1
               fi
-              validate_tag "${image_version}"
+              [[ "${image_version}" == *-amd64 ]] || image_version="${image_version}-amd64"
               matrix='{"include":[{"platform":"linux/amd64","runner":"ubuntu-latest","slug":"linux-amd64"}]}'
               ;;
             arm64)
-              if [[ "${image_version}" != *-arm64 ]]; then
-                image_version="${image_version}-arm64"
+              if [[ "${image_version}" == *-amd64 ]]; then
+                echo "Snapshot tag ${image_version} conflicts with the requested ARM64 architecture." >&2
+                exit 1
               fi
-              validate_tag "${image_version}"
+              [[ "${image_version}" == *-arm64 ]] || image_version="${image_version}-arm64"
               matrix='{"include":[{"platform":"linux/arm64","runner":"ubuntu-24.04-arm","slug":"linux-arm64"}]}'
               ;;
             *)
-              echo "Unsupported architecture: ${architecture}" >&2
+              echo "Unsupported architecture: ${INPUT_ARCHITECTURE}" >&2
               exit 1
               ;;
           esac
-
+          validate_tag "${image_version}"
           echo "image_version=${image_version}" >> "${GITHUB_OUTPUT}"
-          echo "rolling_version=${rolling_version}" >> "${GITHUB_OUTPUT}"
-          echo "latest=${latest}" >> "${GITHUB_OUTPUT}"
           echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
 
-      - name: Check out release source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          ref: ${{ github.event_name == 'push' && github.ref_name || github.sha }}
+  candidates:
+    name: Build and Verify Snapshot Candidates
+    needs: settings
+    uses: ./.github/workflows/release-container-candidates.yml
+    with:
+      image_version: ${{ needs.settings.outputs.image_version }}
+      source_sha: ${{ needs.settings.outputs.source_sha }}
+      matrix_json: ${{ needs.settings.outputs.matrix }}
+    secrets: inherit
 
-      - name: Validate manifest version
-        if: ${{ github.event_name == 'push' }}
-        run: scripts/validate-release-version.sh "${{ steps.release.outputs.image_version }}"
-
-      - name: Resolve and validate immutable source
-        id: source
-        shell: bash
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          EVENT_SOURCE_SHA: ${{ github.event.after }}
-        run: |
-          set -euo pipefail
-          source_sha="$(git rev-parse HEAD)"
-          tag_object=""
-          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
-            tag_object="$(git rev-parse "refs/tags/${GITHUB_REF_NAME}")"
-            if [ "$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}")" != "tag" ]; then
-              echo "Release tag ${GITHUB_REF_NAME} must be annotated." >&2
-              exit 1
-            fi
-            source_sha="$(git rev-list -n 1 "refs/tags/${GITHUB_REF_NAME}")"
-            if [ "${source_sha}" != "${EVENT_SOURCE_SHA}" ]; then
-              echo "Release tag ${GITHUB_REF_NAME} no longer points to the commit that triggered this workflow." >&2
-              exit 1
-            fi
-          fi
-          git fetch --no-tags origin \
-            "refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
-          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
-            if ! git merge-base --is-ancestor "${source_sha}" "origin/${DEFAULT_BRANCH}"; then
-              echo "Release tag ${GITHUB_REF_NAME} is not reachable from ${DEFAULT_BRANCH}." >&2
-              echo "Merge the release commit before publishing its tag." >&2
-              exit 1
-            fi
-          fi
-          echo "source_sha=${source_sha}" >> "${GITHUB_OUTPUT}"
-          echo "tag_object=${tag_object}" >> "${GITHUB_OUTPUT}"
-
-  build:
-    name: Build ${{ matrix.platform }}
-    needs: version
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 180
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.version.outputs.matrix) }}
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-          ref: ${{ needs.version.outputs.source_sha }}
-
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        id: meta
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          flavor: |
-            latest=false
-          tags: |
-            type=raw,value=${{ needs.version.outputs.image_version }}
-
-      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
-        id: build
-        with:
-          context: .
-          file: Dockerfile
-          platforms: ${{ matrix.platform }}
-          tags: ${{ env.IMAGE_NAME }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            IMAGE_VERSION=${{ needs.version.outputs.image_version }}
-            IMAGE_REVISION=${{ needs.version.outputs.source_sha }}
-            IMAGE_SOURCE_DIRTY=false
-            IMAGE_BRANCH=${{ github.ref_name }}
-          # Registry caches are shared across release tags/branches and do not
-          # compete with Rust/sccache for the repository's Actions cache quota.
-          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache-${{ matrix.slug }}
-          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache-${{ matrix.slug }},mode=max
-          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
-          provenance: mode=max
-          sbom: true
-
-      - name: Export digest
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "Build returned an invalid image digest: ${digest:-<empty>}" >&2
-            exit 1
-          fi
-          touch "/tmp/digests/${digest#sha256:}"
-
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: digests-${{ matrix.slug }}
-          path: /tmp/digests/*
-          if-no-files-found: error
-          retention-days: 1
-
-  smoke:
-    name: Verify ${{ matrix.platform }} Candidate
+  publish:
+    name: Publish Immutable Snapshot Manifest
     needs:
-      - version
-      - build
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.version.outputs.matrix) }}
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-          ref: ${{ needs.version.outputs.source_sha }}
-
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        with:
-          name: digests-${{ matrix.slug }}
-          path: /tmp/digest
-
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Start candidate digest through the documented all-in-one path
-        shell: bash
-        env:
-          DOCKERHUB_IMAGE_NAME: ${{ env.IMAGE_NAME }}
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          digest_files=(/tmp/digest/*)
-          if [ "${#digest_files[@]}" -ne 1 ]; then
-            echo "Expected one candidate digest for ${{ matrix.platform }}, found ${#digest_files[@]}" >&2
-            exit 1
-          fi
-          digest="$(basename "${digest_files[0]}")"
-          if [[ ! "${digest}" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "Candidate artifact contains an invalid image digest: ${digest}" >&2
-            exit 1
-          fi
-          release_image="${DOCKERHUB_IMAGE_NAME}@sha256:${digest}"
-
-          make stack-env
-          sed -i "s|^ASTRA_IMAGE=.*|ASTRA_IMAGE=${release_image}|" deployment/all-in-one/.env
-          sed -i 's|^MEMORIA_EMBEDDING_PROVIDER=.*|MEMORIA_EMBEDDING_PROVIDER=mock|' deployment/all-in-one/.env
-          make stack-up
-
-          revision="$(docker image inspect "${release_image}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
-          if [ "${revision}" != "${{ needs.version.outputs.source_sha }}" ]; then
-            echo "Candidate image revision ${revision:-<missing>} does not match ${{ needs.version.outputs.source_sha }}" >&2
-            exit 1
-          fi
-
-      - name: Verify health and memory round trip
-        run: make stack-verify
-
-      - name: Show service logs after failure
-        if: ${{ failure() }}
-        working-directory: deployment/all-in-one
-        run: docker compose --env-file .env logs --no-color --tail=200 api memoria matrixone || true
-
-      - name: Remove release smoke stack
-        if: ${{ always() }}
-        run: make stack-clean || true
-
-  merge:
-    name: Publish Verified DockerHub Manifest
-    needs:
-      - version
-      - build
-      - smoke
+      - settings
+      - candidates
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    environment: release-snapshot
+    timeout-minutes: 20
 
     steps:
+      - name: Require the configured snapshot environment
+        shell: bash
+        env:
+          SNAPSHOT_ENVIRONMENT_GUARD: ${{ secrets.ASTRA_SNAPSHOT_ENVIRONMENT_GUARD }}
+        run: |
+          set -euo pipefail
+          if [ "${SNAPSHOT_ENVIRONMENT_GUARD}" != "configured" ]; then
+            echo "The release-snapshot Environment is missing ASTRA_SNAPSHOT_ENVIRONMENT_GUARD=configured." >&2
+            echo "Snapshot publication fails closed when the protected Environment has not been configured." >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ needs.settings.outputs.source_sha }}
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: digests-*
+          pattern: release-digest-*
           path: /tmp/digests
           merge-multiple: true
 
@@ -344,199 +197,28 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        id: meta
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          flavor: |
-            latest=false
-          tags: |
-            type=raw,value=${{ needs.version.outputs.image_version }}
-
-      - name: Create verified DockerHub manifest list
-        shell: bash
-        working-directory: /tmp/digests
-        env:
-          DOCKERHUB_IMAGE_NAME: ${{ env.IMAGE_NAME }}
-          DOCKERHUB_METADATA_JSON: ${{ steps.meta.outputs.json }}
-          BUILD_MATRIX_JSON: ${{ needs.version.outputs.matrix }}
-          EVENT_NAME: ${{ github.event_name }}
-          EXPECTED_TAG_OBJECT: ${{ needs.version.outputs.tag_object }}
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          mapfile -t tag_args < <(jq -r '.tags[] | "-t", .' <<< "${DOCKERHUB_METADATA_JSON}")
-          if [ "${#tag_args[@]}" -eq 0 ]; then
-            echo "No DockerHub tags were generated" >&2
-            exit 1
-          fi
-
-          sources=()
-          for digest in *; do
-            if [[ ! "${digest}" =~ ^[0-9a-f]{64}$ ]]; then
-              echo "Digest artifact has an invalid filename: ${digest}" >&2
-              exit 1
-            fi
-            sources+=("${DOCKERHUB_IMAGE_NAME}@sha256:${digest}")
-          done
-          if [ "${#sources[@]}" -eq 0 ]; then
-            echo "No platform image digests were downloaded" >&2
-            exit 1
-          fi
-          expected_sources="$(jq -r '.include | length' <<< "${BUILD_MATRIX_JSON}")"
-          if [ "${#sources[@]}" -ne "${expected_sources}" ]; then
-            echo "Expected ${expected_sources} platform digests, found ${#sources[@]}" >&2
-            exit 1
-          fi
-
-          expected_platforms="$(jq -r '.include[].platform' <<< "${BUILD_MATRIX_JSON}" | sort)"
-          image_platform_set() {
-            docker buildx imagetools inspect "$1" --format '{{json .Image}}' |
-              jq -r '
-                if .os? == "linux" and (.architecture? | type) == "string" then
-                  "\(.os)/\(.architecture)"
-                else
-                  to_entries[]
-                  | select(.value.os == "linux" and (.value.architecture | type) == "string")
-                  | "\(.value.os)/\(.value.architecture)"
-                end
-              ' |
-              sort -u
-          }
-          actual_platforms="$(
-            for source in "${sources[@]}"; do
-              image_platform_set "${source}"
-            done | sort -u
-          )"
-          if [ "${actual_platforms}" != "${expected_platforms}" ]; then
-            echo "Candidate platform set does not match the release build matrix" >&2
-            diff <(printf '%s\n' "${expected_platforms}") <(printf '%s\n' "${actual_platforms}") || true
-            exit 1
-          fi
-
-          if [ "${EVENT_NAME}" = "push" ]; then
-            remote_tag_object="$(
-              git ls-remote "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" "refs/tags/${GITHUB_REF_NAME}" |
-                awk 'NR == 1 { print $1 }'
-            )"
-            if [ -z "${remote_tag_object}" ] || [ "${remote_tag_object}" != "${EXPECTED_TAG_OBJECT}" ]; then
-              echo "Release tag ${GITHUB_REF_NAME} was deleted or moved during the build." >&2
-              exit 1
-            fi
-          fi
-
-          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
-
-  promote:
-    name: Promote Verified Release Tags
-    needs:
-      - version
-      - merge
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-
-    steps:
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Promote stable release after smoke verification
+      - name: Publish or verify the immutable snapshot manifest
         shell: bash
         env:
-          IMAGE_VERSION: ${{ needs.version.outputs.image_version }}
-          ROLLING_VERSION: ${{ needs.version.outputs.rolling_version }}
-          PUBLISH_LATEST: ${{ needs.version.outputs.latest }}
+          IMAGE_NAME: matrixorigin/astra
+          IMAGE_VERSION: ${{ needs.settings.outputs.image_version }}
+          BUILD_MATRIX_JSON: ${{ needs.settings.outputs.matrix }}
         run: |
           set -euo pipefail
-          if [ "${PUBLISH_LATEST}" != "true" ]; then
-            echo "Snapshot or prerelease verified; latest remains unchanged."
-            exit 0
-          fi
-          docker buildx imagetools create \
-            --tag "${IMAGE_NAME}:${ROLLING_VERSION}" \
-            --tag "${IMAGE_NAME}:latest" \
-            "${IMAGE_NAME}:${IMAGE_VERSION}"
+          scripts/reconcile-docker-manifest.sh \
+            "${IMAGE_NAME}" "${IMAGE_VERSION}" "${BUILD_MATRIX_JSON}" \
+            /tmp/digests verify
 
-          platform_manifest_set() {
-            docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' |
-              jq -r '.manifests[] | select(.platform.os == "linux" and (.platform.architecture == "amd64" or .platform.architecture == "arm64")) | "\(.platform.os)/\(.platform.architecture)=\(.digest)"' |
-              sort
-          }
-          expected_platforms="$(platform_manifest_set "${IMAGE_NAME}:${IMAGE_VERSION}")"
-          if [ -z "${expected_platforms}" ]; then
-            echo "Verified version manifest has no Linux AMD64/ARM64 images" >&2
-            exit 1
-          fi
-          for target in "${ROLLING_VERSION}" latest; do
-            actual_platforms="$(platform_manifest_set "${IMAGE_NAME}:${target}")"
-            if [ "${actual_platforms}" != "${expected_platforms}" ]; then
-              echo "Promoted tag ${target} does not match ${IMAGE_VERSION}" >&2
-              diff <(printf '%s\n' "${expected_platforms}") <(printf '%s\n' "${actual_platforms}") || true
-              exit 1
-            fi
-          done
-
-  registry-mirror:
-    name: Publish Registry Mirror
-    if: >-
-      vars.CONTAINER_MIRROR_REGISTRY != '' &&
-      vars.CONTAINER_MIRROR_IMAGE != ''
-    needs:
-      - version
-      - promote
-    runs-on: ${{ vars.CONTAINER_MIRROR_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 45
-    env:
-      http_proxy: ${{ vars.CONTAINER_MIRROR_HTTP_PROXY || '' }}
-      https_proxy: ${{ vars.CONTAINER_MIRROR_HTTPS_PROXY || '' }}
-      no_proxy: ${{ vars.CONTAINER_MIRROR_NO_PROXY || '' }}
-
-    steps:
-      - name: Install crane
+      - name: Write snapshot summary
         shell: bash
         env:
-          CRANE_VERSION: v0.20.6
-          CRANE_LINUX_X86_64_SHA256: c1d593d01551f2c9a3df5ca0a0be4385a839bd9b86d4a76e18d7b17d16559127
+          IMAGE: matrixorigin/astra:${{ needs.settings.outputs.image_version }}
+          SOURCE_SHA: ${{ needs.settings.outputs.source_sha }}
         run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/bin"
-          curl -fsSL \
-            -o "${RUNNER_TEMP}/go-containerregistry.tar.gz" \
-            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
-          echo "${CRANE_LINUX_X86_64_SHA256}  ${RUNNER_TEMP}/go-containerregistry.tar.gz" \
-            | sha256sum --check --strict
-          tar -xzf "${RUNNER_TEMP}/go-containerregistry.tar.gz" -C "${RUNNER_TEMP}/bin" crane
-          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
-          "${RUNNER_TEMP}/bin/crane" version
-
-      - name: Copy DockerHub manifest to IDC
-        shell: bash
-        env:
-          IMAGE_VERSION: ${{ needs.version.outputs.image_version }}
-          ROLLING_VERSION: ${{ needs.version.outputs.rolling_version }}
-          PUBLISH_LATEST: ${{ needs.version.outputs.latest }}
-          SOURCE_IMAGE: ${{ env.IMAGE_NAME }}
-          MIRROR_REGISTRY: ${{ vars.CONTAINER_MIRROR_REGISTRY }}
-          TARGET_IMAGE: ${{ vars.CONTAINER_MIRROR_IMAGE }}
-          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
-          MIRROR_USERNAME: ${{ secrets.IDC_REGISTRY_USERNAME }}
-          MIRROR_PASSWORD: ${{ secrets.IDC_REGISTRY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          printf '%s' "${DOCKERHUB_TOKEN}" | crane auth login index.docker.io -u "${DOCKERHUB_USERNAME}" --password-stdin
-          printf '%s' "${MIRROR_PASSWORD}" | crane auth login "${MIRROR_REGISTRY}" -u "${MIRROR_USERNAME}" --password-stdin
-
-          tags=("${IMAGE_VERSION}")
-          if [ "${PUBLISH_LATEST}" = "true" ]; then
-            tags+=("${ROLLING_VERSION}" "latest")
-          fi
-          for tag in "${tags[@]}"; do
-            crane copy --platform=all --jobs 2 \
-              "docker.io/${SOURCE_IMAGE}:${IMAGE_VERSION}" \
-              "${TARGET_IMAGE}:${tag}"
-          done
-          crane manifest "${TARGET_IMAGE}:${IMAGE_VERSION}" >/dev/null
+          {
+            echo "## Docker snapshot published"
+            echo
+            echo "- Image: \`${IMAGE}\`"
+            echo "- Source: \`${SOURCE_SHA}\`"
+            echo "- This immutable snapshot did not update a semantic version or \`latest\`."
+          } >> "${GITHUB_STEP_SUMMARY}"

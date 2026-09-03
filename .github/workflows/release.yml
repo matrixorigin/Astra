@@ -1,0 +1,588 @@
+name: Release Astra
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Semantic version to release, for example 0.1.0 or 0.1.0-rc.1
+        required: true
+        type: string
+      recover_existing_tag:
+        description: Resume a failed publication from an existing immutable tag
+        required: true
+        default: false
+        type: boolean
+
+concurrency:
+  group: release-astra
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Resolve and Validate Release Source
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      source_tag: ${{ steps.resolve.outputs.source_tag }}
+      source_sha: ${{ steps.resolve.outputs.source_sha }}
+      tag_object: ${{ steps.resolve.outputs.tag_object }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+      rolling_version: ${{ steps.resolve.outputs.rolling_version }}
+      publish_latest: ${{ steps.resolve.outputs.publish_latest }}
+      matrix: ${{ steps.resolve.outputs.matrix }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require Docker publication credentials
+        shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "${DOCKERHUB_USERNAME}" ] || missing+=(DOCKERHUB_USERNAME)
+          [ -n "${DOCKERHUB_TOKEN}" ] || missing+=(DOCKERHUB_TOKEN)
+          if [ "${#missing[@]}" -ne 0 ]; then
+            echo "Missing repository or organization Actions secrets: ${missing[*]}" >&2
+            echo "Configure the Docker Hub publisher credentials before building release candidates." >&2
+            exit 1
+          fi
+
+      - name: Select protected source and recovery mode
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          INPUT_VERSION: ${{ inputs.version }}
+          RECOVER_EXISTING_TAG: ${{ inputs.recover_existing_tag }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}" ]; then
+            echo "Select ${DEFAULT_BRANCH} in the Run workflow dialog." >&2
+            echo "The release control plane must execute from the protected default branch." >&2
+            exit 1
+          fi
+
+          version="${INPUT_VERSION#v}"
+          source_tag="v${version}"
+          git fetch --no-tags origin \
+            "refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
+          default_sha="$(git rev-parse "origin/${DEFAULT_BRANCH}")"
+          selected_sha="$(git rev-parse HEAD)"
+          remote_tag_object="$(
+            git ls-remote origin "refs/tags/${source_tag}" |
+              awk 'NR == 1 { print $1 }'
+          )"
+
+          if [ "${RECOVER_EXISTING_TAG}" = "true" ]; then
+            if [ -z "${remote_tag_object}" ]; then
+              echo "Recovery requested, but ${source_tag} does not exist." >&2
+              echo "Start a normal release run instead." >&2
+              exit 1
+            fi
+            git fetch --force origin \
+              "refs/tags/${source_tag}:refs/tags/${source_tag}"
+            if [ "$(git cat-file -t "refs/tags/${source_tag}")" != "tag" ]; then
+              echo "Release tag ${source_tag} must be annotated." >&2
+              exit 1
+            fi
+            source_sha="$(git rev-list -n 1 "refs/tags/${source_tag}")"
+            tag_message="$(git for-each-ref --format='%(contents)' "refs/tags/${source_tag}")"
+            run_marker_prefix="Release-Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/"
+            mapfile -t run_markers < <(grep -F 'Release-Run: ' <<< "${tag_message}" || true)
+            marker_run_id=""
+            if [ "${#run_markers[@]}" -eq 1 ] \
+              && [[ "${run_markers[0]}" == "${run_marker_prefix}"* ]]; then
+              marker_run_id="${run_markers[0]#"${run_marker_prefix}"}"
+            fi
+            if [[ ! "${marker_run_id}" =~ ^[0-9]+$ ]]; then
+              echo "Release tag ${source_tag} was not created by the unified Release Astra workflow." >&2
+              echo "Recovery cannot adopt manual or legacy tags." >&2
+              exit 1
+            fi
+            owner_run_json="$(
+              gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${marker_run_id}"
+            )" || {
+              echo "The Actions run recorded by ${source_tag} no longer exists or is not readable." >&2
+              echo "Recovery will not trust an unverifiable release owner." >&2
+              exit 1
+            }
+            mapfile -t owner_run < <(
+              printf '%s' "${owner_run_json}" | python3 -c 'import json, sys; run = json.load(sys.stdin); print(run.get("path", "")); print(run.get("event", "")); print(run.get("head_branch", "")); print(run.get("head_sha", ""))'
+            )
+            if [ "${#owner_run[@]}" -ne 4 ] \
+              || [ "${owner_run[0]}" != ".github/workflows/release.yml" ] \
+              || [ "${owner_run[1]}" != "workflow_dispatch" ] \
+              || [ "${owner_run[2]}" != "${DEFAULT_BRANCH}" ] \
+              || [ "${owner_run[3]}" != "${source_sha}" ]; then
+              echo "Release tag ${source_tag} names an Actions run that does not own this source." >&2
+              echo "Expected Release Astra on ${DEFAULT_BRANCH} at ${source_sha}." >&2
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "${source_sha}" "${default_sha}"; then
+              echo "Release tag ${source_tag} is not reachable from ${DEFAULT_BRANCH}." >&2
+              exit 1
+            fi
+            tag_object="${remote_tag_object}"
+          else
+            if [ -n "${remote_tag_object}" ]; then
+              echo "Release tag ${source_tag} already exists." >&2
+              echo "Use recovery mode only to resume its original publication." >&2
+              exit 1
+            fi
+            if [ "${selected_sha}" != "${default_sha}" ]; then
+              echo "Selected source ${selected_sha} is not the current ${DEFAULT_BRANCH} head ${default_sha}." >&2
+              echo "Refresh the workflow page and start a new run." >&2
+              exit 1
+            fi
+            source_sha="${selected_sha}"
+            tag_object=""
+          fi
+
+          git checkout --detach "${source_sha}"
+          scripts/validate-release-version.sh "${version}"
+          python3 scripts/ci/validate_repository.py
+
+          prerelease=false
+          publish_latest=true
+          rolling_version="${version%.*}"
+          if [[ "${version}" == *-* ]]; then
+            prerelease=true
+            publish_latest=false
+            rolling_version=""
+          fi
+          matrix='{"include":[{"platform":"linux/amd64","runner":"ubuntu-latest","slug":"linux-amd64"},{"platform":"linux/arm64","runner":"ubuntu-24.04-arm","slug":"linux-arm64"}]}'
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "source_tag=${source_tag}" >> "${GITHUB_OUTPUT}"
+          echo "source_sha=${source_sha}" >> "${GITHUB_OUTPUT}"
+          echo "tag_object=${tag_object}" >> "${GITHUB_OUTPUT}"
+          echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
+          echo "rolling_version=${rolling_version}" >> "${GITHUB_OUTPUT}"
+          echo "publish_latest=${publish_latest}" >> "${GITHUB_OUTPUT}"
+          echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        if: ${{ inputs.recover_existing_tag != true }}
+
+      - name: Reject an existing Docker version before candidate builds
+        if: ${{ inputs.recover_existing_tag != true }}
+        shell: bash
+        env:
+          IMAGE: matrixorigin/astra:${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "${IMAGE}" >/dev/null 2>&1; then
+            echo "Docker version ${IMAGE} already exists." >&2
+            echo "Choose a new version; normal publication never adopts or overwrites an existing tag." >&2
+            exit 1
+          fi
+
+      - name: Write preflight summary
+        shell: bash
+        run: |
+          {
+            echo "## Release preflight"
+            echo
+            echo "- Version: \`${{ steps.resolve.outputs.source_tag }}\`"
+            echo "- Source: \`${{ steps.resolve.outputs.source_sha }}\`"
+            echo "- Recovery: \`${{ inputs.recover_existing_tag }}\`"
+            echo "- Client targets: Linux and macOS, AMD64 and ARM64"
+            echo "- Server targets: Linux AMD64 and ARM64"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  clients:
+    name: Build and Verify Client Candidates
+    needs: preflight
+    uses: ./.github/workflows/release-binaries.yml
+    with:
+      version: ${{ needs.preflight.outputs.version }}
+      source_sha: ${{ needs.preflight.outputs.source_sha }}
+
+  containers:
+    name: Build and Verify Server Candidates
+    needs: preflight
+    uses: ./.github/workflows/release-container-candidates.yml
+    with:
+      image_version: ${{ needs.preflight.outputs.version }}
+      source_sha: ${{ needs.preflight.outputs.source_sha }}
+      matrix_json: ${{ needs.preflight.outputs.matrix }}
+    secrets: inherit
+
+  publish:
+    name: Publish Verified Release
+    needs:
+      - preflight
+      - clients
+      - containers
+    runs-on: ubuntu-latest
+    environment: release
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Require the configured release environment
+        shell: bash
+        env:
+          RELEASE_ENVIRONMENT_GUARD: ${{ secrets.ASTRA_RELEASE_ENVIRONMENT_GUARD }}
+        run: |
+          set -euo pipefail
+          if [ "${RELEASE_ENVIRONMENT_GUARD}" != "configured" ]; then
+            echo "The release Environment is missing ASTRA_RELEASE_ENVIRONMENT_GUARD=configured." >&2
+            echo "Publication fails closed when the protected Environment has not been configured." >&2
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.source_sha }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-client-assets
+          path: dist
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-digest-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Revalidate client assets at the publication boundary
+        shell: bash
+        run: scripts/verify-release-artifacts.sh "${{ needs.preflight.outputs.version }}" dist
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Resolve publication continuation state
+        id: publication_state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RECOVER_EXISTING_TAG: ${{ inputs.recover_existing_tag }}
+          SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+          SOURCE_TAG: ${{ needs.preflight.outputs.source_tag }}
+        run: |
+          set -euo pipefail
+          same_run=false
+          tag_object="$(
+            git ls-remote origin "refs/tags/${SOURCE_TAG}" |
+              awk 'NR == 1 { print $1 }'
+          )"
+          if [ -n "${tag_object}" ] && [ "${RECOVER_EXISTING_TAG}" != "true" ]; then
+            tag_json="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object}")" \
+              || {
+                echo "Existing ${SOURCE_TAG} is not a release tag owned by this run." >&2
+                exit 1
+              }
+            tag_source="$(printf '%s' "${tag_json}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["object"]["sha"])')"
+            tag_message="$(printf '%s' "${tag_json}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["message"])')"
+            run_marker="Release-Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            if [ "${tag_source}" != "${SOURCE_SHA}" ] \
+              || ! grep -Fxq "${run_marker}" <<< "${tag_message}"; then
+              echo "Release tag ${SOURCE_TAG} appeared during candidate verification and is not owned by this run." >&2
+              exit 1
+            fi
+            same_run=true
+          fi
+          echo "same_run=${same_run}" >> "${GITHUB_OUTPUT}"
+          echo "tag_object=${tag_object}" >> "${GITHUB_OUTPUT}"
+
+      - name: Detect existing GitHub Release
+        id: existing_release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ needs.preflight.outputs.source_tag }}
+          RECOVER_EXISTING_TAG: ${{ inputs.recover_existing_tag }}
+          SAME_RUN: ${{ steps.publication_state.outputs.same_run }}
+        run: |
+          set -euo pipefail
+          state=none
+          if release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${SOURCE_TAG}" 2>/dev/null)"; then
+            state="$(printf '%s' "${release_json}" | python3 -c 'import json,sys; print("draft" if json.load(sys.stdin)["draft"] else "published")')"
+          fi
+          if [ "${RECOVER_EXISTING_TAG}" != "true" ] \
+            && [ "${SAME_RUN}" != "true" ] \
+            && [ "${state}" != "none" ]; then
+            echo "GitHub Release ${SOURCE_TAG} already exists; normal publication will not mutate it." >&2
+            exit 1
+          fi
+          echo "state=${state}" >> "${GITHUB_OUTPUT}"
+
+      - name: Reject conflicting Docker version before creating the tag
+        if: >-
+          inputs.recover_existing_tag != true &&
+          steps.publication_state.outputs.same_run != 'true'
+        shell: bash
+        env:
+          IMAGE: matrixorigin/astra:${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "${IMAGE}" >/dev/null 2>&1; then
+            echo "Docker version ${IMAGE} already exists." >&2
+            echo "Choose a new version; normal publication never adopts or overwrites an existing tag." >&2
+            exit 1
+          fi
+
+      - name: Create or validate the immutable release tag
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RECOVER_EXISTING_TAG: ${{ inputs.recover_existing_tag }}
+          SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+          SOURCE_TAG: ${{ needs.preflight.outputs.source_tag }}
+          EXPECTED_TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
+          SAME_RUN: ${{ steps.publication_state.outputs.same_run }}
+          CURRENT_TAG_OBJECT: ${{ steps.publication_state.outputs.tag_object }}
+        run: |
+          set -euo pipefail
+          remote_tag_object="$(
+            git ls-remote origin "refs/tags/${SOURCE_TAG}" |
+              awk 'NR == 1 { print $1 }'
+          )"
+          if [ -z "${remote_tag_object}" ]; then
+            if [ "${RECOVER_EXISTING_TAG}" = "true" ]; then
+              echo "Release tag ${SOURCE_TAG} disappeared after preflight." >&2
+              exit 1
+            fi
+            tag_message="$(printf 'Astra %s\n\nRelease-Run: %s/%s/actions/runs/%s' \
+              "${SOURCE_TAG}" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}")"
+            tag_object="$(
+              gh api --method POST "repos/${GITHUB_REPOSITORY}/git/tags" \
+                -f tag="${SOURCE_TAG}" \
+                -f message="${tag_message}" \
+                -f object="${SOURCE_SHA}" \
+                -f type=commit \
+                --jq .sha
+            )"
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/${SOURCE_TAG}" \
+              -f sha="${tag_object}" >/dev/null
+            remote_tag_object="${tag_object}"
+          else
+            if [ "${RECOVER_EXISTING_TAG}" = "true" ]; then
+              if [ "${remote_tag_object}" != "${EXPECTED_TAG_OBJECT}" ]; then
+                echo "Release tag ${SOURCE_TAG} changed after preflight." >&2
+                exit 1
+              fi
+            elif [ "${SAME_RUN}" != "true" ] \
+              || [ "${remote_tag_object}" != "${CURRENT_TAG_OBJECT}" ]; then
+              echo "Release tag ${SOURCE_TAG} appeared or changed during publication." >&2
+              exit 1
+            fi
+          fi
+
+          git fetch --force origin \
+            "refs/tags/${SOURCE_TAG}:refs/tags/${SOURCE_TAG}"
+          if [ "$(git cat-file -t "refs/tags/${SOURCE_TAG}")" != "tag" ]; then
+            echo "Release tag ${SOURCE_TAG} is not annotated." >&2
+            exit 1
+          fi
+          peeled_sha="$(git rev-list -n 1 "refs/tags/${SOURCE_TAG}")"
+          if [ "${peeled_sha}" != "${SOURCE_SHA}" ]; then
+            echo "Release tag ${SOURCE_TAG} points to ${peeled_sha}, expected ${SOURCE_SHA}." >&2
+            exit 1
+          fi
+
+      - name: Create or verify the immutable Docker version manifest
+        shell: bash
+        env:
+          IMAGE_NAME: matrixorigin/astra
+          IMAGE_VERSION: ${{ needs.preflight.outputs.version }}
+          BUILD_MATRIX_JSON: ${{ needs.preflight.outputs.matrix }}
+          RECOVER_EXISTING_TAG: ${{ inputs.recover_existing_tag }}
+          SAME_RUN: ${{ steps.publication_state.outputs.same_run }}
+        run: |
+          set -euo pipefail
+          existing_policy=reject
+          if [ "${RECOVER_EXISTING_TAG}" = "true" ] || [ "${SAME_RUN}" = "true" ]; then
+            existing_policy=verify
+          fi
+          scripts/reconcile-docker-manifest.sh \
+            "${IMAGE_NAME}" "${IMAGE_VERSION}" "${BUILD_MATRIX_JSON}" \
+            /tmp/digests "${existing_policy}"
+
+      - name: Verify already-published release during recovery
+        if: ${{ steps.existing_release.outputs.state == 'published' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ needs.preflight.outputs.source_tag }}
+        run: |
+          set -euo pipefail
+          existing_dir="${RUNNER_TEMP}/existing-release"
+          published_manifests="${RUNNER_TEMP}/published-manifests"
+          mkdir -p "${existing_dir}"
+          mkdir -p "${published_manifests}"
+          gh release download "${SOURCE_TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --dir "${existing_dir}"
+          cp "${existing_dir}/checksums.txt" "${published_manifests}/checksums.txt"
+          cp "${existing_dir}/checksums.txt.sha256" "${published_manifests}/checksums.txt.sha256"
+          scripts/verify-release-artifacts.sh \
+            "${{ needs.preflight.outputs.version }}" "${existing_dir}"
+          cmp "${published_manifests}/checksums.txt" "${existing_dir}/checksums.txt"
+          cmp "${published_manifests}/checksums.txt.sha256" "${existing_dir}/checksums.txt.sha256"
+          cmp dist/checksums.txt "${existing_dir}/checksums.txt"
+          cmp dist/checksums.txt.sha256 "${existing_dir}/checksums.txt.sha256"
+
+      - name: Stage GitHub Release and verified assets
+        if: ${{ steps.existing_release.outputs.state != 'published' }}
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          token: ${{ github.token }}
+          name: Astra v${{ needs.preflight.outputs.version }}
+          tag_name: ${{ needs.preflight.outputs.source_tag }}
+          draft: true
+          prerelease: ${{ needs.preflight.outputs.prerelease }}
+          generate_release_notes: true
+          make_latest: false
+          files: dist/*
+          fail_on_unmatched_files: true
+
+      - name: Publish GitHub Release
+        if: ${{ steps.existing_release.outputs.state != 'published' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_TAG: ${{ needs.preflight.outputs.source_tag }}
+          PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
+          PUBLISH_LATEST: ${{ needs.preflight.outputs.publish_latest }}
+        run: |
+          set -euo pipefail
+          release_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${SOURCE_TAG}" --jq .id)"
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+            -F draft=false \
+            -F prerelease="${PRERELEASE}" \
+            -f make_latest="${PUBLISH_LATEST}" >/dev/null
+
+      - name: Promote stable rolling Docker tags
+        if: ${{ needs.preflight.outputs.publish_latest == 'true' }}
+        shell: bash
+        env:
+          IMAGE_NAME: matrixorigin/astra
+          IMAGE_VERSION: ${{ needs.preflight.outputs.version }}
+          ROLLING_VERSION: ${{ needs.preflight.outputs.rolling_version }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --tag "${IMAGE_NAME}:${ROLLING_VERSION}" \
+            --tag "${IMAGE_NAME}:latest" \
+            "${IMAGE_NAME}:${IMAGE_VERSION}"
+
+          expected="$(docker buildx imagetools inspect "${IMAGE_NAME}:${IMAGE_VERSION}" --raw | sha256sum | awk '{ print $1 }')"
+          for target in "${ROLLING_VERSION}" latest; do
+            actual="$(docker buildx imagetools inspect "${IMAGE_NAME}:${target}" --raw | sha256sum | awk '{ print $1 }')"
+            if [ "${actual}" != "${expected}" ]; then
+              echo "Promoted tag ${target} does not match ${IMAGE_VERSION}." >&2
+              exit 1
+            fi
+          done
+
+      - name: Write publication summary
+        shell: bash
+        run: |
+          {
+            echo "## Astra release published"
+            echo
+            echo "- Release: \`${{ needs.preflight.outputs.source_tag }}\`"
+            echo "- Source: \`${{ needs.preflight.outputs.source_sha }}\`"
+            echo "- Clients: Linux/macOS, AMD64/ARM64"
+            echo "- Server: \`matrixorigin/astra:${{ needs.preflight.outputs.version }}\`"
+            if [ "${{ needs.preflight.outputs.publish_latest }}" = "true" ]; then
+              echo "- Promoted: \`${{ needs.preflight.outputs.rolling_version }}\`, \`latest\`"
+            else
+              echo "- Prerelease: rolling Docker tags were not changed"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  registry-mirror:
+    name: Publish Optional Registry Mirror
+    if: >-
+      vars.CONTAINER_MIRROR_REGISTRY != '' &&
+      vars.CONTAINER_MIRROR_IMAGE != ''
+    needs:
+      - preflight
+      - publish
+    runs-on: ${{ vars.CONTAINER_MIRROR_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 45
+    continue-on-error: true
+    env:
+      http_proxy: ${{ vars.CONTAINER_MIRROR_HTTP_PROXY || '' }}
+      https_proxy: ${{ vars.CONTAINER_MIRROR_HTTPS_PROXY || '' }}
+      no_proxy: ${{ vars.CONTAINER_MIRROR_NO_PROXY || '' }}
+
+    steps:
+      - name: Install pinned crane
+        shell: bash
+        env:
+          CRANE_VERSION: v0.20.6
+          CRANE_LINUX_X86_64_SHA256: c1d593d01551f2c9a3df5ca0a0be4385a839bd9b86d4a76e18d7b17d16559127
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/bin"
+          curl -fsSL \
+            -o "${RUNNER_TEMP}/go-containerregistry.tar.gz" \
+            "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz"
+          echo "${CRANE_LINUX_X86_64_SHA256}  ${RUNNER_TEMP}/go-containerregistry.tar.gz" \
+            | sha256sum --check --strict
+          tar -xzf "${RUNNER_TEMP}/go-containerregistry.tar.gz" -C "${RUNNER_TEMP}/bin" crane
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/bin/crane" version
+
+      - name: Copy the verified public manifest
+        shell: bash
+        env:
+          IMAGE_VERSION: ${{ needs.preflight.outputs.version }}
+          ROLLING_VERSION: ${{ needs.preflight.outputs.rolling_version }}
+          PUBLISH_LATEST: ${{ needs.preflight.outputs.publish_latest }}
+          SOURCE_IMAGE: matrixorigin/astra
+          MIRROR_REGISTRY: ${{ vars.CONTAINER_MIRROR_REGISTRY }}
+          TARGET_IMAGE: ${{ vars.CONTAINER_MIRROR_IMAGE }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          MIRROR_USERNAME: ${{ secrets.IDC_REGISTRY_USERNAME }}
+          MIRROR_PASSWORD: ${{ secrets.IDC_REGISTRY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          printf '%s' "${DOCKERHUB_TOKEN}" | crane auth login index.docker.io -u "${DOCKERHUB_USERNAME}" --password-stdin
+          printf '%s' "${MIRROR_PASSWORD}" | crane auth login "${MIRROR_REGISTRY}" -u "${MIRROR_USERNAME}" --password-stdin
+
+          source_ref="docker.io/${SOURCE_IMAGE}:${IMAGE_VERSION}"
+          source_digest="$(crane digest "${source_ref}")"
+          tags=("${IMAGE_VERSION}")
+          if [ "${PUBLISH_LATEST}" = "true" ]; then
+            tags+=("${ROLLING_VERSION}" latest)
+          fi
+          for tag in "${tags[@]}"; do
+            crane copy --platform=all --jobs 2 \
+              "${source_ref}" \
+              "${TARGET_IMAGE}:${tag}"
+            target_digest="$(crane digest "${TARGET_IMAGE}:${tag}")"
+            if [ "${target_digest}" != "${source_digest}" ]; then
+              echo "Mirror tag ${TARGET_IMAGE}:${tag} does not match ${source_ref}." >&2
+              exit 1
+            fi
+          done

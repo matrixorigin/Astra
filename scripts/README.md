@@ -223,20 +223,39 @@ Installs a checksum-verified archive containing the `astra` CLI and
 `astra-edge` User Runner from this repository's GitHub Releases:
 
 ```sh
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh -s -- --dir "$HOME/.local/bin"
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
 The installer, source tag, release assets, and user documentation deliberately
 live in the same repository. Checksums are mandatory; a missing or mismatched
-checksum fails the installation.
+checksum fails the installation. Existing clients are backed up during the
+two-binary replacement and restored if the update cannot finish. After a
+successful install, the script prints a version-matched source checkout and
+`make stack-setup` command so the CLI, User Runner, Server, MatrixOne, and
+Memoria do not silently drift across releases.
 
 ### `scripts/validate-release-version.sh` and `scripts/verify-release-artifacts.sh`
 The release workflows use these scripts as shared, locally testable gates.
-The first requires every versioned workspace surface to match the Git tag. The
+The first requires every versioned workspace surface, including the default
+all-in-one Astra image, to match the selected release version. The
 second requires the complete four-platform client archive set, verifies every
 checksum and archive layout, and creates the aggregate checksum manifest.
-`scripts/ci/test_release_contract.sh` exercises the success and tampering paths
-without compiling binaries or publishing artifacts.
+`scripts/ci/test_release_contract.sh` exercises the success, rollback, and
+tampering paths without compiling binaries or publishing artifacts.
+`scripts/ci/test_release_manifest_contract.sh` separately proves immutable
+Docker-tag creation, exact recovery, and rejection of duplicate platform
+candidates with an offline registry fixture. The shared
+`scripts/reconcile-docker-manifest.sh` performs the same platform-to-digest
+reconciliation at the actual publication boundary.
+
+### `scripts/prepare-release-version.py`
+
+Used by `make release-prepare VERSION=X.Y.Z` to synchronize all release version
+surfaces before review. It starts only from a consistent, unmodified version
+set, stages every replacement before replacing any destination, and validates
+the result. It deliberately leaves MatrixOne and Memoria digest selection to a
+maintainer.
 
 ### `scripts/ops/*.sh`
 Operational helpers for health checks, backup/restore, and deployment.

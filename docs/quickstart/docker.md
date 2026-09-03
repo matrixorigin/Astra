@@ -8,11 +8,13 @@ The guided setup requires Docker Compose v2, OpenSSL, and Python 3.9 or newer.
 
 ```bash
 # 1. Install the checksum-verified CLI and Edge/User Runner
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh -s -- --dir "$HOME/.local/bin"
+export PATH="$HOME/.local/bin:$PATH"
 
-# 2. Clone the deployment files
-git clone https://github.com/matrixorigin/Astra.git
-cd Astra
+# 2. Clone the deployment files from the exact installed release
+ASTRA_VERSION="$(astra --version | awk '{print $2}')"
+git clone --branch "v${ASTRA_VERSION}" --depth 1 https://github.com/matrixorigin/Astra.git "Astra-${ASTRA_VERSION}"
+cd "Astra-${ASTRA_VERSION}"
 
 # 3. Start the stack and follow the guided prompts
 make stack-setup
@@ -39,10 +41,13 @@ For semantic memory, set `MEMORIA_EMBEDDING_BASE_URL` and, when the endpoint
 requires it, `MEMORIA_EMBEDDING_API_KEY`, then run `make stack-start`.
 `stack-start` initializes configuration, starts Compose, waits for health, and
 verifies an exact memory round trip.
-The Make wizard works in Linux/macOS terminals and Windows WSL or Git Bash;
-restricted Windows shells can use the explicit targets and `astra admin setup`.
+The released clients and full guided path support Linux, macOS, and Windows
+through WSL. Native Windows and Git Bash are not release targets yet.
 Loopback embedding endpoints are tested directly; other endpoints honor the
 host proxy settings and report when `NO_PROXY` may be needed for a private URL.
+The release checkout pins Astra, MatrixOne, and Memoria to the compatibility
+set verified by the release workflow; do not replace those pins with `latest`
+when diagnosing a reproducibility or upgrade problem.
 
 The installer also provides `astra-edge`. To give Web sessions access to one
 explicit local workspace, run:
