@@ -8,7 +8,15 @@ updates:
       day: monday
       time: "09:00"
       timezone: Asia/Shanghai
-    open-pull-requests-limit: 2
+    # Keep the maintenance queue reviewable. Security updates are not counted
+    # against this version-update limit.
+    open-pull-requests-limit: 1
+    rebase-strategy: disabled
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+      semver-minor-days: 7
+      semver-patch-days: 3
     groups:
       rust-minor-and-patch:
         patterns:
@@ -24,7 +32,13 @@ updates:
       day: monday
       time: "09:30"
       timezone: Asia/Shanghai
-    open-pull-requests-limit: 2
+    open-pull-requests-limit: 1
+    rebase-strategy: disabled
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+      semver-minor-days: 7
+      semver-patch-days: 3
     groups:
       sdk-minor-and-patch:
         patterns:
@@ -40,7 +54,13 @@ updates:
       day: monday
       time: "09:45"
       timezone: Asia/Shanghai
-    open-pull-requests-limit: 2
+    open-pull-requests-limit: 1
+    rebase-strategy: disabled
+    cooldown:
+      default-days: 7
+      semver-major-days: 30
+      semver-minor-days: 7
+      semver-patch-days: 3
     groups:
       web-minor-and-patch:
         patterns:
@@ -56,7 +76,10 @@ updates:
       day: monday
       time: "10:00"
       timezone: Asia/Shanghai
-    open-pull-requests-limit: 2
+    open-pull-requests-limit: 1
+    rebase-strategy: disabled
+    cooldown:
+      default-days: 7
     groups:
       actions-minor-and-patch:
         patterns:
@@ -72,4 +95,7 @@ updates:
       day: monday
       time: "10:15"
       timezone: Asia/Shanghai
-    open-pull-requests-limit: 2
+    open-pull-requests-limit: 1
+    rebase-strategy: disabled
+    cooldown:
+      default-days: 7
