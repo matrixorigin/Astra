@@ -63,6 +63,25 @@ services:
         max-size: "50m"
         max-file: "3"
 
+  memoria-init:
+    image: ${MEMORIA_IMAGE:-matrixorigin/memoria:latest}
+    user: root
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -eu
+        mkdir -p /var/log/memoria
+        if ! grep -qx "${UID:-1000}:${GID:-1000}" /var/log/memoria/.astra-owner 2>/dev/null; then
+          chown -R "${UID:-1000}:${GID:-1000}" /var/log/memoria
+          printf '%s\n' "${UID:-1000}:${GID:-1000}" > /var/log/memoria/.astra-owner
+          chown "${UID:-1000}:${GID:-1000}" /var/log/memoria/.astra-owner
+        fi
+    volumes:
+      - ${MEMORIA_LOG_DIR:-./data/logs/memoria}:/var/log/memoria
+    network_mode: none
+    restart: "no"
+
   memoria:
     image: ${MEMORIA_IMAGE:-matrixorigin/memoria:latest}
     hostname: memoria
@@ -97,6 +116,8 @@ services:
     depends_on:
       matrixone:
         condition: service_healthy
+      memoria-init:
+        condition: service_completed_successfully
     networks:
       - mo-net
     healthcheck:
@@ -142,6 +163,9 @@ services:
       ASTRA_JWT_REFRESH_TTL_DAYS: ${ASTRA_JWT_REFRESH_TTL_DAYS:-7}
       ASTRA_TOKEN_ENCRYPTION_KEY: ${ASTRA_TOKEN_ENCRYPTION_KEY:?Set ASTRA_TOKEN_ENCRYPTION_KEY in deployment/all-in-one/.env}
       ASTRA_RUNTIME_ROOT_SECRET: ${ASTRA_RUNTIME_ROOT_SECRET:?Set ASTRA_RUNTIME_ROOT_SECRET in deployment/all-in-one/.env}
+      # Released images before the runtime-root rename still read this name.
+      # Keep one operator-facing secret and translate only at the image boundary.
+      ASTRA_BRIDGE_SECRET: ${ASTRA_RUNTIME_ROOT_SECRET:?Set ASTRA_RUNTIME_ROOT_SECRET in deployment/all-in-one/.env}
       MEMORIA_BASE_URL: http://memoria:8100
       MEMORIA_MASTER_KEY: ${MEMORIA_MASTER_KEY:?Set MEMORIA_MASTER_KEY in deployment/all-in-one/.env}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}

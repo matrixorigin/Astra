@@ -20,8 +20,8 @@ make stack-env
 # 3. Start all services
 make stack-up
 
-# 4. Verify
-curl http://localhost:17001/health
+# 4. Verify readiness, dependencies, and a memory round trip
+make stack-verify
 
 # 5. Install the prebuilt CLI (no Rust toolchain needed)
 curl -sSL https://raw.githubusercontent.com/matrixorigin/astra-suite/main/scripts/install-astra.sh | sh
@@ -52,7 +52,8 @@ cp .env.example .env
 # Configure a real embedding endpoint, or set MEMORIA_EMBEDDING_PROVIDER=mock
 # for deterministic local evaluation.
 
-docker compose up -d
+env UID="$(id -u)" GID="$(id -g)" \
+  docker compose up -d --wait --wait-timeout 180
 docker compose logs -f api
 
 docker compose down
@@ -130,6 +131,9 @@ make stack-down
 
 # View logs
 make stack-logs SERVICE=api
+
+# Verify API health and a memory round trip
+make stack-verify
 ```
 
 ### Using Docker Compose Directly
@@ -138,7 +142,8 @@ make stack-logs SERVICE=api
 cd deployment/all-in-one
 
 # Start services
-docker compose up -d
+env UID="$(id -u)" GID="$(id -g)" \
+  docker compose up -d --wait --wait-timeout 180
 
 # View logs
 docker compose logs -f api

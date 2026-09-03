@@ -72,3 +72,15 @@ env_file_has_configured_value() {
     env_file_value="$(env_file_read "$1" "$2" 2>/dev/null || true)"
     ! env_value_is_placeholder "$env_file_value"
 }
+
+# Match Docker Compose precedence: an exported process value (including an
+# explicitly empty one) overrides the value in the env file.
+env_resolve_value() {
+    env_resolve_file="$1"
+    env_resolve_key="$2"
+    if printenv "$env_resolve_key" >/dev/null 2>&1; then
+        printenv "$env_resolve_key"
+    else
+        env_file_read "$env_resolve_file" "$env_resolve_key"
+    fi
+}

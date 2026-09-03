@@ -30,7 +30,20 @@ make stack-up
 
 `make stack-up` fails before starting containers if a required secret is empty,
 or if a non-mock embedding provider is missing its base URL. An API key is
-optional for unauthenticated local endpoints.
+optional for unauthenticated local endpoints. If a service does not become
+healthy, the command prints container status and recent logs while leaving the
+partial stack available for inspection. Fix the first reported error and rerun
+the command, or use `make stack-down` to stop it.
+
+To verify the complete local service path, including a deterministic memory
+write and retrieval:
+
+```bash
+make stack-verify
+```
+
+This check uses the configured Memoria provider, retrieves the exact smoke
+memory it writes, and removes that record before returning.
 
 ## Runtime Startup Profiles
 
@@ -149,8 +162,12 @@ both values blank.
 Then start the stack:
 
 ```bash
-docker compose up -d
+env UID="$(id -u)" GID="$(id -g)" \
+  docker compose up -d --wait --wait-timeout 180
 ```
+
+Passing the host UID and GID keeps bind-mounted service logs owned by the user
+running Compose. The Make targets do this automatically.
 
 ## Services
 
@@ -185,6 +202,7 @@ MEMORIA_IMAGE=matrixorigin/memoria:latest
 
 ```bash
 make stack-status
+make stack-verify
 make stack-logs SERVICE=api
 
 docker compose ps

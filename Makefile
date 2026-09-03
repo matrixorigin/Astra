@@ -103,6 +103,7 @@ help:
 	@echo "  make stack-down         - Stop compose stack"
 	@echo "  make stack-clean        - Stop compose stack and remove MatrixOne data"
 	@echo "  make stack-status       - Show compose stack status"
+	@echo "  make stack-verify       - Verify API health and a memory round trip"
 	@echo "  make stack-logs         - Follow stack logs (SERVICE=api optional)"
 	@echo ""
 	@echo "Docker API (alternative to source mode):"
@@ -139,7 +140,7 @@ DOCKER_METADATA_BUILD_ARGS := --build-arg IMAGE_VERSION=$(IMAGE_VERSION) --build
 DEFAULT_API_PORT := 17001
 STACK_DIR := deployment/all-in-one
 STACK_ENV := $(STACK_DIR)/.env
-STACK_COMPOSE := cd $(STACK_DIR) && docker compose --env-file $(abspath $(STACK_ENV))
+STACK_COMPOSE := cd $(STACK_DIR) && env UID=$$(id -u) GID=$$(id -g) docker compose --env-file $(abspath $(STACK_ENV))
 STACK_SECRET_ENV := ASTRA_JWT_SECRET ASTRA_TOKEN_ENCRYPTION_KEY ASTRA_RUNTIME_ROOT_SECRET MEMORIA_MASTER_KEY
 STACK_EMBEDDING_ENV := MEMORIA_EMBEDDING_BASE_URL
 
@@ -534,13 +535,8 @@ release-docker:
 	@echo "Building Docker image $(IMAGE_NAME):$(IMAGE_VERSION)..."
 	@docker build $(DOCKER_PROXY_BUILD_ARGS) $(DOCKER_METADATA_BUILD_ARGS) $(DOCKER_BUILD_ARGS) -t "$(IMAGE_NAME):$(IMAGE_VERSION)" .
 	@docker push "$(IMAGE_NAME):$(IMAGE_VERSION)"
-	@if echo "$(IMAGE_VERSION)" | grep -q -- '-'; then \
-		echo "Pre-release $(IMAGE_VERSION): leaving latest unchanged"; \
-	else \
-		docker tag "$(IMAGE_NAME):$(IMAGE_VERSION)" "$(IMAGE_NAME):latest"; \
-		docker push "$(IMAGE_NAME):latest"; \
-	fi
 	@echo "✅ Pushed Docker image $(IMAGE_NAME):$(IMAGE_VERSION)"
+	@echo "   Rolling and latest tags are promoted only by the release workflow after multi-platform runtime verification."
 
 # ============================================================================
 # Compose Stack Deployment
@@ -603,7 +599,7 @@ stack-check-env:
 		exit 1; \
 	fi
 	@. scripts/lib/env_file.sh; \
-	embedding_provider="$$(env_file_read "$(STACK_ENV)" MEMORIA_EMBEDDING_PROVIDER 2>/dev/null || true)"; \
+	embedding_provider="$$(env_resolve_value "$(STACK_ENV)" MEMORIA_EMBEDDING_PROVIDER 2>/dev/null || true)"; \
 	embedding_provider="$$(printf '%s' "$$embedding_provider" | tr '[:upper:]' '[:lower:]')"; \
 	required="$(STACK_SECRET_ENV)"; \
 	if [ "$${embedding_provider:-openai}" != "mock" ]; then \
@@ -611,7 +607,8 @@ stack-check-env:
 	fi; \
 	missing=""; \
 	for key in $$required; do \
-		if ! env_file_has_configured_value "$(STACK_ENV)" "$$key"; then \
+		value="$$(env_resolve_value "$(STACK_ENV)" "$$key" 2>/dev/null || true)"; \
+		if env_value_is_placeholder "$$value"; then \
 			missing="$$missing $$key"; \
 		fi; \
 	done; \
@@ -629,9 +626,32 @@ stack-config: stack-check-env
 .PHONY: stack-up
 stack-up: stack-config
 	@echo "Starting compose stack..."
-	@$(STACK_COMPOSE) up -d --wait --wait-timeout 180
+	@if ! ( $(STACK_COMPOSE) up -d --wait --wait-timeout 180 ); then \
+		echo ""; \
+		echo "❌ Compose stack did not become healthy."; \
+		echo ""; \
+		echo "Service status:"; \
+		( $(STACK_COMPOSE) ps -a ) || true; \
+		echo ""; \
+		echo "Recent service logs:"; \
+		failed_services="$$( \
+			for state in exited dead restarting unhealthy; do \
+				( $(STACK_COMPOSE) ps -a --status "$$state" --services ) 2>/dev/null || true; \
+			done | sort -u | tr '\n' ' ' \
+		)"; \
+		if [ -n "$$failed_services" ]; then \
+			( $(STACK_COMPOSE) logs --no-color --tail=80 $$failed_services ) || true; \
+		else \
+			echo "No failed container was identified; run 'make stack-logs' for full logs."; \
+		fi; \
+		echo ""; \
+		echo "Fix the first reported error, then rerun 'make stack-up'."; \
+		echo "The partial stack is left running so it can be inspected; use 'make stack-down' to stop it."; \
+		exit 1; \
+	fi
 	@echo "✅ Compose stack started"
-	@API_PORT=$$(sed -n 's/^ASTRA_API_PORT=//p' $(STACK_ENV) | tail -1); \
+	@. scripts/lib/env_file.sh; \
+	API_PORT=$$(env_resolve_value "$(STACK_ENV)" ASTRA_API_PORT 2>/dev/null || true); \
 	echo "   API: http://localhost:$${API_PORT:-$(DEFAULT_API_PORT)}"
 
 .PHONY: stack-up-server-only
@@ -643,7 +663,8 @@ stack-up-server-only:
 
 .PHONY: stack-up-server-edge
 stack-up-server-edge: stack-up-server-only
-	@API_PORT=$$([ -f "$(STACK_ENV)" ] && sed -n 's/^ASTRA_API_PORT=//p' $(STACK_ENV) | tail -1 || true); \
+	@. scripts/lib/env_file.sh; \
+	API_PORT=$$([ -f "$(STACK_ENV)" ] && env_resolve_value "$(STACK_ENV)" ASTRA_API_PORT 2>/dev/null || true); \
 	ASTRA_EDGE_SERVER_URL="http://127.0.0.1:$${API_PORT:-$(DEFAULT_API_PORT)}" $(MAKE) dev-edge-start
 	@echo "✅ Server + edge stack ready"
 
@@ -660,6 +681,10 @@ stack-clean:
 .PHONY: stack-status
 stack-status: stack-check-env
 	@$(STACK_COMPOSE) ps
+
+.PHONY: stack-verify
+stack-verify: stack-check-env
+	@scripts/ops/verify_all_in_one.sh "$(STACK_ENV)"
 
 .PHONY: stack-logs
 stack-logs: stack-check-env

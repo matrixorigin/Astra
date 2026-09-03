@@ -90,6 +90,33 @@ def main() -> None:
             if not pinned_action.fullmatch(action):
                 errors.append(f"{source}: action must be pinned to a full commit SHA ({action})")
 
+    release_workflow = Path(".github/workflows/release-docker.yml").read_text(encoding="utf-8")
+    merge_start = release_workflow.find("\n  merge:")
+    smoke_start = release_workflow.find("\n  smoke:")
+    promote_start = release_workflow.find("\n  promote:")
+    mirror_start = release_workflow.find("\n  registry-mirror:")
+    if not 0 <= merge_start < smoke_start < promote_start < mirror_start:
+        errors.append(
+            ".github/workflows/release-docker.yml: release jobs must publish an immutable tag, "
+            "smoke it, and only then promote rolling tags"
+        )
+    else:
+        merge_job = release_workflow[merge_start:smoke_start]
+        smoke_job = release_workflow[smoke_start:promote_start]
+        promote_job = release_workflow[promote_start:mirror_start]
+        if "type=raw,value=latest" in merge_job:
+            errors.append(
+                ".github/workflows/release-docker.yml: merge job must not publish latest before smoke verification"
+            )
+        if "- merge" not in smoke_job or "make stack-verify" not in smoke_job:
+            errors.append(
+                ".github/workflows/release-docker.yml: published image smoke must verify the all-in-one runtime"
+            )
+        if "- smoke" not in promote_job or '--tag "${IMAGE_NAME}:latest"' not in promote_job:
+            errors.append(
+                ".github/workflows/release-docker.yml: latest promotion must depend on the runtime smoke"
+            )
+
     design_index = Path("docs/design/README.md").read_text(encoding="utf-8")
     for design in Path("docs/design").glob("*.md"):
         if design.name != "README.md" and f"]({design.name})" not in design_index:
