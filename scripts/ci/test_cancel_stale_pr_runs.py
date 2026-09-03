@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from itertools import permutations
 import json
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -192,11 +192,31 @@ class GitHubApiTests(unittest.TestCase):
             side_effect=[
                 HTTPError("url", 409, "Conflict", {}, None),
                 (json.dumps({"status": "in_progress"}).encode(), {}),
+                (json.dumps({"status": "in_progress"}).encode(), {}),
+                (json.dumps({"status": "in_progress"}).encode(), {}),
             ]
         )
 
-        with self.assertRaisesRegex(RuntimeError, "refused to cancel active"):
+        with (
+            patch("cancel_stale_pr_runs.time.sleep") as sleep,
+            self.assertRaisesRegex(RuntimeError, "refused to cancel active"),
+        ):
             api.cancel_run("matrixorigin/Astra", 42)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_cancel_waits_for_an_already_requested_cancellation(self) -> None:
+        api = GitHubApi("test-token")
+        api._request = Mock(  # type: ignore[method-assign]
+            side_effect=[
+                HTTPError("url", 409, "Conflict", {}, None),
+                (json.dumps({"status": "in_progress"}).encode(), {}),
+                (json.dumps({"status": "completed"}).encode(), {}),
+            ]
+        )
+
+        with patch("cancel_stale_pr_runs.time.sleep") as sleep:
+            self.assertFalse(api.cancel_run("matrixorigin/Astra", 42))
+        sleep.assert_called_once()
 
 
 class CancelSupersededRunsTests(unittest.TestCase):
@@ -234,6 +254,27 @@ class CancelSupersededRunsTests(unittest.TestCase):
 
         self.assertEqual((found, cancelled), (2, 1))
         self.assertEqual(api.cancelled, [1])
+
+    def test_one_failure_does_not_prevent_other_runs_from_being_cancelled(self) -> None:
+        api = Mock()
+        api.list_runs.return_value = [workflow_run(1), workflow_run(2)]
+        api.cancel_run.side_effect = [RuntimeError("transient failure"), True]
+
+        with (
+            redirect_stderr(StringIO()),
+            redirect_stdout(StringIO()),
+            self.assertRaisesRegex(RuntimeError, "failed to cancel 1 workflow run"),
+        ):
+            cancel_superseded_runs(
+                api,
+                "matrixorigin/Astra",
+                SupersededHead(101, "fix/runtime", OLD_SHA),
+            )
+
+        self.assertEqual(
+            [call.args for call in api.cancel_run.call_args_list],
+            [("matrixorigin/Astra", 1), ("matrixorigin/Astra", 2)],
+        )
 
     def test_unexpected_cancellation_fanout_fails_before_mutation(self) -> None:
         api = FakeApi(
@@ -306,6 +347,21 @@ class WorkflowSecurityContractTests(unittest.TestCase):
         ):
             with self.subTest(workflow=relative):
                 self.assertIn(expected, (root / relative).read_text(encoding="utf-8"))
+
+    def test_cancellation_bound_covers_every_pull_request_workflow(self) -> None:
+        workflows = Path(__file__).resolve().parents[2] / ".github/workflows"
+        pull_request_workflows = [
+            path.name
+            for pattern in ("*.yml", "*.yaml")
+            for path in workflows.glob(pattern)
+            if "\n  pull_request:\n" in path.read_text(encoding="utf-8")
+        ]
+
+        self.assertEqual(
+            sorted(pull_request_workflows),
+            ["pr-title.yml", "static-checks.yml", "test.yml"],
+        )
+        self.assertLessEqual(len(pull_request_workflows), MAX_SUPERSEDED_RUNS)
 
     def test_pr_jobs_do_not_resist_workflow_cancellation(self) -> None:
         root = Path(__file__).resolve().parents[2]

@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sys
+import time
 from typing import Any, Protocol
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urljoin, urlsplit
@@ -21,8 +22,10 @@ ACTIVE_RUN_STATUSES = frozenset(
 # These caps keep the worst-case request path within the workflow's five-minute
 # timeout while leaving headroom over Astra's three pull-request workflows.
 MAX_PAGES = 5
-MAX_SUPERSEDED_RUNS = 10
+MAX_SUPERSEDED_RUNS = 5
 REQUEST_TIMEOUT_SECONDS = 10
+TERMINAL_STATUS_POLLS = 3
+TERMINAL_STATUS_POLL_SECONDS = 1
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
 
@@ -130,9 +133,12 @@ class GitHubApi:
                 raise
             if error.fp is not None:
                 error.close()
-            run = self._get_json(f"repos/{repository}/actions/runs/{run_id}")
-            if run.get("status") == "completed":
-                return False
+            for attempt in range(TERMINAL_STATUS_POLLS):
+                run = self._get_json(f"repos/{repository}/actions/runs/{run_id}")
+                if run.get("status") == "completed":
+                    return False
+                if attempt + 1 < TERMINAL_STATUS_POLLS:
+                    time.sleep(TERMINAL_STATUS_POLL_SECONDS)
             raise RuntimeError(
                 f"GitHub refused to cancel active workflow run {run_id}"
             ) from error
@@ -172,9 +178,18 @@ def cancel_superseded_runs(
         )
 
     cancelled = 0
+    failures: list[tuple[int, Exception]] = []
     for run in superseded_runs:
         run_id = int(run["id"])
-        if api.cancel_run(repository, run_id):
+        try:
+            cancellation_requested = api.cancel_run(repository, run_id)
+        except Exception as error:
+            failures.append((run_id, error))
+            print(
+                f"Failed to cancel run {run_id}; continuing cleanup.", file=sys.stderr
+            )
+            continue
+        if cancellation_requested:
             cancelled += 1
             print(
                 f"Cancellation requested for {run.get('name', 'workflow')} "
@@ -188,6 +203,11 @@ def cancel_superseded_runs(
         f"repository={superseded_head.repository_id}, ref={superseded_head.ref}, "
         f"sha={superseded_head.sha}; requested {cancelled} cancellation(s)."
     )
+    if failures:
+        failed_run_ids = ", ".join(str(run_id) for run_id, _ in failures)
+        raise RuntimeError(
+            f"failed to cancel {len(failures)} workflow run(s): {failed_run_ids}"
+        ) from failures[0][1]
     return len(superseded_runs), cancelled
 
 
