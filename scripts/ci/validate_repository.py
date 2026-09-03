@@ -6,6 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import re
+import stat
 import subprocess
 
 
@@ -40,9 +41,10 @@ def main() -> None:
             if relative and not (source.parent / relative).resolve().exists():
                 errors.append(f"{source}: broken local link {target}")
 
+    parsed_json: dict[Path, object] = {}
     for source in [path for path in files if path.suffix == ".json"]:
         try:
-            json.loads(source.read_text(encoding="utf-8"))
+            parsed_json[source] = json.loads(source.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             errors.append(f"{source}: invalid JSON ({error})")
 
@@ -99,15 +101,92 @@ def main() -> None:
             errors.append(f"{name}: .agent and .claude instruction bodies differ")
 
     stale_suffixes = {".bak", ".disabled", ".orig", ".rej"}
+    generated_parts = {
+        ".next",
+        ".pytest_cache",
+        ".turbo",
+        "__pycache__",
+        "coverage",
+        "dist",
+        "node_modules",
+        "target",
+    }
     for path in files:
         if path.suffix in stale_suffixes:
             errors.append(f"{path}: tracked stale/disabled artifact")
+        if generated_parts.intersection(path.parts):
+            errors.append(f"{path}: tracked generated/cache artifact")
+        if path.name in {".DS_Store", "Thumbs.db"}:
+            errors.append(f"{path}: tracked operating-system artifact")
+        if (path.name == ".env" or path.name.startswith(".env.")) and not path.name.endswith(
+            ".example"
+        ):
+            errors.append(f"{path}: tracked environment file; commit a sanitized example instead")
+
+        try:
+            has_shebang = path.read_bytes().startswith(b"#!")
+            executable = bool(path.stat().st_mode & stat.S_IXUSR)
+        except OSError as error:
+            errors.append(f"{path}: cannot inspect file mode contract ({error})")
+            continue
+        if executable and not has_shebang:
+            errors.append(f"{path}: executable file is missing a shebang")
+        if path.parts and path.parts[0] == "scripts" and has_shebang and not executable:
+            errors.append(f"{path}: script has a shebang but is not executable")
+
+    rust_source = "\n".join(
+        path.read_text(encoding="utf-8", errors="replace")
+        for path in files
+        if path.parts
+        and path.parts[0] == "crates"
+        and path.suffix == ".rs"
+        and "tests" not in path.parts
+        and path.name not in {"test.rs", "tests.rs"}
+    )
+    exported_metrics = set(re.findall(r"\bastra_[a-z0-9_]+\b", rust_source))
+    latency_prefixes = re.findall(
+        r'register_latency_metrics\(\s*[^,]+,\s*"(astra_[a-z0-9_]+)"', rust_source
+    )
+    for prefix in latency_prefixes:
+        exported_metrics.update(
+            f"{prefix}{suffix}"
+            for suffix in ("_us_total", "_count", "_min_us", "_max_us", "_avg_us")
+        )
+
+    monitoring_sources = [
+        path
+        for path in files
+        if path == Path("monitoring/alert-rules.yml")
+        or path.parent == Path("deployment/monitoring/dashboards")
+    ]
+    for source in monitoring_sources:
+        if source.parent == Path("deployment/monitoring/dashboards"):
+            dashboard = parsed_json.get(source)
+            if not isinstance(dashboard, dict):
+                continue
+            if "dashboard" in dashboard:
+                errors.append(
+                    f"{source}: file-provisioned dashboard must not use the HTTP API wrapper"
+                )
+            if not isinstance(dashboard.get("title"), str) or not isinstance(
+                dashboard.get("panels"), list
+            ):
+                errors.append(f"{source}: invalid file-provisioned dashboard shape")
+        referenced_metrics = set(
+            re.findall(
+                r"\bastra_[a-z0-9_]+\b",
+                source.read_text(encoding="utf-8", errors="replace"),
+            )
+        )
+        for metric in sorted(referenced_metrics - exported_metrics):
+            errors.append(f"{source}: references metric not found in Rust sources ({metric})")
 
     if errors:
         raise SystemExit("\n".join(errors))
     print(
         f"repository metadata: ok ({len(markdown)} Markdown/rule files, "
-        f"{len(shell_scripts)} shell scripts, {len(agent_names)} mirrored skills)"
+        f"{len(shell_scripts)} shell scripts, {len(agent_names)} mirrored skills, "
+        f"{len(monitoring_sources)} monitoring definitions)"
     )
 
 

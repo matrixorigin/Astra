@@ -4,6 +4,7 @@
 
 - `deployment/all-in-one/` - local or single-host Docker compose deployment
 - `deployment/kubernetes/` - cluster-oriented manifests and chart assets
+- `deployment/monitoring/` - optional Prometheus and Grafana stack
 - `scripts/ops/` - operational helpers
 
 ## Image Build Paths

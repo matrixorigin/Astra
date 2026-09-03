@@ -1,57 +1,12 @@
 {
-  "dashboard": {
-    "title": "astra API Overview",
-    "tags": ["astra", "api"],
+    "title": "Astra Model & Prompt Overview",
+    "tags": ["astra", "model", "prompt"],
     "timezone": "browser",
     "panels": [
       {
-        "title": "Request Rate",
-        "type": "graph",
-        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
-        "targets": [
-          {
-            "expr": "rate(http_requests_total[5m])",
-            "legendFormat": "{{method}} {{path}}"
-          }
-        ]
-      },
-      {
-        "title": "Response Time (p95)",
-        "type": "graph",
-        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
-        "targets": [
-          {
-            "expr": "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))",
-            "legendFormat": "p95"
-          }
-        ]
-      },
-      {
-        "title": "Error Rate",
-        "type": "graph",
-        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
-        "targets": [
-          {
-            "expr": "rate(http_requests_total{status=~\"5..\"}[5m])",
-            "legendFormat": "5xx errors"
-          }
-        ]
-      },
-      {
-        "title": "Active Database Connections",
-        "type": "graph",
-        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
-        "targets": [
-          {
-            "expr": "db_connections_active",
-            "legendFormat": "Active"
-          }
-        ]
-      },
-      {
         "title": "Physical Model Request Rate",
         "type": "graph",
-        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
         "targets": [
           {
             "expr": "max by (topology, provider, model_family, purpose, outcome) (rate(astra_model_requests_total[5m]))",
@@ -62,7 +17,7 @@
       {
         "title": "Model Token Lanes",
         "type": "graph",
-        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+        "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
         "targets": [
           {
             "expr": "max by (bucket, topology, provider, model_family, purpose) (rate(astra_llm_input_tokens_total[5m]))",
@@ -77,7 +32,7 @@
       {
         "title": "Prompt Cache Read Share",
         "type": "graph",
-        "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+        "gridPos": {"h": 8, "w": 24, "x": 0, "y": 8},
         "targets": [
           {
             "expr": "max by (topology, provider, model_family, purpose) (astra_prompt_cache_read_share)",
@@ -88,5 +43,4 @@
     ],
     "refresh": "10s",
     "time": {"from": "now-1h", "to": "now"}
-  }
 }

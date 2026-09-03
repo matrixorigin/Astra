@@ -27,6 +27,7 @@ jobs:
       sdk: ${{ steps.scope.outputs.sdk }}
       web: ${{ steps.scope.outputs.web }}
       harness: ${{ steps.scope.outputs.harness }}
+      script_contracts: ${{ steps.scope.outputs.script_contracts }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -55,7 +56,17 @@ jobs:
         if: ${{ needs.scope.result != 'success' || needs.scope.outputs.harness == 'true' }}
         run: |
           bash -n scripts/harness/local_gateway_contract.sh scripts/harness/test_local_gateway_contract.sh scripts/harness/run_terminal_bench_current.sh
+          python3 -m unittest \
+            scripts.harness.test_benchmark_model_seed \
+            scripts.harness.test_case_history \
+            scripts.harness.test_fresh_database_contract
           bash scripts/harness/test_local_gateway_contract.sh
+      - name: Validate offline script contracts
+        if: ${{ needs.scope.result != 'success' || needs.scope.outputs.script_contracts == 'true' }}
+        run: |
+          python3 -m unittest discover -s scripts/load -p 'test_*.py'
+          python3 scripts/schema/test_schema_inventory.py
+          python3 scripts/e2e/validate_capability_matrix.py
       - uses: ./.github/actions/rust-setup
         if: ${{ needs.scope.result != 'success' || needs.scope.outputs.rust == 'true' }}
         with:

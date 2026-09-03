@@ -1,6 +1,6 @@
 # Monitoring Stack
 
-Prometheus + Grafana monitoring for astra.
+Prometheus + Grafana monitoring for Astra.
 
 ## Quick Start
 
@@ -42,7 +42,7 @@ Those rules use metric names exported by Astra's `/metrics` endpoint.
 
 **Available dashboards:**
 
-- API Overview
+- Model & Prompt Overview
 - Runtime Capacity
 
 ### Node Exporter

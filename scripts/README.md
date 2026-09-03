@@ -6,36 +6,43 @@ Scripts are organized by responsibility and kept dependency-light.
 
 ```text
 scripts/
-├── harness/
-│   ├── preflight.py
-│   ├── run_terminal_bench_current.sh
-│   └── test_*.py
-├── dev/
-│   ├── init.sh
-│   ├── start-api.sh
-│   └── stop-api.sh
-├── load/
-│   ├── cleanup_pressure_probe.py
-│   ├── durable_event_pressure_probe.py
-│   ├── extract_slow_sql.py
-│   ├── mock_openai_server.py
-│   ├── multi_cli_capacity_probe.py
-│   └── db_capacity_report.py
-├── e2e/
-│   ├── validate_cases.py
-│   └── validate_capability_matrix.py
-├── schema/
-│   └── schema_inventory.py
-├── setup/
-│   └── demo-init.sh
-├── ops/
-│   ├── backup.sh
-│   ├── deploy.sh
-│   ├── health_check.sh
-│   └── restore.sh
-├── phase0-production-baseline.sh
-└── validate-release-version.sh
+├── ci/       # repository contracts and changed-path CI routing
+├── dev/      # local API, Web, and Edge lifecycle helpers
+├── e2e/      # capability and test-case manifest validators
+├── harness/  # Terminal-Bench lifecycle and offline contract tests
+├── load/     # capacity probes, mock provider, reports, and unit tests
+├── ops/      # deployment, health, backup, and restore helpers
+├── schema/   # schema inventory and its contract tests
+├── setup/    # demo environment initialization
+└── *.sh/*.py # release, production-baseline, and diagram utilities
 ```
+
+## Offline Contract Tests
+
+These checks need no service, database, model provider, or API credential. The
+repository and routing checks always run; CI routes the remaining suites only
+when their owning script area changes:
+
+```sh
+python3 scripts/ci/validate_repository.py
+python3 scripts/ci/test_ci_scope.py
+python3 -m unittest \
+  scripts.harness.test_benchmark_model_seed \
+  scripts.harness.test_case_history \
+  scripts.harness.test_fresh_database_contract
+bash scripts/harness/test_local_gateway_contract.sh
+python3 -m unittest discover -s scripts/load -p 'test_*.py'
+python3 scripts/schema/test_schema_inventory.py
+python3 scripts/e2e/validate_capability_matrix.py
+```
+
+The repository validator covers local documentation links, JSON and shell
+syntax, pinned GitHub Actions, mirrored agent instructions, accidental tracked
+artifacts, executable script modes, and monitoring metric references.
+
+The remaining Harness tests exercise Harbor integration contracts and require
+the benchmark environment. Run the complete suite there with
+`python3 -m unittest discover -s scripts/harness -p 'test_*.py'`.
 
 ## Key Scripts
 
@@ -44,12 +51,15 @@ scripts/
 Owns the Terminal-Bench/Harbor benchmark lifecycle: preflight checks, fresh
 database contracts, process supervision, sealed run snapshots, verifier
 readiness, recovery metadata, and the current benchmark launcher. Its colocated
-`test_*.py` and `test_*.sh` files are the offline contract tests for the harness.
+tests cover both dependency-free lifecycle contracts and Harbor integration.
 
-Run the harness tests without starting a benchmark:
+Run the dependency-free harness tests without starting a benchmark:
 
 ```sh
-python3 -m unittest discover -s scripts/harness -p 'test_*.py'
+python3 -m unittest \
+  scripts.harness.test_benchmark_model_seed \
+  scripts.harness.test_case_history \
+  scripts.harness.test_fresh_database_contract
 bash scripts/harness/test_local_gateway_contract.sh
 ```
 
