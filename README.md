@@ -189,7 +189,7 @@ change Astra itself. For production topologies, use the
 
 | Path | What you get | Additional prerequisites |
 | --- | --- | --- |
-| [Docker](#docker) | MatrixOne, Memoria, and `astra-server` from published images, plus prebuilt CLI and User Runner binaries | Docker Compose and OpenSSL |
+| [Docker](#docker) | MatrixOne, Memoria, and `astra-server` from published images, plus prebuilt CLI and User Runner binaries | Docker Compose, OpenSSL, and Python 3.9+ |
 | [From source](#build-from-source) | The same backbone built locally, plus the Web dashboard and CLI-local Runner capacity | Rust 1.97 and Node.js 24, both pinned in the repository |
 
 Both paths need Git, Make, and at least one supported LLM endpoint. Semantic
@@ -221,11 +221,14 @@ cd Astra
 make stack-setup
 ```
 
-The guided setup asks for the embedding mode, starts the stack, verifies health
-and a memory round trip, then opens an interactive administrator/model setup.
-API keys are hidden while typing and the local `.env` is written with owner-only
-permissions. Choose mock embeddings for deterministic evaluation; use a real
-OpenAI-compatible endpoint for production retrieval.
+The guided setup validates the embedding endpoint, credentials, model, and
+vector dimension before starting containers. It detects an existing stack,
+reuses healthy services, and offers a data-preserving repair when containers or
+networks are partial. Startup and verification failures offer retry, stop, or
+leave-for-inspection choices before the administrator/model wizard begins.
+API keys are hidden while typing and the local `.env` is owner-only. Choose mock
+embeddings for deterministic evaluation; use a real OpenAI-compatible endpoint
+for production retrieval. The wizard never deletes persistent volumes.
 It runs in Linux/macOS terminals and Windows WSL or Git Bash; on a restricted
 Windows shell, use the scripted stack targets and run `astra admin setup`
 directly.
@@ -247,7 +250,7 @@ and `make stack-verify` explicitly.
 | HTTP API | <http://localhost:17001> |
 | Health check | <http://localhost:17001/health> |
 
-#### 2. Check the CLI and service URLs
+#### 3. Confirm the CLI and service
 
 The stack ships `astra-server`; the prebuilt `astra` binary installed in step 1
 drives it:
@@ -262,18 +265,20 @@ so no extra configuration is needed. If you remapped `ASTRA_API_PORT`, set
 installer, and set `ASTRA_IMAGE` before `make stack-up`, when you need a pinned
 CLI and server pair.
 
-#### 3. Bootstrap the admin account
+For scripted or advanced environments, replace the guided account/model phase
+with the following two operations.
+
+##### Bootstrap the admin account
 
 ```bash
-astra admin setup
+astra admin register --username admin --password '<password>'
 ```
 
-The wizard asks whether the database is fresh or already has an admin, stores
-the returned credentials in the local CLI profile, and probes the model before
-declaring it ready. Use `astra admin register` and `astra admin model ...` for
-scripted or advanced flows.
+On a fresh data volume this creates the initial administrator and stores the
+returned credentials in the local CLI profile. After an administrator exists,
+the command must be run while logged in as an existing administrator.
 
-#### 4. Register a model
+##### Register a model
 
 ```bash
 astra admin model add MODEL_NAME openai \
@@ -288,7 +293,7 @@ step that tells you routing will work. For more than one model, write a
 `.models.yaml` and run
 `astra admin model load .models.yaml --update-existing`.
 
-#### 5. First agent response
+#### 4. Get the first agent response
 
 ```bash
 astra chat -m "Explain what you can and cannot do in this deployment"
@@ -303,7 +308,7 @@ MCP, and introspection are available, while file, shell, Git, build/test, and
 private-network tools stay unavailable until a Runner connects — which is what
 the answer above should tell you.
 
-#### 6. Connect a User Runner when local execution is needed
+#### 5. Connect a User Runner when local execution is needed
 
 After the CLI has stored your account credentials, expose one deliberate local
 workspace to the Server:

@@ -2,6 +2,8 @@
 
 Run Astra with the all-in-one Docker Compose stack.
 
+The guided setup requires Docker Compose v2, OpenSSL, and Python 3.9 or newer.
+
 ## Quick Start
 
 ```bash
@@ -19,10 +21,13 @@ make stack-setup
 astra chat -m "Explain what you can and cannot do in this deployment"
 ```
 
-`make stack-setup` prompts for mock or real embeddings, starts and verifies the
-services, then runs `astra admin setup` for the administrator and model. The
-CLI defaults to `http://127.0.0.1:17001`; set `ASTRA_API_URL` if you remapped
-`ASTRA_API_PORT`.
+`make stack-setup` validates a mock or real embedding configuration before
+starting services, detects and safely reconciles an existing stack, verifies a
+real memory round trip, then runs `astra admin setup`. It never deletes volumes;
+on failure it lets you retry, stop containers while preserving data, or leave
+the state for inspection. The CLI defaults to `http://127.0.0.1:17001`; set
+`ASTRA_API_URL` if you remapped `ASTRA_API_PORT`. For CI or scripts, use explicit
+`make stack-env`, `make stack-up`, and `make stack-verify` targets instead.
 
 For a non-interactive local evaluation, use deterministic mock embeddings:
 
@@ -33,11 +38,11 @@ MEMORIA_EMBEDDING_PROVIDER=mock make stack-start
 For semantic memory, set `MEMORIA_EMBEDDING_BASE_URL` and, when the endpoint
 requires it, `MEMORIA_EMBEDDING_API_KEY`, then run `make stack-start`.
 `stack-start` initializes configuration, starts Compose, waits for health, and
-verifies an exact memory round trip. For lower-level automation, use
-`make stack-env`, `make stack-up`, and `make stack-verify` explicitly.
-
+verifies an exact memory round trip.
 The Make wizard works in Linux/macOS terminals and Windows WSL or Git Bash;
 restricted Windows shells can use the explicit targets and `astra admin setup`.
+Loopback embedding endpoints are tested directly; other endpoints honor the
+host proxy settings and report when `NO_PROXY` may be needed for a private URL.
 
 The installer also provides `astra-edge`. To give Web sessions access to one
 explicit local workspace, run:

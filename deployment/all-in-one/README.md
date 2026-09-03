@@ -2,6 +2,8 @@
 
 This compose stack starts MatrixOne, Memoria, and `astra-server`.
 
+The guided setup requires Docker Compose v2, OpenSSL, and Python 3.9 or newer.
+
 The development flow is separate and still uses `docker-compose.deps.yml` through the repo-root `make dev-deps-*` targets, followed by `make dev-api-start` for a locally built API server.
 
 ## Start With Make
@@ -18,13 +20,16 @@ From the repository root, the recommended first-run path is guided:
 make stack-setup
 ```
 
-The guided path asks for embedding configuration, starts Compose, verifies a
-memory round trip, and launches `astra admin setup` for the administrator and
-LLM model. API keys are hidden while typing and the local `.env` is owner-only.
-Choose a real endpoint for production retrieval or deterministic mock
-embeddings for evaluation. The wizard works in Linux/macOS terminals and
-Windows WSL or Git Bash; restricted Windows shells can use the non-interactive
-targets and `astra admin setup`.
+The guided path tests the embedding endpoint, credentials, model, and dimension
+before starting Compose. It inventories an existing stack, reuses healthy
+services, repairs disconnected containers without deleting volumes, verifies a
+memory round trip, and then launches `astra admin setup`. Startup failures offer
+repair/retry, stop-and-preserve, and leave-for-inspection choices. API keys are
+hidden and the local `.env` is owner-only. The wizard works in Linux/macOS
+terminals and Windows WSL or Git Bash; restricted Windows shells can use the
+explicit targets and `astra admin setup`.
+Loopback embedding probes bypass HTTP proxies; other endpoints honor the host
+proxy configuration and suggest `NO_PROXY` when a private URL is intercepted.
 
 For a non-interactive local evaluation, use deterministic mock embeddings:
 
