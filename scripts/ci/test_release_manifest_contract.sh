@@ -39,7 +39,14 @@ case "${operation}" in
             architecture="${ASTRA_TEST_SECOND_ARCH:-arm64}"
             image_digest="${ASTRA_TEST_ARM64_IMAGE}"
         else
-            [[ -e "${ASTRA_TEST_DOCKER_STATE}/target" ]] || exit 1
+            if [[ "${ASTRA_TEST_TARGET_INSPECT_ERROR:-false}" == true ]]; then
+                echo 'ERROR: registry request failed: TLS handshake timeout' >&2
+                exit 1
+            fi
+            if [[ ! -e "${ASTRA_TEST_DOCKER_STATE}/target" ]]; then
+                echo 'ERROR: matrixorigin/astra:test: not found' >&2
+                exit 1
+            fi
             if [[ "${2:-}" == --format ]]; then
                 printf '{"schemaVersion":2,"manifests":[{"digest":"%s","platform":{"os":"linux","architecture":"amd64"}},{"digest":"%s","platform":{"os":"linux","architecture":"arm64"}}]}\n' \
                     "${ASTRA_TEST_AMD64_IMAGE}" "${ASTRA_TEST_TARGET_ARM64_IMAGE:-${ASTRA_TEST_ARM64_IMAGE}}"
@@ -100,6 +107,19 @@ if env "${common_env[@]}" ASTRA_TEST_DOCKER_STATE="${wrong_state}" \
     exit 1
 fi
 [[ ! -e "${wrong_state}/target" ]]
+
+# A registry/network/authentication failure is not proof that a tag is absent.
+# Publication must fail closed without attempting to create or replace it.
+lookup_error_state="${fixture_root}/lookup-error-state"
+mkdir -p "${lookup_error_state}"
+if env "${common_env[@]}" ASTRA_TEST_DOCKER_STATE="${lookup_error_state}" \
+    ASTRA_TEST_TARGET_INSPECT_ERROR=true \
+    "${repo_root}/scripts/reconcile-docker-manifest.sh" \
+    matrixorigin/astra 0.1.0 "${matrix}" "${digest_dir}" reject >/dev/null 2>&1; then
+    echo "manifest contract treated a registry failure as an absent tag" >&2
+    exit 1
+fi
+[[ ! -e "${lookup_error_state}/target" ]]
 
 # Recovery must reject an existing tag whose platform digest differs.
 mismatch_state="${fixture_root}/mismatch-state"

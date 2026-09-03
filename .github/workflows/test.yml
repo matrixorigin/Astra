@@ -121,7 +121,7 @@ jobs:
           -E 'test(/local_cli_catalog_exposes_the_root_work_lifecycle/)'
       - name: Dump processes on failure
         if: failure() && env.RUN_TESTS == 'true'
-        run: ps -ef | grep -E 'cargo|nextest|astra|bash|sleep' || true
+        run: pgrep -af 'cargo|nextest|astra|bash|sleep' || true
 
   shard-b:
     name: "Test: astra-runtime"

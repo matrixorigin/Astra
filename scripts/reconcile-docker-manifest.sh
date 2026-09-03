@@ -156,7 +156,17 @@ if [[ "$(printf '%s\n' "${expected_platform_names[@]}")" != "$(printf '%s\n' "${
 fi
 
 target="${image_name}:${image_tag}"
-if docker buildx imagetools inspect "${target}" >/dev/null 2>&1; then
+target_exists=false
+if inspect_output="$(docker buildx imagetools inspect "${target}" 2>&1)"; then
+    target_exists=true
+elif ! grep -Eqi '(: not found|manifest unknown|name unknown|HTTP 404|status[^0-9]*404)' \
+    <<< "${inspect_output}"; then
+    echo "could not safely determine whether ${target} exists:" >&2
+    printf '%s\n' "${inspect_output}" >&2
+    exit 1
+fi
+
+if [[ "${target_exists}" == true ]]; then
     if [[ "${existing_policy}" == "reject" ]]; then
         echo "${target} already exists and will not be overwritten" >&2
         exit 1

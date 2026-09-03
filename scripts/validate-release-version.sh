@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 1 ]]; then
-    echo "usage: $0 <version>" >&2
+syntax_only=false
+if [[ $# -eq 2 && "$2" == "--syntax-only" ]]; then
+    syntax_only=true
+elif [[ $# -ne 1 ]]; then
+    echo "usage: $0 <version> [--syntax-only]" >&2
     exit 2
 fi
 
@@ -13,7 +16,7 @@ if [[ ! "$release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; the
 fi
 
 release_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-python3 - "$release_root" "$release_version" <<'PY'
+python3 - "$release_root" "$release_version" "$syntax_only" <<'PY'
 import json
 import re
 import sys
@@ -22,6 +25,7 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 expected = sys.argv[2]
+syntax_only = sys.argv[3] == "true"
 
 core, separator, prerelease = expected.partition("-")
 core_identifiers = core.split(".")
@@ -40,6 +44,10 @@ if separator:
         for identifier in prerelease_identifiers
     ):
         raise SystemExit(f"invalid semantic prerelease version: {expected}")
+
+if syntax_only:
+    print(f"release version syntax is valid: {expected}")
+    raise SystemExit(0)
 
 with (root / "Cargo.toml").open("rb") as manifest:
     document = tomllib.load(manifest)

@@ -77,6 +77,7 @@ jobs:
           fi
 
           version="${INPUT_VERSION#v}"
+          scripts/validate-release-version.sh "${version}" --syntax-only
           source_tag="v${version}"
           git fetch --no-tags origin \
             "refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
@@ -166,14 +167,16 @@ jobs:
           fi
           matrix='{"include":[{"platform":"linux/amd64","runner":"ubuntu-latest","slug":"linux-amd64"},{"platform":"linux/arm64","runner":"ubuntu-24.04-arm","slug":"linux-arm64"}]}'
 
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
-          echo "source_tag=${source_tag}" >> "${GITHUB_OUTPUT}"
-          echo "source_sha=${source_sha}" >> "${GITHUB_OUTPUT}"
-          echo "tag_object=${tag_object}" >> "${GITHUB_OUTPUT}"
-          echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
-          echo "rolling_version=${rolling_version}" >> "${GITHUB_OUTPUT}"
-          echo "publish_latest=${publish_latest}" >> "${GITHUB_OUTPUT}"
-          echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "version=${version}"
+            echo "source_tag=${source_tag}"
+            echo "source_sha=${source_sha}"
+            echo "tag_object=${tag_object}"
+            echo "prerelease=${prerelease}"
+            echo "rolling_version=${rolling_version}"
+            echo "publish_latest=${publish_latest}"
+            echo "matrix=${matrix}"
+          } >> "${GITHUB_OUTPUT}"
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         if: ${{ inputs.recover_existing_tag != true }}
@@ -185,9 +188,15 @@ jobs:
           IMAGE: matrixorigin/astra:${{ steps.resolve.outputs.version }}
         run: |
           set -euo pipefail
-          if docker buildx imagetools inspect "${IMAGE}" >/dev/null 2>&1; then
+          if inspect_output="$(docker buildx imagetools inspect "${IMAGE}" 2>&1)"; then
             echo "Docker version ${IMAGE} already exists." >&2
             echo "Choose a new version; normal publication never adopts or overwrites an existing tag." >&2
+            exit 1
+          elif ! grep -Eqi '(: not found|manifest unknown|name unknown|HTTP 404|status[^0-9]*404)' \
+            <<< "${inspect_output}"; then
+            echo "Could not safely determine whether Docker version ${IMAGE} exists:" >&2
+            printf '%s\n' "${inspect_output}" >&2
+            echo "Resolve the registry or authentication failure before building candidates." >&2
             exit 1
           fi
 
@@ -299,8 +308,10 @@ jobs:
             tag_source="$(printf '%s' "${tag_json}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["object"]["sha"])')"
             tag_message="$(printf '%s' "${tag_json}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["message"])')"
             run_marker="Release-Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            mapfile -t run_markers < <(grep -F 'Release-Run: ' <<< "${tag_message}" || true)
             if [ "${tag_source}" != "${SOURCE_SHA}" ] \
-              || ! grep -Fxq "${run_marker}" <<< "${tag_message}"; then
+              || [ "${#run_markers[@]}" -ne 1 ] \
+              || [ "${run_markers[0]}" != "${run_marker}" ]; then
               echo "Release tag ${SOURCE_TAG} appeared during candidate verification and is not owned by this run." >&2
               exit 1
             fi
@@ -320,9 +331,15 @@ jobs:
         run: |
           set -euo pipefail
           state=none
-          if release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${SOURCE_TAG}" 2>/dev/null)"; then
+          lookup_error="${RUNNER_TEMP}/release-lookup-error"
+          if release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${SOURCE_TAG}" 2>"${lookup_error}")"; then
             state="$(printf '%s' "${release_json}" | python3 -c 'import json,sys; print("draft" if json.load(sys.stdin)["draft"] else "published")')"
+          elif ! grep -Eq 'HTTP 404' "${lookup_error}"; then
+            echo "Could not safely determine whether GitHub Release ${SOURCE_TAG} exists:" >&2
+            cat "${lookup_error}" >&2
+            exit 1
           fi
+          rm -f "${lookup_error}"
           if [ "${RECOVER_EXISTING_TAG}" != "true" ] \
             && [ "${SAME_RUN}" != "true" ] \
             && [ "${state}" != "none" ]; then
@@ -340,9 +357,14 @@ jobs:
           IMAGE: matrixorigin/astra:${{ needs.preflight.outputs.version }}
         run: |
           set -euo pipefail
-          if docker buildx imagetools inspect "${IMAGE}" >/dev/null 2>&1; then
+          if inspect_output="$(docker buildx imagetools inspect "${IMAGE}" 2>&1)"; then
             echo "Docker version ${IMAGE} already exists." >&2
             echo "Choose a new version; normal publication never adopts or overwrites an existing tag." >&2
+            exit 1
+          elif ! grep -Eqi '(: not found|manifest unknown|name unknown|HTTP 404|status[^0-9]*404)' \
+            <<< "${inspect_output}"; then
+            echo "Could not safely determine whether Docker version ${IMAGE} exists:" >&2
+            printf '%s\n' "${inspect_output}" >&2
             exit 1
           fi
 

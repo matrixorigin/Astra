@@ -126,6 +126,7 @@ def main() -> None:
         "workflow_dispatch:",
         "recover_existing_tag:",
         'GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}',
+        'validate-release-version.sh "${version}" --syntax-only',
         "release-binaries.yml",
         "release-container-candidates.yml",
         "environment: release",
@@ -135,6 +136,7 @@ def main() -> None:
         "Reject conflicting Docker version before creating the tag",
         "Resolve publication continuation state",
         "Release-Run:",
+        "Could not safely determine whether GitHub Release",
         "Recovery cannot adopt manual or legacy tags",
         "Recovery will not trust an unverifiable release owner",
         'run.get("path", "")',
@@ -170,6 +172,7 @@ def main() -> None:
         "make stack-verify",
         "release-digest-",
         "Write container candidate summary",
+        "Candidate image version",
     ):
         if required not in container_candidates:
             errors.append(
@@ -197,6 +200,7 @@ def main() -> None:
     for required in (
         "candidate platforms do not match the requested build matrix",
         "already exists and will not be overwritten",
+        "could not safely determine whether",
         "published manifest",
         "does not match the verified candidates",
     ):

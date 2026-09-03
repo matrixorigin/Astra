@@ -147,6 +147,11 @@ jobs:
             echo "Candidate image revision ${revision:-<missing>} does not match ${RELEASE_SOURCE_SHA}" >&2
             exit 1
           fi
+          image_version="$(docker image inspect "${release_image}" --format '{{ index .Config.Labels "org.opencontainers.image.version" }}')"
+          if [ "${image_version}" != "${RELEASE_IMAGE_VERSION}" ]; then
+            echo "Candidate image version ${image_version:-<missing>} does not match ${RELEASE_IMAGE_VERSION}" >&2
+            exit 1
+          fi
 
       - name: Verify health and exact memory round trip
         run: make stack-verify

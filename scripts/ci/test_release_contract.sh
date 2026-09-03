@@ -80,7 +80,14 @@ for invalid_version in 01.0.0 0.1.0-01 0.1.0-rc..1; do
         echo "installer accepted invalid semantic version ${invalid_version}" >&2
         exit 1
     fi
+    if "${repo_root}/scripts/validate-release-version.sh" \
+        "${invalid_version}" --syntax-only >/dev/null 2>&1; then
+        echo "release preflight accepted invalid semantic version ${invalid_version}" >&2
+        exit 1
+    fi
 done
+"${repo_root}/scripts/validate-release-version.sh" \
+    0.1.0-rc.1 --syntax-only >/dev/null
 
 # If replacing the second binary fails, the installer must restore the previous
 # matching CLI/Runner pair instead of leaving a mixed installation behind.
