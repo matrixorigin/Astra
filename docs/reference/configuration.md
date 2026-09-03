@@ -113,7 +113,7 @@ check_endpoint = "http://moi-catalog:8081/api/v1/astra/edge-tokens/check"
 LLM models are **not** configured via env vars. Use the admin CLI:
 
 ```bash
-astra admin model add <name> <provider> --api-key ... --base-url ...
+astra admin model add <name> <provider> --api-key ... --context-window 128000 --base-url ...
 astra admin model check <name>                    # probe + activate
 astra admin model list                            # drains the authoritative paginated catalog
 astra admin config set reasoning_offering_id <id> # optional: pin the judge/summary Offering

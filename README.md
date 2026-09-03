@@ -210,40 +210,51 @@ One checksum-verified archive installs both the `astra` CLI and the
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh
 ```
 
-#### 2. Start and verify the stack
+#### 2. Run the guided setup
 
-Clone the deployment files, then choose the memory mode explicitly. This
-single command generates local secrets, starts Compose, waits for health, and
-verifies an exact memory write/retrieval round trip:
+Clone Astra and follow one guided flow from embedding configuration through the
+first administrator and model:
 
 ```bash
 git clone https://github.com/matrixorigin/Astra.git
 cd Astra
+make stack-setup
+```
 
+The guided setup asks for the embedding mode, starts the stack, verifies health
+and a memory round trip, then opens an interactive administrator/model setup.
+API keys are hidden while typing and the local `.env` is written with owner-only
+permissions. Choose mock embeddings for deterministic evaluation; use a real
+OpenAI-compatible endpoint for production retrieval.
+It runs in Linux/macOS terminals and Windows WSL or Git Bash; on a restricted
+Windows shell, use the scripted stack targets and run `astra admin setup`
+directly.
+
+For a non-interactive local evaluation, use deterministic mock embeddings:
+
+```bash
 MEMORIA_EMBEDDING_PROVIDER=mock make stack-start
 ```
 
-Mock embeddings are deterministic and intended for evaluation or tests, not
-production retrieval. To exercise semantic memory instead, point the same
-one-command start at a real OpenAI-compatible embedding endpoint:
-
-```bash
-MEMORIA_EMBEDDING_BASE_URL=https://your-embedding-endpoint/v1 \
-MEMORIA_EMBEDDING_API_KEY="$EMBEDDING_API_KEY" \
-make stack-start
-```
-
-The API key may be omitted for an unauthenticated local endpoint. Generated
-secrets remain in `deployment/all-in-one/.env`; credentials supplied as process
-environment variables are not written there. On later starts, export the same
-embedding settings again before `make stack-up`, or deliberately persist them
-in that `.env` file. Use `make stack-verify` whenever you want to repeat the
-runtime proof.
+For semantic memory, set `MEMORIA_EMBEDDING_BASE_URL` and, when required,
+`MEMORIA_EMBEDDING_API_KEY`, then run `make stack-start`. The command generates
+local secrets, starts Compose, waits for health, and verifies an exact memory
+round trip. For lower-level automation, run `make stack-env`, `make stack-up`,
+and `make stack-verify` explicitly.
 
 | Service | Default URL |
 | --- | --- |
 | HTTP API | <http://localhost:17001> |
 | Health check | <http://localhost:17001/health> |
+
+#### 2. Check the CLI and service URLs
+
+The stack ships `astra-server`; the prebuilt `astra` binary installed in step 1
+drives it:
+
+```bash
+astra health
+```
 
 The CLI defaults to `http://127.0.0.1:17001`, which is where the stack binds,
 so no extra configuration is needed. If you remapped `ASTRA_API_PORT`, set
@@ -254,18 +265,20 @@ CLI and server pair.
 #### 3. Bootstrap the admin account
 
 ```bash
-astra admin register --username admin --password '<password>'
+astra admin setup
 ```
 
-On a fresh data volume this performs the initial admin bootstrap, prints
-`registered and logged in (initial admin)`, and stores the credentials in the
-local CLI profile.
+The wizard asks whether the database is fresh or already has an admin, stores
+the returned credentials in the local CLI profile, and probes the model before
+declaring it ready. Use `astra admin register` and `astra admin model ...` for
+scripted or advanced flows.
 
 #### 4. Register a model
 
 ```bash
 astra admin model add MODEL_NAME openai \
-  --api-key "$LLM_API_KEY" --base-url https://your-endpoint/v1
+  --api-key "$LLM_API_KEY" --context-window 128000 \
+  --base-url https://your-endpoint/v1
 astra admin model check MODEL_NAME
 ```
 

@@ -19,3 +19,18 @@ pub(crate) fn prompt_or(label: &str, existing: Option<String>) -> Result<String,
         Ok(val)
     }
 }
+
+/// Read a secret without echoing it to the terminal or shell history.
+pub(crate) fn prompt_secret(label: &str) -> Result<String, String> {
+    let value = rpassword::prompt_password(format!("{label}: ")).map_err(|e| e.to_string())?;
+    let value = value.trim().to_string();
+    if value.is_empty() {
+        Err(format!("{label} cannot be empty"))
+    } else {
+        Ok(value)
+    }
+}
+
+pub(crate) fn prompt_secret_or(label: &str, existing: Option<String>) -> Result<String, String> {
+    existing.map_or_else(|| prompt_secret(label), Ok)
+}

@@ -98,6 +98,7 @@ help:
 	@echo "All-in-One Docker Deployment:"
 	@echo "  make stack-env          - Create .env and generate stack secrets"
 	@echo "  make stack-start        - Initialize, start, and verify the Compose stack"
+	@echo "  make stack-setup        - Interactive first-run setup (embedding, admin, model)"
 	@echo "  make stack-up           - Start MatrixOne + Memoria + API"
 	@echo "  make stack-up-server-only - Start compose stack without local edge provider"
 	@echo "  make stack-up-server-edge - Start compose stack plus local astra-edge provider"
@@ -661,6 +662,10 @@ stack-up: stack-config
 	BIND_ADDRESS=$$(env_resolve_value "$(STACK_ENV)" ASTRA_BIND_ADDRESS 2>/dev/null || true); \
 	API_HOST=$$(env_http_host_from_bind "$$BIND_ADDRESS"); \
 	echo "   API: http://$$API_HOST:$${API_PORT:-$(DEFAULT_API_PORT)}"
+
+.PHONY: stack-setup
+stack-setup:
+	@scripts/setup/stack-setup.sh
 
 .PHONY: stack-up-server-only
 stack-up-server-only:

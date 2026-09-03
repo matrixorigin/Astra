@@ -88,6 +88,7 @@ Commands:
 # Auth
 astra admin login --username admin --password '***'
 astra admin register --username admin --password '***' [--email admin@example.com]
+astra admin setup                    # guided admin + model first run
 astra admin whoami
 astra admin interactive
 astra admin refresh
@@ -105,7 +106,7 @@ astra admin user revoke-role alice astra_admin
 
 # Model management
 astra admin model list                   # complete catalog; server pages are drained
-astra admin model add gpt-4 openai --api-key "$OPENAI_API_KEY" [--base-url URL]
+astra admin model add gpt-4 openai --api-key "$OPENAI_API_KEY" --context-window 128000 [--base-url URL]
 astra admin model show gpt-4
 astra admin model check gpt-4
 astra admin model delete gpt-4

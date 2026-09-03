@@ -12,16 +12,41 @@ Install the released client binaries if they are not already available:
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh
 ```
 
-From the repository root, the shortest local evaluation path is one command:
+From the repository root, the recommended first-run path is guided:
+
+```bash
+make stack-setup
+```
+
+The guided path asks for embedding configuration, starts Compose, verifies a
+memory round trip, and launches `astra admin setup` for the administrator and
+LLM model. API keys are hidden while typing and the local `.env` is owner-only.
+Choose a real endpoint for production retrieval or deterministic mock
+embeddings for evaluation. The wizard works in Linux/macOS terminals and
+Windows WSL or Git Bash; restricted Windows shells can use the non-interactive
+targets and `astra admin setup`.
+
+For a non-interactive local evaluation, use deterministic mock embeddings:
 
 ```bash
 MEMORIA_EMBEDDING_PROVIDER=mock make stack-start
 ```
 
+When configuring the file by hand, set `MEMORIA_EMBEDDING_BASE_URL` and, when
+required, `MEMORIA_EMBEDDING_API_KEY`. For no-credential evaluation, set
+`MEMORIA_EMBEDDING_PROVIDER=mock` and leave both blank.
+
 `stack-start` creates `deployment/all-in-one/.env`, generates local secrets,
 validates Compose, starts every service, waits for readiness, and verifies an
-exact memory write/retrieval round trip. Mock embeddings are deterministic and
-suitable for evaluation or tests, not production retrieval.
+exact memory write/retrieval round trip. For lower-level automation, run
+`make stack-env`, `make stack-up`, and `make stack-verify` explicitly.
+
+`make stack-up` fails before starting containers if a required secret is empty,
+or if a non-mock embedding provider is missing its base URL. An API key is
+optional for unauthenticated local endpoints. If a service does not become
+healthy, the command prints container status and recent logs while leaving the
+partial stack available for inspection. Fix the first reported error and rerun
+the command, or use `make stack-down` to stop it.
 
 For semantic memory, supply a real OpenAI-compatible embedding endpoint; its
 API key is optional when the endpoint is unauthenticated:
@@ -91,9 +116,10 @@ make test-runtime-profiles
 
 ## Admin Accounts
 
-Use `astra admin register` to create an administrator account. On a fresh MatrixOne
-data volume this performs the initial admin bootstrap. After an admin exists,
-`astra admin register` must be run while logged in as an existing admin.
+Use `astra admin setup` for the guided administrator and model flow. It asks
+whether the MatrixOne data volume is fresh, then bootstraps or signs in before
+configuring the model. `astra admin register` and `astra admin model ...`
+remain available for automation.
 
 ```bash
 astra admin --api-url http://127.0.0.1:17001 register \

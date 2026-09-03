@@ -76,6 +76,10 @@ fn profile_identity_admission_follows_the_typed_command_tree() {
             CliProfileIdentityAdmission::AuthenticationBootstrap,
         ),
         (
+            &["astra", "admin", "setup"],
+            CliProfileIdentityAdmission::AuthenticationBootstrap,
+        ),
+        (
             &["astra", "health"],
             CliProfileIdentityAdmission::RequireBoundAccount,
         ),

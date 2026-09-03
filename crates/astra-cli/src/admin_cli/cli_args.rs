@@ -23,7 +23,7 @@ impl AdminArgs {
     pub(crate) fn is_authentication_bootstrap(&self) -> bool {
         matches!(
             self.command.as_ref(),
-            Some(Command::Login(_) | Command::Register(_))
+            Some(Command::Login(_) | Command::Register(_) | Command::Setup)
         )
     }
 }
@@ -31,6 +31,8 @@ impl AdminArgs {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     Interactive,
+    /// Guide a first-time operator through admin and model configuration.
+    Setup,
     Login(LoginArgs),
     /// Create an admin account. Bootstraps the first admin, or requires an existing admin login.
     Register(RegisterArgs),

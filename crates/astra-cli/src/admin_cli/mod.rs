@@ -17,6 +17,7 @@ mod config;
 mod http_helpers;
 mod input;
 mod interactive;
+mod setup;
 
 pub use cli_args::AdminArgs;
 use cli_args::*;
@@ -24,6 +25,7 @@ use config::resolve_api_url;
 use http_helpers::*;
 use input::*;
 use interactive::run_interactive;
+use setup::run_setup;
 
 /// Parse `POST /models` or `PUT /models/{name}` JSON and print `is_active` / `connectivity`.
 fn print_model_load_server_result(body: &str, model_name: &str) {
@@ -282,9 +284,10 @@ pub async fn run(
 
     match command {
         Command::Interactive => run_interactive(&api, profile.as_deref()).await,
+        Command::Setup => run_setup(&api, profile.as_deref()).await,
         Command::Login(args) => {
             let username = prompt_or("Username", args.username)?;
-            let password = prompt_or("Password", args.password)?;
+            let password = input::prompt_secret_or("Password", args.password)?;
             let body = api
                 .post_auth_login_json(&serde_json::json!({
                     "username": username,
@@ -299,7 +302,7 @@ pub async fn run(
         }
         Command::Register(args) => {
             let username = prompt_or("Username", args.username)?;
-            let password = prompt_or("Password", args.password)?;
+            let password = input::prompt_secret_or("Password", args.password)?;
             let email = args
                 .email
                 .unwrap_or_else(|| format!("{username}@example.com"));
