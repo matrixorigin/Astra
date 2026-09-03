@@ -76,7 +76,24 @@ class CiScopeTests(unittest.TestCase):
     def test_harness_change_uses_targeted_contract_scope(self) -> None:
         scopes = classify(["scripts/harness/local_gateway_contract.sh"])
         self.assertTrue(scopes["harness"])
+        self.assertFalse(scopes["script_contracts"])
         self.assertFalse(scopes["rust"])
+
+    def test_offline_script_change_uses_targeted_contract_scope(self) -> None:
+        for path in (
+            "scripts/e2e/validate_capability_matrix.py",
+            "scripts/load/db_capacity_report.py",
+            "scripts/schema/schema_inventory.py",
+        ):
+            with self.subTest(path=path):
+                scopes = classify([path])
+                self.assertTrue(scopes["script_contracts"])
+                self.assertFalse(scopes["harness"])
+                self.assertFalse(scopes["rust"])
+
+    def test_unrelated_script_remains_lightweight(self) -> None:
+        scopes = classify(["scripts/render_readme_diagrams.py"])
+        self.assertFalse(any(scopes.values()))
 
     def test_cargo_lock_runs_rust_but_not_node(self) -> None:
         scopes = classify(["Cargo.lock"])

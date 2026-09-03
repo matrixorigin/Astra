@@ -21,6 +21,7 @@ SCOPES = (
     "sdk",
     "web",
     "harness",
+    "script_contracts",
     "test_cli",
     "test_runtime",
     "test_services",
@@ -168,6 +169,9 @@ def classify(paths: list[str]) -> dict[str, bool]:
             continue
         if path.startswith("scripts/harness/"):
             _enable(result, "harness")
+            continue
+        if path.startswith(("scripts/e2e/", "scripts/load/", "scripts/schema/")):
+            _enable(result, "script_contracts")
             continue
         if path.startswith("config/") or path in {".env.example", ".env.production.example"}:
             _enable(
