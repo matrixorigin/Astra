@@ -37,6 +37,11 @@ Never post API keys, tokens, passwords, private URLs, private filesystem paths,
 customer data, or other proprietary information. Redact sensitive values from
 logs, traces, screenshots, and configuration before attaching them.
 
+## Reporting a security vulnerability
+
+Do not report security problems through GitHub Issues. Follow
+[SECURITY.md](SECURITY.md) to report them privately instead.
+
 ## Contributing a fix
 
 If you want to submit a fix or improvement, see [CONTRIBUTING.md](CONTRIBUTING.md)
