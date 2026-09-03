@@ -3,16 +3,23 @@ queue_rules:
     merge_conditions: []
     checks_timeout: 4h
     merge_method: squash
-    commit_message_template: >
-      {{ title }} (#{{ number }})
-
-
-      {{ body | trim | get_section("## Summary") }}
-
-
-      Approved by: @{{ approved_reviews_by | join(', @') }}
+    commit_message_format:
+      title: pr-title
+      body: pr-body
+      trailers:
+        - approved-by
 
 pull_request_rules:
+  - name: Request XuPeng-SH review on every pull request
+    conditions:
+      - author!=XuPeng-SH
+      - -draft
+      - -approved-reviews-by=XuPeng-SH
+    actions:
+      request_reviews:
+        users:
+          - XuPeng-SH
+
   - name: Automatic queue on approval for main
     conditions:
       - "#changes-requested-reviews-by<=0"
