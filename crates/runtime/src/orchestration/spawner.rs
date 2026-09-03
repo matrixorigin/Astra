@@ -1967,6 +1967,7 @@ impl DynamicAgentSpawner {
                     permit.expect("process-wide cancellation retry capacity must remain open")
                 }
                 None => tokio::select! {
+                    biased;
                     _ = self.background_task_shutdown.cancelled() => {
                         return DurableCancellationAttempt::Shutdown;
                     }
@@ -1980,6 +1981,7 @@ impl DynamicAgentSpawner {
             }
         } else {
             tokio::select! {
+                biased;
                 _ = self.background_task_shutdown.cancelled() => {
                     return DurableCancellationAttempt::Shutdown;
                 }
@@ -1993,6 +1995,7 @@ impl DynamicAgentSpawner {
         };
         #[cfg(not(test))]
         let _global_capacity = tokio::select! {
+            biased;
             _ = self.background_task_shutdown.cancelled() => {
                 return DurableCancellationAttempt::Shutdown;
             }
@@ -2005,6 +2008,10 @@ impl DynamicAgentSpawner {
         };
         let outcome = if let Some(executor) = self.executor.as_ref() {
             tokio::select! {
+                // Cancellation ownership is the control-plane fence. If an
+                // old executor result becomes ready in the same poll as a
+                // shutdown or owner upgrade, drop that stale future first.
+                biased;
                 _ = self.background_task_shutdown.cancelled() => {
                     return DurableCancellationAttempt::Shutdown;
                 }
