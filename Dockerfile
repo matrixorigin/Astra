@@ -1,6 +1,7 @@
 # Keep this aligned with rust-toolchain.toml. The cargo-chef and final build
 # stages must use the same compiler or the cooked dependency artifacts cannot
 # be reused. The digest pins the current multi-architecture image index.
+ARG RUST_VERSION=1.97.0-bookworm
 ARG CARGO_CHEF_VERSION=0.1.77
 ARG IMAGE_REVISION=unknown
 ARG IMAGE_SOURCE_DIRTY=true
@@ -9,7 +10,7 @@ ARG IMAGE_SOURCE_DIRTY=true
 ARG CARGO_REGISTRY
 ARG DEBIAN_MIRROR
 
-FROM rust:1.97.0-bookworm@sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e75fea57e2a2a5c3073 AS chef
+FROM rust:${RUST_VERSION}@sha256:8fa55b2f3ddf97471ab6a767bfa3f37e6bad0986ba823e75fea57e2a2a5c3073 AS chef
 
 ARG CARGO_CHEF_VERSION
 ARG CARGO_REGISTRY
