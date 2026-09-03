@@ -201,6 +201,10 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/digests
           digest="${{ steps.build.outputs.digest }}"
+          if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Build returned an invalid image digest: ${digest:-<empty>}" >&2
+            exit 1
+          fi
           touch "/tmp/digests/${digest#sha256:}"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -210,11 +214,80 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  merge:
-    name: Publish DockerHub Manifest
+  smoke:
+    name: Verify ${{ matrix.platform }} Candidate
     needs:
       - version
       - build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.version.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: digests-${{ matrix.slug }}
+          path: /tmp/digest
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Start candidate digest through the documented all-in-one path
+        shell: bash
+        env:
+          DOCKERHUB_IMAGE_NAME: ${{ env.IMAGE_NAME }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          digest_files=(/tmp/digest/*)
+          if [ "${#digest_files[@]}" -ne 1 ]; then
+            echo "Expected one candidate digest for ${{ matrix.platform }}, found ${#digest_files[@]}" >&2
+            exit 1
+          fi
+          digest="$(basename "${digest_files[0]}")"
+          if [[ ! "${digest}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Candidate artifact contains an invalid image digest: ${digest}" >&2
+            exit 1
+          fi
+          release_image="${DOCKERHUB_IMAGE_NAME}@sha256:${digest}"
+
+          make stack-env
+          sed -i "s|^ASTRA_IMAGE=.*|ASTRA_IMAGE=${release_image}|" deployment/all-in-one/.env
+          sed -i 's|^MEMORIA_EMBEDDING_PROVIDER=.*|MEMORIA_EMBEDDING_PROVIDER=mock|' deployment/all-in-one/.env
+          make stack-up
+
+          revision="$(docker image inspect "${release_image}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
+          if [ "${revision}" != "${GITHUB_SHA}" ]; then
+            echo "Candidate image revision ${revision:-<missing>} does not match ${GITHUB_SHA}" >&2
+            exit 1
+          fi
+
+      - name: Verify health and memory round trip
+        run: make stack-verify
+
+      - name: Show service logs after failure
+        if: ${{ failure() }}
+        working-directory: deployment/all-in-one
+        run: docker compose --env-file .env logs --no-color --tail=200 api memoria matrixone || true
+
+      - name: Remove release smoke stack
+        if: ${{ always() }}
+        run: make stack-clean || true
+
+  merge:
+    name: Publish Verified DockerHub Manifest
+    needs:
+      - version
+      - build
+      - smoke
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -241,12 +314,13 @@ jobs:
           tags: |
             type=raw,value=${{ needs.version.outputs.image_version }}
 
-      - name: Create immutable DockerHub manifest list
+      - name: Create verified DockerHub manifest list
         shell: bash
         working-directory: /tmp/digests
         env:
           DOCKERHUB_IMAGE_NAME: ${{ env.IMAGE_NAME }}
           DOCKERHUB_METADATA_JSON: ${{ steps.meta.outputs.json }}
+          BUILD_MATRIX_JSON: ${{ needs.version.outputs.matrix }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -258,70 +332,29 @@ jobs:
 
           sources=()
           for digest in *; do
+            if [[ ! "${digest}" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "Digest artifact has an invalid filename: ${digest}" >&2
+              exit 1
+            fi
             sources+=("${DOCKERHUB_IMAGE_NAME}@sha256:${digest}")
           done
           if [ "${#sources[@]}" -eq 0 ]; then
             echo "No platform image digests were downloaded" >&2
             exit 1
           fi
-
-          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
-
-  smoke:
-    name: Verify ${{ matrix.platform }} Image
-    needs:
-      - version
-      - merge
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.version.outputs.matrix) }}
-
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Start released image through the documented all-in-one path
-        shell: bash
-        env:
-          RELEASE_IMAGE: ${{ env.IMAGE_NAME }}:${{ needs.version.outputs.image_version }}
-        run: |
-          set -euo pipefail
-          make stack-env
-          sed -i "s|^ASTRA_IMAGE=.*|ASTRA_IMAGE=${RELEASE_IMAGE}|" deployment/all-in-one/.env
-          sed -i 's|^MEMORIA_EMBEDDING_PROVIDER=.*|MEMORIA_EMBEDDING_PROVIDER=mock|' deployment/all-in-one/.env
-          make stack-up
-
-          revision="$(docker image inspect "${RELEASE_IMAGE}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
-          if [ "${revision}" != "${GITHUB_SHA}" ]; then
-            echo "Released image revision ${revision:-<missing>} does not match ${GITHUB_SHA}" >&2
+          expected_sources="$(jq -r '.include | length' <<< "${BUILD_MATRIX_JSON}")"
+          if [ "${#sources[@]}" -ne "${expected_sources}" ]; then
+            echo "Expected ${expected_sources} platform digests, found ${#sources[@]}" >&2
             exit 1
           fi
 
-      - name: Verify health and memory round trip
-        run: make stack-verify
-
-      - name: Show service logs after failure
-        if: ${{ failure() }}
-        working-directory: deployment/all-in-one
-        run: docker compose --env-file .env logs --no-color --tail=200 api memoria matrixone || true
-
-      - name: Remove release smoke stack
-        if: ${{ always() }}
-        run: make stack-clean || true
+          docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"
 
   promote:
     name: Promote Verified Release Tags
     needs:
       - version
-      - smoke
+      - merge
     runs-on: ubuntu-latest
     timeout-minutes: 15
 

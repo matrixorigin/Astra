@@ -75,7 +75,12 @@ services:
         if ! grep -qx "${UID:-1000}:${GID:-1000}" /var/log/memoria/.astra-owner 2>/dev/null; then
           chown -R "${UID:-1000}:${GID:-1000}" /var/log/memoria
           printf '%s\n' "${UID:-1000}:${GID:-1000}" > /var/log/memoria/.astra-owner
-          chown "${UID:-1000}:${GID:-1000}" /var/log/memoria/.astra-owner
+        fi
+        # The marker avoids a recursive scan on every start, while these
+        # inexpensive repairs handle a log file recreated by root later.
+        chown "${UID:-1000}:${GID:-1000}" /var/log/memoria /var/log/memoria/.astra-owner
+        if [ -e /var/log/memoria/api.log ]; then
+          chown "${UID:-1000}:${GID:-1000}" /var/log/memoria/api.log
         fi
     volumes:
       - ${MEMORIA_LOG_DIR:-./data/logs/memoria}:/var/log/memoria

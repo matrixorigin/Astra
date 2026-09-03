@@ -23,38 +23,65 @@ done
 api_port="$(env_resolve_value "$env_file" ASTRA_API_PORT 2>/dev/null || true)"
 memoria_port="$(env_resolve_value "$env_file" MEMORIA_PORT 2>/dev/null || true)"
 memoria_key="$(env_resolve_value "$env_file" MEMORIA_MASTER_KEY 2>/dev/null || true)"
-api_url="${ASTRA_SMOKE_API_URL:-http://127.0.0.1:${api_port:-17001}}"
-memoria_url="${ASTRA_SMOKE_MEMORIA_URL:-http://127.0.0.1:${memoria_port:-8100}}"
+bind_address="$(env_resolve_value "$env_file" ASTRA_BIND_ADDRESS 2>/dev/null || true)"
+http_host="$(env_http_host_from_bind "$bind_address")"
+api_url="${ASTRA_SMOKE_API_URL:-http://${http_host}:${api_port:-17001}}"
+memoria_url="${ASTRA_SMOKE_MEMORIA_URL:-http://${http_host}:${memoria_port:-8100}}"
 
 if [[ -z "$memoria_key" ]]; then
     echo "all-in-one verification failed: MEMORIA_MASTER_KEY is empty" >&2
     exit 1
 fi
 
-ready_response="$(curl --noproxy '*' --fail-with-body --silent --show-error --max-time 15 "$api_url/ready")"
+http_request() {
+    local stage="$1"
+    local url="$2"
+    local response
+    shift 2
+    if ! response="$(curl --noproxy '*' --fail-with-body --silent --show-error "$@" "$url")"; then
+        echo "all-in-one verification failed during ${stage}: ${url}" >&2
+        if [[ -n "$response" ]]; then
+            echo "Service response: $response" >&2
+        fi
+        return 1
+    fi
+    printf '%s' "$response"
+}
+
+ready_response="$(http_request "Astra readiness" "$api_url/ready" --max-time 15)"
 printf '%s' "$ready_response" | python3 -c '
 import json
 import sys
 
-response = json.load(sys.stdin)
+try:
+    response = json.load(sys.stdin)
+except (json.JSONDecodeError, UnicodeDecodeError) as error:
+    raise SystemExit(f"Astra readiness returned invalid JSON: {error}")
+if not isinstance(response, dict):
+    raise SystemExit(f"Astra readiness returned an unexpected payload: {response}")
 if response.get("status") != "ready" or response.get("database") != "connected":
     raise SystemExit(f"Astra is not ready: {response}")
 '
 echo "✅ Astra readiness: ready, database connected"
 
-health_response="$(curl --noproxy '*' --fail-with-body --silent --show-error --max-time 15 "$api_url/health")"
+health_response="$(http_request "Astra dependency health" "$api_url/health" --max-time 15)"
 printf '%s' "$health_response" | python3 -c '
 import json
 import sys
 
-response = json.load(sys.stdin)
+try:
+    response = json.load(sys.stdin)
+except (json.JSONDecodeError, UnicodeDecodeError) as error:
+    raise SystemExit(f"Astra health returned invalid JSON: {error}")
+if not isinstance(response, dict):
+    raise SystemExit(f"Astra health returned an unexpected payload: {response}")
 expected = {"status": "healthy", "database": "connected", "memoria": "connected"}
 if any(response.get(key) != value for key, value in expected.items()):
     raise SystemExit(f"Astra dependencies are not healthy: {response}")
 '
 echo "✅ Astra health: database and Memoria connected"
 
-curl --noproxy '*' --fail-with-body --silent --show-error --max-time 15 "$memoria_url/health" >/dev/null
+http_request "Memoria health" "$memoria_url/health" --max-time 15 >/dev/null
 echo "✅ Memoria health: HTTP 2xx"
 
 test_user="astra-all-in-one-smoke"
@@ -66,30 +93,34 @@ cleanup_memory() {
     if [[ -z "$memory_id" ]]; then
         return
     fi
-    if ! curl --noproxy '*' --fail-with-body --silent --show-error --max-time 15 \
+    if ! http_request "smoke memory cleanup" "$memoria_url/v1/memories/purge" --max-time 15 \
         -H "Authorization: Bearer ${memoria_key}" \
         -H "X-User-Id: ${test_user}" \
         -H 'Content-Type: application/json' \
         --data "{\"memory_ids\":[\"${memory_id}\"],\"reason\":\"all-in-one verification cleanup\"}" \
-        "$memoria_url/v1/memories/purge" >/dev/null; then
+        >/dev/null; then
         echo "⚠️  Could not remove smoke memory ${memory_id}; remove it manually." >&2
     fi
 }
 trap cleanup_memory EXIT
 
 store_response="$(
-    curl --noproxy '*' --fail-with-body --silent --show-error --max-time 30 \
+    http_request "memory store" "$memoria_url/v1/memories" --max-time 30 \
         -H "Authorization: Bearer ${memoria_key}" \
         -H "X-User-Id: ${test_user}" \
         -H 'Content-Type: application/json' \
-        --data "{\"content\":\"${content}\",\"memory_type\":\"semantic\",\"session_id\":\"${test_session}\"}" \
-        "$memoria_url/v1/memories"
+        --data "{\"content\":\"${content}\",\"memory_type\":\"semantic\",\"session_id\":\"${test_session}\"}"
 )"
 memory_id="$(printf '%s' "$store_response" | python3 -c '
 import json
 import sys
 
-response = json.load(sys.stdin)
+try:
+    response = json.load(sys.stdin)
+except (json.JSONDecodeError, UnicodeDecodeError) as error:
+    raise SystemExit(f"memory store returned invalid JSON: {error}")
+if not isinstance(response, dict):
+    raise SystemExit(f"memory store returned an unexpected payload: {response}")
 memory_id = response.get("memory_id")
 if not isinstance(memory_id, str) or not memory_id:
     raise SystemExit(f"store response has no memory_id: {response}")
@@ -98,19 +129,21 @@ print(memory_id)
 echo "✅ Memory store: returned an ID"
 
 retrieve_response="$(
-    curl --noproxy '*' --fail-with-body --silent --show-error --max-time 30 \
+    http_request "memory retrieval" "$memoria_url/v1/memories/retrieve" --max-time 30 \
         -H "Authorization: Bearer ${memoria_key}" \
         -H "X-User-Id: ${test_user}" \
         -H 'Content-Type: application/json' \
-        --data "{\"query\":\"violet cedar ${nonce} embedding\",\"top_k\":10,\"session_id\":\"${test_session}\",\"session_scope\":\"only\"}" \
-        "$memoria_url/v1/memories/retrieve"
+        --data "{\"query\":\"violet cedar ${nonce} embedding\",\"top_k\":10,\"session_id\":\"${test_session}\",\"session_scope\":\"only\"}"
 )"
 printf '%s' "$retrieve_response" | CONTENT="$content" MEMORY_ID="$memory_id" python3 -c '
 import json
 import os
 import sys
 
-response = json.load(sys.stdin)
+try:
+    response = json.load(sys.stdin)
+except (json.JSONDecodeError, UnicodeDecodeError) as error:
+    raise SystemExit(f"memory retrieval returned invalid JSON: {error}")
 rows = response.get("memories", response) if isinstance(response, dict) else response
 if not isinstance(rows, list):
     raise SystemExit(f"retrieve response is not a memory list: {response}")
@@ -124,18 +157,22 @@ if not any(
 echo "✅ Memory retrieval: exact stored ID and content returned"
 
 purge_response="$(
-    curl --noproxy '*' --fail-with-body --silent --show-error --max-time 15 \
+    http_request "memory cleanup" "$memoria_url/v1/memories/purge" --max-time 15 \
         -H "Authorization: Bearer ${memoria_key}" \
         -H "X-User-Id: ${test_user}" \
         -H 'Content-Type: application/json' \
-        --data "{\"memory_ids\":[\"${memory_id}\"],\"reason\":\"all-in-one verification cleanup\"}" \
-        "$memoria_url/v1/memories/purge"
+        --data "{\"memory_ids\":[\"${memory_id}\"],\"reason\":\"all-in-one verification cleanup\"}"
 )"
 printf '%s' "$purge_response" | python3 -c '
 import json
 import sys
 
-response = json.load(sys.stdin)
+try:
+    response = json.load(sys.stdin)
+except (json.JSONDecodeError, UnicodeDecodeError) as error:
+    raise SystemExit(f"memory cleanup returned invalid JSON: {error}")
+if not isinstance(response, dict):
+    raise SystemExit(f"memory cleanup returned an unexpected payload: {response}")
 purged = response.get("purged", response.get("deleted_count", 0))
 if not isinstance(purged, int) or purged < 1:
     raise SystemExit(f"smoke memory was not removed: {response}")

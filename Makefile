@@ -652,7 +652,9 @@ stack-up: stack-config
 	@echo "✅ Compose stack started"
 	@. scripts/lib/env_file.sh; \
 	API_PORT=$$(env_resolve_value "$(STACK_ENV)" ASTRA_API_PORT 2>/dev/null || true); \
-	echo "   API: http://localhost:$${API_PORT:-$(DEFAULT_API_PORT)}"
+	BIND_ADDRESS=$$(env_resolve_value "$(STACK_ENV)" ASTRA_BIND_ADDRESS 2>/dev/null || true); \
+	API_HOST=$$(env_http_host_from_bind "$$BIND_ADDRESS"); \
+	echo "   API: http://$$API_HOST:$${API_PORT:-$(DEFAULT_API_PORT)}"
 
 .PHONY: stack-up-server-only
 stack-up-server-only:
@@ -665,7 +667,9 @@ stack-up-server-only:
 stack-up-server-edge: stack-up-server-only
 	@. scripts/lib/env_file.sh; \
 	API_PORT=$$([ -f "$(STACK_ENV)" ] && env_resolve_value "$(STACK_ENV)" ASTRA_API_PORT 2>/dev/null || true); \
-	ASTRA_EDGE_SERVER_URL="http://127.0.0.1:$${API_PORT:-$(DEFAULT_API_PORT)}" $(MAKE) dev-edge-start
+	BIND_ADDRESS=$$([ -f "$(STACK_ENV)" ] && env_resolve_value "$(STACK_ENV)" ASTRA_BIND_ADDRESS 2>/dev/null || true); \
+	API_HOST=$$(env_http_host_from_bind "$$BIND_ADDRESS"); \
+	ASTRA_EDGE_SERVER_URL="http://$$API_HOST:$${API_PORT:-$(DEFAULT_API_PORT)}" $(MAKE) dev-edge-start
 	@echo "✅ Server + edge stack ready"
 
 .PHONY: stack-down

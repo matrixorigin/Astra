@@ -12,12 +12,13 @@ A tag named `vX.Y.Z` triggers both release workflows:
 - `release-docker.yml` publishes the multi-architecture
   `matrixorigin/astra:X.Y.Z` image to Docker Hub.
 
-The Docker workflow first publishes the immutable version tag, starts that
-image through the documented all-in-one deployment on every built platform,
-and verifies API health plus an exact memory write/retrieval. Only after those
-checks pass does a stable release update the `X.Y` and `latest` container tags.
-A prerelease such as `v0.2.0-rc.1` is marked as a GitHub prerelease and does not
-update those rolling tags.
+The Docker workflow first starts each untagged platform image by its immutable
+digest through the documented all-in-one deployment, then verifies API health
+plus an exact memory write/retrieval. Only after every platform passes does the
+workflow publish the `X.Y.Z` manifest. A stable release then updates `X.Y` and
+`latest`; a prerelease such as `v0.2.0-rc.1` is marked as a GitHub prerelease
+and does not update those rolling tags. A failed candidate therefore changes no
+user-facing Docker tag.
 
 ## Prepare the release
 
@@ -63,7 +64,7 @@ Wait for both release workflows to pass, then verify:
 - Generated release notes group the included pull requests accurately.
 - A downloaded archive matches its published SHA-256 value.
 - The Docker version tag resolves to both `linux/amd64` and `linux/arm64`.
-- The Docker runtime smoke passed on every published platform, including the
+- The Docker runtime smoke passed on every built platform, including the
   all-in-one health and memory round-trip checks.
 - The binary reports the expected version and completes a basic CLI health
   check.

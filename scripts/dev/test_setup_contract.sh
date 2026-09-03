@@ -154,4 +154,13 @@ fi
 MEMORIA_EMBEDDING_BASE_URL=http://embeddings.internal/v1 \
     make --no-print-directory -s -C "$repo_root" stack-check-env STACK_ENV="$stack_env" >/dev/null
 
+# Stack status, verification, and edge startup must all derive a connectable
+# local URL from the same bind address Compose uses.
+# shellcheck source=../lib/env_file.sh
+. "$repo_root/scripts/lib/env_file.sh"
+[[ "$(env_http_host_from_bind 0.0.0.0)" == "127.0.0.1" ]]
+[[ "$(env_http_host_from_bind 192.0.2.10)" == "192.0.2.10" ]]
+[[ "$(env_http_host_from_bind ::)" == "[::1]" ]]
+[[ "$(env_http_host_from_bind 2001:db8::10)" == "[2001:db8::10]" ]]
+
 echo "setup contracts: ok"

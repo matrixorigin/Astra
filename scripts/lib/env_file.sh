@@ -84,3 +84,26 @@ env_resolve_value() {
         env_file_read "$env_resolve_file" "$env_resolve_key"
     fi
 }
+
+# Convert a Docker host-port bind address into an address a local HTTP client
+# can actually connect to. Wildcard binds are listeners, not destinations.
+env_http_host_from_bind() {
+    env_http_bind_address="${1:-}"
+    case "$env_http_bind_address" in
+        ""|0.0.0.0)
+            printf '%s\n' 127.0.0.1
+            ;;
+        ::|"[::]")
+            printf '%s\n' '[::1]'
+            ;;
+        "["*"]")
+            printf '%s\n' "$env_http_bind_address"
+            ;;
+        *:*)
+            printf '[%s]\n' "$env_http_bind_address"
+            ;;
+        *)
+            printf '%s\n' "$env_http_bind_address"
+            ;;
+    esac
+}
