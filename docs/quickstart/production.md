@@ -13,7 +13,10 @@ make test
 
 Use an immutable Astra release tag or image digest and replace every
 `CHANGE_ME_*` value in `.env.production.example`. Inject the populated values
-through your deployment platform; never commit the resulting file.
+through your deployment platform; never commit the resulting file. The
+checked-in deployment helper rejects missing values, template placeholders,
+mutable or implicit image tags, wildcard CORS, and undersized secrets before
+starting Compose.
 
 ## Single Host
 
@@ -24,18 +27,20 @@ start databases or memory services:
 cp .env.production.example .env.production
 # Edit .env.production and set external MatrixOne, Memoria, CORS, and secrets.
 
+./scripts/ops/deploy.sh 3
+```
+
+The helper validates the environment without evaluating it as shell code, then
+validates and starts the Compose profile. If you need to operate Compose
+directly, keep the same validation gate:
+
+```bash
+./scripts/ops/validate_production_env.sh .env.production
 cd deployment/all-in-one
 docker compose --env-file ../../.env.production \
   -f docker-compose.prod.yml config --quiet
 docker compose --env-file ../../.env.production \
   -f docker-compose.prod.yml up -d --scale api=3
-```
-
-From the repository root, the checked-in helper performs the same validation
-and startup without parsing the environment file in the shell:
-
-```bash
-./scripts/ops/deploy.sh 3
 ```
 
 The API containers are reachable only through the Nginx service, so scaling

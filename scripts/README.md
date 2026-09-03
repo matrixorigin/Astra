@@ -197,4 +197,6 @@ Keep installer behavior there so the public install path, documentation, and rel
 Operational helpers for health checks, backup/restore, and deployment.
 `deploy.sh [api-replicas]` validates and starts the canonical production
 Compose profile using root `.env.production` (override the path with
-`ASTRA_PRODUCTION_ENV_FILE`).
+`ASTRA_PRODUCTION_ENV_FILE`). `validate_production_env.sh` enforces required
+values, immutable image selection, trusted CORS origins, and minimum secret
+lengths without evaluating the environment file.

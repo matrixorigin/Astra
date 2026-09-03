@@ -156,9 +156,10 @@ make dev-start
 
 The `dev-init` command automatically:
 
-- Generates `ASTRA_TOKEN_ENCRYPTION_KEY` if missing
-- Generates `ASTRA_JWT_SECRET` if missing
-- Generates `ASTRA_RUNTIME_ROOT_SECRET` if missing or still using the template placeholder
+- Generates `ASTRA_TOKEN_ENCRYPTION_KEY` if missing or still using a template placeholder
+- Generates `ASTRA_JWT_SECRET` if missing or still using a template placeholder
+- Generates `ASTRA_RUNTIME_ROOT_SECRET` if missing or still using a template placeholder
+- Generates `MEMORIA_MASTER_KEY` if missing or still using a template placeholder
 
 ## Proxy Configuration
 

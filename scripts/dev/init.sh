@@ -1,7 +1,7 @@
 #!/bin/bash
 # Development environment initialization script (Rust-only)
 
-set -e
+set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 ENV_FILE="$PROJECT_ROOT/.env"
@@ -52,8 +52,16 @@ needs_generated_secret() {
         "$value" == astra-dev-* || "$value" == dev-master-key* ]]
 }
 
+generate_secret() {
+    if ! command -v openssl >/dev/null 2>&1; then
+        echo "❌ openssl is required to generate local secrets" >&2
+        return 1
+    fi
+    openssl rand "$@"
+}
+
 if needs_generated_secret "ASTRA_TOKEN_ENCRYPTION_KEY"; then
-    KEY="$(openssl rand -base64 32 | tr -d '\n')"
+    KEY="$(generate_secret -base64 32)"
     update_or_add "ASTRA_TOKEN_ENCRYPTION_KEY" "$KEY"
     echo "✅ Generated ASTRA_TOKEN_ENCRYPTION_KEY"
 else
@@ -61,7 +69,7 @@ else
 fi
 
 if needs_generated_secret "ASTRA_JWT_SECRET"; then
-    JWT_KEY="$(openssl rand -hex 32)"
+    JWT_KEY="$(generate_secret -hex 32)"
     update_or_add "ASTRA_JWT_SECRET" "$JWT_KEY"
     echo "✅ Generated ASTRA_JWT_SECRET"
 else
@@ -69,7 +77,7 @@ else
 fi
 
 if needs_generated_secret "ASTRA_RUNTIME_ROOT_SECRET"; then
-    RUNTIME_ROOT_KEY="$(openssl rand -hex 32)"
+    RUNTIME_ROOT_KEY="$(generate_secret -hex 32)"
     update_or_add "ASTRA_RUNTIME_ROOT_SECRET" "$RUNTIME_ROOT_KEY"
     echo "✅ Generated ASTRA_RUNTIME_ROOT_SECRET"
 else
@@ -77,7 +85,7 @@ else
 fi
 
 if needs_generated_secret "MEMORIA_MASTER_KEY"; then
-    MEMORIA_KEY="$(openssl rand -hex 32)"
+    MEMORIA_KEY="$(generate_secret -hex 32)"
     update_or_add "MEMORIA_MASTER_KEY" "$MEMORIA_KEY"
     echo "✅ Generated MEMORIA_MASTER_KEY"
 else

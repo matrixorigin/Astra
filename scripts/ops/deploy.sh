@@ -9,11 +9,6 @@ COMPOSE_FILE="${REPO_ROOT}/deployment/all-in-one/docker-compose.prod.yml"
 ENV_FILE="${ASTRA_PRODUCTION_ENV_FILE:-${REPO_ROOT}/.env.production}"
 API_REPLICAS="${1:-${ASTRA_API_REPLICAS:-1}}"
 
-if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
-    echo "Error: Docker with the Compose plugin is required." >&2
-    exit 1
-fi
-
 if [ ! -f "${ENV_FILE}" ]; then
     echo "Error: production environment file not found: ${ENV_FILE}" >&2
     echo "Create it with: cp ${REPO_ROOT}/.env.production.example ${REPO_ROOT}/.env.production" >&2
@@ -26,6 +21,13 @@ case "${API_REPLICAS}" in
         exit 1
         ;;
 esac
+
+"${SCRIPT_DIR}/validate_production_env.sh" "${ENV_FILE}"
+
+if ! command -v docker >/dev/null 2>&1 || ! docker compose version >/dev/null 2>&1; then
+    echo "Error: Docker with the Compose plugin is required." >&2
+    exit 1
+fi
 
 compose() {
     docker compose --env-file "${ENV_FILE}" -f "${COMPOSE_FILE}" "$@"

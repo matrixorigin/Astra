@@ -4,7 +4,7 @@
 
 | Command | Description |
 | --- | --- |
-| `make dev-init` | Create `.env` if needed and fetch Rust dependencies |
+| `make dev-init` | Create `.env`, generate local secrets, and fetch development dependencies |
 | `make dev-start` | Start dependencies and the API from source |
 | `make dev-stop` | Stop local services |
 | `make dev-status` | Show dependency and API status |

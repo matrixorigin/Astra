@@ -340,7 +340,7 @@ pub struct AuthConfig {
     pub refresh_ttl_days: Option<u64>,
     /// Root secret for purpose-separated runtime signatures (required in production).
     pub runtime_root_secret: Option<String>,
-    /// Fernet key for encrypting LLM API keys.
+    /// High-entropy secret used to derive a Fernet key for encrypting LLM API keys.
     pub token_encryption_key: Option<String>,
     /// Local authentication rules for provider-originated API calls.
     pub provider_request_auth: Vec<ProviderRequestAuthConfig>,
