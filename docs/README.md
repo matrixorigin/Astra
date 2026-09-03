@@ -14,7 +14,7 @@ operators, and kernel contributors to the level of detail they need.
 
 | Goal | Start here | Next |
 | --- | --- | --- |
-| **Evaluate or use Astra** | [Getting started](quickstart/README.md) | [CLI reference](reference/cli-commands.md), [TUI slash commands](reference/slash-commands.md), [examples](../examples/README.md) |
+| **Evaluate or use Astra** | [Getting started](quickstart/README.md) | [CLI reference](reference/cli-commands.md), [TUI slash commands](reference/slash-commands.md), [configuration](reference/configuration.md) |
 | **Build a product on Astra** | [TypeScript SDK](../packages/sdk/README.md) | [HTTP API](reference/api-reference.md), [configuration](reference/configuration.md) |
 | **Deploy and operate Astra** | [Deployment overview](../deployment/README.md) | [Docker](quickstart/docker.md), [production](quickstart/production.md), [troubleshooting](guides/troubleshooting.md) |
 | **Develop or contribute** | [Developer setup](quickstart/development.md) | [Development workflow](guides/development-workflow.md), [testing](guides/testing.md), [Make targets](reference/makefile-commands.md) |
@@ -29,7 +29,7 @@ operators, and kernel contributors to the level of detail they need.
 | [TUI slash commands](reference/slash-commands.md) | Interactive workspace, planning, observability, memory, MCP, and team commands |
 | [TypeScript SDK](../packages/sdk/README.md) | REST, SSE, WebSocket, React hooks, and browser integration |
 | [HTTP API](reference/api-reference.md) | Authentication and server resource contracts |
-| [Examples](../examples/README.md) | Maintained hands-on flows and integration-test examples |
+| [Configuration](reference/configuration.md) | Models, authentication, Server, User Runner, and observability settings |
 
 ## Deploy and operate Astra
 
@@ -89,6 +89,7 @@ ownership boundaries.
 | `design/` | Normative architecture and target behavior |
 | `architecture/` | Cross-domain architecture views |
 | `testing/` | Test strategy, matrices, and coverage contracts |
+| `product/` | Versioned product acceptance baselines; not current user guidance |
 
 ## Documentation rules
 

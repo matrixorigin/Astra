@@ -1,6 +1,6 @@
 //! Live MatrixOne checks for list endpoints (`pagination` caps, `skills_registry` seek list + index),
 //! cross-session audit aggregates (`get_cross_session_stats`, `list_sessions`, runtime
-//! promotions), and durable-task `resume_task` verification history reads.
+//! promotions), session restore, and owner-bound sync behavior.
 //!
 //! ```text
 //! ASTRA_TEST_DB_IT=1 cargo test -p astra-services --test services_db_integration -- --ignored

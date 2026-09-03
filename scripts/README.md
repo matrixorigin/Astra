@@ -6,6 +6,10 @@ Scripts are organized by responsibility and kept dependency-light.
 
 ```text
 scripts/
+├── harness/
+│   ├── preflight.py
+│   ├── run_terminal_bench_current.sh
+│   └── test_*.py
 ├── dev/
 │   ├── init.sh
 │   ├── start-api.sh
@@ -29,10 +33,28 @@ scripts/
 │   ├── deploy.sh
 │   ├── health_check.sh
 │   └── restore.sh
-└── README.md
+├── phase0-production-baseline.sh
+└── validate-release-version.sh
 ```
 
 ## Key Scripts
+
+### `scripts/harness/`
+
+Owns the Terminal-Bench/Harbor benchmark lifecycle: preflight checks, fresh
+database contracts, process supervision, sealed run snapshots, verifier
+readiness, recovery metadata, and the current benchmark launcher. Its colocated
+`test_*.py` and `test_*.sh` files are the offline contract tests for the harness.
+
+Run the harness tests without starting a benchmark:
+
+```sh
+python3 -m unittest discover -s scripts/harness -p 'test_*.py'
+bash scripts/harness/test_local_gateway_contract.sh
+```
+
+See the [Terminal-Bench results](../README.md#terminal-bench-21) for the public
+benchmark summary.
 
 ### `scripts/dev/init.sh`
 Initializes local development configuration, generating required local secrets in `.env`, and prepares the Rust-first workflow behind `make dev-init`.
@@ -140,6 +162,17 @@ offline, dependency-free guard against renamed or deleted evidence anchors:
 ```sh
 python3 scripts/e2e/validate_capability_matrix.py
 ```
+
+### `scripts/render_readme_diagrams.py`
+Regenerates the README architecture diagrams under `docs/assets/diagrams/` as
+matching light and dark SVG pairs. Standard library only:
+
+```sh
+python3 scripts/render_readme_diagrams.py
+```
+
+Edit the diagram definitions in this script rather than the generated SVG, then
+commit the regenerated files.
 
 ### Public CLI Installer
 The published `astra` CLI installer is owned by the public `matrixorigin/astra-suite` repository:

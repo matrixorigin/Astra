@@ -33,8 +33,3 @@ scrape_configs:
   # - job_name: 'matrixone'
   #   static_configs:
   #     - targets: ['host.docker.internal:6001']
-
-  # Redis metrics (if redis_exporter is used)
-  # - job_name: 'redis'
-  #   static_configs:
-  #     - targets: ['redis-exporter:9121']

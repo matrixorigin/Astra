@@ -16,7 +16,10 @@ cargo test -p astra-runtime --test system_matrix_http_e2e --features e2e-hooks -
   --ignored --nocapture
 ```
 
-Requires the same environment as `astra-server`: `MATRIXONE_*`, `ASTRA_JWT_SECRET` / `` and related keys via `astra_core::AppSettings::from_env`, etc. Use a local `.env` if you use one for development.
+Requires the same environment as `astra-server`: `MATRIXONE_*`,
+`ASTRA_JWT_SECRET`, `ASTRA_TOKEN_ENCRYPTION_KEY`, Memoria, and related settings
+parsed by `astra_core::AppSettings::from_env`. Use a local `.env` if you use
+one for development.
 
 ## Environment variables (对照表)
 
@@ -37,7 +40,7 @@ Requires the same environment as `astra-server`: `MATRIXONE_*`, `ASTRA_JWT_SECRE
 | `ASTRA_TOKEN_ENCRYPTION_KEY` | Token encryption | Default dev string if unset |
 | `MEMORIA_EMBEDDING_*` | Embeddings config | `MEMORIA_EMBEDDING_DIM` may be required for unknown models |
 | `ASTRA_RUNTIME_ROOT_SECRET` | Runtime signature root | Required by the production-shaped server state; artifact and execution-grant keys are purpose-derived from it |
-| `ASTRA_TEST_DB_IT_TEST_THREADS` | Makefile only | Set to `1` to run `system_matrix_http_e2e` with `--test-threads=1` (serial) |
+| `ASTRA_TEST_DB_IT_TEST_THREADS` | Makefile and CI | Set to `1` to run online integration binaries serially (`-j 1`) |
 
 Evaluation **read** routes in the full journey use `x-user-id` without bearer (see `journey_full`). Other authenticated calls use the JWT from `bootstrap`.
 
@@ -45,7 +48,7 @@ Evaluation **read** routes in the full journey use `x-user-id` without bearer (s
 
 Ignored tests in `system_matrix_http_e2e` avoid overlap with the full journey (e.g. no separate “basic session” test that repeats the same list/get/close/resume steps).
 
-**Related (separate crate / gate):** `ASTRA_TEST_DB_IT=1` runs `cargo test -p astra-services --test services_db_integration -- --ignored` (MatrixOne): pagination clamps, `skills_registry` list/index, cross-session audit service paths, and `MatrixOneDurableTaskLifecycle::resume_task` verification history (see that test file’s module doc).
+**Related (separate crate / gate):** `ASTRA_TEST_DB_IT=1` runs `cargo test -p astra-services --test services_db_integration -- --ignored` (MatrixOne): pagination clamps, `skills_registry` list/index, cross-session audit paths, session restore, and owner-bound sync behavior (see that test file’s module doc).
 
 | Test name | File / module | Scope |
 |-----------|---------------|-------|
@@ -86,8 +89,8 @@ Shared helpers: `crates/runtime/tests/system_matrix_http_e2e/harness.rs`
 
 - **Shared database**: All tests use the same MatrixOne database from `AppSettings` (typically `astra_runtime`). There is **no separate schema per test**.
 - **Row isolation**: Each `bootstrap()` registers a **new user** (`prod_matrix_{uuid}`), creates a **new** `session_id`, and uses an `edge_agent_id` / `suffix` unique to that run. API state and SQL assertions are scoped by those IDs.
-- **Parallel runs**: Tests are safe to run in parallel by default (`cargo` / `make test-online` without `ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS=1`). The full journey uses a **suffix-scoped marketplace skill name** (`e2e_matrix_mkt_{suffix}`) so concurrent runs do not fight over the same global marketplace stats key.
-- **Opt-in serial**: If you hit flakiness (shared Redis keys, connection limits, etc.), run with `ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS=1` (see `Makefile` `test-ignored-integration`) to force `--test-threads=1` for `system_matrix_http_e2e` only.
+- **Parallel runs**: Tests are safe to run in parallel by default (`cargo` / `make test-online` without `ASTRA_TEST_DB_IT_TEST_THREADS=1`). The full journey uses a **suffix-scoped marketplace skill name** (`e2e_matrix_mkt_{suffix}`) so concurrent runs do not fight over the same global marketplace stats key.
+- **Opt-in serial**: If database connection limits or another shared dependency makes the lane flaky, run with `ASTRA_TEST_DB_IT_TEST_THREADS=1`. The Makefile passes `-j 1` to the online `nextest` invocations.
 
 ## API groups vs coverage (P0 / P1)
 
@@ -127,7 +130,7 @@ Legend: **DB** = SQL assertion on MatrixOne; **HTTP** = response-only; **—** =
 
 ## CI
 
-- **PR** (`.github/workflows/test.yml`): MatrixOne + Redis service containers; single `make test` step with `ASTRA_TEST_DB_IT`, `ASTRA_SYSTEM_MATRIX_E2E_TEST_THREADS`, and `ASTRA_TEST_DB_IT` set for ignored **`system_matrix_http_e2e`** and **`multi_agent_integration`**. See also [`coverage-matrix.md`](./coverage-matrix.md).
+- **PR** (`.github/workflows/test.yml`): offline tests are sharded by package; two online lanes start MatrixOne and Memoria through `make dev-deps-up`, set `ASTRA_TEST_DB_IT=1` and `ASTRA_TEST_DB_IT_TEST_THREADS=1`, and run the core and integration groups separately. See also [`coverage-matrix.md`](./coverage-matrix.md).
 - **Manual / nightly**: `.github/workflows/e2e-matrix-nightly.yml` — `workflow_dispatch` with optional **test name filter** (substring) to run a subset (e.g. `e2e_matrix_chat_run_pause_resume_http`) or leave empty for all ignored tests in the binary.
 
 ## Router groups alignment

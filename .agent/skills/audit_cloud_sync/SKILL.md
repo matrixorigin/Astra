@@ -1,14 +1,14 @@
 ---
 name: audit-cloud-sync
-description: "Audit Astra edge/cloud synchronization using local journals/checkpoints and current MatrixOne projection tables. Use for event ingestion gaps, restore/checkpoint mismatch, task projection drift, and skill/learning visibility issues."
+description: "Audit Astra edge/cloud synchronization using local journals/checkpoints and current MatrixOne projection tables. Use for event ingestion gaps, restore/checkpoint mismatch, Work projection drift, and skill/learning visibility issues."
 user_invocable: true
 when_to_use: "When the user wants to audit edge-cloud sync, event ingestion, restore behavior, checkpoint projection, task state, learning/preferences sync, or cloud/local data drift."
 arguments:
   - name: TARGET
-    description: "Session ID, run ID, task ID, or 'last'. Omit for most recent session."
+    description: "Session ID, run ID, Work ID, or 'last'. Omit for most recent session."
     required: false
   - name: ASPECT
-    description: "Audit focus: events, learning, checkpoints, tasks, skills, restore, or all. Default: all."
+    description: "Audit focus: events, learning, checkpoints, work, skills, restore, or all. Default: all."
     required: false
 allowed_tools:
   - bash
@@ -31,18 +31,19 @@ $ARGUMENTS
 Before querying data, confirm table names and owner modules from the repo:
 
 ```bash
-rg -n "CREATE TABLE IF NOT EXISTS (agent_events|agent_sessions|session_checkpoints|run_checkpoints|agent_tasks|task_contracts|verification_results|user_preferences|skills_registry)" crates/services/src/storage.rs
+rg -n "CREATE TABLE IF NOT EXISTS (agent_events|agent_sessions|session_checkpoints|run_checkpoints|user_preferences|skills_registry)" crates/services/src/storage.rs
+rg -n "CREATE TABLE IF NOT EXISTS work_(items|branches|check_runs|acceptance_decisions|events|runtime_event_outbox)" crates/services/src/work.rs
 rg -n "HybridRestoreService|RestoredSession|restore_recent_tools|session_checkpoints|run_checkpoints|learning_snapshots|skills_registry" crates/services crates/runtime crates/astra-cli --glob '!target/**'
 ```
 
 Reference document when the issue involves restore, checkpoints, or skill paths:
-`docs/edge-cloud-sync-architecture.md`, especially section 8.
+`docs/architecture/edge-cloud-sync-architecture.md`, especially section 8.
 
 Important current facts:
 
 - `agent_events` and `agent_sessions` are core projection tables.
 - `session_checkpoints` stores session checkpoints; `run_checkpoints` stores run checkpoint payloads.
-- `agent_tasks`, `task_contracts`, and `verification_results` cover durable task state.
+- `work_items`, `work_branches`, `work_check_runs`, and `work_acceptance_decisions` cover durable Work declaration and verification state.
 - `skills_registry` is the database-backed skill catalog for web/runtime skills.
 - `user_preferences` is current; `session_sync_log` is intentionally dropped in schema setup and must not be used as proof of current sync health.
 
@@ -80,7 +81,7 @@ Suggested query dimensions:
 | Session projection | `agent_sessions` by `user_id`, `session_id`, `event_count`, status fields |
 | Session checkpoints | `session_checkpoints` by `user_id`, `session_id`, `number`, `turn` |
 | Run checkpoints | `run_checkpoints` by `user_id`, `session_id`, `run_id`, `checkpoint_kind` |
-| Durable tasks | `agent_tasks`, `task_contracts`, `verification_results` |
+| Durable Work | `work_items`, `work_branches`, `work_check_runs`, `work_acceptance_decisions`, `work_events` |
 | Skills | `skills_registry` plus runtime/API `GET /skills` path if testing web visibility |
 | Preferences | `user_preferences` |
 
@@ -101,10 +102,10 @@ Checkpoints:
 - `run_checkpoints` should be used for run-scoped recovery, not confused with session rewind checkpoints.
 - For restore bugs, compare `astra_services::session_restore::RestoredSession` with runtime step restore data; they are distinct layers.
 
-Tasks:
+Work:
 
-- `agent_tasks.status`, task plan JSON, task contract status, and verification results must describe the same lifecycle.
-- A completed task without verification evidence is a task lifecycle issue, not just sync lag.
+- Work item revisions, check runs, acceptance decisions, and Work events must refer to compatible goal, graph, and criteria revisions.
+- A delivered Work branch without current check and acceptance evidence is a Work lifecycle issue, not just sync lag.
 
 Skills:
 
@@ -116,7 +117,7 @@ Skills:
 
 ```text
 Scope:
-- target=<session/run/task>, aspect=<aspect>, mode=<local-only|local+cloud>
+- target=<session/run/work>, aspect=<aspect>, mode=<local-only|local+cloud>
 
 Evidence:
 - local: <journal/checkpoint/digest facts>

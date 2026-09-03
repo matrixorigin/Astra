@@ -6,8 +6,8 @@
 
 **Right context. Governed actions. Runners where your IT lives. End-to-end traceability.**
 
-[![Test Suite](https://github.com/matrixorigin/astra/actions/workflows/test.yml/badge.svg)](https://github.com/matrixorigin/astra/actions/workflows/test.yml)
-[![Static Checks](https://github.com/matrixorigin/astra/actions/workflows/static-checks.yml/badge.svg)](https://github.com/matrixorigin/astra/actions/workflows/static-checks.yml)
+[![Test Suite](https://github.com/matrixorigin/Astra/actions/workflows/test.yml/badge.svg)](https://github.com/matrixorigin/Astra/actions/workflows/test.yml)
+[![Static Checks](https://github.com/matrixorigin/Astra/actions/workflows/static-checks.yml/badge.svg)](https://github.com/matrixorigin/Astra/actions/workflows/static-checks.yml)
 [![VLDB ADS](https://img.shields.io/badge/VLDB_ADS-Accepted-6F42C1)](https://vldb-ads.top/)
 [![arXiv](https://img.shields.io/badge/arXiv-2609.00749-B31B1B?logo=arxiv&logoColor=white)](https://arxiv.org/abs/2609.00749)
 [![Terminal-Bench](https://img.shields.io/badge/Terminal--Bench_2.1-67.4%25-0A7EA4)](#terminal-bench-21)
@@ -63,6 +63,16 @@ Astra makes that full loop part of the runtime:
 
 ### From context to execution
 
+<div align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/diagrams/context-to-execution-dark.svg">
+  <img alt="Vertical flow: the Context Pipeline assembles task, enterprise, runtime and memory state; the model decides; policy and provider admission binds identity, capability, permission and execution route; a Runner executes inside the owning environment; and Trace, Introspect, Explain and Reflect feed durable Work and future context back into the pipeline." src="docs/assets/diagrams/context-to-execution.svg" width="660">
+</picture>
+</div>
+
+<details>
+<summary>Text version</summary>
+
 ```text
 Context Pipeline
       │  assemble task, enterprise, runtime, and memory state
@@ -80,6 +90,8 @@ Trace ──► Introspect ──► Explain / Reflect
       │
       └──► durable Work and future context
 ```
+
+</details>
 
 Models and tools can change. Astra preserves the context, execution boundary,
 lifecycle, provider decision, and evidence model around them.
@@ -187,8 +199,8 @@ Web dashboard.
 #### 1. Initialize
 
 ```bash
-git clone https://github.com/matrixorigin/astra.git
-cd astra
+git clone https://github.com/matrixorigin/Astra.git
+cd Astra
 
 cp .models.yaml.example .models.yaml
 make dev-init
@@ -306,6 +318,16 @@ Astra has one durable agent backbone and multiple bounded capacity providers.
 Interfaces do not own separate agent loops; each environment contributes the
 capabilities it can safely execute.
 
+<div align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/diagrams/architecture-dark.svg">
+  <img alt="Experience surfaces sit above a durable control backbone. The Context Pipeline, model decision and policy decision fan out to execution capacity: Server provider, User Runner on CLI or Edge, and MCP or sandbox. The User Runner reaches private enterprise IT. Evidence returns to the Context Pipeline as future context, over durable facts in MatrixOne and Memoria." src="docs/assets/diagrams/architecture.svg" width="900">
+</picture>
+</div>
+
+<details>
+<summary>Text version</summary>
+
 ```text
 Experience
   Web dashboard · CLI/TUI · TypeScript SDK · API clients
@@ -333,6 +355,8 @@ Context Pipeline ──► model decision ──► Policy + provider decision
 Durable facts
   MatrixOne · Memoria · transcript · artifacts · checkpoints · trace · audit
 ```
+
+</details>
 
 One lifecycle connects four system planes: **Intelligence** assembles context,
 **Control** owns durable Work and policy, **Execution** supplies bounded
@@ -442,6 +466,16 @@ Session
 - **Checkpoints and events** make pause, resume, reconnect, and recovery
   reconstructable from durable facts.
 
+<div align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/diagrams/run-lifecycle-dark.svg">
+  <img alt="A run moves from queued to running to completed. From running it can enter waiting, paused or blocked and return to running, or move to cancelling and then cancelled, or to failed." src="docs/assets/diagrams/run-lifecycle.svg" width="860">
+</picture>
+</div>
+
+<details>
+<summary>Text version</summary>
+
 ```text
 queued → running → completed
              ├── waiting ──→ running
@@ -451,6 +485,8 @@ queued → running → completed
              └── failed
 ```
 
+</details>
+
 ### Context Pipeline
 
 The Context Pipeline is a core Astra kernel contribution described in
@@ -459,6 +495,16 @@ at ADS 2026, co-located with VLDB 2026. It is the intelligence plane between
 durable enterprise state and each model decision. Context is treated as a
 governed, recoverable data pipeline—not one indefinitely growing prompt string
 and not a one-time retrieval step.
+
+<div align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/diagrams/context-pipeline-dark.svg">
+  <img alt="Six structured inputs are assembled, then selected, budgeted and compressed into the model boundary. Decision, usage and checkpoint output returns as future context." src="docs/assets/diagrams/context-pipeline.svg" width="880">
+</picture>
+</div>
+
+<details>
+<summary>Text version</summary>
 
 ```text
 System contract ─────────────┐
@@ -471,6 +517,8 @@ Trace · reflection ──────────┘                           
                                                         │
                                                         └──► future context
 ```
+
+</details>
 
 At every model boundary, the pipeline turns the current Work, memory,
 artifacts, runtime availability, policy state, and prior execution facts into a
@@ -518,6 +566,16 @@ Runner and Edge are therefore not synonyms: Runner describes the execution
 boundary; Edge describes where that boundary is deployed. A User Runner
 describes who owns and authorizes it.
 
+<div align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/diagrams/runner-boundary-dark.svg">
+  <img alt="A user or app submits durable Work to the Astra Server, which owns durable Work, identity, context, policy and the provider decision. An admitted tool call goes to a User Runner inside the user or enterprise trust boundary, which reaches private enterprise IT: file, shell, Git, builds, private network and local MCP. A typed result with execution identity and evidence returns to the backbone." src="docs/assets/diagrams/runner-boundary.svg" width="660">
+</picture>
+</div>
+
+<details>
+<summary>Text version</summary>
+
 ```text
 User / app
     │ submit durable Work
@@ -533,6 +591,8 @@ Private enterprise IT
     │
     └──── typed result + execution identity + evidence ────► backbone
 ```
+
+</details>
 
 This is the last-mile integration layer between an agent and the systems where
 enterprise work already lives. Instead of exposing every internal system to a
@@ -557,12 +617,24 @@ The Runner contributes bounded execution capacity, not a second agent brain:
 The observation plane is part of the agent contract, not an after-the-fact log
 viewer:
 
+<div align="center">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/diagrams/observation-plane-dark.svg">
+  <img alt="Runtime facts flow into Trace, then Introspect, which projects into Explain and Reflect. Trace and policy decisions both feed Audit." src="docs/assets/diagrams/observation-plane.svg" width="700">
+</picture>
+</div>
+
+<details>
+<summary>Text version</summary>
+
 ```text
 Runtime facts ──► Trace ──► Introspect ──► Explain
                     │             └──────► Reflect
                     │
 Policy decisions ───┴─────────────► Audit
 ```
+
+</details>
 
 | Component | Question it answers | Authority |
 | --- | --- | --- |
@@ -604,7 +676,7 @@ documentation is organized by reader goal:
 | I want to... | Start here | Continue with |
 | --- | --- | --- |
 | **Try and use Astra** | [Getting started](docs/quickstart/README.md) | [CLI commands](docs/reference/cli-commands.md) and [TUI slash commands](docs/reference/slash-commands.md) |
-| **Build an application** | [TypeScript SDK](packages/sdk/README.md) | [HTTP API](docs/reference/api-reference.md) and [examples](examples/README.md) |
+| **Build an application** | [TypeScript SDK](packages/sdk/README.md) | [HTTP API](docs/reference/api-reference.md) and [configuration](docs/reference/configuration.md) |
 | **Deploy and operate** | [Deployment overview](deployment/README.md) | [Configuration](docs/reference/configuration.md) and [troubleshooting](docs/guides/troubleshooting.md) |
 | **Get help or report a problem** | [Support](SUPPORT.md) | [Questions, bug reports, documentation issues, and feature requests](https://github.com/matrixorigin/Astra/issues/new/choose) |
 | **Develop and contribute** | [Contributing guide](CONTRIBUTING.md) | [Developer setup](docs/quickstart/development.md), [workflow](docs/guides/development-workflow.md), [testing](docs/guides/testing.md), and [Make targets](docs/reference/makefile-commands.md) |
@@ -661,9 +733,43 @@ Issues and pull requests are welcome. Before submitting a change:
 For substantial behavior changes, open an issue first so the runtime contract
 and implementation can evolve together.
 
+## Citation
+
+If Astra or the Context Pipeline is useful in your research, please cite the
+ContextPipe paper:
+
+```bibtex
+@inproceedings{xu2026contextpipe,
+  title         = {ContextPipe: Database-Inspired Context Assembly for Long-Horizon Agents},
+  author        = {Xu, Peng and Zhang, Zuyu and Sun, Yuze and Tian, Feng and Wang, Long and Zhang, Chen},
+  booktitle     = {Applied Data Science Track (ADS 2026), co-located with VLDB 2026},
+  year          = {2026},
+  eprint        = {2609.00749},
+  archivePrefix = {arXiv},
+  url           = {https://arxiv.org/abs/2609.00749}
+}
+```
+
+[`CITATION.cff`](CITATION.cff) also lets GitHub generate APA and BibTeX entries
+for the software itself through **Cite this repository**.
+
 ## License
 
 Astra is licensed under the [Apache License, Version 2.0](LICENSE).
+
+## Star history
+
+<div align="center">
+
+<a href="https://star-history.com/#matrixorigin/Astra&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=matrixorigin/Astra&type=Date&theme=dark">
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=matrixorigin/Astra&type=Date">
+    <img alt="Star history chart for matrixorigin/Astra" src="https://api.star-history.com/svg?repos=matrixorigin/Astra&type=Date" width="600">
+  </picture>
+</a>
+
+</div>
 
 ---
 

@@ -6,6 +6,20 @@
 - `deployment/kubernetes/` - cluster-oriented manifests and chart assets
 - `scripts/ops/` - operational helpers
 
+## Image Build Paths
+
+The release workflow builds multi-architecture images from the root
+[`Dockerfile`](../Dockerfile). Use this path for normal development and
+published releases.
+
+[`Dockerfile.prebuilt`](../Dockerfile.prebuilt) is a specialized amd64 path for
+packaging already cross-compiled `astra-server` and `astra` binaries without
+running a Rust build inside Docker. Its colocated
+[`Dockerfile.prebuilt.dockerignore`](../Dockerfile.prebuilt.dockerignore) keeps
+that build context limited to the two binaries and the license. Follow the
+prerequisite and build commands in the Dockerfile header; it is not used by the
+standard release workflow.
+
 ## Pre-Deployment Validation
 
 ```bash

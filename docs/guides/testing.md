@@ -5,13 +5,13 @@ This repository is validated through Rust-first checks, contract tests (fast, ma
 ## Primary Commands
 
 ```bash
-# Full suite: workspace + e2e-hooks + online #[ignore] Matrix E2E + multi-agent integration (requires MatrixOne + Redis for the online portion)
+# Full suite: workspace + e2e-hooks + online #[ignore] Matrix E2E + multi-agent integration (requires MatrixOne and Memoria for the online portion)
 make test
 
 # Workspace + server E2E hooks only (no online #[ignore] suites)
 make test-offline
 
-# Online #[ignore] suites only (exports ASTRA_TEST_DB_IT=1 and ASTRA_TEST_DB_IT=1)
+# Online #[ignore] suites only (exports ASTRA_TEST_DB_IT=1; set ASTRA_TEST_DB_IT_TEST_THREADS=1 for serial execution)
 make test-online
 
 # Narrow contract smoke (HTTP + admin integration binaries; settings JSON via astra-core lib tests)
@@ -36,7 +36,6 @@ cargo check --manifest-path Cargo.toml
 - `crates/runtime/tests/` — HTTP integration tests for `astra-runtime` (including `*_contract.rs`, `system_matrix_http_e2e/`, bridge E2E).
 - `crates/services/tests/` — service-layer tests (e.g. `multi_agent_integration` with live DB when `ASTRA_TEST_DB_IT=1`).
 - `fixtures/contracts/` — JSON fixtures for contract tests that load shared request/response shapes.
-- `tests/fixtures/golden_sessions/` — golden session payloads for selected flows.
 - Capability ↔ route ↔ E2E mapping: [`docs/testing/system-e2e-matrix.md`](../testing/system-e2e-matrix.md).
 - SaaS 能力测试计划：[`docs/testing/saas-test-plan.md`](../testing/saas-test-plan.md)（`make test-saas`；含 Rust HTTP E2E + 可选 `@astra/sdk` 远程）
 - Coverage matrix (what replaced stub tests, large-binary audit): [`docs/testing/coverage-matrix.md`](../testing/coverage-matrix.md).
@@ -53,7 +52,14 @@ cargo test -p astra-runtime --test system_matrix_http_e2e --features e2e-hooks -
   --ignored --nocapture
 ```
 
-Requires the same environment as `astra-server`: `MATRIXONE_*`, `ASTRA_JWT_SECRET` / ``, `ASTRA_TOKEN_ENCRYPTION_KEY`, Redis, embedding settings per `astra_core::AppSettings::from_env`. Use a local `.env` if you use one for development. To isolate from production on one MatrixOne host, set **`ASTRA_DATABASE_PREFIX`** (effective DB = prefix + `ASTRA_DATABASE`). Optionally set **`ASTRA_AUTO_CREATE_DATABASE=1`** so the first `ensure_core_schema` (server or online tests) runs `CREATE DATABASE IF NOT EXISTS` for that effective name (bootstrap catalog defaults to `mysql`).
+Requires the same environment as `astra-server`: `MATRIXONE_*`,
+`ASTRA_JWT_SECRET`, `ASTRA_TOKEN_ENCRYPTION_KEY`, Memoria, and embedding
+settings parsed by `astra_core::AppSettings::from_env`. Use a local `.env` if
+you use one for development. To isolate from production on one MatrixOne host,
+set **`ASTRA_DATABASE_PREFIX`** (effective DB = prefix + `ASTRA_DATABASE`).
+Optionally set **`ASTRA_AUTO_CREATE_DATABASE=1`** so the first
+`ensure_core_schema` (server or online tests) runs `CREATE DATABASE IF NOT
+EXISTS` for that effective name (bootstrap catalog defaults to `mysql`).
 
 ## Recommended Workflow
 
@@ -67,7 +73,7 @@ make test-contract
 # 3. Full workspace + server E2E hooks (no online #[ignore] suites)
 make test-offline
 
-# 4. With MatrixOne + Redis up: add online #[ignore] suites (same as the second half of `make test`)
+# 4. With MatrixOne + Memoria up: add online #[ignore] suites (same as the second half of `make test`)
 make test-online
 ```
 

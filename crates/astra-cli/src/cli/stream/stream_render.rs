@@ -11309,19 +11309,19 @@ mod tests {
         );
         // github
         assert_eq!(
-            format_tool_display_from_preview("github", Some("get_issue matrixorigin/astra#147")),
-            "GitHub: get_issue matrixorigin/astra#147"
+            format_tool_display_from_preview("github", Some("get_issue matrixorigin/Astra#147")),
+            "GitHub: get_issue matrixorigin/Astra#147"
         );
         assert_eq!(
-            format_tool_display_from_preview("github", Some("list_issues matrixorigin/astra")),
-            "GitHub: list_issues matrixorigin/astra"
+            format_tool_display_from_preview("github", Some("list_issues matrixorigin/Astra")),
+            "GitHub: list_issues matrixorigin/Astra"
         );
         assert_eq!(
             format_tool_display_from_preview(
                 "github",
-                Some("create_issue matrixorigin/astra: \"Fix renderer drift\"")
+                Some("create_issue matrixorigin/Astra: \"Fix renderer drift\"")
             ),
-            "GitHub: create_issue matrixorigin/astra: \"Fix renderer drift\""
+            "GitHub: create_issue matrixorigin/Astra: \"Fix renderer drift\""
         );
     }
 

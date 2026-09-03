@@ -26,7 +26,7 @@ Astra SaaS 指 MatrixOrigin 托管的 **Agent Runtime 云服务**，与本地 `-
 │  资源治理 · Admin · 运行时存储维护 · 多 Agent Run / Lease       │
 └────────────────────────────┬────────────────────────────────────┘
                              │
-              MatrixOne · Redis · Memoria ·（可选 Skill Worker）
+              MatrixOne · Memoria ·（可选 Skill Worker）
 ```
 
 **SaaS 与单机/私有化部署的区别**（测试必须覆盖）：
@@ -79,7 +79,7 @@ Astra SaaS 指 MatrixOrigin 托管的 **Agent Runtime 云服务**，与本地 `-
 - **第一层、第二层** 决定 SaaS 能否对外开服。
 - **第三层** 验证真实客户路径（CLI 开发者、SDK 集成方、Admin 运维）。
 - **第四层** 决定能否承载生产流量（Beta/GA 全量前必做）。
-- 测试环境：**类生产 SaaS 栈**（MatrixOne + Redis + Memoria + 多副本 API + 真实 LLM）。
+- 测试环境：**类生产 SaaS 栈**（MatrixOne + Memoria + 多副本 API + 真实 LLM）。
 
 ---
 
@@ -355,7 +355,7 @@ Token 消耗 → GET /resources/usage 准确
 | 拓扑 | 必测项 |
 |------|--------|
 | Docker Compose（all-in-one） | 一键启动；Init → API 健康 |
-| K8s + Helm | 2+ API 副本；外部 MatrixOne/Redis |
+| K8s + Helm | 2+ API 副本；外部 MatrixOne 与 Memoria |
 | HPA | CPU/RPS 触发扩容；扩容后 Session 粘性无要求（无状态） |
 | 滚动升级 | 零 downtime；进行中 Run 可恢复或失败可感知 |
 
@@ -385,7 +385,6 @@ helm install astra deployment/kubernetes/chart \
 |------|---------------|
 | 单 API Pod 终止 | 其他副本接管；客户端重试成功 |
 | MatrixOne 30s 不可用 | `/health` unhealthy；恢复后 OK |
-| Redis 不可用 | 限流/cache 降级（按设计 fail-open/closed） |
 | Memoria 不可用 | 记忆跳过；Chat 可用 |
 | LLM 区域故障 | fallback_chain 切换模型 |
 
@@ -393,7 +392,7 @@ helm install astra deployment/kubernetes/chart \
 
 | 项 | 验证 |
 |----|------|
-| `/health` | DB + Redis + 依赖状态 |
+| `/health` | DB + 运行时依赖状态 |
 | Prometheus 指标 | RPS、延迟、错误率、Run 数 |
 | `GET /introspection/*` | context trend、memory recall、retrieval quality |
 | `GET /events` | Session 时间线可导出 |
@@ -422,7 +421,6 @@ helm install astra deployment/kubernetes/chart \
 |------|------|
 | astra-server | ≥2 实例（第四层） |
 | MatrixOne | 独立测试 Account；可用 `ASTRA_DATABASE_PREFIX` 隔离 |
-| Redis | 与生产同 major 版本 |
 | Memoria | 真实实例或等价 test double |
 | LLM | GA 主模型 + fallback 模型各一 |
 

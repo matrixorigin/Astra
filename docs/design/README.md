@@ -1,7 +1,7 @@
 # Design documentation index
 
 > Status: canonical documentation map.
-> Last updated: 2026-07-19.
+> Last updated: 2026-09-03.
 
 The design docs are organized by orthogonal ownership boundaries. If a topic appears to belong in multiple places, write the invariant in the owning domain and reference it elsewhere instead of duplicating it.
 
@@ -16,6 +16,7 @@ These documents describe target contracts. They should not be read as proof that
 | Agent/provider model | [agent-backbone-capacity-provider.md](agent-backbone-capacity-provider.md) | Shared backbone semantics and capacity provider contract. |
 | Runtime lifecycle | [runtime-lifecycle.md](runtime-lifecycle.md) | Session, run, turn, task, plan, cancel, resume, recovery. |
 | Durable runs | [durable-agent-runs.md](durable-agent-runs.md) | Lease, checkpoint, resume, terminal outcome, crash recovery details. |
+| Background work journey | [background-work-user-journey.md](background-work-user-journey.md) | Foreground fan-in, explicit background handoff, visible states, and recovery UX. |
 | Capabilities | [capability-system.md](capability-system.md) | Tools, skills, MCP, provider decisions, admission, fallback. |
 | Capability provider runtime | [capability-provider-runtime.md](capability-provider-runtime.md) | Provider adapters, discovery snapshots, internal tool identity, invocation and typed outcome contracts. |
 | Skills and tools | [skills-and-tools.md](skills-and-tools.md) | Skill maturity, packaging, lifecycle, compatibility, discovery, evaluation, and rollout. |
@@ -28,6 +29,7 @@ These documents describe target contracts. They should not be read as proof that
 | Session observability | [session-observability.md](session-observability.md) | User/support visible status, stream projection, stuck diagnosis, reconnect. |
 | Tool result quality | [tool-result-quality-firewall.md](tool-result-quality-firewall.md) | Tool output validation, quality annotation, retry/fallback hints. |
 | Edge/cloud execution | [edge-cloud-execution.md](edge-cloud-execution.md) | Edge local capacity and server-safe fallback. |
+| Runtime tool boundary | [edge-runtime-tool-boundary.md](edge-runtime-tool-boundary.md) | Runtime authority domains, workspace isolation, side effects, and result containment. |
 | Cloud-edge sync | [../architecture/edge-cloud-sync-architecture.md](../architecture/edge-cloud-sync-architecture.md) | Durable outbox, sync facts, repair, retention. |
 | Orchestration | [orchestration.md](orchestration.md) | Multi-agent delegation, model selection per agent, coordination. |
 | Model access and inference | [model-access-and-inference.md](model-access-and-inference.md) | Cloud/Workspace/Device model access, TaaS bindings, Offerings, connections, inference placement, invocation, usage, and billing boundaries. |
@@ -46,6 +48,7 @@ These documents describe target contracts. They should not be read as proof that
 | Feedback control loop | [feedback-control-loop.md](feedback-control-loop.md) | Feedback collection, classification, proposal, activation, and monitoring. |
 | Tuning jobs | [tuning-jobs.md](tuning-jobs.md) | Controlled prompt/skill/routing/memory/model improvement workflows. |
 | Client/deployment | [client-surfaces-and-deployment.md](client-surfaces-and-deployment.md) | Web/CLI/TUI client boundaries and deployment topology. |
+| Web Agent runner | [web-agent-runner.md](web-agent-runner.md) | Web-specific stream, reconnect, provider-state, and diagnostic experience. |
 
 ## Anti-duplication rules
 

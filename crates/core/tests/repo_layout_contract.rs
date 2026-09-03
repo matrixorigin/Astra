@@ -107,8 +107,11 @@ fn dockerignore_excludes_only_the_whole_removed_workspace_path() {
 #[test]
 fn developer_guidance_uses_repo_root_workspace() {
     for relative in [
+        "AGENTS.md",
         "CLAUDE.md",
         ".claude/CLAUDE.md",
+        ".cursor/rules/project-rules.mdc",
+        ".kiro/steering/project-rules.md",
         ".agent/skills/astra-dev/SKILL.md",
         ".agent/skills/verify_task/SKILL.md",
         ".claude/skills/astra-dev/SKILL.md",
@@ -132,5 +135,52 @@ fn developer_guidance_uses_repo_root_workspace() {
                 "{relative} still references the removed rust/ workspace layout: {forbidden}"
             );
         }
+    }
+}
+
+#[test]
+fn developer_tool_adapters_delegate_to_canonical_guidance() {
+    for relative in [
+        "CLAUDE.md",
+        ".claude/CLAUDE.md",
+        ".cursor/rules/project-rules.mdc",
+        ".kiro/steering/project-rules.md",
+    ] {
+        let text = read_workspace_file(relative);
+        assert!(
+            text.contains("AGENTS.md"),
+            "{relative} must delegate repository-wide rules to AGENTS.md"
+        );
+        assert!(
+            text.contains("canonical"),
+            "{relative} must identify AGENTS.md as the canonical guidance"
+        );
+    }
+}
+
+#[test]
+fn design_index_covers_every_design_document() {
+    let design_root = workspace_path("docs/design");
+    let index = read_workspace_file("docs/design/README.md");
+
+    for entry in std::fs::read_dir(&design_root)
+        .unwrap_or_else(|e| panic!("read {}: {e}", design_root.display()))
+    {
+        let entry = entry.unwrap_or_else(|e| panic!("read design entry: {e}"));
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("md") {
+            continue;
+        }
+        let name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("design document file name must be UTF-8");
+        if name == "README.md" {
+            continue;
+        }
+        assert!(
+            index.contains(&format!("]({name})")),
+            "docs/design/{name} must appear in the canonical design index"
+        );
     }
 }
