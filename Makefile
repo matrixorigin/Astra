@@ -6,7 +6,7 @@ help:
 	@echo "=================================="
 	@echo ""
 	@echo "Quick Start:"
-	@echo "  make dev-start          - Start all (deps + API server + web UI)"
+	@echo "  make dev-start          - Start deterministic server-only development (deps + debug API + web)"
 	@echo "  make dev-start-server-only - Start server-only runtime (deps + API + web; no edge provider)"
 	@echo "  make dev-start-server-edge - Start server + local astra-edge provider"
 	@echo "  make dev-stop           - Stop all services"
@@ -43,7 +43,7 @@ help:
 	@echo "  make dev-edge-start     - Start local astra-edge provider for web/server workspace tools"
 	@echo "  make dev-edge-stop      - Stop local astra-edge provider"
 	@echo "  make dev-edge-logs      - Show astra-edge logs"
-	@echo "  make dev-edge-status    - Show astra-edge status"
+	@echo "  make dev-edge-status    - Show this checkout's repo-managed astra-edge status"
 	@echo ""
 	@echo "Testing:"
 	@echo "  make test               - test-offline + test-online (Rust DB online; optional SDK remote E2E if ASTRA_SDK_ONLINE_E2E=1)"
@@ -97,6 +97,7 @@ help:
 	@echo ""
 	@echo "All-in-One Docker Deployment:"
 	@echo "  make stack-env          - Create .env and generate stack secrets"
+	@echo "  make stack-start        - Initialize, start, and verify the Compose stack"
 	@echo "  make stack-up           - Start MatrixOne + Memoria + API"
 	@echo "  make stack-up-server-only - Start compose stack without local edge provider"
 	@echo "  make stack-up-server-edge - Start compose stack plus local astra-edge provider"
@@ -180,9 +181,6 @@ NEXTEST_PHASE0_BASELINE_EXCLUSION := not test(/e2e_matrix_phase0_(server_only_pr
 dev-init: setup install-dev-deps
 	@echo "Initializing development environment..."
 	@bash scripts/dev/init.sh
-	@echo ""
-	@echo "✅ Development environment initialized!"
-	@echo "Next: make dev-start"
 
 .PHONY: setup
 setup:
@@ -467,9 +465,10 @@ dev-edge-logs:
 .PHONY: dev-edge-status
 dev-edge-status:
 	@PID_FILE=$${ASTRA_EDGE_PID_FILE:-$(CURDIR)/astra_edge.pid}; \
-	echo "Edge Provider Status:"; \
-	echo "====================="; \
-	if [ -f "$$PID_FILE" ] && kill -0 $$(cat "$$PID_FILE") 2>/dev/null; then \
+	. ./scripts/dev/edge-process.sh; \
+	echo "Repo-managed Edge Provider Status:"; \
+	echo "=================================="; \
+	if [ -f "$$PID_FILE" ] && edge_process_is_owned "$(CURDIR)" "$$(cat "$$PID_FILE")"; then \
 		PID=$$(cat "$$PID_FILE"); \
 		echo "  ✅ Running (PID: $$PID)"; \
 	else \
@@ -527,6 +526,10 @@ release-check:
 		echo "❌ HEAD must be the commit tagged v$(IMAGE_VERSION)"; \
 		exit 1; \
 	fi
+	@if [ "$$(git cat-file -t "v$(IMAGE_VERSION)" 2>/dev/null)" != "tag" ]; then \
+		echo "❌ v$(IMAGE_VERSION) must be an annotated tag"; \
+		exit 1; \
+	fi
 	@echo "✅ Release metadata and tagged source are consistent"
 	@echo "   Push v$(IMAGE_VERSION) to run the verified binary and multi-platform image workflows."
 
@@ -581,7 +584,8 @@ stack-env:
 	ensure_secret ASTRA_TOKEN_ENCRYPTION_KEY; \
 	ensure_secret ASTRA_RUNTIME_ROOT_SECRET; \
 	ensure_secret MEMORIA_MASTER_KEY; \
-	echo "Configure a real embedding endpoint, or set MEMORIA_EMBEDDING_PROVIDER=mock for local evaluation, before running: make stack-up"
+	echo "Configure a real embedding endpoint, or explicitly use MEMORIA_EMBEDDING_PROVIDER=mock for local evaluation."; \
+	echo "Then run 'make stack-start' (first start) or 'make stack-up' (subsequent starts)."
 
 .PHONY: stack-check-env
 stack-check-env:
@@ -614,6 +618,16 @@ stack-check-env:
 stack-config: stack-check-env
 	@$(STACK_COMPOSE) config --quiet
 	@echo "✅ Compose stack config OK"
+
+.PHONY: stack-start
+stack-start: stack-env
+	@$(MAKE) stack-up
+	@$(MAKE) stack-verify
+	@echo ""
+	@echo "✅ Astra local stack is ready"
+	@echo "   Next: astra admin register"
+	@echo "   Then: astra admin model add MODEL_NAME openai --api-key \"\$$LLM_API_KEY\" --base-url https://your-endpoint/v1"
+	@echo "   Try:  astra chat -m \"Explain what you can do in this deployment\""
 
 .PHONY: stack-up
 stack-up: stack-config
@@ -650,10 +664,10 @@ stack-up: stack-config
 
 .PHONY: stack-up-server-only
 stack-up-server-only:
-	@echo "Ensuring no local astra-edge provider remains connected..."
+	@echo "Stopping this checkout's repo-managed astra-edge provider..."
 	@$(MAKE) dev-edge-stop
 	@$(MAKE) stack-up
-	@echo "✅ Server-only stack ready (no local edge provider connected)"
+	@echo "✅ Server-only stack ready (this checkout did not connect a User Runner)"
 
 .PHONY: stack-up-server-edge
 stack-up-server-edge: stack-up-server-only
@@ -696,7 +710,7 @@ dev-start-server-only:
 	@$(MAKE) dev-edge-stop
 	@$(MAKE) dev-deps-up
 	@$(MAKE) dev-deps-wait
-	@$(MAKE) dev-api-start
+	@$(MAKE) dev-api-start-debug
 	@$(MAKE) dev-web-start
 	@echo ""
 	@echo "✅ Server-only development environment started!"
@@ -705,9 +719,10 @@ dev-start-server-only:
 	@echo "   Edge provider: not connected"
 	@echo ""
 	@echo "Next steps:"
-	@echo "  astra register"
-	@echo "  astra login"
-	@echo "  astra chat"
+	@echo "  make build-cli-debug"
+	@echo "  ./target/debug/astra admin register       # first database only"
+	@echo "  ./target/debug/astra admin model load .models.yaml --update-existing"
+	@echo "  ./target/debug/astra"
 
 .PHONY: dev-start-server-edge
 dev-start-server-edge:
@@ -720,20 +735,7 @@ dev-start-server-edge:
 	@echo "   Edge workspace: $${ASTRA_EDGE_WORKSPACE_DIR:-$$(pwd)}"
 
 .PHONY: dev-start
-dev-start:
-	@echo "Starting development environment..."
-	@$(MAKE) dev-deps-up
-	@$(MAKE) dev-deps-wait
-	@$(MAKE) dev-api-start
-	@$(MAKE) dev-web-start
-	@echo ""
-	@echo "✅ Development environment started!"
-	@echo "   API: http://localhost:$${ASTRA_API_PORT:-$(DEFAULT_API_PORT)}"
-	@echo "   Web: http://localhost:$${ASTRA_WEB_PORT:-$${WEB_PORT:-3536}}"
-	@echo "   Edge provider: unchanged"
-	@echo ""
-	@echo "Use make dev-start-server-only to explicitly disconnect local edge."
-	@echo "Use make dev-start-server-edge to start or reconnect local edge."
+dev-start: dev-start-server-only
 
 .PHONY: dev-start-docker
 # Docker API mode reuses the dev dependency stack; dev-api-docker-up starts only api.

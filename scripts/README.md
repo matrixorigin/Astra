@@ -202,7 +202,8 @@ Keep the flow explicitly labeled as illustrative so the asset explains Astra's
 runtime contract without being mistaken for a captured live session.
 
 ### `scripts/install-astra.sh`
-Installs a checksum-verified `astra` CLI archive from this repository's GitHub Releases:
+Installs a checksum-verified archive containing the `astra` CLI and
+`astra-edge` User Runner from this repository's GitHub Releases:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh
@@ -215,7 +216,7 @@ checksum fails the installation.
 ### `scripts/validate-release-version.sh` and `scripts/verify-release-artifacts.sh`
 The release workflows use these scripts as shared, locally testable gates.
 The first requires every versioned workspace surface to match the Git tag. The
-second requires the complete four-platform CLI archive set, verifies every
+second requires the complete four-platform client archive set, verifies every
 checksum and archive layout, and creates the aggregate checksum manifest.
 `scripts/ci/test_release_contract.sh` exercises the success and tampering paths
 without compiling binaries or publishing artifacts.

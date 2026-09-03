@@ -6,44 +6,49 @@ The development flow is separate and still uses `docker-compose.deps.yml` throug
 
 ## Start With Make
 
-From the repo root:
+Install the released client binaries if they are not already available:
 
 ```bash
-make stack-env
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh
 ```
 
-`make stack-env` creates `deployment/all-in-one/.env` and generates local
-stack secrets. For semantic memory, configure:
-
-- `MEMORIA_EMBEDDING_BASE_URL`
-- `MEMORIA_EMBEDDING_API_KEY` when the endpoint requires authentication
-
-For a no-credential local evaluation, set `MEMORIA_EMBEDDING_PROVIDER=mock`
-and leave both values blank. Mock embeddings are deterministic and suitable for
-evaluation or tests, not production retrieval.
-
-Then start the stack:
+From the repository root, the shortest local evaluation path is one command:
 
 ```bash
-make stack-up
+MEMORIA_EMBEDDING_PROVIDER=mock make stack-start
 ```
 
-`make stack-up` fails before starting containers if a required secret is empty,
-or if a non-mock embedding provider is missing its base URL. An API key is
-optional for unauthenticated local endpoints. If a service does not become
-healthy, the command prints container status and recent logs while leaving the
-partial stack available for inspection. Fix the first reported error and rerun
-the command, or use `make stack-down` to stop it.
+`stack-start` creates `deployment/all-in-one/.env`, generates local secrets,
+validates Compose, starts every service, waits for readiness, and verifies an
+exact memory write/retrieval round trip. Mock embeddings are deterministic and
+suitable for evaluation or tests, not production retrieval.
 
-To verify the complete local service path, including a deterministic memory
-write and retrieval:
+For semantic memory, supply a real OpenAI-compatible embedding endpoint; its
+API key is optional when the endpoint is unauthenticated:
 
 ```bash
+MEMORIA_EMBEDDING_BASE_URL=https://your-embedding-endpoint/v1 \
+MEMORIA_EMBEDDING_API_KEY="$EMBEDDING_API_KEY" \
+make stack-start
+```
+
+Process-level credentials are passed to Compose but are not written to `.env`.
+Put embedding settings in that file only when persistence is intentional;
+otherwise export them again on subsequent `make stack-up` invocations.
+`make stack-verify` repeats the runtime proof.
+
+If a service does not become healthy, startup prints container status and
+recent logs while leaving the partial stack available for inspection. Fix the
+first reported error and rerun `make stack-up`, or use `make stack-down`.
+
+The complete operator loop is:
+
+```bash
+make stack-status
 make stack-verify
+make stack-logs SERVICE=api
+make stack-down
 ```
-
-This check uses the configured Memoria provider, retrieves the exact smoke
-memory it writes, and removes that record before returning.
 
 ## Runtime Startup Profiles
 
@@ -90,13 +95,6 @@ Use `astra admin register` to create an administrator account. On a fresh Matrix
 data volume this performs the initial admin bootstrap. After an admin exists,
 `astra admin register` must be run while logged in as an existing admin.
 
-This stack ships `astra-server` but not the `astra` CLI binary. Install the
-prebuilt CLI if you are not building from source:
-
-```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh
-```
-
 ```bash
 astra admin --api-url http://127.0.0.1:17001 register \
   --username admin \
@@ -104,6 +102,13 @@ astra admin --api-url http://127.0.0.1:17001 register \
   --password '<password>'
 
 astra admin --api-url http://127.0.0.1:17001 model load .models.yaml --update-existing
+```
+
+Connect the installed User Runner to expose one explicit local workspace:
+
+```bash
+astra-edge --server-url http://127.0.0.1:17001 \
+  --workspace-dir /path/to/workspace
 ```
 
 When building from source, use `./target/debug/astra` (or

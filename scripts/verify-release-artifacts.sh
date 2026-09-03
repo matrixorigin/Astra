@@ -40,6 +40,23 @@ expected=(
 )
 
 shopt -s nullglob
+# Aggregate manifests are derived output. Rebuild them on recovery runs before
+# validating the exact workflow-produced input set.
+rm -f checksums.txt checksums.txt.sha256
+
+for asset in *; do
+    [[ -f "$asset" ]] || { echo "unexpected release artifact entry: $asset" >&2; exit 1; }
+    allowed=false
+    for suffix in "${expected[@]}"; do
+        archive="astra-v${release_version}-${suffix}.tar.gz"
+        if [[ "$asset" == "$archive" || "$asset" == "${archive}.sha256" ]]; then
+            allowed=true
+            break
+        fi
+    done
+    [[ "$allowed" == true ]] || { echo "unexpected release artifact: $asset" >&2; exit 1; }
+done
+
 archives=(astra-v*.tar.gz)
 checksum_files=(astra-v*.tar.gz.sha256)
 if [[ "${#archives[@]}" -ne "${#expected[@]}" || "${#checksum_files[@]}" -ne "${#expected[@]}" ]]; then
@@ -51,8 +68,9 @@ for suffix in "${expected[@]}"; do
     archive="astra-v${release_version}-${suffix}.tar.gz"
     [[ -f "$archive" ]] || { echo "missing release archive: $archive" >&2; exit 1; }
     [[ -f "${archive}.sha256" ]] || { echo "missing release checksum: ${archive}.sha256" >&2; exit 1; }
+    checksum_line_count="$(awk 'END { print NR }' "${archive}.sha256")"
     read -r published_hash published_name extra < "${archive}.sha256"
-    if [[ ! "$published_hash" =~ ^[0-9a-f]{64}$ || "$published_name" != "$archive" || -n "${extra:-}" ]]; then
+    if [[ "$checksum_line_count" -ne 1 || ! "$published_hash" =~ ^[0-9a-f]{64}$ || "$published_name" != "$archive" || -n "${extra:-}" ]]; then
         echo "invalid checksum record: ${archive}.sha256" >&2
         exit 1
     fi
@@ -63,8 +81,8 @@ for suffix in "${expected[@]}"; do
     fi
 
     members="$(tar -tzf "$archive" | sort)"
-    if [[ "$members" != $'LICENSE\nastra' ]]; then
-        echo "$archive must contain exactly astra and LICENSE at its root" >&2
+    if [[ "$members" != $'LICENSE\nastra\nastra-edge' ]]; then
+        echo "$archive must contain exactly astra, astra-edge, and LICENSE at its root" >&2
         printf '%s\n' "$members" >&2
         exit 1
     fi

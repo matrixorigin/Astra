@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# Install a released Astra CLI binary from matrixorigin/Astra.
+# Install the released Astra CLI and Edge/User Runner from matrixorigin/Astra.
 #
 # Usage:
 #   curl --proto '=https' --tlsv1.2 -fsSL \
@@ -9,7 +9,7 @@
 set -eu
 
 REPOSITORY="matrixorigin/Astra"
-BINARY="astra"
+BINARIES="astra astra-edge"
 VERSION=""
 INSTALL_DIR="${ASTRA_INSTALL_DIR:-}"
 DRY_RUN=false
@@ -109,21 +109,29 @@ if [ -z "$INSTALL_DIR" ]; then
 fi
 
 target="${os}-${arch}"
-archive="${BINARY}-v${VERSION}-${target}.tar.gz"
+archive="astra-v${VERSION}-${target}.tar.gz"
 base_url="https://github.com/${REPOSITORY}/releases/download/${tag}"
 archive_url="${base_url}/${archive}"
 checksum_url="${archive_url}.sha256"
 
 info "Release: ${tag} (${target})"
 info "Source:  ${archive_url}"
-info "Target:  ${INSTALL_DIR}/${BINARY}"
+info "Target:  ${INSTALL_DIR}/astra and ${INSTALL_DIR}/astra-edge"
 
 if [ "$DRY_RUN" = true ]; then
     exit 0
 fi
 
 tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/astra-install.XXXXXX")
-trap 'rm -rf "$tmp_dir"' EXIT HUP INT TERM
+install_stage=""
+cleanup() {
+    rm -rf "$tmp_dir"
+    if [ -n "$install_stage" ]; then
+        rm -rf "$install_stage"
+    fi
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
 
 info "Downloading archive and checksum"
 curl_download -sS -o "${tmp_dir}/${archive}" "$archive_url" \
@@ -131,8 +139,13 @@ curl_download -sS -o "${tmp_dir}/${archive}" "$archive_url" \
 curl_download -sS -o "${tmp_dir}/${archive}.sha256" "$checksum_url" \
     || fail "failed to download the required checksum"
 
-expected=$(awk 'NR == 1 { print $1 }' "${tmp_dir}/${archive}.sha256")
-if ! printf '%s\n' "$expected" | grep -Eq '^[0-9a-fA-F]{64}$'; then
+checksum_record="${tmp_dir}/${archive}.sha256"
+checksum_lines=$(awk 'END { print NR }' "$checksum_record")
+read -r expected checksum_name checksum_extra < "$checksum_record"
+if [ "$checksum_lines" -ne 1 ] \
+    || ! printf '%s\n' "$expected" | grep -Eq '^[0-9a-f]{64}$' \
+    || [ "$checksum_name" != "$archive" ] \
+    || [ -n "${checksum_extra:-}" ]; then
     fail "the published checksum is invalid"
 fi
 if command -v sha256sum >/dev/null 2>&1; then
@@ -146,25 +159,31 @@ fi
 info "Checksum verified"
 
 members=$(tar -tzf "${tmp_dir}/${archive}" | sort)
-[ "$members" = "$(printf 'LICENSE\nastra')" ] \
-    || fail "release archive must contain exactly astra and LICENSE at its root"
-tar -xOf "${tmp_dir}/${archive}" "$BINARY" > "${tmp_dir}/${BINARY}"
-chmod 0755 "${tmp_dir}/${BINARY}"
-reported_version=$("${tmp_dir}/${BINARY}" --version 2>/dev/null) \
-    || fail "downloaded ${BINARY} could not report its version"
-case "$reported_version" in
-    *"${VERSION}"*) ;;
-    *) fail "downloaded binary reports '${reported_version}', expected ${VERSION}" ;;
-esac
+[ "$members" = "$(printf 'LICENSE\nastra\nastra-edge')" ] \
+    || fail "release archive must contain exactly astra, astra-edge, and LICENSE at its root"
+for binary in $BINARIES; do
+    tar -xOf "${tmp_dir}/${archive}" "$binary" > "${tmp_dir}/${binary}"
+    chmod 0755 "${tmp_dir}/${binary}"
+    reported_version=$("${tmp_dir}/${binary}" --version 2>/dev/null) \
+        || fail "downloaded ${binary} could not report its version"
+    [ "$reported_version" = "${binary} ${VERSION}" ] \
+        || fail "downloaded ${binary} reports '${reported_version}', expected ${binary} ${VERSION}"
+done
 
-mkdir -p "$INSTALL_DIR"
+mkdir -p "$INSTALL_DIR" || fail "could not create ${INSTALL_DIR}"
 if [ ! -w "$INSTALL_DIR" ]; then
     fail "${INSTALL_DIR} is not writable; choose a writable directory with --dir"
 fi
-install -m 0755 "${tmp_dir}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
-info "Installed ${BINARY} ${VERSION} to ${INSTALL_DIR}/${BINARY}"
+install_stage=$(mktemp -d "${INSTALL_DIR}/.astra-install.XXXXXX")
+for binary in $BINARIES; do
+    install -m 0755 "${tmp_dir}/${binary}" "${install_stage}/${binary}"
+done
+mv -f "${install_stage}/astra-edge" "${INSTALL_DIR}/astra-edge"
+# Move the CLI last so a visible new `astra` always has its matching Runner.
+mv -f "${install_stage}/astra" "${INSTALL_DIR}/astra"
+info "Installed astra and astra-edge ${VERSION} to ${INSTALL_DIR}"
 
 case ":${PATH}:" in
     *":${INSTALL_DIR}:"*) ;;
-    *) info "Add ${INSTALL_DIR} to PATH before invoking ${BINARY}" ;;
+    *) info "Add ${INSTALL_DIR} to PATH before invoking Astra" ;;
 esac

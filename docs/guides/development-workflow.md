@@ -3,36 +3,47 @@
 ## Quick Start (Most Common)
 
 ```bash
-# First time setup
-make dev-init           # Complete setup: .env + dependencies + config
+# First checkout: install pinned dependencies and create local config
+cp .models.yaml.example .models.yaml
+make dev-init
 
-# Daily development
-make dev-start-server-only # Start deps + API + Web without a local edge provider
-make dev-status         # Check if everything is ready
+# Configure embeddings in .env and at least one model in .models.yaml.
 
-# Web sessions that need local files/shell/git
-make dev-start-server-edge # Also starts astra-edge for this repo
+# First start: establish identity before connecting a User Runner
+make build-cli-debug
+make dev-start          # Explicit Server-only default: deps + API + Web
+./target/debug/astra admin register
+./target/debug/astra admin model load .models.yaml --update-existing
 
-# After code changes
-make dev-api-restart    # Restart API server only
+# After login, connect this checkout as a User Runner when needed
+ASTRA_EDGE_WORKSPACE_DIR="$PWD" make dev-edge-start
 
-# Stop everything
+# Normal edit loop
+make dev-api-restart-debug
+make test-contract
+
 make dev-stop
 ```
+
+`make dev-start` is intentionally an alias for the Server-only profile. It
+always disconnects the Edge process previously launched by this checkout, so
+startup state is reproducible without touching independently managed Runners.
+After the first login, `make dev-start-server-edge` starts the same backbone
+and reconnects the User Runner in one command.
 
 ## Command Reference
 
 ### Quick Start Commands
 
-| Command                      | Description                                                      | Time    |
-| ---------------------------- | ---------------------------------------------------------------- | ------- |
-| `make dev-start`             | Alias for `make dev-start-server-only`                           | ~5s     |
-| `make dev-start-server-only` | Start deps + API + Web; server-service tools only, no edge tools | ~5s     |
-| `make dev-start-server-edge` | Start server-only, then connect local `astra-edge`               | ~10s    |
-| `make dev-start-docker`      | Start deps + API in Docker mode                                  | ~10s    |
-| `make dev-stop`              | Stop Web, API, deps, and local `astra-edge` if running           | ~2s     |
-| `make dev-status`            | Show dependency, API, Web, and edge-provider status              | instant |
-| `make dev-init`              | Initialize environment                                           | ~10s    |
+| Command                      | Description                                                      |
+| ---------------------------- | ---------------------------------------------------------------- |
+| `make dev-start`             | Alias for the deterministic Server-only profile                  |
+| `make dev-start-server-only` | Start deps + API + Web; disconnect any repo-launched Edge        |
+| `make dev-start-server-edge` | Start Server-only, then connect this checkout as a User Runner   |
+| `make dev-start-docker`      | Start dependencies plus the configured API container image      |
+| `make dev-stop`              | Stop Web, API, dependencies, and the repo-launched Edge process  |
+| `make dev-status`            | Show dependency, API, Web, and Edge status                       |
+| `make dev-init`              | Create config and install pinned Rust/Node dependencies          |
 
 ### Dependency Services (MatrixOne + Memoria)
 
@@ -75,6 +86,9 @@ make dev-stop
 | Docker server    | `make dev-start-docker`      | Testing API container packaging without a local edge provider.           |
 | Docker + edge    | `make dev-start-docker && make dev-edge-start` | Testing a containerized API with a host `astra-edge`.       |
 
+Run `make dev-api-docker-build` first when you need the container to include
+unpublished server changes from the current checkout.
+
 `astra-edge` reads the selected Astra CLI profile token by default. Run
 `astra login` first, or set `ASTRA_TOKEN` explicitly. Override the local
 workspace with `ASTRA_EDGE_WORKSPACE_DIR=/path/to/repo make dev-edge-start`.
@@ -83,7 +97,8 @@ workspace with `ASTRA_EDGE_WORKSPACE_DIR=/path/to/repo make dev-edge-start`.
 
 | Command              | Description                                                                                                              |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `make test`          | Run all Rust workspace tests                                                                                             |
+| `make test`          | Run the complete offline and online repository suite; requires live development dependencies                            |
+| `make test-offline`  | Run the offline Rust, SDK, Web, hook, and runtime-profile gates                                                          |
 | `make test-server-only` | Focused server-only Web/runtime tests                                                                                 |
 | `make test-server-edge` | Focused edge provider protocol and routing tests                                                                       |
 | `make test-contract` | Run `http_contract` / `admin_contract` (astra-runtime) + settings JSON contract (`astra-core` `settings_contract_tests`) |
@@ -93,17 +108,18 @@ workspace with `ASTRA_EDGE_WORKSPACE_DIR=/path/to/repo make dev-edge-start`.
 ### Daily Development
 
 ```bash
-# Morning
-make dev-start-server-only # Start server-only profile
-make dev-status         # Verify ready
+# Morning: begin from a deterministic provider boundary
+make dev-start
+make dev-status
 
 # Need local workspace tools from Web
 make dev-start-server-edge
 
 # Development loop
 # ... edit code ...
-make dev-api-restart    # Restart API after changes
-make test               # Run tests
+make dev-api-restart-debug
+make test-contract      # Smallest relevant loop for API work
+make test-offline       # Broader pre-PR gate
 
 # Evening
 make dev-stop           # Stop everything
@@ -112,14 +128,14 @@ make dev-stop           # Stop everything
 ### Testing Changes
 
 ```bash
-# Quick: run all tests
-make test
-
-# Targeted: run integration contracts only
+# Fast focused contracts while iterating
 make test-contract
 
-# Specific: run individual contract suites
-make test-contract
+# Full offline gate before the PR
+make test-offline
+
+# Online suite only when the changed boundary requires live dependencies
+make test-online
 ```
 
 ### Docker Mode (Multi-replica Testing)

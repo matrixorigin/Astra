@@ -5,40 +5,49 @@ Run Astra with the all-in-one Docker Compose stack.
 ## Quick Start
 
 ```bash
-# 1. Clone repository
+# 1. Install the checksum-verified CLI and Edge/User Runner
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh
+
+# 2. Clone the deployment files
 git clone https://github.com/matrixorigin/Astra.git
 cd Astra
 
-# 2. Create stack environment
-make stack-env
-# For semantic memory, edit deployment/all-in-one/.env and set:
-#   MEMORIA_EMBEDDING_BASE_URL
-#   MEMORIA_EMBEDDING_API_KEY  # only if the endpoint requires authentication
-# Or, for deterministic local evaluation without embedding credentials:
-#   MEMORIA_EMBEDDING_PROVIDER=mock
+# 3. Generate local secrets, start Compose, and verify the runtime
+MEMORIA_EMBEDDING_PROVIDER=mock make stack-start
 
-# 3. Start all services
-make stack-up
-
-# 4. Verify readiness, dependencies, and a memory round trip
-make stack-verify
-
-# 5. Install the prebuilt CLI (no Rust toolchain needed)
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh
-
-# 6. Bootstrap the admin account and register a model
+# 4. Bootstrap the admin account and register a model
 astra admin register --username admin --password '<password>'
 astra admin model add MODEL_NAME openai --api-key "$LLM_API_KEY" --base-url https://your-endpoint/v1
 astra admin model check MODEL_NAME
 
-# 7. First agent response
+# 5. Complete a real agent turn
 astra chat -m "Explain what you can and cannot do in this deployment"
 ```
 
-Steps 1-4 prove the services are up; steps 5-7 prove Astra is usable. The CLI
-defaults to `http://127.0.0.1:17001`; set `ASTRA_API_URL` or pass `--api-url`
-if you remapped `ASTRA_API_PORT`. `model check` reports `is_active` and
-`connectivity`, and a model becomes active only when the probe succeeds.
+`stack-start` creates `deployment/all-in-one/.env`, generates local secrets,
+waits for all services, and proves API, database, Memoria, and memory
+write/retrieval behavior. The explicit mock mode is for local evaluation, not
+production retrieval. For semantic memory, replace it with:
+
+```bash
+MEMORIA_EMBEDDING_BASE_URL=https://your-embedding-endpoint/v1 \
+MEMORIA_EMBEDDING_API_KEY="$EMBEDDING_API_KEY" \
+make stack-start
+```
+
+The API key is optional for unauthenticated local endpoints. The CLI defaults
+to `http://127.0.0.1:17001`; set `ASTRA_API_URL` or pass `--api-url` if you
+remapped `ASTRA_API_PORT`. `model check` reports `is_active` and `connectivity`,
+and a model becomes active only when the probe succeeds. Process-level
+embedding settings are not written to `.env`; export them again for later
+starts, or persist them there deliberately.
+
+The installer also provides `astra-edge`. To give Web sessions access to a
+specific local workspace without building from source, run:
+
+```bash
+astra-edge --workspace-dir /path/to/workspace
+```
 
 ## Compose Stack
 
@@ -122,6 +131,9 @@ The stack includes:
 ```bash
 # Create stack environment
 make stack-env
+
+# First start: start and verify the full stack
+MEMORIA_EMBEDDING_PROVIDER=mock make stack-start
 
 # Start stack
 make stack-up

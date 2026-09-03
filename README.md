@@ -189,7 +189,7 @@ change Astra itself. For production topologies, use the
 
 | Path | What you get | Additional prerequisites |
 | --- | --- | --- |
-| [Docker](#docker) | MatrixOne, Memoria, and `astra-server` from published images, plus the prebuilt `astra` CLI | Docker Compose and OpenSSL |
+| [Docker](#docker) | MatrixOne, Memoria, and `astra-server` from published images, plus prebuilt CLI and User Runner binaries | Docker Compose and OpenSSL |
 | [From source](#build-from-source) | The same backbone built locally, plus the Web dashboard and CLI-local Runner capacity | Rust 1.97 and Node.js 24, both pinned in the repository |
 
 Both paths need Git, Make, and at least one supported LLM endpoint. Semantic
@@ -201,42 +201,49 @@ for local evaluation and tests.
 No Rust or Node toolchain. These steps run all the way to a real agent
 response, not just a healthy port.
 
-#### 1. Start the stack
+#### 1. Install the client binaries
+
+One checksum-verified archive installs both the `astra` CLI and the
+`astra-edge` User Runner — Linux and macOS, `amd64` and `arm64`:
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh
+```
+
+#### 2. Start and verify the stack
+
+Clone the deployment files, then choose the memory mode explicitly. This
+single command generates local secrets, starts Compose, waits for health, and
+verifies an exact memory write/retrieval round trip:
 
 ```bash
 git clone https://github.com/matrixorigin/Astra.git
 cd Astra
 
-make stack-env
+MEMORIA_EMBEDDING_PROVIDER=mock make stack-start
 ```
 
-`make stack-env` creates `deployment/all-in-one/.env` and generates the local
-stack secrets. For semantic memory, configure `MEMORIA_EMBEDDING_BASE_URL` and,
-when the provider requires it, `MEMORIA_EMBEDDING_API_KEY`. For a deterministic
-local evaluation without an embedding endpoint, set
-`MEMORIA_EMBEDDING_PROVIDER=mock` and leave both blank. Mock embeddings are
-deterministic and intended for evaluation or tests, not production retrieval.
-Then start the stack:
+Mock embeddings are deterministic and intended for evaluation or tests, not
+production retrieval. To exercise semantic memory instead, point the same
+one-command start at a real OpenAI-compatible embedding endpoint:
 
 ```bash
-make stack-up
-curl http://localhost:17001/health
+MEMORIA_EMBEDDING_BASE_URL=https://your-embedding-endpoint/v1 \
+MEMORIA_EMBEDDING_API_KEY="$EMBEDDING_API_KEY" \
+make stack-start
 ```
+
+The API key may be omitted for an unauthenticated local endpoint. Generated
+secrets remain in `deployment/all-in-one/.env`; credentials supplied as process
+environment variables are not written there. On later starts, export the same
+embedding settings again before `make stack-up`, or deliberately persist them
+in that `.env` file. Use `make stack-verify` whenever you want to repeat the
+runtime proof.
 
 | Service | Default URL |
 | --- | --- |
 | HTTP API | <http://localhost:17001> |
 | Health check | <http://localhost:17001/health> |
-
-#### 2. Install the CLI
-
-The stack ships `astra-server`, not the CLI. Install the prebuilt `astra`
-binary to drive it — Linux and macOS, `amd64` and `arm64`:
-
-```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/matrixorigin/Astra/main/scripts/install-astra.sh | sh
-astra health
-```
 
 The CLI defaults to `http://127.0.0.1:17001`, which is where the stack binds,
 so no extra configuration is needed. If you remapped `ASTRA_API_PORT`, set
@@ -281,8 +288,21 @@ You are through the loop when the request returns a model response and
 This stack is Server-only by design. Server-side agent turns, memory, planning,
 MCP, and introspection are available, while file, shell, Git, build/test, and
 private-network tools stay unavailable until a Runner connects — which is what
-the answer above should tell you. Operate it with `make stack-status`,
-`make stack-logs SERVICE=api`, and `make stack-down`. The
+the answer above should tell you.
+
+#### 6. Connect a User Runner when local execution is needed
+
+After the CLI has stored your account credentials, expose one deliberate local
+workspace to the Server:
+
+```bash
+astra-edge --workspace-dir /path/to/workspace
+```
+
+The Runner inherits the selected Astra CLI profile and reconnects on transient
+disconnects. Stop it to remove that execution capacity; the Server remains
+available without ambient access to the machine. Operate the stack with
+`make stack-status`, `make stack-logs SERVICE=api`, and `make stack-down`. The
 [all-in-one guide](deployment/all-in-one/README.md) covers the server+edge
 profile; the [Docker quick start](docs/quickstart/docker.md) covers ports and
 troubleshooting.
@@ -310,10 +330,10 @@ one model provider in `.models.yaml`. Never commit either local file.
 #### 2. Build and start Server-only
 
 ```bash
-make build
-make dev-start-server-only
+make build-cli-debug
+make dev-start
 
-export PATH="$PWD/target/release:$PATH"
+export PATH="$PWD/target/debug:$PATH"
 astra health
 ```
 

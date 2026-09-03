@@ -61,6 +61,7 @@ def main() -> None:
 
     contract_scripts = [
         Path("scripts/dev/test_setup_contract.sh"),
+        Path("scripts/dev/test_edge_process_contract.sh"),
         Path("scripts/ops/test_production_env_contract.sh"),
         Path("scripts/ci/test_release_contract.sh"),
     ]
@@ -154,13 +155,29 @@ def main() -> None:
             )
     for required in (
         "permissions:\n      contents: write",
+        "fetch-depth: 0",
         "git merge-base --is-ancestor",
+        "EVENT_SOURCE_SHA",
+        "source_sha",
+        "astra-edge",
         "scripts/verify-release-artifacts.sh",
         "fail_on_unmatched_files: true",
     ):
         if required not in binary_release_workflow:
             errors.append(
                 ".github/workflows/release-binaries.yml: missing current-repository release guard "
+                f"({required})"
+            )
+
+    for required in (
+        "fetch-depth: 0",
+        "EVENT_SOURCE_SHA",
+        "source_sha",
+        "EXPECTED_TAG_OBJECT",
+    ):
+        if required not in release_workflow:
+            errors.append(
+                ".github/workflows/release-docker.yml: missing immutable release source guard "
                 f"({required})"
             )
 
@@ -188,6 +205,25 @@ def main() -> None:
             errors.append(
                 f"scripts/validate-release-version.sh: missing release version source {version_source}"
             )
+
+    makefile = Path("Makefile").read_text(encoding="utf-8")
+    for required in (
+        "stack-start: stack-env",
+        "$(MAKE) stack-up",
+        "$(MAKE) stack-verify",
+        "dev-start: dev-start-server-only",
+    ):
+        if required not in makefile:
+            errors.append(f"Makefile: missing reproducible local journey contract ({required})")
+
+    edge_lifecycle = "\n".join(
+        Path(path).read_text(encoding="utf-8")
+        for path in ("scripts/dev/start-edge.sh", "scripts/dev/stop-edge.sh")
+    )
+    if "pgrep" in edge_lifecycle or "edge_process_is_owned" not in edge_lifecycle:
+        errors.append(
+            "scripts/dev: edge lifecycle must manage only the PID owned by this checkout"
+        )
 
     design_index = Path("docs/design/README.md").read_text(encoding="utf-8")
     for design in Path("docs/design").glob("*.md"):

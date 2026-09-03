@@ -6,9 +6,12 @@
 | --- | --- |
 | `make dev-init` | Create `.env`, generate local secrets, and fetch development dependencies |
 | `make dev-start` | Start dependencies and the API from source |
+| `make dev-start-server-only` | Reset to dependencies + debug API + Web without a repo-launched User Runner |
+| `make dev-start-server-edge` | Start Server-only and connect this checkout as a User Runner |
 | `make dev-stop` | Stop local services |
 | `make dev-status` | Show dependency and API status |
 | `make dev-api-restart` | Restart the source-mode API server |
+| `make dev-api-restart-debug` | Rebuild and restart the source-mode API server in debug mode |
 | `make dev-start-docker` | Start the app stack in Docker mode |
 
 ## Testing
@@ -44,6 +47,17 @@
 | `make build-server-release` | Build `astra-server` in release mode |
 | `make build-cli` | Build the `astra` CLI in release mode (same as `build-cli-release`) |
 | `make build-cli-release` | Build the `astra` CLI in release mode |
+
+## Published Compose Stack
+
+| Command | Description |
+| --- | --- |
+| `make stack-env` | Create deployment environment files and generate local secrets |
+| `make stack-start` | Start the published all-in-one stack, wait for health, and print the next CLI steps |
+| `make stack-up` | Start or resume the configured stack without running the guided verification |
+| `make stack-verify` | Check stack health and run a memory round trip |
+| `make stack-down` | Stop the stack while preserving its data |
+| `make stack-clean` | Immediately delete the stack and its persisted data (destructive; no confirmation prompt) |
 
 ## Memoria
 

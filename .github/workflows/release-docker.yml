@@ -42,6 +42,8 @@ jobs:
       rolling_version: ${{ steps.release.outputs.rolling_version }}
       latest: ${{ steps.release.outputs.latest }}
       matrix: ${{ steps.release.outputs.matrix }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      tag_object: ${{ steps.source.outputs.tag_object }}
 
     steps:
       - name: Resolve image tag and build matrix
@@ -135,29 +137,49 @@ jobs:
           echo "matrix=${matrix}" >> "${GITHUB_OUTPUT}"
 
       - name: Check out release source
-        if: ${{ github.event_name == 'push' }}
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          fetch-depth: 0
           persist-credentials: false
+          ref: ${{ github.event_name == 'push' && github.ref_name || github.sha }}
 
       - name: Validate manifest version
         if: ${{ github.event_name == 'push' }}
         run: scripts/validate-release-version.sh "${{ steps.release.outputs.image_version }}"
 
-      - name: Require a release commit from the default branch
-        if: ${{ github.event_name == 'push' }}
+      - name: Resolve and validate immutable source
+        id: source
         shell: bash
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_SOURCE_SHA: ${{ github.event.after }}
         run: |
           set -euo pipefail
+          source_sha="$(git rev-parse HEAD)"
+          tag_object=""
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            tag_object="$(git rev-parse "refs/tags/${GITHUB_REF_NAME}")"
+            if [ "$(git cat-file -t "refs/tags/${GITHUB_REF_NAME}")" != "tag" ]; then
+              echo "Release tag ${GITHUB_REF_NAME} must be annotated." >&2
+              exit 1
+            fi
+            source_sha="$(git rev-list -n 1 "refs/tags/${GITHUB_REF_NAME}")"
+            if [ "${source_sha}" != "${EVENT_SOURCE_SHA}" ]; then
+              echo "Release tag ${GITHUB_REF_NAME} no longer points to the commit that triggered this workflow." >&2
+              exit 1
+            fi
+          fi
           git fetch --no-tags origin \
             "refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
-          if ! git merge-base --is-ancestor HEAD "origin/${DEFAULT_BRANCH}"; then
-            echo "Release tag ${GITHUB_REF_NAME} is not reachable from ${DEFAULT_BRANCH}." >&2
-            echo "Merge the release commit before publishing its tag." >&2
-            exit 1
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            if ! git merge-base --is-ancestor "${source_sha}" "origin/${DEFAULT_BRANCH}"; then
+              echo "Release tag ${GITHUB_REF_NAME} is not reachable from ${DEFAULT_BRANCH}." >&2
+              echo "Merge the release commit before publishing its tag." >&2
+              exit 1
+            fi
           fi
+          echo "source_sha=${source_sha}" >> "${GITHUB_OUTPUT}"
+          echo "tag_object=${tag_object}" >> "${GITHUB_OUTPUT}"
 
   build:
     name: Build ${{ matrix.platform }}
@@ -172,6 +194,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          ref: ${{ needs.version.outputs.source_sha }}
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
@@ -199,7 +222,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             IMAGE_VERSION=${{ needs.version.outputs.image_version }}
-            IMAGE_REVISION=${{ github.sha }}
+            IMAGE_REVISION=${{ needs.version.outputs.source_sha }}
             IMAGE_SOURCE_DIRTY=false
             IMAGE_BRANCH=${{ github.ref_name }}
           # Registry caches are shared across release tags/branches and do not
@@ -244,6 +267,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          ref: ${{ needs.version.outputs.source_sha }}
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -280,8 +304,8 @@ jobs:
           make stack-up
 
           revision="$(docker image inspect "${release_image}" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
-          if [ "${revision}" != "${GITHUB_SHA}" ]; then
-            echo "Candidate image revision ${revision:-<missing>} does not match ${GITHUB_SHA}" >&2
+          if [ "${revision}" != "${{ needs.version.outputs.source_sha }}" ]; then
+            echo "Candidate image revision ${revision:-<missing>} does not match ${{ needs.version.outputs.source_sha }}" >&2
             exit 1
           fi
 
@@ -336,6 +360,8 @@ jobs:
           DOCKERHUB_IMAGE_NAME: ${{ env.IMAGE_NAME }}
           DOCKERHUB_METADATA_JSON: ${{ steps.meta.outputs.json }}
           BUILD_MATRIX_JSON: ${{ needs.version.outputs.matrix }}
+          EVENT_NAME: ${{ github.event_name }}
+          EXPECTED_TAG_OBJECT: ${{ needs.version.outputs.tag_object }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -386,6 +412,17 @@ jobs:
             echo "Candidate platform set does not match the release build matrix" >&2
             diff <(printf '%s\n' "${expected_platforms}") <(printf '%s\n' "${actual_platforms}") || true
             exit 1
+          fi
+
+          if [ "${EVENT_NAME}" = "push" ]; then
+            remote_tag_object="$(
+              git ls-remote "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" "refs/tags/${GITHUB_REF_NAME}" |
+                awk 'NR == 1 { print $1 }'
+            )"
+            if [ -z "${remote_tag_object}" ] || [ "${remote_tag_object}" != "${EXPECTED_TAG_OBJECT}" ]; then
+              echo "Release tag ${GITHUB_REF_NAME} was deleted or moved during the build." >&2
+              exit 1
+            fi
           fi
 
           docker buildx imagetools create "${tag_args[@]}" "${sources[@]}"

@@ -24,13 +24,18 @@ The repository pins Rust in [`rust-toolchain.toml`](rust-toolchain.toml) and
 Node.js in [`.nvmrc`](.nvmrc).
 
 ```bash
+cp .models.yaml.example .models.yaml
 make dev-init
-make dev-start-server-only
+# Configure embeddings in .env and a model in .models.yaml.
+make build-cli-debug
+make dev-start
 make dev-status
 ```
 
-Use `make dev-start-server-edge` when Web or Server tests need local files,
-shell, Git, or private-network access through the User Runner.
+The default is deliberately Server-only. Bootstrap/login with
+`./target/debug/astra` before the first Edge start, then use
+`make dev-start-server-edge` when Web or Server tests need local files, shell,
+Git, or private-network access through the User Runner.
 
 See the [developer setup](docs/quickstart/development.md) and
 [development workflow](docs/guides/development-workflow.md) for prerequisites,
@@ -49,8 +54,9 @@ runtime profiles, and troubleshooting.
 
 ## Validate the change
 
-Run the smallest relevant checks while iterating, then the appropriate
-repository gate before opening a pull request:
+Run the smallest relevant check while iterating, then the appropriate broader
+gate before opening a pull request. `make test` includes online lanes and is not
+the default inner-loop command:
 
 ```bash
 make format-check       # Rust formatting

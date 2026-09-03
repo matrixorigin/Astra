@@ -6,8 +6,8 @@ providers are connected.
 
 | Goal | Path |
 | --- | --- |
-| Evaluate Astra and use the CLI/TUI | [Build from source](#build-from-source) |
-| Run the packaged service stack | [Docker quick start](docker.md) |
+| Evaluate Astra and use the CLI/TUI | [Docker quick start](docker.md) — no Rust or Node toolchain |
+| Build Astra locally | [Build from source](#build-from-source) |
 | Prepare a real deployment | [Production deployment](production.md) |
 | Change Astra itself | [Developer setup](development.md) |
 
@@ -40,10 +40,10 @@ for at least one model endpoint to `.models.yaml`. Never commit either local
 file.
 
 ```bash
-make build
-make dev-start-server-only
+make build-cli-debug
+make dev-start
 
-export PATH="$PWD/target/release:$PATH"
+export PATH="$PWD/target/debug:$PATH"
 astra health
 ```
 
@@ -76,7 +76,8 @@ ASTRA_EDGE_WORKSPACE_DIR=/path/to/workspace make dev-edge-start
 ```
 
 On later starts, `make dev-start-server-edge` brings up the Server and local
-User Runner together.
+User Runner together. `make dev-start` always returns to the deterministic
+Server-only boundary.
 
 ## Next steps
 

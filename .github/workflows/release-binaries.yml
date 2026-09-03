@@ -1,4 +1,4 @@
-name: Release Astra CLI Binaries
+name: Release Astra Client Binaries
 
 permissions:
   contents: read
@@ -20,7 +20,6 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  BINARY: astra
   CROSS_REVISION: 8c1a8aa4b661711f4b7b6ac07c2e8929ce2f7d27 # upstream main, 2026-08-19
 
 jobs:
@@ -31,6 +30,8 @@ jobs:
     outputs:
       value: ${{ steps.resolve.outputs.value }}
       source_tag: ${{ steps.resolve.outputs.source_tag }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      tag_object: ${{ steps.source.outputs.tag_object }}
       prerelease: ${{ steps.resolve.outputs.prerelease }}
     steps:
       - name: Resolve release version
@@ -66,25 +67,45 @@ jobs:
       - name: Check out release source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          fetch-depth: 0
           persist-credentials: false
           ref: ${{ steps.resolve.outputs.source_tag }}
 
       - name: Validate manifest version
         run: scripts/validate-release-version.sh "${{ steps.resolve.outputs.value }}"
 
-      - name: Require a release commit from the default branch
+      - name: Validate immutable release source
+        id: source
         shell: bash
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_SOURCE_SHA: ${{ github.event.after }}
+          SOURCE_TAG: ${{ steps.resolve.outputs.source_tag }}
         run: |
           set -euo pipefail
+          tag_object="$(git rev-parse "refs/tags/${SOURCE_TAG}")"
+          if [ "$(git cat-file -t "refs/tags/${SOURCE_TAG}")" != "tag" ]; then
+            echo "Release tag ${SOURCE_TAG} must be annotated." >&2
+            exit 1
+          fi
+          source_sha="$(git rev-list -n 1 "refs/tags/${SOURCE_TAG}")"
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${source_sha}" != "${EVENT_SOURCE_SHA}" ]; then
+            echo "Release tag ${SOURCE_TAG} no longer points to the commit that triggered this workflow." >&2
+            exit 1
+          fi
+          if [ "$(git rev-parse HEAD)" != "${source_sha}" ]; then
+            echo "Checked-out source does not match ${SOURCE_TAG}." >&2
+            exit 1
+          fi
           git fetch --no-tags origin \
             "refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"
-          if ! git merge-base --is-ancestor HEAD "origin/${DEFAULT_BRANCH}"; then
+          if ! git merge-base --is-ancestor "${source_sha}" "origin/${DEFAULT_BRANCH}"; then
             echo "Release tag ${{ steps.resolve.outputs.source_tag }} is not reachable from ${DEFAULT_BRANCH}." >&2
             echo "Merge the release commit before publishing its tag." >&2
             exit 1
           fi
+          echo "source_sha=${source_sha}" >> "${GITHUB_OUTPUT}"
+          echo "tag_object=${tag_object}" >> "${GITHUB_OUTPUT}"
 
   build:
     name: Build ${{ matrix.target }}
@@ -99,12 +120,12 @@ jobs:
             target: x86_64-unknown-linux-musl
             suffix: linux-amd64
             use-cross: false
-            features: --features release-vendored-openssl
+            features: astra-cli/release-vendored-openssl
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             suffix: linux-arm64
             use-cross: true
-            features: --features release-vendored-openssl
+            features: astra-cli/release-vendored-openssl
           - os: macos-15-intel
             target: x86_64-apple-darwin
             suffix: darwin-amd64
@@ -120,7 +141,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-          ref: ${{ needs.version.outputs.source_tag }}
+          ref: ${{ needs.version.outputs.source_sha }}
 
       - name: Cache cargo registry
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -155,13 +176,33 @@ jobs:
 
       - name: Build with cross
         if: ${{ matrix.use-cross }}
+        env:
+          RELEASE_FEATURES: ${{ matrix.features }}
         run: |
-          cross build --release --no-default-features ${{ matrix.features }} --manifest-path Cargo.toml --target "${{ matrix.target }}" -p astra-cli --bin "${BINARY}"
+          set -euo pipefail
+          feature_args=()
+          if [ -n "${RELEASE_FEATURES}" ]; then
+            feature_args=(--features "${RELEASE_FEATURES}")
+          fi
+          cross build --release --no-default-features "${feature_args[@]}" \
+            --manifest-path Cargo.toml --target "${{ matrix.target }}" \
+            -p astra-cli --bin astra \
+            -p astra-edge --bin astra-edge
 
       - name: Build native
         if: ${{ !matrix.use-cross }}
+        env:
+          RELEASE_FEATURES: ${{ matrix.features }}
         run: |
-          cargo build --release --no-default-features ${{ matrix.features }} --manifest-path Cargo.toml --target "${{ matrix.target }}" -p astra-cli --bin "${BINARY}"
+          set -euo pipefail
+          feature_args=()
+          if [ -n "${RELEASE_FEATURES}" ]; then
+            feature_args=(--features "${RELEASE_FEATURES}")
+          fi
+          cargo build --release --no-default-features "${feature_args[@]}" \
+            --manifest-path Cargo.toml --target "${{ matrix.target }}" \
+            -p astra-cli --bin astra \
+            -p astra-edge --bin astra-edge
 
       - name: Package archive
         shell: bash
@@ -177,14 +218,16 @@ jobs:
           }
 
           mkdir -p dist
-          package_dir="${RUNNER_TEMP}/${BINARY}-package"
+          package_dir="${RUNNER_TEMP}/astra-package"
           mkdir -p "${package_dir}"
-          install -m 0755 \
-            "target/${{ matrix.target }}/release/${BINARY}" \
-            "${package_dir}/${BINARY}"
+          for binary in astra astra-edge; do
+            install -m 0755 \
+              "target/${{ matrix.target }}/release/${binary}" \
+              "${package_dir}/${binary}"
+          done
           install -m 0644 LICENSE "${package_dir}/LICENSE"
-          archive="${BINARY}-v${{ needs.version.outputs.value }}-${{ matrix.suffix }}.tar.gz"
-          tar -czf "dist/${archive}" -C "${package_dir}" "${BINARY}" LICENSE
+          archive="astra-v${{ needs.version.outputs.value }}-${{ matrix.suffix }}.tar.gz"
+          tar -czf "dist/${archive}" -C "${package_dir}" astra astra-edge LICENSE
           (cd dist && checksum_file "${archive}" | tee "${archive}.sha256" > /dev/null)
 
       - name: Upload artifact
@@ -209,7 +252,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-          ref: ${{ needs.version.outputs.source_tag }}
+          ref: ${{ needs.version.outputs.source_sha }}
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -220,6 +263,22 @@ jobs:
       - name: Verify release artifacts and create checksum manifest
         shell: bash
         run: scripts/verify-release-artifacts.sh "${{ needs.version.outputs.value }}" dist
+
+      - name: Require the original immutable release tag
+        shell: bash
+        env:
+          EXPECTED_TAG_OBJECT: ${{ needs.version.outputs.tag_object }}
+          SOURCE_TAG: ${{ needs.version.outputs.source_tag }}
+        run: |
+          set -euo pipefail
+          remote_tag_object="$(
+            git ls-remote origin "refs/tags/${SOURCE_TAG}" |
+              awk 'NR == 1 { print $1 }'
+          )"
+          if [ -z "${remote_tag_object}" ] || [ "${remote_tag_object}" != "${EXPECTED_TAG_OBJECT}" ]; then
+            echo "Release tag ${SOURCE_TAG} was deleted or moved during the build." >&2
+            exit 1
+          fi
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
