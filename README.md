@@ -4,7 +4,7 @@
 
 ### The self-hosted runtime for agents that must act inside private systems
 
-**Durable work. User-bound execution. Policy before action. Evidence after every step.**
+**Work survives. Access stays local. Every action is traceable.**
 
 [![Test Suite](https://github.com/matrixorigin/Astra/actions/workflows/test.yml/badge.svg)](https://github.com/matrixorigin/Astra/actions/workflows/test.yml)
 [![Static Checks](https://github.com/matrixorigin/Astra/actions/workflows/static-checks.yml/badge.svg)](https://github.com/matrixorigin/Astra/actions/workflows/static-checks.yml)
@@ -27,19 +27,35 @@ that must keep working across requests and reconnects, act inside private
 environments under the right user or enterprise identity, and leave verifiable
 evidence of every action.
 
-| Work survives | Access stays local | Authority stays explicit |
+| Work survives | Access stays local | Every action is traceable |
 | --- | --- | --- |
-| Durable Work, checkpoints, retries, and handoffs outlive any request or chat connection. | The Server coordinates; a User Runner executes beside private repositories, tools, data, network, and credentials. | Policy decides who may do what and where before execution; Trace and Audit record what happened afterward. |
+| Durable Work, checkpoints, retries, and handoffs outlive any request or chat connection. | The Server coordinates; a User Runner executes beside private repositories, tools, data, network, and credentials. | Policy admits each action before execution; Trace and Audit preserve its route, result, and evidence afterward. |
 
 Astra includes the Server, CLI/TUI, Web dashboard, APIs, and TypeScript SDK. You
 bring the LLM and embedding endpoints, then connect tools and data through a
 Runner or MCP.
+
+**Codex starts with the agent experience. DeepSeek Harness starts with the
+plugin graph. Astra starts with durable enterprise Work, then routes each
+admitted action to the identity and environment allowed to perform it.**
 
 <div align="center">
   <img alt="Illustrative 20-second Astra flow: a request becomes durable Work on the Server, context and policy determine an execution route, a user-bound Runner acts inside a private environment, and the result returns with trace and audit evidence." src="docs/assets/astra-cli-demo.gif" width="900">
 </div>
 
 <p align="center"><sub>The Server keeps the Work. The Runner keeps private access local. Policy governs the boundary. Trace preserves the evidence.</sub></p>
+
+### Pick the layer you need
+
+All three can run models and tools. The difference is what each system makes
+authoritative.
+
+| | [Codex](https://developers.openai.com/codex/) | [DeepSeek Harness](https://www.deepseek.com/harness/en/) | **Astra** |
+| --- | --- | --- | --- |
+| **You are choosing** | A ready-to-use agent and embeddable harness | A composable agent harness | A shared, self-hosted agent runtime |
+| **System of record** | The Codex task and workspace | An append-only session event stream assembled from plugins | Durable Work, identity, policy, provider decisions, trace, and audit across users and applications |
+| **Execution boundary** | The local or cloud environment selected for the task | Configured tools, sandboxes, storage, and runtime plugins | The Server admits the action; a user-bound Runner executes inside the private environment |
+| **Best fit** | Use an agent directly to complete work | Build or customize a coding agent and its runtime | Operate governed infrastructure behind many agents, products, and trust boundaries |
 
 Use Astra when an agent becomes shared infrastructure across users,
 applications, private networks, and approval boundaries. If all you need is a
@@ -486,21 +502,21 @@ the complete design.
 ## How Astra differs from coding agents
 
 [Claude Code](https://code.claude.com/docs/en/getting-started),
-[Codex](https://developers.openai.com/codex),
+[Codex](https://developers.openai.com/codex/),
 [Pi](https://pi.dev/docs/latest), and
 [DeepSeek Harness](https://www.deepseek.com/harness/en/) are strong systems for
-interactive coding or composing an agent harness. Astra expands the boundary
-from one coding loop to an enterprise-owned runtime across users, applications,
-private environments, and trust boundaries.
+completing work or composing an agent harness. Astra expands the system of
+record from an agent task or session to an enterprise-owned runtime across
+users, applications, private environments, and trust boundaries.
 
 > **Models decide. Runners act. Astra governs and traces the entire loop.**
 
 | System | Primary design center | Astra's distinction |
 | --- | --- | --- |
 | Claude Code | Developer-facing coding agent across terminal, IDE, tools, and enterprise model endpoints | Astra makes the durable enterprise runtime—not one coding surface—the system of record |
-| Codex | Coding agent across local, cloud, IDE, automation, and integration surfaces | Astra is model-provider independent and centers self-hosted backbone state, User Runners, and governed providers |
+| Codex | Agent product across local, cloud, IDE, automation, and integration surfaces | Astra is model-provider independent and centers self-hosted backbone state, User Runners, and governed providers |
 | Pi | Minimal terminal coding harness extended through TypeScript packages, skills, prompts, and themes | Astra centers a distributed Server/Runner architecture, durable Work, enterprise identity, and operations |
-| DeepSeek Harness | Plugin-first harness with composable capabilities, runtime modes, and a traceable session log | Astra centers canonical lifecycle state, cross-user control, provider decisions, and user-bound execution |
+| DeepSeek Harness | Local-first, plugin-composable coding agent and runtime with a traceable session log | Astra centers canonical lifecycle state, cross-user control, provider decisions, and user-bound execution |
 | **Astra** | **Enterprise context-to-execution runtime** | **One durable backbone connecting governed context to execution across Web, CLI, Server, Edge, MCP, sandboxes, and User Runners** |
 
 The distinction is architectural:
@@ -837,20 +853,6 @@ for the software itself through **Cite this repository**.
 ## License
 
 Astra is licensed under the [Apache License, Version 2.0](LICENSE).
-
-## Star history
-
-<div align="center">
-
-<a href="https://star-history.com/#matrixorigin/Astra&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=matrixorigin/Astra&type=Date&theme=dark">
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=matrixorigin/Astra&type=Date">
-    <img alt="Star history chart for matrixorigin/Astra" src="https://api.star-history.com/svg?repos=matrixorigin/Astra&type=Date" width="600">
-  </picture>
-</a>
-
-</div>
 
 ---
 
