@@ -141,7 +141,7 @@ STACK_DIR := deployment/all-in-one
 STACK_ENV := $(STACK_DIR)/.env
 STACK_COMPOSE := cd $(STACK_DIR) && docker compose --env-file $(abspath $(STACK_ENV))
 STACK_SECRET_ENV := ASTRA_JWT_SECRET ASTRA_TOKEN_ENCRYPTION_KEY ASTRA_RUNTIME_ROOT_SECRET MEMORIA_MASTER_KEY
-STACK_EMBEDDING_ENV := MEMORIA_EMBEDDING_API_KEY MEMORIA_EMBEDDING_BASE_URL
+STACK_EMBEDDING_ENV := MEMORIA_EMBEDDING_BASE_URL
 
 # Per-test-case hard budget. Any case running longer than the budget is
 # killed and counted as FAIL. Nextest has no CLI override for slow-timeout
@@ -558,23 +558,7 @@ stack-env:
 		echo "❌ openssl is required to generate stack secrets"; \
 		exit 1; \
 	fi; \
-	has_env_value() { \
-		key="$$1"; \
-		awk -v key="$$key" ' \
-			/^[[:space:]]*#/ { next } \
-			{ \
-				line = $$0; \
-				sub(/^[[:space:]]*/, "", line); \
-				if (line ~ "^" key "[[:space:]]*=") { \
-					sub(/^[^=]*=/, "", line); \
-					sub(/^[[:space:]]*/, "", line); \
-					lower = tolower(line); \
-					if (line != "" && lower !~ /(change[-_]?me|change-in-production|astra-dev-|dev-master-key|your-)/) found = 1; \
-				} \
-			} \
-			END { exit found ? 0 : 1 } \
-		' "$(STACK_ENV)"; \
-	}; \
+	. scripts/lib/env_file.sh; \
 	set_env_value() { \
 		key="$$1"; \
 		value="$$2"; \
@@ -597,7 +581,7 @@ stack-env:
 	}; \
 	ensure_secret() { \
 		key="$$1"; \
-		if has_env_value "$$key"; then \
+		if env_file_has_configured_value "$(STACK_ENV)" "$$key"; then \
 			echo "✅ $$key already configured"; \
 			return 0; \
 		fi; \
@@ -618,33 +602,22 @@ stack-check-env:
 		echo "   Run: make stack-env"; \
 		exit 1; \
 	fi
-	@embedding_provider="$$(sed -n 's/^[[:space:]]*MEMORIA_EMBEDDING_PROVIDER[[:space:]]*=[[:space:]]*//p' "$(STACK_ENV)" | tail -n 1 | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"; \
+	@. scripts/lib/env_file.sh; \
+	embedding_provider="$$(env_file_read "$(STACK_ENV)" MEMORIA_EMBEDDING_PROVIDER 2>/dev/null || true)"; \
+	embedding_provider="$$(printf '%s' "$$embedding_provider" | tr '[:upper:]' '[:lower:]')"; \
 	required="$(STACK_SECRET_ENV)"; \
 	if [ "$${embedding_provider:-openai}" != "mock" ]; then \
 		required="$$required $(STACK_EMBEDDING_ENV)"; \
 	fi; \
 	missing=""; \
 	for key in $$required; do \
-		if ! awk -v key="$$key" ' \
-			/^[[:space:]]*#/ { next } \
-			{ \
-				line = $$0; \
-				sub(/^[[:space:]]*/, "", line); \
-				if (line ~ "^" key "[[:space:]]*=") { \
-					sub(/^[^=]*=/, "", line); \
-					sub(/^[[:space:]]*/, "", line); \
-					lower = tolower(line); \
-					if (line != "" && lower !~ /(change[-_]?me|change-in-production|astra-dev-|dev-master-key|your-)/) found = 1; \
-				} \
-			} \
-			END { exit found ? 0 : 1 } \
-		' "$(STACK_ENV)"; then \
+		if ! env_file_has_configured_value "$(STACK_ENV)" "$$key"; then \
 			missing="$$missing $$key"; \
 		fi; \
 	done; \
 	if [ -n "$$missing" ]; then \
 		echo "❌ Missing or insecure required config in $(STACK_ENV):$$missing"; \
-		echo "   Run make stack-env to generate secrets. For non-mock embeddings, fill the API key and base URL."; \
+		echo "   Run make stack-env to generate secrets. For non-mock embeddings, fill the base URL and any provider-required API key."; \
 		exit 1; \
 	fi
 

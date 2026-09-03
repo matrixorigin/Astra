@@ -5,6 +5,7 @@ set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 ENV_FILE="$PROJECT_ROOT/.env"
+. "$PROJECT_ROOT/scripts/lib/env_file.sh"
 
 if [ ! -f "$ENV_FILE" ]; then
     echo "❌ .env file not found. Create one first."
@@ -31,25 +32,8 @@ update_or_add() {
 needs_generated_secret() {
     local key="$1"
     local value
-    value="$(awk -v key="$key" '
-        /^[[:space:]]*#/ { next }
-        {
-            line = $0
-            sub(/^[[:space:]]*/, "", line)
-            if (line ~ "^" key "[[:space:]]*=") {
-                sub(/^[^=]*=/, "", line)
-                sub(/^[[:space:]]*/, "", line)
-                value = line
-            }
-        }
-        END { print value }
-    ' "$ENV_FILE")"
-    value="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
-
-    [[ -z "$value" || "$value" == *changeme* || "$value" == *change_me* || \
-        "$value" == *change-me* || "$value" == *change_in_production* || \
-        "$value" == *change-in-production* || "$value" == your-* || \
-        "$value" == astra-dev-* || "$value" == dev-master-key* ]]
+    value="$(env_file_read "$ENV_FILE" "$key" 2>/dev/null || true)"
+    env_value_is_placeholder "$value"
 }
 
 generate_secret() {

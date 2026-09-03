@@ -33,10 +33,11 @@ cp .models.yaml.example .models.yaml
 make dev-init
 ```
 
-Configure `MEMORIA_EMBEDDING_API_KEY` and `MEMORIA_EMBEDDING_BASE_URL` in
-`.env` for semantic memory, or set `MEMORIA_EMBEDDING_PROVIDER=mock` for local
-evaluation. Then add credentials for at least one model endpoint to
-`.models.yaml`. Never commit either local file.
+Configure `MEMORIA_EMBEDDING_BASE_URL` in `.env` for semantic memory and add
+`MEMORIA_EMBEDDING_API_KEY` when the endpoint requires authentication, or set
+`MEMORIA_EMBEDDING_PROVIDER=mock` for local evaluation. Then add credentials
+for at least one model endpoint to `.models.yaml`. Never commit either local
+file.
 
 ```bash
 make build

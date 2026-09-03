@@ -57,8 +57,10 @@ snapshot_secrets() {
 }
 
 mkdir -p "$test_root/scripts/dev"
+mkdir -p "$test_root/scripts/lib"
 cp "$repo_root/.env.example" "$test_root/.env"
 cp "$repo_root/scripts/dev/init.sh" "$test_root/scripts/dev/init.sh"
+cp "$repo_root/scripts/lib/env_file.sh" "$test_root/scripts/lib/env_file.sh"
 chmod +x "$test_root/scripts/dev/init.sh"
 
 "$test_root/scripts/dev/init.sh" >/dev/null
@@ -91,16 +93,29 @@ cp "$repo_root/deployment/all-in-one/.env.example" "$stack_env"
 for key in ASTRA_JWT_SECRET ASTRA_TOKEN_ENCRYPTION_KEY ASTRA_RUNTIME_ROOT_SECRET MEMORIA_MASTER_KEY; do
     set_env_value "$stack_env" "$key" "test-${key}-value"
 done
-set_env_value "$stack_env" "MEMORIA_EMBEDDING_PROVIDER" "mock"
+set_env_value "$stack_env" "ASTRA_JWT_SECRET" '"operator-supplied-stack-secret" # retained'
+set_env_value "$stack_env" "MEMORIA_EMBEDDING_PROVIDER" '"MoCk" # local evaluation'
 set_env_value "$stack_env" "MEMORIA_EMBEDDING_API_KEY" ""
 set_env_value "$stack_env" "MEMORIA_EMBEDDING_BASE_URL" ""
+
+stack_secret_before="$(grep '^ASTRA_JWT_SECRET=' "$stack_env")"
+make --no-print-directory -s -C "$repo_root" stack-env STACK_ENV="$stack_env" >/dev/null
+if [[ "$(grep '^ASTRA_JWT_SECRET=' "$stack_env")" != "$stack_secret_before" ]]; then
+    echo "setup contract failed: stack-env overwrote a quoted operator secret" >&2
+    exit 1
+fi
 
 make --no-print-directory -s -C "$repo_root" stack-check-env STACK_ENV="$stack_env" >/dev/null
 
 set_env_value "$stack_env" "MEMORIA_EMBEDDING_PROVIDER" "openai"
+set_env_value "$stack_env" "MEMORIA_EMBEDDING_API_KEY" " # still empty"
+set_env_value "$stack_env" "MEMORIA_EMBEDDING_BASE_URL" " # still empty"
 if make --no-print-directory -s -C "$repo_root" stack-check-env STACK_ENV="$stack_env" >/dev/null 2>&1; then
-    echo "setup contract failed: non-mock embeddings accepted empty credentials" >&2
+    echo "setup contract failed: non-mock embeddings accepted a missing endpoint" >&2
     exit 1
 fi
+
+set_env_value "$stack_env" "MEMORIA_EMBEDDING_BASE_URL" "http://embeddings.internal/v1"
+make --no-print-directory -s -C "$repo_root" stack-check-env STACK_ENV="$stack_env" >/dev/null
 
 echo "setup contracts: ok"

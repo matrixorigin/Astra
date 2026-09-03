@@ -170,8 +170,9 @@ make stack-env
 ```
 
 `make stack-env` creates `deployment/all-in-one/.env` and generates the local
-stack secrets. For semantic memory, configure `MEMORIA_EMBEDDING_API_KEY` and
-`MEMORIA_EMBEDDING_BASE_URL`. For a no-credential local evaluation, set
+stack secrets. For semantic memory, configure `MEMORIA_EMBEDDING_BASE_URL` and,
+when the provider requires it, `MEMORIA_EMBEDDING_API_KEY`. For a deterministic
+local evaluation without an embedding endpoint, set
 `MEMORIA_EMBEDDING_PROVIDER=mock` and leave both blank. Mock embeddings are
 deterministic and intended for evaluation or tests, not production retrieval.
 Then start the stack:
@@ -210,7 +211,8 @@ cp .models.yaml.example .models.yaml
 make dev-init
 ```
 
-Configure a real embedding endpoint in `.env` for semantic memory, or set
+Configure a real embedding endpoint in `.env` for semantic memory, adding an
+API key only when that endpoint requires one, or set
 `MEMORIA_EMBEDDING_PROVIDER=mock` for local evaluation. Then configure at least
 one model provider in `.models.yaml`. Never commit either local file.
 

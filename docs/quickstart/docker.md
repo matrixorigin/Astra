@@ -11,9 +11,9 @@ cd Astra
 
 # 2. Create stack environment
 make stack-env
-# For semantic memory, edit deployment/all-in-one/.env and fill:
-#   MEMORIA_EMBEDDING_API_KEY
+# For semantic memory, edit deployment/all-in-one/.env and set:
 #   MEMORIA_EMBEDDING_BASE_URL
+#   MEMORIA_EMBEDDING_API_KEY  # only if the endpoint requires authentication
 # Or, for deterministic local evaluation without embedding credentials:
 #   MEMORIA_EMBEDDING_PROVIDER=mock
 
@@ -68,8 +68,10 @@ Create `deployment/all-in-one/.env` with:
 
 ```bash
 # Required for non-mock embeddings
-MEMORIA_EMBEDDING_API_KEY=...
 MEMORIA_EMBEDDING_BASE_URL=...
+
+# Required only when the embedding endpoint uses API-key authentication
+MEMORIA_EMBEDDING_API_KEY=...
 
 # Alternative for local evaluation and tests (not production retrieval)
 # MEMORIA_EMBEDDING_PROVIDER=mock

@@ -69,6 +69,11 @@ benchmark summary.
 ### `scripts/dev/init.sh`
 Initializes local development configuration, generating required local secrets in `.env`, and prepares the Rust-first workflow behind `make dev-init`.
 
+### `scripts/lib/env_file.sh`
+Provides the canonical, non-evaluating reader and placeholder checks for Astra
+environment templates. Source this helper instead of independently parsing
+dotenv values in setup or deployment scripts.
+
 ### `scripts/setup/demo-init.sh`
 Sets up a demo environment and performs prerequisite checks.
 
