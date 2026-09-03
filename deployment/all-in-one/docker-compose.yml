@@ -11,18 +11,29 @@ services:
   matrixone-init:
     image: ${MATRIXONE_IMAGE:-matrixorigin/matrixone:latest}
     user: root
+    environment:
+      HOST_UID: ${UID:-1000}
+      HOST_GID: ${GID:-1000}
     entrypoint:
       - sh
       - -c
       - |
         set -eu
-        if ! grep -qx "${UID:-1000}:${GID:-1000}" /mo-data/.astra-owner 2>/dev/null; then
-          chown -R "${UID:-1000}:${GID:-1000}" /mo-data
-          printf '%s\n' "${UID:-1000}:${GID:-1000}" > /mo-data/.astra-owner
-          chown "${UID:-1000}:${GID:-1000}" /mo-data/.astra-owner
+        case "$${HOST_UID}" in ''|*[!0-9]*) echo "UID must be numeric" >&2; exit 1;; esac
+        case "$${HOST_GID}" in ''|*[!0-9]*) echo "GID must be numeric" >&2; exit 1;; esac
+        owner="$${HOST_UID}:$${HOST_GID}"
+        marker=/mo-data/.astra-owner
+        if [ -L "$${marker}" ] || { [ -e "$${marker}" ] && [ ! -f "$${marker}" ]; }; then
+          echo "Unsafe owner marker: $${marker} must be a regular file" >&2
+          exit 1
+        fi
+        if ! grep -qx "$${owner}" "$${marker}" 2>/dev/null; then
+          chown -R --no-dereference "$${owner}" /mo-data
+          printf '%s\n' "$${owner}" > "$${marker}"
+          chown "$${owner}" "$${marker}"
         fi
         mkdir -p /mo-logs
-        chown "${UID:-1000}:${GID:-1000}" /mo-logs
+        chown "$${owner}" /mo-logs
     volumes:
       - matrixone-data:/mo-data
       - ${MATRIXONE_LOG_DIR:-./data/matrixone/logs}:/mo-logs
@@ -63,6 +74,44 @@ services:
         max-size: "50m"
         max-file: "3"
 
+  memoria-init:
+    image: ${MEMORIA_IMAGE:-matrixorigin/memoria:latest}
+    user: root
+    environment:
+      HOST_UID: ${UID:-1000}
+      HOST_GID: ${GID:-1000}
+    entrypoint:
+      - sh
+      - -c
+      - |
+        set -eu
+        case "$${HOST_UID}" in ''|*[!0-9]*) echo "UID must be numeric" >&2; exit 1;; esac
+        case "$${HOST_GID}" in ''|*[!0-9]*) echo "GID must be numeric" >&2; exit 1;; esac
+        owner="$${HOST_UID}:$${HOST_GID}"
+        mkdir -p /var/log/memoria
+        marker=/var/log/memoria/.astra-owner
+        log_file=/var/log/memoria/api.log
+        for path in "$${marker}" "$${log_file}"; do
+          if [ -L "$${path}" ] || { [ -e "$${path}" ] && [ ! -f "$${path}" ]; }; then
+            echo "Unsafe log path: $${path} must be a regular file" >&2
+            exit 1
+          fi
+        done
+        if ! grep -qx "$${owner}" "$${marker}" 2>/dev/null; then
+          chown -R --no-dereference "$${owner}" /var/log/memoria
+          printf '%s\n' "$${owner}" > "$${marker}"
+        fi
+        # The marker avoids a recursive scan on every start, while these
+        # inexpensive repairs handle a log file recreated by root later.
+        chown "$${owner}" /var/log/memoria "$${marker}"
+        if [ -e "$${log_file}" ]; then
+          chown "$${owner}" "$${log_file}"
+        fi
+    volumes:
+      - ${MEMORIA_LOG_DIR:-./data/logs/memoria}:/var/log/memoria
+    network_mode: none
+    restart: "no"
+
   memoria:
     image: ${MEMORIA_IMAGE:-matrixorigin/memoria:latest}
     hostname: memoria
@@ -97,6 +146,8 @@ services:
     depends_on:
       matrixone:
         condition: service_healthy
+      memoria-init:
+        condition: service_completed_successfully
     networks:
       - mo-net
     healthcheck:
@@ -142,6 +193,9 @@ services:
       ASTRA_JWT_REFRESH_TTL_DAYS: ${ASTRA_JWT_REFRESH_TTL_DAYS:-7}
       ASTRA_TOKEN_ENCRYPTION_KEY: ${ASTRA_TOKEN_ENCRYPTION_KEY:?Set ASTRA_TOKEN_ENCRYPTION_KEY in deployment/all-in-one/.env}
       ASTRA_RUNTIME_ROOT_SECRET: ${ASTRA_RUNTIME_ROOT_SECRET:?Set ASTRA_RUNTIME_ROOT_SECRET in deployment/all-in-one/.env}
+      # Released images before the runtime-root rename still read this name.
+      # Keep one operator-facing secret and translate only at the image boundary.
+      ASTRA_BRIDGE_SECRET: ${ASTRA_RUNTIME_ROOT_SECRET:?Set ASTRA_RUNTIME_ROOT_SECRET in deployment/all-in-one/.env}
       MEMORIA_BASE_URL: http://memoria:8100
       MEMORIA_MASTER_KEY: ${MEMORIA_MASTER_KEY:?Set MEMORIA_MASTER_KEY in deployment/all-in-one/.env}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}

@@ -63,6 +63,12 @@ set_env_value "$production_env" MEMORIA_MASTER_KEY 3456789abcdef0123456789abcdef
 
 "$repo_root/scripts/ops/validate_production_env.sh" "$production_env" >/dev/null
 
+production_compose="$repo_root/deployment/all-in-one/docker-compose.prod.yml"
+if [[ "$(grep -c 'ASTRA_BRIDGE_SECRET:.*ASTRA_RUNTIME_ROOT_SECRET' "$production_compose")" -ne 1 ]]; then
+    echo "production environment contract failed: immutable pre-rename images cannot consume the canonical runtime root secret" >&2
+    exit 1
+fi
+
 set_env_value "$production_env" ASTRA_IMAGE matrixorigin/astra:latest
 expect_rejected "$production_env"
 set_env_value "$production_env" ASTRA_IMAGE matrixorigin/astra:0.1.0

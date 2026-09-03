@@ -90,6 +90,53 @@ def main() -> None:
             if not pinned_action.fullmatch(action):
                 errors.append(f"{source}: action must be pinned to a full commit SHA ({action})")
 
+    release_workflow = Path(".github/workflows/release-docker.yml").read_text(encoding="utf-8")
+    build_start = release_workflow.find("\n  build:")
+    smoke_start = release_workflow.find("\n  smoke:")
+    merge_start = release_workflow.find("\n  merge:")
+    promote_start = release_workflow.find("\n  promote:")
+    mirror_start = release_workflow.find("\n  registry-mirror:")
+    if not 0 <= build_start < smoke_start < merge_start < promote_start < mirror_start:
+        errors.append(
+            ".github/workflows/release-docker.yml: release jobs must smoke untagged digests, "
+            "publish the verified manifest, and only then promote rolling tags"
+        )
+    else:
+        build_job = release_workflow[build_start:smoke_start]
+        smoke_job = release_workflow[smoke_start:merge_start]
+        merge_job = release_workflow[merge_start:promote_start]
+        promote_job = release_workflow[promote_start:mirror_start]
+        if "push-by-digest=true" not in build_job or "name-canonical=true" not in build_job:
+            errors.append(
+                ".github/workflows/release-docker.yml: candidate builds must be pushed by digest without a tag"
+            )
+        if "type=raw,value=" in smoke_job or "- merge" in smoke_job:
+            errors.append(
+                ".github/workflows/release-docker.yml: smoke job must verify build digests before any tag is published"
+            )
+        if "- build" not in smoke_job or "@sha256:" not in smoke_job or "make stack-verify" not in smoke_job:
+            errors.append(
+                ".github/workflows/release-docker.yml: candidate digests must be verified through the all-in-one runtime"
+            )
+        if (
+            "- smoke" not in merge_job
+            or "type=raw,value=latest" in merge_job
+            or "actual_platforms" not in merge_job
+            or "expected_platforms" not in merge_job
+        ):
+            errors.append(
+                ".github/workflows/release-docker.yml: version manifest must depend on smoke and validate its platform set"
+            )
+        if (
+            "- merge" not in promote_job
+            or '--tag "${IMAGE_NAME}:latest"' not in promote_job
+            or "expected_platforms" not in promote_job
+            or "actual_platforms" not in promote_job
+        ):
+            errors.append(
+                ".github/workflows/release-docker.yml: rolling promotion must depend on and match the verified manifest"
+            )
+
     design_index = Path("docs/design/README.md").read_text(encoding="utf-8")
     for design in Path("docs/design").glob("*.md"):
         if design.name != "README.md" and f"]({design.name})" not in design_index:

@@ -7,6 +7,14 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 test_root="$(mktemp -d "${TMPDIR:-/tmp}/astra-setup-contract.XXXXXX")"
 trap 'rm -rf "$test_root"' EXIT
 
+# Keep the contract deterministic when a developer's shell already exports
+# stack configuration. Individual precedence cases set their own overrides.
+for key in ASTRA_JWT_SECRET ASTRA_TOKEN_ENCRYPTION_KEY ASTRA_RUNTIME_ROOT_SECRET \
+    MEMORIA_MASTER_KEY MEMORIA_EMBEDDING_PROVIDER MEMORIA_EMBEDDING_API_KEY \
+    MEMORIA_EMBEDDING_BASE_URL; do
+    unset "$key"
+done
+
 read_env_value() {
     local file="$1"
     local key="$2"
@@ -107,6 +115,35 @@ fi
 
 make --no-print-directory -s -C "$repo_root" stack-check-env STACK_ENV="$stack_env" >/dev/null
 
+# The public configuration has one runtime root secret. Compose must project it
+# to both the current input and the legacy input accepted by already-published
+# Astra images, without requiring users to configure a second secret.
+compose_file="$repo_root/deployment/all-in-one/docker-compose.yml"
+if [[ "$(grep -c 'ASTRA_RUNTIME_ROOT_SECRET:.*ASTRA_RUNTIME_ROOT_SECRET' "$compose_file")" -lt 1 ]] ||
+    [[ "$(grep -c 'ASTRA_BRIDGE_SECRET:.*ASTRA_RUNTIME_ROOT_SECRET' "$compose_file")" -ne 1 ]]; then
+    echo "setup contract failed: compose does not project the canonical runtime root secret to both image generations" >&2
+    exit 1
+fi
+if grep -q '^ASTRA_BRIDGE_SECRET=' "$repo_root/deployment/all-in-one/.env.example"; then
+    echo "setup contract failed: legacy image input leaked into operator configuration" >&2
+    exit 1
+fi
+if [[ "$(grep -c '^[[:space:]]*memoria-init:' "$compose_file")" -lt 2 ]] ||
+    [[ "$(grep -c 'condition: service_completed_successfully' "$compose_file")" -lt 2 ]]; then
+    echo "setup contract failed: Memoria log ownership is not initialized before startup" >&2
+    exit 1
+fi
+if [[ "$(grep -c -- '--no-dereference' "$compose_file")" -ne 2 ]] ||
+    [[ "$(grep -c 'must be a regular file' "$compose_file")" -ne 2 ]]; then
+    echo "setup contract failed: privileged ownership initialization can follow unsafe persistent paths" >&2
+    exit 1
+fi
+if [[ "$(grep -c 'HOST_UID:.*UID' "$compose_file")" -ne 2 ]] ||
+    [[ "$(grep -c 'UID must be numeric' "$compose_file")" -ne 2 ]]; then
+    echo "setup contract failed: privileged ownership initialization accepts an unvalidated UID" >&2
+    exit 1
+fi
+
 set_env_value "$stack_env" "MEMORIA_EMBEDDING_PROVIDER" "openai"
 set_env_value "$stack_env" "MEMORIA_EMBEDDING_API_KEY" " # still empty"
 set_env_value "$stack_env" "MEMORIA_EMBEDDING_BASE_URL" " # still empty"
@@ -115,7 +152,25 @@ if make --no-print-directory -s -C "$repo_root" stack-check-env STACK_ENV="$stac
     exit 1
 fi
 
-set_env_value "$stack_env" "MEMORIA_EMBEDDING_BASE_URL" "http://embeddings.internal/v1"
-make --no-print-directory -s -C "$repo_root" stack-check-env STACK_ENV="$stack_env" >/dev/null
+MEMORIA_EMBEDDING_PROVIDER=mock \
+    make --no-print-directory -s -C "$repo_root" stack-check-env STACK_ENV="$stack_env" >/dev/null
+
+if ASTRA_JWT_SECRET= MEMORIA_EMBEDDING_PROVIDER=mock \
+    make --no-print-directory -s -C "$repo_root" stack-check-env STACK_ENV="$stack_env" >/dev/null 2>&1; then
+    echo "setup contract failed: an explicitly empty shell override did not override the env file" >&2
+    exit 1
+fi
+
+MEMORIA_EMBEDDING_BASE_URL=http://embeddings.internal/v1 \
+    make --no-print-directory -s -C "$repo_root" stack-check-env STACK_ENV="$stack_env" >/dev/null
+
+# Stack status, verification, and edge startup must all derive a connectable
+# local URL from the same bind address Compose uses.
+# shellcheck source=../lib/env_file.sh
+. "$repo_root/scripts/lib/env_file.sh"
+[[ "$(env_http_host_from_bind 0.0.0.0)" == "127.0.0.1" ]]
+[[ "$(env_http_host_from_bind 192.0.2.10)" == "192.0.2.10" ]]
+[[ "$(env_http_host_from_bind ::)" == "[::1]" ]]
+[[ "$(env_http_host_from_bind 2001:db8::10)" == "[2001:db8::10]" ]]
 
 echo "setup contracts: ok"
