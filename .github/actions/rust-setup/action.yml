@@ -74,7 +74,9 @@ runs:
         {
           echo "SCCACHE_GHA_ENABLED=true"
           echo "SCCACHE_CACHE_SIZE=5G"
-          echo "RUSTC_WRAPPER=sccache"
+          # Keep compiler caching fail-open. The wrapper retries with rustc and
+          # disables sccache for the job if the remote cache backend fails.
+          echo "RUSTC_WRAPPER=${GITHUB_WORKSPACE}/scripts/ci/rustc-sccache-fallback.sh"
         } >> "$GITHUB_ENV"
 
     - name: Report sccache fallback
