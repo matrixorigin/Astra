@@ -505,7 +505,7 @@ impl GenerationTamperWatch {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = (lock_paths, binding_paths);
+            let _ = (lock_paths, binding_paths, cancel_token);
             Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "workspace generation tamper watch is unavailable",
@@ -1219,7 +1219,7 @@ impl WorkspacePathIdentity {
                 path,
                 device: metadata.dev(),
                 inode: metadata.ino(),
-                file_type: metadata.mode() & libc::S_IFMT,
+                file_type: metadata.mode() & (libc::S_IFMT as u32),
             })
         }
         #[cfg(not(unix))]
@@ -1238,7 +1238,7 @@ impl WorkspacePathIdentity {
             use std::os::unix::fs::MetadataExt;
             metadata.dev() == self.device
                 && metadata.ino() == self.inode
-                && metadata.mode() & libc::S_IFMT == self.file_type
+                && metadata.mode() & (libc::S_IFMT as u32) == self.file_type
         }
         #[cfg(not(unix))]
         {

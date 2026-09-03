@@ -486,7 +486,7 @@ impl StallReflection {
     /// Format as a nudge message for injection into the conversation.
     pub fn to_nudge_message(&self) -> String {
         let mut parts = vec![
-            format!("⚠ REFLECTION — Agent appears stuck.\n"),
+            "⚠ REFLECTION — Agent appears stuck.\n".to_string(),
             format!("What happened: {}\n", self.what_happened),
             format!("Why: {}\n", self.why),
             format!("What to try: {}", self.what_to_try),

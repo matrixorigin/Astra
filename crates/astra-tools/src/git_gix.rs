@@ -1307,7 +1307,8 @@ pub fn blame(project_root: &Path, args: &Value) -> String {
         let Ok(end) = u32::try_from(end) else {
             return "Error: 'end_line' exceeds the supported line range".to_string();
         };
-        match gix::blame::BlameRanges::from_one_based_inclusive_ranges(vec![start..=end]) {
+        let line_range = start..=end;
+        match gix::blame::BlameRanges::from_one_based_inclusive_ranges(vec![line_range]) {
             Ok(ranges) => options.ranges = ranges,
             Err(e) => return format!("Error: invalid line range: {e}"),
         }

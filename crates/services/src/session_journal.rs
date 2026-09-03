@@ -2046,6 +2046,9 @@ impl SessionExecutionLease {
                 }
             })?;
         let lock_path = execution_lease_path(&journal_path, session_id);
+        // On Linux this binds a kernel-held guard that must live for the whole
+        // lease; the non-Linux fallback returns unit, which trips the lint.
+        #[allow(clippy::let_unit_value)]
         let _kernel_authority =
             acquire_execution_kernel_authority(&owner_scope, &journal_path, session_id)?;
         let created_parent_dirs = journal_path

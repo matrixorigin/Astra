@@ -6761,9 +6761,7 @@ printf 'probe.txt:1:needle\n'
         let result = execute_bash(
             &ctx,
             &serde_json::json!({
-                "command": format!(
-                    "echo line_1; touch .cancel_sentinel; sleep 0.1; echo line_2; sleep 10"
-                )
+                "command": "echo line_1; touch .cancel_sentinel; sleep 0.1; echo line_2; sleep 10"
             }),
         )
         .await;

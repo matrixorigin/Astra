@@ -73,9 +73,17 @@ pub fn shared_tool_semaphore() -> Arc<Semaphore> {
         .clone()
 }
 
+/// Failure to obtain a slot from the process-wide tool execution budget.
+#[derive(Debug, thiserror::Error)]
+pub enum ToolPermitError {
+    /// The shared semaphore was closed, so no further tool admissions are possible.
+    #[error("global tool execution admission is closed")]
+    AdmissionClosed,
+}
+
 /// Acquire one slot from the process-wide tool execution budget while
 /// preserving the same wait/closed metrics across all runtime frontends.
-pub async fn acquire_shared_tool_permit() -> Result<OwnedSemaphorePermit, ()> {
+pub async fn acquire_shared_tool_permit() -> Result<OwnedSemaphorePermit, ToolPermitError> {
     let start = Instant::now();
     match shared_tool_semaphore().acquire_owned().await {
         Ok(permit) => {
@@ -84,7 +92,7 @@ pub async fn acquire_shared_tool_permit() -> Result<OwnedSemaphorePermit, ()> {
         }
         Err(_closed) => {
             record_tool_admission("closed", start.elapsed());
-            Err(())
+            Err(ToolPermitError::AdmissionClosed)
         }
     }
 }
