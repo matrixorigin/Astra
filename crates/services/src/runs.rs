@@ -23917,6 +23917,12 @@ mod tests {
                 settings.db_pool_min_connections = settings
                     .db_pool_min_connections
                     .min(settings.db_pool_max_connections);
+                // These integration tests validate transaction correctness under
+                // contention, not production overload admission. Keep the pool
+                // deliberately small, but leave enough of the 30-second nextest
+                // budget for queued operations to acquire one of its eight slots.
+                settings.db_pool_acquire_timeout_secs =
+                    settings.db_pool_acquire_timeout_secs.max(15);
                 let catalog = std::env::var("ASTRA_DATABASE_BOOTSTRAP_CATALOG")
                     .unwrap_or_else(|_| "mysql".to_string());
                 crate::storage::ensure_core_schema(&settings, &catalog)

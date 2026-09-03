@@ -162,6 +162,10 @@ DURABLE_EVENT_PRESSURE_ARGS ?=
 
 NEXTEST_OFFLINE_FLAGS := --profile $(NEXTEST_OFFLINE_PROFILE)
 NEXTEST_ONLINE_FLAGS  := --profile $(NEXTEST_ONLINE_PROFILE)
+# Operational pressure probes have dedicated runners and data-size controls.
+# Keep them out of the generic ignored-test lane, whose per-case timeout is a
+# correctness budget rather than a load-test budget.
+NEXTEST_CLEANUP_PRESSURE_EXCLUSION := not test(/(db_cleanup_expired|db_truncate_gc|prompt_retention)_pressure_probe/)
 # Phase-0 production baselines require hermetic binary/model inputs and the
 # ASTRA_PHASE0_BASELINE_EXCLUSIVE guard. They are owned by
 # scripts/phase0-production-baseline.sh, not the generic ignored-test lane.
@@ -1175,13 +1179,14 @@ test-online:
 			ASTRA_TEST_DB_IT=1 \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) $(API_SHELL_PKG) \
 				--lib --bins --run-ignored only $(NEXTEST_ONLINE_FLAGS) $$ONLINE_JOBS_FLAG \
-				-E 'not test(/durable_run_event_pressure_probe/)' \
+				-E 'not test(/durable_run_event_pressure_probe/) and $(NEXTEST_CLEANUP_PRESSURE_EXCLUSION)' \
 				|| FAILED="$$FAILED astra-runtime-ignored"; \
 		echo "Running astra-turn-core db-store ignored tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
 		ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
 			ASTRA_TEST_DB_IT=1 \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-turn-core \
 				--features db-store --lib --run-ignored only $(NEXTEST_ONLINE_FLAGS) $$ONLINE_JOBS_FLAG \
+				-E '$(NEXTEST_CLEANUP_PRESSURE_EXCLUSION)' \
 				|| FAILED="$$FAILED astra-turn-core-db-store"; \
 		echo "Running astra-services ignored lib/integration tests (live DB=$$RUNTIME_IGNORED_DB; nextest profile=$(NEXTEST_ONLINE_PROFILE))..."; \
 		ASTRA_DATABASE=$$RUNTIME_IGNORED_DB ASTRA_DATABASE_PREFIX="" ASTRA_AUTO_CREATE_DATABASE=1 \
@@ -1189,6 +1194,7 @@ test-online:
 			ASTRA_TEST_DB_IT=1 \
 			CARGO_INCREMENTAL=0 cargo nextest run $(CARGO_MANIFEST_FLAG) -p astra-services \
 				--lib --tests --run-ignored only $(NEXTEST_ONLINE_FLAGS) $$ONLINE_JOBS_FLAG \
+				-E '$(NEXTEST_CLEANUP_PRESSURE_EXCLUSION)' \
 				|| FAILED="$$FAILED astra-services-online"; \
 	fi; \
 	if [ "$$ONLINE_LANE" != "core" ]; then \
