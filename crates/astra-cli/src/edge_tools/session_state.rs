@@ -280,8 +280,20 @@ impl ToolExecutor {
                     })?
                 {
                     astra_services::session_workspace::WorkspaceConfigRestoreOutcome::Applied {
-                        config, revision, ..
+                        config,
+                        revision,
+                        postcommit,
+                        ..
                     } => {
+                        if let Some(warning) = postcommit.warning {
+                            tracing::warn!(
+                                session_id,
+                                path,
+                                revision,
+                                warning,
+                                "config rollback committed but its audit event could not be appended"
+                            );
+                        }
                         if let Err(error) = self.restore_observability_snapshot(snapshot) {
                             tracing::warn!(
                                 session_id,

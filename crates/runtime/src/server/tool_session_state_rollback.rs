@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -5,7 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
-use crate::server::tool_session_config::{ConfigRestoreOutcome, restore_config_override};
+use crate::server::tool_session_config::{
+    ConfigRestoreOutcome, project_observability_config, restore_config_override,
+};
 
 #[derive(Debug, Clone)]
 pub(crate) enum SessionStateRollbackAction {
@@ -46,6 +49,7 @@ pub(crate) struct RollbackSessionStateContext {
 pub(crate) struct SessionStateRollbackJournal {
     entries: Vec<SessionStateRollbackEntry>,
     next_sequence: u64,
+    local_mutation_coordinator: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SessionStateRollbackJournal {
@@ -54,15 +58,17 @@ impl SessionStateRollbackJournal {
         turn_index: u32,
         label: String,
         action: SessionStateRollbackAction,
-    ) {
+    ) -> u64 {
+        let sequence = self.next_sequence;
         self.entries.push(SessionStateRollbackEntry {
-            sequence: self.next_sequence,
+            sequence,
             turn_index,
             timestamp: SystemTime::now(),
             label,
             action,
         });
         self.next_sequence = self.next_sequence.saturating_add(1);
+        sequence
     }
 
     pub(crate) fn list(&self) -> Vec<SessionStateRollbackEntry> {
@@ -78,19 +84,21 @@ impl SessionStateRollbackJournal {
         turn_index: u32,
         checkpoint: u64,
     ) -> Vec<SessionStateRollbackEntry> {
-        self.entries
+        let mut plan = self
+            .entries
             .iter()
             .rev()
             .filter(|entry| entry.turn_index == turn_index && entry.sequence >= checkpoint)
             .cloned()
-            .collect()
+            .collect::<Vec<_>>();
+        order_config_rollbacks_by_owner(&mut plan);
+        plan
     }
 
     pub(crate) fn checkpoint(&self) -> u64 {
         self.next_sequence
     }
 
-    #[cfg(test)]
     pub(crate) fn remove_sequence(&mut self, sequence: u64) -> bool {
         if let Some(index) = self
             .entries
@@ -129,6 +137,35 @@ impl SessionStateRollbackJournal {
         }
         self.entries.remove(index);
         true
+    }
+}
+
+fn config_owner_revision(entry: &SessionStateRollbackEntry) -> Option<u64> {
+    match &entry.action {
+        SessionStateRollbackAction::ConfigOverride {
+            expected_revision, ..
+        } => Some(expected_revision.load(Ordering::Relaxed)),
+        SessionStateRollbackAction::Compression { .. } => None,
+    }
+}
+
+/// Preserve the established sequence slots for heterogeneous rollback actions,
+/// while ordering config actions by their durable workspace ownership token.
+/// This avoids treating asynchronous publication completion as config order.
+fn order_config_rollbacks_by_owner(plan: &mut [SessionStateRollbackEntry]) {
+    let mut configs = plan
+        .iter()
+        .filter(|entry| config_owner_revision(entry).is_some())
+        .cloned()
+        .collect::<Vec<_>>();
+    configs.sort_by_key(|entry| Reverse(config_owner_revision(entry).unwrap_or_default()));
+    let mut configs = configs.into_iter();
+    for entry in plan.iter_mut() {
+        if config_owner_revision(entry).is_some() {
+            *entry = configs
+                .next()
+                .expect("config rollback slot count must remain stable");
+        }
     }
 }
 
@@ -174,15 +211,25 @@ pub(crate) fn journal_checkpoint(journal: &Mutex<SessionStateRollbackJournal>) -
     })
 }
 
+pub(crate) fn local_mutation_coordinator(
+    journal: &Mutex<SessionStateRollbackJournal>,
+) -> Arc<tokio::sync::Mutex<()>> {
+    with_journal(
+        journal,
+        "session_state_local_mutation_coordinator",
+        |journal| journal.local_mutation_coordinator.clone(),
+    )
+}
+
 pub(crate) fn record(
     journal: &Mutex<SessionStateRollbackJournal>,
     turn_index: u32,
     label: String,
     action: SessionStateRollbackAction,
-) {
+) -> u64 {
     with_journal_mut(journal, "record_session_state_rollback", |journal| {
         journal.record(turn_index, label, action)
-    });
+    })
 }
 
 pub(crate) fn entries(
@@ -212,7 +259,6 @@ pub(crate) fn restore_plan_for_turn_since(
     )
 }
 
-#[cfg(test)]
 pub(crate) fn remove_sequence(journal: &Mutex<SessionStateRollbackJournal>, sequence: u64) -> bool {
     with_journal_mut(journal, "remove_session_state_rollback", |journal| {
         journal.remove_sequence(sequence)
@@ -337,17 +383,30 @@ fn settle_config_restore(
 ) -> Result<Option<u64>, String> {
     match outcome {
         ConfigRestoreOutcome::Applied {
-            config, revision, ..
+            config,
+            revision,
+            postcommit,
+            ..
         } => {
+            if let Some(warning) = postcommit.warning {
+                tracing::warn!(
+                    session_id = context.session_id,
+                    path,
+                    revision,
+                    warning,
+                    "config rollback committed but its audit event could not be appended"
+                );
+            }
             if let Some(observability_session) = context.observability_session.as_ref() {
-                match observability_session.write() {
-                    Ok(mut session) => session.config = *config,
-                    Err(_) => tracing::warn!(
+                let receipt = project_observability_config(observability_session, Some(*config));
+                if let Some(warning) = receipt.warning {
+                    tracing::warn!(
                         session_id = context.session_id,
                         path,
                         revision,
+                        warning,
                         "config rollback committed but observability projection is unavailable"
-                    ),
+                    );
                 }
             }
             Ok(Some(revision))
@@ -358,14 +417,16 @@ fn settle_config_restore(
             ..
         } => {
             if let Some(observability_session) = context.observability_session.as_ref() {
-                match observability_session.write() {
-                    Ok(mut session) => session.config = *current_config,
-                    Err(_) => tracing::warn!(
+                let receipt =
+                    project_observability_config(observability_session, Some(*current_config));
+                if let Some(warning) = receipt.warning {
+                    tracing::warn!(
                         session_id = context.session_id,
                         path,
                         current_revision,
+                        warning,
                         "config rollback conflict preserved authority but observability projection is unavailable"
-                    ),
+                    );
                 }
             }
             Err(format!(
@@ -384,10 +445,16 @@ fn settle_config_restore(
             if let Some(config) = observed_config
                 && let Some(observability_session) = context.observability_session.as_ref()
             {
-                observability_session
-                    .write()
-                    .map_err(|_| "Failed to acquire observability session".to_string())?
-                    .config = *config;
+                let receipt = project_observability_config(observability_session, Some(*config));
+                if let Some(warning) = receipt.warning {
+                    tracing::warn!(
+                        session_id = context.session_id,
+                        path,
+                        revision,
+                        warning,
+                        "config rollback outcome unknown projected recovered authority"
+                    );
+                }
             }
             Err(format!(
                 "config rollback outcome unknown for {path} at revision {revision}: {reason}"
@@ -472,7 +539,11 @@ where
         .unwrap_or(0);
 
     match scope {
-        "list" => rollback_session_state_list(&context.journal),
+        "list" => {
+            let coordinator = local_mutation_coordinator(&context.journal);
+            let _local_guard = coordinator.lock().await;
+            rollback_session_state_list(&context.journal)
+        }
         "turn" | "current_turn" => {
             rollback_session_state_turn(
                 context,
@@ -524,6 +595,8 @@ where
     PublishFuture: Future<Output = Result<(), String>>,
 {
     let turn_index = explicit_turn_index.unwrap_or(u64::from(context.current_turn_index)) as u32;
+    let coordinator = local_mutation_coordinator(&context.journal);
+    let local_guard = coordinator.lock().await;
     let plan = if checkpoint > 0 {
         restore_plan_for_turn_since(&context.journal, turn_index, checkpoint)
     } else {
@@ -562,6 +635,7 @@ where
         }
     }
     let success = !restored.is_empty() && failed.is_empty();
+    drop(local_guard);
     let mut warnings = Vec::new();
     if !plan.is_empty() {
         if let Err(error) = publish_current_workspace().await {

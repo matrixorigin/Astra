@@ -853,36 +853,52 @@ fn persist_config_mutation_value(
     path: &str,
     new_value: serde_json::Value,
 ) -> Result<MutateApplyResponse, String> {
-    let outcome = session_workspace::update_existing_workspace_config(session_id, |workspace| {
-        let base_config = effective_runtime_config(Some(workspace))
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let (preview, candidate_config) =
-            prepare_config_mutation(session_id, path, new_value.clone(), &base_config)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-        let candidate_json =
-            serde_json::to_string(&candidate_config).map_err(std::io::Error::other)?;
-        workspace.tuned_config_json = if preview.would_clear_override {
-            None
-        } else {
-            Some(candidate_json)
-        };
-        workspace.updated_at = Utc::now().to_rfc3339();
-        Ok(std::ops::ControlFlow::<(), _>::Continue((
-            preview,
-            workspace.turn_count,
-        )))
-    })
+    let outcome = session_workspace::update_existing_workspace_config(
+        session_id,
+        |workspace| {
+            let base_config = effective_runtime_config(Some(workspace))
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            let (preview, candidate_config) =
+                prepare_config_mutation(session_id, path, new_value.clone(), &base_config)
+                    .map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidInput, error)
+                    })?;
+            let candidate_json =
+                serde_json::to_string(&candidate_config).map_err(std::io::Error::other)?;
+            workspace.tuned_config_json = if preview.would_clear_override {
+                None
+            } else {
+                Some(candidate_json)
+            };
+            workspace.updated_at = Utc::now().to_rfc3339();
+            Ok(std::ops::ControlFlow::<(), _>::Continue((
+                preview,
+                workspace.turn_count,
+            )))
+        },
+        |_, revision, value| {
+            append_config_change_event(
+                session_id,
+                value.1,
+                path,
+                &value.0.new_value,
+                Some(value.0.old_value.clone()),
+                revision,
+            )
+        },
+    )
     .map_err(|error| error.to_string())?;
-    let (preview, turn, config_revision, committed_config) = match outcome {
+    let (preview, config_revision, committed_config, postcommit) = match outcome {
         session_workspace::WorkspaceConfigMutationOutcome::Applied {
             value,
             revision,
             workspace,
+            postcommit,
         } => (
             value.0,
-            value.1,
             revision,
             effective_runtime_config(Some(&workspace))?,
+            postcommit,
         ),
         session_workspace::WorkspaceConfigMutationOutcome::Rejected(()) => {
             unreachable!("unconditional CLI config mutation cannot reject")
@@ -891,23 +907,14 @@ fn persist_config_mutation_value(
             return Err(format!("workspace config commit outcome unknown: {reason}"));
         }
     };
-    let audit_warning = append_config_change_event(
-        session_id,
-        turn,
-        path,
-        &preview.new_value,
-        Some(preview.old_value.clone()),
-    )
-    .err()
-    .map(|error| {
-        tracing::warn!(session_id, path, %error, "config mutation committed without audit event");
-        error.chars().take(240).collect()
-    });
+    let audit_warning = postcommit
+        .warning
+        .map(|warning| warning.chars().take(240).collect());
     Ok(MutateApplyResponse {
         preview,
         config_revision,
         committed_config,
-        audit_recorded: audit_warning.is_none(),
+        audit_recorded: postcommit.recorded,
         audit_warning,
     })
 }
@@ -927,40 +934,56 @@ pub(crate) fn persist_governed_config_override(
     force: bool,
     drift_ceiling: f64,
 ) -> Result<(MutateApplyResponse, Option<f64>), GovernedConfigMutationError> {
-    let outcome = session_workspace::update_existing_workspace_config(session_id, |workspace| {
-        let base_config = effective_runtime_config(Some(workspace))
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let prepared = prepare_governed_config_mutation(
-            session_id,
-            path,
-            new_value.clone(),
-            &base_config,
-            force,
-            drift_ceiling,
-        );
-        let (preview, candidate_config, drift) = match prepared {
-            Ok(prepared) => prepared,
-            Err(rejection) => return Ok(std::ops::ControlFlow::Break(rejection)),
-        };
-        workspace.tuned_config_json = if preview.would_clear_override {
-            None
-        } else {
-            Some(serde_json::to_string(&candidate_config).map_err(std::io::Error::other)?)
-        };
-        workspace.updated_at = Utc::now().to_rfc3339();
-        Ok(std::ops::ControlFlow::Continue((
-            preview,
-            candidate_config,
-            drift,
-            workspace.turn_count,
-            workspace.tuned_config_json.clone(),
-        )))
-    })
+    let outcome = session_workspace::update_existing_workspace_config(
+        session_id,
+        |workspace| {
+            let base_config = effective_runtime_config(Some(workspace))
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            let prepared = prepare_governed_config_mutation(
+                session_id,
+                path,
+                new_value.clone(),
+                &base_config,
+                force,
+                drift_ceiling,
+            );
+            let (preview, candidate_config, drift) = match prepared {
+                Ok(prepared) => prepared,
+                Err(rejection) => return Ok(std::ops::ControlFlow::Break(rejection)),
+            };
+            workspace.tuned_config_json = if preview.would_clear_override {
+                None
+            } else {
+                Some(serde_json::to_string(&candidate_config).map_err(std::io::Error::other)?)
+            };
+            workspace.updated_at = Utc::now().to_rfc3339();
+            Ok(std::ops::ControlFlow::Continue((
+                preview,
+                candidate_config,
+                drift,
+                workspace.turn_count,
+                workspace.tuned_config_json.clone(),
+            )))
+        },
+        |_, revision, value| {
+            append_config_change_event(
+                session_id,
+                value.3,
+                path,
+                &value.0.new_value,
+                Some(value.0.old_value.clone()),
+                revision,
+            )
+        },
+    )
     .map_err(|error| GovernedConfigMutationError::Persistence(error.to_string()))?;
-    let (preview, committed_config, drift, turn, config_revision) = match outcome {
+    let (preview, committed_config, drift, config_revision, postcommit) = match outcome {
         session_workspace::WorkspaceConfigMutationOutcome::Applied {
-            value, revision, ..
-        } => (value.0, value.1, value.2, value.3, revision),
+            value,
+            revision,
+            postcommit,
+            ..
+        } => (value.0, value.1, value.2, revision, postcommit),
         session_workspace::WorkspaceConfigMutationOutcome::Rejected(rejection) => {
             return Err(GovernedConfigMutationError::Rejected(rejection));
         }
@@ -994,24 +1017,15 @@ pub(crate) fn persist_governed_config_override(
             )));
         }
     };
-    let audit_warning = append_config_change_event(
-        session_id,
-        turn,
-        path,
-        &preview.new_value,
-        Some(preview.old_value.clone()),
-    )
-    .err()
-    .map(|error| {
-        tracing::warn!(session_id, path, %error, "config mutation committed without audit event");
-        error.chars().take(240).collect()
-    });
+    let audit_warning = postcommit
+        .warning
+        .map(|warning| warning.chars().take(240).collect());
     Ok((
         MutateApplyResponse {
             preview,
             config_revision,
             committed_config,
-            audit_recorded: audit_warning.is_none(),
+            audit_recorded: postcommit.recorded,
             audit_warning,
         },
         drift,
@@ -1029,27 +1043,17 @@ pub(crate) fn restore_config_override(
         path,
         new_value.clone(),
         expected_revision,
+        |workspace, revision, previous_value| {
+            append_config_change_event(
+                session_id,
+                workspace.turn_count,
+                path,
+                &new_value,
+                Some(previous_value.clone()),
+                revision,
+            )
+        },
     )?;
-    if let session_workspace::WorkspaceConfigRestoreOutcome::Applied {
-        previous_value,
-        workspace,
-        ..
-    } = &outcome
-        && let Err(error) = append_config_change_event(
-            session_id,
-            workspace.turn_count,
-            path,
-            &new_value,
-            Some(previous_value.clone()),
-        )
-    {
-        tracing::warn!(
-            session_id,
-            path,
-            %error,
-            "config rollback committed without audit event"
-        );
-    }
     Ok(outcome)
 }
 
@@ -1073,12 +1077,17 @@ fn append_config_change_event(
     key: &str,
     new_value: &serde_json::Value,
     old_value: Option<serde_json::Value>,
+    config_revision: u64,
 ) -> Result<(), String> {
     let writer = session_journal::JournalWriter::new(session_id).map_err(|e| e.to_string())?;
     let mut metadata = serde_json::Map::new();
     metadata.insert(
         "source".to_string(),
         serde_json::Value::String("astra self mutate".to_string()),
+    );
+    metadata.insert(
+        "config_revision".to_string(),
+        serde_json::Value::from(config_revision),
     );
     if let Some(old_value) = old_value {
         metadata.insert("old_value".to_string(), old_value);
@@ -1327,14 +1336,10 @@ pub(crate) fn verify_runtime_config(tuned_config_json: Option<&str>) -> Vec<Chec
         }
     };
 
-    let verification_ok = config.verification.min_strictness <= config.verification.strictness
-        && config.verification.strictness <= config.verification.max_strictness
-        && (0.0..=1.0).contains(&config.verification.min_strictness)
-        && (0.0..=1.0).contains(&config.verification.strictness)
-        && (0.0..=1.0).contains(&config.verification.max_strictness);
+    let invariant_validation = astra_config::governed_config_invariant_validation(&config);
     checks.push(CheckResult {
         name: "verification_bounds".to_string(),
-        ok: verification_ok,
+        ok: invariant_validation.verification_bounds,
         detail: format!(
             "min={} strictness={} max={}",
             config.verification.min_strictness,
@@ -1343,14 +1348,9 @@ pub(crate) fn verify_runtime_config(tuned_config_json: Option<&str>) -> Vec<Chec
         ),
     });
 
-    let compression_ok = (0.0..=1.0).contains(&config.compression.compression_threshold)
-        && (0.0..=1.0).contains(&config.context_window.compression_threshold_min)
-        && (0.0..=1.0).contains(&config.context_window.compression_threshold_max)
-        && config.context_window.compression_threshold_min
-            <= config.context_window.compression_threshold_max;
     checks.push(CheckResult {
         name: "compression_bounds".to_string(),
-        ok: compression_ok,
+        ok: invariant_validation.compression_bounds,
         detail: format!(
             "compression={} window=[{}, {}]",
             config.compression.compression_threshold,

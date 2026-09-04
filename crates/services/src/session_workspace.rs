@@ -754,6 +754,7 @@ pub enum WorkspaceConfigMutationOutcome<T, R> {
         value: T,
         revision: u64,
         workspace: Box<WorkspaceMetadata>,
+        postcommit: WorkspaceConfigPostCommitReceipt,
     },
     Rejected(R),
     OutcomeUnknown {
@@ -762,6 +763,15 @@ pub enum WorkspaceConfigMutationOutcome<T, R> {
         observed: Option<Box<WorkspaceMetadata>>,
         reason: String,
     },
+}
+
+/// Result of a local side effect linearized with an applied workspace config
+/// commit. A side-effect failure never rolls back or disguises the durable
+/// config mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceConfigPostCommitReceipt {
+    pub recorded: bool,
+    pub warning: Option<String>,
 }
 
 /// Return the proposed revision only when readback proves exact ownership of a
@@ -788,6 +798,7 @@ pub enum WorkspaceConfigRestoreOutcome {
         config: Box<astra_config::RuntimeConfig>,
         revision: u64,
         workspace: Box<WorkspaceMetadata>,
+        postcommit: WorkspaceConfigPostCommitReceipt,
     },
     Rejected {
         current_revision: u64,
@@ -825,49 +836,57 @@ pub fn restore_workspace_config_override(
     path: &str,
     new_value: serde_json::Value,
     expected_revision: u64,
+    postcommit: impl FnOnce(&WorkspaceMetadata, u64, &serde_json::Value) -> Result<(), String>,
 ) -> Result<WorkspaceConfigRestoreOutcome, String> {
     let baseline = serde_json::to_value(astra_config::RuntimeConfig::load())
         .map_err(|error| error.to_string())?;
-    let outcome = update_existing_workspace_config(session_id, |workspace| {
-        let current_config = effective_workspace_config(workspace)?;
-        if workspace.config_mutation_revision != expected_revision {
-            return Ok(std::ops::ControlFlow::Break((
-                workspace.config_mutation_revision,
-                Box::new(current_config),
-                Box::new(workspace.clone()),
-            )));
-        }
-        let mut candidate = serde_json::to_value(&current_config).map_err(std::io::Error::other)?;
-        let previous_value =
-            astra_config::replace_existing_json_path(&mut candidate, path, new_value.clone())
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-        let committed_config: astra_config::RuntimeConfig =
-            serde_json::from_value(candidate.clone()).map_err(std::io::Error::other)?;
-        workspace.tuned_config_json = if candidate == baseline {
-            None
-        } else {
-            Some(serde_json::to_string(&committed_config).map_err(std::io::Error::other)?)
-        };
-        workspace.updated_at = chrono::Utc::now().to_rfc3339();
-        Ok(std::ops::ControlFlow::Continue(
-            WorkspaceConfigRestoreMutation {
-                previous_value,
-                committed_config: Box::new(committed_config),
-                committed_tuned_config_json: workspace.tuned_config_json.clone(),
-            },
-        ))
-    })
+    let outcome = update_existing_workspace_config(
+        session_id,
+        |workspace| {
+            let current_config = effective_workspace_config(workspace)?;
+            if workspace.config_mutation_revision != expected_revision {
+                return Ok(std::ops::ControlFlow::Break((
+                    workspace.config_mutation_revision,
+                    Box::new(current_config),
+                    Box::new(workspace.clone()),
+                )));
+            }
+            let mut candidate =
+                serde_json::to_value(&current_config).map_err(std::io::Error::other)?;
+            let previous_value =
+                astra_config::replace_existing_json_path(&mut candidate, path, new_value.clone())
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+            let committed_config: astra_config::RuntimeConfig =
+                serde_json::from_value(candidate.clone()).map_err(std::io::Error::other)?;
+            workspace.tuned_config_json = if candidate == baseline {
+                None
+            } else {
+                Some(serde_json::to_string(&committed_config).map_err(std::io::Error::other)?)
+            };
+            workspace.updated_at = chrono::Utc::now().to_rfc3339();
+            Ok(std::ops::ControlFlow::Continue(
+                WorkspaceConfigRestoreMutation {
+                    previous_value,
+                    committed_config: Box::new(committed_config),
+                    committed_tuned_config_json: workspace.tuned_config_json.clone(),
+                },
+            ))
+        },
+        |workspace, revision, mutation| postcommit(workspace, revision, &mutation.previous_value),
+    )
     .map_err(|error| error.to_string())?;
     match outcome {
         WorkspaceConfigMutationOutcome::Applied {
             value,
             revision,
             workspace,
+            postcommit,
         } => Ok(WorkspaceConfigRestoreOutcome::Applied {
             previous_value: value.previous_value,
             config: value.committed_config,
             revision,
             workspace,
+            postcommit,
         }),
         WorkspaceConfigMutationOutcome::Rejected((
             current_revision,
@@ -909,9 +928,16 @@ pub fn restore_workspace_config_override(
 /// This is the sole owner-level write primitive for `tuned_config_json`. Every
 /// accepted decision receives a fresh revision, including same-value writes.
 /// A rejected decision never rewrites the workspace.
+///
+/// `postcommit` runs only after an `Applied` commit is durable and while the
+/// per-session workspace file lock is still held. It must remain bounded and
+/// local, and must not re-enter a workspace mutation for the same session.
+/// Its error or panic is reported in the applied receipt without changing the
+/// authoritative commit. It never runs for `Rejected` or `OutcomeUnknown`.
 pub fn update_existing_workspace_config<T, R>(
     session_id: &str,
     update: impl FnOnce(&mut WorkspaceMetadata) -> std::io::Result<std::ops::ControlFlow<R, T>>,
+    postcommit: impl FnOnce(&WorkspaceMetadata, u64, &T) -> Result<(), String>,
 ) -> std::io::Result<WorkspaceConfigMutationOutcome<T, R>> {
     let dir = validated_workspace_dir(session_id)?;
     if !dir.exists() {
@@ -927,7 +953,6 @@ pub fn update_existing_workspace_config<T, R>(
             format!("workspace does not exist for session {session_id}"),
         ));
     };
-    validate_workspace_identity(session_id, &metadata)?;
     let projection_revision = metadata.projection_revision;
     let value = match update(&mut metadata)? {
         std::ops::ControlFlow::Continue(value) => value,
@@ -945,11 +970,30 @@ pub fn update_existing_workspace_config<T, R>(
     let revision = metadata.config_mutation_revision;
     let metadata = canonical_workspace_metadata(&metadata);
     match commit_workspace_unlocked(&metadata, &dir)? {
-        WorkspaceCommitOutcome::Applied => Ok(WorkspaceConfigMutationOutcome::Applied {
-            value,
-            revision,
-            workspace: Box::new(metadata),
-        }),
+        WorkspaceCommitOutcome::Applied => {
+            let postcommit = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                postcommit(&metadata, revision, &value)
+            })) {
+                Ok(Ok(())) => WorkspaceConfigPostCommitReceipt {
+                    recorded: true,
+                    warning: None,
+                },
+                Ok(Err(warning)) => WorkspaceConfigPostCommitReceipt {
+                    recorded: false,
+                    warning: Some(warning),
+                },
+                Err(_) => WorkspaceConfigPostCommitReceipt {
+                    recorded: false,
+                    warning: Some("workspace config postcommit callback panicked".to_string()),
+                },
+            };
+            Ok(WorkspaceConfigMutationOutcome::Applied {
+                value,
+                revision,
+                workspace: Box::new(metadata),
+                postcommit,
+            })
+        }
         WorkspaceCommitOutcome::OutcomeUnknown(error) => {
             let (observed, readback_error) = match read_workspace_optional(session_id) {
                 Ok(observed) => (observed, None),
@@ -2134,20 +2178,32 @@ mod tests {
         let session_id = "workspace-config-rejected";
         write_workspace(&WorkspaceMetadata::new(session_id, "gpt-5")).unwrap();
         assert_eq!(read_workspace(session_id).unwrap().projection_revision, 1);
-        let applied = update_existing_workspace_config(session_id, |workspace| {
-            workspace.tuned_config_json = Some("owned".to_string());
-            Ok::<_, std::io::Error>(std::ops::ControlFlow::<(), _>::Continue(()))
-        })
+        let applied = update_existing_workspace_config(
+            session_id,
+            |workspace| {
+                workspace.tuned_config_json = Some("owned".to_string());
+                Ok::<_, std::io::Error>(std::ops::ControlFlow::<(), _>::Continue(()))
+            },
+            |_, _, _| Ok(()),
+        )
         .unwrap();
         let WorkspaceConfigMutationOutcome::Applied {
             revision,
             workspace: committed,
+            postcommit,
             ..
         } = applied
         else {
             panic!("config mutation must apply")
         };
         assert_eq!(revision, 1);
+        assert_eq!(
+            postcommit,
+            WorkspaceConfigPostCommitReceipt {
+                recorded: true,
+                warning: None,
+            }
+        );
         assert_eq!(committed.projection_revision, 2);
         assert_eq!(
             serde_json::to_value(&*committed).unwrap(),
@@ -2156,12 +2212,15 @@ mod tests {
         let path = workspace_file_path(session_id).unwrap();
         let before = std::fs::read(&path).unwrap();
 
-        let outcome: WorkspaceConfigMutationOutcome<(), &str> =
-            update_existing_workspace_config(session_id, |workspace| {
+        let outcome: WorkspaceConfigMutationOutcome<(), &str> = update_existing_workspace_config(
+            session_id,
+            |workspace| {
                 workspace.tuned_config_json = Some("must-not-persist".to_string());
                 Ok(std::ops::ControlFlow::Break("stale revision"))
-            })
-            .unwrap();
+            },
+            |_, _, _| panic!("rejected mutation must not run postcommit"),
+        )
+        .unwrap();
 
         assert!(matches!(
             outcome,
@@ -2199,6 +2258,134 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn config_postcommit_callbacks_follow_durable_revision_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = ProcessJournalDirGuard::new(&sessions_dir);
+        let session_id = "workspace-config-postcommit-order";
+        write_workspace(&WorkspaceMetadata::new(session_id, "gpt-5")).unwrap();
+
+        let revisions = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (first_entered_tx, first_entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::sync_channel(0);
+        let first_revisions = revisions.clone();
+        let first = std::thread::spawn(move || {
+            update_existing_workspace_config(
+                session_id,
+                |workspace| {
+                    workspace.tuned_config_json = Some("first".to_string());
+                    Ok::<_, std::io::Error>(std::ops::ControlFlow::<(), _>::Continue(()))
+                },
+                move |_, revision, _| {
+                    first_revisions.lock().unwrap().push(revision);
+                    first_entered_tx.send(()).unwrap();
+                    release_first_rx.recv().unwrap();
+                    Ok(())
+                },
+            )
+            .unwrap()
+        });
+        first_entered_rx.recv().unwrap();
+
+        let second_start = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let second_start_in_thread = second_start.clone();
+        let (second_attempted_tx, second_attempted_rx) = std::sync::mpsc::channel();
+        let (second_mutation_tx, second_mutation_rx) = std::sync::mpsc::channel();
+        let second_revisions = revisions.clone();
+        let second = std::thread::spawn(move || {
+            second_start_in_thread.wait();
+            second_attempted_tx.send(()).unwrap();
+            update_existing_workspace_config(
+                session_id,
+                |workspace| {
+                    second_mutation_tx.send(()).unwrap();
+                    workspace.tuned_config_json = Some("second".to_string());
+                    Ok::<_, std::io::Error>(std::ops::ControlFlow::<(), _>::Continue(()))
+                },
+                move |_, revision, _| {
+                    second_revisions.lock().unwrap().push(revision);
+                    Ok(())
+                },
+            )
+            .unwrap()
+        });
+        second_start.wait();
+        second_attempted_rx.recv().unwrap();
+        let entered_before_release = second_mutation_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_ok();
+        release_first_tx.send(()).unwrap();
+
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+        assert!(
+            !entered_before_release,
+            "second writer entered its mutation while the first postcommit was pending"
+        );
+        assert!(matches!(
+            first,
+            WorkspaceConfigMutationOutcome::Applied { revision: 1, .. }
+        ));
+        assert!(matches!(
+            second,
+            WorkspaceConfigMutationOutcome::Applied { revision: 2, .. }
+        ));
+        assert_eq!(*revisions.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn config_postcommit_panic_is_an_applied_warning_and_releases_owner_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = JournalDirGuard::new(&sessions_dir);
+        let session_id = "workspace-config-postcommit-panic";
+        write_workspace(&WorkspaceMetadata::new(session_id, "gpt-5")).unwrap();
+
+        let outcome = update_existing_workspace_config(
+            session_id,
+            |workspace| {
+                workspace.tuned_config_json = Some("committed".to_string());
+                Ok::<_, std::io::Error>(std::ops::ControlFlow::<(), _>::Continue(()))
+            },
+            |_, _, _| panic!("injected postcommit panic"),
+        )
+        .unwrap();
+        let WorkspaceConfigMutationOutcome::Applied {
+            revision,
+            postcommit,
+            ..
+        } = outcome
+        else {
+            panic!("durable commit must remain applied")
+        };
+        assert_eq!(revision, 1);
+        assert!(!postcommit.recorded);
+        assert!(postcommit.warning.is_some());
+
+        let next = update_existing_workspace_config(
+            session_id,
+            |workspace| {
+                workspace.tuned_config_json = Some("next".to_string());
+                Ok::<_, std::io::Error>(std::ops::ControlFlow::<(), _>::Continue(()))
+            },
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+        assert!(matches!(
+            next,
+            WorkspaceConfigMutationOutcome::Applied {
+                revision: 2,
+                postcommit: WorkspaceConfigPostCommitReceipt { recorded: true, .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn config_restore_owner_rejects_stale_and_aba_revisions() {
         let temp = tempfile::tempdir().unwrap();
         let sessions_dir = temp.path().join("sessions");
@@ -2214,6 +2401,7 @@ mod tests {
             "memory.retrieval_top_k",
             serde_json::json!(changed),
             0,
+            |_, _, _| Ok(()),
         )
         .unwrap();
         assert!(matches!(
@@ -2225,6 +2413,7 @@ mod tests {
             "memory.retrieval_top_k",
             serde_json::json!(changed),
             1,
+            |_, _, _| Ok(()),
         )
         .unwrap();
         assert!(matches!(
@@ -2236,6 +2425,7 @@ mod tests {
             "memory.retrieval_top_k",
             serde_json::json!(baseline),
             0,
+            |_, _, _| panic!("rejected restore must not run postcommit"),
         )
         .unwrap();
         assert!(matches!(
@@ -2266,11 +2456,19 @@ mod tests {
         let session_id = "workspace-config-sync-unknown";
         write_workspace(&WorkspaceMetadata::new(session_id, "gpt-5")).unwrap();
         inject_workspace_commit_parent_sync_failure_once();
+        let postcommit_called = std::cell::Cell::new(false);
 
-        let outcome = update_existing_workspace_config(session_id, |workspace| {
-            workspace.tuned_config_json = Some("candidate".to_string());
-            Ok::<_, std::io::Error>(std::ops::ControlFlow::<(), _>::Continue("candidate"))
-        })
+        let outcome = update_existing_workspace_config(
+            session_id,
+            |workspace| {
+                workspace.tuned_config_json = Some("candidate".to_string());
+                Ok::<_, std::io::Error>(std::ops::ControlFlow::<(), _>::Continue("candidate"))
+            },
+            |_, _, _| {
+                postcommit_called.set(true);
+                Ok(())
+            },
+        )
         .unwrap();
 
         let WorkspaceConfigMutationOutcome::OutcomeUnknown {
@@ -2288,6 +2486,7 @@ mod tests {
         assert_eq!(observed.config_mutation_revision, 1);
         assert_eq!(observed.tuned_config_json.as_deref(), Some("candidate"));
         assert!(reason.contains("injected workspace commit directory sync failure"));
+        assert!(!postcommit_called.get());
     }
 
     #[test]

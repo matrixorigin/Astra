@@ -10,6 +10,50 @@ use crate::server::tool_session_state_rollback::{
 
 type RuntimeConfigUpdate = astra_config::GovernedConfigMutation;
 
+#[cfg(test)]
+#[derive(Clone)]
+struct LocalCommitBarrier {
+    session_id: String,
+    entered: Arc<std::sync::Barrier>,
+    release: Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+static LOCAL_COMMIT_BARRIER: StdMutex<Option<LocalCommitBarrier>> = StdMutex::new(None);
+
+#[cfg(test)]
+fn install_local_commit_barrier(session_id: &str) -> LocalCommitBarrier {
+    let barrier = LocalCommitBarrier {
+        session_id: session_id.to_string(),
+        entered: Arc::new(std::sync::Barrier::new(2)),
+        release: Arc::new(std::sync::Barrier::new(2)),
+    };
+    *LOCAL_COMMIT_BARRIER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(barrier.clone());
+    barrier
+}
+
+#[cfg(test)]
+fn wait_at_local_commit_barrier(session_id: &str) {
+    let mut installed = LOCAL_COMMIT_BARRIER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let barrier = if installed
+        .as_ref()
+        .is_some_and(|barrier| barrier.session_id == session_id)
+    {
+        installed.take()
+    } else {
+        None
+    };
+    drop(installed);
+    if let Some(barrier) = barrier {
+        barrier.entered.wait();
+        barrier.release.wait();
+    }
+}
+
 pub(crate) fn effective_runtime_config(
     workspace: Option<&astra_services::session_workspace::WorkspaceMetadata>,
 ) -> Result<astra_config::runtime_config::RuntimeConfig, String> {
@@ -26,6 +70,7 @@ pub(crate) fn append_config_change_event(
     key: &str,
     new_value: &Value,
     old_value: Option<Value>,
+    config_revision: u64,
     source: &str,
 ) -> Result<(), String> {
     let writer = astra_services::session_journal::JournalWriter::for_user(user_id, session_id)
@@ -36,8 +81,10 @@ pub(crate) fn append_config_change_event(
         &new_value.to_string(),
     );
     event.turn = Some(turn);
-    let mut metadata =
-        serde_json::Map::from_iter([("source".to_string(), Value::String(source.to_string()))]);
+    let mut metadata = serde_json::Map::from_iter([
+        ("source".to_string(), Value::String(source.to_string())),
+        ("config_revision".to_string(), Value::from(config_revision)),
+    ]);
     if let Some(old_value) = old_value {
         metadata.insert("old_value".to_string(), old_value);
     }
@@ -74,61 +121,143 @@ fn bounded_warning(error: impl std::fmt::Display) -> String {
     error.to_string().chars().take(240).collect()
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ConfigProjectionReceipt {
+    pub(crate) recorded: bool,
+    pub(crate) warning: Option<String>,
+}
+
+pub(crate) fn project_observability_config(
+    observability_session: &RwLock<crate::observability::ObservabilitySession>,
+    config: Option<astra_config::RuntimeConfig>,
+) -> ConfigProjectionReceipt {
+    let Some(config) = config else {
+        return ConfigProjectionReceipt {
+            recorded: false,
+            warning: Some("authoritative workspace config unavailable".to_string()),
+        };
+    };
+    match observability_session.write() {
+        Ok(mut session) => {
+            session.config = config;
+            ConfigProjectionReceipt {
+                recorded: true,
+                warning: None,
+            }
+        }
+        Err(poisoned) => {
+            let mut recovered = poisoned.into_inner();
+            recovered.config = config;
+            observability_session.clear_poison();
+            drop(recovered);
+            ConfigProjectionReceipt {
+                recorded: true,
+                warning: Some(
+                    "observability config projection lock was poisoned and recovered".to_string(),
+                ),
+            }
+        }
+    }
+}
+
 fn config_value(config: &astra_config::RuntimeConfig, path: &str) -> Result<Value, String> {
     let value = serde_json::to_value(config).map_err(|error| error.to_string())?;
     astra_config::read_existing_json_path(&value, path).map_err(|error| error.to_string())
 }
 
 fn commit_config_mutation(
+    user_id: &str,
     session_id: &str,
     path: &str,
     expected_revision: Option<u64>,
+    audit_source: &str,
     mutate: impl FnOnce(
         &mut astra_config::RuntimeConfig,
     ) -> Result<RuntimeConfigUpdate, ConfigMutationRejection>,
 ) -> Result<ConfigMutationOutcome, String> {
     let baseline_json = serde_json::to_value(astra_config::runtime_config::RuntimeConfig::load())
         .map_err(|e| e.to_string())?;
-    astra_services::session_workspace::update_existing_workspace_config(session_id, |workspace| {
-        let previous_config = effective_runtime_config(Some(workspace))
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        if expected_revision.is_some_and(|expected| expected != workspace.config_mutation_revision)
-        {
-            return Ok(std::ops::ControlFlow::Break(
-                ConfigMutationRejection::RevisionConflict {
-                    current_revision: workspace.config_mutation_revision,
-                    current_value: config_value(&previous_config, path).map_err(|error| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, error)
-                    })?,
-                    current_config: Box::new(previous_config),
-                    current_workspace: Box::new(workspace.clone()),
-                },
-            ));
-        }
-        let mut committed_config = previous_config.clone();
-        let update = match mutate(&mut committed_config) {
-            Ok(update) => update,
-            Err(rejection) => {
-                return Ok(std::ops::ControlFlow::Break(rejection));
+    astra_services::session_workspace::update_existing_workspace_config(
+        session_id,
+        |workspace| {
+            let previous_config = effective_runtime_config(Some(workspace))
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            if expected_revision
+                .is_some_and(|expected| expected != workspace.config_mutation_revision)
+            {
+                return Ok(std::ops::ControlFlow::Break(
+                    ConfigMutationRejection::RevisionConflict {
+                        current_revision: workspace.config_mutation_revision,
+                        current_value: config_value(&previous_config, path).map_err(|error| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, error)
+                        })?,
+                        current_config: Box::new(previous_config),
+                        current_workspace: Box::new(workspace.clone()),
+                    },
+                ));
             }
-        };
-        let committed_json =
-            serde_json::to_value(&committed_config).map_err(std::io::Error::other)?;
-        workspace.tuned_config_json = if committed_json == baseline_json {
-            None
-        } else {
-            Some(serde_json::to_string(&committed_config).map_err(std::io::Error::other)?)
-        };
-        workspace.updated_at = chrono::Utc::now().to_rfc3339();
-        Ok(std::ops::ControlFlow::Continue(DurableConfigMutation {
-            update,
-            previous_config: Box::new(previous_config),
-            committed_config: Box::new(committed_config),
-            committed_tuned_config_json: workspace.tuned_config_json.clone(),
-            turn: workspace.turn_count,
-        }))
-    })
+            let mut committed_config = previous_config.clone();
+            let update = match mutate(&mut committed_config) {
+                Ok(update) => update,
+                Err(rejection) => {
+                    return Ok(std::ops::ControlFlow::Break(rejection));
+                }
+            };
+            if let Err(error) = astra_config::validate_governed_config_candidate(&committed_config)
+            {
+                return Ok(std::ops::ControlFlow::Break(
+                    ConfigMutationRejection::Invalid(error.to_json()),
+                ));
+            }
+            let committed_json =
+                serde_json::to_value(&committed_config).map_err(std::io::Error::other)?;
+            workspace.tuned_config_json = if committed_json == baseline_json {
+                None
+            } else {
+                Some(serde_json::to_string(&committed_config).map_err(std::io::Error::other)?)
+            };
+            workspace.updated_at = chrono::Utc::now().to_rfc3339();
+            Ok(std::ops::ControlFlow::Continue(DurableConfigMutation {
+                update,
+                previous_config: Box::new(previous_config),
+                committed_config: Box::new(committed_config),
+                committed_tuned_config_json: workspace.tuned_config_json.clone(),
+                turn: workspace.turn_count,
+            }))
+        },
+        |_, revision, mutation| {
+            append_config_change_event(
+                user_id,
+                session_id,
+                mutation.turn,
+                path,
+                &mutation.update.new_value,
+                Some(mutation.update.old_value.clone()),
+                revision,
+                audit_source,
+            )
+        },
+    )
     .map_err(|error| error.to_string())
+}
+
+fn record_config_rollback(
+    journal: &StdMutex<SessionStateRollbackJournal>,
+    journal_turn_index: u32,
+    path: &str,
+    mutation: &DurableConfigMutation,
+    owner_revision: u64,
+) -> u64 {
+    tool_session_state_rollback::record(
+        journal,
+        journal_turn_index,
+        format!("adjust_config:{path}"),
+        SessionStateRollbackAction::ConfigOverride {
+            path: path.to_string(),
+            old_value: mutation.update.old_value.clone(),
+            expected_revision: Arc::new(std::sync::atomic::AtomicU64::new(owner_revision)),
+        },
+    )
 }
 
 fn record_outcome_unknown_config_rollback(
@@ -148,48 +277,8 @@ fn record_outcome_unknown_config_rollback(
     else {
         return false;
     };
-    tool_session_state_rollback::record(
-        journal,
-        journal_turn_index,
-        format!("adjust_config:{path}"),
-        SessionStateRollbackAction::ConfigOverride {
-            path: path.to_string(),
-            old_value: mutation.update.old_value.clone(),
-            expected_revision: Arc::new(std::sync::atomic::AtomicU64::new(owner_revision)),
-        },
-    );
+    record_config_rollback(journal, journal_turn_index, path, mutation, owner_revision);
     true
-}
-
-fn append_config_mutation_audit(
-    user_id: &str,
-    session_id: &str,
-    path: &str,
-    mutation: &DurableConfigMutation,
-    source: &str,
-) -> Option<String> {
-    match append_config_change_event(
-        user_id,
-        session_id,
-        mutation.turn,
-        path,
-        &mutation.update.new_value,
-        Some(mutation.update.old_value.clone()),
-        source,
-    ) {
-        Ok(()) => None,
-        Err(error) => {
-            let warning = bounded_warning(&error);
-            tracing::warn!(
-                session_id,
-                path,
-                source,
-                error,
-                "config override committed but its audit event could not be appended"
-            );
-            Some(warning)
-        }
-    }
 }
 
 pub(crate) type ConfigRestoreOutcome =
@@ -208,23 +297,19 @@ pub(crate) fn restore_config_override(
         path,
         new_value.clone(),
         expected_revision,
+        |workspace, revision, previous_value| {
+            append_config_change_event(
+                user_id,
+                session_id,
+                workspace.turn_count,
+                path,
+                &new_value,
+                Some(previous_value.clone()),
+                revision,
+                source,
+            )
+        },
     )?;
-    if let ConfigRestoreOutcome::Applied {
-        previous_value,
-        workspace,
-        ..
-    } = &outcome
-    {
-        let _ = append_config_change_event(
-            user_id,
-            session_id,
-            workspace.turn_count,
-            path,
-            &new_value,
-            Some(previous_value.clone()),
-            source,
-        );
-    }
     Ok(outcome)
 }
 
@@ -401,21 +486,36 @@ where
             Err(error) => return session_tool_output(error),
         };
 
-    let mutation = match commit_config_mutation(&session_id, &path, None, |config| {
-        astra_config::apply_governed_config_mutation(
-            config,
-            &path,
-            &value,
-            force,
-            constraints.config_drift_ceiling,
-        )
-        .map_err(|error| ConfigMutationRejection::Invalid(error.to_json()))
-    }) {
+    let local_coordinator =
+        tool_session_state_rollback::local_mutation_coordinator(&session_state_journal);
+    let local_guard = local_coordinator.lock().await;
+    let mutation = match commit_config_mutation(
+        &user_id,
+        &session_id,
+        &path,
+        None,
+        "runtime_tool_executor:adjust_config",
+        |config| {
+            astra_config::apply_governed_config_mutation(
+                config,
+                &path,
+                &value,
+                force,
+                constraints.config_drift_ceiling,
+            )
+            .map_err(|error| ConfigMutationRejection::Invalid(error.to_json()))
+        },
+    ) {
         Ok(ConfigMutationOutcome::Applied {
             value,
             revision,
             workspace,
-        }) => (value, revision, workspace),
+            postcommit,
+        }) => {
+            #[cfg(test)]
+            wait_at_local_commit_barrier(&session_id);
+            (value, revision, workspace, postcommit)
+        }
         Ok(ConfigMutationOutcome::Rejected(ConfigMutationRejection::Invalid(error))) => {
             drop(reservation);
             return session_tool_output(error);
@@ -434,6 +534,12 @@ where
             let observed_revision = observed
                 .as_ref()
                 .map(|workspace| workspace.config_mutation_revision);
+            let projection = project_observability_config(
+                &observability_session,
+                observed
+                    .as_deref()
+                    .and_then(|workspace| effective_runtime_config(Some(workspace)).ok()),
+            );
             let rollback_recorded = record_outcome_unknown_config_rollback(
                 &session_state_journal,
                 journal_turn_index,
@@ -442,12 +548,6 @@ where
                 revision,
                 observed.as_deref(),
             );
-            if let Some(workspace) = observed.as_ref()
-                && let Ok(config) = effective_runtime_config(Some(workspace))
-                && let Ok(mut session) = observability_session.write()
-            {
-                session.config = config;
-            }
             reservation.finish(ConfigMutationSettlement::OutcomeUnknown);
             return session_tool_output(json!({
                 "error": "config_commit_outcome_unknown",
@@ -458,6 +558,8 @@ where
                 "side_effects_maybe": true,
                 "owner_confirmed": rollback_recorded,
                 "rollback_recorded": rollback_recorded,
+                "projection_recorded": projection.recorded,
+                "projection_warning": projection.warning,
                 "audit_recorded": false,
             }));
         }
@@ -470,23 +572,36 @@ where
             }));
         }
     };
-    let (mutation, revision, committed_workspace) = mutation;
+    let (mutation, revision, committed_workspace, postcommit) = mutation;
     reservation.mark_durably_committed();
-    if let Ok(mut session) = observability_session.write() {
-        session.config = (*mutation.committed_config).clone();
-    }
-    let audit_warning = append_config_mutation_audit(
-        &user_id,
-        &session_id,
+    let rollback_sequence = record_config_rollback(
+        &session_state_journal,
+        journal_turn_index,
         &path,
         &mutation,
-        "runtime_tool_executor:adjust_config",
+        revision,
     );
+    let projection = project_observability_config(
+        &observability_session,
+        Some((*mutation.committed_config).clone()),
+    );
+    let audit_recorded = postcommit.recorded;
+    let audit_warning = postcommit.warning.map(bounded_warning);
+    drop(local_guard);
 
+    let join_projection = projection.clone();
+    let join_audit_recorded = audit_recorded;
+    let join_audit_warning = audit_warning.clone();
     let settlement = tokio::spawn(async move {
         if let Err(error) = publish_workspace(*committed_workspace).await {
-            let compensation =
-                commit_config_mutation(&session_id, &path, Some(revision), |config| {
+            let compensation_guard = local_coordinator.lock().await;
+            let compensation = commit_config_mutation(
+                &user_id,
+                &session_id,
+                &path,
+                Some(revision),
+                "runtime_tool_executor:adjust_config:publish_rollback",
+                |config| {
                     *config = (*mutation.previous_config).clone();
                     Ok(RuntimeConfigUpdate {
                         path: mutation.update.path,
@@ -494,24 +609,27 @@ where
                         new_value: mutation.update.old_value.clone(),
                         drift: None,
                     })
-                });
+                },
+            );
             return match compensation {
                 Ok(ConfigMutationOutcome::Applied {
                     value: compensation,
                     revision: compensation_revision,
                     workspace,
+                    postcommit,
                 }) => {
-                    if let Ok(mut session) = observability_session.write() {
-                        session.config = (*compensation.committed_config).clone();
-                    }
-                    let compensation_audit_warning = append_config_mutation_audit(
-                        &user_id,
-                        &session_id,
-                        &path,
-                        &compensation,
-                        "runtime_tool_executor:adjust_config:publish_rollback",
+                    let compensation_projection = project_observability_config(
+                        &observability_session,
+                        Some((*compensation.committed_config).clone()),
+                    );
+                    tool_session_state_rollback::remove_sequence(
+                        &session_state_journal,
+                        rollback_sequence,
                     );
                     reservation.finish(ConfigMutationSettlement::Compensated);
+                    let compensation_audit_recorded = postcommit.recorded;
+                    let compensation_audit_warning = postcommit.warning.map(bounded_warning);
+                    drop(compensation_guard);
                     let remote_restore = publish_workspace(*workspace).await;
                     let remote_outcome_unknown = remote_restore.is_err();
                     session_tool_output(json!({
@@ -524,9 +642,12 @@ where
                         "remote_outcome_unknown": remote_outcome_unknown,
                         "remote_restore_detail": remote_restore.err().map(bounded_warning),
                         "retryable": remote_outcome_unknown,
-                        "audit_recorded": audit_warning.is_none(),
+                        "rollback_recorded": false,
+                        "projection_recorded": compensation_projection.recorded,
+                        "projection_warning": compensation_projection.warning,
+                        "audit_recorded": audit_recorded,
                         "audit_warning": audit_warning.as_deref(),
-                        "compensation_audit_recorded": compensation_audit_warning.is_none(),
+                        "compensation_audit_recorded": compensation_audit_recorded,
                         "compensation_audit_warning": compensation_audit_warning.as_deref(),
                     }))
                 }
@@ -538,10 +659,10 @@ where
                         current_workspace,
                     },
                 )) => {
-                    if let Ok(mut session) = observability_session.write() {
-                        session.config = *current_config;
-                    }
+                    let current_projection =
+                        project_observability_config(&observability_session, Some(*current_config));
                     reservation.finish(ConfigMutationSettlement::Superseded);
+                    drop(compensation_guard);
                     let remote_current = publish_workspace(*current_workspace).await;
                     let remote_outcome_unknown = remote_current.is_err();
                     session_tool_output(json!({
@@ -556,7 +677,10 @@ where
                         "remote_outcome_unknown": remote_outcome_unknown,
                         "remote_current_detail": remote_current.err().map(bounded_warning),
                         "retryable": remote_outcome_unknown,
-                        "audit_recorded": audit_warning.is_none(),
+                        "rollback_recorded": true,
+                        "projection_recorded": current_projection.recorded,
+                        "projection_warning": current_projection.warning,
+                        "audit_recorded": audit_recorded,
                         "audit_warning": audit_warning.as_deref(),
                     }))
                 }
@@ -564,19 +688,32 @@ where
                     unreachable!("compensation does not perform value validation")
                 }
                 Ok(ConfigMutationOutcome::OutcomeUnknown {
+                    value: compensation,
                     revision,
                     observed,
                     reason,
-                    ..
                 }) => {
+                    let compensation_owner_confirmed =
+                        astra_services::session_workspace::exact_workspace_config_owner_revision(
+                            revision,
+                            &compensation.committed_tuned_config_json,
+                            observed.as_deref(),
+                        )
+                        .is_some();
                     let observed_revision = observed
                         .as_ref()
                         .map(|workspace| workspace.config_mutation_revision);
-                    if let Some(workspace) = observed.as_ref()
-                        && let Ok(config) = effective_runtime_config(Some(workspace))
-                        && let Ok(mut session) = observability_session.write()
-                    {
-                        session.config = config;
+                    let compensation_projection = project_observability_config(
+                        &observability_session,
+                        observed
+                            .as_deref()
+                            .and_then(|workspace| effective_runtime_config(Some(workspace)).ok()),
+                    );
+                    if compensation_owner_confirmed {
+                        tool_session_state_rollback::remove_sequence(
+                            &session_state_journal,
+                            rollback_sequence,
+                        );
                     }
                     reservation.finish(ConfigMutationSettlement::OutcomeUnknown);
                     session_tool_output(json!({
@@ -589,8 +726,11 @@ where
                         "observed_revision": observed_revision,
                         "compensation_detail": bounded_warning(reason),
                         "side_effects_maybe": true,
-                        "recovery_recorded": false,
-                        "audit_recorded": audit_warning.is_none(),
+                        "recovery_recorded": !compensation_owner_confirmed,
+                        "rollback_recorded": !compensation_owner_confirmed,
+                        "projection_recorded": compensation_projection.recorded,
+                        "projection_warning": compensation_projection.warning,
+                        "audit_recorded": audit_recorded,
                         "audit_warning": audit_warning.as_deref(),
                     }))
                 }
@@ -598,9 +738,10 @@ where
                     // The initial commit is still authoritative. Do not create an
                     // unconditional recovery action that could overwrite a newer
                     // writer when replayed later.
-                    if let Ok(mut session) = observability_session.write() {
-                        session.config = (*mutation.committed_config).clone();
-                    }
+                    let current_projection = project_observability_config(
+                        &observability_session,
+                        Some((*mutation.committed_config).clone()),
+                    );
                     reservation.finish(ConfigMutationSettlement::Committed);
                     session_tool_output(json!({
                         "error": "failed_to_publish_workspace_artifact",
@@ -608,8 +749,11 @@ where
                         "detail": error,
                         "persisted_config_restored": false,
                         "compensation_error": bounded_warning(compensation_error),
-                        "recovery_recorded": false,
-                        "audit_recorded": audit_warning.is_none(),
+                        "recovery_recorded": true,
+                        "rollback_recorded": true,
+                        "projection_recorded": current_projection.recorded,
+                        "projection_warning": current_projection.warning,
+                        "audit_recorded": audit_recorded,
                         "audit_warning": audit_warning.as_deref(),
                     }))
                 }
@@ -618,21 +762,10 @@ where
 
         let mutations_this_turn = reservation.finish(ConfigMutationSettlement::Committed);
 
-        let old_value = mutation.update.old_value.clone();
-        tool_session_state_rollback::record(
-            &session_state_journal,
-            journal_turn_index,
-            format!("adjust_config:{path}"),
-            SessionStateRollbackAction::ConfigOverride {
-                path: path.to_string(),
-                old_value: mutation.update.old_value,
-                expected_revision: Arc::new(std::sync::atomic::AtomicU64::new(revision)),
-            },
-        );
         json!({
             "status": "ok",
             "path": path,
-            "old": old_value,
+            "old": mutation.update.old_value,
             "new": mutation.update.new_value,
             "turn": turn,
             "mutations_this_turn": mutations_this_turn,
@@ -640,7 +773,9 @@ where
             "drift": mutation.update.drift,
             "drift_ceiling": constraints.config_drift_ceiling,
             "config_revision": revision,
-            "audit_recorded": audit_warning.is_none(),
+            "projection_recorded": projection.recorded,
+            "projection_warning": projection.warning,
+            "audit_recorded": audit_recorded,
             "audit_warning": audit_warning.as_deref(),
         })
         .to_string()
@@ -651,6 +786,10 @@ where
             "error": "config_settlement_task_failed",
             "detail": bounded_warning(error),
             "side_effects_maybe": true,
+            "projection_recorded": join_projection.recorded,
+            "projection_warning": join_projection.warning,
+            "audit_recorded": join_audit_recorded,
+            "audit_warning": join_audit_warning,
         })),
     }
 }
@@ -982,6 +1121,348 @@ mod tests {
         assert_eq!(fixture.observed_top_k(), old_top_k);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn concurrent_publish_completion_uses_durable_revision_rollback_order() {
+        let fixture = ConfigFixture::new("sess-adjust-config-concurrent-publish-order", 5);
+        let _process_guard =
+            astra_services::session_journal::ProcessJournalDirGuard::new(fixture._sessions.path());
+        let first = fixture.alternate();
+        let second = (1..=20)
+            .find(|value| *value != fixture.baseline && *value != first)
+            .unwrap();
+        let publish_started = Arc::new(tokio::sync::Notify::new());
+        let release_publish = Arc::new(tokio::sync::Notify::new());
+        let commit_barrier = install_local_commit_barrier(fixture.session_id);
+        let first_task = tokio::spawn(execute_adjust_config(
+            TEST_USER.to_string(),
+            fixture.session_id.to_string(),
+            Some(fixture.session.clone()),
+            fixture.config.clone(),
+            json!({"path": TOP_K_PATH, "value": first, "force": true}),
+            {
+                let publish_started = publish_started.clone();
+                let release_publish = release_publish.clone();
+                move |_| {
+                    let publish_started = publish_started.clone();
+                    let release_publish = release_publish.clone();
+                    async move {
+                        publish_started.notify_one();
+                        release_publish.notified().await;
+                        Ok(())
+                    }
+                }
+            },
+            fixture.rollback_journal.clone(),
+            0,
+        ));
+        let commit_entered = commit_barrier.entered.clone();
+        tokio::task::spawn_blocking(move || commit_entered.wait())
+            .await
+            .unwrap();
+        assert!(tool_session_state_rollback::entries(&fixture.rollback_journal).is_empty());
+        assert!(
+            tool_session_state_rollback::local_mutation_coordinator(&fixture.rollback_journal)
+                .try_lock()
+                .is_err(),
+            "durable commit-to-journal linearization must retain its local coordinator"
+        );
+        commit_barrier.release.wait();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            publish_started.notified(),
+        )
+        .await
+        .expect("first revision must reach its remote publisher");
+
+        let second_output = fixture.adjust(second, |_| async { Ok(()) }).await;
+        assert_eq!(second_output["status"], "ok");
+        assert_eq!(second_output["config_revision"], 2);
+        release_publish.notify_one();
+        let first_output: Value = serde_json::from_str(
+            &tokio::time::timeout(std::time::Duration::from_secs(1), first_task)
+                .await
+                .expect("first publication must finish after release")
+                .expect("first config caller"),
+        )
+        .unwrap();
+        assert_eq!(first_output["status"], "ok");
+        assert_eq!(first_output["config_revision"], 1);
+
+        let audit_revisions =
+            astra_services::session_journal::read_journal_for_user(TEST_USER, fixture.session_id)
+                .expect("read config audit journal")
+                .into_iter()
+                .filter(|event| {
+                    event.event_type
+                        == astra_services::session_journal::JournalEventType::ConfigChange
+                })
+                .filter_map(|event| {
+                    event
+                        .metadata
+                        .and_then(|metadata| metadata.get("config_revision").cloned())
+                        .and_then(|revision| revision.as_u64())
+                })
+                .collect::<Vec<_>>();
+        assert_eq!(audit_revisions, vec![1, 2]);
+
+        let owner_revisions =
+            tool_session_state_rollback::restore_plan_for_turn(&fixture.rollback_journal, 0)
+                .iter()
+                .map(|entry| match &entry.action {
+                    SessionStateRollbackAction::ConfigOverride {
+                        expected_revision, ..
+                    } => expected_revision.load(std::sync::atomic::Ordering::Relaxed),
+                    other => panic!("expected config rollback, got {other:?}"),
+                })
+                .collect::<Vec<_>>();
+        assert_eq!(owner_revisions, vec![2, 1]);
+
+        let rollback: Value = serde_json::from_str(
+            &tool_session_state_rollback::execute_rollback_session_state(
+                tool_session_state_rollback::RollbackSessionStateContext {
+                    journal: fixture.rollback_journal.clone(),
+                    current_turn_index: 0,
+                    restore_context: tool_session_state_rollback::SessionStateRestoreContext {
+                        user_id: TEST_USER.to_string(),
+                        session_id: fixture.session_id.to_string(),
+                        observability_session: Some(fixture.session.clone()),
+                    },
+                },
+                json!({"scope": "current_turn"}),
+                || async { Ok(()) },
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(rollback["success"], true);
+        assert_eq!(rollback["restored"][0]["expected_revision"], 2);
+        assert_eq!(rollback["restored"][1]["expected_revision"], 3);
+        assert_eq!(fixture.persisted_top_k(), fixture.baseline);
+        assert_eq!(fixture.workspace().config_mutation_revision, 4);
+        assert_eq!(fixture.observed_top_k(), fixture.baseline);
+        assert!(tool_session_state_rollback::entries(&fixture.rollback_journal).is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn rollback_during_pending_publish_preserves_restored_authority() {
+        let fixture = ConfigFixture::new("sess-adjust-config-rollback-pending-publish", 5);
+        let changed = fixture.alternate();
+        let publish_started = Arc::new(tokio::sync::Notify::new());
+        let release_publish = Arc::new(tokio::sync::Notify::new());
+        let adjust = tokio::spawn(execute_adjust_config(
+            TEST_USER.to_string(),
+            fixture.session_id.to_string(),
+            Some(fixture.session.clone()),
+            fixture.config.clone(),
+            json!({"path": TOP_K_PATH, "value": changed, "force": true}),
+            {
+                let publish_started = publish_started.clone();
+                let release_publish = release_publish.clone();
+                move |_| {
+                    let publish_started = publish_started.clone();
+                    let release_publish = release_publish.clone();
+                    async move {
+                        publish_started.notify_one();
+                        release_publish.notified().await;
+                        Ok(())
+                    }
+                }
+            },
+            fixture.rollback_journal.clone(),
+            0,
+        ));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            publish_started.notified(),
+        )
+        .await
+        .expect("remote publication must become pending");
+
+        let rollback: Value = serde_json::from_str(
+            &tool_session_state_rollback::execute_rollback_session_state(
+                tool_session_state_rollback::RollbackSessionStateContext {
+                    journal: fixture.rollback_journal.clone(),
+                    current_turn_index: 0,
+                    restore_context: tool_session_state_rollback::SessionStateRestoreContext {
+                        user_id: TEST_USER.to_string(),
+                        session_id: fixture.session_id.to_string(),
+                        observability_session: Some(fixture.session.clone()),
+                    },
+                },
+                json!({"scope": "current_turn"}),
+                || async { Ok(()) },
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(rollback["success"], true);
+        assert_eq!(fixture.persisted_top_k(), fixture.baseline);
+        assert_eq!(fixture.observed_top_k(), fixture.baseline);
+        assert!(tool_session_state_rollback::entries(&fixture.rollback_journal).is_empty());
+
+        release_publish.notify_one();
+        let output: Value = serde_json::from_str(
+            &tokio::time::timeout(std::time::Duration::from_secs(1), adjust)
+                .await
+                .expect("pending publication must finish after release")
+                .expect("adjust config caller"),
+        )
+        .unwrap();
+        assert_eq!(output["status"], "ok");
+        assert_eq!(fixture.persisted_top_k(), fixture.baseline);
+        assert_eq!(fixture.observed_top_k(), fixture.baseline);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn postcommit_poison_recovers_projection_with_explicit_receipt() {
+        let fixture = ConfigFixture::new("sess-adjust-config-poisoned-projection", 5);
+        let _process_guard =
+            astra_services::session_journal::ProcessJournalDirGuard::new(fixture._sessions.path());
+        let changed = fixture.alternate();
+        let commit_barrier = install_local_commit_barrier(fixture.session_id);
+        let adjust = tokio::spawn(execute_adjust_config(
+            TEST_USER.to_string(),
+            fixture.session_id.to_string(),
+            Some(fixture.session.clone()),
+            fixture.config.clone(),
+            json!({"path": TOP_K_PATH, "value": changed, "force": true}),
+            |_| async { Ok(()) },
+            fixture.rollback_journal.clone(),
+            0,
+        ));
+        let commit_entered = commit_barrier.entered.clone();
+        tokio::task::spawn_blocking(move || commit_entered.wait())
+            .await
+            .unwrap();
+        let poisoned = fixture.session.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = poisoned.write().unwrap();
+            panic!("poison postcommit observability projection");
+        }));
+        commit_barrier.release.wait();
+
+        let output: Value = serde_json::from_str(&adjust.await.unwrap()).unwrap();
+        assert_eq!(output["status"], "ok");
+        assert_eq!(output["projection_recorded"], true);
+        assert!(output["projection_warning"].is_string());
+        assert_eq!(fixture.persisted_top_k(), changed);
+        assert_eq!(
+            fixture
+                .session
+                .read()
+                .unwrap()
+                .config
+                .memory
+                .retrieval_top_k,
+            changed
+        );
+        let second = (1..=20)
+            .find(|value| *value != fixture.baseline && *value != changed)
+            .unwrap();
+        let second_output = fixture.adjust(second, |_| async { Ok(()) }).await;
+        assert_eq!(second_output["status"], "ok");
+        assert_eq!(second_output["projection_recorded"], true);
+        assert_eq!(second_output["projection_warning"], Value::Null);
+        assert_eq!(
+            fixture
+                .session
+                .read()
+                .unwrap()
+                .config
+                .memory
+                .retrieval_top_k,
+            second
+        );
+        assert_eq!(
+            tool_session_state_rollback::entries(&fixture.rollback_journal).len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn strictness_mutation_obeys_effective_verification_bounds() {
+        let fixture = ConfigFixture::new("sess-adjust-config-verification-bounds", 5);
+        let rejected: Value = serde_json::from_str(
+            &execute_adjust_config(
+                TEST_USER.to_string(),
+                fixture.session_id.to_string(),
+                Some(fixture.session.clone()),
+                fixture.config.clone(),
+                json!({"path": "verification.strictness", "value": 0.95, "force": true}),
+                |_| async { Ok(()) },
+                fixture.rollback_journal.clone(),
+                0,
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(rejected["error"], "invalid_runtime_config");
+        assert_eq!(rejected["invariant"], "verification_bounds");
+        assert_eq!(fixture.workspace().config_mutation_revision, 0);
+        assert!(tool_session_state_rollback::entries(&fixture.rollback_journal).is_empty());
+
+        let mut custom = astra_config::RuntimeConfig::load();
+        custom.verification.min_strictness = 0.4;
+        custom.verification.max_strictness = 0.8;
+        custom.verification.strictness = 0.5;
+        let custom_json = serde_json::to_string(&custom).unwrap();
+        let outcome = astra_services::session_workspace::update_existing_workspace_config(
+            fixture.session_id,
+            |workspace| {
+                workspace.tuned_config_json = Some(custom_json.clone());
+                Ok::<_, std::io::Error>(std::ops::ControlFlow::<(), _>::Continue(()))
+            },
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            astra_services::session_workspace::WorkspaceConfigMutationOutcome::Applied {
+                revision: 1,
+                ..
+            }
+        ));
+        project_observability_config(&fixture.session, Some(custom));
+
+        let custom_rejected: Value = serde_json::from_str(
+            &execute_adjust_config(
+                TEST_USER.to_string(),
+                fixture.session_id.to_string(),
+                Some(fixture.session.clone()),
+                fixture.config.clone(),
+                json!({"path": "verification.strictness", "value": 0.81, "force": true}),
+                |_| async { Ok(()) },
+                fixture.rollback_journal.clone(),
+                0,
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(custom_rejected["error"], "invalid_runtime_config");
+        assert_eq!(custom_rejected["max"], 0.8);
+        assert_eq!(fixture.workspace().config_mutation_revision, 1);
+
+        let accepted: Value = serde_json::from_str(
+            &execute_adjust_config(
+                TEST_USER.to_string(),
+                fixture.session_id.to_string(),
+                Some(fixture.session.clone()),
+                fixture.config.clone(),
+                json!({"path": "verification.strictness", "value": 0.8, "force": true}),
+                |_| async { Ok(()) },
+                fixture.rollback_journal.clone(),
+                0,
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(accepted["status"], "ok");
+        assert_eq!(accepted["config_revision"], 2);
+    }
+
     #[cfg(feature = "e2e-hooks")]
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
@@ -1106,6 +1587,7 @@ mod tests {
             published.lock().unwrap().as_slice(),
             &[fixture.alternate(), fixture.baseline]
         );
+        assert!(tool_session_state_rollback::entries(&fixture.rollback_journal).is_empty());
     }
 
     #[tokio::test]
@@ -1131,6 +1613,7 @@ mod tests {
         assert_eq!(output["error"], "config_settlement_task_failed");
         assert_eq!(fixture.persisted_top_k(), fixture.baseline);
         assert_eq!(fixture.config.lock().unwrap().mutation_counter, (7, 0));
+        assert!(tool_session_state_rollback::entries(&fixture.rollback_journal).is_empty());
     }
 
     #[tokio::test]
@@ -1164,6 +1647,18 @@ mod tests {
         assert_eq!(output["error"], "config_settlement_task_failed");
         assert_eq!(fixture.persisted_top_k(), concurrent);
         assert_eq!(fixture.config.lock().unwrap().mutation_counter, (7, 0));
+        let entries = tool_session_state_rollback::entries(&fixture.rollback_journal);
+        assert_eq!(entries.len(), 1);
+        let SessionStateRollbackAction::ConfigOverride {
+            expected_revision, ..
+        } = &entries[0].action
+        else {
+            panic!("superseded config mutation must retain its revision-owned rollback");
+        };
+        assert_eq!(
+            expected_revision.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1283,10 +1778,14 @@ mod tests {
         .expect("config output");
         assert_eq!(rejected["error"], "mutation_limit_exceeded");
         assert_eq!(fixture.persisted_top_k(), changed);
+        assert_eq!(
+            tool_session_state_rollback::entries(&fixture.rollback_journal).len(),
+            1
+        );
     }
 
     #[tokio::test]
-    async fn compensation_io_failure_keeps_authority_and_records_no_unsafe_replay() {
+    async fn compensation_io_failure_retains_revision_owned_rollback() {
         let fixture = ConfigFixture::new("sess-adjust-config-compensation-io", 3);
         let changed = fixture.alternate();
         let lock_path = astra_services::session_workspace::workspace_dir_for(fixture.session_id)
@@ -1304,11 +1803,23 @@ mod tests {
             .await;
 
         assert_eq!(output["persisted_config_restored"], false);
-        assert_eq!(output["recovery_recorded"], false);
+        assert_eq!(output["recovery_recorded"], true);
+        assert_eq!(output["rollback_recorded"], true);
         assert_eq!(fixture.persisted_top_k(), changed);
         assert_eq!(fixture.observed_top_k(), changed);
         assert_eq!(fixture.config.lock().unwrap().mutation_counter, (3, 1));
-        assert!(tool_session_state_rollback::entries(&fixture.rollback_journal).is_empty());
+        let entries = tool_session_state_rollback::entries(&fixture.rollback_journal);
+        assert_eq!(entries.len(), 1);
+        let SessionStateRollbackAction::ConfigOverride {
+            expected_revision, ..
+        } = &entries[0].action
+        else {
+            panic!("durable config mutation must retain its rollback fact");
+        };
+        assert_eq!(
+            expected_revision.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1365,7 +1876,18 @@ mod tests {
         assert_eq!(output["current"], failed_value);
         assert_eq!(output["current_revision"], 4);
         assert_eq!(output["remote_projection_current"], true);
-        assert!(tool_session_state_rollback::entries(&fixture.rollback_journal).is_empty());
+        let entries = tool_session_state_rollback::entries(&fixture.rollback_journal);
+        assert_eq!(entries.len(), 1);
+        let SessionStateRollbackAction::ConfigOverride {
+            expected_revision, ..
+        } = &entries[0].action
+        else {
+            panic!("superseded config mutation must retain its rollback fact");
+        };
+        assert_eq!(
+            expected_revision.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
         assert_eq!(fixture.persisted_top_k(), failed_value);
         assert_eq!(fixture.observed_top_k(), failed_value);
         assert_eq!(fixture.workspace().config_mutation_revision, 4);

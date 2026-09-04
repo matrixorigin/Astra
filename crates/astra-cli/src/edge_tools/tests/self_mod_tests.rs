@@ -74,6 +74,38 @@ async fn adjust_config_respects_drift_ceiling_without_force() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
+async fn adjust_config_rejects_strictness_above_effective_maximum() {
+    let (_tmp, _guard, exe, session, session_id) = executor_with_persisted_session();
+    let baseline = session.read().unwrap().config.verification.strictness;
+
+    let rejected: Value = serde_json::from_str(
+        &exe.execute(
+            "adjust_config",
+            &json!({
+                "path": "verification.strictness",
+                "value": 0.95,
+                "force": true
+            }),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(rejected["error"], "invalid_runtime_config");
+    assert_eq!(rejected["invariant"], "verification_bounds");
+    assert_eq!(
+        session.read().unwrap().config.verification.strictness,
+        baseline
+    );
+    assert_eq!(
+        session_workspace::read_workspace(&session_id)
+            .unwrap()
+            .config_mutation_revision,
+        0
+    );
+}
+
+#[tokio::test]
 async fn self_mod_persists_config() {
     let (_tmp, _guard, exe, _session, session_id) = executor_with_persisted_session();
 
@@ -89,9 +121,29 @@ async fn self_mod_persists_config() {
 
     let parsed_adjust: Value = serde_json::from_str(&adjust_out).unwrap();
     assert_eq!(parsed_adjust["status"], "completed");
+    assert_eq!(parsed_adjust["audit_recorded"], true);
 
     let ws = session_workspace::read_workspace(&session_id).unwrap();
     assert!(ws.tuned_config_json.is_some());
+    assert_eq!(
+        parsed_adjust["config_revision"],
+        ws.config_mutation_revision
+    );
+    let config_events = astra_services::session_journal::read_journal(&session_id)
+        .unwrap()
+        .into_iter()
+        .filter(|event| {
+            event.event_type == astra_services::session_journal::JournalEventType::ConfigChange
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(config_events.len(), 1);
+    assert_eq!(
+        config_events[0]
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("config_revision")),
+        Some(&serde_json::json!(ws.config_mutation_revision))
+    );
 }
 
 #[tokio::test]

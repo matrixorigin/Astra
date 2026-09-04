@@ -4539,7 +4539,7 @@ mod tests {
     impl SessionArtifactJsonStore for RecordingResultArtifactStore {
         async fn persist_json_artifact(
             &self,
-            record: astra_services::SessionArtifactJsonRecord,
+            mut record: astra_services::SessionArtifactJsonRecord,
         ) -> Result<astra_services::StoredSessionArtifact, astra_services::SessionArtifactStoreError>
         {
             tokio::task::yield_now().await;
@@ -4549,6 +4549,9 @@ mod tests {
                         "injected artifact failure".to_string(),
                     ),
                 );
+            }
+            if record.artifact_id.trim().is_empty() {
+                record.artifact_id = "artifact-result-1".to_string();
             }
             *self.seen.lock().unwrap() = Some(record.clone());
             Ok(Self::stored(record))
@@ -4938,6 +4941,7 @@ mod tests {
         assert_eq!(reference["artifactKind"], "tool_result_evidence_v1");
 
         let stored = store.seen.lock().unwrap().clone().expect("stored artifact");
+        assert_eq!(stored.artifact_id, reference["artifactId"]);
         assert_eq!(stored.user_id, identity.user_id);
         assert_eq!(stored.session_id, identity.session_id);
         let encoded = stored.content.to_string();

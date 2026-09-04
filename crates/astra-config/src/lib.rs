@@ -13,8 +13,10 @@ pub mod user_profile;
 
 // Re-exports for ergonomic cross-crate use.
 pub use governed_mutation::{
-    GovernedConfigMutation, GovernedConfigMutationError, GovernedConfigPath,
-    GovernedConfigValueType, apply_governed_config_mutation, normalized_config_drift,
+    GovernedConfigInvariantValidation, GovernedConfigMutation, GovernedConfigMutationError,
+    GovernedConfigPath, GovernedConfigValueType, apply_governed_config_mutation,
+    governed_config_invariant_validation, normalized_config_drift,
+    validate_governed_config_candidate,
 };
 pub use json_mutation::{
     JsonPathMutationError, read_existing_json_path, replace_existing_json_path,
