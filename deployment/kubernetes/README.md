@@ -72,7 +72,7 @@ helm upgrade --install astra ./chart \
   --namespace astra \
   --set api.existingSecret=astra-runtime \
   --set api.image.repository=registry.example.com/platform/astra \
-  --set api.image.tag=0.1.0
+  --set api.image.tag=0.2.0
 ```
 
 For an immutable deployment, set `api.image.digest` to a `sha256:...` digest;
