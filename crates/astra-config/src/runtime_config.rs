@@ -75,12 +75,10 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub safety: SafetyConfig,
 
-    /// Fork-prefix cache inheritance configuration.
+    /// Fork-prefix cache telemetry configuration.
     ///
-    /// Controls whether child spawns inherit their parent's cacheable
-    /// prefix (for prompt-cache reuse) and how fork-cache telemetry
-    /// events are emitted. Defaults to disabled — operators must
-    /// opt in explicitly.
+    /// Parent-prefix capture and eligible child inheritance are always on.
+    /// This section controls only telemetry emission.
     #[serde(default)]
     pub fork_prefix: ForkPrefixConfig,
 
@@ -245,59 +243,12 @@ pub enum ForkCacheSinkKind {
 /// Captures happen on every parent turn end, spawns with
 /// `inherit_prefix` reuse captured prefixes, and telemetry events
 /// flow to the configured `sink`.
-///
-/// Thresholds tune the classifier in `fork_cache_event::evaluate`.
-///
-/// Invariants:
-/// - `miss_floor > 0.0`
-/// - `hit_threshold > miss_floor`
-/// - `hit_threshold <= 1.0`
-///
-/// Invalid values silently fall back to classifier defaults at
-/// runtime (via `ForkCacheThresholds::validate`); callers that want
-/// strict config rejection should `validate()` the loaded config.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ForkPrefixConfig {
-    /// Deprecated no-op. Fork capture is now always-on. Retained
-    /// for backward-compatible TOML deserialization only.
-    #[serde(default)]
-    pub enabled: bool,
-
     /// Telemetry sink to install. `Noop` discards events; `Stderr`
     /// writes JSON lines with `[fork-cache]` prefix.
     #[serde(default)]
     pub sink: ForkCacheSinkKind,
-
-    /// Ratio (observed/expected cache_read_tokens) at or above
-    /// which a probe classifies as `Hit`. Default 0.80.
-    #[serde(default = "default_fork_hit_threshold")]
-    pub hit_threshold: f64,
-
-    /// Ratio below which a probe classifies as `Miss`. Between
-    /// `miss_floor` and `hit_threshold` is `PartialDrift`. Default
-    /// 0.05 — distinguishes "essentially nothing reused" from
-    /// "some reuse happened".
-    #[serde(default = "default_fork_miss_floor")]
-    pub miss_floor: f64,
-}
-
-fn default_fork_hit_threshold() -> f64 {
-    0.80
-}
-
-fn default_fork_miss_floor() -> f64 {
-    0.05
-}
-
-impl Default for ForkPrefixConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            sink: ForkCacheSinkKind::Noop,
-            hit_threshold: default_fork_hit_threshold(),
-            miss_floor: default_fork_miss_floor(),
-        }
-    }
 }
 
 /// Safety-guard configuration.
@@ -883,11 +834,6 @@ pub struct ToolSelectionConfig {
     #[serde(default = "default_max_tool_schema_tokens")]
     pub max_tool_schema_tokens: u32,
 
-    /// Deprecated scenario-driven override for the removed tool selector budget.
-    /// 0 = no override. Retained so older config files continue to deserialize.
-    #[serde(default)]
-    pub tool_budget_tokens: u32,
-
     /// Max times the same (tool, args) can execute across a session.
     /// 0 = use default (2). Prevents infinite loops from ignored dedup hints.
     #[serde(default)]
@@ -898,16 +844,6 @@ pub struct ToolSelectionConfig {
     /// Prevents pathological turns where the agent requests 50+ tool calls.
     #[serde(default)]
     pub max_tools_per_turn: u32,
-
-    /// Round budget warning — DEPRECATED, always ignored.
-    /// Retained for config file backward compatibility (deserialization won't fail).
-    #[serde(default)]
-    pub round_budget_warning: u32,
-
-    /// Round budget limit — DEPRECATED, always ignored.
-    /// Retained for config file backward compatibility (deserialization won't fail).
-    #[serde(default)]
-    pub round_budget_limit: u32,
 
     /// Circuit breaker: consecutive stall rounds (no new patterns, no mutations)
     /// before tripping. 0 = use default (3).
@@ -1209,18 +1145,6 @@ impl ToolSelectionConfig {
         }
     }
 
-    /// DEPRECATED — always returns a high value so callers that still check
-    /// this never trigger budget pressure.
-    pub fn effective_round_budget_warning(&self) -> u32 {
-        200
-    }
-
-    /// DEPRECATED — always returns a high value so callers that still check
-    /// this never trigger the old phase1/phase2 logic.
-    pub fn effective_round_budget_limit(&self) -> u32 {
-        200
-    }
-
     /// Resolved circuit breaker stall threshold (0 → default 3, floor 2).
     pub fn effective_circuit_breaker_stall_threshold(&self) -> u32 {
         resolve_threshold(self.circuit_breaker_stall_threshold, 6, 3)
@@ -1457,11 +1381,8 @@ impl Default for ToolSelectionConfig {
             prefer_recent_tools: default_true(),
             recent_tool_boost: default_recent_tool_boost(),
             max_tool_schema_tokens: default_max_tool_schema_tokens(),
-            tool_budget_tokens: 0,
             max_identical_tool_calls: 0,
             max_tools_per_turn: 0,
-            round_budget_warning: 0,
-            round_budget_limit: 0,
             circuit_breaker_stall_threshold: 0,
             circuit_breaker_repetition_threshold: 0,
             circuit_breaker_half_open_patience: 0,
@@ -2267,11 +2188,8 @@ impl RuntimeConfig {
             prefer_recent_tools,
             recent_tool_boost,
             max_tool_schema_tokens,
-            tool_budget_tokens,
             max_identical_tool_calls,
             max_tools_per_turn,
-            round_budget_warning,
-            round_budget_limit,
             circuit_breaker_stall_threshold,
             circuit_breaker_repetition_threshold,
             circuit_breaker_half_open_patience,
@@ -2314,11 +2232,6 @@ impl RuntimeConfig {
             default_max_tool_schema_tokens(),
         );
         merge_if_non_default(
-            &mut self.tool_selection.tool_budget_tokens,
-            tool_budget_tokens,
-            0,
-        );
-        merge_if_non_default(
             &mut self.tool_selection.max_identical_tool_calls,
             max_identical_tool_calls,
             0,
@@ -2326,16 +2239,6 @@ impl RuntimeConfig {
         merge_if_non_default(
             &mut self.tool_selection.max_tools_per_turn,
             max_tools_per_turn,
-            0,
-        );
-        merge_if_non_default(
-            &mut self.tool_selection.round_budget_warning,
-            round_budget_warning,
-            0,
-        );
-        merge_if_non_default(
-            &mut self.tool_selection.round_budget_limit,
-            round_budget_limit,
             0,
         );
         merge_if_non_default(
@@ -2734,9 +2637,8 @@ impl RuntimeConfig {
 
         // ForkPrefixConfig: whole-struct replacement when `other`
         // differs from default. Simple enough to treat atomically —
-        // sub-field merging would just add complexity without
-        // meaningful use cases (you either want fork-prefix on with
-        // a specific sink / thresholds, or off).
+        // sub-field merging would add complexity without a meaningful use
+        // case because the section owns one telemetry sink.
         if fork_prefix != ForkPrefixConfig::default() {
             self.fork_prefix = fork_prefix;
         }
@@ -2815,8 +2717,8 @@ impl RuntimeConfig {
                 .enabled_categories
                 .push(TraceCategory::LlmExchanges);
         }
-        // ASTRA_FORK_INHERIT_PREFIX env var is ignored — fork capture
-        // is now always-on. The `enabled` field is a deprecated no-op.
+        // ASTRA_FORK_INHERIT_PREFIX is intentionally ignored: fork capture
+        // and eligible inheritance are always on.
     }
 
     /// Get configuration as TOML string.
@@ -2932,11 +2834,19 @@ mod tests {
     }
 
     #[test]
-    fn test_config_serialization() {
+    fn canonical_config_serialization_excludes_retired_fields() {
         let config = RuntimeConfig::default();
         let toml = config.to_toml().unwrap();
         assert!(toml.contains("max_history_tokens"));
         assert!(toml.contains("retrieval_top_k"));
+        assert!(!toml.contains("tool_budget_tokens"));
+        assert!(!toml.contains("round_budget_warning"));
+        assert!(!toml.contains("round_budget_limit"));
+
+        let fork_prefix = toml::to_string(&config.fork_prefix).unwrap();
+        assert!(!fork_prefix.contains("enabled"));
+        assert!(!fork_prefix.contains("hit_threshold"));
+        assert!(!fork_prefix.contains("miss_floor"));
     }
 
     #[test]
@@ -3023,11 +2933,8 @@ mod tests {
                 prefer_recent_tools: false,
                 recent_tool_boost: 0.4,
                 max_tool_schema_tokens: 22000,
-                tool_budget_tokens: 0,
                 max_identical_tool_calls: 0,
                 max_tools_per_turn: 0,
-                round_budget_warning: 0,
-                round_budget_limit: 0,
                 circuit_breaker_stall_threshold: 0,
                 circuit_breaker_repetition_threshold: 0,
                 circuit_breaker_half_open_patience: 0,
@@ -3196,14 +3103,6 @@ mod tests {
     }
 
     #[test]
-    fn round_budget_defaults() {
-        // Deprecated: always returns 200 (effectively disabled).
-        let cfg = ToolSelectionConfig::default();
-        assert_eq!(cfg.effective_round_budget_warning(), 200);
-        assert_eq!(cfg.effective_round_budget_limit(), 200);
-    }
-
-    #[test]
     fn runtime_turn_ceiling_config_overrides_env() {
         let cfg = RuntimeLimitsConfig {
             max_turns: 8,
@@ -3248,40 +3147,6 @@ mod tests {
             plan_subtask_max_turns: 0,
         };
         assert_eq!(cfg.resolve_turn_ceiling(true), env_effective);
-    }
-
-    #[test]
-    fn round_budget_custom_values() {
-        // Deprecated: custom values are ignored, always returns 200.
-        let cfg = ToolSelectionConfig {
-            round_budget_warning: 5,
-            round_budget_limit: 10,
-            ..Default::default()
-        };
-        assert_eq!(cfg.effective_round_budget_warning(), 200);
-        assert_eq!(cfg.effective_round_budget_limit(), 200);
-    }
-
-    #[test]
-    fn round_budget_limit_enforces_above_warning() {
-        // Deprecated: always returns 200 regardless of config.
-        let cfg = ToolSelectionConfig {
-            round_budget_warning: 8,
-            round_budget_limit: 5,
-            ..Default::default()
-        };
-        assert_eq!(cfg.effective_round_budget_limit(), 200);
-    }
-
-    #[test]
-    fn round_budget_limit_zero_uses_default_regardless_of_warning() {
-        // Deprecated: always returns 200.
-        let cfg = ToolSelectionConfig {
-            round_budget_warning: 5,
-            round_budget_limit: 0,
-            ..Default::default()
-        };
-        assert_eq!(cfg.effective_round_budget_limit(), 200);
     }
 
     #[test]
@@ -3899,12 +3764,9 @@ mod tests {
     // ─── Fork-prefix config ─────────────────────────────────────────
 
     #[test]
-    fn fork_prefix_defaults_to_disabled_noop_sink() {
+    fn fork_prefix_defaults_to_noop_sink() {
         let cfg = ForkPrefixConfig::default();
-        assert!(!cfg.enabled, "fork-prefix must default to disabled");
         assert_eq!(cfg.sink, ForkCacheSinkKind::Noop);
-        assert!((cfg.hit_threshold - 0.80).abs() < 1e-9);
-        assert!((cfg.miss_floor - 0.05).abs() < 1e-9);
     }
 
     #[test]
@@ -3913,16 +3775,10 @@ mod tests {
             version = "1.0"
 
             [fork_prefix]
-            enabled = true
             sink = "stderr"
-            hit_threshold = 0.85
-            miss_floor = 0.10
         "#;
         let cfg: RuntimeConfig = toml::from_str(toml_str).unwrap();
-        assert!(cfg.fork_prefix.enabled);
         assert_eq!(cfg.fork_prefix.sink, ForkCacheSinkKind::Stderr);
-        assert!((cfg.fork_prefix.hit_threshold - 0.85).abs() < 1e-9);
-        assert!((cfg.fork_prefix.miss_floor - 0.10).abs() < 1e-9);
     }
 
     #[test]
@@ -3930,7 +3786,6 @@ mod tests {
         // A TOML without the section must not fail — defaults fill in.
         let toml_str = r#"version = "1.0""#;
         let cfg: RuntimeConfig = toml::from_str(toml_str).unwrap();
-        assert!(!cfg.fork_prefix.enabled);
         assert_eq!(cfg.fork_prefix.sink, ForkCacheSinkKind::Noop);
     }
 
@@ -3940,26 +3795,13 @@ mod tests {
         // tripwire pins both directions so a future rename to e.g.
         // `SnakeCase` is an explicit breaking config change.
         let s = toml::to_string(&ForkPrefixConfig {
-            enabled: true,
             sink: ForkCacheSinkKind::Stderr,
-            ..Default::default()
         })
         .unwrap();
         assert!(
             s.contains("sink = \"stderr\""),
             "expected lowercase serialization, got {s}"
         );
-    }
-
-    #[test]
-    fn fork_prefix_enabled_field_is_deprecated_noop() {
-        // The `enabled` field remains for backward-compatible TOML
-        // deserialization but has no runtime effect. Fork capture is
-        // always-on.
-        let cfg = ForkPrefixConfig::default();
-        // Default value doesn't matter for runtime behavior since
-        // the field is a no-op; we just verify it deserializes.
-        let _ = cfg.enabled;
     }
 
     // ─── SessionTraceConfig::from_cli() tests ─────────────────────

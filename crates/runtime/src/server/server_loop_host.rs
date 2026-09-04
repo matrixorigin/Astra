@@ -2826,8 +2826,8 @@ pub struct ServerAgenticLoopHost {
     emitted_tool_call_ids: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 
     // ── Fork-prefix parent capture (G2) ──
-    /// Optional fork-prefix store. When set + the fork-prefix feature
-    /// flag is on, `on_turn_completed` captures the parent turn's
+    /// Optional fork-prefix store. When wired, `on_turn_completed`
+    /// captures the parent turn's
     /// cacheable prefix so delegate / agent-spawn sub-runs routed
     /// through the server-side DelegationEngine can inherit it. Mirrors
     /// the CLI-side wiring in `CliAgenticLoopHost::prefix_store`.
@@ -3183,7 +3183,7 @@ impl ServerAgenticLoopHostBuilder {
     /// captures the parent turn's cacheable prefix into this store so
     /// delegate / agent-spawn sub-runs can inherit it. `None` (default)
     /// makes `on_turn_completed` a no-op — preserves zero-overhead
-    /// behavior for callers that don't enable the fork-prefix feature.
+    /// behavior for generic builders that do not wire a store.
     pub fn with_prefix_store(
         mut self,
         store: Option<std::sync::Arc<dyn astra_turn_core::fork_prefix_store::PrefixCaptureSink>>,
@@ -14368,9 +14368,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
         // G2: server-side parent capture. Mirrors the CLI host's
         // `on_turn_completed`, so delegate / agent-spawn sub-runs
         // routed through the server DelegationEngine can inherit the
-        // parent's cacheable prefix. No-op unless the store was wired
-        // in and the feature flag is on (`capture_parent_prefix`
-        // early-returns if so).
+        // parent's cacheable prefix. No-op unless the builder wired a
+        // store for this host.
         let Some(store) = self.prefix_store.as_ref() else {
             return;
         };
@@ -26632,7 +26631,6 @@ mod tests {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
-            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             runtime_tool_executor: None,
             interruption: None,
@@ -32513,8 +32511,7 @@ mod tests {
     // These tests pin behaviors of the server host's capture path so
     // a future refactor can't silently regress:
     //
-    //  1. No store wired → no-op (zero overhead for callers that
-    //     don't enable fork-prefix).
+    //  1. No store wired → no-op (zero overhead for generic builders).
     //  2. Store wired + non-empty run_id/messages → prefix lands in
     //     the sink with the right run_id and the tool_schemas are
     //     populated from the advertised edge_tools.

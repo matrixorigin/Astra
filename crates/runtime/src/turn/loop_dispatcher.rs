@@ -355,7 +355,6 @@ mod tests {
             consecutive_context_window_errors: 0,
             compaction_effectiveness: Default::default(),
             pinned_tool_schema_tokens: 0,
-            tool_budget_override: None,
             sticky_tool_schemas: Vec::new(),
             max_turn_input_tokens: 0,
             budget_wrapup_injected: false,

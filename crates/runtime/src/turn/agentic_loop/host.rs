@@ -3156,13 +3156,6 @@ pub struct AgenticLoopState {
     /// Optional step signal collector for within-turn outcome tracking.
     pub step_signal_collector: Option<astra_turn_core::liquid_step_signals::StepSignalCollector>,
 
-    // ── Tool selection budget override ──
-    /// Scenario-driven override for the tool selection token budget.
-    /// When `Some(n)` with n > 0, the host should use this instead of the
-    /// registry's default budget (800 tokens) when building the selection context.
-    /// Set by `apply_adaptive_execution_profile` from `config.tool_selection.tool_budget_tokens`.
-    pub tool_budget_override: Option<u32>,
-
     /// Recent tactical adaptations applied while liquid tactical tuning runs.
     pub recent_tactical_actions: Vec<String>,
 
@@ -4850,7 +4843,6 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         permission_handler: None,
         tactical_adapter: None,
         step_signal_collector: None,
-        tool_budget_override: None,
         recent_tactical_actions: Vec::new(),
         runtime_tool_executor: None,
         interruption: None,
@@ -6409,7 +6401,6 @@ pub(crate) mod tests {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
-            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             runtime_tool_executor: None,
             interruption: None,

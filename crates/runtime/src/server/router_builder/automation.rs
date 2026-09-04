@@ -4,13 +4,14 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
     router
         .route(
             "/agents",
-            post(agents::create_agent_handler).get(agents::list_agents_handler),
+            post(crate::service_handlers::agents::create_agent_handler)
+                .get(crate::service_handlers::agents::list_agents_handler),
         )
         .route(
             "/agents/{agent_id}",
-            get(agents::get_agent_handler)
-                .put(agents::update_agent_handler)
-                .delete(agents::delete_agent_handler),
+            get(crate::service_handlers::agents::get_agent_handler)
+                .put(crate::service_handlers::agents::update_agent_handler)
+                .delete(crate::service_handlers::agents::delete_agent_handler),
         )
         .route(
             "/events",
@@ -36,11 +37,12 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         )
         .route(
             "/context",
-            post(context::create_snapshot_handler).get(context::list_snapshots_handler),
+            post(crate::service_handlers::context::create_snapshot_handler)
+                .get(crate::service_handlers::context::list_snapshots_handler),
         )
         .route(
             "/context/{context_capture_id}",
-            get(context::get_snapshot_handler),
+            get(crate::service_handlers::context::get_snapshot_handler),
         )
         .route(
             "/decisions",

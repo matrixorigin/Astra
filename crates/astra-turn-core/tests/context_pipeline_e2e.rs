@@ -18,7 +18,6 @@ use astra_turn_core::pipeline_stats::PipelineStats;
 use astra_turn_core::recovery_state::RecoveryState;
 use astra_turn_core::section_types::SectionKind;
 use astra_turn_core::session_latches::SessionLatches;
-use astra_turn_core::shadow_diff::diff_pipeline_outputs;
 use astra_turn_core::token_accounting::TokenAccounting;
 use astra_turn_core::trace_alert::evaluate_alerts;
 
@@ -296,64 +295,6 @@ fn pipeline_emergent_context_flows() {
     );
 }
 
-/// Shadow diff: identical pipeline runs produce clean result.
-#[test]
-fn pipeline_shadow_diff_identical() {
-    let (statics, agent, latches, session, turn, ext, emer, stats) = build_sources();
-    let sources = ContextSources {
-        statics: &statics,
-        agent: &agent,
-        latches: &latches,
-        session: &session,
-        turn: &turn,
-        external: &ext,
-        emergent: &emer,
-        working_memory: None,
-        stats: &stats,
-    };
-
-    let plan_input = PlanInput {
-        tokens: &turn.tokens,
-        model_limit: session.model_limit,
-        pre_reserved_output_tokens: 0,
-        recovery: &turn.recovery,
-        latches: &latches,
-        stats: &stats,
-        provider_policy: &session.provider_policy,
-        has_memory: !ext.memory_entries.is_empty(),
-        model_id: &session.model_id,
-        query_source: "repl",
-    };
-
-    let plan = plan_turn(&plan_input);
-    let bound1 = bind_all(&plan, &sources);
-    let bound2 = bind_all(&plan, &sources);
-    let limits = OptimizeLimits::default();
-    let opt1 = optimize(
-        &plan,
-        bound1,
-        &latches,
-        &session.provider_policy,
-        &limits,
-        1,
-    );
-    let opt2 = optimize(
-        &plan,
-        bound2,
-        &latches,
-        &session.provider_policy,
-        &limits,
-        1,
-    );
-
-    let diff = diff_pipeline_outputs(&opt1, &opt2, 1);
-    assert!(
-        diff.is_clean(),
-        "identical runs should produce clean diff: {:?}",
-        diff.alerts
-    );
-}
-
 /// Trace alerts fire on recovery loop.
 #[test]
 fn pipeline_trace_alerts_on_recovery() {
@@ -368,94 +309,5 @@ fn pipeline_trace_alerts_on_recovery() {
     assert!(
         alerts.iter().any(|a| a.rule == "recovery_loop"),
         "2 PTL errors should trigger recovery_loop alert"
-    );
-}
-
-/// Shadow diff: pipeline outputs with different recovery states produce divergence alerts.
-/// This validates that shadow diff actually detects real differences (non-tautological).
-#[test]
-fn pipeline_shadow_diff_detects_recovery_divergence() {
-    let (statics, agent, latches, session, mut turn, ext, emer, stats) = build_sources();
-
-    // First run: normal state
-    let sources_normal = ContextSources {
-        statics: &statics,
-        agent: &agent,
-        latches: &latches,
-        session: &session,
-        turn: &turn,
-        external: &ext,
-        emergent: &emer,
-        working_memory: None,
-        stats: &stats,
-    };
-    let plan_input_normal = PlanInput {
-        tokens: &turn.tokens,
-        model_limit: session.model_limit,
-        pre_reserved_output_tokens: 0,
-        recovery: &turn.recovery,
-        latches: &latches,
-        stats: &stats,
-        provider_policy: &session.provider_policy,
-        has_memory: !ext.memory_entries.is_empty(),
-        model_id: &session.model_id,
-        query_source: "repl",
-    };
-    let plan_normal = plan_turn(&plan_input_normal);
-    let bound_normal = bind_all(&plan_normal, &sources_normal);
-    let limits = OptimizeLimits::default();
-    let opt_normal = optimize(
-        &plan_normal,
-        bound_normal,
-        &latches,
-        &session.provider_policy,
-        &limits,
-        1,
-    );
-
-    // Second run: recovery state (different pressure → different output)
-    turn.recovery.record_ptl_error();
-    turn.recovery.record_ptl_error();
-    let sources_recovery = ContextSources {
-        statics: &statics,
-        agent: &agent,
-        latches: &latches,
-        session: &session,
-        turn: &turn,
-        external: &ext,
-        emergent: &emer,
-        working_memory: None,
-        stats: &stats,
-    };
-    let plan_input_recovery = PlanInput {
-        tokens: &turn.tokens,
-        model_limit: session.model_limit,
-        pre_reserved_output_tokens: 0,
-        recovery: &turn.recovery,
-        latches: &latches,
-        stats: &stats,
-        provider_policy: &session.provider_policy,
-        has_memory: !ext.memory_entries.is_empty(),
-        model_id: &session.model_id,
-        query_source: "repl",
-    };
-    let plan_recovery = plan_turn(&plan_input_recovery);
-    let bound_recovery = bind_all(&plan_recovery, &sources_recovery);
-    let opt_recovery = optimize(
-        &plan_recovery,
-        bound_recovery,
-        &latches,
-        &session.provider_policy,
-        &limits,
-        2,
-    );
-
-    let diff = diff_pipeline_outputs(&opt_normal, &opt_recovery, 2);
-    // Recovery state changes pressure tier → different sections/content
-    // The diff should either be clean (same structure) or produce alerts (different structure)
-    // Key invariant: diff_pipeline_outputs never panics, always produces a valid result
-    assert!(
-        diff.section_count_match || !diff.alerts.is_empty(),
-        "Shadow diff must either match or produce diagnostic alerts"
     );
 }

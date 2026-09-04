@@ -29,7 +29,6 @@ use crate::pipeline_config::PipelineConfig;
 use crate::pipeline_stats::PipelineStats;
 use crate::recovery_state::RecoveryState;
 use crate::session_latches::SessionLatches;
-use crate::shadow_diff::{ShadowDiffResult, diff_pipeline_outputs};
 use crate::working_memory::WorkingMemoryState;
 use std::sync::Arc;
 
@@ -63,12 +62,6 @@ pub struct TurnOutput {
     pub serialized: SerializedProviderRequest,
     pub explain: PipelineExplain,
     pub metrics: PipelineRunMetrics,
-}
-
-/// Shadow mode comparison result (when running dual paths during rollout).
-pub struct ShadowTurnOutput {
-    pub pipeline_output: TurnOutput,
-    pub diff: ShadowDiffResult,
 }
 
 /// Session-scoped pipeline orchestrator.
@@ -452,22 +445,6 @@ impl PipelineSession {
             );
         }
         accepted
-    }
-
-    /// Run the pipeline in shadow mode: produce pipeline output AND compare
-    /// against a pre-computed legacy `ContextOptimized` for diffing.
-    pub fn run_turn_shadow(
-        &mut self,
-        input: TurnInput<'_>,
-        legacy_output: &ContextOptimized,
-    ) -> Result<ShadowTurnOutput, PipelineAbort> {
-        let turn_index = input.turn.turn_index;
-        let output = self.run_turn(input)?;
-        let diff = diff_pipeline_outputs(legacy_output, &output.optimized, turn_index);
-        Ok(ShadowTurnOutput {
-            pipeline_output: output,
-            diff,
-        })
     }
 
     /// Record feedback from the API response. Updates stats, recovery state,
@@ -1381,44 +1358,6 @@ mod tests {
         sess.record_feedback("model", "repl", &mut feedback, None);
         assert_eq!(sess.recovery.consecutive_ptl_errors, 0);
         assert!(!sess.recovery.is_in_recovery());
-    }
-
-    #[test]
-    fn shadow_mode_detects_no_diff_on_same_output() {
-        let mut sess = PipelineSession::new(PipelineConfig::default());
-        let statics = test_statics();
-        let agent = AgentContext::default();
-        let session = test_session_context();
-        let turn = test_turn_state(1);
-        let external = test_external();
-        let limits = OptimizeLimits::default();
-
-        let input = TurnInput {
-            statics: &statics,
-            agent: &agent,
-            session: &session,
-            turn: &turn,
-            external: &external,
-            optimize_limits: &limits,
-            model_id: "model",
-            query_source: "repl",
-        };
-
-        let output = sess.run_turn(input).unwrap();
-
-        let input2 = TurnInput {
-            statics: &statics,
-            agent: &agent,
-            session: &session,
-            turn: &turn,
-            external: &external,
-            optimize_limits: &limits,
-            model_id: "model",
-            query_source: "repl",
-        };
-
-        let shadow = sess.run_turn_shadow(input2, &output.optimized).unwrap();
-        assert!(shadow.diff.is_clean());
     }
 
     #[test]

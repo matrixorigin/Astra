@@ -41,19 +41,6 @@ pub mod orchestration;
 pub(crate) mod service_handlers;
 pub mod skills;
 
-// ── Backward-compatible module re-exports (moved into service_handlers/) ──────
-//
-// `agents` and `context` are still consumed as bare module names from
-// `server/router_builder/*` via `use super::*;`. Keep them as crate-private
-// re-exports until those call sites migrate to the canonical
-// `service_handlers::{agents,context}` paths.
-pub(crate) mod agents {
-    pub use crate::service_handlers::agents::*;
-}
-pub(crate) mod context {
-    pub use crate::service_handlers::context::*;
-}
-
 // ── self_model (the self_model/ directory) ──────────────────────────────────
 #[path = "self_model/mod.rs"]
 pub mod self_model;

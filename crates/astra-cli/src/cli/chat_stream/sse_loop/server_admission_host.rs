@@ -246,8 +246,8 @@ pub(crate) struct CliServerAdmissionHost<'a> {
     /// Original-deadline-backed source for a fresh request-local wall budget.
     /// This stays typed and out of all static prompt/cache-prefix fields.
     pub execution_time_budget: Option<crate::cli::chat_stream::ExecutionTimeBudgetClock>,
-    /// Optional fork-prefix store: when set + fork flag enabled,
-    /// this host calls `capture_parent_prefix` in its
+    /// Optional fork-prefix store. When wired, this host calls
+    /// `capture_parent_prefix` in its
     /// `on_turn_completed` hook, feeding the store that the
     /// DynamicAgentSpawner and DelegationEngine share. Without
     /// this, a captured parent prefix never exists and children

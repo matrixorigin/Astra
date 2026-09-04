@@ -83,7 +83,6 @@ pub mod safety_middleware;
 pub mod section_types;
 pub mod semantic_read_cache;
 pub mod session_latches;
-pub mod shadow_diff;
 pub mod spill_backend;
 pub mod sse;
 pub mod stall;

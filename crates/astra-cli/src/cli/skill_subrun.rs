@@ -1313,7 +1313,6 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             permission_handler: None,
             tactical_adapter: None,
             step_signal_collector: None,
-            tool_budget_override: None,
             recent_tactical_actions: Vec::new(),
             runtime_tool_executor: None,
             interruption: None,
