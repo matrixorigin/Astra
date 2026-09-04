@@ -1,6 +1,6 @@
 {
   "name": "@astra/sdk",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "Apache-2.0",
   "description": "TypeScript SDK for Astra — streaming chat, tool execution, and WebSocket support",
   "homepage": "https://github.com/matrixorigin/Astra#readme",
