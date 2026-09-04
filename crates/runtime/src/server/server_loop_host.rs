@@ -2045,31 +2045,136 @@ pub struct CapturedLlmRequest {
 #[derive(Debug)]
 struct ProviderCanonicalHydrationOutcome {
     reconciled_transitions: usize,
-    head_transition_id: Option<String>,
-    head_result: Option<astra_turn_types::CanonicalPrefixIdentityV1>,
+    head: Option<crate::turn::agentic_loop::host::ProviderCanonicalWalHead>,
     replacement: Option<astra_turn_types::ProviderCanonicalTransitionV2>,
 }
 
-fn sanitize_provider_canonical_wal_snapshot(
-    durable_base: &astra_turn_types::CanonicalPrefixIdentityV1,
-    messages: &[Value],
-) -> Vec<Value> {
-    let base_count = usize::try_from(durable_base.message_count).ok();
-    if let Some(base_count) = base_count
-        && messages.len() >= base_count
-        && astra_turn_types::canonical_conversation_root(&messages[..base_count])
-            == durable_base.root_hash
-    {
-        let mut sanitized = messages[..base_count].to_vec();
-        sanitized.extend(
-            astra_turn_core::runtime_scaffolding::sanitize_durable_message_values(
-                messages[base_count..].to_vec(),
-            ),
+#[derive(Debug, Clone, Copy)]
+struct ProviderCanonicalWalLimits {
+    max_entries: u32,
+    max_bytes: u64,
+}
+
+impl ProviderCanonicalWalLimits {
+    const PRODUCTION: Self = Self {
+        max_entries: astra_turn_types::MAX_PROVIDER_CANONICAL_WAL_ENTRIES,
+        max_bytes: astra_turn_types::MAX_PROVIDER_CANONICAL_WAL_BYTES,
+    };
+}
+
+#[derive(Debug)]
+struct ProviderCanonicalWalPlan {
+    transition: astra_turn_types::ProviderCanonicalTransitionV2,
+    head: crate::turn::agentic_loop::host::ProviderCanonicalWalHead,
+}
+
+/// Plan one durable provider-owned transition from the current atomic WAL
+/// head. Normal rounds hash and persist only the delta since the prior head.
+/// A bounded, lossless checkpoint is emitted before the service-side hard
+/// limit is reached; canonical replacement remains a separate operation that
+/// requires explicit rewrite authority.
+fn plan_provider_canonical_wal_transition(
+    durable_base: &astra_turn_types::ProviderCanonicalWalBaseV2,
+    head: Option<&crate::turn::agentic_loop::host::ProviderCanonicalWalHead>,
+    predecessor_messages: &[Value],
+    appended_messages: Vec<Value>,
+    replacement_authorization: Option<
+        &crate::turn::canonical_commit::ProviderWalReplacementAuthorization,
+    >,
+    limits: ProviderCanonicalWalLimits,
+) -> Result<ProviderCanonicalWalPlan, astra_turn_types::ProviderCanonicalTransitionError> {
+    let durable_appended =
+        astra_turn_core::runtime_scaffolding::sanitize_durable_message_values(appended_messages);
+
+    let mut transition = if let Some(authorization) = replacement_authorization {
+        let durable_predecessor =
+            crate::turn::canonical_commit::sanitize_provider_canonical_wal_snapshot(
+                durable_base,
+                predecessor_messages,
+            );
+        let transition =
+            astra_turn_types::ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
+                head.map(|head| head.transition_id.clone()),
+                durable_base.clone(),
+                authorization.generation,
+                &durable_predecessor,
+                durable_appended.clone(),
+            )?;
+        if transition.predecessor != authorization.durable_predecessor {
+            return Err(astra_turn_types::ProviderCanonicalTransitionError::RecoveryRootMismatch);
+        }
+        transition
+    } else if let Some(head) = head {
+        let parent_count = usize::try_from(head.result.message_count).map_err(|_| {
+            astra_turn_types::ProviderCanonicalTransitionError::MessageCountOverflow
+        })?;
+        if predecessor_messages.len() < parent_count {
+            return Err(
+                astra_turn_types::ProviderCanonicalTransitionError::MissingLinkedPredecessor,
+            );
+        }
+        let recovery_delta = astra_turn_core::runtime_scaffolding::sanitize_durable_message_values(
+            predecessor_messages[parent_count..].to_vec(),
         );
-        sanitized
+        astra_turn_types::ProviderCanonicalTransitionV2::new_linked_from_deltas(
+            head.transition_id.clone(),
+            head.result.clone(),
+            durable_base.clone(),
+            recovery_delta,
+            durable_appended.clone(),
+        )?
     } else {
-        astra_turn_core::runtime_scaffolding::sanitize_durable_message_values(messages.to_vec())
+        let durable_predecessor =
+            crate::turn::canonical_commit::sanitize_provider_canonical_wal_snapshot(
+                durable_base,
+                predecessor_messages,
+            );
+        astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
+            None,
+            durable_base.clone(),
+            &durable_predecessor,
+            durable_appended.clone(),
+        )?
+    };
+
+    if replacement_authorization.is_none()
+        && head.is_some_and(|head| {
+            head.would_exceed_with_limits(&transition, limits.max_entries, limits.max_bytes)
+                .unwrap_or(true)
+        })
+    {
+        let head = head.expect("the capacity predicate requires a WAL head");
+        let durable_predecessor =
+            crate::turn::canonical_commit::sanitize_provider_canonical_wal_snapshot(
+                durable_base,
+                predecessor_messages,
+            );
+        transition = astra_turn_types::ProviderCanonicalTransitionV2::new_checkpoint_from_parent(
+            head.transition_id.clone(),
+            head.result.clone(),
+            durable_base.clone(),
+            &durable_predecessor,
+            durable_appended,
+        )?;
     }
+
+    let planned_head = match head {
+        Some(head) => head.advanced(&transition)?,
+        None => crate::turn::agentic_loop::host::ProviderCanonicalWalHead::from_chain(
+            std::slice::from_ref(&transition),
+        )?
+        .expect("a one-entry transition chain always has a head"),
+    };
+    if planned_head.chain_length > limits.max_entries {
+        return Err(astra_turn_types::ProviderCanonicalTransitionError::TooManyWalEntries);
+    }
+    if planned_head.chain_payload_bytes > limits.max_bytes {
+        return Err(astra_turn_types::ProviderCanonicalTransitionError::TooManyWalBytes);
+    }
+    Ok(ProviderCanonicalWalPlan {
+        transition,
+        head: planned_head,
+    })
 }
 
 fn apply_provider_canonical_transition_receipts(
@@ -2079,8 +2184,7 @@ fn apply_provider_canonical_transition_receipts(
     if receipts.is_empty() {
         return Ok(ProviderCanonicalHydrationOutcome {
             reconciled_transitions: 0,
-            head_transition_id: None,
-            head_result: None,
+            head: None,
             replacement: None,
         });
     }
@@ -2109,26 +2213,26 @@ fn apply_provider_canonical_transition_receipts(
                 format!("reconcile provider canonical transition WAL chain: {error}"),
             )
         })?;
-    let head_transition_id = transitions
-        .last()
-        .map(|transition| transition.transition_id.clone());
-    let head_result = transitions
-        .last()
-        .map(|transition| transition.result.clone());
+    let head = crate::turn::agentic_loop::host::ProviderCanonicalWalHead::from_chain(&transitions)
+        .map_err(|error| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                format!("reconstruct provider canonical WAL head: {error}"),
+            )
+        })?;
     Ok(ProviderCanonicalHydrationOutcome {
         reconciled_transitions: transitions.len(),
-        head_transition_id,
-        head_result,
+        head,
         replacement,
     })
 }
 
 fn hydrate_provider_canonical_transition_receipts(
     messages: &mut Vec<Value>,
-    durable_base: &astra_turn_types::CanonicalPrefixIdentityV1,
+    durable_base: &astra_turn_types::ProviderCanonicalWalBaseV2,
     receipts: Vec<astra_services::InferenceCanonicalTransitionReceipt>,
 ) -> Result<ProviderCanonicalHydrationOutcome, astra_core::ClassifiedError> {
-    let durable_count = usize::try_from(durable_base.message_count).map_err(|_| {
+    let durable_count = usize::try_from(durable_base.canonical.message_count).map_err(|_| {
         astra_core::ClassifiedError::new(
             astra_core::ErrorKind::ContractViolation,
             "provider canonical WAL durable-base count overflow",
@@ -2136,7 +2240,7 @@ fn hydrate_provider_canonical_transition_receipts(
     })?;
     if messages.len() < durable_count
         || astra_turn_types::canonical_conversation_root(&messages[..durable_count])
-            != durable_base.root_hash
+            != durable_base.canonical.root_hash
     {
         return Err(astra_core::ClassifiedError::new(
             astra_core::ErrorKind::ContractViolation,
@@ -11178,8 +11282,7 @@ impl ServerAgenticLoopHost {
                     )
                 })?;
         }
-        state.provider_canonical_wal_head_transition_id = outcome.head_transition_id.clone();
-        state.provider_canonical_wal_head_result = outcome.head_result.clone();
+        state.provider_canonical_wal_head = outcome.head.clone();
         tracing::debug!(
             target: "astra_runtime::canonical_wal",
             session_id = %self.session_id,
@@ -12704,7 +12807,8 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     }
                 };
             let attempt_llm_messages = attempt_llm_messages_owned.as_slice();
-            let provider_canonical_transitions = if state.owns_provider_canonical_transition_wal()
+            let (provider_canonical_transitions, provider_canonical_planned_head) = if state
+                .owns_provider_canonical_transition_wal()
                 && matches!(
                     cache_cap.volatile_placement,
                     astra_turn_core::cache_placement::VolatilePlacement::AppendOnlyUserTail
@@ -12742,91 +12846,46 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         return Err(error);
                     };
                     let predecessor_messages = &state.messages[..durable_canonical_cursor];
-                    let durable_predecessor = sanitize_provider_canonical_wal_snapshot(
-                        &durable_base,
-                        predecessor_messages,
-                    );
-                    let durable_appended =
-                        astra_turn_core::runtime_scaffolding::sanitize_durable_message_values(
-                            appended.clone(),
+                    let replacement_authorization = state
+                        .provider_canonical_replacement_authorization(
+                            &durable_base,
+                            predecessor_messages,
                         );
-                    let transition_result = match (
-                        state.provider_canonical_wal_head_transition_id.as_ref(),
-                        state.provider_canonical_wal_head_result.as_ref(),
+                    let plan = match plan_provider_canonical_wal_transition(
+                        &durable_base,
+                        state.provider_canonical_wal_head.as_ref(),
+                        predecessor_messages,
+                        appended,
+                        replacement_authorization.as_ref(),
+                        ProviderCanonicalWalLimits::PRODUCTION,
                     ) {
-                        (None, None) => {
-                            astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
-                                None,
-                                durable_base.clone(),
-                                &durable_predecessor,
-                                durable_appended.clone(),
-                            )
-                        }
-                        (Some(parent_id), Some(parent_result)) => {
-                            astra_turn_types::ProviderCanonicalTransitionV2::new_linked_from_durable_base(
-                                parent_id.clone(),
-                                parent_result.clone(),
-                                durable_base.clone(),
-                                &durable_predecessor,
-                                durable_appended.clone(),
-                            )
-                        }
-                        _ => Err(
-                            astra_turn_types::ProviderCanonicalTransitionError::MissingLinkedPredecessor,
-                        ),
-                    };
-                    let transition_result = match transition_result {
-                        Err(
-                            astra_turn_types::ProviderCanonicalTransitionError::DurableBaseNotPrefix
-                            | astra_turn_types::ProviderCanonicalTransitionError::MissingLinkedPredecessor,
-                        ) => {
-                            let Some(authorization) = state
-                                .provider_canonical_replacement_authorization(
-                                    &durable_base,
-                                    predecessor_messages,
-                                )
-                            else {
-                                let error = astra_core::ClassifiedError::new(
-                                    astra_core::ErrorKind::ContractViolation,
-                                    "provider canonical replacement lacks a valid rewrite proof",
-                                );
-                                durable_invocation.finish_error(&error).await?;
-                                return Err(error);
-                            };
-                            astra_turn_types::ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
-                                state.provider_canonical_wal_head_transition_id.clone(),
-                                durable_base.clone(),
-                                authorization.generation,
-                                &durable_predecessor,
-                                durable_appended,
-                            )
-                        }
-                        other => other,
-                    };
-                    let transition = match transition_result {
-                        Ok(transition) => transition,
+                        Ok(plan) => plan,
                         Err(source) => {
                             let error = astra_core::ClassifiedError::new(
                                 astra_core::ErrorKind::ContractViolation,
                                 format!(
-                                    "failed to construct provider canonical transition: {source}"
+                                    "failed to plan a bounded provider canonical transition: {source}"
                                 ),
                             );
                             durable_invocation.finish_error(&error).await?;
                             return Err(error);
                         }
                     };
-                    vec![transition]
+                    (vec![plan.transition], Some(plan.head))
                 }
             } else {
-                Vec::new()
+                (Vec::new(), None)
             };
             let provider_canonical_transition_id = provider_canonical_transitions
                 .first()
                 .map(|transition| transition.transition_id.clone());
-            let provider_canonical_transition_result = provider_canonical_transitions
+            let provider_canonical_replacement = provider_canonical_transitions
                 .first()
-                .map(|transition| transition.result.clone());
+                .filter(|transition| {
+                    transition.recovery_mode
+                        == astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase
+                })
+                .cloned();
             if let Err(error) = durable_invocation
                 .bind_provider_canonical_transitions(provider_canonical_transitions)
             {
@@ -13158,21 +13217,44 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                 provider_result
             };
             let provider_attempts = durable_invocation.provider_attempt_facts().await;
-            if let Some(admitted_transition_id) =
-                durable_invocation.admitted_canonical_transition_id()
-            {
-                if provider_canonical_transition_id.as_deref()
-                    != Some(admitted_transition_id.as_str())
+            match (
+                durable_invocation.admitted_canonical_transition_id(),
+                provider_canonical_planned_head,
+            ) {
+                (Some(admitted_transition_id), Some(planned_head))
+                    if provider_canonical_transition_id.as_deref()
+                        == Some(admitted_transition_id.as_str())
+                        && planned_head.transition_id == admitted_transition_id =>
                 {
+                    if let Some(replacement) = provider_canonical_replacement.as_ref()
+                        && let Err(source) =
+                            state.acknowledge_provider_canonical_replacement(replacement)
+                    {
+                        let error = astra_core::ClassifiedError::new(
+                            astra_core::ErrorKind::ContractViolation,
+                            format!(
+                                "failed to consume provider canonical replacement authority: {source}"
+                            ),
+                        );
+                        durable_invocation.finish_error(&error).await?;
+                        return Err(error);
+                    }
+                    state.provider_canonical_wal_head = Some(planned_head);
+                }
+                (None, Some(_)) if r.is_err() => {
+                    // Admission failures carry the authoritative database or
+                    // contract error through `provider_result`; do not replace
+                    // it with a secondary missing-head diagnostic.
+                }
+                (None, None) => {}
+                _ => {
                     let error = astra_core::ClassifiedError::new(
                         astra_core::ErrorKind::ContractViolation,
-                        "durable provider admission returned a different canonical WAL head",
+                        "durable provider admission did not preserve the planned canonical WAL head",
                     );
                     durable_invocation.finish_error(&error).await?;
                     return Err(error);
                 }
-                state.provider_canonical_wal_head_transition_id = Some(admitted_transition_id);
-                state.provider_canonical_wal_head_result = provider_canonical_transition_result;
             }
             record_provider_attempt_cache_observations(state, &provider_attempts);
             if durable_invocation.provider_dispatch_started() {
@@ -21380,6 +21462,298 @@ mod tests {
     }
 
     #[test]
+    fn provider_wal_planner_persists_only_the_delta_after_its_atomic_head() {
+        let durable = vec![json!({"role": "user", "content": "do the work"})];
+        let durable_base =
+            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
+        let authority = |text| {
+            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                text,
+                crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
+                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let first = plan_provider_canonical_wal_transition(
+            &durable_base,
+            None,
+            &durable,
+            vec![authority("first")],
+            None,
+            ProviderCanonicalWalLimits::PRODUCTION,
+        )
+        .unwrap();
+        let mut predecessor = durable;
+        predecessor.extend(first.transition.appended_messages.iter().cloned());
+        let provider_response = json!({"role": "assistant", "content": "intermediate"});
+        predecessor.push(provider_response.clone());
+
+        let second = plan_provider_canonical_wal_transition(
+            &durable_base,
+            Some(&first.head),
+            &predecessor,
+            vec![authority("second")],
+            None,
+            ProviderCanonicalWalLimits::PRODUCTION,
+        )
+        .unwrap();
+
+        assert_eq!(
+            second.transition.recovery_mode,
+            astra_turn_types::ProviderCanonicalRecoveryModeV2::AppendFromDurableBase
+        );
+        assert_eq!(second.transition.recovery_messages, vec![provider_response]);
+        assert_eq!(second.head.chain_length, 2);
+        assert_eq!(second.head.result, second.transition.result);
+    }
+
+    #[test]
+    fn provider_wal_planner_rolls_up_before_the_hard_entry_limit() {
+        let durable = vec![json!({"role": "user", "content": "do the work"})];
+        let durable_base =
+            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
+        let authority = |text| {
+            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                text,
+                crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
+                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let first = plan_provider_canonical_wal_transition(
+            &durable_base,
+            None,
+            &durable,
+            vec![authority("first")],
+            None,
+            ProviderCanonicalWalLimits::PRODUCTION,
+        )
+        .unwrap();
+        let mut predecessor = durable.clone();
+        predecessor.extend(first.transition.appended_messages.iter().cloned());
+        predecessor.push(json!({"role": "assistant", "content": "intermediate"}));
+
+        let checkpoint = plan_provider_canonical_wal_transition(
+            &durable_base,
+            Some(&first.head),
+            &predecessor,
+            vec![authority("second")],
+            None,
+            ProviderCanonicalWalLimits {
+                max_entries: 1,
+                max_bytes: astra_turn_types::MAX_PROVIDER_CANONICAL_WAL_BYTES,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            checkpoint.transition.recovery_mode,
+            astra_turn_types::ProviderCanonicalRecoveryModeV2::CheckpointFromParent
+        );
+        assert_eq!(checkpoint.head.chain_length, 1);
+        assert_eq!(
+            checkpoint.transition.replacement_compaction_generation,
+            None
+        );
+
+        let mut recovered = durable;
+        astra_turn_types::ProviderCanonicalTransitionV2::apply_chain_to(
+            std::slice::from_ref(&checkpoint.transition),
+            &mut recovered,
+        )
+        .unwrap();
+        predecessor.extend(checkpoint.transition.appended_messages.iter().cloned());
+        assert_eq!(recovered, predecessor);
+    }
+
+    #[test]
+    fn provider_wal_planner_rejects_history_shorter_than_its_durable_head() {
+        let durable = vec![json!({"role": "user", "content": "do the work"})];
+        let durable_base =
+            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
+        let authority = crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+            "first",
+            crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
+            astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+        )
+        .unwrap()
+        .unwrap();
+        let first = plan_provider_canonical_wal_transition(
+            &durable_base,
+            None,
+            &durable,
+            vec![authority],
+            None,
+            ProviderCanonicalWalLimits::PRODUCTION,
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan_provider_canonical_wal_transition(
+                &durable_base,
+                Some(&first.head),
+                &[],
+                Vec::new(),
+                None,
+                ProviderCanonicalWalLimits::PRODUCTION,
+            )
+            .unwrap_err(),
+            astra_turn_types::ProviderCanonicalTransitionError::MissingLinkedPredecessor
+        );
+    }
+
+    #[test]
+    fn provider_wal_planner_binds_rewrite_authority_to_the_exact_durable_snapshot() {
+        let base_secret = "hf_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789";
+        let suffix_secret = "hf_ZyXwVuTsRqPoNmLkJiHgFeDcBa9876543210";
+        let durable = vec![json!({
+            "role": "user",
+            "content": format!("already admitted {base_secret}")
+        })];
+        let durable_base =
+            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
+        let mut proof = crate::turn::canonical_commit::CanonicalRewriteProof::new(
+            &durable,
+            &durable_base.canonical.root_hash,
+            3,
+        );
+        let permit = proof.begin(&durable);
+        let mut rewritten = durable.clone();
+        rewritten.push(json!({
+            "role": "assistant",
+            "content": format!("new summary {suffix_secret}")
+        }));
+        proof.finish(permit, &rewritten, Some(&durable_base));
+        let authorization = proof
+            .provider_wal_replacement_authorization(&durable_base, &rewritten)
+            .expect("the admitted rewrite has exact replacement authority");
+
+        let plan = plan_provider_canonical_wal_transition(
+            &durable_base,
+            None,
+            &rewritten,
+            Vec::new(),
+            Some(&authorization),
+            ProviderCanonicalWalLimits::PRODUCTION,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.transition.recovery_mode,
+            astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase
+        );
+        assert_eq!(
+            plan.transition.predecessor,
+            authorization.durable_predecessor
+        );
+        assert!(
+            serde_json::to_string(&plan.transition.recovery_messages)
+                .unwrap()
+                .contains(base_secret),
+            "an already-persisted WAL base must remain byte-identical"
+        );
+        assert!(
+            !serde_json::to_string(&plan.transition.recovery_messages)
+                .unwrap()
+                .contains(suffix_secret),
+            "the not-yet-persisted suffix must be sanitized"
+        );
+
+        let mut tampered = authorization;
+        tampered.durable_predecessor =
+            astra_turn_types::ProviderCanonicalHistoryIdentityV2::empty();
+        assert_eq!(
+            plan_provider_canonical_wal_transition(
+                &durable_base,
+                None,
+                &rewritten,
+                Vec::new(),
+                Some(&tampered),
+                ProviderCanonicalWalLimits::PRODUCTION,
+            )
+            .unwrap_err(),
+            astra_turn_types::ProviderCanonicalTransitionError::RecoveryRootMismatch
+        );
+    }
+
+    #[test]
+    fn crash_hydration_preserves_the_openai_cache_visible_prompt() {
+        let durable = vec![
+            json!({"role": "system", "content": "stable enterprise policy"}),
+            json!({"role": "user", "content": "do the work"}),
+        ];
+        let durable_base =
+            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
+        let authority = |text| {
+            crate::turn::wire_assembly::required_append_only_runtime_authority_message(
+                text,
+                crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
+                astra_turn_types::RuntimeAuthorityLifetime::CurrentUserTurn,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let first = plan_provider_canonical_wal_transition(
+            &durable_base,
+            None,
+            &durable,
+            vec![authority("first")],
+            None,
+            ProviderCanonicalWalLimits::PRODUCTION,
+        )
+        .unwrap();
+        let mut uninterrupted = durable.clone();
+        uninterrupted.extend(first.transition.appended_messages.iter().cloned());
+        uninterrupted.push(json!({"role": "assistant", "content": "intermediate"}));
+        let second = plan_provider_canonical_wal_transition(
+            &durable_base,
+            Some(&first.head),
+            &uninterrupted,
+            vec![authority("second")],
+            None,
+            ProviderCanonicalWalLimits::PRODUCTION,
+        )
+        .unwrap();
+        uninterrupted.extend(second.transition.appended_messages.iter().cloned());
+        let fresh = json!({"role": "user", "content": "fresh follow-up"});
+        uninterrupted.push(fresh.clone());
+
+        let mut recovered = durable;
+        recovered.push(fresh);
+        hydrate_provider_canonical_transition_receipts(
+            &mut recovered,
+            &durable_base,
+            vec![astra_services::InferenceCanonicalTransitionReceipt {
+                turn: 1,
+                round: 1,
+                logical_attempt: 0,
+                physical_attempt: 0,
+                transitions: vec![first.transition, second.transition],
+            }],
+        )
+        .unwrap();
+
+        let capability = append_only_test_cache_capability();
+        let uninterrupted_wire = crate::turn::llm::client::consolidate_system_messages_for_provider(
+            &uninterrupted,
+            "openai",
+            Some(capability),
+        );
+        let recovered_wire = crate::turn::llm::client::consolidate_system_messages_for_provider(
+            &recovered,
+            "openai",
+            Some(capability),
+        );
+        assert_eq!(recovered, uninterrupted);
+        assert_eq!(recovered_wire, uninterrupted_wire);
+        assert!(
+            !serde_json::to_string(&recovered_wire)
+                .unwrap()
+                .contains("cache_control")
+        );
+    }
+
+    #[test]
     fn provider_transition_wal_hydrates_ordered_pairs_once_before_fresh_user_suffix() {
         let durable_head = vec![
             json!({"role": "user", "content": "older request"}),
@@ -21388,7 +21762,7 @@ mod tests {
         let mut base = durable_head.clone();
         base.push(json!({"role": "user", "content": "do the work"}));
         let durable_base =
-            astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&durable_head).unwrap();
+            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable_head).unwrap();
         let first_authority =
             crate::turn::wire_assembly::required_append_only_runtime_authority_message(
                 "opaque first authority",
@@ -21445,7 +21819,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome.reconciled_transitions, 2);
-        assert_eq!(outcome.head_transition_id, Some(second.transition_id));
+        assert_eq!(
+            outcome
+                .head
+                .as_ref()
+                .map(|head| head.transition_id.as_str()),
+            Some(second.transition_id.as_str())
+        );
         assert_eq!(restored[2], base[2]);
         assert_eq!(restored[3], first_authority);
         assert_eq!(restored[4], first_provider_response);
@@ -21461,7 +21841,7 @@ mod tests {
         let mut predecessor = durable_head.clone();
         predecessor.push(repeated.clone());
         let durable_base =
-            astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&durable_head).unwrap();
+            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable_head).unwrap();
         let authority = crate::turn::wire_assembly::required_append_only_runtime_authority_message(
             "continue safely",
             crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
@@ -21503,7 +21883,7 @@ mod tests {
         let mut predecessor = durable_head.clone();
         predecessor.push(old_user.clone());
         let durable_base =
-            astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&durable_head).unwrap();
+            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable_head).unwrap();
         let transition = astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
             None,
             durable_base.clone(),
@@ -21540,7 +21920,7 @@ mod tests {
     fn provider_transition_wal_redacts_uncommitted_credentials_before_persistence() {
         let durable_head = vec![json!({"role": "assistant", "content": "ready"})];
         let durable_base =
-            astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&durable_head).unwrap();
+            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable_head).unwrap();
         let secret = "hf_abcdefghijklmnopqrstuvwxyz123456";
         let mut snapshot = durable_head.clone();
         snapshot.push(json!({
@@ -21556,7 +21936,10 @@ mod tests {
             }]
         }));
 
-        let durable = sanitize_provider_canonical_wal_snapshot(&durable_base, &snapshot);
+        let durable = crate::turn::canonical_commit::sanitize_provider_canonical_wal_snapshot(
+            &durable_base,
+            &snapshot,
+        );
         assert_eq!(durable[0], durable_head[0]);
         assert!(serde_json::to_string(&snapshot).unwrap().contains(secret));
         assert!(!serde_json::to_string(&durable).unwrap().contains(secret));
@@ -21569,7 +21952,7 @@ mod tests {
             json!({"role": "assistant", "content": "old answer"}),
         ];
         let durable_base =
-            astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&durable_head).unwrap();
+            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable_head).unwrap();
         let authority = |text, kind| {
             crate::turn::wire_assembly::required_append_only_runtime_authority_message(
                 text,
@@ -21738,7 +22121,7 @@ mod tests {
     fn provider_transition_wal_rejects_disconnected_valid_branches_atomically() {
         let base = vec![json!({"role": "assistant", "content": "ready"})];
         let durable_base =
-            astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&base).unwrap();
+            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&base).unwrap();
         let authority = |text| {
             crate::turn::wire_assembly::required_append_only_runtime_authority_message(
                 text,
@@ -26221,8 +26604,7 @@ mod tests {
             context_compression_triggered: false,
             canonical_rewrite_state: Default::default(),
             provider_canonical_wal_base: None,
-            provider_canonical_wal_head_transition_id: None,
-            provider_canonical_wal_head_result: None,
+            provider_canonical_wal_head: None,
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: CompactionTier::Normal,
             skill_produced_output: false,

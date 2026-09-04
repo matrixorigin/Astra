@@ -3085,16 +3085,10 @@ pub struct AgenticLoopState {
     /// may reconstruct this uncommitted turn. Present only when the outer
     /// canonical coordinator admitted the turn; local/subrun histories must
     /// not invent this authority.
-    pub provider_canonical_wal_base: Option<astra_turn_types::CanonicalPrefixIdentityV1>,
-    /// Latest transition durably admitted for this unfinished turn. Every new
-    /// transition names this exact id as its parent; recovery restores it from
-    /// the database-owned per-turn WAL head instead of inferring lineage from
-    /// message values.
-    pub provider_canonical_wal_head_transition_id: Option<String>,
-    /// Canonical result owned by the latest admitted transition. The next WAL
-    /// entry uses this exact boundary to persist only messages produced since
-    /// that admission.
-    pub provider_canonical_wal_head_result: Option<astra_turn_types::CanonicalPrefixIdentityV1>,
+    pub provider_canonical_wal_base: Option<astra_turn_types::ProviderCanonicalWalBaseV2>,
+    /// Atomic database-owned WAL head. Identity and capacity accounting move
+    /// together so a half-initialized lineage cannot be represented.
+    pub provider_canonical_wal_head: Option<ProviderCanonicalWalHead>,
     /// Counts how many post-wrap-up rounds still emitted tool_calls. Task #43
     /// hybrid enforcement: the first such round triggers a physical lockout
     /// (tool_calls dropped, `restricted_tools` populated, loop continues so the
@@ -3254,6 +3248,75 @@ pub struct AgenticLoopState {
     /// verification. Updated after each tool phase; read before each LLM
     /// round to auto-inject a compact self-status block into the prompt.
     pub observation_journal: ObservationJournal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCanonicalWalHead {
+    pub(crate) transition_id: String,
+    pub(crate) result: astra_turn_types::ProviderCanonicalHistoryIdentityV2,
+    pub(crate) chain_length: u32,
+    pub(crate) chain_payload_bytes: u64,
+}
+
+impl ProviderCanonicalWalHead {
+    pub(crate) fn from_chain(
+        transitions: &[astra_turn_types::ProviderCanonicalTransitionV2],
+    ) -> Result<Option<Self>, astra_turn_types::ProviderCanonicalTransitionError> {
+        let Some(last) = transitions.last() else {
+            return Ok(None);
+        };
+        let mut chain_payload_bytes = 0_u64;
+        for transition in transitions {
+            chain_payload_bytes = chain_payload_bytes
+                .checked_add(transition.durable_payload_bytes()?)
+                .ok_or(astra_turn_types::ProviderCanonicalTransitionError::TooManyWalBytes)?;
+        }
+        Ok(Some(Self {
+            transition_id: last.transition_id.clone(),
+            result: last.result.clone(),
+            chain_length: u32::try_from(transitions.len()).map_err(|_| {
+                astra_turn_types::ProviderCanonicalTransitionError::TooManyWalEntries
+            })?,
+            chain_payload_bytes,
+        }))
+    }
+
+    pub(crate) fn advanced(
+        &self,
+        transition: &astra_turn_types::ProviderCanonicalTransitionV2,
+    ) -> Result<Self, astra_turn_types::ProviderCanonicalTransitionError> {
+        let payload_bytes = transition.durable_payload_bytes()?;
+        let (chain_length, chain_payload_bytes) = if transition.recovery_mode
+            == astra_turn_types::ProviderCanonicalRecoveryModeV2::AppendFromDurableBase
+        {
+            (
+                self.chain_length
+                    .checked_add(1)
+                    .ok_or(astra_turn_types::ProviderCanonicalTransitionError::TooManyWalEntries)?,
+                self.chain_payload_bytes
+                    .checked_add(payload_bytes)
+                    .ok_or(astra_turn_types::ProviderCanonicalTransitionError::TooManyWalBytes)?,
+            )
+        } else {
+            (1, payload_bytes)
+        };
+        Ok(Self {
+            transition_id: transition.transition_id.clone(),
+            result: transition.result.clone(),
+            chain_length,
+            chain_payload_bytes,
+        })
+    }
+
+    pub(crate) fn would_exceed_with_limits(
+        &self,
+        transition: &astra_turn_types::ProviderCanonicalTransitionV2,
+        max_entries: u32,
+        max_bytes: u64,
+    ) -> Result<bool, astra_turn_types::ProviderCanonicalTransitionError> {
+        let next = self.advanced(transition)?;
+        Ok(next.chain_length > max_entries || next.chain_payload_bytes > max_bytes)
+    }
 }
 
 /// Build the stable runtime manifest carried through context metadata.
@@ -3449,9 +3512,8 @@ impl AgenticLoopState {
 
     pub(crate) fn initialize_provider_canonical_wal_base(&mut self, durable_prefix: &[Value]) {
         self.provider_canonical_wal_base =
-            astra_turn_types::CanonicalPrefixIdentityV1::from_messages(durable_prefix).ok();
-        self.provider_canonical_wal_head_transition_id = None;
-        self.provider_canonical_wal_head_result = None;
+            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(durable_prefix).ok();
+        self.provider_canonical_wal_head = None;
     }
 
     pub(crate) fn canonical_rewrite_proof(
@@ -3462,7 +3524,7 @@ impl AgenticLoopState {
 
     pub(crate) fn provider_canonical_replacement_authorization(
         &self,
-        durable_base: &astra_turn_types::CanonicalPrefixIdentityV1,
+        durable_base: &astra_turn_types::ProviderCanonicalWalBaseV2,
         predecessor_messages: &[Value],
     ) -> Option<crate::turn::canonical_commit::ProviderWalReplacementAuthorization> {
         self.canonical_rewrite_state
@@ -3487,6 +3549,21 @@ impl AgenticLoopState {
             .recover_provider_wal_replacement(durable_base, transition, recovered_messages)
     }
 
+    pub(crate) fn acknowledge_provider_canonical_replacement(
+        &mut self,
+        transition: &astra_turn_types::ProviderCanonicalTransitionV2,
+    ) -> Result<(), String> {
+        let durable_base = self
+            .provider_canonical_wal_base
+            .as_ref()
+            .ok_or_else(|| "provider WAL admission has no admitted durable base".to_string())?;
+        self.canonical_rewrite_state
+            .proof
+            .as_mut()
+            .ok_or_else(|| "provider WAL replacement has no admitted rewrite proof".to_string())?
+            .acknowledge_provider_wal_replacement(durable_base, transition)
+    }
+
     pub(crate) fn begin_canonical_rewrite(
         &self,
     ) -> Option<crate::turn::canonical_commit::CanonicalRewritePermit> {
@@ -3504,7 +3581,11 @@ impl AgenticLoopState {
             return;
         };
         if let Some(proof) = self.canonical_rewrite_state.proof.as_mut() {
-            proof.finish(permit, &self.messages);
+            proof.finish(
+                permit,
+                &self.messages,
+                self.provider_canonical_wal_base.as_ref(),
+            );
         }
     }
 
@@ -4759,8 +4840,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         context_compression_triggered: false,
         canonical_rewrite_state: Default::default(),
         provider_canonical_wal_base: None,
-        provider_canonical_wal_head_transition_id: None,
-        provider_canonical_wal_head_result: None,
+        provider_canonical_wal_head: None,
         budget_wrapup_ignored_rounds: 0,
         compact_tier_applied: CompactionTier::Normal,
         skill_produced_output: false,
@@ -6315,8 +6395,7 @@ pub(crate) mod tests {
             context_compression_triggered: false,
             canonical_rewrite_state: Default::default(),
             provider_canonical_wal_base: None,
-            provider_canonical_wal_head_transition_id: None,
-            provider_canonical_wal_head_result: None,
+            provider_canonical_wal_head: None,
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: CompactionTier::Normal,
             skill_produced_output: false,

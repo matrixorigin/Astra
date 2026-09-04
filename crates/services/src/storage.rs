@@ -2678,6 +2678,18 @@ fn inference_canonical_transition_wal_schema_mismatches(
     reasons
 }
 
+fn inference_canonical_transition_wal_definition_mismatches(create_sql: &str) -> Vec<String> {
+    let normalized = create_sql.to_ascii_lowercase();
+    if normalized.contains("'checkpoint_from_parent'") {
+        Vec::new()
+    } else {
+        vec![
+            "recovery-mode CHECK does not admit checkpoint_from_parent; rebuild this pre-release WAL table before startup"
+                .to_string(),
+        ]
+    }
+}
+
 fn inference_invocation_schema_mismatches(
     columns: &BTreeMap<String, ObservedColumnShape>,
 ) -> Vec<String> {
@@ -3006,7 +3018,13 @@ async fn verify_inference_canonical_transition_wal_schema_contract(
         }
         index.columns.push(column);
     }
-    let reasons = inference_canonical_transition_wal_schema_mismatches(&columns, &indexes);
+    let mut reasons = inference_canonical_transition_wal_schema_mismatches(&columns, &indexes);
+    let show_create = format!("SHOW CREATE TABLE `{database}`.`{table}`");
+    let create_row = query(&show_create).fetch_one(pool).await?;
+    let create_sql: String = create_row.try_get(1_usize)?;
+    reasons.extend(inference_canonical_transition_wal_definition_mismatches(
+        &create_sql,
+    ));
     if reasons.is_empty() {
         return Ok(());
     }
@@ -6917,7 +6935,7 @@ async fn ensure_core_schema_while_leased(
             INDEX idx_inference_canonical_wal_parent
                 (user_id, session_id, turn_index, parent_transition_id),
             CONSTRAINT chk_inference_canonical_wal_recovery_mode
-                CHECK (recovery_mode IN ('append_from_durable_base', 'replace_from_durable_base')),
+                CHECK (recovery_mode IN ('append_from_durable_base', 'checkpoint_from_parent', 'replace_from_durable_base')),
             CONSTRAINT chk_inference_canonical_wal_bounds
                 CHECK (payload_bytes > 0 AND predecessor_count >= 0 AND result_count >= 0)
         )",
@@ -9733,6 +9751,19 @@ mod tests {
         assert!(
             inference_canonical_transition_wal_schema_mismatches(&exact_columns, &exact_indexes,)
                 .is_empty()
+        );
+        assert!(
+            inference_canonical_transition_wal_definition_mismatches(
+                "CONSTRAINT chk CHECK (recovery_mode IN ('append_from_durable_base', 'checkpoint_from_parent', 'replace_from_durable_base'))"
+            )
+            .is_empty()
+        );
+        assert!(
+            inference_canonical_transition_wal_definition_mismatches(
+                "CONSTRAINT chk CHECK (recovery_mode IN ('append_from_durable_base', 'replace_from_durable_base'))"
+            )
+            .iter()
+            .any(|reason| reason.contains("does not admit checkpoint_from_parent"))
         );
 
         let mut nullable_owner = exact_columns.clone();

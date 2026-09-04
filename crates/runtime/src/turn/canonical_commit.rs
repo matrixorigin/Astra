@@ -8,6 +8,7 @@ pub(crate) struct CanonicalRewriteProof {
     authorized_prefix_len: usize,
     authorized_prefix_root: String,
     rewritten: bool,
+    pending_provider_wal_predecessor: Option<astra_turn_types::ProviderCanonicalHistoryIdentityV2>,
     valid: bool,
 }
 
@@ -19,6 +20,33 @@ pub(crate) struct CanonicalRewritePermit {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ProviderWalReplacementAuthorization {
     pub(crate) generation: u64,
+    pub(crate) durable_predecessor: astra_turn_types::ProviderCanonicalHistoryIdentityV2,
+}
+
+/// Produce the durable provider snapshot without rewriting bytes that were
+/// already admitted as the WAL base. The base is an immutable persistence
+/// boundary: only the suffix that has not yet crossed that boundary may be
+/// sanitized again.
+pub(crate) fn sanitize_provider_canonical_wal_snapshot(
+    durable_base: &astra_turn_types::ProviderCanonicalWalBaseV2,
+    messages: &[Value],
+) -> Vec<Value> {
+    let base_count = usize::try_from(durable_base.canonical.message_count).ok();
+    if let Some(base_count) = base_count
+        && messages.len() >= base_count
+        && astra_turn_types::canonical_conversation_root(&messages[..base_count])
+            == durable_base.canonical.root_hash
+    {
+        let mut sanitized = messages[..base_count].to_vec();
+        sanitized.extend(
+            astra_turn_core::runtime_scaffolding::sanitize_durable_message_values(
+                messages[base_count..].to_vec(),
+            ),
+        );
+        sanitized
+    } else {
+        astra_turn_core::runtime_scaffolding::sanitize_durable_message_values(messages.to_vec())
+    }
 }
 
 impl CanonicalRewriteProof {
@@ -35,6 +63,7 @@ impl CanonicalRewriteProof {
             authorized_prefix_len: admitted_prefix.len(),
             authorized_prefix_root: admitted_root.clone(),
             rewritten: false,
+            pending_provider_wal_predecessor: None,
             valid: admitted_root == base_root,
         }
     }
@@ -48,14 +77,33 @@ impl CanonicalRewriteProof {
         CanonicalRewritePermit { valid }
     }
 
-    pub(crate) fn finish(&mut self, permit: CanonicalRewritePermit, messages: &[Value]) {
+    pub(crate) fn finish(
+        &mut self,
+        permit: CanonicalRewritePermit,
+        messages: &[Value],
+        durable_base: Option<&astra_turn_types::ProviderCanonicalWalBaseV2>,
+    ) {
         if !permit.valid {
             self.valid = false;
+            self.pending_provider_wal_predecessor = None;
             return;
         }
         self.authorized_prefix_len = messages.len();
         self.authorized_prefix_root = astra_turn_types::canonical_conversation_root(messages);
         self.rewritten = true;
+        let Some(durable_base) = durable_base else {
+            self.pending_provider_wal_predecessor = None;
+            return;
+        };
+        let durable_messages = sanitize_provider_canonical_wal_snapshot(durable_base, messages);
+        match astra_turn_types::ProviderCanonicalHistoryIdentityV2::from_messages(&durable_messages)
+        {
+            Ok(identity) => self.pending_provider_wal_predecessor = Some(identity),
+            Err(_) => {
+                self.pending_provider_wal_predecessor = None;
+                self.valid = false;
+            }
+        }
     }
 
     fn authorizes(&self, messages: &[Value]) -> bool {
@@ -91,24 +139,26 @@ impl CanonicalRewriteProof {
 
     pub(crate) fn provider_wal_replacement_authorization(
         &self,
-        durable_base: &astra_turn_types::CanonicalPrefixIdentityV1,
+        durable_base: &astra_turn_types::ProviderCanonicalWalBaseV2,
         messages: &[Value],
     ) -> Option<ProviderWalReplacementAuthorization> {
-        let base_count = usize::try_from(durable_base.message_count).ok()?;
+        let base_count = usize::try_from(durable_base.canonical.message_count).ok()?;
+        let durable_predecessor = self.pending_provider_wal_predecessor.as_ref()?;
         if base_count != self.base_prefix_len
-            || durable_base.root_hash != self.base_root
+            || durable_base.canonical.root_hash != self.base_root
             || !self.authorizes(messages)
         {
             return None;
         }
         Some(ProviderWalReplacementAuthorization {
             generation: self.base_compaction_generation.saturating_add(1),
+            durable_predecessor: durable_predecessor.clone(),
         })
     }
 
     pub(crate) fn recover_provider_wal_replacement(
         &mut self,
-        durable_base: &astra_turn_types::CanonicalPrefixIdentityV1,
+        durable_base: &astra_turn_types::ProviderCanonicalWalBaseV2,
         transition: &astra_turn_types::ProviderCanonicalTransitionV2,
         recovered_messages: &[Value],
     ) -> Result<(), String> {
@@ -118,23 +168,60 @@ impl CanonicalRewriteProof {
             || &transition.durable_base != durable_base
             || transition.replacement_compaction_generation
                 != Some(self.base_compaction_generation.saturating_add(1))
-            || usize::try_from(durable_base.message_count).ok() != Some(self.base_prefix_len)
-            || durable_base.root_hash != self.base_root
+            || usize::try_from(durable_base.canonical.message_count).ok()
+                != Some(self.base_prefix_len)
+            || durable_base.canonical.root_hash != self.base_root
         {
             return Err("provider WAL replacement does not match the admitted rewrite base".into());
         }
         let result_count = usize::try_from(transition.result.message_count)
             .map_err(|_| "provider WAL replacement result count overflow".to_string())?;
         if recovered_messages.len() < result_count
-            || astra_turn_types::canonical_conversation_root(&recovered_messages[..result_count])
-                != transition.result.root_hash
+            || astra_turn_types::ProviderCanonicalHistoryIdentityV2::from_messages(
+                &recovered_messages[..result_count],
+            )
+            .map_err(|error| error.to_string())?
+                != transition.result
         {
             return Err("provider WAL replacement result is absent from recovered history".into());
         }
         self.authorized_prefix_len = result_count;
-        self.authorized_prefix_root = transition.result.root_hash.clone();
+        self.authorized_prefix_root =
+            astra_turn_types::canonical_conversation_root(&recovered_messages[..result_count]);
         self.rewritten = true;
+        self.pending_provider_wal_predecessor = None;
         self.valid = true;
+        Ok(())
+    }
+
+    pub(crate) fn acknowledge_provider_wal_replacement(
+        &mut self,
+        durable_base: &astra_turn_types::ProviderCanonicalWalBaseV2,
+        transition: &astra_turn_types::ProviderCanonicalTransitionV2,
+    ) -> Result<(), String> {
+        let Some(expected_predecessor) = self.pending_provider_wal_predecessor.as_ref() else {
+            return Err("provider WAL replacement authority was already consumed".into());
+        };
+        transition.validate().map_err(|error| error.to_string())?;
+        if transition.recovery_mode
+            != astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase
+            || &transition.durable_base != durable_base
+            || transition.replacement_compaction_generation
+                != Some(self.base_compaction_generation.saturating_add(1))
+            || &transition.predecessor != expected_predecessor
+            || usize::try_from(durable_base.canonical.message_count).ok()
+                != Some(self.base_prefix_len)
+            || durable_base.canonical.root_hash != self.base_root
+        {
+            return Err("provider WAL replacement does not match the admitted rewrite base".into());
+        }
+        // The transition stores a redacted durable snapshot. Live canonical
+        // proof must remain bound to the in-memory rewritten predecessor,
+        // which may legitimately contain values redacted at persistence.
+        // Crash recovery deliberately rebinds to the recovered snapshot in
+        // `recover_provider_wal_replacement`; live acknowledgement only
+        // consumes the one-shot WAL authority.
+        self.pending_provider_wal_predecessor = None;
         Ok(())
     }
 }
@@ -293,27 +380,67 @@ mod tests {
             json!({"role": "assistant", "content": "answer"}),
         ];
         let base = astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&durable).unwrap();
+        let wal_base =
+            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
 
         let mut invalid = CanonicalRewriteProof::new(&durable, &base.root_hash, 4);
-        let rewritten = vec![json!({"role": "system", "content": "summary"})];
+        let rewritten = vec![json!({
+            "role": "system",
+            "content": "summary with hf_AbCdEfGhIjKlMnOpQrStUvWxYz0123456789"
+        })];
         let invalid_permit = invalid.begin(&rewritten);
-        invalid.finish(invalid_permit, &rewritten);
+        invalid.finish(invalid_permit, &rewritten, Some(&wal_base));
         assert_eq!(
-            invalid.provider_wal_replacement_authorization(&base, &rewritten),
+            invalid.provider_wal_replacement_authorization(&wal_base, &rewritten),
             None
         );
 
         let mut valid = CanonicalRewriteProof::new(&durable, &base.root_hash, 4);
         let permit = valid.begin(&durable);
-        valid.finish(permit, &rewritten);
+        valid.finish(permit, &rewritten, Some(&wal_base));
         let authorization = valid
-            .provider_wal_replacement_authorization(&base, &rewritten)
+            .provider_wal_replacement_authorization(&wal_base, &rewritten)
             .expect("valid rewrite authorization");
         assert_eq!(authorization.generation, 5);
+        let durable_rewritten = sanitize_provider_canonical_wal_snapshot(&wal_base, &rewritten);
+        assert_ne!(durable_rewritten, rewritten);
         assert_eq!(
-            valid.provider_wal_replacement_authorization(&base, &durable),
+            authorization.durable_predecessor,
+            astra_turn_types::ProviderCanonicalHistoryIdentityV2::from_messages(
+                &durable_rewritten,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            valid.provider_wal_replacement_authorization(&wal_base, &durable),
             None,
             "authorization is bound to the exact rewritten predecessor"
+        );
+        let transition =
+            astra_turn_types::ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
+                None,
+                wal_base.clone(),
+                authorization.generation,
+                &durable_rewritten,
+                vec![authority()],
+            )
+            .unwrap();
+        valid
+            .acknowledge_provider_wal_replacement(&wal_base, &transition)
+            .unwrap();
+        assert_eq!(
+            valid.provider_wal_replacement_authorization(&wal_base, &rewritten),
+            None,
+            "one canonical rewrite may establish only one replacement WAL anchor"
+        );
+        let mut completed = rewritten;
+        completed.push(json!({"role": "assistant", "content": "done"}));
+        assert_eq!(
+            canonical_commit_delta(&durable, true, &completed, Some(&valid), false)
+                .unwrap()
+                .expect("live rewrite proof remains valid after redacted WAL admission")
+                .0,
+            astra_turn_types::CanonicalDeltaModeV1::Replace
         );
     }
 
@@ -324,19 +451,21 @@ mod tests {
             json!({"role": "assistant", "content": "answer"}),
         ];
         let base = astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&durable).unwrap();
+        let wal_base =
+            astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
         let mut live = CanonicalRewriteProof::new(&durable, &base.root_hash, 7);
         let mut source = durable.clone();
         source.push(json!({"role": "user", "content": "current"}));
         let permit = live.begin(&source);
         let rewritten = vec![json!({"role": "user", "content": "typed summary"})];
-        live.finish(permit, &rewritten);
+        live.finish(permit, &rewritten, Some(&wal_base));
         let authorization = live
-            .provider_wal_replacement_authorization(&base, &rewritten)
+            .provider_wal_replacement_authorization(&wal_base, &rewritten)
             .unwrap();
         let transition =
             astra_turn_types::ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
                 None,
-                base.clone(),
+                wal_base.clone(),
                 authorization.generation,
                 &rewritten,
                 vec![authority()],
@@ -347,10 +476,15 @@ mod tests {
         transition.apply_to(&mut recovered).unwrap();
         let mut restored_proof = CanonicalRewriteProof::new(&durable, &base.root_hash, 7);
         restored_proof
-            .recover_provider_wal_replacement(&base, &transition, &recovered)
+            .recover_provider_wal_replacement(&wal_base, &transition, &recovered)
             .unwrap();
         let mut completed = recovered.clone();
         completed.push(json!({"role": "assistant", "content": "done"}));
+        assert_eq!(
+            restored_proof.provider_wal_replacement_authorization(&wal_base, &completed),
+            None,
+            "crash recovery must not reissue consumed replacement authority"
+        );
         let (mode, _) =
             canonical_commit_delta(&durable, true, &completed, Some(&restored_proof), false)
                 .unwrap()
@@ -359,9 +493,9 @@ mod tests {
 
         let second_permit = restored_proof.begin(&completed);
         let second_rewrite = vec![json!({"role": "user", "content": "summary two"})];
-        restored_proof.finish(second_permit, &second_rewrite);
+        restored_proof.finish(second_permit, &second_rewrite, Some(&wal_base));
         let second_authorization = restored_proof
-            .provider_wal_replacement_authorization(&base, &second_rewrite)
+            .provider_wal_replacement_authorization(&wal_base, &second_rewrite)
             .unwrap();
         assert_eq!(second_authorization.generation, 8);
     }

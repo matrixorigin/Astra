@@ -827,7 +827,7 @@ pub(crate) async fn stream_chat_sse(
         current_session_id,
         current_run_id: Some(parent_turn_run_id.clone()),
         current_run_owner_generation: None,
-        provider_canonical_wal_head_transition_id: None,
+        provider_canonical_wal_head: None,
         inference_purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
         context_manifest_pool: None,
         context_manifest_user_id: persist_session_artifacts.then_some(current_user_id),

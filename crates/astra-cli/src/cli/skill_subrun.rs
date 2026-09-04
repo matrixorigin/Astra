@@ -1195,7 +1195,7 @@ impl SkillSubRunExecutor for CliSkillSubRunExecutor {
             current_session_id: Some(parent_session_id.to_string()),
             current_run_id: Some(parent_run_id.to_string()),
             current_run_owner_generation: None,
-            provider_canonical_wal_head_transition_id: None,
+            provider_canonical_wal_head: None,
             inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
             context_manifest_pool: None,
             context_manifest_user_id: Some(user_id),

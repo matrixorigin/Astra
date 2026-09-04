@@ -64,9 +64,9 @@ pub use provider_canonical_transition::{
     CanonicalPrefixIdentityV1, MAX_PROVIDER_CANONICAL_RECOVERY_BYTES,
     MAX_PROVIDER_CANONICAL_TRANSITION_BYTES, MAX_PROVIDER_CANONICAL_TRANSITION_DURABLE_BYTES,
     MAX_PROVIDER_CANONICAL_WAL_BYTES, MAX_PROVIDER_CANONICAL_WAL_ENTRIES,
-    PROVIDER_CANONICAL_TRANSITION_SCHEMA_VERSION, ProviderCanonicalRecoveryModeV2,
-    ProviderCanonicalTransitionApply, ProviderCanonicalTransitionError,
-    ProviderCanonicalTransitionV2,
+    PROVIDER_CANONICAL_TRANSITION_SCHEMA_VERSION, ProviderCanonicalHistoryIdentityV2,
+    ProviderCanonicalRecoveryModeV2, ProviderCanonicalTransitionApply,
+    ProviderCanonicalTransitionError, ProviderCanonicalTransitionV2, ProviderCanonicalWalBaseV2,
 };
 pub use provider_contract::{
     DescriptorVersion, NativeToolId, PROVIDER_INTERACTION_REQUEST_METADATA_KEY,

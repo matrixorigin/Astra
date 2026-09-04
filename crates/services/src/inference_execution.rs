@@ -71,9 +71,10 @@ pub struct InferenceProviderAttemptPlan {
     canonical_parent_transition_id: Option<String>,
     canonical_transition_payload: Option<String>,
     canonical_transition_hash: Option<String>,
-    canonical_transition_parent_result: Option<astra_turn_types::CanonicalPrefixIdentityV1>,
-    canonical_transition_predecessor: Option<astra_turn_types::CanonicalPrefixIdentityV1>,
-    canonical_transition_result: Option<astra_turn_types::CanonicalPrefixIdentityV1>,
+    canonical_transition_parent_result:
+        Option<astra_turn_types::ProviderCanonicalHistoryIdentityV2>,
+    canonical_transition_predecessor: Option<astra_turn_types::ProviderCanonicalHistoryIdentityV2>,
+    canonical_transition_result: Option<astra_turn_types::ProviderCanonicalHistoryIdentityV2>,
     canonical_transition_recovery_mode: Option<astra_turn_types::ProviderCanonicalRecoveryModeV2>,
     invocation_input: InferenceInvocationInput,
     request_context: ModelRequestContextSeed,
@@ -2224,8 +2225,8 @@ struct CanonicalTransitionWalInsert<'a> {
     payload: &'a str,
     payload_hash: &'a str,
     payload_bytes: i64,
-    predecessor: &'a astra_turn_types::CanonicalPrefixIdentityV1,
-    result: &'a astra_turn_types::CanonicalPrefixIdentityV1,
+    predecessor: &'a astra_turn_types::ProviderCanonicalHistoryIdentityV2,
+    result: &'a astra_turn_types::ProviderCanonicalHistoryIdentityV2,
     recovery_mode: &'a str,
 }
 
@@ -2297,6 +2298,9 @@ async fn advance_inference_canonical_transition_head(
     let recovery_mode_str = match recovery_mode {
         astra_turn_types::ProviderCanonicalRecoveryModeV2::AppendFromDurableBase => {
             "append_from_durable_base"
+        }
+        astra_turn_types::ProviderCanonicalRecoveryModeV2::CheckpointFromParent => {
+            "checkpoint_from_parent"
         }
         astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase => {
             "replace_from_durable_base"
@@ -2439,7 +2443,7 @@ async fn advance_inference_canonical_transition_head(
             }
         } else {
             if recovery_mode
-                == astra_turn_types::ProviderCanonicalRecoveryModeV2::AppendFromDurableBase
+                != astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase
                 && parent_result.is_none_or(|parent_result| {
                     current_result_count != i64::from(parent_result.message_count)
                         || current_result_root_hash != parent_result.root_hash
@@ -2450,7 +2454,7 @@ async fn advance_inference_canonical_transition_head(
                 ));
             }
             let (next_chain_length, next_chain_payload_bytes) = if recovery_mode
-                == astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase
+                != astra_turn_types::ProviderCanonicalRecoveryModeV2::AppendFromDurableBase
             {
                 sqlx::query(
                     "DELETE FROM inference_canonical_transition_wal
@@ -2464,7 +2468,7 @@ async fn advance_inference_canonical_transition_head(
                 .map_err(|error| {
                     ServiceError::with_source(
                         ServiceErrorKind::Persistence,
-                        "truncate canonical transition WAL at a replacement checkpoint",
+                        "truncate canonical transition WAL at a recovery checkpoint",
                         error,
                     )
                 })?;
@@ -2484,7 +2488,7 @@ async fn advance_inference_canonical_transition_head(
                             .unwrap_or(i64::MAX)
                 {
                     return Err(ServiceError::conflict(
-                        "canonical transition WAL requires a replacement checkpoint",
+                        "canonical transition WAL requires a lossless checkpoint",
                     ));
                 }
                 (next_length, next_bytes)
@@ -3641,6 +3645,9 @@ pub async fn load_inference_canonical_transitions_for_session(
             astra_turn_types::ProviderCanonicalRecoveryModeV2::AppendFromDurableBase => {
                 "append_from_durable_base"
             }
+            astra_turn_types::ProviderCanonicalRecoveryModeV2::CheckpointFromParent => {
+                "checkpoint_from_parent"
+            }
             astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase => {
                 "replace_from_durable_base"
             }
@@ -3790,7 +3797,7 @@ pub async fn load_inference_canonical_transitions_for_session(
             ServiceError::conflict("canonical transition WAL head has a missing ancestor")
         })?;
         let stop_at_checkpoint = entry.transition.recovery_mode
-            == astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase;
+            != astra_turn_types::ProviderCanonicalRecoveryModeV2::AppendFromDurableBase;
         let parent = entry.transition.parent_transition_id.clone();
         chain.push(entry);
         if stop_at_checkpoint || parent.is_none() {

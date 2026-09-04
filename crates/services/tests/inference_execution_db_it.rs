@@ -433,7 +433,7 @@ async fn large_canonical_payload_does_not_change_provider_terminal_identity() {
     let run_id = format!("canonical-large-run-{suffix}");
     seed_run(pool, &user_id, &session_id, &run_id).await;
 
-    let durable_base = astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&[])
+    let durable_base = astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&[])
         .expect("empty durable base");
     let history = vec![serde_json::json!({
         "role": "user",
@@ -558,7 +558,7 @@ async fn superseded_payload_owner_can_terminalize_after_its_child_becomes_head()
     let run_id = format!("canonical-late-terminal-run-{suffix}");
     seed_run(pool, &user_id, &session_id, &run_id).await;
 
-    let durable_base = astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&[])
+    let durable_base = astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&[])
         .expect("empty durable base");
     let parent_history = vec![serde_json::json!({"role": "user", "content": "parent"})];
     let parent_transition = astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
@@ -666,7 +666,7 @@ async fn canonical_transition_wal_is_linear_and_recoverable_across_many_rounds()
     let run_id = format!("canonical-head-run-{suffix}");
     seed_run(pool, &user_id, &session_id, &run_id).await;
 
-    let durable_base = astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&[])
+    let durable_base = astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&[])
         .expect("empty durable base");
     const ROUNDS: u32 = 300;
     let mut history = Vec::new();
@@ -674,12 +674,16 @@ async fn canonical_transition_wal_is_linear_and_recoverable_across_many_rounds()
     let mut parent_result = None;
     let mut first_retry_attempt_id = None;
     for round in 0..ROUNDS {
-        if round > 0 {
-            history.push(serde_json::json!({
+        let recovery_delta = if round > 0 {
+            let provider_response = serde_json::json!({
                 "role": "assistant",
                 "content": format!("provider response {round}")
-            }));
-        }
+            });
+            history.push(provider_response.clone());
+            vec![provider_response]
+        } else {
+            Vec::new()
+        };
         let appended = canonical_authority(&format!("durable request {round}"));
         let transition = match (parent_transition_id.clone(), parent_result.clone()) {
             (None, None) => astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
@@ -689,11 +693,11 @@ async fn canonical_transition_wal_is_linear_and_recoverable_across_many_rounds()
                 vec![appended.clone()],
             ),
             (Some(parent_transition_id), Some(parent_result)) => {
-                astra_turn_types::ProviderCanonicalTransitionV2::new_linked_from_durable_base(
+                astra_turn_types::ProviderCanonicalTransitionV2::new_linked_from_deltas(
                     parent_transition_id,
                     parent_result,
                     durable_base.clone(),
-                    &history,
+                    recovery_delta,
                     vec![appended.clone()],
                 )
             }
@@ -901,7 +905,7 @@ async fn canonical_transition_wal_is_isolated_by_owner_and_session() {
     seed_run(pool, &user_b, &shared_session, &run_b).await;
     seed_run(pool, &user_a, &session_a2, &run_a2).await;
 
-    let durable_base = astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&[])
+    let durable_base = astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&[])
         .expect("empty durable base");
     for (scope, user_id, session_id, run_id) in [
         ("owner-a-shared", &user_a, &shared_session, &run_a),
@@ -1016,7 +1020,7 @@ async fn competing_canonical_roots_commit_exactly_one_branch_without_orphans() {
     let run_id = format!("canonical-root-race-run-{suffix}");
     seed_run(pool, &user_id, &session_id, &run_id).await;
 
-    let durable_base = astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&[])
+    let durable_base = astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&[])
         .expect("empty durable base");
     let left = astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
         None,
@@ -1153,7 +1157,7 @@ async fn competing_canonical_children_commit_exactly_one_branch_without_orphans(
     let run_id = format!("canonical-fork-run-{suffix}");
     seed_run(pool, &user_id, &session_id, &run_id).await;
 
-    let durable_base = astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&[])
+    let durable_base = astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&[])
         .expect("empty durable base");
     let mut history = vec![serde_json::json!({"role": "user", "content": "root"})];
     let root = astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
@@ -1308,7 +1312,7 @@ async fn canonical_wal_capacity_rejects_append_atomically_and_accepts_checkpoint
     let run_id = format!("canonical-capacity-run-{suffix}");
     seed_run(pool, &user_id, &session_id, &run_id).await;
 
-    let durable_base = astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&[])
+    let durable_base = astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&[])
         .expect("empty durable base");
     let mut history = vec![serde_json::json!({"role": "user", "content": "root"})];
     let root = astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
@@ -1372,7 +1376,7 @@ async fn canonical_wal_capacity_rejects_append_atomically_and_accepts_checkpoint
     assert_eq!(
         begin_inference_provider_attempt(&shared_pool, &append_attempt)
             .await
-            .expect_err("an append at the WAL limit must require compaction")
+            .expect_err("an append at the WAL limit must require a checkpoint")
             .kind,
         ServiceErrorKind::Conflict
     );
@@ -1408,19 +1412,18 @@ async fn canonical_wal_capacity_rejects_append_atomically_and_accepts_checkpoint
         .await
         .expect("finish capacity-rejected logical invocation");
 
-    let checkpoint_history = vec![
-        serde_json::json!({"role": "system", "content": "bounded checkpoint"}),
-        serde_json::json!({"role": "user", "content": "continue"}),
-    ];
-    let checkpoint =
-        astra_turn_types::ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
-            Some(root.transition_id),
-            durable_base,
-            1,
-            &checkpoint_history,
-            vec![canonical_authority("checkpoint")],
-        )
-        .expect("construct bounded replacement checkpoint");
+    history.push(serde_json::json!({
+        "role": "assistant",
+        "content": "provider response before roll-up"
+    }));
+    let checkpoint = astra_turn_types::ProviderCanonicalTransitionV2::new_checkpoint_from_parent(
+        root.transition_id,
+        root.result,
+        durable_base,
+        &history,
+        vec![canonical_authority("checkpoint")],
+    )
+    .expect("construct bounded lossless checkpoint");
     commit_canonical_transition(
         &shared_pool,
         &user_id,
@@ -1472,7 +1475,7 @@ async fn canonical_transition_wal_fails_closed_and_replacement_is_an_atomic_chec
     let run_id = format!("canonical-corruption-run-{suffix}");
     seed_run(pool, &user_id, &session_id, &run_id).await;
 
-    let durable_base = astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&[])
+    let durable_base = astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&[])
         .expect("empty durable base");
     let mut history = vec![serde_json::json!({"role": "user", "content": "original"})];
     let first = astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
@@ -4901,7 +4904,7 @@ async fn expired_inference_owner_recovers_every_sigkill_shape_without_old_owner_
     admit_inference_invocation(&shared_pool, &delivery_unknown)
         .await
         .expect("admit delivered orphan");
-    let durable_base = astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&[])
+    let durable_base = astra_turn_types::ProviderCanonicalWalBaseV2::from_messages(&[])
         .expect("empty durable base");
     let old_user = serde_json::json!({"role": "user", "content": "old request"});
     let frame_content = astra_turn_types::render_append_only_runtime_authority_frame(

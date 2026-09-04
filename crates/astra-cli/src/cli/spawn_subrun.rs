@@ -944,7 +944,7 @@ impl SpawnAgentExecutor for CliSpawnAgentExecutor {
             current_session_id: server_session_id,
             current_run_id: Some(config.run_id.clone()),
             current_run_owner_generation: None,
-            provider_canonical_wal_head_transition_id: None,
+            provider_canonical_wal_head: None,
             inference_purpose: astra_turn_types::InferencePurpose::SubAgent,
             context_manifest_pool: None,
             context_manifest_user_id: Some(user_id),

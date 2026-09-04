@@ -23,6 +23,7 @@ pub const MAX_PROVIDER_CANONICAL_TRANSITION_DURABLE_BYTES: u64 =
 pub const MAX_PROVIDER_CANONICAL_WAL_ENTRIES: u32 = 4_096;
 pub const MAX_PROVIDER_CANONICAL_WAL_BYTES: u64 = 32 * 1024 * 1024;
 const TRANSITION_ID_DOMAIN: &[u8] = b"astra.provider-canonical-transition.v2\0";
+const HISTORY_ID_DOMAIN: &[u8] = b"astra.provider-canonical-history.v2\0";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -41,10 +42,85 @@ impl CanonicalPrefixIdentityV1 {
     }
 }
 
+/// Append-friendly identity for the uncommitted provider-owned history.
+///
+/// The committed durable base keeps the canonical conversation root used by
+/// the session coordinator. Everything after that base uses this hash chain,
+/// so admitting one provider delta never has to re-hash the complete growing
+/// turn history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderCanonicalHistoryIdentityV2 {
+    pub message_count: u32,
+    pub root_hash: String,
+}
+
+impl ProviderCanonicalHistoryIdentityV2 {
+    #[must_use]
+    pub fn empty() -> Self {
+        let mut digest = Sha256::new();
+        digest.update(HISTORY_ID_DOMAIN);
+        digest.update(0_u32.to_be_bytes());
+        Self {
+            message_count: 0,
+            root_hash: format!("{:x}", digest.finalize()),
+        }
+    }
+
+    pub fn from_messages(messages: &[Value]) -> Result<Self, ProviderCanonicalTransitionError> {
+        Self::empty().extended(messages)
+    }
+
+    pub fn extended(&self, messages: &[Value]) -> Result<Self, ProviderCanonicalTransitionError> {
+        validate_hash(&self.root_hash)?;
+        let mut identity = self.clone();
+        for message in messages {
+            let next_count = identity
+                .message_count
+                .checked_add(1)
+                .ok_or(ProviderCanonicalTransitionError::MessageCountOverflow)?;
+            let message_root = canonical_conversation_identity(std::slice::from_ref(message)).0;
+            let mut digest = Sha256::new();
+            digest.update(HISTORY_ID_DOMAIN);
+            digest.update(identity.root_hash.as_bytes());
+            digest.update(next_count.to_be_bytes());
+            digest.update(message_root.as_bytes());
+            identity = Self {
+                message_count: next_count,
+                root_hash: format!("{:x}", digest.finalize()),
+            };
+        }
+        Ok(identity)
+    }
+}
+
+/// The committed canonical base and its append-friendly equivalent. Both are
+/// computed once when a canonical turn is admitted and are bound into every
+/// WAL entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderCanonicalWalBaseV2 {
+    pub canonical: CanonicalPrefixIdentityV1,
+    pub history: ProviderCanonicalHistoryIdentityV2,
+}
+
+impl ProviderCanonicalWalBaseV2 {
+    pub fn from_messages(messages: &[Value]) -> Result<Self, ProviderCanonicalTransitionError> {
+        Ok(Self {
+            canonical: CanonicalPrefixIdentityV1::from_messages(messages)?,
+            history: ProviderCanonicalHistoryIdentityV2::from_messages(messages)?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderCanonicalRecoveryModeV2 {
     AppendFromDurableBase,
+    /// A lossless roll-up of the current append-only chain. Unlike a canonical
+    /// replacement, this mode proves the parent result is still an exact
+    /// prefix and therefore needs no rewrite authority.
+    CheckpointFromParent,
     ReplaceFromDurableBase,
 }
 
@@ -58,20 +134,20 @@ pub struct ProviderCanonicalTransitionV2 {
     pub parent_transition_id: Option<String>,
     /// Exact result identity of `parent_transition_id`. Linked entries recover
     /// messages produced after the parent admission from this boundary.
-    pub parent_result: Option<CanonicalPrefixIdentityV1>,
-    pub durable_base: CanonicalPrefixIdentityV1,
+    pub parent_result: Option<ProviderCanonicalHistoryIdentityV2>,
+    pub durable_base: ProviderCanonicalWalBaseV2,
     pub recovery_mode: ProviderCanonicalRecoveryModeV2,
     pub replacement_compaction_generation: Option<u64>,
     pub recovery_messages: Vec<Value>,
-    pub predecessor: CanonicalPrefixIdentityV1,
-    pub result: CanonicalPrefixIdentityV1,
+    pub predecessor: ProviderCanonicalHistoryIdentityV2,
+    pub result: ProviderCanonicalHistoryIdentityV2,
     pub appended_messages: Vec<Value>,
 }
 
 struct ProviderCanonicalRecoveryPlan {
     parent_transition_id: Option<String>,
-    parent_result: Option<CanonicalPrefixIdentityV1>,
-    durable_base: CanonicalPrefixIdentityV1,
+    parent_result: Option<ProviderCanonicalHistoryIdentityV2>,
+    durable_base: ProviderCanonicalWalBaseV2,
     recovery_mode: ProviderCanonicalRecoveryModeV2,
     replacement_compaction_generation: Option<u64>,
     recovery_messages: Vec<Value>,
@@ -139,7 +215,7 @@ impl ProviderCanonicalTransitionV2 {
     ) -> Result<Self, ProviderCanonicalTransitionError> {
         Self::new_from_durable_base(
             parent_transition_id,
-            CanonicalPrefixIdentityV1::from_messages(predecessor_messages)?,
+            ProviderCanonicalWalBaseV2::from_messages(predecessor_messages)?,
             predecessor_messages,
             appended_messages,
         )
@@ -147,16 +223,19 @@ impl ProviderCanonicalTransitionV2 {
 
     pub fn new_from_durable_base(
         parent_transition_id: Option<String>,
-        durable_base: CanonicalPrefixIdentityV1,
+        durable_base: ProviderCanonicalWalBaseV2,
         predecessor_messages: &[Value],
         appended_messages: Vec<Value>,
     ) -> Result<Self, ProviderCanonicalTransitionError> {
         validate_appended_messages(&appended_messages)?;
-        let durable_base_count = usize::try_from(durable_base.message_count)
+        let durable_base_count = usize::try_from(durable_base.canonical.message_count)
             .map_err(|_| ProviderCanonicalTransitionError::MessageCountOverflow)?;
         let base_is_preserved = predecessor_messages.len() >= durable_base_count
             && canonical_conversation_identity(&predecessor_messages[..durable_base_count]).0
-                == durable_base.root_hash;
+                == durable_base.canonical.root_hash
+            && ProviderCanonicalHistoryIdentityV2::from_messages(
+                &predecessor_messages[..durable_base_count],
+            )? == durable_base.history;
         if !base_is_preserved {
             return Err(ProviderCanonicalTransitionError::DurableBaseNotPrefix);
         }
@@ -168,7 +247,7 @@ impl ProviderCanonicalTransitionV2 {
             (None, predecessor_messages[durable_base_count..].to_vec())
         } else {
             (
-                Some(CanonicalPrefixIdentityV1::from_messages(
+                Some(ProviderCanonicalHistoryIdentityV2::from_messages(
                     predecessor_messages,
                 )?),
                 Vec::new(),
@@ -193,39 +272,109 @@ impl ProviderCanonicalTransitionV2 {
     /// append become durable payload.
     pub fn new_linked_from_durable_base(
         parent_transition_id: String,
-        parent_result: CanonicalPrefixIdentityV1,
-        durable_base: CanonicalPrefixIdentityV1,
+        parent_result: ProviderCanonicalHistoryIdentityV2,
+        durable_base: ProviderCanonicalWalBaseV2,
         predecessor_messages: &[Value],
         appended_messages: Vec<Value>,
     ) -> Result<Self, ProviderCanonicalTransitionError> {
         validate_appended_messages(&appended_messages)?;
-        let durable_base_count = usize::try_from(durable_base.message_count)
+        let durable_base_count = usize::try_from(durable_base.canonical.message_count)
             .map_err(|_| ProviderCanonicalTransitionError::MessageCountOverflow)?;
         let parent_count = usize::try_from(parent_result.message_count)
             .map_err(|_| ProviderCanonicalTransitionError::MessageCountOverflow)?;
         if predecessor_messages.len() < durable_base_count
             || CanonicalPrefixIdentityV1::from_messages(
                 &predecessor_messages[..durable_base_count],
-            )? != durable_base
+            )? != durable_base.canonical
+            || ProviderCanonicalHistoryIdentityV2::from_messages(
+                &predecessor_messages[..durable_base_count],
+            )? != durable_base.history
         {
             return Err(ProviderCanonicalTransitionError::DurableBaseNotPrefix);
         }
         if predecessor_messages.len() < parent_count
-            || CanonicalPrefixIdentityV1::from_messages(&predecessor_messages[..parent_count])?
-                != parent_result
+            || ProviderCanonicalHistoryIdentityV2::from_messages(
+                &predecessor_messages[..parent_count],
+            )? != parent_result
         {
             return Err(ProviderCanonicalTransitionError::MissingLinkedPredecessor);
         }
-        Self::new_with_recovery(
+        Self::new_linked_from_deltas(
+            parent_transition_id,
+            parent_result,
+            durable_base,
+            predecessor_messages[parent_count..].to_vec(),
+            appended_messages,
+        )
+    }
+
+    /// Construct a linked entry from only the messages added since its parent.
+    /// The caller owns the in-memory parent identity; the durable service later
+    /// serializes admission against the exact database head.
+    pub fn new_linked_from_deltas(
+        parent_transition_id: String,
+        parent_result: ProviderCanonicalHistoryIdentityV2,
+        durable_base: ProviderCanonicalWalBaseV2,
+        recovery_messages: Vec<Value>,
+        appended_messages: Vec<Value>,
+    ) -> Result<Self, ProviderCanonicalTransitionError> {
+        let predecessor = parent_result.extended(&recovery_messages)?;
+        Self::new_with_recovery_and_predecessor(
             ProviderCanonicalRecoveryPlan {
                 parent_transition_id: Some(parent_transition_id),
                 parent_result: Some(parent_result),
                 durable_base,
                 recovery_mode: ProviderCanonicalRecoveryModeV2::AppendFromDurableBase,
                 replacement_compaction_generation: None,
-                recovery_messages: predecessor_messages[parent_count..].to_vec(),
+                recovery_messages,
             },
-            predecessor_messages,
+            predecessor,
+            appended_messages,
+        )
+    }
+
+    /// Collapse an append-only chain without changing canonical history. The
+    /// complete predecessor is stored as the new recovery anchor, and its
+    /// parent prefix is cryptographically checked before construction.
+    pub fn new_checkpoint_from_parent(
+        parent_transition_id: String,
+        parent_result: ProviderCanonicalHistoryIdentityV2,
+        durable_base: ProviderCanonicalWalBaseV2,
+        predecessor_messages: &[Value],
+        appended_messages: Vec<Value>,
+    ) -> Result<Self, ProviderCanonicalTransitionError> {
+        let durable_base_count = usize::try_from(durable_base.canonical.message_count)
+            .map_err(|_| ProviderCanonicalTransitionError::MessageCountOverflow)?;
+        let parent_count = usize::try_from(parent_result.message_count)
+            .map_err(|_| ProviderCanonicalTransitionError::MessageCountOverflow)?;
+        if predecessor_messages.len() < durable_base_count
+            || CanonicalPrefixIdentityV1::from_messages(
+                &predecessor_messages[..durable_base_count],
+            )? != durable_base.canonical
+            || ProviderCanonicalHistoryIdentityV2::from_messages(
+                &predecessor_messages[..durable_base_count],
+            )? != durable_base.history
+        {
+            return Err(ProviderCanonicalTransitionError::DurableBaseNotPrefix);
+        }
+        if predecessor_messages.len() < parent_count
+            || ProviderCanonicalHistoryIdentityV2::from_messages(
+                &predecessor_messages[..parent_count],
+            )? != parent_result
+        {
+            return Err(ProviderCanonicalTransitionError::MissingLinkedPredecessor);
+        }
+        let predecessor = ProviderCanonicalHistoryIdentityV2::from_messages(predecessor_messages)?;
+        Self::new_with_recovery_and_predecessor(
+            ProviderCanonicalRecoveryPlan {
+                parent_transition_id: Some(parent_transition_id),
+                parent_result: Some(parent_result),
+                durable_base,
+                recovery_mode: ProviderCanonicalRecoveryModeV2::CheckpointFromParent,
+                replacement_compaction_generation: None,
+                recovery_messages: predecessor_messages.to_vec(),
+            },
+            predecessor,
             appended_messages,
         )
     }
@@ -235,7 +384,7 @@ impl ProviderCanonicalTransitionV2 {
     /// mismatch alone is never replacement authority.
     pub fn new_replacement_from_durable_base(
         parent_transition_id: Option<String>,
-        durable_base: CanonicalPrefixIdentityV1,
+        durable_base: ProviderCanonicalWalBaseV2,
         replacement_compaction_generation: u64,
         predecessor_messages: &[Value],
         appended_messages: Vec<Value>,
@@ -260,6 +409,15 @@ impl ProviderCanonicalTransitionV2 {
         predecessor_messages: &[Value],
         appended_messages: Vec<Value>,
     ) -> Result<Self, ProviderCanonicalTransitionError> {
+        let predecessor = ProviderCanonicalHistoryIdentityV2::from_messages(predecessor_messages)?;
+        Self::new_with_recovery_and_predecessor(recovery, predecessor, appended_messages)
+    }
+
+    fn new_with_recovery_and_predecessor(
+        recovery: ProviderCanonicalRecoveryPlan,
+        predecessor: ProviderCanonicalHistoryIdentityV2,
+        appended_messages: Vec<Value>,
+    ) -> Result<Self, ProviderCanonicalTransitionError> {
         let ProviderCanonicalRecoveryPlan {
             parent_transition_id,
             parent_result,
@@ -268,18 +426,8 @@ impl ProviderCanonicalTransitionV2 {
             replacement_compaction_generation,
             recovery_messages,
         } = recovery;
-        let predecessor = CanonicalPrefixIdentityV1::from_messages(predecessor_messages)?;
         validate_recovery_messages(&recovery_messages)?;
-        let mut result_messages = Vec::with_capacity(
-            predecessor_messages
-                .len()
-                .saturating_add(appended_messages.len()),
-        );
-        result_messages.extend_from_slice(predecessor_messages);
-        result_messages.extend(appended_messages.iter().cloned());
-        crate::validate_canonical_tool_pairing(&result_messages)
-            .map_err(|_| ProviderCanonicalTransitionError::InvalidCanonicalRecovery)?;
-        let result = CanonicalPrefixIdentityV1::from_messages(&result_messages)?;
+        let result = predecessor.extended(&appended_messages)?;
         let mut transition = Self {
             schema_version: PROVIDER_CANONICAL_TRANSITION_SCHEMA_VERSION,
             transition_id: String::new(),
@@ -298,6 +446,11 @@ impl ProviderCanonicalTransitionV2 {
         Ok(transition)
     }
 
+    pub fn durable_payload_bytes(&self) -> Result<u64, ProviderCanonicalTransitionError> {
+        crate::json_serialized_len(std::slice::from_ref(self))
+            .map_err(|_| ProviderCanonicalTransitionError::TooManyDurableBytes)
+    }
+
     pub fn validate(&self) -> Result<(), ProviderCanonicalTransitionError> {
         if self.schema_version != PROVIDER_CANONICAL_TRANSITION_SCHEMA_VERSION {
             return Err(ProviderCanonicalTransitionError::UnsupportedSchema(
@@ -306,7 +459,11 @@ impl ProviderCanonicalTransitionV2 {
         }
         validate_hash(&self.predecessor.root_hash)?;
         validate_hash(&self.result.root_hash)?;
-        validate_hash(&self.durable_base.root_hash)?;
+        validate_hash(&self.durable_base.canonical.root_hash)?;
+        validate_hash(&self.durable_base.history.root_hash)?;
+        if self.durable_base.canonical.message_count != self.durable_base.history.message_count {
+            return Err(ProviderCanonicalTransitionError::RecoveryCountMismatch);
+        }
         validate_hash(&self.transition_id)?;
         if let Some(parent_transition_id) = self.parent_transition_id.as_deref() {
             validate_hash(parent_transition_id)?;
@@ -330,15 +487,66 @@ impl ProviderCanonicalTransitionV2 {
                         {
                             return Err(ProviderCanonicalTransitionError::RecoveryCountMismatch);
                         }
+                        if parent_result.extended(&self.recovery_messages)? != self.predecessor {
+                            return Err(ProviderCanonicalTransitionError::RecoveryRootMismatch);
+                        }
                     }
                     (None, None) => {
-                        if self.durable_base.message_count.checked_add(recovery_count)
+                        if self
+                            .durable_base
+                            .history
+                            .message_count
+                            .checked_add(recovery_count)
                             != Some(self.predecessor.message_count)
                         {
                             return Err(ProviderCanonicalTransitionError::RecoveryCountMismatch);
                         }
+                        if self
+                            .durable_base
+                            .history
+                            .extended(&self.recovery_messages)?
+                            != self.predecessor
+                        {
+                            return Err(ProviderCanonicalTransitionError::RecoveryRootMismatch);
+                        }
                     }
                     _ => return Err(ProviderCanonicalTransitionError::RecoveryCountMismatch),
+                }
+            }
+            ProviderCanonicalRecoveryModeV2::CheckpointFromParent => {
+                if self.replacement_compaction_generation.is_some() {
+                    return Err(ProviderCanonicalTransitionError::InvalidReplacementAuthorization);
+                }
+                let (Some(_), Some(parent_result)) =
+                    (&self.parent_transition_id, &self.parent_result)
+                else {
+                    return Err(ProviderCanonicalTransitionError::MissingLinkedPredecessor);
+                };
+                if recovery_count != self.predecessor.message_count {
+                    return Err(ProviderCanonicalTransitionError::RecoveryCountMismatch);
+                }
+                let durable_base_count = usize::try_from(self.durable_base.canonical.message_count)
+                    .map_err(|_| ProviderCanonicalTransitionError::MessageCountOverflow)?;
+                let parent_count = usize::try_from(parent_result.message_count)
+                    .map_err(|_| ProviderCanonicalTransitionError::MessageCountOverflow)?;
+                if self.recovery_messages.len() < durable_base_count
+                    || CanonicalPrefixIdentityV1::from_messages(
+                        &self.recovery_messages[..durable_base_count],
+                    )? != self.durable_base.canonical
+                    || ProviderCanonicalHistoryIdentityV2::from_messages(
+                        &self.recovery_messages[..durable_base_count],
+                    )? != self.durable_base.history
+                {
+                    return Err(ProviderCanonicalTransitionError::DurableBaseNotPrefix);
+                }
+                if self.recovery_messages.len() < parent_count
+                    || ProviderCanonicalHistoryIdentityV2::from_messages(
+                        &self.recovery_messages[..parent_count],
+                    )? != *parent_result
+                    || ProviderCanonicalHistoryIdentityV2::from_messages(&self.recovery_messages)?
+                        != self.predecessor
+                {
+                    return Err(ProviderCanonicalTransitionError::RecoveryRootMismatch);
                 }
             }
             ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase => {
@@ -349,7 +557,7 @@ impl ProviderCanonicalTransitionV2 {
                 if recovery_count != self.predecessor.message_count {
                     return Err(ProviderCanonicalTransitionError::RecoveryCountMismatch);
                 }
-                if CanonicalPrefixIdentityV1::from_messages(&self.recovery_messages)?
+                if ProviderCanonicalHistoryIdentityV2::from_messages(&self.recovery_messages)?
                     != self.predecessor
                 {
                     return Err(ProviderCanonicalTransitionError::RecoveryRootMismatch);
@@ -362,6 +570,9 @@ impl ProviderCanonicalTransitionV2 {
             != Some(self.result.message_count)
         {
             return Err(ProviderCanonicalTransitionError::ResultCountMismatch);
+        }
+        if self.predecessor.extended(&self.appended_messages)? != self.result {
+            return Err(ProviderCanonicalTransitionError::ResultRootMismatch);
         }
         if self.transition_id != transition_identity(self) {
             return Err(ProviderCanonicalTransitionError::IdentityMismatch);
@@ -379,7 +590,11 @@ impl ProviderCanonicalTransitionV2 {
         durable_base_messages: &[Value],
     ) -> Result<Vec<Value>, ProviderCanonicalTransitionError> {
         self.validate()?;
-        if CanonicalPrefixIdentityV1::from_messages(durable_base_messages)? != self.durable_base {
+        if CanonicalPrefixIdentityV1::from_messages(durable_base_messages)?
+            != self.durable_base.canonical
+            || ProviderCanonicalHistoryIdentityV2::from_messages(durable_base_messages)?
+                != self.durable_base.history
+        {
             return Err(ProviderCanonicalTransitionError::PrefixConflict);
         }
         let predecessor = match self.recovery_mode {
@@ -391,11 +606,14 @@ impl ProviderCanonicalTransitionV2 {
                 messages.extend(self.recovery_messages.iter().cloned());
                 messages
             }
+            ProviderCanonicalRecoveryModeV2::CheckpointFromParent => {
+                return Err(ProviderCanonicalTransitionError::MissingLinkedPredecessor);
+            }
             ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase => {
                 self.recovery_messages.clone()
             }
         };
-        if CanonicalPrefixIdentityV1::from_messages(&predecessor)? != self.predecessor {
+        if ProviderCanonicalHistoryIdentityV2::from_messages(&predecessor)? != self.predecessor {
             return Err(ProviderCanonicalTransitionError::RecoveryRootMismatch);
         }
         Ok(predecessor)
@@ -414,7 +632,7 @@ impl ProviderCanonicalTransitionV2 {
     /// Atomically apply an ordered WAL chain with work proportional to the
     /// materialized history and transition payloads. Intermediate prefix
     /// identities are causally bound by transition ids and parent-result
-    /// links; the fully reconstructed canonical root is hashed exactly once.
+    /// links; the fully reconstructed append-friendly identity is hashed once.
     pub fn apply_chain_to(
         transitions: &[Self],
         messages: &mut Vec<Value>,
@@ -441,7 +659,7 @@ impl ProviderCanonicalTransitionV2 {
                 continue;
             }
             let parent = &transitions[index - 1];
-            if transition.recovery_mode == ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase {
+            if transition.recovery_mode != ProviderCanonicalRecoveryModeV2::AppendFromDurableBase {
                 return Err(ProviderCanonicalTransitionError::ReplacementNotChainAnchor);
             }
             if transition.parent_transition_id.as_deref() != Some(parent.transition_id.as_str())
@@ -453,7 +671,7 @@ impl ProviderCanonicalTransitionV2 {
         }
 
         let first = &transitions[0];
-        let current = CanonicalPrefixIdentityV1::from_messages(messages)?;
+        let current = ProviderCanonicalHistoryIdentityV2::from_messages(messages)?;
         let final_result = &transitions
             .last()
             .expect("non-empty canonical transition chain")
@@ -471,7 +689,7 @@ impl ProviderCanonicalTransitionV2 {
                         first.parent_result.as_ref(),
                     ) {
                         (Some(_), Some(parent_result)) => parent_result,
-                        (None, None) => &first.durable_base,
+                        (None, None) => &first.durable_base.history,
                         _ => {
                             return Err(ProviderCanonicalTransitionError::RecoveryCountMismatch);
                         }
@@ -485,8 +703,19 @@ impl ProviderCanonicalTransitionV2 {
                     }
                     candidate.extend(first.recovery_messages.iter().cloned());
                 }
+                ProviderCanonicalRecoveryModeV2::CheckpointFromParent => {
+                    if CanonicalPrefixIdentityV1::from_messages(messages)?
+                        != first.durable_base.canonical
+                    {
+                        return Err(ProviderCanonicalTransitionError::PrefixConflict);
+                    }
+                    candidate.clear();
+                    candidate.extend(first.recovery_messages.iter().cloned());
+                }
                 ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase => {
-                    if current != first.durable_base {
+                    if CanonicalPrefixIdentityV1::from_messages(messages)?
+                        != first.durable_base.canonical
+                    {
                         return Err(ProviderCanonicalTransitionError::PrefixConflict);
                     }
                     candidate.clear();
@@ -508,7 +737,7 @@ impl ProviderCanonicalTransitionV2 {
             }
         }
 
-        if CanonicalPrefixIdentityV1::from_messages(&candidate)? != *final_result {
+        if ProviderCanonicalHistoryIdentityV2::from_messages(&candidate)? != *final_result {
             return Err(ProviderCanonicalTransitionError::ResultRootMismatch);
         }
         crate::validate_canonical_tool_pairing(&candidate)
@@ -613,11 +842,19 @@ fn transition_identity(transition: &ProviderCanonicalTransitionV2) -> String {
         }
         None => digest.update([0]),
     }
-    digest.update(transition.durable_base.message_count.to_be_bytes());
-    digest.update(transition.durable_base.root_hash.as_bytes());
+    digest.update(
+        transition
+            .durable_base
+            .canonical
+            .message_count
+            .to_be_bytes(),
+    );
+    digest.update(transition.durable_base.canonical.root_hash.as_bytes());
+    digest.update(transition.durable_base.history.root_hash.as_bytes());
     digest.update([match transition.recovery_mode {
         ProviderCanonicalRecoveryModeV2::AppendFromDurableBase => 0,
-        ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase => 1,
+        ProviderCanonicalRecoveryModeV2::CheckpointFromParent => 1,
+        ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase => 2,
     }]);
     match transition.replacement_compaction_generation {
         Some(generation) => {
@@ -738,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn transition_identity_rejects_tampering_without_inspecting_text() {
+    fn transition_validation_rejects_tampering_without_inspecting_text() {
         let base = vec![json!({"role": "user", "content": "goal"})];
         let mut transition =
             ProviderCanonicalTransitionV2::new(None, &base, vec![authority("work")]).unwrap();
@@ -749,7 +986,7 @@ mod tests {
         transition.appended_messages[0]["content"] = Value::String(content);
         assert_eq!(
             transition.validate(),
-            Err(ProviderCanonicalTransitionError::IdentityMismatch)
+            Err(ProviderCanonicalTransitionError::ResultRootMismatch)
         );
     }
 
@@ -781,7 +1018,7 @@ mod tests {
     #[test]
     fn linked_wal_entries_store_only_their_own_delta_and_require_ordered_replay() {
         let durable = vec![json!({"role": "user", "content": "goal"})];
-        let durable_base = CanonicalPrefixIdentityV1::from_messages(&durable).unwrap();
+        let durable_base = ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
         let first = ProviderCanonicalTransitionV2::new_from_durable_base(
             None,
             durable_base.clone(),
@@ -818,7 +1055,7 @@ mod tests {
     #[test]
     fn linked_entry_recovers_messages_produced_after_parent_admission() {
         let durable = vec![json!({"role": "user", "content": "goal"})];
-        let durable_base = CanonicalPrefixIdentityV1::from_messages(&durable).unwrap();
+        let durable_base = ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
         let first = ProviderCanonicalTransitionV2::new_from_durable_base(
             None,
             durable_base.clone(),
@@ -854,7 +1091,7 @@ mod tests {
     #[test]
     fn corrupt_linked_gap_never_partially_mutates_history() {
         let durable = vec![json!({"role": "user", "content": "goal"})];
-        let durable_base = CanonicalPrefixIdentityV1::from_messages(&durable).unwrap();
+        let durable_base = ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
         let first = ProviderCanonicalTransitionV2::new_from_durable_base(
             None,
             durable_base.clone(),
@@ -881,7 +1118,7 @@ mod tests {
 
         assert_eq!(
             second.apply_to(&mut parent_result_messages),
-            Err(ProviderCanonicalTransitionError::ResultRootMismatch)
+            Err(ProviderCanonicalTransitionError::RecoveryRootMismatch)
         );
         assert_eq!(parent_result_messages, before);
     }
@@ -890,23 +1127,34 @@ mod tests {
     fn fixed_size_linked_entries_have_linear_serialized_storage() {
         const ENTRIES: usize = 256;
         let durable = vec![json!({"role": "user", "content": "goal"})];
-        let durable_base = CanonicalPrefixIdentityV1::from_messages(&durable).unwrap();
+        let durable_base = ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
         let mut history = durable.clone();
-        let mut parent = None;
         let mut encoded_lengths = Vec::with_capacity(ENTRIES);
         let mut transitions = Vec::with_capacity(ENTRIES);
 
-        for _ in 0..ENTRIES {
-            let transition = ProviderCanonicalTransitionV2::new_from_durable_base(
-                parent,
+        let first = ProviderCanonicalTransitionV2::new_from_durable_base(
+            None,
+            durable_base.clone(),
+            &history,
+            vec![authority("work")],
+        )
+        .unwrap();
+        encoded_lengths.push(serde_json::to_vec(&[&first]).unwrap().len());
+        history.extend(first.appended_messages.iter().cloned());
+        transitions.push(first);
+
+        for _ in 1..ENTRIES {
+            let parent = transitions.last().expect("first transition");
+            let transition = ProviderCanonicalTransitionV2::new_linked_from_deltas(
+                parent.transition_id.clone(),
+                parent.result.clone(),
                 durable_base.clone(),
-                &history,
+                Vec::new(),
                 vec![authority("work")],
             )
             .unwrap();
             encoded_lengths.push(serde_json::to_vec(&[&transition]).unwrap().len());
             history.extend(transition.appended_messages.iter().cloned());
-            parent = Some(transition.transition_id.clone());
             transitions.push(transition);
         }
 
@@ -925,6 +1173,67 @@ mod tests {
             ProviderCanonicalTransitionV2::apply_chain_to(&transitions, &mut restored).unwrap(),
             ProviderCanonicalTransitionApply::AlreadyApplied
         );
+    }
+
+    #[test]
+    fn incremental_history_identity_matches_one_pass_materialization() {
+        let prefix = vec![
+            json!({"role": "user", "content": "goal"}),
+            json!({"role": "assistant", "content": "working"}),
+        ];
+        let suffix = vec![authority("work"), authority("budget")];
+        let mut materialized = prefix.clone();
+        materialized.extend(suffix.iter().cloned());
+
+        let incrementally_extended = ProviderCanonicalHistoryIdentityV2::from_messages(&prefix)
+            .unwrap()
+            .extended(&suffix)
+            .unwrap();
+        assert_eq!(
+            incrementally_extended,
+            ProviderCanonicalHistoryIdentityV2::from_messages(&materialized).unwrap()
+        );
+    }
+
+    #[test]
+    fn checkpoint_is_a_lossless_anchor_without_rewrite_authority() {
+        let durable = vec![json!({"role": "user", "content": "goal"})];
+        let durable_base = ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
+        let first = ProviderCanonicalTransitionV2::new_from_durable_base(
+            None,
+            durable_base.clone(),
+            &durable,
+            vec![authority("first")],
+        )
+        .unwrap();
+        let mut predecessor = durable.clone();
+        predecessor.extend(first.appended_messages.iter().cloned());
+        predecessor.push(json!({"role": "assistant", "content": "provider result"}));
+        let checkpoint = ProviderCanonicalTransitionV2::new_checkpoint_from_parent(
+            first.transition_id,
+            first.result,
+            durable_base,
+            &predecessor,
+            vec![authority("next")],
+        )
+        .unwrap();
+        assert_eq!(
+            checkpoint.recovery_mode,
+            ProviderCanonicalRecoveryModeV2::CheckpointFromParent
+        );
+        assert_eq!(checkpoint.replacement_compaction_generation, None);
+
+        let mut recovered = durable;
+        assert_eq!(
+            ProviderCanonicalTransitionV2::apply_chain_to(
+                std::slice::from_ref(&checkpoint),
+                &mut recovered,
+            )
+            .unwrap(),
+            ProviderCanonicalTransitionApply::Applied
+        );
+        predecessor.extend(checkpoint.appended_messages.iter().cloned());
+        assert_eq!(recovered, predecessor);
     }
 
     #[test]
@@ -962,7 +1271,7 @@ mod tests {
     #[test]
     fn chain_replay_rejects_a_non_anchor_replacement_atomically() {
         let durable = vec![json!({"role": "user", "content": "goal"})];
-        let durable_base = CanonicalPrefixIdentityV1::from_messages(&durable).unwrap();
+        let durable_base = ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
         let first = ProviderCanonicalTransitionV2::new_from_durable_base(
             None,
             durable_base.clone(),
@@ -985,6 +1294,42 @@ mod tests {
             Err(ProviderCanonicalTransitionError::ReplacementNotChainAnchor)
         );
         assert_eq!(restored, durable);
+    }
+
+    #[test]
+    fn replacement_anchor_accepts_incremental_successors() {
+        let durable = vec![json!({"role": "user", "content": "original"})];
+        let durable_base = ProviderCanonicalWalBaseV2::from_messages(&durable).unwrap();
+        let rewritten = vec![json!({"role": "system", "content": "typed summary"})];
+        let replacement = ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
+            None,
+            durable_base.clone(),
+            1,
+            &rewritten,
+            vec![authority("replacement")],
+        )
+        .unwrap();
+        let provider_response = json!({"role": "assistant", "content": "intermediate"});
+        let successor = ProviderCanonicalTransitionV2::new_linked_from_deltas(
+            replacement.transition_id.clone(),
+            replacement.result.clone(),
+            durable_base,
+            vec![provider_response.clone()],
+            vec![authority("successor")],
+        )
+        .unwrap();
+
+        let mut recovered = durable;
+        ProviderCanonicalTransitionV2::apply_chain_to(
+            &[replacement.clone(), successor.clone()],
+            &mut recovered,
+        )
+        .unwrap();
+        let mut expected = rewritten;
+        expected.extend(replacement.appended_messages);
+        expected.push(provider_response);
+        expected.extend(successor.appended_messages);
+        assert_eq!(recovered, expected);
     }
 
     #[test]
@@ -1027,7 +1372,7 @@ mod tests {
         let authority = authority("budget");
         let transition = ProviderCanonicalTransitionV2::new_from_durable_base(
             None,
-            CanonicalPrefixIdentityV1::from_messages(&durable_head).unwrap(),
+            ProviderCanonicalWalBaseV2::from_messages(&durable_head).unwrap(),
             &predecessor,
             vec![authority.clone()],
         )
@@ -1057,7 +1402,7 @@ mod tests {
         predecessor.push(json!({"role": "user", "content": "old request"}));
         let transition = ProviderCanonicalTransitionV2::new_from_durable_base(
             None,
-            CanonicalPrefixIdentityV1::from_messages(&durable_head).unwrap(),
+            ProviderCanonicalWalBaseV2::from_messages(&durable_head).unwrap(),
             &predecessor,
             Vec::new(),
         )
@@ -1086,7 +1431,7 @@ mod tests {
         assert_eq!(
             ProviderCanonicalTransitionV2::new_from_durable_base(
                 None,
-                CanonicalPrefixIdentityV1::from_messages(&durable_head).unwrap(),
+                ProviderCanonicalWalBaseV2::from_messages(&durable_head).unwrap(),
                 &rewritten,
                 vec![authority.clone()],
             ),
@@ -1094,7 +1439,7 @@ mod tests {
         );
         let transition = ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
             None,
-            CanonicalPrefixIdentityV1::from_messages(&durable_head).unwrap(),
+            ProviderCanonicalWalBaseV2::from_messages(&durable_head).unwrap(),
             1,
             &rewritten,
             vec![authority.clone()],
@@ -1116,7 +1461,7 @@ mod tests {
 
     #[test]
     fn non_append_runtime_controls_cannot_enter_canonical_recovery() {
-        let durable_base = CanonicalPrefixIdentityV1::from_messages(&[]).unwrap();
+        let durable_base = ProviderCanonicalWalBaseV2::from_messages(&[]).unwrap();
         for delivery in [
             crate::RuntimeMessageDelivery::EphemeralControl,
             crate::RuntimeMessageDelivery::RequiredContext,

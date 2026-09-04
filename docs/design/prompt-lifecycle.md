@@ -1,7 +1,7 @@
 # Prompt lifecycle
 
 > Status: target design contract.
-> Last updated: 2026-09-03.
+> Last updated: 2026-09-04.
 
 Prompt lifecycle defines how Astra builds, versions, caches, inspects, and evolves prompts. It is distinct from context selection and tool routing, though it consumes both.
 
@@ -141,47 +141,52 @@ terminals never fabricate cache statistics.
 Append-only canonical state uses the provider-attempt ledger as a write-ahead
 boundary. Before HTTP is authorized, the same transaction that admits the
 exact provider body stores every newly provider-owned canonical append as a
-versioned transition with predecessor/result message counts and canonical root
-hashes. The transition is self-contained from the canonical coordinator's
-admitted durable base: it carries either the lossless uncommitted suffix or an
-explicit replacement after an authorized compaction rewrite, followed by the
-attempt-owned append. A request with no new runtime frame still stores a
-recovery-only snapshot: provider delivery, rather than the presence of a
+versioned transition with predecessor/result message counts and append-friendly
+history identities. The first transition is self-contained from the canonical
+coordinator's admitted durable base. Each successor stores only the lossless
+gap since its parent plus the attempt-owned append; this keeps admission work
+and storage proportional to new data instead of repeatedly hashing and writing
+the complete growing turn. A request with no new runtime frame still stores a
+recovery-only transition: provider delivery, rather than the presence of a
 particular authority shape, creates the durability obligation. Initial
 authority frames are authority-only appends; an internal continuation is one
 atomic assistant-plus-authority append.
 
 A resumed host uses the admitted durable message count as an ownership
 boundary. It detaches the fresh request suffix, loads the database-authoritative
-per-turn head, restores that one self-contained leaf on the durable base, and
+per-turn head, restores its bounded transition chain on the durable base, and
 finally reattaches the fresh suffix. Every transition names its immutable parent
-transition id. Provider-attempt admission validates parent-to-current-head and
-advances the head in the same transaction as the exact provider body; a
-same-transition physical retry is idempotent. It never compares message values
-to infer lineage or guess whether repeated input such as `continue` belongs
-before or after the crash. A missing parent, fork, stale head, payload/hash
-conflict, or ambiguous commit without the exact head attempt fails before HTTP
-or canonical mutation.
+transition id and parent result identity. Provider-attempt admission validates
+parent-to-current-head and advances the head in the same transaction as the
+exact provider body; a same-transition physical retry is idempotent. It never
+compares message values to infer lineage or guess whether repeated input such as
+`continue` belongs before or after the crash. A missing parent, fork, stale
+head, payload/hash conflict, or ambiguous commit without the exact head attempt
+fails before HTTP or canonical mutation.
 This covers a crash after HTTP authorization but before any step or canonical
 checkpoint. Provider body roles, model names, prompt text, transport errors,
 timestamps, run-local counters, and attempt ids are not recovery evidence.
 
-WAL snapshots cross the same durable credential-redaction boundary as runtime
+WAL payloads cross the same durable credential-redaction boundary as runtime
 checkpoints. They preserve the already-durable canonical base byte-for-byte and
-redact only newly retained message data. Head advancement clears the prior
-attempt's large JSON payload in the admission transaction, leaving exactly one
-recoverable snapshot regardless of provider-round count; transition id, parent,
-and content hash remain as audit evidence. Once a canonical commit absorbs a
-turn, its head and final payload are retired atomically; the next session
-boundary retries retirement for an earlier commit that crashed before cleanup.
-Hard session deletion removes both owner-scoped heads and attempt rows.
+redact only newly retained message data. The head tracks both chain length and
+serialized bytes. Before either hard limit is reached, runtime emits a lossless
+checkpoint that proves the prior head is an exact prefix, stores one
+self-contained recovery anchor, and atomically retires the earlier chain. This
+capacity checkpoint is not context compaction and needs no rewrite authority.
+Once a canonical commit absorbs a turn, its head and payloads are retired
+atomically; the next session boundary retries retirement for an earlier commit
+that crashed before cleanup. Hard session deletion removes both owner-scoped
+heads and attempt rows.
 
 Prefix mismatch is not replacement authority. An append transition must prove
 that the admitted durable base remains an exact prefix. A replacement
 transition can be created only from the canonical rewrite proof after its
 pre-mutation permit has been validated and bound to the exact resulting
-predecessor identity and compaction generation; otherwise provider admission
-fails before HTTP.
+predecessor identity and compaction generation. That authority is consumed when
+the replacement anchor is admitted, so later provider rounds return to
+incremental append until another real rewrite occurs. Otherwise provider
+admission fails before HTTP.
 
 At a text-only completion boundary, a provider may receive one request with a
 stable schema declaration plus its native no-tool choice. If it nevertheless
