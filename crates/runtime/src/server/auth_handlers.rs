@@ -518,6 +518,9 @@ async fn memoria_owner_id_for_user(
     state: &AppState,
     user_id: &str,
 ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+    if state.memoria_forwarder_is_override {
+        return Ok(user_id.to_string());
+    }
     let Some(pool) = state.shared_pool.as_ref() else {
         return Ok(user_id.to_string());
     };
@@ -563,6 +566,15 @@ async fn forward_memoria_for_user(
     endpoint: &str,
     mut body: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    // Explicit composition overrides are used by bounded in-process fixtures
+    // and custom deployments. They are never inferred from a configured
+    // server master key, so normal production requests remain BYOK-only.
+    if state.memoria_forwarder_is_override {
+        return state
+            .memoria_forwarder
+            .forward(method, endpoint, body)
+            .await;
+    }
     let Some(pool) = state.shared_pool.as_ref() else {
         // Narrow unit fixtures predate per-user credential storage. Production
         // composition always injects the shared pool and therefore never uses
@@ -1030,9 +1042,8 @@ async fn memoria_management_proxy_call(
         body.unwrap_or_else(|| serde_json::json!({})),
         &user.user_id,
     );
-    state
-        .memoria_forwarder
-        .forward(method, endpoint, body)
+    let requires_write = method != reqwest::Method::GET;
+    forward_memoria_for_user(state, &user.user_id, requires_write, method, endpoint, body)
         .await
         .map(Json)
         .map_err(|error| {
@@ -1044,6 +1055,12 @@ async fn memoria_management_proxy_call(
             );
             if error.contains("not configured") {
                 error_response(StatusCode::SERVICE_UNAVAILABLE, &error)
+            } else if error.contains("disabled by the user")
+                || error.contains("not enabled for this Astra account")
+            {
+                error_response(StatusCode::FORBIDDEN, &error)
+            } else if let Some(status) = parse_memoria_forward_status(&error) {
+                error_response(status, &error)
             } else {
                 internal_error(&error)
             }
