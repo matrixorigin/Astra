@@ -31,7 +31,8 @@ use astra_services::session_restore::{
 };
 use astra_services::session_workspace::{
     ContextTraceSignal, ContextTraceToolSurface, WORKSPACE_METADATA_ARTIFACT_KIND,
-    WorkspaceMetadata, persist_remote_workspace,
+    WORKSPACE_METADATA_PROJECTION_ID, WorkspaceMetadata, persist_remote_workspace,
+    to_remote_artifact_record,
 };
 use astra_services::{
     AcquireWriterOutcome, AdminAuditFilter, AdminAuditReader, ContextService,
@@ -4612,8 +4613,7 @@ async fn sync_audit_no_longer_persists_session_sync_log_on_live_matrixone() {
 
 #[tokio::test]
 #[ignore = "ASTRA_TEST_DB_IT=1 and live MatrixOne"]
-async fn remote_workspace_artifact_restores_picker_metadata_without_runtime_authority_on_live_matrixone()
- {
+async fn monotonic_remote_workspace_projection_restores_picker_metadata_on_live_matrixone() {
     let (shared, settings) = setup_pool_and_settings().await;
     let pool = shared.get().clone();
 
@@ -4638,6 +4638,7 @@ async fn remote_workspace_artifact_restores_picker_metadata_without_runtime_auth
         Some("feature/remote-workspace-old"),
     );
     older_workspace.record_turn(120, 45, 0, 0);
+    older_workspace.projection_revision = 1;
     older_workspace.last_context_trace = Some(ContextTraceSignal {
         turn_id: "turn-remote-workspace-old".into(),
         captured_at: Some("2026-09-07T10:00:00Z".into()),
@@ -4662,6 +4663,7 @@ async fn remote_workspace_artifact_restores_picker_metadata_without_runtime_auth
     );
     newer_workspace.record_turn(120, 45, 0, 0);
     newer_workspace.record_turn(240, 90, 0, 0);
+    newer_workspace.projection_revision = 2;
     newer_workspace.last_context_trace = Some(ContextTraceSignal {
         turn_id: "turn-remote-workspace-new".into(),
         captured_at: Some("2026-09-07T10:00:00Z".into()),
@@ -4681,43 +4683,48 @@ async fn remote_workspace_artifact_restores_picker_metadata_without_runtime_auth
     let artifact_store = DatabaseSessionArtifactStore::new(settings.clone()).with_pool(shared);
     let older_artifact = persist_remote_workspace(&older_workspace, &user_id, &artifact_store)
         .await
-        .expect("persist old remote workspace");
+        .expect("persist initial revision 1 workspace");
+    assert_eq!(older_artifact.content["projection_revision"], 1);
     let newer_artifact = persist_remote_workspace(&newer_workspace, &user_id, &artifact_store)
         .await
-        .expect("persist newest remote workspace");
-    force_session_artifacts_created_at(
-        &pool,
-        &user_id,
-        &session_id,
-        &[
-            older_artifact.artifact_id.clone(),
-            newer_artifact.artifact_id.clone(),
-        ],
-        "2026-09-07 10:00:00.123456",
-    )
-    .await;
+        .expect("persist newer remote workspace");
+    let late_older = persist_remote_workspace(&older_workspace, &user_id, &artifact_store)
+        .await
+        .expect("late older projection is ignored");
+    let idempotent = persist_remote_workspace(&newer_workspace, &user_id, &artifact_store)
+        .await
+        .expect("same projection revision and content is idempotent");
+    let mut conflict = newer_workspace.clone();
+    conflict.status = "completed".into();
+    let conflict = artifact_store
+        .upsert_monotonic_workspace_projection(
+            to_remote_artifact_record(&conflict, &user_id).unwrap(),
+            conflict.projection_revision,
+        )
+        .await
+        .expect_err("same revision with different content must conflict");
 
-    let (expected_artifact, expected_workspace) =
-        if newer_artifact.artifact_id > older_artifact.artifact_id {
-            (&newer_artifact, &newer_workspace)
-        } else {
-            (&older_artifact, &older_workspace)
-        };
-
-    assert_eq!(expected_artifact.session_id, session_id);
-    assert_eq!(expected_artifact.user_id, user_id);
+    assert!(matches!(
+        conflict,
+        SessionArtifactStoreError::WorkspaceProjectionRevisionConflict { revision: 2 }
+    ));
+    assert_eq!(newer_artifact.artifact_id, WORKSPACE_METADATA_PROJECTION_ID);
+    assert_eq!(late_older.content, newer_artifact.content);
+    assert_eq!(idempotent.content, newer_artifact.content);
+    assert_eq!(newer_artifact.session_id, session_id);
+    assert_eq!(newer_artifact.user_id, user_id);
     assert_eq!(
-        expected_artifact.artifact_kind,
+        newer_artifact.artifact_kind,
         WORKSPACE_METADATA_ARTIFACT_KIND
     );
-    assert_eq!(expected_artifact.turn, Some(expected_workspace.turn_count));
+    assert_eq!(newer_artifact.turn, Some(newer_workspace.turn_count));
 
-    let latest_artifact = artifact_store
-        .load_latest_json_artifact(&user_id, &session_id, WORKSPACE_METADATA_ARTIFACT_KIND)
+    let projection = artifact_store
+        .load_json_artifact(&user_id, &session_id, WORKSPACE_METADATA_PROJECTION_ID)
         .await
-        .expect("load latest remote workspace artifact")
-        .expect("remote workspace artifact exists");
-    assert_eq!(latest_artifact.artifact_id, expected_artifact.artifact_id);
+        .expect("load remote workspace projection")
+        .expect("remote workspace projection exists");
+    assert_eq!(projection.content, newer_artifact.content);
 
     let restore = HybridRestoreService::new(pool.clone());
     let restored = restore
@@ -4727,19 +4734,16 @@ async fn remote_workspace_artifact_restores_picker_metadata_without_runtime_auth
         .expect("session restored from remote workspace artifact");
 
     assert!(restored.restored_from_cloud);
-    assert_eq!(restored.turn_count, expected_workspace.turn_count);
-    assert_eq!(restored.total_tokens_in, expected_workspace.total_tokens_in);
-    assert_eq!(
-        restored.total_tokens_out,
-        expected_workspace.total_tokens_out
-    );
+    assert_eq!(restored.turn_count, newer_workspace.turn_count);
+    assert_eq!(restored.total_tokens_in, newer_workspace.total_tokens_in);
+    assert_eq!(restored.total_tokens_out, newer_workspace.total_tokens_out);
     assert!(
         restored.recent_tools.is_empty(),
         "an unversioned workspace artifact cannot grant prompt-facing tool history"
     );
     assert_eq!(
         restored.git_branch.as_deref(),
-        expected_workspace.git_branch.as_deref()
+        newer_workspace.git_branch.as_deref()
     );
     assert!(restored.model.is_none());
     assert!(restored.last_context_trace.is_none());

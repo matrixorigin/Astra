@@ -11,7 +11,9 @@ pub mod runtime_config;
 pub mod user_profile;
 
 // Re-exports for ergonomic cross-crate use.
-pub use json_mutation::{JsonPathMutationError, replace_existing_json_path};
+pub use json_mutation::{
+    JsonPathMutationError, read_existing_json_path, replace_existing_json_path,
+};
 pub use runtime_config::{
     EffectiveToolPolicy, ModelPolicyProfile, RuntimeConfig, SafetyConfig, ToolPolicyConfig,
     ToolSurfaceConfig, TrustModeSerde,

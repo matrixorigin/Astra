@@ -828,11 +828,11 @@ impl HybridRestoreService {
             Some(pool) => pool,
             None => return Ok(None),
         };
-        let artifact = crate::session_artifact_store::load_latest_json_artifact_from_pool(
+        let artifact = crate::session_artifact_store::load_json_artifact_from_pool(
             pool,
             user_id,
             session_id,
-            super::session_workspace::WORKSPACE_METADATA_ARTIFACT_KIND,
+            super::session_workspace::WORKSPACE_METADATA_PROJECTION_ID,
         )
         .await
         .map_err(|e| format!("restore_cloud_workspace: {e}"))?;

@@ -21,6 +21,7 @@ use crate::{
 };
 
 pub const WORKSPACE_METADATA_ARTIFACT_KIND: &str = "workspace_metadata";
+pub const WORKSPACE_METADATA_PROJECTION_ID: &str = "projection:workspace-metadata";
 
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
@@ -380,6 +381,15 @@ pub struct WorkspaceMetadata {
     /// RuntimeConfig override snapshot (JSON) persisted for local resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tuned_config_json: Option<String>,
+    /// Monotonic owner token for the complete remote workspace projection.
+    pub projection_revision: u64,
+    /// Monotonic ownership token for accepted runtime-config mutations.
+    ///
+    /// The config mutation owner increments this revision even when the
+    /// replacement JSON is byte-for-byte identical. Compensation compares the
+    /// token, rather than the config value, so distinct writers and ABA updates
+    /// cannot be mistaken for the mutation being compensated.
+    pub config_mutation_revision: u64,
 }
 
 fn deserialize_model_override<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -404,6 +414,14 @@ fn is_model_override_none(model: &Option<String>) -> bool {
 }
 
 impl WorkspaceMetadata {
+    fn bump_projection_revision(&mut self) -> std::io::Result<()> {
+        self.projection_revision = self
+            .projection_revision
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("workspace projection revision exhausted"))?;
+        Ok(())
+    }
+
     /// Create initial metadata for a new session.
     pub fn new(session_id: &str, model: &str) -> Self {
         let now = chrono::Utc::now().to_rfc3339();
@@ -492,6 +510,8 @@ impl WorkspaceMetadata {
             active_experiment_id: None,
             active_variant: None,
             tuned_config_json: None,
+            projection_revision: 0,
+            config_mutation_revision: 0,
         }
     }
     pub fn with_context(
@@ -538,6 +558,8 @@ impl WorkspaceMetadata {
             active_experiment_id: None,
             active_variant: None,
             tuned_config_json: None,
+            projection_revision: 0,
+            config_mutation_revision: 0,
         }
     }
 
@@ -586,7 +608,7 @@ pub fn to_remote_artifact_record(
 ) -> Result<SessionArtifactJsonRecord, serde_json::Error> {
     let metadata = canonical_workspace_metadata(metadata);
     Ok(SessionArtifactJsonRecord {
-        artifact_id: String::new(),
+        artifact_id: WORKSPACE_METADATA_PROJECTION_ID.to_string(),
         session_id: metadata.session_id.clone(),
         user_id: user_id.to_string(),
         artifact_kind: WORKSPACE_METADATA_ARTIFACT_KIND.to_string(),
@@ -610,7 +632,7 @@ pub async fn persist_remote_workspace(
 ) -> Result<StoredSessionArtifact, String> {
     let record = to_remote_artifact_record(metadata, user_id).map_err(|error| error.to_string())?;
     store
-        .persist_json_artifact(record)
+        .upsert_monotonic_workspace_projection(record, metadata.projection_revision)
         .await
         .map_err(|error| error.to_string())
 }
@@ -642,7 +664,14 @@ pub fn write_workspace(metadata: &WorkspaceMetadata) -> std::io::Result<()> {
     std::fs::create_dir_all(&dir)?;
     sync_parent_dir(&dir)?;
     let _lock = lock_workspace(&dir)?;
-    write_workspace_unlocked(metadata, &dir)
+    let mut candidate = metadata.clone();
+    if let Some(current) = read_workspace_optional(&metadata.session_id)? {
+        candidate.tuned_config_json = current.tuned_config_json;
+        candidate.config_mutation_revision = current.config_mutation_revision;
+        candidate.projection_revision = current.projection_revision;
+    }
+    candidate.bump_projection_revision()?;
+    write_workspace_unlocked(&candidate, &dir)
 }
 
 /// Atomically read, update, and rewrite a workspace under its per-session lock.
@@ -659,37 +688,148 @@ pub fn update_workspace(
     std::fs::create_dir_all(&dir)?;
     sync_parent_dir(&dir)?;
     let _lock = lock_workspace(&dir)?;
-    let mut metadata = match read_workspace_optional(session_id)? {
-        Some(metadata) => metadata,
-        None => initialize(),
+    let (mut metadata, existing_config) = match read_workspace_optional(session_id)? {
+        Some(metadata) => {
+            let config = (
+                metadata.tuned_config_json.clone(),
+                metadata.config_mutation_revision,
+                metadata.projection_revision,
+            );
+            (metadata, Some(config))
+        }
+        None => (initialize(), None),
     };
     validate_workspace_identity(session_id, &metadata)?;
     update(&mut metadata);
+    if let Some((tuned_config_json, revision, projection_revision)) = existing_config {
+        metadata.tuned_config_json = tuned_config_json;
+        metadata.config_mutation_revision = revision;
+        metadata.projection_revision = projection_revision;
+    }
+    metadata.bump_projection_revision()?;
     validate_workspace_identity(session_id, &metadata)?;
     write_workspace_unlocked(&metadata, &dir)
 }
 
 /// Update an existing workspace under its per-session lock.
 ///
-/// Returns `false` when the workspace does not exist. Corrupt workspaces remain
-/// errors and are never silently replaced.
+/// Returns the canonical, committed workspace, or `None` when it does not
+/// exist. Corrupt workspaces remain errors and are never silently replaced.
 pub fn update_existing_workspace(
     session_id: &str,
     update: impl FnOnce(&mut WorkspaceMetadata),
-) -> std::io::Result<bool> {
+) -> std::io::Result<Option<WorkspaceMetadata>> {
     let dir = validated_workspace_dir(session_id)?;
     if !dir.exists() {
-        return Ok(false);
+        return Ok(None);
     }
     let _lock = lock_workspace(&dir)?;
     let Some(mut metadata) = read_workspace_optional(session_id)? else {
-        return Ok(false);
+        return Ok(None);
     };
     validate_workspace_identity(session_id, &metadata)?;
+    let tuned_config_json = metadata.tuned_config_json.clone();
+    let config_mutation_revision = metadata.config_mutation_revision;
+    let projection_revision = metadata.projection_revision;
     update(&mut metadata);
+    metadata.tuned_config_json = tuned_config_json;
+    metadata.config_mutation_revision = config_mutation_revision;
+    metadata.projection_revision = projection_revision;
+    metadata.bump_projection_revision()?;
     validate_workspace_identity(session_id, &metadata)?;
+    let metadata = canonical_workspace_metadata(&metadata);
     write_workspace_unlocked(&metadata, &dir)?;
-    Ok(true)
+    Ok(Some(metadata))
+}
+
+/// Durable outcome of a conditional workspace config mutation.
+///
+/// `OutcomeUnknown` is reserved for a failure after the atomic rename. The
+/// replacement is visible to this process, but its directory entry may not be
+/// durable across a crash. Callers must not treat it as either an applied or a
+/// rejected mutation, and must not issue an unconditional compensation.
+#[derive(Debug)]
+pub enum WorkspaceConfigMutationOutcome<T, R> {
+    Applied {
+        value: T,
+        revision: u64,
+        workspace: Box<WorkspaceMetadata>,
+    },
+    Rejected(R),
+    OutcomeUnknown {
+        value: T,
+        revision: u64,
+        observed: Option<Box<WorkspaceMetadata>>,
+        reason: String,
+    },
+}
+
+/// Conditionally mutate the config projection of an existing workspace under
+/// its per-session file lock.
+///
+/// This is the sole owner-level write primitive for `tuned_config_json`. Every
+/// accepted decision receives a fresh revision, including same-value writes.
+/// A rejected decision never rewrites the workspace.
+pub fn update_existing_workspace_config<T, R>(
+    session_id: &str,
+    update: impl FnOnce(&mut WorkspaceMetadata) -> std::io::Result<std::ops::ControlFlow<R, T>>,
+) -> std::io::Result<WorkspaceConfigMutationOutcome<T, R>> {
+    let dir = validated_workspace_dir(session_id)?;
+    if !dir.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("workspace does not exist for session {session_id}"),
+        ));
+    }
+    let _lock = lock_workspace(&dir)?;
+    let Some(mut metadata) = read_workspace_optional(session_id)? else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("workspace does not exist for session {session_id}"),
+        ));
+    };
+    validate_workspace_identity(session_id, &metadata)?;
+    let projection_revision = metadata.projection_revision;
+    let value = match update(&mut metadata)? {
+        std::ops::ControlFlow::Continue(value) => value,
+        std::ops::ControlFlow::Break(rejection) => {
+            return Ok(WorkspaceConfigMutationOutcome::Rejected(rejection));
+        }
+    };
+    metadata.config_mutation_revision = metadata
+        .config_mutation_revision
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::other("workspace config mutation revision exhausted"))?;
+    metadata.projection_revision = projection_revision;
+    metadata.bump_projection_revision()?;
+    validate_workspace_identity(session_id, &metadata)?;
+    let revision = metadata.config_mutation_revision;
+    let metadata = canonical_workspace_metadata(&metadata);
+    match commit_workspace_unlocked(&metadata, &dir)? {
+        WorkspaceCommitOutcome::Applied => Ok(WorkspaceConfigMutationOutcome::Applied {
+            value,
+            revision,
+            workspace: Box::new(metadata),
+        }),
+        WorkspaceCommitOutcome::OutcomeUnknown(error) => {
+            let (observed, readback_error) = match read_workspace_optional(session_id) {
+                Ok(observed) => (observed, None),
+                Err(readback_error) => (None, Some(readback_error)),
+            };
+            let reason = match readback_error {
+                Some(readback_error) => {
+                    format!("{error}; workspace readback also failed: {readback_error}")
+                }
+                None => error.to_string(),
+            };
+            Ok(WorkspaceConfigMutationOutcome::OutcomeUnknown {
+                value,
+                revision,
+                observed: observed.map(Box::new),
+                reason,
+            })
+        }
+    }
 }
 
 fn validate_workspace_identity(
@@ -737,7 +877,22 @@ fn lock_workspace(dir: &Path) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
+enum WorkspaceCommitOutcome {
+    Applied,
+    OutcomeUnknown(std::io::Error),
+}
+
 fn write_workspace_unlocked(metadata: &WorkspaceMetadata, dir: &Path) -> std::io::Result<()> {
+    match commit_workspace_unlocked(metadata, dir)? {
+        WorkspaceCommitOutcome::Applied => Ok(()),
+        WorkspaceCommitOutcome::OutcomeUnknown(error) => Err(error),
+    }
+}
+
+fn commit_workspace_unlocked(
+    metadata: &WorkspaceMetadata,
+    dir: &Path,
+) -> std::io::Result<WorkspaceCommitOutcome> {
     let metadata = canonical_workspace_metadata(metadata);
     let path = dir.join("workspace.yaml");
     let yaml = serde_yaml_ng::to_string(&metadata)
@@ -764,8 +919,10 @@ fn write_workspace_unlocked(metadata: &WorkspaceMetadata, dir: &Path) -> std::io
     std::fs::rename(&tmp_path, &path).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp_path);
     })?;
-    sync_parent_dir(&path)?;
-    Ok(())
+    match sync_workspace_commit_parent(&path) {
+        Ok(()) => Ok(WorkspaceCommitOutcome::Applied),
+        Err(error) => Ok(WorkspaceCommitOutcome::OutcomeUnknown(error)),
+    }
 }
 
 /// Read workspace metadata when present, while preserving corruption as an error.
@@ -823,6 +980,26 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
         return Ok(());
     };
     std::fs::File::open(parent)?.sync_all()
+}
+
+fn sync_workspace_commit_parent(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if WORKSPACE_COMMIT_SYNC_FAILURE_ONCE.with(|fail| fail.replace(false)) {
+        return Err(std::io::Error::other(
+            "injected workspace commit directory sync failure",
+        ));
+    }
+    sync_parent_dir(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    static WORKSPACE_COMMIT_SYNC_FAILURE_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_next_workspace_commit_sync() {
+    WORKSPACE_COMMIT_SYNC_FAILURE_ONCE.with(|fail| fail.set(true));
 }
 
 /// Get the workspace directory for a session.
@@ -967,8 +1144,8 @@ pub fn finalize_workspace_on_end(session_id: &str) -> Option<String> {
     match update_existing_workspace(session_id, |workspace| {
         workspace.mark_completed(summary_for_update.as_deref());
     }) {
-        Ok(true) => {}
-        Ok(false) => return None,
+        Ok(Some(_)) => {}
+        Ok(None) => return None,
         Err(error) => {
             eprintln!("[knowledge-backflow] Failed to update workspace on end: {error}");
         }
@@ -1008,6 +1185,28 @@ mod tests {
         seen: Arc<Mutex<Option<SessionArtifactJsonRecord>>>,
     }
 
+    fn stored(record: SessionArtifactJsonRecord) -> StoredSessionArtifact {
+        StoredSessionArtifact {
+            artifact_id: record.artifact_id.clone(),
+            session_id: record.session_id,
+            user_id: record.user_id,
+            artifact_kind: record.artifact_kind,
+            source: record.source,
+            turn: record.turn,
+            round: record.round,
+            content: record.content,
+            metadata: record.metadata,
+            retention_policy: Some("default".into()),
+            retention_until: None,
+            status: Some("active".into()),
+            referenced_by_manifest_count: 0,
+            referenced_by_state_items_count: 0,
+            referenced_by_citation_count: 0,
+            referenced_by_durable_count: 0,
+            created_at: Some("2026-04-25T14:00:00Z".into()),
+        }
+    }
+
     #[async_trait]
     impl SessionArtifactJsonStore for RecordingArtifactStore {
         async fn persist_json_artifact(
@@ -1015,25 +1214,7 @@ mod tests {
             record: SessionArtifactJsonRecord,
         ) -> Result<StoredSessionArtifact, crate::SessionArtifactStoreError> {
             *astra_core::sync_poison::recover_mutex_lock(&self.seen) = Some(record.clone());
-            Ok(StoredSessionArtifact {
-                artifact_id: "artifact-1".into(),
-                session_id: record.session_id,
-                user_id: record.user_id,
-                artifact_kind: record.artifact_kind,
-                source: record.source,
-                turn: record.turn,
-                round: record.round,
-                content: record.content,
-                metadata: record.metadata,
-                retention_policy: Some("default".into()),
-                retention_until: None,
-                status: Some("active".into()),
-                referenced_by_manifest_count: 0,
-                referenced_by_state_items_count: 0,
-                referenced_by_citation_count: 0,
-                referenced_by_durable_count: 0,
-                created_at: Some("2026-04-25T14:00:00Z".into()),
-            })
+            Ok(stored(record))
         }
 
         async fn upsert_json_artifact_projection(
@@ -1041,6 +1222,32 @@ mod tests {
             record: SessionArtifactJsonRecord,
         ) -> Result<StoredSessionArtifact, crate::SessionArtifactStoreError> {
             self.persist_json_artifact(record).await
+        }
+
+        async fn upsert_monotonic_workspace_projection(
+            &self,
+            record: SessionArtifactJsonRecord,
+            projection_revision: u64,
+        ) -> Result<StoredSessionArtifact, crate::SessionArtifactStoreError> {
+            let mut current = astra_core::sync_poison::recover_mutex_lock(&self.seen);
+            if let Some(stored_record) = current.as_ref() {
+                let stored_revision = stored_record.content["projection_revision"]
+                    .as_u64()
+                    .expect("stored workspace projection revision");
+                if stored_revision > projection_revision {
+                    return Ok(stored(stored_record.clone()));
+                }
+                if stored_revision == projection_revision && stored_record.content != record.content
+                {
+                    return Err(
+                        crate::SessionArtifactStoreError::WorkspaceProjectionRevisionConflict {
+                            revision: projection_revision,
+                        },
+                    );
+                }
+            }
+            *current = Some(record.clone());
+            Ok(stored(record))
         }
 
         async fn load_json_artifact(
@@ -1161,7 +1368,7 @@ mod tests {
 
     #[test]
     fn workspace_legacy_default_model_deserializes_as_no_override() {
-        let yaml = "session_id: s\ncwd: /tmp\nmodel: default\ncreated_at: '2025-01-01T00:00:00Z'\nupdated_at: '2025-01-01T00:00:00Z'\nturn_count: 0\ntotal_tokens_in: 0\ntotal_tokens_out: 0\nstatus: active\n";
+        let yaml = "session_id: s\ncwd: /tmp\nmodel: default\ncreated_at: '2025-01-01T00:00:00Z'\nupdated_at: '2025-01-01T00:00:00Z'\nturn_count: 0\ntotal_tokens_in: 0\ntotal_tokens_out: 0\nstatus: active\nprojection_revision: 0\nconfig_mutation_revision: 0\n";
         let ws: WorkspaceMetadata = serde_yaml_ng::from_str(yaml).unwrap();
         assert!(ws.model.is_none());
     }
@@ -1197,6 +1404,7 @@ mod tests {
         let record = to_remote_artifact_record(&ws, "user-1").unwrap();
         assert_eq!(record.session_id, "sess-1");
         assert_eq!(record.user_id, "user-1");
+        assert_eq!(record.artifact_id, WORKSPACE_METADATA_PROJECTION_ID);
         assert_eq!(record.artifact_kind, WORKSPACE_METADATA_ARTIFACT_KIND);
         assert_eq!(record.source.as_deref(), Some("workspace_metadata"));
         assert_eq!(record.turn, Some(1));
@@ -1208,9 +1416,16 @@ mod tests {
     async fn persist_remote_workspace_uses_workspace_record() {
         let mut ws = WorkspaceMetadata::with_context("sess-1", "gpt-4", "/home/user", Some("main"));
         ws.record_turn(100, 50, 0, 0);
+        ws.projection_revision = 2;
         let store = RecordingArtifactStore::default();
 
-        let stored = persist_remote_workspace(&ws, "user-1", &store)
+        persist_remote_workspace(&ws, "user-1", &store)
+            .await
+            .unwrap();
+        let mut stale = ws.clone();
+        stale.projection_revision = 1;
+        stale.status = "completed".into();
+        let retained = persist_remote_workspace(&stale, "user-1", &store)
             .await
             .unwrap();
         let seen = store
@@ -1221,9 +1436,10 @@ mod tests {
             .expect("captured record");
 
         assert_eq!(seen.artifact_kind, WORKSPACE_METADATA_ARTIFACT_KIND);
+        assert_eq!(seen.artifact_id, WORKSPACE_METADATA_PROJECTION_ID);
         assert_eq!(seen.turn, Some(1));
-        assert_eq!(stored.artifact_id, "artifact-1");
-        assert_eq!(stored.content["session_id"], "sess-1");
+        assert_eq!(retained.content["projection_revision"], 2);
+        assert_eq!(seen.content["status"], "active");
     }
 
     #[test]
@@ -1685,7 +1901,7 @@ mod tests {
     #[test]
     fn workspace_adaptive_state_defaults_on_missing_fields() {
         // YAML from older versions without adaptive fields should deserialize cleanly
-        let yaml = "session_id: s\ncwd: /tmp\nmodel: m\ncreated_at: '2025-01-01T00:00:00Z'\nupdated_at: '2025-01-01T00:00:00Z'\nturn_count: 5\ntotal_tokens_in: 100\ntotal_tokens_out: 50\nstatus: active\n";
+        let yaml = "session_id: s\ncwd: /tmp\nmodel: m\ncreated_at: '2025-01-01T00:00:00Z'\nupdated_at: '2025-01-01T00:00:00Z'\nturn_count: 5\ntotal_tokens_in: 100\ntotal_tokens_out: 50\nstatus: active\nprojection_revision: 0\nconfig_mutation_revision: 0\n";
         let ws: WorkspaceMetadata = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(ws.last_scenario_change_turn, None);
         assert_eq!(ws.last_token_budget_direction, 0);
@@ -1760,8 +1976,119 @@ mod tests {
         let session_id = "workspace-update-existing-missing";
         let dir = workspace_dir_for(session_id);
 
-        assert!(!update_existing_workspace(session_id, |_| {}).unwrap());
+        assert!(
+            update_existing_workspace(session_id, |_| {})
+                .unwrap()
+                .is_none()
+        );
         assert!(!dir.exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn workspace_writers_advance_owner_revision_without_rewriting_rejections() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = JournalDirGuard::new(&sessions_dir);
+        let session_id = "workspace-config-rejected";
+        write_workspace(&WorkspaceMetadata::new(session_id, "gpt-5")).unwrap();
+        assert_eq!(read_workspace(session_id).unwrap().projection_revision, 1);
+        let applied = update_existing_workspace_config(session_id, |workspace| {
+            workspace.tuned_config_json = Some("owned".to_string());
+            Ok::<_, std::io::Error>(std::ops::ControlFlow::<(), _>::Continue(()))
+        })
+        .unwrap();
+        let WorkspaceConfigMutationOutcome::Applied {
+            revision,
+            workspace: committed,
+            ..
+        } = applied
+        else {
+            panic!("config mutation must apply")
+        };
+        assert_eq!(revision, 1);
+        assert_eq!(committed.projection_revision, 2);
+        assert_eq!(
+            serde_json::to_value(&*committed).unwrap(),
+            serde_json::to_value(read_workspace(session_id).unwrap()).unwrap()
+        );
+        let path = workspace_file_path(session_id).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let outcome: WorkspaceConfigMutationOutcome<(), &str> =
+            update_existing_workspace_config(session_id, |workspace| {
+                workspace.tuned_config_json = Some("must-not-persist".to_string());
+                Ok(std::ops::ControlFlow::Break("stale revision"))
+            })
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WorkspaceConfigMutationOutcome::Rejected("stale revision")
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), before);
+
+        let mut stale_whole_snapshot = WorkspaceMetadata::new(session_id, "gpt-5");
+        stale_whole_snapshot.status = "completed".to_string();
+        write_workspace(&stale_whole_snapshot).unwrap();
+        assert_eq!(read_workspace(session_id).unwrap().projection_revision, 3);
+        let committed = update_existing_workspace(session_id, |workspace| {
+            workspace.tuned_config_json = Some("generic-writer-must-not-own-config".to_string());
+            workspace.config_mutation_revision = 0;
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(committed.projection_revision, 4);
+        assert_eq!(
+            serde_json::to_value(&committed).unwrap(),
+            serde_json::to_value(read_workspace(session_id).unwrap()).unwrap()
+        );
+        update_workspace(
+            session_id,
+            || panic!("workspace exists"),
+            |workspace| workspace.summary = Some("updated".into()),
+        )
+        .unwrap();
+        let workspace = read_workspace(session_id).unwrap();
+        assert_eq!(workspace.projection_revision, 5);
+        assert_eq!(workspace.status, "completed");
+        assert_eq!(workspace.tuned_config_json.as_deref(), Some("owned"));
+        assert_eq!(workspace.config_mutation_revision, 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn post_rename_sync_failure_returns_unknown_with_lock_scoped_readback() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = JournalDirGuard::new(&sessions_dir);
+        let session_id = "workspace-config-sync-unknown";
+        write_workspace(&WorkspaceMetadata::new(session_id, "gpt-5")).unwrap();
+        fail_next_workspace_commit_sync();
+
+        let outcome = update_existing_workspace_config(session_id, |workspace| {
+            workspace.tuned_config_json = Some("candidate".to_string());
+            Ok::<_, std::io::Error>(std::ops::ControlFlow::<(), _>::Continue("candidate"))
+        })
+        .unwrap();
+
+        let WorkspaceConfigMutationOutcome::OutcomeUnknown {
+            value,
+            revision,
+            observed,
+            reason,
+        } = outcome
+        else {
+            panic!("post-rename sync failure must remain outcome-unknown");
+        };
+        assert_eq!(value, "candidate");
+        assert_eq!(revision, 1);
+        let observed = observed.expect("renamed candidate must be readable under the same lock");
+        assert_eq!(observed.config_mutation_revision, 1);
+        assert_eq!(observed.tuned_config_json.as_deref(), Some("candidate"));
+        assert!(reason.contains("injected workspace commit directory sync failure"));
     }
 
     #[test]

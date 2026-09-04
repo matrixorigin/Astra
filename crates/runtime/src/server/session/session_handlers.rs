@@ -4,7 +4,9 @@ use crate::server::*;
 use astra_core::{STATUS_CANCELLED, error_response, is_duplicate_key_error};
 use astra_services::context_manifest::session_artifact_raw_payload_is_available;
 use astra_services::session_restore::SessionRestoreService;
-use astra_services::session_workspace::{WORKSPACE_METADATA_ARTIFACT_KIND, WorkspaceMetadata};
+use astra_services::session_workspace::{
+    WORKSPACE_METADATA_ARTIFACT_KIND, WORKSPACE_METADATA_PROJECTION_ID, WorkspaceMetadata,
+};
 use astra_services::{
     DatabaseSessionArtifactStore, DatabaseStateProjectionStore, PresignedArtifactDownload,
     SessionArtifactJsonStore, StoredSessionArtifact, UserAnchorMemoryItem,
@@ -1244,7 +1246,7 @@ async fn load_workspace_authority(
     session_id: &str,
 ) -> Result<Option<WorkspaceAuthorityResponse>, (StatusCode, Json<ErrorResponse>)> {
     let artifact = session_artifact_store(state)?
-        .load_latest_json_artifact(user_id, session_id, WORKSPACE_METADATA_ARTIFACT_KIND)
+        .load_json_artifact(user_id, session_id, WORKSPACE_METADATA_PROJECTION_ID)
         .await
         .map_err(internal_error)?;
     artifact
@@ -4960,7 +4962,9 @@ mod tests {
                 "total_tokens_in": 10,
                 "total_tokens_out": 20,
                 "status": "active",
-                "checkpoints": []
+                "checkpoints": [],
+                "projection_revision": 1,
+                "config_mutation_revision": 0
             }),
             metadata: None,
             retention_policy: None,

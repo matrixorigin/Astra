@@ -1192,19 +1192,18 @@ impl ToolHandler<RuntimeToolExecutor> for RollbackSessionStateToolHandler {
         tool_result_from_output(
             tool_session_state_rollback::execute_rollback_session_state(
                 RollbackSessionStateContext {
-                    journal: context.session_state_journal.as_ref(),
+                    journal: context.session_state_journal.clone(),
                     current_turn_index: context.journal_turn_index.load(Ordering::Relaxed),
                     restore_context: SessionStateRestoreContext {
-                        user_id: &context.user_id,
-                        session_id: &context.session_id,
-                        observability_session: context.observability_session.as_ref(),
+                        user_id: context.user_id.clone(),
+                        session_id: context.session_id.clone(),
+                        observability_session: context.observability_session.clone(),
                     },
                 },
-                args,
-                || {
-                    context
-                        .publish_current_workspace("runtime_tool_executor:rollback_session_state")
-                },
+                args.clone(),
+                context.owned_current_workspace_publisher(
+                    "runtime_tool_executor:rollback_session_state",
+                ),
             )
             .await,
         )

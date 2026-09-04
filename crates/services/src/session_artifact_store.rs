@@ -130,6 +130,15 @@ pub enum SessionArtifactStoreError {
         value: String,
         reason: &'static str,
     },
+
+    #[error("workspace projection revision mismatch: argument={expected}, content={actual:?}")]
+    InvalidWorkspaceProjectionRevision { expected: u64, actual: Option<u64> },
+
+    #[error("workspace projection revision {revision} has conflicting content")]
+    WorkspaceProjectionRevisionConflict { revision: u64 },
+
+    #[error("artifact store does not support monotonic workspace projections")]
+    MonotonicWorkspaceProjectionUnsupported,
 }
 
 pub const LOCAL_SESSION_LAYOUT_VERSION: &str = "v1";
@@ -398,6 +407,16 @@ pub trait SessionArtifactJsonStore: Send + Sync {
         record: SessionArtifactJsonRecord,
     ) -> Result<StoredSessionArtifact, SessionArtifactStoreError>;
 
+    /// Idempotently publishes the full workspace projection without allowing
+    /// an older snapshot to replace a newer logical revision.
+    async fn upsert_monotonic_workspace_projection(
+        &self,
+        _record: SessionArtifactJsonRecord,
+        _projection_revision: u64,
+    ) -> Result<StoredSessionArtifact, SessionArtifactStoreError> {
+        Err(SessionArtifactStoreError::MonotonicWorkspaceProjectionUnsupported)
+    }
+
     /// Atomically merges a composite-snapshot index projection with the
     /// currently stored value. Implementations backed by shared storage must
     /// serialize the read/merge/write operation; replacing the whole
@@ -523,6 +542,171 @@ impl DatabaseSessionArtifactStore {
             session_id: session_id.to_string(),
             user_id: user_id.to_string(),
         })
+    }
+
+    async fn upsert_projection(
+        &self,
+        record: SessionArtifactJsonRecord,
+        monotonic_revision: Option<u64>,
+    ) -> Result<StoredSessionArtifact, SessionArtifactStoreError> {
+        validate_session_id(&record.session_id)?;
+        if !is_valid_mutable_artifact_projection_id(&record.artifact_id) {
+            return Err(SessionArtifactStoreError::InvalidMutableProjectionId {
+                prefix: MUTABLE_ARTIFACT_PROJECTION_ID_PREFIX,
+                artifact_id: record.artifact_id,
+            });
+        }
+        if !record.references.is_empty() {
+            return Err(SessionArtifactStoreError::MutableProjectionReferencesUnsupported);
+        }
+        if let Some(expected) = monotonic_revision {
+            let actual = record
+                .content
+                .get("projection_revision")
+                .and_then(Value::as_u64);
+            if actual != Some(expected) {
+                return Err(
+                    SessionArtifactStoreError::InvalidWorkspaceProjectionRevision {
+                        expected,
+                        actual,
+                    },
+                );
+            }
+        }
+
+        let pool = self.get_pool().await?;
+        self.require_owned_session(&pool, &record.user_id, &record.session_id)
+            .await?;
+        let content_json = serde_json::to_string(&record.content)?;
+        let metadata_json = record.metadata.as_ref().map(Value::to_string);
+        let turn = encode_counter(record.turn, SessionArtifactStoreError::TurnOverflow)?;
+        let round = encode_counter(record.round, SessionArtifactStoreError::RoundOverflow)?;
+        let mut tx = pool.begin().await?;
+        query(
+            "INSERT INTO session_artifacts \
+             (artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
+              content_json, metadata, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6)) \
+             ON DUPLICATE KEY UPDATE updated_at = updated_at",
+        )
+        .bind(&record.artifact_id)
+        .bind(&record.session_id)
+        .bind(&record.user_id)
+        .bind(&record.artifact_kind)
+        .bind(record.source.as_deref())
+        .bind(turn)
+        .bind(round)
+        .bind(&content_json)
+        .bind(&metadata_json)
+        .execute(&mut *tx)
+        .await?;
+
+        let existing = query(
+            "SELECT artifact_kind, referenced_by_manifest_count, \
+                    referenced_by_state_items_count, referenced_by_citation_count \
+             FROM session_artifacts \
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ? FOR UPDATE",
+        )
+        .bind(&record.user_id)
+        .bind(&record.session_id)
+        .bind(&record.artifact_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let existing_kind = existing.string_column("artifact_kind")?;
+        if existing_kind != record.artifact_kind {
+            return Err(
+                SessionArtifactStoreError::MutableProjectionIdentityConflict {
+                    artifact_id: record.artifact_id,
+                    existing_kind,
+                    requested_kind: record.artifact_kind,
+                },
+            );
+        }
+        let counter_references = [
+            "referenced_by_manifest_count",
+            "referenced_by_state_items_count",
+            "referenced_by_citation_count",
+        ]
+        .into_iter()
+        .try_fold(0_i64, |total, column| {
+            existing.i64_column(column).map(|value| total + value)
+        })?;
+        let durable_references: i64 = query_scalar(
+            "SELECT COUNT(*) FROM session_artifact_references \
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        )
+        .bind(&record.user_id)
+        .bind(&record.session_id)
+        .bind(&record.artifact_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if counter_references != 0 || durable_references != 0 {
+            return Err(SessionArtifactStoreError::MutableProjectionReferencesUnsupported);
+        }
+
+        let mut update = String::from(
+            "UPDATE session_artifacts \
+             SET source = ?, turn = ?, round = ?, content_json = ?, metadata = ?, \
+                 status = 'active', updated_at = CURRENT_TIMESTAMP(6) \
+             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
+        );
+        if monotonic_revision.is_some() {
+            update.push_str(
+                " AND CAST(JSON_UNQUOTE(JSON_EXTRACT(content_json, '$.projection_revision')) AS UNSIGNED) \
+                      < CAST(? AS UNSIGNED)",
+            );
+        }
+        let mut update = query(&update)
+            .bind(record.source.as_deref())
+            .bind(turn)
+            .bind(round)
+            .bind(&content_json)
+            .bind(metadata_json)
+            .bind(&record.user_id)
+            .bind(&record.session_id)
+            .bind(&record.artifact_id);
+        if let Some(revision) = monotonic_revision {
+            update = update.bind(revision.to_string());
+        }
+        update.execute(&mut *tx).await?;
+        tx.commit().await?;
+
+        let stored = self
+            .load_json_artifact(&record.user_id, &record.session_id, &record.artifact_id)
+            .await?
+            .ok_or_else(|| SessionArtifactStoreError::ArtifactNotFound {
+                artifact_id: record.artifact_id.clone(),
+                session_id: record.session_id.clone(),
+                user_id: record.user_id.clone(),
+            })?;
+        if let Some(incoming) = monotonic_revision {
+            let stored_revision = stored
+                .content
+                .get("projection_revision")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| SessionArtifactStoreError::InvalidDatabaseValue {
+                    artifact_id: record.artifact_id.clone(),
+                    column: "content_json",
+                    value: stored.content.to_string(),
+                    reason: "workspace projection revision is missing or invalid",
+                })?;
+            if stored_revision == incoming && stored.content != record.content {
+                return Err(
+                    SessionArtifactStoreError::WorkspaceProjectionRevisionConflict {
+                        revision: incoming,
+                    },
+                );
+            }
+            if stored_revision < incoming {
+                return Err(SessionArtifactStoreError::InvalidDatabaseValue {
+                    artifact_id: record.artifact_id,
+                    column: "content_json",
+                    value: stored_revision.to_string(),
+                    reason: "monotonic workspace projection update did not advance",
+                });
+            }
+        }
+        Ok(stored)
     }
 }
 
@@ -919,123 +1103,16 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         &self,
         record: SessionArtifactJsonRecord,
     ) -> Result<StoredSessionArtifact, SessionArtifactStoreError> {
-        validate_session_id(&record.session_id)?;
-        if record.artifact_id.trim().is_empty() {
-            return Err(SessionArtifactStoreError::InvalidArtifactId(
-                record.artifact_id,
-            ));
-        }
-        if !is_valid_mutable_artifact_projection_id(&record.artifact_id) {
-            return Err(SessionArtifactStoreError::InvalidMutableProjectionId {
-                prefix: MUTABLE_ARTIFACT_PROJECTION_ID_PREFIX,
-                artifact_id: record.artifact_id,
-            });
-        }
-        if !record.references.is_empty() {
-            return Err(SessionArtifactStoreError::MutableProjectionReferencesUnsupported);
-        }
+        self.upsert_projection(record, None).await
+    }
 
-        let pool = self.get_pool().await?;
-        self.require_owned_session(&pool, &record.user_id, &record.session_id)
-            .await?;
-        let content_json = serde_json::to_string(&record.content)?;
-        let metadata_json = record.metadata.as_ref().map(serde_json::Value::to_string);
-        let turn = encode_counter(record.turn, SessionArtifactStoreError::TurnOverflow)?;
-        let round = encode_counter(record.round, SessionArtifactStoreError::RoundOverflow)?;
-        let mut tx = pool.begin().await?;
-        // Claim the composite identity before inspecting it. The duplicate-key
-        // branch assigns a non-key column to itself because MatrixOne rejects
-        // assignments to primary/unique columns even when the value is
-        // unchanged. Do not use INSERT IGNORE here: it can suppress unrelated
-        // data errors. Concurrent first writers still serialize on the unique
-        // insert before the row lock below.
-        query(
-            "INSERT INTO session_artifacts \
-             (artifact_id, session_id, user_id, artifact_kind, source, turn, round, \
-              content_json, metadata, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6)) \
-             ON DUPLICATE KEY UPDATE updated_at = updated_at",
-        )
-        .bind(&record.artifact_id)
-        .bind(&record.session_id)
-        .bind(&record.user_id)
-        .bind(&record.artifact_kind)
-        .bind(record.source.as_deref())
-        .bind(turn)
-        .bind(round)
-        .bind(&content_json)
-        .bind(&metadata_json)
-        .execute(&mut *tx)
-        .await?;
-
-        let existing = query(
-            "SELECT artifact_kind, referenced_by_manifest_count, \
-                    referenced_by_state_items_count, referenced_by_citation_count \
-             FROM session_artifacts \
-             WHERE user_id = ? AND session_id = ? AND artifact_id = ? FOR UPDATE",
-        )
-        .bind(&record.user_id)
-        .bind(&record.session_id)
-        .bind(&record.artifact_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        let existing_kind = existing.string_column("artifact_kind")?;
-        if existing_kind != record.artifact_kind {
-            return Err(
-                SessionArtifactStoreError::MutableProjectionIdentityConflict {
-                    artifact_id: record.artifact_id,
-                    existing_kind,
-                    requested_kind: record.artifact_kind,
-                },
-            );
-        }
-        let counter_references = [
-            "referenced_by_manifest_count",
-            "referenced_by_state_items_count",
-            "referenced_by_citation_count",
-        ]
-        .into_iter()
-        .try_fold(0_i64, |total, column| {
-            existing.i64_column(column).map(|value| total + value)
-        })?;
-        let durable_references: i64 = query_scalar(
-            "SELECT COUNT(*) FROM session_artifact_references \
-             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
-        )
-        .bind(&record.user_id)
-        .bind(&record.session_id)
-        .bind(&record.artifact_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        if counter_references != 0 || durable_references != 0 {
-            return Err(SessionArtifactStoreError::MutableProjectionReferencesUnsupported);
-        }
-
-        query(
-            "UPDATE session_artifacts \
-             SET source = ?, turn = ?, round = ?, content_json = ?, metadata = ?, \
-                 status = 'active', updated_at = CURRENT_TIMESTAMP(6) \
-             WHERE user_id = ? AND session_id = ? AND artifact_id = ?",
-        )
-        .bind(record.source.as_deref())
-        .bind(turn)
-        .bind(round)
-        .bind(content_json)
-        .bind(metadata_json)
-        .bind(&record.user_id)
-        .bind(&record.session_id)
-        .bind(&record.artifact_id)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-
-        self.load_json_artifact(&record.user_id, &record.session_id, &record.artifact_id)
-            .await?
-            .ok_or(SessionArtifactStoreError::ArtifactNotFound {
-                artifact_id: record.artifact_id,
-                session_id: record.session_id,
-                user_id: record.user_id,
-            })
+    async fn upsert_monotonic_workspace_projection(
+        &self,
+        record: SessionArtifactJsonRecord,
+        projection_revision: u64,
+    ) -> Result<StoredSessionArtifact, SessionArtifactStoreError> {
+        self.upsert_projection(record, Some(projection_revision))
+            .await
     }
 
     async fn merge_composite_snapshot_index_projection(

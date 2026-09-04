@@ -912,7 +912,10 @@ mod tests {
         assert_eq!(ws.last_scenario_change_turn, Some(11));
         assert_eq!(ws.last_token_budget_direction, -1);
         assert_eq!(ws.last_token_budget_change_turn, Some(7));
-        assert!(ws.tuned_config_json.is_some());
+        assert!(
+            ws.tuned_config_json.is_none(),
+            "workspace config remains authoritative during recovery projection"
+        );
     }
 
     #[serial_test::serial]

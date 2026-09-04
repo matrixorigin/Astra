@@ -15,7 +15,6 @@ pub(crate) fn sync_session_state_to_workspace(
             ws.last_scenario_change_turn = guard.last_scenario_change_turn;
             ws.last_token_budget_direction = guard.last_token_budget_direction;
             ws.last_token_budget_change_turn = guard.last_token_budget_change_turn;
-            ws.tuned_config_json = serde_json::to_string(&guard.config).ok();
         }
     }
 }

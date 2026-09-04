@@ -15,7 +15,9 @@
 //! delegates runtime-executor tools through the bound provider route.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -436,7 +438,7 @@ pub(crate) struct SessionConfigInner {
 
 /// Self-modification session configuration state.
 pub(crate) struct SessionConfigState {
-    pub(crate) inner: Mutex<SessionConfigInner>,
+    pub(crate) inner: Arc<tokio::sync::Mutex<SessionConfigInner>>,
 }
 
 /// Trusted, process-local handle to the durable primary attempt owned by this
@@ -454,9 +456,9 @@ pub(super) struct ActivePrimaryWorkAttempt {
 impl SessionConfigState {
     fn new() -> Self {
         Self {
-            inner: Mutex::new(SessionConfigInner {
+            inner: Arc::new(tokio::sync::Mutex::new(SessionConfigInner {
                 mutation_counter: (0, 0),
-            }),
+            })),
         }
     }
 }
@@ -977,17 +979,38 @@ impl RuntimeToolExecutor {
         &self.user_id
     }
 
-    pub(super) fn adjust_config(&self, args: &Value) -> String {
+    pub(super) async fn adjust_config(&self, args: &Value) -> String {
         crate::server::tool_session_config::execute_adjust_config(
-            &self.user_id,
-            &self.session_id,
-            self.observability_session.as_ref(),
-            &self.session_config.inner,
-            args,
-            || self.publish_current_workspace("adjust_config"),
-            &self.session_state_journal,
+            self.user_id.clone(),
+            self.session_id.clone(),
+            self.observability_session.clone(),
+            self.session_config.inner.clone(),
+            args.clone(),
+            {
+                let store = self.session_artifact_store.clone();
+                let user_id = self.user_id.clone();
+                move |workspace| {
+                    let store = store.clone();
+                    let user_id = user_id.clone();
+                    async move {
+                        let Some(store) = store else {
+                            return Ok(());
+                        };
+                        astra_services::session_workspace::persist_remote_workspace(
+                            &workspace,
+                            &user_id,
+                            store.as_ref(),
+                        )
+                        .await
+                        .map(|_| ())
+                        .map_err(|error| format!("adjust_config: {error}"))
+                    }
+                }
+            },
+            self.session_state_journal.clone(),
             self.journal_turn_index.load(Ordering::Relaxed),
         )
+        .await
     }
 
     pub(super) fn compress_context(&self, args: &Value) -> String {
@@ -2559,38 +2582,40 @@ impl RuntimeToolExecutor {
         request
     }
 
-    pub(crate) fn publish_current_workspace(&self, source: &str) -> Result<(), String> {
-        let Some(store) = self.session_artifact_store.clone() else {
-            return Ok(());
-        };
-        let workspace = astra_services::session_workspace::read_workspace(&self.session_id)
+    async fn publish_current_workspace_owned(
+        store: Option<Arc<dyn SessionArtifactJsonStore>>,
+        user_id: String,
+        session_id: String,
+        source: String,
+    ) -> Result<(), String> {
+        let Some(store) = store else { return Ok(()) };
+        let workspace = astra_services::session_workspace::read_workspace(&session_id)
             .map_err(|error| format!("{source}: {error}"))?;
+        astra_services::session_workspace::persist_remote_workspace(
+            &workspace,
+            &user_id,
+            store.as_ref(),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("{source}: {error}"))
+    }
+
+    pub(crate) fn owned_current_workspace_publisher(
+        &self,
+        source: &'static str,
+    ) -> impl FnOnce() -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + 'static
+    {
+        let store = self.session_artifact_store.clone();
         let user_id = self.user_id.clone();
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => handle.block_on(async {
-                astra_services::session_workspace::persist_remote_workspace(
-                    &workspace,
-                    &user_id,
-                    store.as_ref(),
-                )
-                .await
-                .map(|_| ())
-                .map_err(|error| format!("{source}: {error}"))
-            }),
-            Err(_) => tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| error.to_string())?
-                .block_on(async {
-                    astra_services::session_workspace::persist_remote_workspace(
-                        &workspace,
-                        &user_id,
-                        store.as_ref(),
-                    )
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| format!("{source}: {error}"))
-                }),
+        let session_id = self.session_id.clone();
+        move || {
+            Box::pin(Self::publish_current_workspace_owned(
+                store,
+                user_id,
+                session_id,
+                source.to_string(),
+            ))
         }
     }
 
@@ -4466,29 +4491,26 @@ mod tests {
         );
     }
 
+    #[derive(Clone)]
+    struct ProjectionWriteBarrier {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        completed: Arc<tokio::sync::Notify>,
+    }
+
     #[derive(Default)]
     struct RecordingResultArtifactStore {
         seen: StdMutex<Option<astra_services::SessionArtifactJsonRecord>>,
         fail_persist: bool,
+        projection_barrier: StdMutex<Option<ProjectionWriteBarrier>>,
     }
 
-    #[async_trait]
-    impl SessionArtifactJsonStore for RecordingResultArtifactStore {
-        async fn persist_json_artifact(
-            &self,
+    impl RecordingResultArtifactStore {
+        fn stored(
             record: astra_services::SessionArtifactJsonRecord,
-        ) -> Result<astra_services::StoredSessionArtifact, astra_services::SessionArtifactStoreError>
-        {
-            if self.fail_persist {
-                return Err(
-                    astra_services::SessionArtifactStoreError::InvalidArtifactId(
-                        "injected artifact failure".to_string(),
-                    ),
-                );
-            }
-            *self.seen.lock().unwrap() = Some(record.clone());
-            Ok(astra_services::StoredSessionArtifact {
-                artifact_id: "artifact-result-1".to_string(),
+        ) -> astra_services::StoredSessionArtifact {
+            astra_services::StoredSessionArtifact {
+                artifact_id: record.artifact_id.clone(),
                 session_id: record.session_id,
                 user_id: record.user_id,
                 artifact_kind: record.artifact_kind,
@@ -4505,7 +4527,31 @@ mod tests {
                 referenced_by_citation_count: 0,
                 referenced_by_durable_count: 0,
                 created_at: None,
-            })
+            }
+        }
+
+        fn block_next_workspace_projection(&self, barrier: ProjectionWriteBarrier) {
+            *self.projection_barrier.lock().unwrap() = Some(barrier);
+        }
+    }
+
+    #[async_trait]
+    impl SessionArtifactJsonStore for RecordingResultArtifactStore {
+        async fn persist_json_artifact(
+            &self,
+            record: astra_services::SessionArtifactJsonRecord,
+        ) -> Result<astra_services::StoredSessionArtifact, astra_services::SessionArtifactStoreError>
+        {
+            tokio::task::yield_now().await;
+            if self.fail_persist {
+                return Err(
+                    astra_services::SessionArtifactStoreError::InvalidArtifactId(
+                        "injected artifact failure".to_string(),
+                    ),
+                );
+            }
+            *self.seen.lock().unwrap() = Some(record.clone());
+            Ok(Self::stored(record))
         }
 
         async fn upsert_json_artifact_projection(
@@ -4514,6 +4560,46 @@ mod tests {
         ) -> Result<astra_services::StoredSessionArtifact, astra_services::SessionArtifactStoreError>
         {
             self.persist_json_artifact(record).await
+        }
+
+        async fn upsert_monotonic_workspace_projection(
+            &self,
+            record: astra_services::SessionArtifactJsonRecord,
+            projection_revision: u64,
+        ) -> Result<astra_services::StoredSessionArtifact, astra_services::SessionArtifactStoreError>
+        {
+            tokio::task::yield_now().await;
+            let barrier = self.projection_barrier.lock().unwrap().take();
+            if let Some(barrier) = &barrier {
+                barrier.entered.notify_one();
+                barrier.release.notified().await;
+            }
+            if self.fail_persist {
+                return Err(
+                    astra_services::SessionArtifactStoreError::InvalidArtifactId(
+                        "injected artifact failure".to_string(),
+                    ),
+                );
+            }
+            let mut seen = self.seen.lock().unwrap();
+            if let Some(current) = seen.as_ref() {
+                let revision = current.content["projection_revision"].as_u64().unwrap();
+                if revision > projection_revision {
+                    return Ok(Self::stored(current.clone()));
+                }
+                if revision == projection_revision && current.content != record.content {
+                    return Err(
+                        astra_services::SessionArtifactStoreError::WorkspaceProjectionRevisionConflict {
+                            revision,
+                        },
+                    );
+                }
+            }
+            *seen = Some(record.clone());
+            if let Some(barrier) = barrier {
+                barrier.completed.notify_one();
+            }
+            Ok(Self::stored(record))
         }
 
         async fn load_json_artifact(
@@ -4878,6 +4964,7 @@ mod tests {
         let store = Arc::new(RecordingResultArtifactStore {
             seen: StdMutex::new(None),
             fail_persist: true,
+            projection_barrier: StdMutex::new(None),
         });
         let exec = exec.with_test_session_artifact_store(store.clone());
         let identity = astra_turn_types::ToolInvocationIdentity::new(
@@ -13030,40 +13117,138 @@ esac
         );
     }
 
-    /// The old pattern (nested current_thread runtime inside block_in_place)
-    /// deadlocks when the future calls `tokio::spawn` on a current_thread
-    /// parent runtime — the only worker thread is stuck inside the nested
-    /// runtime's block_on, so the spawned task can never run.
-    #[test]
-    fn handle_block_on_inside_block_in_place_completes() {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicBool, Ordering};
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
+    async fn session_config_publish_awaits_store_on_current_thread_runtime() {
+        let sessions = tempfile::TempDir::new().unwrap();
+        let _journal_guard = astra_services::session_journal::JournalDirGuard::new(sessions.path());
+        astra_services::session_workspace::write_workspace(
+            &astra_services::session_workspace::WorkspaceMetadata::new(
+                "test-session",
+                "test-model",
+            ),
+        )
+        .unwrap();
+        let (mut exec, _workspace) = test_executor();
+        exec.set_observability_session(Arc::new(std::sync::RwLock::new(
+            crate::observability::ObservabilitySession::new_simple("test-session"),
+        )));
+        let store = Arc::new(RecordingResultArtifactStore::default());
+        let exec = exec.with_test_session_artifact_store(store.clone());
+        let top_k = astra_config::RuntimeConfig::load().memory.retrieval_top_k;
+        let changed = if top_k == 20 { 19 } else { top_k + 1 };
 
-        let done = Arc::new(AtomicBool::new(false));
-        let done2 = done.clone();
-
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-
-        rt.block_on(async {
-            tokio::task::block_in_place(|| {
-                let handle = tokio::runtime::Handle::current();
-                handle.block_on(async {
-                    tokio::spawn(async move {
-                        done2.store(true, Ordering::SeqCst);
-                    })
-                    .await
-                    .unwrap();
-                });
-            });
-        });
-
-        assert!(
-            done.load(Ordering::SeqCst),
-            "Handle::block_on inside block_in_place should allow spawned tasks to complete"
+        let result = crate::server::tool_session_runtime::execute_with_executor(
+            &exec,
+            &json!({
+                "action": "config",
+                "path": "memory.retrieval_top_k",
+                "value": changed,
+                "force": true,
+            }),
+        )
+        .await;
+        assert!(!result.is_error, "{result:?}");
+        assert_eq!(
+            store.seen.lock().unwrap().as_ref().unwrap().artifact_kind,
+            astra_services::session_workspace::WORKSPACE_METADATA_ARTIFACT_KIND
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rollback_publish_settlement_survives_outer_cancellation() {
+        let sessions = tempfile::TempDir::new().unwrap();
+        let _journal_guard = astra_services::session_journal::JournalDirGuard::new(sessions.path());
+        astra_services::session_workspace::write_workspace(
+            &astra_services::session_workspace::WorkspaceMetadata::new(
+                "test-session",
+                "test-model",
+            ),
+        )
+        .unwrap();
+        let (mut exec, _workspace) = test_executor();
+        exec.set_observability_session(Arc::new(std::sync::RwLock::new(
+            crate::observability::ObservabilitySession::new_simple("test-session"),
+        )));
+        let store = Arc::new(RecordingResultArtifactStore::default());
+        let exec = exec.with_test_session_artifact_store(store.clone());
+        let baseline = astra_config::RuntimeConfig::load().memory.retrieval_top_k;
+        let changed = if baseline == 20 { 19 } else { baseline + 1 };
+        let config_result = crate::server::tool_session_runtime::execute_with_executor(
+            &exec,
+            &json!({
+                "action": "config",
+                "path": "memory.retrieval_top_k",
+                "value": changed,
+                "force": true,
+            }),
+        )
+        .await;
+        assert!(!config_result.is_error, "{config_result:?}");
+        assert_eq!(
+            tool_session_state_rollback::entries(&exec.session_state_journal).len(),
+            1
+        );
+
+        let barrier = ProjectionWriteBarrier {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+            completed: Arc::new(tokio::sync::Notify::new()),
+        };
+        store.block_next_workspace_projection(barrier.clone());
+        let caller = tokio::spawn(tool_session_state_rollback::execute_rollback_session_state(
+            RollbackSessionStateContext {
+                journal: exec.session_state_journal.clone(),
+                current_turn_index: exec.journal_turn_index.load(Ordering::Relaxed),
+                restore_context: SessionStateRestoreContext {
+                    user_id: exec.user_id.clone(),
+                    session_id: exec.session_id.clone(),
+                    observability_session: exec.observability_session.clone(),
+                },
+            },
+            json!({"scope": "current_turn"}),
+            exec.owned_current_workspace_publisher("rollback_session_state"),
+        ));
+
+        barrier.entered.notified().await;
+        caller.abort();
+        let error = caller.await.expect_err("outer caller must be cancelled");
+        assert!(error.is_cancelled());
+        barrier.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(1), barrier.completed.notified())
+            .await
+            .expect("owned rollback settlement must finish production publication");
+
+        let local = astra_services::session_workspace::read_workspace("test-session").unwrap();
+        let stored = store
+            .seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("stored workspace");
+        assert_eq!(
+            stored.artifact_id,
+            astra_services::session_workspace::WORKSPACE_METADATA_PROJECTION_ID
+        );
+        let remote: astra_services::session_workspace::WorkspaceMetadata =
+            serde_json::from_value(stored.content).unwrap();
+        assert_eq!(remote.projection_revision, local.projection_revision);
+        assert_eq!(remote.tuned_config_json, local.tuned_config_json);
+        assert_eq!(
+            crate::server::tool_session_config::effective_runtime_config(Some(&local))
+                .unwrap()
+                .memory
+                .retrieval_top_k,
+            baseline
+        );
+        assert_eq!(
+            crate::server::tool_session_config::effective_runtime_config(Some(&remote))
+                .unwrap()
+                .memory
+                .retrieval_top_k,
+            baseline
+        );
+        assert!(tool_session_state_rollback::entries(&exec.session_state_journal).is_empty());
     }
 }

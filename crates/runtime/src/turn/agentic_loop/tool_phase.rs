@@ -1700,19 +1700,19 @@ async fn finalize_server_rollback_boundary_with_authority(
             if session_state_entries_added > 0 {
                 let output = tool_session_state_rollback::execute_rollback_session_state(
                     tool_session_state_rollback::RollbackSessionStateContext {
-                        journal: executor.session_state_journal.as_ref(),
+                        journal: executor.session_state_journal.clone(),
                         current_turn_index: executor.journal_turn_index.load(Ordering::Relaxed),
                         restore_context: tool_session_state_rollback::SessionStateRestoreContext {
-                            user_id: executor.journal_user_id(),
-                            session_id: &executor.session_id,
-                            observability_session: executor.observability_session.as_ref(),
+                            user_id: executor.journal_user_id().to_string(),
+                            session_id: executor.session_id.clone(),
+                            observability_session: executor.observability_session.clone(),
                         },
                     },
-                    &serde_json::json!({
+                    serde_json::json!({
                         "scope": "current_turn",
                         "session_state_after_sequence": session_state_checkpoint,
                     }),
-                    || executor.publish_current_workspace("tool_phase:rollback_session_state"),
+                    executor.owned_current_workspace_publisher("tool_phase:rollback_session_state"),
                 )
                 .await;
                 Some(parse_server_rollback_output(

@@ -1,20 +1,22 @@
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
-use crate::server::tool_session_config::persist_config_override;
+use crate::server::tool_session_config::{ConfigRestoreOutcome, restore_config_override};
 
 #[derive(Debug, Clone)]
 pub(crate) enum SessionStateRollbackAction {
     ConfigOverride {
         path: String,
         old_value: Value,
-        snapshot: crate::observability::ObservabilitySessionRollbackSnapshot,
+        expected_revision: Arc<AtomicU64>,
     },
     Compression {
         turn: u32,
-        snapshot: crate::observability::ObservabilitySessionRollbackSnapshot,
+        snapshot: Box<crate::observability::ObservabilitySessionRollbackSnapshot>,
     },
 }
 
@@ -27,17 +29,17 @@ pub(crate) struct SessionStateRollbackEntry {
     pub(crate) action: SessionStateRollbackAction,
 }
 
-pub(crate) struct SessionStateRestoreContext<'a> {
-    pub(crate) user_id: &'a str,
-    pub(crate) session_id: &'a str,
+pub(crate) struct SessionStateRestoreContext {
+    pub(crate) user_id: String,
+    pub(crate) session_id: String,
     pub(crate) observability_session:
-        Option<&'a Arc<RwLock<crate::observability::ObservabilitySession>>>,
+        Option<Arc<RwLock<crate::observability::ObservabilitySession>>>,
 }
 
-pub(crate) struct RollbackSessionStateContext<'a> {
-    pub(crate) journal: &'a Mutex<SessionStateRollbackJournal>,
+pub(crate) struct RollbackSessionStateContext {
+    pub(crate) journal: Arc<Mutex<SessionStateRollbackJournal>>,
     pub(crate) current_turn_index: u32,
-    pub(crate) restore_context: SessionStateRestoreContext<'a>,
+    pub(crate) restore_context: SessionStateRestoreContext,
 }
 
 #[derive(Debug, Default)]
@@ -236,8 +238,16 @@ pub(crate) fn rollback_session_state_entry_json(entry: &SessionStateRollbackEntr
         );
     }
     match &entry.action {
-        SessionStateRollbackAction::ConfigOverride { path, .. } => {
+        SessionStateRollbackAction::ConfigOverride {
+            path,
+            expected_revision,
+            ..
+        } => {
             value.insert("path".to_string(), Value::String(path.clone()));
+            value.insert(
+                "expected_revision".to_string(),
+                Value::from(expected_revision.load(Ordering::Relaxed)),
+            );
         }
         SessionStateRollbackAction::Compression { turn, .. } => {
             value.insert(
@@ -250,38 +260,125 @@ pub(crate) fn rollback_session_state_entry_json(entry: &SessionStateRollbackEntr
 }
 
 pub(crate) async fn restore_entry(
-    context: &SessionStateRestoreContext<'_>,
+    context: &SessionStateRestoreContext,
     entry: &SessionStateRollbackEntry,
-) -> Result<(), String> {
+    chained_config_revision: Option<u64>,
+) -> Result<Option<u64>, String> {
     match &entry.action {
         SessionStateRollbackAction::ConfigOverride {
             path,
             old_value,
-            snapshot,
+            expected_revision,
         } => {
-            restore_observability_snapshot(context.observability_session, snapshot)?;
-            persist_config_override(
-                context.user_id,
-                context.session_id,
+            let expected = chained_config_revision
+                .unwrap_or_else(|| expected_revision.load(Ordering::Relaxed));
+            let outcome = restore_config_override(
+                &context.user_id,
+                &context.session_id,
                 path,
                 old_value.clone(),
+                expected,
                 "tool_session_state_rollback:restore_entry",
-            )
-            .map_err(|error| {
-                format!("failed to persist restored config override for {path}: {error}")
-            })
+            )?;
+            settle_config_restore(context, path, expected_revision, expected, outcome)
         }
         SessionStateRollbackAction::Compression { snapshot, .. } => {
-            restore_observability_snapshot(context.observability_session, snapshot)
+            restore_observability_snapshot(context.observability_session.as_ref(), snapshot)?;
+            Ok(chained_config_revision)
         }
     }
 }
 
-pub(crate) async fn execute_rollback_session_state(
-    context: RollbackSessionStateContext<'_>,
-    args: &Value,
-    publish_current_workspace: impl FnOnce() -> Result<(), String>,
-) -> String {
+fn settle_config_restore(
+    context: &SessionStateRestoreContext,
+    path: &str,
+    owner_revision: &AtomicU64,
+    expected_revision: u64,
+    outcome: ConfigRestoreOutcome,
+) -> Result<Option<u64>, String> {
+    match outcome {
+        ConfigRestoreOutcome::Applied { config, revision } => {
+            let Some(observability_session) = context.observability_session.as_ref() else {
+                return Err("No observability session available".to_string());
+            };
+            observability_session
+                .write()
+                .map_err(|_| "Failed to acquire observability session".to_string())?
+                .config = *config;
+            Ok(Some(revision))
+        }
+        ConfigRestoreOutcome::Rejected { current_revision } => Err(format!(
+            "config rollback revision conflict for {path}: expected {expected_revision}, current {current_revision}",
+        )),
+        ConfigRestoreOutcome::OutcomeUnknown {
+            revision,
+            reason,
+            observed_config,
+            retry_revision,
+        } => {
+            if let Some(config) = observed_config
+                && let Some(observability_session) = context.observability_session.as_ref()
+            {
+                observability_session
+                    .write()
+                    .map_err(|_| "Failed to acquire observability session".to_string())?
+                    .config = *config;
+            }
+            if let Some(retry_revision) = retry_revision {
+                owner_revision.store(retry_revision, Ordering::Relaxed);
+            }
+            Err(format!(
+                "config rollback outcome unknown for {path} at revision {revision}: {reason}"
+            ))
+        }
+    }
+}
+
+pub(crate) async fn execute_rollback_session_state<PublishWorkspace, PublishFuture>(
+    context: RollbackSessionStateContext,
+    args: Value,
+    publish_current_workspace: PublishWorkspace,
+) -> String
+where
+    PublishWorkspace: FnOnce() -> PublishFuture + Send + 'static,
+    PublishFuture: Future<Output = Result<(), String>> + Send + 'static,
+{
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return serde_json::json!({
+            "success": false,
+            "error": "rollback_session_state requires an active Tokio runtime",
+            "side_effects_maybe": false,
+        })
+        .to_string();
+    };
+    match handle
+        .spawn(execute_rollback_session_state_owned(
+            context,
+            args,
+            publish_current_workspace,
+        ))
+        .await
+    {
+        Ok(output) => output,
+        Err(error) => serde_json::json!({
+            "success": false,
+            "error": "rollback_session_state settlement task failed",
+            "detail": error.to_string().chars().take(240).collect::<String>(),
+            "side_effects_maybe": true,
+        })
+        .to_string(),
+    }
+}
+
+async fn execute_rollback_session_state_owned<PublishWorkspace, PublishFuture>(
+    context: RollbackSessionStateContext,
+    args: Value,
+    publish_current_workspace: PublishWorkspace,
+) -> String
+where
+    PublishWorkspace: FnOnce() -> PublishFuture,
+    PublishFuture: Future<Output = Result<(), String>>,
+{
     if args.get("after_sequence").is_some() {
         return serde_json::json!({
             "success": false,
@@ -313,7 +410,7 @@ pub(crate) async fn execute_rollback_session_state(
         .unwrap_or(0);
 
     match scope {
-        "list" => rollback_session_state_list(context.journal),
+        "list" => rollback_session_state_list(&context.journal),
         "turn" | "current_turn" => {
             rollback_session_state_turn(
                 context,
@@ -353,25 +450,31 @@ fn rollback_session_state_list(journal: &Mutex<SessionStateRollbackJournal>) -> 
     .to_string()
 }
 
-async fn rollback_session_state_turn(
-    context: RollbackSessionStateContext<'_>,
+async fn rollback_session_state_turn<PublishWorkspace, PublishFuture>(
+    context: RollbackSessionStateContext,
     scope: &str,
     explicit_turn_index: Option<u64>,
     checkpoint: u64,
-    publish_current_workspace: impl FnOnce() -> Result<(), String>,
-) -> String {
+    publish_current_workspace: PublishWorkspace,
+) -> String
+where
+    PublishWorkspace: FnOnce() -> PublishFuture,
+    PublishFuture: Future<Output = Result<(), String>>,
+{
     let turn_index = explicit_turn_index.unwrap_or(u64::from(context.current_turn_index)) as u32;
     let plan = if checkpoint > 0 {
-        restore_plan_for_turn_since(context.journal, turn_index, checkpoint)
+        restore_plan_for_turn_since(&context.journal, turn_index, checkpoint)
     } else {
-        restore_plan_for_turn(context.journal, turn_index)
+        restore_plan_for_turn(&context.journal, turn_index)
     };
     let mut restored = Vec::new();
     let mut failed = Vec::new();
+    let mut chained_config_revision = None;
     for entry in &plan {
-        match restore_entry(&context.restore_context, entry).await {
-            Ok(()) => {
-                remove_sequence(context.journal, entry.sequence);
+        match restore_entry(&context.restore_context, entry, chained_config_revision).await {
+            Ok(next_revision) => {
+                chained_config_revision = next_revision;
+                remove_sequence(&context.journal, entry.sequence);
                 restored.push(rollback_session_state_entry_json(entry));
             }
             Err(error) => {
@@ -381,13 +484,14 @@ async fn rollback_session_state_turn(
                     .unwrap_or_default();
                 failed_entry.insert("error".to_string(), Value::String(error));
                 failed.push(Value::Object(failed_entry));
+                break;
             }
         }
     }
     let success = !restored.is_empty() && failed.is_empty();
     let mut warnings = Vec::new();
-    if !restored.is_empty() && failed.is_empty() {
-        if let Err(error) = publish_current_workspace() {
+    if !plan.is_empty() {
+        if let Err(error) = publish_current_workspace().await {
             warnings.push(serde_json::json!({
                 "error": error,
                 "kind": "workspace_artifact_publish"
@@ -449,8 +553,105 @@ mod tests {
 
     use super::*;
 
-    fn observability_snapshot() -> crate::observability::ObservabilitySessionRollbackSnapshot {
-        crate::observability::ObservabilitySessionRollbackSnapshot {
+    const TOP_K_PATH: &str = "memory.retrieval_top_k";
+
+    struct ConfigRollbackFixture {
+        _guard: astra_services::session_journal::JournalDirGuard,
+        _temp: tempfile::TempDir,
+        session_id: &'static str,
+        observability: Arc<RwLock<crate::observability::ObservabilitySession>>,
+        baseline: u32,
+    }
+
+    impl ConfigRollbackFixture {
+        fn new(session_id: &'static str) -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let guard = astra_services::session_journal::JournalDirGuard::new(temp.path());
+            astra_services::session_workspace::write_workspace(
+                &astra_services::session_workspace::WorkspaceMetadata::new(session_id, "gpt-5"),
+            )
+            .unwrap();
+            let baseline = crate::server::tool_session_config::effective_runtime_config(Some(
+                &astra_services::session_workspace::read_workspace(session_id).unwrap(),
+            ))
+            .unwrap()
+            .memory
+            .retrieval_top_k;
+            Self {
+                _guard: guard,
+                _temp: temp,
+                session_id,
+                observability: Arc::new(RwLock::new(
+                    crate::observability::ObservabilitySession::new_simple(session_id),
+                )),
+                baseline,
+            }
+        }
+
+        fn apply(&self, value: u32, expected_revision: u64) -> u64 {
+            match restore_config_override(
+                "test-user",
+                self.session_id,
+                TOP_K_PATH,
+                serde_json::json!(value),
+                expected_revision,
+                "test:rollback-fixture",
+            )
+            .unwrap()
+            {
+                ConfigRestoreOutcome::Applied { revision, .. } => revision,
+                _ => panic!("fixture config mutation must apply"),
+            }
+        }
+
+        fn persisted(&self) -> (u32, u64) {
+            let workspace =
+                astra_services::session_workspace::read_workspace(self.session_id).unwrap();
+            (
+                crate::server::tool_session_config::effective_runtime_config(Some(&workspace))
+                    .unwrap()
+                    .memory
+                    .retrieval_top_k,
+                workspace.config_mutation_revision,
+            )
+        }
+
+        async fn rollback(
+            &self,
+            journal: Arc<Mutex<SessionStateRollbackJournal>>,
+            publish_calls: Arc<std::sync::atomic::AtomicUsize>,
+        ) -> Value {
+            let output = execute_rollback_session_state(
+                RollbackSessionStateContext {
+                    journal,
+                    current_turn_index: 1,
+                    restore_context: SessionStateRestoreContext {
+                        user_id: "test-user".into(),
+                        session_id: self.session_id.into(),
+                        observability_session: Some(self.observability.clone()),
+                    },
+                },
+                serde_json::json!({"scope": "current_turn"}),
+                move || async move {
+                    publish_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                },
+            )
+            .await;
+            serde_json::from_str(&output).unwrap()
+        }
+    }
+
+    fn config_action(value: u32, expected_revision: u64) -> SessionStateRollbackAction {
+        SessionStateRollbackAction::ConfigOverride {
+            path: TOP_K_PATH.into(),
+            old_value: serde_json::json!(value),
+            expected_revision: Arc::new(AtomicU64::new(expected_revision)),
+        }
+    }
+
+    fn observability_snapshot() -> Box<crate::observability::ObservabilitySessionRollbackSnapshot> {
+        Box::new(crate::observability::ObservabilitySessionRollbackSnapshot {
             config: astra_config::runtime_config::RuntimeConfig::default(),
             original_query: None,
             recent_queries: vec![],
@@ -458,7 +659,7 @@ mod tests {
             user_corrections: vec![],
             context_traces: vec![],
             last_query_at: None,
-        }
+        })
     }
 
     #[test]
@@ -509,7 +710,7 @@ mod tests {
 
     #[test]
     fn journal_helpers_record_list_and_remove() {
-        let journal = Mutex::new(SessionStateRollbackJournal::default());
+        let journal = Arc::new(Mutex::new(SessionStateRollbackJournal::default()));
 
         record(
             &journal,
@@ -590,12 +791,12 @@ mod tests {
             },
         };
         let context = SessionStateRestoreContext {
-            user_id: "test-user",
-            session_id: "session-1",
+            user_id: "test-user".into(),
+            session_id: "session-1".into(),
             observability_session: None,
         };
 
-        let error = restore_entry(&context, &entry)
+        let error = restore_entry(&context, &entry, None)
             .await
             .expect_err("missing observability session must fail closed");
 
@@ -604,19 +805,19 @@ mod tests {
 
     #[tokio::test]
     async fn execute_rollback_session_state_requires_turn_index_for_turn_scope() {
-        let journal = Mutex::new(SessionStateRollbackJournal::default());
+        let journal = Arc::new(Mutex::new(SessionStateRollbackJournal::default()));
         let output = execute_rollback_session_state(
             RollbackSessionStateContext {
-                journal: &journal,
+                journal,
                 current_turn_index: 1,
                 restore_context: SessionStateRestoreContext {
-                    user_id: "test-user",
-                    session_id: "session-1",
+                    user_id: "test-user".into(),
+                    session_id: "session-1".into(),
                     observability_session: None,
                 },
             },
-            &serde_json::json!({"scope": "turn"}),
-            || Ok(()),
+            serde_json::json!({"scope": "turn"}),
+            || async { Ok(()) },
         )
         .await;
 
@@ -630,23 +831,26 @@ mod tests {
 
     #[tokio::test]
     async fn execute_rollback_session_state_does_not_publish_when_plan_is_empty() {
-        let journal = Mutex::new(SessionStateRollbackJournal::default());
-        let publish_calls = std::sync::atomic::AtomicUsize::new(0);
+        let journal = Arc::new(Mutex::new(SessionStateRollbackJournal::default()));
+        let publish_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let output = execute_rollback_session_state(
             RollbackSessionStateContext {
-                journal: &journal,
+                journal,
                 current_turn_index: 9,
                 restore_context: SessionStateRestoreContext {
-                    user_id: "test-user",
-                    session_id: "session-1",
+                    user_id: "test-user".into(),
+                    session_id: "session-1".into(),
                     observability_session: None,
                 },
             },
-            &serde_json::json!({"scope": "current_turn"}),
-            || {
-                publish_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                Ok(())
+            serde_json::json!({"scope": "current_turn"}),
+            {
+                let publish_calls = publish_calls.clone();
+                move || async move {
+                    publish_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(())
+                }
             },
         )
         .await;
@@ -663,7 +867,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_rollback_session_state_keeps_restore_success_when_publish_fails() {
-        let journal = Mutex::new(SessionStateRollbackJournal::default());
+        let journal = Arc::new(Mutex::new(SessionStateRollbackJournal::default()));
         record(
             &journal,
             4,
@@ -679,16 +883,16 @@ mod tests {
 
         let output = execute_rollback_session_state(
             RollbackSessionStateContext {
-                journal: &journal,
+                journal,
                 current_turn_index: 4,
                 restore_context: SessionStateRestoreContext {
-                    user_id: "test-user",
-                    session_id: "session-1",
-                    observability_session: Some(&observability_session),
+                    user_id: "test-user".into(),
+                    session_id: "session-1".into(),
+                    observability_session: Some(observability_session),
                 },
             },
-            &serde_json::json!({"scope": "current_turn"}),
-            || Err("publish failed".to_string()),
+            serde_json::json!({"scope": "current_turn"}),
+            || async { Err("publish failed".to_string()) },
         )
         .await;
 
@@ -697,5 +901,158 @@ mod tests {
         assert_eq!(value["failed"].as_array().map(Vec::len), Some(0));
         assert_eq!(value["warnings"][0]["kind"], "workspace_artifact_publish");
         assert_eq!(value["warnings"][0]["error"], "publish failed");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn multi_config_rollback_chains_fresh_owner_revisions() {
+        let fixture = ConfigRollbackFixture::new("rollback-config-chain");
+        let first = if fixture.baseline == 5 { 6 } else { 5 };
+        let second = if first == 7 { 8 } else { 7 };
+        assert_eq!(fixture.apply(first, 0), 1);
+        assert_eq!(fixture.apply(second, 1), 2);
+        let journal = Arc::new(Mutex::new(SessionStateRollbackJournal::default()));
+        record(
+            &journal,
+            1,
+            "first".into(),
+            config_action(fixture.baseline, 1),
+        );
+        record(&journal, 1, "second".into(), config_action(first, 2));
+        let publish_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let output = fixture
+            .rollback(journal.clone(), publish_calls.clone())
+            .await;
+
+        assert_eq!(output["success"], true);
+        assert_eq!(output["restored"].as_array().map(Vec::len), Some(2));
+        assert_eq!(fixture.persisted(), (fixture.baseline, 4));
+        assert_eq!(publish_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn aba_writer_blocks_rollback_and_still_publishes_current() {
+        let fixture = ConfigRollbackFixture::new("rollback-config-aba");
+        let first = if fixture.baseline == 5 { 6 } else { 5 };
+        let second = if first == 7 { 8 } else { 7 };
+        assert_eq!(fixture.apply(first, 0), 1);
+        let journal = Arc::new(Mutex::new(SessionStateRollbackJournal::default()));
+        record(
+            &journal,
+            1,
+            "owned".into(),
+            config_action(fixture.baseline, 1),
+        );
+        assert_eq!(fixture.apply(first, 1), 2);
+        assert_eq!(fixture.apply(second, 2), 3);
+        assert_eq!(fixture.apply(first, 3), 4);
+        let publish_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let output = fixture
+            .rollback(journal.clone(), publish_calls.clone())
+            .await;
+
+        assert_eq!(output["success"], false);
+        assert_eq!(output["failed"].as_array().map(Vec::len), Some(1));
+        assert_eq!(fixture.persisted(), (first, 4));
+        assert_eq!(entries(&journal).len(), 1);
+        assert_eq!(publish_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn partial_plan_failure_removes_success_and_publishes_current() {
+        let fixture = ConfigRollbackFixture::new("rollback-config-partial");
+        let first = if fixture.baseline == 5 { 6 } else { 5 };
+        let second = if first == 7 { 8 } else { 7 };
+        fixture.apply(first, 0);
+        fixture.apply(second, 1);
+        let journal = Arc::new(Mutex::new(SessionStateRollbackJournal::default()));
+        record(
+            &journal,
+            1,
+            "unprocessed".into(),
+            config_action(fixture.baseline, 1),
+        );
+        record(
+            &journal,
+            1,
+            "failed".into(),
+            SessionStateRollbackAction::ConfigOverride {
+                path: "missing.path".into(),
+                old_value: Value::Null,
+                expected_revision: Arc::new(AtomicU64::new(2)),
+            },
+        );
+        record(&journal, 1, "successful".into(), config_action(first, 2));
+        let publish_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let output = fixture
+            .rollback(journal.clone(), publish_calls.clone())
+            .await;
+
+        assert_eq!(output["restored"].as_array().map(Vec::len), Some(1));
+        assert_eq!(output["failed"].as_array().map(Vec::len), Some(1));
+        assert_eq!(fixture.persisted(), (first, 3));
+        let remaining = entries(&journal);
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().all(|entry| entry.label != "successful"));
+        assert_eq!(publish_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn outcome_unknown_readback_advances_retry_owner_then_succeeds() {
+        let fixture = ConfigRollbackFixture::new("rollback-config-unknown-retry");
+        let first = if fixture.baseline == 5 { 6 } else { 5 };
+        let second = if first == 7 { 8 } else { 7 };
+        fixture.apply(first, 0);
+        fixture.apply(second, 1);
+        let entry = SessionStateRollbackEntry {
+            sequence: 0,
+            turn_index: 1,
+            timestamp: UNIX_EPOCH,
+            label: "retry".into(),
+            action: config_action(first, 1),
+        };
+        let context = SessionStateRestoreContext {
+            user_id: "test-user".into(),
+            session_id: fixture.session_id.into(),
+            observability_session: Some(fixture.observability.clone()),
+        };
+        let current_config = crate::server::tool_session_config::effective_runtime_config(Some(
+            &astra_services::session_workspace::read_workspace(fixture.session_id).unwrap(),
+        ))
+        .unwrap();
+        let SessionStateRollbackAction::ConfigOverride {
+            expected_revision, ..
+        } = &entry.action
+        else {
+            unreachable!()
+        };
+
+        let error = settle_config_restore(
+            &context,
+            TOP_K_PATH,
+            expected_revision,
+            1,
+            ConfigRestoreOutcome::OutcomeUnknown {
+                revision: 2,
+                reason: "directory sync outcome unknown".into(),
+                observed_config: Some(Box::new(current_config)),
+                retry_revision: Some(2),
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("outcome unknown"));
+        assert_eq!(expected_revision.load(Ordering::Relaxed), 2);
+
+        assert_eq!(
+            restore_entry(&context, &entry, None).await.unwrap(),
+            Some(3)
+        );
+        assert_eq!(fixture.persisted(), (first, 3));
     }
 }

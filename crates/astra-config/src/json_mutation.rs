@@ -16,16 +16,10 @@ pub enum JsonPathMutationError {
     UnknownLeaf { leaf: String },
 }
 
-/// Replace one existing leaf in a JSON object and return its previous value.
-///
-/// The path grammar is a non-empty sequence of non-empty keys separated by
-/// dots. This function never creates objects or leaves. Failed mutations leave
-/// `root` unchanged.
-pub fn replace_existing_json_path(
-    root: &mut Value,
-    path: &str,
-    new_value: Value,
-) -> Result<Value, JsonPathMutationError> {
+fn locate_existing_json_path<'a, 'p>(
+    root: &'a Value,
+    path: &'p str,
+) -> Result<(&'a Value, Vec<&'p str>), JsonPathMutationError> {
     if path.is_empty() {
         return Err(JsonPathMutationError::EmptyPath);
     }
@@ -36,35 +30,57 @@ pub fn replace_existing_json_path(
         });
     }
 
-    let (leaf, parents) = segments
-        .split_last()
-        .expect("a non-empty path has at least one segment");
+    let mut current = root;
+    for (index, segment) in segments.iter().enumerate() {
+        let object = current
+            .as_object()
+            .ok_or_else(|| JsonPathMutationError::ParentNotObject {
+                path: path.to_string(),
+            })?;
+        current = object.get(*segment).ok_or_else(|| {
+            if index + 1 == segments.len() {
+                JsonPathMutationError::UnknownLeaf {
+                    leaf: (*segment).to_string(),
+                }
+            } else {
+                JsonPathMutationError::UnknownSegment {
+                    segment: (*segment).to_string(),
+                }
+            }
+        })?;
+    }
+    Ok((current, segments))
+}
+
+/// Read one existing value addressed by the canonical dotted-path grammar.
+pub fn read_existing_json_path(root: &Value, path: &str) -> Result<Value, JsonPathMutationError> {
+    locate_existing_json_path(root, path).map(|(value, _)| value.clone())
+}
+
+/// Replace one existing leaf in a JSON object and return its previous value.
+///
+/// The path grammar is a non-empty sequence of non-empty keys separated by
+/// dots. This function never creates objects or leaves. Failed mutations leave
+/// `root` unchanged.
+pub fn replace_existing_json_path(
+    root: &mut Value,
+    path: &str,
+    new_value: Value,
+) -> Result<Value, JsonPathMutationError> {
+    let (old, segments) = locate_existing_json_path(root, path)?;
+    let old = old.clone();
+    let (leaf, parents) = segments.split_last().expect("validated non-empty path");
     let mut current = root;
     for segment in parents {
-        let object =
-            current
-                .as_object_mut()
-                .ok_or_else(|| JsonPathMutationError::ParentNotObject {
-                    path: path.to_string(),
-                })?;
-        current =
-            object
-                .get_mut(*segment)
-                .ok_or_else(|| JsonPathMutationError::UnknownSegment {
-                    segment: (*segment).to_string(),
-                })?;
+        current = current
+            .get_mut(*segment)
+            .expect("path was validated against the same JSON value");
     }
-    let parent = current
-        .as_object_mut()
-        .ok_or_else(|| JsonPathMutationError::ParentNotObject {
-            path: path.to_string(),
-        })?;
-    let slot = parent
+    let slot = current
         .get_mut(*leaf)
-        .ok_or_else(|| JsonPathMutationError::UnknownLeaf {
-            leaf: (*leaf).to_string(),
-        })?;
-    Ok(std::mem::replace(slot, new_value))
+        .expect("leaf was validated against the same JSON value");
+    *slot = new_value;
+    Ok(old)
 }
 
 #[cfg(test)]
@@ -75,6 +91,10 @@ mod tests {
     #[test]
     fn replaces_existing_leaf_and_returns_previous_value() {
         let mut root = json!({"memory": {"retrieval_top_k": 5}});
+        assert_eq!(
+            read_existing_json_path(&root, "memory.retrieval_top_k").unwrap(),
+            json!(5)
+        );
 
         let old = replace_existing_json_path(&mut root, "memory.retrieval_top_k", json!(8))
             .expect("existing leaf");
@@ -126,6 +146,7 @@ mod tests {
                 .expect_err("invalid path must fail");
             assert_eq!(error, expected, "path={path}");
             assert_eq!(root, original, "failed mutation must be atomic: {path}");
+            assert_eq!(read_existing_json_path(&root, path).unwrap_err(), expected);
         }
     }
 }

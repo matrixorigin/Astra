@@ -169,20 +169,15 @@ async fn persist_context_trace_to_workspace_if_present(
     signal: astra_services::session_workspace::ContextTraceSignal,
 ) {
     let workspace_session_id = session_id.clone();
-    let result = tokio::task::spawn_blocking(
-        move || -> std::io::Result<Option<astra_services::session_workspace::WorkspaceMetadata>> {
-            let mut updated_workspace = None;
-            let existed = astra_services::session_workspace::update_existing_workspace(
-                &workspace_session_id,
-                |workspace| {
-                    workspace.last_context_trace = Some(signal);
-                    workspace.updated_at = chrono::Utc::now().to_rfc3339();
-                    updated_workspace = Some(workspace.clone());
-                },
-            )?;
-            Ok(existed.then_some(updated_workspace).flatten())
-        },
-    )
+    let result = tokio::task::spawn_blocking(move || {
+        astra_services::session_workspace::update_existing_workspace(
+            &workspace_session_id,
+            |workspace| {
+                workspace.last_context_trace = Some(signal);
+                workspace.updated_at = chrono::Utc::now().to_rfc3339();
+            },
+        )
+    })
     .await;
 
     match result {
