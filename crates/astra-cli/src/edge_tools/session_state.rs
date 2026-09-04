@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use astra_runtime::observability::ObservabilitySessionRollbackSnapshot;
@@ -11,6 +13,7 @@ pub(crate) enum SessionStateRollbackAction {
         path: String,
         old_value: Value,
         snapshot: ObservabilitySessionRollbackSnapshot,
+        expected_revision: Option<Arc<AtomicU64>>,
     },
     Compression {
         turn: u32,
@@ -70,17 +73,32 @@ impl SessionStateRollbackJournal {
         self.next_sequence
     }
 
-    fn remove_sequence(&mut self, sequence: u64) -> bool {
-        if let Some(index) = self
+    fn settle_restored_sequence(
+        &mut self,
+        sequence: u64,
+        next_config_owner: Option<(u64, u64)>,
+    ) -> bool {
+        let Some(index) = self
             .entries
             .iter()
             .position(|entry| entry.sequence == sequence)
+        else {
+            return false;
+        };
+        if let Some((next_sequence, revision)) = next_config_owner
+            && let Some(SessionStateRollbackAction::ConfigOverride {
+                expected_revision: Some(expected_revision),
+                ..
+            }) = self
+                .entries
+                .iter()
+                .find(|entry| entry.sequence == next_sequence)
+                .map(|entry| &entry.action)
         {
-            self.entries.remove(index);
-            true
-        } else {
-            false
+            expected_revision.store(revision, Ordering::Relaxed);
         }
+        self.entries.remove(index);
+        true
     }
 }
 
@@ -107,6 +125,7 @@ impl ToolExecutor {
         path: impl Into<String>,
         old_value: Value,
         snapshot: ObservabilitySessionRollbackSnapshot,
+        expected_revision: Option<u64>,
     ) {
         let path = path.into();
         self.record_session_state_rollback(
@@ -115,6 +134,8 @@ impl ToolExecutor {
                 path,
                 old_value,
                 snapshot,
+                expected_revision: expected_revision
+                    .map(|revision| Arc::new(AtomicU64::new(revision))),
             },
         );
     }
@@ -167,13 +188,15 @@ impl ToolExecutor {
         }
     }
 
-    fn remove_session_state_rollback(&self, sequence: u64) {
+    fn settle_session_state_rollback(&self, sequence: u64, next_config_owner: Option<(u64, u64)>) {
         match self.session_state_journal.lock() {
             Ok(mut journal) => {
-                journal.remove_sequence(sequence);
+                journal.settle_restored_sequence(sequence, next_config_owner);
             }
             Err(poisoned) => {
-                poisoned.into_inner().remove_sequence(sequence);
+                poisoned
+                    .into_inner()
+                    .settle_restored_sequence(sequence, next_config_owner);
             }
         }
     }
@@ -205,8 +228,18 @@ impl ToolExecutor {
             ),
         ]);
         match &entry.action {
-            SessionStateRollbackAction::ConfigOverride { path, .. } => {
+            SessionStateRollbackAction::ConfigOverride {
+                path,
+                expected_revision,
+                ..
+            } => {
                 value.insert("path".to_string(), Value::String(path.clone()));
+                if let Some(expected_revision) = expected_revision {
+                    value.insert(
+                        "expected_revision".to_string(),
+                        Value::from(expected_revision.load(Ordering::Relaxed)),
+                    );
+                }
             }
             SessionStateRollbackAction::Compression { turn, .. } => {
                 value.insert(
@@ -221,29 +254,94 @@ impl ToolExecutor {
     async fn rollback_session_state_entry(
         &self,
         entry: &SessionStateRollbackEntry,
-    ) -> Result<(), String> {
+    ) -> Result<Option<u64>, String> {
         match &entry.action {
             SessionStateRollbackAction::ConfigOverride {
                 path,
                 old_value,
                 snapshot,
+                expected_revision,
             } => {
-                self.restore_observability_snapshot(snapshot)?;
-                if let Some(session_id) = self.active_session_id() {
-                    crate::cli::self_command::persist_config_override(
+                let Some(expected_revision) = expected_revision else {
+                    return self.restore_observability_snapshot(snapshot).map(|_| None);
+                };
+                let session_id = self
+                    .active_session_id()
+                    .ok_or_else(|| "durable config rollback has no active session".to_string())?;
+                let expected = expected_revision.load(Ordering::Relaxed);
+                match crate::cli::self_command::restore_config_override(
                         &session_id,
                         path,
                         old_value.clone(),
+                        expected,
                     )
-                    .map(|_| ())
                     .map_err(|error| {
                         format!("failed to persist restored config override for {path}: {error}")
-                    })?;
+                    })?
+                {
+                    astra_services::session_workspace::WorkspaceConfigRestoreOutcome::Applied {
+                        config, revision, ..
+                    } => {
+                        if let Err(error) = self.restore_observability_snapshot(snapshot) {
+                            tracing::warn!(
+                                session_id,
+                                path,
+                                revision,
+                                error,
+                                "config rollback committed but observability snapshot could not be restored"
+                            );
+                        }
+                        if let Some(obs) = self.observability_session.as_ref() {
+                            match obs.write() {
+                                Ok(mut session) => session.config = *config,
+                                Err(_) => tracing::warn!(
+                                    session_id,
+                                    path,
+                                    revision,
+                                    "config rollback committed but observability config could not be projected"
+                                ),
+                            }
+                        }
+                        Ok(Some(revision))
+                    }
+                    astra_services::session_workspace::WorkspaceConfigRestoreOutcome::Rejected {
+                        current_revision,
+                        current_config,
+                        ..
+                    } => {
+                        if let Some(obs) = self.observability_session.as_ref() {
+                            obs.write()
+                                .map_err(|_| "Failed to acquire observability session".to_string())?
+                                .config = *current_config;
+                        }
+                        Err(format!(
+                            "config rollback revision conflict for {path}: expected {expected}, current {current_revision}"
+                        ))
+                    }
+                    astra_services::session_workspace::WorkspaceConfigRestoreOutcome::OutcomeUnknown {
+                        revision,
+                        reason,
+                        observed_config,
+                        retry_revision,
+                    } => {
+                        if let Some(retry_revision) = retry_revision {
+                            expected_revision.store(retry_revision, Ordering::Relaxed);
+                        }
+                        if let Some(config) = observed_config
+                            && let Some(obs) = self.observability_session.as_ref()
+                        {
+                            obs.write()
+                                .map_err(|_| "Failed to acquire observability session".to_string())?
+                                .config = *config;
+                        }
+                        Err(format!(
+                            "config rollback outcome unknown for {path} at revision {revision}: {reason}"
+                        ))
+                    }
                 }
-                Ok(())
             }
             SessionStateRollbackAction::Compression { snapshot, .. } => {
-                self.restore_observability_snapshot(snapshot)
+                self.restore_observability_snapshot(snapshot).map(|_| None)
             }
         }
     }
@@ -304,10 +402,24 @@ impl ToolExecutor {
                 };
                 let mut restored = Vec::new();
                 let mut failed = Vec::new();
-                for entry in &plan {
+                for (index, entry) in plan.iter().enumerate() {
                     match self.rollback_session_state_entry(entry).await {
-                        Ok(()) => {
-                            self.remove_session_state_rollback(entry.sequence);
+                        Ok(next_revision) => {
+                            let next_config_owner = next_revision.and_then(|revision| {
+                                plan[index + 1..]
+                                    .iter()
+                                    .find(|entry| {
+                                        matches!(
+                                            &entry.action,
+                                            SessionStateRollbackAction::ConfigOverride {
+                                                expected_revision: Some(_),
+                                                ..
+                                            }
+                                        )
+                                    })
+                                    .map(|entry| (entry.sequence, revision))
+                            });
+                            self.settle_session_state_rollback(entry.sequence, next_config_owner);
                             restored.push(Self::rollback_session_state_entry_json(entry));
                         }
                         Err(error) => {
@@ -317,6 +429,7 @@ impl ToolExecutor {
                                 .unwrap_or_default();
                             failed_entry.insert("error".to_string(), Value::String(error));
                             failed.push(Value::Object(failed_entry));
+                            break;
                         }
                     }
                 }
@@ -358,5 +471,117 @@ impl ToolExecutor {
             })
             .to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use astra_services::session_journal::JournalDirGuard;
+    use astra_services::session_workspace::{self, WorkspaceMetadata};
+    use serde_json::json;
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn partial_cli_rollback_transfers_revision_across_calls() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = JournalDirGuard::new(temp.path());
+        let session_id = "cli-partial-config-rollback";
+        session_workspace::write_workspace(&WorkspaceMetadata::new(session_id, "test-model"))
+            .unwrap();
+        let observability = Arc::new(std::sync::RwLock::new(
+            astra_runtime::observability::ObservabilitySession::new_simple(session_id),
+        ));
+        let baseline = observability.read().unwrap().config.memory.retrieval_top_k;
+        let first = (1..=20).find(|value| *value != baseline).unwrap();
+        let second = (1..=20)
+            .find(|value| *value != baseline && *value != first)
+            .unwrap();
+        let executor = ToolExecutor::new(temp.path())
+            .with_active_session_id(session_id)
+            .with_observability_session(observability.clone());
+        let first_result: Value = serde_json::from_str(
+            &executor
+                .execute(
+                    "adjust_config",
+                    &json!({"path": "memory.retrieval_top_k", "value": first, "force": true}),
+                )
+                .await,
+        )
+        .unwrap();
+        assert_eq!(first_result["status"], "completed");
+        let snapshot = observability.read().unwrap().rollback_snapshot();
+        executor.record_session_state_rollback(
+            "invalid-owner".into(),
+            SessionStateRollbackAction::ConfigOverride {
+                path: "missing.path".into(),
+                old_value: Value::Null,
+                snapshot,
+                expected_revision: Some(Arc::new(AtomicU64::new(2))),
+            },
+        );
+        let second_result: Value = serde_json::from_str(
+            &executor
+                .execute(
+                    "adjust_config",
+                    &json!({"path": "memory.retrieval_top_k", "value": second, "force": true}),
+                )
+                .await,
+        )
+        .unwrap();
+        assert_eq!(second_result["status"], "completed");
+
+        let partial: Value = serde_json::from_str(
+            &executor
+                .execute("rollback_session_state", &json!({"scope": "current_turn"}))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(partial["restored"].as_array().map(Vec::len), Some(1));
+        assert_eq!(partial["failed"].as_array().map(Vec::len), Some(1));
+        {
+            let mut journal = executor.session_state_journal.lock().unwrap();
+            let failed = journal
+                .entries
+                .iter_mut()
+                .find(|entry| entry.sequence == 1)
+                .unwrap();
+            let SessionStateRollbackAction::ConfigOverride {
+                path,
+                old_value,
+                expected_revision: Some(expected_revision),
+                ..
+            } = &mut failed.action
+            else {
+                panic!("failed rollback entry must remain config-owned");
+            };
+            assert_eq!(expected_revision.load(Ordering::Relaxed), 3);
+            *path = "memory.retrieval_top_k".into();
+            *old_value = json!(first);
+        }
+
+        let completed: Value = serde_json::from_str(
+            &executor
+                .execute("rollback_session_state", &json!({"scope": "current_turn"}))
+                .await,
+        )
+        .unwrap();
+        assert_eq!(completed["success"], true);
+        assert_eq!(completed["restored"].as_array().map(Vec::len), Some(2));
+        assert!(
+            executor
+                .session_state_journal
+                .lock()
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        let workspace = session_workspace::read_workspace(session_id).unwrap();
+        assert_eq!(workspace.config_mutation_revision, 5);
+        assert!(workspace.tuned_config_json.is_none());
+        assert_eq!(
+            observability.read().unwrap().config.memory.retrieval_top_k,
+            baseline
+        );
     }
 }

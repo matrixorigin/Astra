@@ -90,6 +90,7 @@ impl SessionStateRollbackJournal {
         self.next_sequence
     }
 
+    #[cfg(test)]
     pub(crate) fn remove_sequence(&mut self, sequence: u64) -> bool {
         if let Some(index) = self
             .entries
@@ -101,6 +102,33 @@ impl SessionStateRollbackJournal {
         } else {
             false
         }
+    }
+
+    fn settle_restored_sequence(
+        &mut self,
+        sequence: u64,
+        next_config_owner: Option<(u64, u64)>,
+    ) -> bool {
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.sequence == sequence)
+        else {
+            return false;
+        };
+        if let Some((next_sequence, revision)) = next_config_owner
+            && let Some(SessionStateRollbackAction::ConfigOverride {
+                expected_revision, ..
+            }) = self
+                .entries
+                .iter()
+                .find(|entry| entry.sequence == next_sequence)
+                .map(|entry| &entry.action)
+        {
+            expected_revision.store(revision, Ordering::Relaxed);
+        }
+        self.entries.remove(index);
+        true
     }
 }
 
@@ -184,9 +212,20 @@ pub(crate) fn restore_plan_for_turn_since(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn remove_sequence(journal: &Mutex<SessionStateRollbackJournal>, sequence: u64) -> bool {
     with_journal_mut(journal, "remove_session_state_rollback", |journal| {
         journal.remove_sequence(sequence)
+    })
+}
+
+fn settle_restored_sequence(
+    journal: &Mutex<SessionStateRollbackJournal>,
+    sequence: u64,
+    next_config_owner: Option<(u64, u64)>,
+) -> bool {
+    with_journal_mut(journal, "settle_session_state_rollback", |journal| {
+        journal.settle_restored_sequence(sequence, next_config_owner)
     })
 }
 
@@ -297,25 +336,51 @@ fn settle_config_restore(
     outcome: ConfigRestoreOutcome,
 ) -> Result<Option<u64>, String> {
     match outcome {
-        ConfigRestoreOutcome::Applied { config, revision } => {
-            let Some(observability_session) = context.observability_session.as_ref() else {
-                return Err("No observability session available".to_string());
-            };
-            observability_session
-                .write()
-                .map_err(|_| "Failed to acquire observability session".to_string())?
-                .config = *config;
+        ConfigRestoreOutcome::Applied {
+            config, revision, ..
+        } => {
+            if let Some(observability_session) = context.observability_session.as_ref() {
+                match observability_session.write() {
+                    Ok(mut session) => session.config = *config,
+                    Err(_) => tracing::warn!(
+                        session_id = context.session_id,
+                        path,
+                        revision,
+                        "config rollback committed but observability projection is unavailable"
+                    ),
+                }
+            }
             Ok(Some(revision))
         }
-        ConfigRestoreOutcome::Rejected { current_revision } => Err(format!(
-            "config rollback revision conflict for {path}: expected {expected_revision}, current {current_revision}",
-        )),
+        ConfigRestoreOutcome::Rejected {
+            current_revision,
+            current_config,
+            ..
+        } => {
+            if let Some(observability_session) = context.observability_session.as_ref() {
+                match observability_session.write() {
+                    Ok(mut session) => session.config = *current_config,
+                    Err(_) => tracing::warn!(
+                        session_id = context.session_id,
+                        path,
+                        current_revision,
+                        "config rollback conflict preserved authority but observability projection is unavailable"
+                    ),
+                }
+            }
+            Err(format!(
+                "config rollback revision conflict for {path}: expected {expected_revision}, current {current_revision}",
+            ))
+        }
         ConfigRestoreOutcome::OutcomeUnknown {
             revision,
             reason,
             observed_config,
             retry_revision,
         } => {
+            if let Some(retry_revision) = retry_revision {
+                owner_revision.store(retry_revision, Ordering::Relaxed);
+            }
             if let Some(config) = observed_config
                 && let Some(observability_session) = context.observability_session.as_ref()
             {
@@ -323,9 +388,6 @@ fn settle_config_restore(
                     .write()
                     .map_err(|_| "Failed to acquire observability session".to_string())?
                     .config = *config;
-            }
-            if let Some(retry_revision) = retry_revision {
-                owner_revision.store(retry_revision, Ordering::Relaxed);
             }
             Err(format!(
                 "config rollback outcome unknown for {path} at revision {revision}: {reason}"
@@ -470,11 +532,22 @@ where
     let mut restored = Vec::new();
     let mut failed = Vec::new();
     let mut chained_config_revision = None;
-    for entry in &plan {
+    for (index, entry) in plan.iter().enumerate() {
         match restore_entry(&context.restore_context, entry, chained_config_revision).await {
             Ok(next_revision) => {
                 chained_config_revision = next_revision;
-                remove_sequence(&context.journal, entry.sequence);
+                let next_config_owner = next_revision.and_then(|revision| {
+                    plan[index + 1..]
+                        .iter()
+                        .find(|entry| {
+                            matches!(
+                                entry.action,
+                                SessionStateRollbackAction::ConfigOverride { .. }
+                            )
+                        })
+                        .map(|entry| (entry.sequence, revision))
+                });
+                settle_restored_sequence(&context.journal, entry.sequence, next_config_owner);
                 restored.push(rollback_session_state_entry_json(entry));
             }
             Err(error) => {
@@ -957,13 +1030,56 @@ mod tests {
         assert_eq!(output["success"], false);
         assert_eq!(output["failed"].as_array().map(Vec::len), Some(1));
         assert_eq!(fixture.persisted(), (first, 4));
+        assert_eq!(
+            fixture
+                .observability
+                .read()
+                .unwrap()
+                .config
+                .memory
+                .retrieval_top_k,
+            first
+        );
         assert_eq!(entries(&journal).len(), 1);
         assert_eq!(publish_calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn partial_plan_failure_removes_success_and_publishes_current() {
+    async fn poisoned_projection_does_not_replace_revision_conflict() {
+        let fixture = ConfigRollbackFixture::new("rollback-config-poisoned-conflict");
+        let first = if fixture.baseline == 5 { 6 } else { 5 };
+        let second = if first == 7 { 8 } else { 7 };
+        fixture.apply(first, 0);
+        let journal = Arc::new(Mutex::new(SessionStateRollbackJournal::default()));
+        record(
+            &journal,
+            1,
+            "owned".into(),
+            config_action(fixture.baseline, 1),
+        );
+        fixture.apply(second, 1);
+        let poisoned = fixture.observability.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = poisoned.write().unwrap();
+            panic!("poison observability projection");
+        }));
+        let publish_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let output = fixture
+            .rollback(journal.clone(), publish_calls.clone())
+            .await;
+
+        assert_eq!(output["success"], false);
+        assert_eq!(output["failed"].as_array().map(Vec::len), Some(1));
+        assert_eq!(fixture.persisted(), (second, 2));
+        assert_eq!(entries(&journal).len(), 1);
+        assert_eq!(publish_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn partial_plan_transfers_owner_revision_across_calls() {
         let fixture = ConfigRollbackFixture::new("rollback-config-partial");
         let first = if fixture.baseline == 5 { 6 } else { 5 };
         let second = if first == 7 { 8 } else { 7 };
@@ -998,8 +1114,40 @@ mod tests {
         assert_eq!(fixture.persisted(), (first, 3));
         let remaining = entries(&journal);
         assert_eq!(remaining.len(), 2);
-        assert!(remaining.iter().all(|entry| entry.label != "successful"));
+        assert_eq!(remaining[0].sequence, 1);
+        let SessionStateRollbackAction::ConfigOverride {
+            expected_revision, ..
+        } = &remaining[0].action
+        else {
+            panic!("next rollback entry must be config-owned");
+        };
+        assert_eq!(expected_revision.load(Ordering::Relaxed), 3);
         assert_eq!(publish_calls.load(Ordering::Relaxed), 1);
+
+        {
+            let mut journal = journal.lock().unwrap();
+            let SessionStateRollbackAction::ConfigOverride {
+                path, old_value, ..
+            } = &mut journal
+                .entries
+                .iter_mut()
+                .find(|entry| entry.sequence == 1)
+                .unwrap()
+                .action
+            else {
+                panic!("failed entry must remain config-owned");
+            };
+            *path = "memory.retrieval_top_k".into();
+            *old_value = Value::from(first);
+        }
+        let retry = fixture
+            .rollback(journal.clone(), publish_calls.clone())
+            .await;
+        assert_eq!(retry["success"], true);
+        assert_eq!(retry["restored"].as_array().map(Vec::len), Some(2));
+        assert_eq!(fixture.persisted(), (fixture.baseline, 5));
+        assert!(entries(&journal).is_empty());
+        assert_eq!(publish_calls.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]

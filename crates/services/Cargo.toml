@@ -7,6 +7,7 @@ publish = false
 
 [features]
 openssl-vendored = ["dep:openssl", "openssl/vendored"]
+e2e-hooks = []
 
 [dependencies]
 astra-config.workspace = true

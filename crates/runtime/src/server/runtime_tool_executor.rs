@@ -438,7 +438,7 @@ pub(crate) struct SessionConfigInner {
 
 /// Self-modification session configuration state.
 pub(crate) struct SessionConfigState {
-    pub(crate) inner: Arc<tokio::sync::Mutex<SessionConfigInner>>,
+    pub(crate) inner: Arc<std::sync::Mutex<SessionConfigInner>>,
 }
 
 /// Trusted, process-local handle to the durable primary attempt owned by this
@@ -456,7 +456,7 @@ pub(super) struct ActivePrimaryWorkAttempt {
 impl SessionConfigState {
     fn new() -> Self {
         Self {
-            inner: Arc::new(tokio::sync::Mutex::new(SessionConfigInner {
+            inner: Arc::new(std::sync::Mutex::new(SessionConfigInner {
                 mutation_counter: (0, 0),
             })),
         }

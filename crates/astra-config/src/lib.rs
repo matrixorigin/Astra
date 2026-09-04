@@ -5,12 +5,17 @@
 pub mod config_overlay;
 pub mod config_version_cli;
 pub mod config_versions;
+pub mod governed_mutation;
 pub mod json_mutation;
 pub mod lock_ext;
 pub mod runtime_config;
 pub mod user_profile;
 
 // Re-exports for ergonomic cross-crate use.
+pub use governed_mutation::{
+    GovernedConfigMutation, GovernedConfigMutationError, GovernedConfigPath,
+    GovernedConfigValueType, apply_governed_config_mutation, normalized_config_drift,
+};
 pub use json_mutation::{
     JsonPathMutationError, read_existing_json_path, replace_existing_json_path,
 };

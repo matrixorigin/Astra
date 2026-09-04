@@ -764,6 +764,145 @@ pub enum WorkspaceConfigMutationOutcome<T, R> {
     },
 }
 
+/// Return the proposed revision only when readback proves exact ownership of a
+/// config mutation. Revision equality prevents ABA/same-value writers from
+/// being mistaken for the caller, while the canonical config projection
+/// prevents a conflicting value at the same revision from being accepted.
+pub fn exact_workspace_config_owner_revision(
+    proposed_revision: u64,
+    proposed_tuned_config_json: &Option<String>,
+    observed: Option<&WorkspaceMetadata>,
+) -> Option<u64> {
+    observed
+        .filter(|workspace| {
+            workspace.config_mutation_revision == proposed_revision
+                && &workspace.tuned_config_json == proposed_tuned_config_json
+        })
+        .map(|_| proposed_revision)
+}
+
+#[derive(Debug)]
+pub enum WorkspaceConfigRestoreOutcome {
+    Applied {
+        previous_value: serde_json::Value,
+        config: Box<astra_config::RuntimeConfig>,
+        revision: u64,
+        workspace: Box<WorkspaceMetadata>,
+    },
+    Rejected {
+        current_revision: u64,
+        current_config: Box<astra_config::RuntimeConfig>,
+        current_workspace: Box<WorkspaceMetadata>,
+    },
+    OutcomeUnknown {
+        revision: u64,
+        reason: String,
+        observed_config: Option<Box<astra_config::RuntimeConfig>>,
+        retry_revision: Option<u64>,
+    },
+}
+
+struct WorkspaceConfigRestoreMutation {
+    previous_value: serde_json::Value,
+    committed_config: Box<astra_config::RuntimeConfig>,
+    committed_tuned_config_json: Option<String>,
+}
+
+fn effective_workspace_config(
+    workspace: &WorkspaceMetadata,
+) -> std::io::Result<astra_config::RuntimeConfig> {
+    workspace
+        .tuned_config_json
+        .as_deref()
+        .map(serde_json::from_str)
+        .transpose()
+        .map(|config| config.unwrap_or_else(astra_config::RuntimeConfig::load))
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+pub fn restore_workspace_config_override(
+    session_id: &str,
+    path: &str,
+    new_value: serde_json::Value,
+    expected_revision: u64,
+) -> Result<WorkspaceConfigRestoreOutcome, String> {
+    let baseline = serde_json::to_value(astra_config::RuntimeConfig::load())
+        .map_err(|error| error.to_string())?;
+    let outcome = update_existing_workspace_config(session_id, |workspace| {
+        let current_config = effective_workspace_config(workspace)?;
+        if workspace.config_mutation_revision != expected_revision {
+            return Ok(std::ops::ControlFlow::Break((
+                workspace.config_mutation_revision,
+                Box::new(current_config),
+                Box::new(workspace.clone()),
+            )));
+        }
+        let mut candidate = serde_json::to_value(&current_config).map_err(std::io::Error::other)?;
+        let previous_value =
+            astra_config::replace_existing_json_path(&mut candidate, path, new_value.clone())
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        let committed_config: astra_config::RuntimeConfig =
+            serde_json::from_value(candidate.clone()).map_err(std::io::Error::other)?;
+        workspace.tuned_config_json = if candidate == baseline {
+            None
+        } else {
+            Some(serde_json::to_string(&committed_config).map_err(std::io::Error::other)?)
+        };
+        workspace.updated_at = chrono::Utc::now().to_rfc3339();
+        Ok(std::ops::ControlFlow::Continue(
+            WorkspaceConfigRestoreMutation {
+                previous_value,
+                committed_config: Box::new(committed_config),
+                committed_tuned_config_json: workspace.tuned_config_json.clone(),
+            },
+        ))
+    })
+    .map_err(|error| error.to_string())?;
+    match outcome {
+        WorkspaceConfigMutationOutcome::Applied {
+            value,
+            revision,
+            workspace,
+        } => Ok(WorkspaceConfigRestoreOutcome::Applied {
+            previous_value: value.previous_value,
+            config: value.committed_config,
+            revision,
+            workspace,
+        }),
+        WorkspaceConfigMutationOutcome::Rejected((
+            current_revision,
+            current_config,
+            current_workspace,
+        )) => Ok(WorkspaceConfigRestoreOutcome::Rejected {
+            current_revision,
+            current_config,
+            current_workspace,
+        }),
+        WorkspaceConfigMutationOutcome::OutcomeUnknown {
+            value,
+            revision,
+            observed,
+            reason,
+        } => {
+            let retry_revision = exact_workspace_config_owner_revision(
+                revision,
+                &value.committed_tuned_config_json,
+                observed.as_deref(),
+            );
+            let observed_config = observed
+                .as_deref()
+                .and_then(|workspace| effective_workspace_config(workspace).ok())
+                .map(Box::new);
+            Ok(WorkspaceConfigRestoreOutcome::OutcomeUnknown {
+                revision,
+                reason,
+                observed_config,
+                retry_revision,
+            })
+        }
+    }
+}
+
 /// Conditionally mutate the config projection of an existing workspace under
 /// its per-session file lock.
 ///
@@ -983,7 +1122,7 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
 }
 
 fn sync_workspace_commit_parent(path: &Path) -> std::io::Result<()> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "e2e-hooks"))]
     if WORKSPACE_COMMIT_SYNC_FAILURE_ONCE.with(|fail| fail.replace(false)) {
         return Err(std::io::Error::other(
             "injected workspace commit directory sync failure",
@@ -992,13 +1131,14 @@ fn sync_workspace_commit_parent(path: &Path) -> std::io::Result<()> {
     sync_parent_dir(path)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "e2e-hooks"))]
 thread_local! {
     static WORKSPACE_COMMIT_SYNC_FAILURE_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(test)]
-fn fail_next_workspace_commit_sync() {
+#[cfg(any(test, feature = "e2e-hooks"))]
+#[doc(hidden)]
+pub fn inject_workspace_commit_parent_sync_failure_once() {
     WORKSPACE_COMMIT_SYNC_FAILURE_ONCE.with(|fail| fail.set(true));
 }
 
@@ -2059,6 +2199,65 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn config_restore_owner_rejects_stale_and_aba_revisions() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions_dir = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let _guard = JournalDirGuard::new(&sessions_dir);
+        let session_id = "workspace-config-restore-owner";
+        write_workspace(&WorkspaceMetadata::new(session_id, "gpt-5")).unwrap();
+        let baseline = astra_config::RuntimeConfig::load().memory.retrieval_top_k;
+        let changed = (1..=20).find(|value| *value != baseline).unwrap();
+
+        let applied = restore_workspace_config_override(
+            session_id,
+            "memory.retrieval_top_k",
+            serde_json::json!(changed),
+            0,
+        )
+        .unwrap();
+        assert!(matches!(
+            applied,
+            WorkspaceConfigRestoreOutcome::Applied { revision: 1, .. }
+        ));
+        let same_value = restore_workspace_config_override(
+            session_id,
+            "memory.retrieval_top_k",
+            serde_json::json!(changed),
+            1,
+        )
+        .unwrap();
+        assert!(matches!(
+            same_value,
+            WorkspaceConfigRestoreOutcome::Applied { revision: 2, .. }
+        ));
+        let rejected = restore_workspace_config_override(
+            session_id,
+            "memory.retrieval_top_k",
+            serde_json::json!(baseline),
+            0,
+        )
+        .unwrap();
+        assert!(matches!(
+            rejected,
+            WorkspaceConfigRestoreOutcome::Rejected {
+                current_revision: 2,
+                ..
+            }
+        ));
+        let workspace = read_workspace(session_id).unwrap();
+        assert_eq!(workspace.config_mutation_revision, 2);
+        assert_eq!(
+            effective_workspace_config(&workspace)
+                .unwrap()
+                .memory
+                .retrieval_top_k,
+            changed
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn post_rename_sync_failure_returns_unknown_with_lock_scoped_readback() {
         let temp = tempfile::tempdir().unwrap();
         let sessions_dir = temp.path().join("sessions");
@@ -2066,7 +2265,7 @@ mod tests {
         let _guard = JournalDirGuard::new(&sessions_dir);
         let session_id = "workspace-config-sync-unknown";
         write_workspace(&WorkspaceMetadata::new(session_id, "gpt-5")).unwrap();
-        fail_next_workspace_commit_sync();
+        inject_workspace_commit_parent_sync_failure_once();
 
         let outcome = update_existing_workspace_config(session_id, |workspace| {
             workspace.tuned_config_json = Some("candidate".to_string());

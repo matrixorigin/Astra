@@ -8,7 +8,7 @@ publish = false
 [features]
 default = ["harness"]
 # Enables deterministic provider and edge-callback controls for full-stack tests.
-e2e-hooks = []
+e2e-hooks = ["astra-services/e2e-hooks"]
 # Enables OTLP trace export via `astra-logging` (build with `--features otel`).
 otel = ["astra-logging/otel"]
 # Observation + verification harness (zero cost when disabled).

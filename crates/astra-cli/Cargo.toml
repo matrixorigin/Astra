@@ -21,6 +21,7 @@ path = "src/lib.rs"
 default = ["harness"]
 harness = ["astra-runtime/harness", "dep:astra-harness"]
 release-vendored-openssl = ["astra-services/openssl-vendored"]
+e2e-hooks = ["astra-services/e2e-hooks"]
 
 [dependencies]
 astra-core.workspace = true
