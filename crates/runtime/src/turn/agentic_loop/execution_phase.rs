@@ -5965,6 +5965,7 @@ pub(crate) fn pending_terminal_completion_action_for_work_state(
     if active_work_attempt
         || workspace_observation_is_quarantined(state)
         || has_bound_workspace_completion_evidence(state)
+        || has_successful_terminal_task_action(state)
         || !super::lifecycle::unfinished_parallel_agent_ids(state).is_empty()
     {
         return None;
@@ -5974,6 +5975,14 @@ pub(crate) fn pending_terminal_completion_action_for_work_state(
         WorkspaceMutationIntent::Unknown | WorkspaceMutationIntent::MayMutate
     )
     .then_some(CompletionAction::CompletionTaskAction)
+}
+
+fn has_successful_terminal_task_action(state: &AgenticLoopState) -> bool {
+    state.stall.tool_call_records.iter().any(|record| {
+        record.was_executed()
+            && record.ok
+            && tool_is_terminal_completion_task_action(record.name.trim())
+    })
 }
 
 /// Match a raw canonical provider tool call against a typed completion action.
@@ -9929,6 +9938,30 @@ mod tests {
                 pending_terminal_completion_action_for_work_state(&uncertain, false),
                 Some(CompletionAction::CompletionTaskAction),
                 "intent={intent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_completion_action_does_not_repeat_a_successful_task_action() {
+        for intent in [
+            astra_config::user_profile::WorkspaceMutationIntent::Unknown,
+            astra_config::user_profile::WorkspaceMutationIntent::MayMutate,
+        ] {
+            let mut state = make_state();
+            state.turn_intent = Some(
+                astra_config::user_profile::TurnIntent::default().with_workspace_mutation(intent),
+            );
+            state.stall.tool_call_records.push(executed_record(
+                "bash",
+                true,
+                Some(r#"{"command":"git worktree list"}"#),
+            ));
+
+            assert_eq!(
+                pending_terminal_completion_action_for_work_state(&state, false),
+                None,
+                "intent={intent:?}: a successful task-facing action already spent the fallback obligation"
             );
         }
     }

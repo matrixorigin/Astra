@@ -399,6 +399,32 @@ fn tool_call_stats(calls: Option<&Vec<session_journal::ToolCallRecord>>) -> Tool
     stats
 }
 
+fn authoritative_tool_call_stats(event: &session_journal::JournalEvent) -> ToolCallStats {
+    let record_stats = tool_call_stats(event.tool_calls.as_ref());
+    let record_count = event.tool_calls.as_ref().map_or(0, Vec::len);
+    let Some(outcomes) = event
+        .tool_outcomes
+        .as_ref()
+        .filter(|outcomes| outcomes.is_consistent())
+        .filter(|outcomes| outcomes.requested as usize > record_count)
+    else {
+        return record_stats;
+    };
+
+    ToolCallStats {
+        ok: outcomes
+            .succeeded
+            .saturating_add(outcomes.reused)
+            .saturating_add(outcomes.suppressed),
+        fail: outcomes
+            .failed
+            .saturating_add(outcomes.rejected)
+            .saturating_add(outcomes.deferred),
+        fresh: outcomes.succeeded,
+        noop_or_cached: outcomes.reused.saturating_add(outcomes.suppressed),
+    }
+}
+
 /// Treat a tool call as a failure when either:
 /// - transport reports failure (`ok == false`), OR
 /// - transport succeeded but the result body encodes an error that the
@@ -783,7 +809,7 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     total_root_llm_rounds += u64::from(rounds);
                     root_attempts_with_llm_rounds += 1;
                 }
-                let stats = tool_call_stats(ev.tool_calls.as_ref());
+                let stats = authoritative_tool_call_stats(ev);
                 let (reentry_c, locked_out_c) = skill_reentry_counts(ev.tool_calls.as_ref());
                 // Fallback: if tool_calls Vec is absent, use tool_count scalar.
                 let effective_total = if stats.total() > 0 {
@@ -951,7 +977,7 @@ pub fn build_digest(session_id: &str, focus: DigestFocus) -> Result<JournalDiges
                     total_root_llm_rounds += u64::from(rounds);
                     root_attempts_with_llm_rounds += 1;
                 }
-                let stats = tool_call_stats(ev.tool_calls.as_ref());
+                let stats = authoritative_tool_call_stats(ev);
                 let effective_total = if stats.total() > 0 {
                     u64::from(stats.total())
                 } else {
@@ -2320,6 +2346,26 @@ mod tests {
         assert!(d.failed_tool_calls.is_empty());
         // But aggregate counts still work
         assert_eq!(d.aggregates.tool_calls_failed, 1);
+    }
+
+    #[test]
+    fn digest_uses_remote_tool_outcomes_when_call_details_are_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _g = JournalDirGuard::new(tmp.path());
+
+        let sid = "test-remote-outcomes-00000000-0000-0000-0000-000000000014";
+        fs::write(
+            journal_path_for_test(sid),
+            r#"{"type":"turn","ts":"2026-01-01T00:00:00Z","session_id":"S","turn":1,"tool_count":3,"tool_outcomes":{"requested":4,"executed":3,"succeeded":2,"failed":1,"rejected":1,"reused":0,"suppressed":0,"deferred":0}}"#,
+        )
+        .expect("write journal");
+
+        let d = build_digest(sid, DigestFocus::Summary).expect("digest");
+        assert_eq!(d.aggregates.total_tool_calls, 4);
+        assert_eq!(d.aggregates.total_fresh_tool_calls, 2);
+        assert_eq!(d.aggregates.tool_calls_failed, 2);
+        assert_eq!(d.turns[0].tool_calls_ok, 2);
+        assert_eq!(d.turns[0].tool_calls_fail, 2);
     }
 
     #[test]

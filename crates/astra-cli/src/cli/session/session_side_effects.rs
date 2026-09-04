@@ -319,6 +319,7 @@ pub(crate) fn append_one_shot_journal_events(
     .with_budget_pressure(result.budget_pressure)
     .with_cache_tokens(result.cache_read_tokens, result.cache_creation_tokens)
     .with_conversation_commit(prepared.commit);
+    result.apply_canonical_tool_outcomes(&mut turn_event);
     turn_event.llm_rounds = result.llm_rounds;
     // Content redaction is allowed to suppress the embedded commit. Do not
     // advertise a canonical settlement when the exact intended commit will
@@ -474,6 +475,18 @@ mod tests {
 
         let mut second = crate::tests::stub_stream_result("second answer");
         second.tool_calls_count = 2;
+        second.tool_ledger_aggregate =
+            astra_turn_core::tool_ledger_receipt::ToolLedgerCanonicalAggregate {
+                attempted: 2,
+                terminal: 2,
+                unresolved: 0,
+                result_classes: astra_turn_core::tool_ledger_receipt::ToolLedgerResultClassCounts {
+                    succeeded: 1,
+                    failed: 1,
+                    ..Default::default()
+                },
+                consistent: true,
+            };
         second.tools_used = vec!["tool_search".to_string(), "agent".to_string()];
         second.llm_rounds = Some(3);
         append_one_shot_journal_events(
@@ -521,6 +534,8 @@ mod tests {
             Some(["agent".to_string(), "tool_search".to_string()].as_slice())
         );
         assert!(turns[1].tool_calls.is_none());
+        assert_eq!(turns[1].tool_outcomes.as_ref().unwrap().succeeded, 1);
+        assert_eq!(turns[1].tool_outcomes.as_ref().unwrap().failed, 1);
         assert_eq!(turns[1].llm_rounds, Some(3));
         let traces: Vec<_> = events
             .iter()

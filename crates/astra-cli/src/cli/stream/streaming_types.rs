@@ -337,6 +337,42 @@ pub(crate) struct StreamResult {
 }
 
 impl StreamResult {
+    /// Project the complete run-total ledger into the durable journal shape.
+    /// Per-call records may be absent or only cover the Edge wrapper for a
+    /// Server-owned run, so every CLI entrypoint must use this aggregate when
+    /// it is internally complete.
+    pub(crate) fn canonical_tool_outcomes(
+        &self,
+    ) -> Option<astra_services::session_journal::ToolOutcomeSummary> {
+        let aggregate = self.tool_ledger_aggregate;
+        if !aggregate.is_complete_for(self.tool_calls_count) {
+            return None;
+        }
+        let classes = aggregate.result_classes;
+        let outcomes = astra_services::session_journal::ToolOutcomeSummary {
+            requested: aggregate.attempted,
+            executed: classes.succeeded.saturating_add(classes.failed),
+            succeeded: classes.succeeded,
+            failed: classes.failed,
+            rejected: classes.rejected,
+            reused: classes.reused,
+            suppressed: classes.suppressed,
+            deferred: 0,
+        };
+        outcomes.is_consistent().then_some(outcomes)
+    }
+
+    pub(crate) fn apply_canonical_tool_outcomes(
+        &self,
+        event: &mut astra_services::session_journal::JournalEvent,
+    ) {
+        let Some(outcomes) = self.canonical_tool_outcomes() else {
+            return;
+        };
+        event.tool_count = Some(outcomes.executed);
+        event.tool_outcomes = Some(outcomes);
+    }
+
     /// Merge terminal background-agent outputs into the user-facing aggregate
     /// response used by one-shot CLI and server surfaces.
     ///

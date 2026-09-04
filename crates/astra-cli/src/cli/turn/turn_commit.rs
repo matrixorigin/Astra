@@ -642,6 +642,11 @@ fn build_primary_turn_event(
     )
     .with_memoria_time(result.memoria_ms)
     .with_cache_tokens(result.cache_read_tokens, result.cache_creation_tokens);
+    // Server-owned runs expose a complete fixed-size ledger aggregate even
+    // though the Edge cannot retain their per-call records. Persist that
+    // authority alongside any local detail window so offline journal tools do
+    // not silently turn remote failures into successes.
+    result.apply_canonical_tool_outcomes(&mut turn_event);
     turn_event =
         turn_event.with_applied_user_intents(result.applied_user_intents.iter().map(|intent| {
             (
@@ -841,13 +846,25 @@ mod tests {
     }
 
     #[test]
-    fn server_only_tool_details_remain_unknown_in_cli_projection() {
+    fn server_only_tool_details_keep_authoritative_outcomes_in_cli_projection() {
         let state = SessionState {
             turn: 1,
             ..Default::default()
         };
         let mut result = crate::tests::stub_stream_result("done");
         result.tool_calls_count = 2;
+        result.tool_ledger_aggregate =
+            astra_turn_core::tool_ledger_receipt::ToolLedgerCanonicalAggregate {
+                attempted: 2,
+                terminal: 2,
+                unresolved: 0,
+                result_classes: astra_turn_core::tool_ledger_receipt::ToolLedgerResultClassCounts {
+                    succeeded: 1,
+                    failed: 1,
+                    ..Default::default()
+                },
+                consistent: true,
+            };
         result.tools_used = vec!["bash".into(), "git".into()];
         result.tool_call_records.clear();
 
@@ -855,6 +872,18 @@ mod tests {
         let (event, _) = build_primary_turn_event(&state, "review", &mut result, Instant::now());
         assert_eq!(event.total_tool_ms, None);
         assert_eq!(event.total_llm_ms, None);
+        assert!(event.tool_calls.is_none());
+        assert_eq!(event.tool_count, Some(2));
+        assert_eq!(
+            event.tool_outcomes,
+            Some(session_journal::ToolOutcomeSummary {
+                requested: 2,
+                executed: 2,
+                succeeded: 1,
+                failed: 1,
+                ..Default::default()
+            })
+        );
 
         let learning = analyze_chat_turn_learning("review", state.turn, &[], &result);
         let mut sidecars = Vec::new();
