@@ -1193,12 +1193,15 @@ pub fn is_workspace_mutation_tool(name: &str, args: &Value) -> bool {
                 crate::git_tool_contract::GitAction::Commit
                 | crate::git_tool_contract::GitAction::RevertCommit
                 | crate::git_tool_contract::GitAction::Push => true,
-                crate::git_tool_contract::GitAction::Stash => args
-                    .get("sub_action")
-                    .and_then(Value::as_str)
-                    .is_some_and(git_stash_sub_action_mutates_workspace),
-                crate::git_tool_contract::GitAction::CheckoutFile
-                | crate::git_tool_contract::GitAction::Worktree => true,
+                crate::git_tool_contract::GitAction::Stash => {
+                    crate::git_tool_contract::git_stash_sub_action_from_args(args)
+                        .is_ok_and(|action| action.mutates_workspace())
+                }
+                crate::git_tool_contract::GitAction::Worktree => {
+                    crate::git_tool_contract::git_worktree_sub_action_from_args(args)
+                        .map_or(true, |action| action.mutates_workspace())
+                }
+                crate::git_tool_contract::GitAction::CheckoutFile => true,
                 crate::git_tool_contract::GitAction::Status
                 | crate::git_tool_contract::GitAction::Diff
                 | crate::git_tool_contract::GitAction::Log
@@ -1251,13 +1254,6 @@ fn validate_host_owned_write_boundary(
     Ok(())
 }
 
-fn git_stash_sub_action_mutates_workspace(action: &str) -> bool {
-    matches!(
-        action,
-        "push" | "save" | "apply" | "pop" | "drop" | "branch"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -1272,6 +1268,25 @@ mod tests {
         let ctx = ToolContext::test(tmp.path());
         let exec = DefaultToolExecutor::new(ctx);
         (tmp, exec)
+    }
+
+    #[test]
+    fn git_nested_read_actions_do_not_claim_workspace_mutation() {
+        for args in [
+            serde_json::json!({"action": "stash", "sub_action": "list"}),
+            serde_json::json!({"action": "worktree", "sub_action": "list"}),
+        ] {
+            assert!(!is_workspace_mutation_tool("git", &args), "{args}");
+        }
+
+        for args in [
+            serde_json::json!({"action": "stash", "sub_action": "push"}),
+            serde_json::json!({"action": "worktree", "sub_action": "enter"}),
+            serde_json::json!({"action": "worktree", "sub_action": "add"}),
+            serde_json::json!({"action": "worktree", "sub_action": "remove"}),
+        ] {
+            assert!(is_workspace_mutation_tool("git", &args), "{args}");
+        }
     }
 
     #[test]

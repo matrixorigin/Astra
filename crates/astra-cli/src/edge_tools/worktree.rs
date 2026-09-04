@@ -687,17 +687,13 @@ impl ToolExecutor {
     }
 
     pub(crate) fn worktree_with_metadata(&self, args: &Value) -> super::ToolExecutionOutcome {
-        let action = match args.get("action").and_then(Value::as_str) {
-            Some(a) => a,
-            None => {
-                return super::ToolExecutionOutcome::error(
-                    "Error: 'action' is required (enter, exit, add, list, remove)".to_string(),
-                );
-            }
+        let action = match astra_tools::git_tool_contract::git_worktree_sub_action_from_args(args) {
+            Ok(action) => action,
+            Err(error) => return super::ToolExecutionOutcome::error(format!("Error: {error}")),
         };
 
         match action {
-            "enter" => {
+            astra_tools::git_tool_contract::GitWorktreeSubAction::Enter => {
                 let branch = match args.get("branch").and_then(Value::as_str) {
                     Some(b) if !b.is_empty() => b,
                     _ => {
@@ -747,7 +743,7 @@ impl ToolExecutor {
                     Err(e) => super::ToolExecutionOutcome::error(format!("Error: {e}")),
                 }
             }
-            "exit" => {
+            astra_tools::git_tool_contract::GitWorktreeSubAction::Exit => {
                 let exit_action = args
                     .get("exit_action")
                     .and_then(Value::as_str)
@@ -775,7 +771,7 @@ impl ToolExecutor {
                     Err(e) => super::ToolExecutionOutcome::error(format!("Error: {e}")),
                 }
             }
-            "add" | "create" => {
+            astra_tools::git_tool_contract::GitWorktreeSubAction::Add => {
                 let outcome = super::git_gix::worktree_add_with_metadata(&self.project_root, args);
                 if let Some(fields) = outcome.tool_result_fields.as_ref()
                     && let Some(worktree_path) = fields.get("worktree_path").and_then(Value::as_str)
@@ -801,12 +797,14 @@ impl ToolExecutor {
                 }
                 outcome
             }
-            "list" | "ls" => super::ToolExecutionOutcome {
-                output: super::git_gix::worktree_list(&self.project_root),
-                tool_result_fields: None,
-                is_error: false,
-            },
-            "remove" | "rm" | "delete" => {
+            astra_tools::git_tool_contract::GitWorktreeSubAction::List => {
+                super::ToolExecutionOutcome {
+                    output: super::git_gix::worktree_list(&self.project_root),
+                    tool_result_fields: None,
+                    is_error: false,
+                }
+            }
+            astra_tools::git_tool_contract::GitWorktreeSubAction::Remove => {
                 let normalized_path = args
                     .get("path")
                     .and_then(Value::as_str)
@@ -830,9 +828,6 @@ impl ToolExecutor {
                     is_error,
                 }
             }
-            _ => super::ToolExecutionOutcome::error(format!(
-                "Error: unknown worktree action '{action}'. Use: enter, exit, add, list, remove"
-            )),
         }
     }
 

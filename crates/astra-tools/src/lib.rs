@@ -666,12 +666,6 @@ pub const APPROVAL_REQUIRED_TOOLS: &[&str] = &[
     "rollback_database_snapshots",
 ];
 
-fn git_stash_sub_action_requires_approval(args: &Value) -> bool {
-    args.get("sub_action")
-        .and_then(Value::as_str)
-        .is_some_and(|action| matches!(action, "push" | "save" | "apply" | "pop" | "drop"))
-}
-
 /// Returns `true` if this exact tool invocation requires user approval.
 pub fn tool_requires_approval(tool_name: &str, args: &Value) -> bool {
     match tool_name {
@@ -682,7 +676,8 @@ pub fn tool_requires_approval(tool_name: &str, args: &Value) -> bool {
                 | crate::git_tool_contract::GitAction::RevertCommit
                 | crate::git_tool_contract::GitAction::Push => true,
                 crate::git_tool_contract::GitAction::Stash => {
-                    git_stash_sub_action_requires_approval(args)
+                    crate::git_tool_contract::git_stash_sub_action_from_args(args)
+                        .is_ok_and(|action| action.mutates_workspace())
                 }
                 crate::git_tool_contract::GitAction::Status
                 | crate::git_tool_contract::GitAction::Diff

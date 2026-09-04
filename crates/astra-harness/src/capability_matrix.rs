@@ -127,6 +127,17 @@ pub const CAPABILITY_CASES: &[CapabilityCase] = &[
         },
     },
     CapabilityCase {
+        id: "tools.cli_server.git_worktree_list_contract",
+        quadrant: CapabilityQuadrant::ToolExecution,
+        topology: Topology::CliServer,
+        kind: CaseKind::Happy,
+        boundary: "git(action=worktree, sub_action=list) is projected, admitted, and executed as a read-only Edge operation",
+        system_test: "git_worktree_public_contract_dispatches_sub_action",
+        model_validation: ModelValidation::Probe {
+            case: "git_worktree_list_contract",
+        },
+    },
+    CapabilityCase {
         id: "tools.edge_server.duplicate_callback",
         quadrant: CapabilityQuadrant::ToolExecution,
         topology: Topology::EdgeServer,

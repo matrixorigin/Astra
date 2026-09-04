@@ -714,7 +714,15 @@ pub fn classify(name: &str, args: Option<&serde_json::Value>) -> ToolClassificat
                 if args
                     .and_then(|a| a.get("sub_action"))
                     .and_then(|v| v.as_str())
-                    .is_some_and(|action| matches!(action, "list" | "show")) =>
+                    .is_some_and(|action| action == "list") =>
+            {
+                ToolIdempotency::PureRead
+            }
+            Some("worktree")
+                if args
+                    .and_then(|a| a.get("sub_action"))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|action| matches!(action, "list" | "ls")) =>
             {
                 ToolIdempotency::PureRead
             }
@@ -898,6 +906,7 @@ mod tests {
         assert_eq!(worktree_list.category, ToolCategory::ReadOnly);
         assert!(!worktree_list.approval_required);
         assert!(worktree_list.parallelizable);
+        assert_eq!(worktree_list.idempotency, ToolIdempotency::PureRead);
 
         let worktree_add = classify(
             "git",

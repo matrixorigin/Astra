@@ -1,0 +1,57 @@
+name: git_worktree_list_contract
+description: |
+  **What**: Invoke the consolidated Git tool's documented worktree list shape.
+  **Tests**: Model-visible schema, parent/sub-action binding, read-only Edge
+  dispatch, and durable successful tool evidence.
+  **Why**: A dispatcher once routed action=worktree correctly, then incorrectly
+  reused that parent value as the nested action and rejected every documented
+  worktree request.
+  **Pass means**: DeepSeek emits action=worktree with sub_action=list, the Edge
+  executor returns the real Git worktree listing, and no fallback shell is used.
+  **Fail means**: Schema projection, nested validation, execution routing, or
+  durable result classification has drifted.
+prompt: |
+  这是一次只读 Git worktree 契约检查。只调用一次 `git` 工具，参数必须准确使用
+  `action="worktree"` 和 `sub_action="list"`。不要调用 bash 或任何其他工具。
+  收到真实工具结果后，如果结果包含 `Git Worktrees:` 且不是错误，只回复
+  `WORKTREE_LIST_OK`。
+models:
+  - deepseek-v4-flash
+capability: tool_use
+difficulty: 1
+weight: 2.0
+timeout_seconds: 120
+debug_log: true
+criteria:
+  - type: exit_code
+    code: 0
+  - type: journal_tool_call_count
+    name: git
+    min: 1
+    max: 1
+    document: arguments
+    path: /action
+    equals: worktree
+  - type: journal_tool_call_count
+    name: git
+    min: 1
+    max: 1
+    document: arguments
+    path: /sub_action
+    equals: list
+  - type: journal_tool_json_contains
+    name: git
+    document: result
+    path: ""
+    contains: "Git Worktrees:"
+  - type: journal_tool_success_ratio
+    min: 1.0
+    min_calls: 1
+  - type: tools_count_between
+    min: 1
+    max: 1
+  - type: text_contains
+    needle: WORKTREE_LIST_OK
+  - type: turn_rounds_between
+    min: 2
+    max: 4

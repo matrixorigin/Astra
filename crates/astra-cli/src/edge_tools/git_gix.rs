@@ -528,18 +528,16 @@ impl ToolExecutor {
     }
 
     pub(crate) fn stash_with_metadata(&self, args: &Value) -> super::ToolExecutionOutcome {
-        let action = args
-            .get("action")
-            .and_then(Value::as_str)
-            .map(|action| action.trim().to_ascii_lowercase())
-            .unwrap_or_default();
+        let action = astra_tools::git_tool_contract::git_stash_sub_action_from_args(args).ok();
         let outcome = stash_with_metadata(&self.project_root, args);
-        if matches!(action.as_str(), "push" | "save")
-            && let Some(stash_ref) = outcome
-                .tool_result_fields
-                .as_ref()
-                .and_then(|fields| fields.get("stash_ref"))
-                .and_then(Value::as_str)
+        if matches!(
+            action,
+            Some(astra_tools::git_tool_contract::GitStashSubAction::Push)
+        ) && let Some(stash_ref) = outcome
+            .tool_result_fields
+            .as_ref()
+            .and_then(|fields| fields.get("stash_ref"))
+            .and_then(Value::as_str)
         {
             self.record_git_stash_rollback(
                 stash_ref.to_string(),
@@ -548,8 +546,13 @@ impl ToolExecutor {
                     .map(ToString::to_string),
             );
             self.clear_file_state();
-        } else if matches!(action.as_str(), "apply" | "pop")
-            && !outcome.output.starts_with("Error:")
+        } else if matches!(
+            action,
+            Some(
+                astra_tools::git_tool_contract::GitStashSubAction::Apply
+                    | astra_tools::git_tool_contract::GitStashSubAction::Pop
+            )
+        ) && !outcome.output.starts_with("Error:")
         {
             self.clear_file_state();
         }
@@ -657,16 +660,24 @@ impl ToolExecutor {
 
 /// Create, list, or remove git worktrees for isolated parallel work.
 pub fn worktree(project_root: &Path, args: &Value) -> String {
-    let action = match args.get("action").and_then(Value::as_str) {
-        Some(a) => a,
-        None => return "Error: 'action' is required (add, list, remove)".to_string(),
+    let action = match astra_tools::git_tool_contract::git_worktree_sub_action_from_args(args) {
+        Ok(action) => action,
+        Err(error) => return format!("Error: {error}"),
     };
 
     match action {
-        "add" | "create" => worktree_add(project_root, args),
-        "list" | "ls" => worktree_list(project_root),
-        "remove" | "rm" | "delete" => worktree_remove(project_root, args),
-        _ => format!("Error: unknown worktree action '{action}'. Use: add, list, remove"),
+        astra_tools::git_tool_contract::GitWorktreeSubAction::Add => {
+            worktree_add(project_root, args)
+        }
+        astra_tools::git_tool_contract::GitWorktreeSubAction::List => worktree_list(project_root),
+        astra_tools::git_tool_contract::GitWorktreeSubAction::Remove => {
+            worktree_remove(project_root, args)
+        }
+        astra_tools::git_tool_contract::GitWorktreeSubAction::Enter
+        | astra_tools::git_tool_contract::GitWorktreeSubAction::Exit => {
+            "Error: git worktree enter/exit requires the session-aware CLI/edge executor"
+                .to_string()
+        }
     }
 }
 
@@ -2044,7 +2055,7 @@ mod tests {
             "should require action"
         );
         assert!(
-            stash(&root, &json!({"action": "fly"})).contains("unknown stash action"),
+            stash(&root, &json!({"action": "fly"})).contains("unknown git stash sub_action"),
             "should reject unknown action"
         );
     }
@@ -2052,7 +2063,7 @@ mod tests {
     #[test]
     fn git_action_stash_list_works() {
         let root = repo_root();
-        let result = stash(&root, &json!({"action": "list"}));
+        let result = stash(&root, &json!({"action": "stash", "sub_action": "list"}));
         // Should return stash list or "No stashes found"
         assert!(
             result.contains("stash@") || result.contains("No stashes") || result.is_empty(),

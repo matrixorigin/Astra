@@ -343,6 +343,17 @@ fn git_commit_and_revert_actions_declare_required_fields() {
         conditional_required_for(git, "worktree"),
         vec!["sub_action".to_string()]
     );
+    let worktree_sub_actions =
+        git["function"]["parameters"]["x-astra-per-action-sub-actions"]["worktree"]
+            .as_array()
+            .expect("git worktree sub_action contract")
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>();
+    assert_eq!(
+        worktree_sub_actions,
+        astra_tools::git_tool_contract::GIT_WORKTREE_SUB_ACTIONS
+    );
 }
 
 #[test]

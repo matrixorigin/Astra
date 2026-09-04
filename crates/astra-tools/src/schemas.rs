@@ -1456,7 +1456,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "path": {
                             "type": "string",
-                            "description": "Repository-relative file or directory path. Used by: diff (one filter only), log, blame, checkout_file, contributors. For a diff over more than one path, use `paths`; never concatenate multiple paths into this string."
+                            "description": "File, directory, or worktree path. Repository-relative for diff (one filter only), log, blame, checkout_file, and contributors; used as the worktree target for worktree(remove). For a diff over more than one path, use `paths`; never concatenate multiple paths into this string."
                         },
                         "paths": {
                             "type": "array",
@@ -1526,7 +1526,7 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "sub_action": {
                             "type": "string",
-                            "description": "Sub-operation for multi-mode actions. Used by: stash (push/save/pop/apply/drop/list), worktree (add/list/remove)."
+                            "description": "Sub-operation for multi-mode actions. Used by: stash (push/apply/pop/list/drop), worktree (enter/exit/add/list/remove). worktree enter/add require branch; remove requires path."
                         },
                         "index": {
                             "type": "integer",
@@ -1542,7 +1542,28 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         },
                         "branch": {
                             "type": "string",
-                            "description": "Target branch name. Used by: push (required)."
+                            "description": "Target branch name. Required by: push, worktree(enter), and worktree(add)."
+                        },
+                        "new_branch": {
+                            "type": "boolean",
+                            "description": "For worktree(add), create branch when true (default); attach an existing branch when false."
+                        },
+                        "force": {
+                            "type": "boolean",
+                            "description": "For worktree(remove), pass --force. Default false."
+                        },
+                        "delete_branch": {
+                            "type": "boolean",
+                            "description": "For worktree(remove), also delete the associated branch after removal. Default false."
+                        },
+                        "exit_action": {
+                            "type": "string",
+                            "enum": ["keep", "remove"],
+                            "description": "For worktree(exit), keep or remove the session worktree. Default keep."
+                        },
+                        "discard_changes": {
+                            "type": "boolean",
+                            "description": "For worktree(exit, exit_action=remove), allow discarding worktree changes. Default false."
                         },
                         "force_with_lease": {
                             "type": "boolean",
@@ -1564,6 +1585,10 @@ fn all_tool_schemas_core() -> Vec<Value> {
                         "checkout_file": ["path", "ref"],
                         "worktree": ["sub_action"],
                         "push": ["remote", "branch"]
+                    },
+                    "x-astra-per-action-sub-actions": {
+                        "stash": crate::git_tool_contract::GIT_STASH_SUB_ACTIONS,
+                        "worktree": crate::git_tool_contract::GIT_WORKTREE_SUB_ACTIONS
                     }
                 }
             }

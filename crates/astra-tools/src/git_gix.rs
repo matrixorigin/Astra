@@ -413,7 +413,13 @@ pub fn validate_git_request(
             "Error: git field `paths` is only valid for git(action=diff)",
         ));
     }
-    for candidate in [path, file]
+    // Worktree targets are allowed to be registered sibling paths outside the
+    // repository root. Their authority is checked by the Edge path preflight;
+    // repository file filters remain strictly root-relative here.
+    let repository_path = (action != crate::git_tool_contract::GitAction::Worktree)
+        .then_some(path)
+        .flatten();
+    for candidate in [repository_path, file]
         .into_iter()
         .flatten()
         .chain(paths.iter().flatten().copied())
@@ -469,9 +475,27 @@ pub fn validate_git_request(
         crate::git_tool_contract::GitAction::LogSearch => {
             required_exact_string(args, "query", action)?;
         }
-        crate::git_tool_contract::GitAction::Stash
-        | crate::git_tool_contract::GitAction::Worktree => {
-            required_exact_string(args, "sub_action", action)?;
+        crate::git_tool_contract::GitAction::Stash => {
+            crate::git_tool_contract::git_stash_sub_action_from_args(args).map_err(|error| {
+                GitRequestValidationError::invalid_arguments(format!("Error: {error}"))
+            })?;
+        }
+        crate::git_tool_contract::GitAction::Worktree => {
+            let sub_action = crate::git_tool_contract::git_worktree_sub_action_from_args(args)
+                .map_err(|error| {
+                    GitRequestValidationError::invalid_arguments(format!("Error: {error}"))
+                })?;
+            match sub_action {
+                crate::git_tool_contract::GitWorktreeSubAction::Enter
+                | crate::git_tool_contract::GitWorktreeSubAction::Add => {
+                    required_exact_string(args, "branch", action)?;
+                }
+                crate::git_tool_contract::GitWorktreeSubAction::Remove => {
+                    required_exact_string(args, "path", action)?;
+                }
+                crate::git_tool_contract::GitWorktreeSubAction::Exit
+                | crate::git_tool_contract::GitWorktreeSubAction::List => {}
+            }
         }
         crate::git_tool_contract::GitAction::CheckoutFile => {
             required_exact_string(args, "path", action)?;
@@ -2737,7 +2761,7 @@ pub fn revert_commit_with_metadata(project_root: &Path, args: &Value) -> ToolExe
 /// Stash working tree changes.
 ///
 /// Parameters:
-/// - `action` (required): "push" (save), "apply", "pop" (restore + drop), "list", "drop"
+/// - `sub_action` (required): "push", "apply", "pop" (restore + drop), "list", "drop"
 /// - `message` (optional): description for push
 /// - `index` (optional): stash index for apply/pop/drop (default 0)
 /// - `stash_ref` (optional): exact stash selector or OID for apply
@@ -2746,18 +2770,15 @@ pub fn stash(project_root: &Path, args: &Value) -> String {
 }
 
 pub fn stash_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionOutcome {
-    let action = match args.get("action").and_then(Value::as_str) {
-        Some(a) => a,
-        None => {
-            return ToolExecutionOutcome::error(
-                "Error: 'action' is required (push, apply, pop, list, drop)".to_string(),
-            );
-        }
+    let action = match crate::git_tool_contract::git_stash_sub_action_from_args(args) {
+        Ok(action) => action,
+        Err(error) => return ToolExecutionOutcome::error(format!("Error: {error}")),
     };
+    let action_name = action.as_str();
 
     let mut cmd = std::process::Command::new("git");
     cmd.current_dir(project_root);
-    let before_stash_oid = matches!(action, "push" | "save")
+    let before_stash_oid = matches!(action, crate::git_tool_contract::GitStashSubAction::Push)
         .then(|| {
             std::process::Command::new("git")
                 .args(["rev-parse", "--verify", "refs/stash"])
@@ -2770,34 +2791,29 @@ pub fn stash_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionOu
         .flatten();
 
     match action {
-        "push" | "save" => {
+        crate::git_tool_contract::GitStashSubAction::Push => {
             cmd.arg("stash").arg("push");
             if let Some(msg) = args.get("message").and_then(Value::as_str) {
                 cmd.arg("-m").arg(msg);
             }
         }
-        "apply" => {
+        crate::git_tool_contract::GitStashSubAction::Apply => {
             let selector = match apply_stash_selector(args) {
                 Ok(selector) => selector,
                 Err(error) => return ToolExecutionOutcome::error(error),
             };
             cmd.arg("stash").arg("apply").arg(selector);
         }
-        "pop" => {
+        crate::git_tool_contract::GitStashSubAction::Pop => {
             let selector = stash_index_selector(args);
             cmd.arg("stash").arg("pop").arg(selector);
         }
-        "list" => {
+        crate::git_tool_contract::GitStashSubAction::List => {
             cmd.arg("stash").arg("list");
         }
-        "drop" => {
+        crate::git_tool_contract::GitStashSubAction::Drop => {
             let selector = stash_index_selector(args);
             cmd.arg("stash").arg("drop").arg(selector);
-        }
-        _ => {
-            return ToolExecutionOutcome::error(format!(
-                "Error: unknown stash action '{action}'. Use: push, apply, pop, list, drop"
-            ));
         }
     }
 
@@ -2809,15 +2825,19 @@ pub fn stash_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionOu
                 let result = stdout.trim();
                 let output = if result.is_empty() {
                     match action {
-                        "push" | "save" => "✓ Changes stashed".to_string(),
-                        "list" => "No stashes found".to_string(),
-                        _ => format!("✓ Stash {action} done"),
+                        crate::git_tool_contract::GitStashSubAction::Push => {
+                            "✓ Changes stashed".to_string()
+                        }
+                        crate::git_tool_contract::GitStashSubAction::List => {
+                            "No stashes found".to_string()
+                        }
+                        _ => format!("✓ Stash {action_name} done"),
                     }
                 } else {
                     result.to_string()
                 };
                 let mut tool_result_fields = None;
-                if matches!(action, "push" | "save") {
+                if matches!(action, crate::git_tool_contract::GitStashSubAction::Push) {
                     let after_stash_oid = std::process::Command::new("git")
                         .args(["rev-parse", "--verify", "refs/stash"])
                         .current_dir(project_root)
@@ -2840,12 +2860,14 @@ pub fn stash_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionOu
                     is_error: false,
                 };
                 let applied = match action {
-                    "apply" | "pop" | "drop" => true,
-                    "push" | "save" => outcome
+                    crate::git_tool_contract::GitStashSubAction::Apply
+                    | crate::git_tool_contract::GitStashSubAction::Pop
+                    | crate::git_tool_contract::GitStashSubAction::Drop => true,
+                    crate::git_tool_contract::GitStashSubAction::Push => outcome
                         .tool_result_fields
                         .as_ref()
                         .is_some_and(|fields| fields.contains_key("stash_ref")),
-                    _ => false,
+                    crate::git_tool_contract::GitStashSubAction::List => false,
                 };
                 if applied {
                     outcome = outcome.with_workspace_mutation_applied();
@@ -2858,7 +2880,9 @@ pub fn stash_with_metadata(project_root: &Path, args: &Value) -> ToolExecutionOu
                     // the gix error verbatim and flag as failure explicitly.
                     ToolExecutionOutcome::error(err.to_string())
                 } else {
-                    ToolExecutionOutcome::error(format!("Error: git stash {action} failed: {err}"))
+                    ToolExecutionOutcome::error(format!(
+                        "Error: git stash {action_name} failed: {err}"
+                    ))
                 }
             }
         }
@@ -2979,19 +3003,7 @@ pub fn git_dispatch(project_root: &Path, args: &Value) -> ToolExecutionOutcome {
         crate::git_tool_contract::GitAction::RevertCommit => {
             revert_commit_with_metadata(project_root, args)
         }
-        crate::git_tool_contract::GitAction::Stash => {
-            // Remap: read `sub_action` and set it as `action` for the
-            // inner stash function which expects action ∈ {push,apply,pop,list,drop}.
-            let stash_sub_action = args.get("sub_action").and_then(Value::as_str);
-            let remapped_args = if let Some(sa) = stash_sub_action {
-                let mut map = args.as_object().cloned().unwrap_or_default();
-                map.insert("action".to_string(), Value::String(sa.to_string()));
-                Value::Object(map)
-            } else {
-                args.clone()
-            };
-            stash_with_metadata(project_root, &remapped_args)
-        }
+        crate::git_tool_contract::GitAction::Stash => stash_with_metadata(project_root, args),
         crate::git_tool_contract::GitAction::CheckoutFile => ToolExecutionOutcome::error(
             "Error: git.checkout_file requires a CLI/edge executor with checkout_file support."
                 .to_string(),
@@ -3069,6 +3081,42 @@ mod tests {
                 .unwrap();
 
         assert_eq!(action, crate::git_tool_contract::GitAction::Diff);
+    }
+
+    #[test]
+    fn git_request_validation_enforces_parent_specific_sub_actions() {
+        let dir = TempDir::new().expect("tempdir");
+
+        validate_git_request(
+            dir.path(),
+            &json!({"action": "worktree", "sub_action": "list"}),
+        )
+        .expect("worktree list is a complete read request");
+
+        for args in [
+            json!({"action": "worktree"}),
+            json!({"action": "worktree", "sub_action": "enter"}),
+            json!({"action": "worktree", "sub_action": "remove"}),
+            json!({"action": "stash", "sub_action": "enter"}),
+        ] {
+            let error = validate_git_request(dir.path(), &args)
+                .expect_err("incomplete or cross-parent sub-action must fail");
+            assert_eq!(error.evidence.kind, astra_core::ErrorKind::ToolInvalidArgs);
+            assert_eq!(
+                error.evidence.cause,
+                astra_core::ToolFailureCause::InvalidArguments
+            );
+        }
+
+        validate_git_request(
+            dir.path(),
+            &json!({
+                "action": "worktree",
+                "sub_action": "enter",
+                "branch": "feature/test"
+            }),
+        )
+        .expect("worktree enter with a branch is structurally complete");
     }
 
     #[test]
@@ -4646,7 +4694,7 @@ mod tests {
         let root = repo_root();
         let result = stash(&root, &json!({"action": "fly"}));
         assert!(
-            result.contains("unknown stash action"),
+            result.contains("unknown git stash sub_action"),
             "should reject unknown: {result}"
         );
     }
@@ -4654,7 +4702,7 @@ mod tests {
     #[test]
     fn git_action_stash_list_works() {
         let root = repo_root();
-        let result = stash(&root, &json!({"action": "list"}));
+        let result = stash(&root, &json!({"action": "stash", "sub_action": "list"}));
         // Should return stash list or "No stashes found"
         assert!(
             result.contains("stash@") || result.contains("No stashes") || result.is_empty(),

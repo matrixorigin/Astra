@@ -230,17 +230,6 @@ pub(crate) fn is_plan_mode_blocked_tool(tool: &str, args: &Value) -> bool {
     astra_turn_core::plan_mode_policy::is_plan_mode_blocked_tool(tool, args)
 }
 
-fn git_stash_sub_action_args(args: &Value) -> Value {
-    let sub_action = args.get("sub_action").and_then(Value::as_str);
-    let Some(sub_action) = sub_action else {
-        return args.clone();
-    };
-
-    let mut map = args.as_object().cloned().unwrap_or_default();
-    map.insert("action".to_string(), Value::String(sub_action.to_string()));
-    Value::Object(map)
-}
-
 #[path = "edge_tools/diagnose.rs"]
 mod diagnose;
 #[path = "edge_tools/file_state.rs"]
@@ -4645,7 +4634,23 @@ impl ToolExecutor {
                     return outcome;
                 }
                 astra_tools::git_tool_contract::GitAction::Stash => {
-                    let Some(_workspace_mutation_lease) =
+                    if let Err(error) =
+                        astra_tools::git_gix::validate_git_request(&self.project_root, args)
+                    {
+                        return EdgeToolRun::failure_evidence(error.message, error.evidence)
+                            .into_outcome();
+                    }
+                    let stash_action =
+                        match astra_tools::git_tool_contract::git_stash_sub_action_from_args(args) {
+                            Ok(action) => action,
+                            Err(error) => {
+                                return ToolExecutionOutcome::error(format!("Error: {error}"));
+                            }
+                        };
+                    // Read-only stash listing follows the ordinary path so it
+                    // does not contend on the workspace mutation lease.
+                    if stash_action.mutates_workspace() {
+                        let Some(_workspace_mutation_lease) =
                         astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options(
                             &self.project_root,
                             cancel_token,
@@ -4660,17 +4665,37 @@ impl ToolExecutor {
                             "workspace coordination lock was unavailable, contended, or the host temporary lock namespace is not trustworthy; no git stash was run. Retry after the active writer finishes or repair the host temporary-directory ownership and sticky-bit permissions".to_string(),
                         );
                     };
-                    if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-                        return cancelled_tool_execution_outcome("git", false);
+                        if cancel_token
+                            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+                        {
+                            return cancelled_tool_execution_outcome("git", false);
+                        }
+                        let mut outcome = self.stash_with_metadata(args);
+                        outcome.output = self.finalize_tool_output(outcome.output, name);
+                        self.record_output_size(outcome.output.len());
+                        return outcome;
                     }
-                    let stash_args = git_stash_sub_action_args(args);
-                    let mut outcome = self.stash_with_metadata(&stash_args);
-                    outcome.output = self.finalize_tool_output(outcome.output, name);
-                    self.record_output_size(outcome.output.len());
-                    return outcome;
                 }
                 astra_tools::git_tool_contract::GitAction::Worktree => {
-                    let Some(_workspace_mutation_lease) =
+                    if let Err(error) =
+                        astra_tools::git_gix::validate_git_request(&self.project_root, args)
+                    {
+                        return EdgeToolRun::failure_evidence(error.message, error.evidence)
+                            .into_outcome();
+                    }
+                    let worktree_action =
+                        match astra_tools::git_tool_contract::git_worktree_sub_action_from_args(
+                            args,
+                        ) {
+                            Ok(action) => action,
+                            Err(error) => {
+                                return ToolExecutionOutcome::error(format!("Error: {error}"));
+                            }
+                        };
+                    // `list` is a pure observation and must not wait for a
+                    // writer lease held by an unrelated operation.
+                    if worktree_action.mutates_workspace() {
+                        let Some(_workspace_mutation_lease) =
                         astra_tools::workspace_observation::acquire_workspace_mutation_lease_with_options(
                             &self.project_root,
                             cancel_token,
@@ -4685,13 +4710,16 @@ impl ToolExecutor {
                             "workspace coordination lock was unavailable, contended, or the host temporary lock namespace is not trustworthy; no git worktree was run. Retry after the active writer finishes or repair the host temporary-directory ownership and sticky-bit permissions".to_string(),
                         );
                     };
-                    if cancel_token.is_some_and(tokio_util::sync::CancellationToken::is_cancelled) {
-                        return cancelled_tool_execution_outcome("git", false);
+                        if cancel_token
+                            .is_some_and(tokio_util::sync::CancellationToken::is_cancelled)
+                        {
+                            return cancelled_tool_execution_outcome("git", false);
+                        }
+                        let mut outcome = self.worktree_with_metadata(args);
+                        outcome.output = self.finalize_tool_output(outcome.output, name);
+                        self.record_output_size(outcome.output.len());
+                        return outcome;
                     }
-                    let mut outcome = self.worktree_with_metadata(args);
-                    outcome.output = self.finalize_tool_output(outcome.output, name);
-                    self.record_output_size(outcome.output.len());
-                    return outcome;
                 }
                 astra_tools::git_tool_contract::GitAction::Status
                 | astra_tools::git_tool_contract::GitAction::Diff
@@ -5215,10 +5243,7 @@ impl ToolExecutor {
                         astra_tools::git_tool_contract::GitAction::RevertCommit => {
                             self.revert_commit(args)
                         }
-                        astra_tools::git_tool_contract::GitAction::Stash => {
-                            let stash_args = git_stash_sub_action_args(args);
-                            self.stash(&stash_args)
-                        }
+                        astra_tools::git_tool_contract::GitAction::Stash => self.stash(args),
                         astra_tools::git_tool_contract::GitAction::CheckoutFile => {
                             self.checkout_file(args)
                         }
@@ -6317,8 +6342,8 @@ mod tests {
         background_task_output_result_fields, cli_default_capabilities, cli_tool_output_is_error,
         detect_git_remote_repos, embedded_work_unit_observation, extract_github_owner_repo,
         file_checkpoint_dir_for, format_background_task_error, format_background_task_output,
-        format_background_task_output_wait_timeout, format_background_task_stop_error,
-        git_stash_sub_action_args, memoria, parse_memory_search_contents, utf16_col_to_char_idx,
+        format_background_task_output_wait_timeout, format_background_task_stop_error, memoria,
+        parse_memory_search_contents, utf16_col_to_char_idx,
     };
     use crate::background_task_error::BackgroundTaskError;
     use crate::lock_recovery::LockRecovery;
@@ -6474,13 +6499,6 @@ mod tests {
         assert_eq!(observation.id, "fanout-group-1");
         assert_eq!(observation.kind, "agent_fanout");
         assert_eq!(observation.status, WorkUnitStatus::Completed);
-    }
-
-    #[test]
-    fn git_stash_bridge_remaps_canonical_sub_action() {
-        let canonical =
-            git_stash_sub_action_args(&serde_json::json!({"action":"stash","sub_action":"push"}));
-        assert_eq!(canonical["action"], "push");
     }
 
     struct ImmediateSpawnExecutor;

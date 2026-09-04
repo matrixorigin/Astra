@@ -157,14 +157,53 @@ fn git_worktree_error_paths() {
     let exe = ToolExecutor::new(dir.path());
 
     // enter without branch
-    let result = exe.worktree(&json!({"action": "enter"}));
+    let result = exe.worktree(&json!({"action": "worktree", "sub_action": "enter"}));
     assert!(result.contains("Error"));
     assert!(result.contains("branch"));
 
     // exit when not in session
-    let result = exe.worktree(&json!({"action": "exit"}));
+    let result = exe.worktree(&json!({"action": "worktree", "sub_action": "exit"}));
     assert!(result.contains("Error"));
     assert!(result.contains("Not in a worktree session"));
+}
+
+#[tokio::test]
+async fn git_worktree_public_contract_dispatches_sub_action() {
+    let dir = init_temp_git_repo();
+    let exe = ToolExecutor::new(dir.path());
+
+    let outcome = exe
+        .execute_with_metadata(
+            "git",
+            &json!({
+                "action": "worktree",
+                "sub_action": "list",
+            }),
+        )
+        .await;
+
+    assert!(
+        !outcome.is_error,
+        "public worktree list failed: {outcome:?}"
+    );
+    assert!(outcome.output.contains("Git Worktrees:"), "{outcome:?}");
+    assert!(!outcome.output.contains("unknown worktree action"));
+}
+
+#[test]
+fn git_worktree_public_contract_reports_sub_action_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let exe = ToolExecutor::new(dir.path());
+
+    let missing = exe.worktree(&json!({"action": "worktree"}));
+    assert!(missing.contains("requires non-empty string field `sub_action`"));
+
+    let unknown = exe.worktree(&json!({
+        "action": "worktree",
+        "sub_action": "teleport",
+    }));
+    assert!(unknown.contains("unknown git worktree sub_action 'teleport'"));
+    assert!(!unknown.contains("unknown worktree action 'worktree'"));
 }
 
 #[tokio::test]
@@ -175,7 +214,8 @@ async fn git_worktree_enter_records_rollback_handle() {
         .store(7, std::sync::atomic::Ordering::Relaxed);
 
     let outcome = exe.worktree_with_metadata(&json!({
-        "action": "enter",
+        "action": "worktree",
+        "sub_action": "enter",
         "branch": "session-demo",
     }));
     assert!(
@@ -192,7 +232,8 @@ async fn git_worktree_enter_records_rollback_handle() {
     assert_eq!(listed_json["total_git_worktree_entries"].as_u64(), Some(1));
 
     let cleanup = exe.worktree(&json!({
-        "action": "exit",
+        "action": "worktree",
+        "sub_action": "exit",
         "exit_action": "remove",
         "discard_changes": true,
     }));
