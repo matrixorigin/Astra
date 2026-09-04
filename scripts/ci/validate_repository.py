@@ -302,6 +302,8 @@ def main() -> None:
     for required in (
         "release-prepare:",
         'scripts/prepare-release-version.py "$(VERSION)"',
+        "release-publish:",
+        "gh workflow run release.yml --repo matrixorigin/Astra --ref main",
         "stack-start: stack-env",
         "$(MAKE) stack-up",
         "$(MAKE) stack-verify",

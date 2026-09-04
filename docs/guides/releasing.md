@@ -155,12 +155,18 @@ release commit; it does not modify files, create tags, or publish data.
 
 ## Publish
 
-1. Open **Actions → Release Astra → Run workflow**.
-2. Select `main` in the branch selector.
-3. Enter the version without a leading `v`, for example `0.2.0`.
-4. Leave **recover existing tag** disabled for a new release.
-5. Wait for the client and server candidate matrices to pass.
-6. Review the preflight summary and approve the single `release` Environment
+1. Fast-forward a clean local `main` checkout to the merged release commit.
+2. Start the protected workflow:
+
+   ```bash
+   make release-publish VERSION=0.2.0
+   ```
+
+   The command validates the synchronized version metadata, requires a clean
+   checkout at the exact `origin/main` SHA, and dispatches **Release Astra**
+   with recovery disabled. It does not create a tag locally.
+3. Wait for the client and server candidate matrices to pass.
+4. Review the preflight summary and approve the single `release` Environment
    gate for the publication job.
 
 Do not create the tag manually. The workflow creates `vX.Y.Z` as an annotated

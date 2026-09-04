@@ -65,9 +65,11 @@
 | --- | --- |
 | `make release-prepare VERSION=X.Y.Z` | Safely synchronize release versions without committing, tagging, building, or publishing |
 | `make release-check VERSION=X.Y.Z` | Read-only preflight for synchronized versions, installer/archive unhappy paths, repository workflow contracts, and documentation links |
+| `make release-publish VERSION=X.Y.Z` | From a clean local `main` equal to `origin/main`, dispatch the protected Release Astra workflow with recovery disabled |
 
 Publication itself is owned by the protected **Release Astra** GitHub workflow;
-neither Make target creates a tag or publishes an artifact. `release-prepare`
+the publish target only dispatches it, and the workflow creates the tag and
+artifacts after its candidate checks and Environment approval. `release-prepare`
 refuses to overwrite existing version-file edits and leaves MatrixOne/Memoria
 digest changes for deliberate maintainer review.
 

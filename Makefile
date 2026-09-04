@@ -534,7 +534,34 @@ release-check:
 	@scripts/validate-release-version.sh "$(VERSION)"
 	@python3 scripts/ci/validate_repository.py
 	@echo "✅ Release metadata, installer, artifacts, and workflow contracts are consistent"
-	@echo "   Commit and merge the reviewed version changes, then run Release Astra from main."
+	@echo "   Commit and merge the reviewed version changes, then run make release-publish VERSION=$(VERSION) from main."
+
+.PHONY: release-publish
+release-publish:
+	@if [ -z "$(VERSION)" ]; then \
+		echo "❌ VERSION is required, for example: make release-publish VERSION=0.2.0"; \
+		exit 1; \
+	fi
+	@scripts/validate-release-version.sh "$(VERSION)"
+	@command -v gh >/dev/null 2>&1 || { echo "❌ GitHub CLI (gh) is required to start a release"; exit 1; }
+	@gh auth status -h github.com >/dev/null 2>&1 || { echo "❌ Authenticate gh with permission to dispatch repository workflows"; exit 1; }
+	@default_branch="$$(gh repo view matrixorigin/Astra --json defaultBranchRef --jq '.defaultBranchRef.name')"; \
+	if [ "$$(git branch --show-current)" != "$$default_branch" ]; then \
+		echo "❌ Run release-publish from $$default_branch after the release PR merges"; \
+		exit 1; \
+	fi; \
+	if ! git diff --quiet || ! git diff --cached --quiet; then \
+		echo "❌ Commit or stash local changes before starting a release"; \
+		exit 1; \
+	fi; \
+	git fetch origin "$$default_branch"; \
+	if [ "$$(git rev-parse HEAD)" != "$$(git rev-parse "origin/$$default_branch")" ]; then \
+		echo "❌ Local $$default_branch is not at origin/$$default_branch; fast-forward it before starting a release"; \
+		exit 1; \
+	fi
+	@gh workflow run release.yml --repo matrixorigin/Astra --ref main \
+		-f version="$(VERSION)" -f recover_existing_tag=false
+	@echo "✅ Release Astra started for $(VERSION). Candidate builds run before the protected release approval."
 
 # ============================================================================
 # Compose Stack Deployment
