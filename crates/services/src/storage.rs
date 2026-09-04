@@ -3624,6 +3624,19 @@ async fn ensure_core_schema_while_leased(
     .execute(&pool)
     .await?;
 
+    core_schema_create!(
+        pool,
+        "auth_memoria_identities",
+        "CREATE TABLE IF NOT EXISTS auth_memoria_identities (
+            memoria_user_id VARCHAR(128) PRIMARY KEY,
+            astra_user_id VARCHAR(128) NOT NULL UNIQUE,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            INDEX idx_auth_memoria_astra_user (astra_user_id)
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     core_schema_create!(pool, "auth_provider_request_replay",
         "CREATE TABLE IF NOT EXISTS auth_provider_request_replay (
             provider VARCHAR(64) NOT NULL,

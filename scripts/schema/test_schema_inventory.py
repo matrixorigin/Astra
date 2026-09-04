@@ -528,6 +528,7 @@ fn char_literal() { let slash = '/'; }
             "auth_roles",
             "auth_refresh_tokens",
             "auth_tokens",
+            "auth_memoria_identities",
             "auth_audit_logs",
             "infra_llm_models",
             "runtime_llm_trusted_domains",

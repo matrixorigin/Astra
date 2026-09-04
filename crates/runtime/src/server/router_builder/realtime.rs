@@ -11,6 +11,7 @@ pub(super) fn add_routes(router: Router<AppState>) -> Router<AppState> {
         .route("/metrics", get(meta_handlers::metrics_handler))
         .route("/auth/register", post(auth_handlers::auth_register_handler))
         .route("/auth/login", post(auth_handlers::auth_login_handler))
+        .route("/auth/memoria", post(auth_handlers::auth_memoria_handler))
         .route("/auth/refresh", post(auth_handlers::auth_refresh_handler))
         .route("/auth/logout", post(auth_handlers::auth_logout_handler))
         .route(

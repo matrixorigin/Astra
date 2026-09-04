@@ -4,8 +4,8 @@ use crate::cli::arg_render::{
     render_review_args, render_team_args,
 };
 use crate::cli::auth_flow::{
-    clear_profile_auth, do_login, do_register, is_auth_error, parse_auth_tokens,
-    save_refreshed_profile_tokens,
+    clear_profile_auth, do_login, do_memoria_browser_login, do_memoria_login_with_key, do_register,
+    is_auth_error, parse_auth_tokens, save_refreshed_profile_tokens,
 };
 use crate::cli::cli_config::cli_args::{
     AuditCmd, Cli, Command, JournalCmd, ModelCmd, SessionCaptureCmd, SessionCmd, SkillCmd,
@@ -1016,9 +1016,16 @@ async fn execute_cli_command_impl(
                     .magenta()
                     .bold()
             );
-            let username = prompt_or("Username", args.username)?;
-            let password = prompt_password_masked("Password", args.password)?;
-            do_login(api, profile.as_deref(), &username, &password).await?;
+            if args.username.is_some() || args.password.is_some() {
+                let username = prompt_or("Username", args.username)?;
+                let password = prompt_password_masked("Password", args.password)?;
+                do_login(api, profile.as_deref(), &username, &password).await?;
+            } else if args.manual {
+                let connection_key = prompt_password_masked("Memoria connection key", None)?;
+                do_memoria_login_with_key(api, profile.as_deref(), &connection_key).await?;
+            } else {
+                do_memoria_browser_login(api, profile.as_deref()).await?;
+            }
             eprintln!(
                 "{}",
                 "  ✓  Logged in. Run `astra` to start chatting.".green()

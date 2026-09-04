@@ -208,6 +208,11 @@ pub struct AppState {
     pub memoria_base_url: String,
     pub memoria_master_key: Option<String>,
     pub memoria_forwarder: Arc<dyn MemoriaForwarder>,
+    /// True only when the application composition explicitly injects a
+    /// forwarder (normally an in-process test double). Production BYOK calls
+    /// resolve a per-user credential instead of falling back to the
+    /// server-wide forwarder merely because one is configured.
+    pub(crate) memoria_forwarder_is_override: bool,
     memoria_health_cache: Arc<std::sync::RwLock<CachedMemoriaHealth>>,
     memoria_health_refresh: Arc<tokio::sync::Mutex<()>>,
     pub shared_pool: Option<SharedPool>,
@@ -327,6 +332,7 @@ impl AppState {
             memoria_base_url: default_memoria.base_url,
             memoria_master_key: default_memoria.master_key,
             memoria_forwarder: Arc::new(NoopMemoriaForwarder),
+            memoria_forwarder_is_override: false,
             memoria_health_cache: Arc::new(std::sync::RwLock::new(CachedMemoriaHealth::new(
                 MemoriaHealth::Disabled,
             ))),
@@ -419,6 +425,7 @@ impl AppState {
         } else {
             Arc::new(ReqwestMemoriaForwarder::new(base_url.clone(), key))
         };
+        self.memoria_forwarder_is_override = false;
         *astra_core::sync_poison::recover_rwlock_write(&self.memoria_health_cache) =
             CachedMemoriaHealth::new(
                 if master_key.as_deref().is_some_and(|key| !key.is_empty()) {
@@ -435,6 +442,7 @@ impl AppState {
     /// Inject a custom MemoriaForwarder (for testing).
     pub fn with_memoria_forwarder(mut self, forwarder: Arc<dyn MemoriaForwarder>) -> Self {
         self.memoria_forwarder = forwarder;
+        self.memoria_forwarder_is_override = true;
         *astra_core::sync_poison::recover_rwlock_write(&self.memoria_health_cache) =
             CachedMemoriaHealth::new(MemoriaHealth::Unavailable("probe pending".to_string()));
         self

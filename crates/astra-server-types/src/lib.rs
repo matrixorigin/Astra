@@ -683,6 +683,13 @@ pub struct AuthLoginRequest {
 #[cfg(feature = "server")]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct AuthMemoriaRequest {
+    pub connection_key: String,
+}
+
+#[cfg(feature = "server")]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthRefreshRequest {
     pub refresh_token: String,
 }
@@ -994,6 +1001,18 @@ pub struct AuthTokenResponse {
     pub refresh_token: String,
     pub token_type: String,
     pub expires_in: u32,
+}
+
+#[cfg(feature = "server")]
+#[derive(Serialize, PartialEq, Eq)]
+pub struct AuthMemoriaResponse {
+    pub user_id: String,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub token_type: String,
+    pub expires_in: u32,
+    pub memory_access: String,
+    pub granted_scopes: Vec<String>,
 }
 
 #[cfg(feature = "server")]

@@ -940,6 +940,16 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / auth",
         product_owner="admin secret/token management and scoped provider credentials",
     ),
+    "auth_memoria_identities": TableMetadata(
+        semantic_owner="astra_services::auth / Memoria integration",
+        state_class="durable external-to-Astra identity mapping fact",
+        primary_query="resolve the stable Astra user_id by Memoria user_id during scoped-key login",
+        retention_policy="retain while the linked Astra account exists; remove only through an explicit account-unlink or account-deletion workflow",
+        rebuildability="deterministically rebuildable from the verified Memoria user_id, but loss can break continuity until the mapping is recreated",
+        merge_guidance="keep separate from auth_users and auth_tokens; external identity mapping, local account state, and encrypted credentials have different trust and revocation boundaries",
+        migration_owner="astra_services::storage / auth",
+        product_owner="Memoria sign-in and Astra account continuity",
+    ),
     "auth_audit_logs": TableMetadata(
         semantic_owner="astra_services::auth::admin / auth session audit",
         state_class="durable auth audit event",
