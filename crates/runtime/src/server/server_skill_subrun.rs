@@ -1140,6 +1140,7 @@ impl SkillSubRunExecutor for ServerSkillSubRunExecutor {
             canonical_rewrite_state: Default::default(),
             provider_canonical_wal_base: None,
             provider_canonical_wal_head_transition_id: None,
+            provider_canonical_wal_head_result: None,
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: astra_turn_core::compaction_types::CompactionTier::Normal,
             skill_produced_output: false,

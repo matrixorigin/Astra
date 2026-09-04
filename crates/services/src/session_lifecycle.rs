@@ -434,6 +434,13 @@ const SESSION_DELETE_DIRECT_BATCH_TABLES: &[SessionBatchDeleteStatement] = &[
         sql: SESSION_DELETE_INFERENCE_SETTLEMENT_DEBTS_SQL,
     },
     SessionBatchDeleteStatement {
+        label: "inference_canonical_transition_wal",
+        sql: "DELETE FROM inference_canonical_transition_wal
+             WHERE session_id = ? AND user_id = ?
+             ORDER BY turn_index ASC, transition_id ASC
+             LIMIT ?",
+    },
+    SessionBatchDeleteStatement {
         label: "inference_canonical_transition_heads",
         sql: "DELETE FROM inference_canonical_transition_heads
              WHERE session_id = ? AND user_id = ?
@@ -561,6 +568,7 @@ const SESSION_DELETE_CORE_RESIDUAL_TABLES: &[(&str, &str)] = &[
     ("agent_events", "user_id"),
     ("agent_event_edges", "user_id"),
     ("agent_runs", "user_id"),
+    ("inference_canonical_transition_wal", "user_id"),
     ("inference_canonical_transition_heads", "user_id"),
     ("inference_invocation_settlement_debts", "user_id"),
 ];
@@ -1526,6 +1534,7 @@ mod tests {
                 "agent_run_events",
                 "conversation_log",
                 "inference_canonical_transition_heads",
+                "inference_canonical_transition_wal",
                 "inference_invocation_settlement_debts",
                 "inference_invocations",
                 "inference_provider_attempts",

@@ -3426,7 +3426,7 @@ impl DurableInferenceInvocation {
     /// that fences the exact provider body.
     pub(crate) fn bind_provider_canonical_transitions(
         &self,
-        transitions: Vec<astra_turn_types::ProviderCanonicalTransitionV1>,
+        transitions: Vec<astra_turn_types::ProviderCanonicalTransitionV2>,
     ) -> Result<(), astra_core::ClassifiedError> {
         for transition in &transitions {
             transition.validate().map_err(|error| {
@@ -3761,7 +3761,7 @@ struct DurableProviderAttemptObserver {
     settlement_reservation: Arc<std::sync::Mutex<Option<ProviderSettlementReservation>>>,
     invocation: astra_services::InferenceInvocationPlan,
     request_context: astra_services::ModelRequestContextSeed,
-    canonical_transitions: std::sync::Mutex<Vec<astra_turn_types::ProviderCanonicalTransitionV1>>,
+    canonical_transitions: std::sync::Mutex<Vec<astra_turn_types::ProviderCanonicalTransitionV2>>,
     admitted_canonical_transition_id: std::sync::Mutex<Option<String>>,
     next_attempt: AtomicU32,
     dispatch_started: AtomicBool,
@@ -7557,7 +7557,7 @@ mod tests {
             astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
         );
         let transition =
-            astra_turn_types::ProviderCanonicalTransitionV1::new(None, &base, vec![authority])
+            astra_turn_types::ProviderCanonicalTransitionV2::new(None, &base, vec![authority])
                 .unwrap();
         let transition_id = transition.transition_id.clone();
         invocation

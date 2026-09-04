@@ -2046,7 +2046,8 @@ pub struct CapturedLlmRequest {
 struct ProviderCanonicalHydrationOutcome {
     reconciled_transitions: usize,
     head_transition_id: Option<String>,
-    replacement: Option<astra_turn_types::ProviderCanonicalTransitionV1>,
+    head_result: Option<astra_turn_types::CanonicalPrefixIdentityV1>,
+    replacement: Option<astra_turn_types::ProviderCanonicalTransitionV2>,
 }
 
 fn sanitize_provider_canonical_wal_snapshot(
@@ -2079,41 +2080,53 @@ fn apply_provider_canonical_transition_receipts(
         return Ok(ProviderCanonicalHydrationOutcome {
             reconciled_transitions: 0,
             head_transition_id: None,
+            head_result: None,
             replacement: None,
         });
     }
-    if receipts.len() != 1 || receipts[0].transitions.len() != 1 {
+    if receipts.len() != 1 || receipts[0].transitions.is_empty() {
         return Err(astra_core::ClassifiedError::new(
             astra_core::ErrorKind::ContractViolation,
-            "provider canonical WAL loader returned more than its unique-head contract",
+            "provider canonical WAL loader returned an invalid turn chain",
         ));
     }
-    let leaf = receipts
+    let transitions = receipts
         .into_iter()
         .next()
-        .and_then(|receipt| receipt.transitions.into_iter().next())
-        .expect("the unique-head cardinality was checked above");
-    leaf.validate().map_err(|error| {
-        astra_core::ClassifiedError::new(
-            astra_core::ErrorKind::ContractViolation,
-            format!("validate provider canonical WAL head: {error}"),
-        )
-    })?;
+        .map(|receipt| receipt.transitions)
+        .expect("the turn receipt cardinality was checked above");
     let mut candidate = messages.clone();
-    leaf.apply_to(&mut candidate).map_err(|error| {
-        astra_core::ClassifiedError::new(
-            astra_core::ErrorKind::ContractViolation,
-            format!("reconcile provider canonical transition WAL leaf: {error}"),
-        )
-    })?;
-    let replacement = (leaf.recovery_mode
-        == astra_turn_types::ProviderCanonicalRecoveryModeV1::ReplaceFromDurableBase)
-        .then_some(leaf.clone());
-    let head_transition_id = Some(leaf.transition_id.clone());
+    let mut replacement = None;
+    for transition in &transitions {
+        transition.validate().map_err(|error| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                format!("validate provider canonical WAL entry: {error}"),
+            )
+        })?;
+        transition.apply_to(&mut candidate).map_err(|error| {
+            astra_core::ClassifiedError::new(
+                astra_core::ErrorKind::ContractViolation,
+                format!("reconcile provider canonical transition WAL chain: {error}"),
+            )
+        })?;
+        if transition.recovery_mode
+            == astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase
+        {
+            replacement = Some(transition.clone());
+        }
+    }
+    let head_transition_id = transitions
+        .last()
+        .map(|transition| transition.transition_id.clone());
+    let head_result = transitions
+        .last()
+        .map(|transition| transition.result.clone());
     *messages = candidate;
     Ok(ProviderCanonicalHydrationOutcome {
-        reconciled_transitions: 1,
+        reconciled_transitions: transitions.len(),
         head_transition_id,
+        head_result,
         replacement,
     })
 }
@@ -11174,6 +11187,7 @@ impl ServerAgenticLoopHost {
                 })?;
         }
         state.provider_canonical_wal_head_transition_id = outcome.head_transition_id.clone();
+        state.provider_canonical_wal_head_result = outcome.head_result.clone();
         tracing::debug!(
             target: "astra_runtime::canonical_wal",
             session_id = %self.session_id,
@@ -12744,15 +12758,35 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                         astra_turn_core::runtime_scaffolding::sanitize_durable_message_values(
                             appended.clone(),
                         );
-                    let transition_result = match
-                        astra_turn_types::ProviderCanonicalTransitionV1::new_from_durable_base(
-                            state.provider_canonical_wal_head_transition_id.clone(),
-                            durable_base.clone(),
-                            &durable_predecessor,
-                            durable_appended.clone(),
-                        ) {
+                    let transition_result = match (
+                        state.provider_canonical_wal_head_transition_id.as_ref(),
+                        state.provider_canonical_wal_head_result.as_ref(),
+                    ) {
+                        (None, None) => {
+                            astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
+                                None,
+                                durable_base.clone(),
+                                &durable_predecessor,
+                                durable_appended.clone(),
+                            )
+                        }
+                        (Some(parent_id), Some(parent_result)) => {
+                            astra_turn_types::ProviderCanonicalTransitionV2::new_linked_from_durable_base(
+                                parent_id.clone(),
+                                parent_result.clone(),
+                                durable_base.clone(),
+                                &durable_predecessor,
+                                durable_appended.clone(),
+                            )
+                        }
+                        _ => Err(
+                            astra_turn_types::ProviderCanonicalTransitionError::MissingLinkedPredecessor,
+                        ),
+                    };
+                    let transition_result = match transition_result {
                         Err(
-                            astra_turn_types::ProviderCanonicalTransitionError::DurableBaseNotPrefix,
+                            astra_turn_types::ProviderCanonicalTransitionError::DurableBaseNotPrefix
+                            | astra_turn_types::ProviderCanonicalTransitionError::MissingLinkedPredecessor,
                         ) => {
                             let Some(authorization) = state
                                 .provider_canonical_replacement_authorization(
@@ -12767,7 +12801,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                                 durable_invocation.finish_error(&error).await?;
                                 return Err(error);
                             };
-                            astra_turn_types::ProviderCanonicalTransitionV1::new_replacement_from_durable_base(
+                            astra_turn_types::ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
                                 state.provider_canonical_wal_head_transition_id.clone(),
                                 durable_base.clone(),
                                 authorization.generation,
@@ -12798,6 +12832,9 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
             let provider_canonical_transition_id = provider_canonical_transitions
                 .first()
                 .map(|transition| transition.transition_id.clone());
+            let provider_canonical_transition_result = provider_canonical_transitions
+                .first()
+                .map(|transition| transition.result.clone());
             if let Err(error) = durable_invocation
                 .bind_provider_canonical_transitions(provider_canonical_transitions)
             {
@@ -13143,6 +13180,7 @@ impl AgenticLoopHost for ServerAgenticLoopHost {
                     return Err(error);
                 }
                 state.provider_canonical_wal_head_transition_id = Some(admitted_transition_id);
+                state.provider_canonical_wal_head_result = provider_canonical_transition_result;
             }
             record_provider_attempt_cache_observations(state, &provider_attempts);
             if durable_invocation.provider_dispatch_started() {
@@ -21367,7 +21405,7 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        let first = astra_turn_types::ProviderCanonicalTransitionV1::new_from_durable_base(
+        let first = astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
             None,
             durable_base.clone(),
             &base,
@@ -21376,6 +21414,9 @@ mod tests {
         .unwrap();
         let mut after_first = base.clone();
         after_first.push(first_authority.clone());
+        let first_provider_response =
+            json!({"role": "assistant", "content": "first provider response"});
+        after_first.push(first_provider_response.clone());
         let assistant = json!({"role": "assistant", "content": "partial result"});
         let retry_authority =
             crate::turn::wire_assembly::required_append_only_runtime_authority_message(
@@ -21385,8 +21426,9 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        let second = astra_turn_types::ProviderCanonicalTransitionV1::new_from_durable_base(
-            Some(first.transition_id.clone()),
+        let second = astra_turn_types::ProviderCanonicalTransitionV2::new_linked_from_durable_base(
+            first.transition_id.clone(),
+            first.result.clone(),
             durable_base.clone(),
             &after_first,
             vec![assistant.clone(), retry_authority.clone()],
@@ -21406,17 +21448,18 @@ mod tests {
         let outcome = hydrate_provider_canonical_transition_receipts(
             &mut restored,
             &durable_base,
-            vec![receipt(1, vec![second.clone()])],
+            vec![receipt(1, vec![first, second.clone()])],
         )
         .unwrap();
 
-        assert_eq!(outcome.reconciled_transitions, 1);
+        assert_eq!(outcome.reconciled_transitions, 2);
         assert_eq!(outcome.head_transition_id, Some(second.transition_id));
         assert_eq!(restored[2], base[2]);
         assert_eq!(restored[3], first_authority);
-        assert_eq!(restored[4], assistant);
-        assert_eq!(restored[5], retry_authority);
-        assert_eq!(restored[6], fresh_user);
+        assert_eq!(restored[4], first_provider_response);
+        assert_eq!(restored[5], assistant);
+        assert_eq!(restored[6], retry_authority);
+        assert_eq!(restored[7], fresh_user);
     }
 
     #[test]
@@ -21434,7 +21477,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let transition = astra_turn_types::ProviderCanonicalTransitionV1::new_from_durable_base(
+        let transition = astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
             None,
             durable_base.clone(),
             &predecessor,
@@ -21469,7 +21512,7 @@ mod tests {
         predecessor.push(old_user.clone());
         let durable_base =
             astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&durable_head).unwrap();
-        let transition = astra_turn_types::ProviderCanonicalTransitionV1::new_from_durable_base(
+        let transition = astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
             None,
             durable_base.clone(),
             &predecessor,
@@ -21551,7 +21594,7 @@ mod tests {
             "first",
             crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
         );
-        let append = astra_turn_types::ProviderCanonicalTransitionV1::new_from_durable_base(
+        let append = astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
             None,
             durable_base.clone(),
             &pre_rewrite,
@@ -21564,7 +21607,7 @@ mod tests {
             crate::turn::wire_assembly::RuntimeAuthorityKind::ExecutionTimeBudget,
         );
         let first_replacement =
-            astra_turn_types::ProviderCanonicalTransitionV1::new_replacement_from_durable_base(
+            astra_turn_types::ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
                 Some(append.transition_id.clone()),
                 durable_base.clone(),
                 1,
@@ -21584,7 +21627,7 @@ mod tests {
             ordinary_response.clone(),
         ];
         let ordinary_post_compaction =
-            astra_turn_types::ProviderCanonicalTransitionV1::new_replacement_from_durable_base(
+            astra_turn_types::ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
                 Some(first_replacement.transition_id.clone()),
                 durable_base.clone(),
                 1,
@@ -21599,7 +21642,7 @@ mod tests {
             crate::turn::wire_assembly::RuntimeAuthorityKind::EdgeRequiredContext,
         );
         let second_replacement =
-            astra_turn_types::ProviderCanonicalTransitionV1::new_replacement_from_durable_base(
+            astra_turn_types::ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
                 Some(ordinary_post_compaction.transition_id.clone()),
                 durable_base.clone(),
                 1,
@@ -21664,7 +21707,7 @@ mod tests {
             .unwrap()
             .unwrap()
         };
-        let left = astra_turn_types::ProviderCanonicalTransitionV1::new(
+        let left = astra_turn_types::ProviderCanonicalTransitionV2::new(
             None,
             &base,
             vec![authority(
@@ -21673,7 +21716,7 @@ mod tests {
             )],
         )
         .unwrap();
-        let right = astra_turn_types::ProviderCanonicalTransitionV1::new(
+        let right = astra_turn_types::ProviderCanonicalTransitionV2::new(
             None,
             &base,
             vec![authority(
@@ -21715,7 +21758,7 @@ mod tests {
         };
         let mut left_predecessor = base.clone();
         left_predecessor.push(json!({"role": "user", "content": "left"}));
-        let left = astra_turn_types::ProviderCanonicalTransitionV1::new_from_durable_base(
+        let left = astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
             None,
             durable_base.clone(),
             &left_predecessor,
@@ -21724,7 +21767,7 @@ mod tests {
         .unwrap();
         let mut right_predecessor = base.clone();
         right_predecessor.push(json!({"role": "user", "content": "right"}));
-        let right = astra_turn_types::ProviderCanonicalTransitionV1::new_from_durable_base(
+        let right = astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
             None,
             durable_base,
             &right_predecessor,
@@ -26187,6 +26230,7 @@ mod tests {
             canonical_rewrite_state: Default::default(),
             provider_canonical_wal_base: None,
             provider_canonical_wal_head_transition_id: None,
+            provider_canonical_wal_head_result: None,
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: CompactionTier::Normal,
             skill_produced_output: false,

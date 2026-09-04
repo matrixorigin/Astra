@@ -109,12 +109,12 @@ impl CanonicalRewriteProof {
     pub(crate) fn recover_provider_wal_replacement(
         &mut self,
         durable_base: &astra_turn_types::CanonicalPrefixIdentityV1,
-        transition: &astra_turn_types::ProviderCanonicalTransitionV1,
+        transition: &astra_turn_types::ProviderCanonicalTransitionV2,
         recovered_messages: &[Value],
     ) -> Result<(), String> {
         transition.validate().map_err(|error| error.to_string())?;
         if transition.recovery_mode
-            != astra_turn_types::ProviderCanonicalRecoveryModeV1::ReplaceFromDurableBase
+            != astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase
             || &transition.durable_base != durable_base
             || transition.replacement_compaction_generation
                 != Some(self.base_compaction_generation.saturating_add(1))
@@ -334,7 +334,7 @@ mod tests {
             .provider_wal_replacement_authorization(&base, &rewritten)
             .unwrap();
         let transition =
-            astra_turn_types::ProviderCanonicalTransitionV1::new_replacement_from_durable_base(
+            astra_turn_types::ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
                 None,
                 base.clone(),
                 authorization.generation,

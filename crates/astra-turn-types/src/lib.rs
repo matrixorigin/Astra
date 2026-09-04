@@ -63,9 +63,10 @@ pub use phase_receipt::{
 pub use provider_canonical_transition::{
     CanonicalPrefixIdentityV1, MAX_PROVIDER_CANONICAL_RECOVERY_BYTES,
     MAX_PROVIDER_CANONICAL_TRANSITION_BYTES, MAX_PROVIDER_CANONICAL_TRANSITION_DURABLE_BYTES,
-    PROVIDER_CANONICAL_TRANSITION_SCHEMA_VERSION, ProviderCanonicalRecoveryModeV1,
+    MAX_PROVIDER_CANONICAL_WAL_BYTES, MAX_PROVIDER_CANONICAL_WAL_ENTRIES,
+    PROVIDER_CANONICAL_TRANSITION_SCHEMA_VERSION, ProviderCanonicalRecoveryModeV2,
     ProviderCanonicalTransitionApply, ProviderCanonicalTransitionError,
-    ProviderCanonicalTransitionV1,
+    ProviderCanonicalTransitionV2,
 };
 pub use provider_contract::{
     DescriptorVersion, NativeToolId, PROVIDER_INTERACTION_REQUEST_METADATA_KEY,

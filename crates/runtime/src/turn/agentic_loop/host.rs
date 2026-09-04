@@ -3091,6 +3091,10 @@ pub struct AgenticLoopState {
     /// the database-owned per-turn WAL head instead of inferring lineage from
     /// message values.
     pub provider_canonical_wal_head_transition_id: Option<String>,
+    /// Canonical result owned by the latest admitted transition. The next WAL
+    /// entry uses this exact boundary to persist only messages produced since
+    /// that admission.
+    pub provider_canonical_wal_head_result: Option<astra_turn_types::CanonicalPrefixIdentityV1>,
     /// Counts how many post-wrap-up rounds still emitted tool_calls. Task #43
     /// hybrid enforcement: the first such round triggers a physical lockout
     /// (tool_calls dropped, `restricted_tools` populated, loop continues so the
@@ -3447,6 +3451,7 @@ impl AgenticLoopState {
         self.provider_canonical_wal_base =
             astra_turn_types::CanonicalPrefixIdentityV1::from_messages(durable_prefix).ok();
         self.provider_canonical_wal_head_transition_id = None;
+        self.provider_canonical_wal_head_result = None;
     }
 
     pub(crate) fn canonical_rewrite_proof(
@@ -3468,7 +3473,7 @@ impl AgenticLoopState {
 
     pub(crate) fn recover_provider_canonical_replacement(
         &mut self,
-        transition: &astra_turn_types::ProviderCanonicalTransitionV1,
+        transition: &astra_turn_types::ProviderCanonicalTransitionV2,
         recovered_messages: &[Value],
     ) -> Result<(), String> {
         let durable_base = self
@@ -4755,6 +4760,7 @@ pub fn make_test_loop_state_for_model(model: Option<&str>) -> AgenticLoopState {
         canonical_rewrite_state: Default::default(),
         provider_canonical_wal_base: None,
         provider_canonical_wal_head_transition_id: None,
+        provider_canonical_wal_head_result: None,
         budget_wrapup_ignored_rounds: 0,
         compact_tier_applied: CompactionTier::Normal,
         skill_produced_output: false,
@@ -6310,6 +6316,7 @@ pub(crate) mod tests {
             canonical_rewrite_state: Default::default(),
             provider_canonical_wal_base: None,
             provider_canonical_wal_head_transition_id: None,
+            provider_canonical_wal_head_result: None,
             budget_wrapup_ignored_rounds: 0,
             compact_tier_applied: CompactionTier::Normal,
             skill_produced_output: false,

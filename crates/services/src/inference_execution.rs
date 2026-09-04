@@ -69,21 +69,26 @@ pub struct InferenceProviderAttemptPlan {
     wire: InferenceProviderWireIdentity,
     canonical_transition_id: Option<String>,
     canonical_parent_transition_id: Option<String>,
-    canonical_transition_json: Option<String>,
+    canonical_transition_payload: Option<String>,
     canonical_transition_hash: Option<String>,
+    canonical_transition_parent_result: Option<astra_turn_types::CanonicalPrefixIdentityV1>,
+    canonical_transition_predecessor: Option<astra_turn_types::CanonicalPrefixIdentityV1>,
+    canonical_transition_result: Option<astra_turn_types::CanonicalPrefixIdentityV1>,
+    canonical_transition_recovery_mode: Option<astra_turn_types::ProviderCanonicalRecoveryModeV2>,
     invocation_input: InferenceInvocationInput,
     request_context: ModelRequestContextSeed,
 }
 
-/// Ordered write-ahead transitions committed with one physical provider
-/// attempt. Coordinates come from the invocation identity, never timestamps.
+/// One ordered, complete recovery chain for a turn. Each transition was
+/// committed by its own physical provider attempt; the receipt coordinates
+/// identify the authoritative leaf and never depend on timestamps.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InferenceCanonicalTransitionReceipt {
     pub turn: u32,
     pub round: u32,
     pub logical_attempt: u32,
     pub physical_attempt: u32,
-    pub transitions: Vec<astra_turn_types::ProviderCanonicalTransitionV1>,
+    pub transitions: Vec<astra_turn_types::ProviderCanonicalTransitionV2>,
 }
 
 /// Immutable identity of the exact serialized provider request body.
@@ -182,13 +187,17 @@ impl InferenceProviderAttemptPlan {
     /// append transition.
     pub fn with_canonical_transitions(
         mut self,
-        transitions: &[astra_turn_types::ProviderCanonicalTransitionV1],
+        transitions: &[astra_turn_types::ProviderCanonicalTransitionV2],
     ) -> ServiceResult<Self> {
         if transitions.is_empty() {
             self.canonical_transition_id = None;
             self.canonical_parent_transition_id = None;
-            self.canonical_transition_json = None;
+            self.canonical_transition_payload = None;
             self.canonical_transition_hash = None;
+            self.canonical_transition_parent_result = None;
+            self.canonical_transition_predecessor = None;
+            self.canonical_transition_result = None;
+            self.canonical_transition_recovery_mode = None;
             return Ok(self);
         }
         if self.invocation_input.purpose != InferencePurpose::PrimaryAgent
@@ -203,7 +212,7 @@ impl InferenceProviderAttemptPlan {
         }
         if transitions.len() != 1 {
             return Err(ServiceError::invalid(
-                "one provider attempt must bind exactly one canonical transition snapshot",
+                "one provider attempt must bind exactly one canonical transition WAL entry",
             ));
         }
         let transition = &transitions[0];
@@ -231,7 +240,11 @@ impl InferenceProviderAttemptPlan {
         self.canonical_transition_id = Some(transition.transition_id.clone());
         self.canonical_parent_transition_id = transition.parent_transition_id.clone();
         self.canonical_transition_hash = Some(format!("{:x}", Sha256::digest(&encoded)));
-        self.canonical_transition_json = Some(String::from_utf8(encoded).map_err(|error| {
+        self.canonical_transition_parent_result = transition.parent_result.clone();
+        self.canonical_transition_predecessor = Some(transition.predecessor.clone());
+        self.canonical_transition_result = Some(transition.result.clone());
+        self.canonical_transition_recovery_mode = Some(transition.recovery_mode);
+        self.canonical_transition_payload = Some(String::from_utf8(encoded).map_err(|error| {
             ServiceError::with_source(
                 ServiceErrorKind::Internal,
                 "encode provider canonical append transitions as UTF-8 JSON",
@@ -660,8 +673,12 @@ pub fn plan_inference_provider_attempt_with_context(
         wire,
         canonical_transition_id: None,
         canonical_parent_transition_id: None,
-        canonical_transition_json: None,
+        canonical_transition_payload: None,
         canonical_transition_hash: None,
+        canonical_transition_parent_result: None,
+        canonical_transition_predecessor: None,
+        canonical_transition_result: None,
+        canonical_transition_recovery_mode: None,
         invocation_input: invocation.input.clone(),
         request_context,
     }
@@ -2034,8 +2051,14 @@ fn validate_ambiguous_provider_attempt_admission(
 
 fn ambiguous_canonical_admission_proof_sql(parent_present: bool) -> String {
     matrixone_statement_with_null_shape(
-        "SELECT attempt.canonical_transition_json AS canonical_payload
+        "SELECT wal.payload_json AS canonical_payload
          FROM inference_canonical_transition_heads AS head
+         INNER JOIN inference_canonical_transition_wal AS wal
+           ON wal.user_id = head.user_id
+          AND wal.session_id = head.session_id
+          AND wal.turn_index = head.turn_index
+          AND wal.transition_id = head.head_transition_id
+          AND wal.attempt_id = head.head_attempt_id
          INNER JOIN inference_provider_attempts AS attempt
            ON attempt.user_id = head.user_id
           AND attempt.session_id = head.session_id
@@ -2051,8 +2074,8 @@ fn ambiguous_canonical_admission_proof_sql(parent_present: bool) -> String {
            AND attempt.invocation_id = ?
            AND attempt.canonical_parent_transition_id <=> ?
            AND attempt.canonical_transition_hash = ?
-           AND attempt.canonical_transition_json IS NOT NULL
-           AND OCTET_LENGTH(attempt.canonical_transition_json) <= ?
+           AND wal.payload_hash = attempt.canonical_transition_hash
+           AND OCTET_LENGTH(wal.payload_json) <= ?
            AND attempt.status = 'started' AND attempt.terminal_fingerprint IS NULL
            AND invocation.scope_kind = 'run'
            AND invocation.purpose = 'primary_agent'
@@ -2073,8 +2096,7 @@ async fn validate_ambiguous_canonical_head_admission(
                AND status = 'started' AND terminal_fingerprint IS NULL
                AND canonical_transition_id IS NULL
                AND canonical_parent_transition_id IS NULL
-               AND canonical_transition_hash IS NULL
-               AND canonical_transition_json IS NULL",
+               AND canonical_transition_hash IS NULL",
         )
         .bind(&attempt.user_id)
         .bind(&attempt.attempt_id)
@@ -2117,7 +2139,7 @@ async fn validate_ambiguous_canonical_head_admission(
         })?;
     let max_payload_bytes = checked_i64(
         astra_turn_types::MAX_PROVIDER_CANONICAL_TRANSITION_DURABLE_BYTES.saturating_add(2),
-        "canonical_transition_json byte bound",
+        "canonical transition WAL payload byte bound",
     )?;
     // This is the rare commit-ambiguous path, so prove the exact payload from
     // bounded raw LONGTEXT bytes. Do not replace this with CAST(... AS CHAR)
@@ -2193,14 +2215,32 @@ fn validate_first_provider_attempt_binding(
     )))
 }
 
+struct CanonicalTransitionWalInsert<'a> {
+    session_id: &'a str,
+    turn: u32,
+    round: u32,
+    logical_attempt: u32,
+    transition_id: &'a str,
+    payload: &'a str,
+    payload_hash: &'a str,
+    payload_bytes: i64,
+    predecessor: &'a astra_turn_types::CanonicalPrefixIdentityV1,
+    result: &'a astra_turn_types::CanonicalPrefixIdentityV1,
+    recovery_mode: &'a str,
+}
+
 async fn advance_inference_canonical_transition_head(
     connection: &mut sqlx::MySqlConnection,
     attempt: &InferenceProviderAttemptPlan,
 ) -> ServiceResult<()> {
     let Some(transition_id) = attempt.canonical_transition_id.as_deref() else {
         if attempt.canonical_parent_transition_id.is_some()
-            || attempt.canonical_transition_json.is_some()
+            || attempt.canonical_transition_payload.is_some()
             || attempt.canonical_transition_hash.is_some()
+            || attempt.canonical_transition_parent_result.is_some()
+            || attempt.canonical_transition_predecessor.is_some()
+            || attempt.canonical_transition_result.is_some()
+            || attempt.canonical_transition_recovery_mode.is_some()
         {
             return Err(ServiceError::invalid(
                 "canonical transition payload is missing its immutable transition id",
@@ -2208,11 +2248,15 @@ async fn advance_inference_canonical_transition_head(
         }
         return Ok(());
     };
-    let (session_id, turn) = match &attempt.invocation_input.scope {
+    let (session_id, turn, round, logical_attempt) = match &attempt.invocation_input.scope {
         InferenceInvocationScope::Run {
-            session_id, turn, ..
+            session_id,
+            turn,
+            round,
+            logical_attempt,
+            ..
         } if attempt.invocation_input.purpose == InferencePurpose::PrimaryAgent => {
-            (session_id.as_str(), *turn)
+            (session_id.as_str(), *turn, *round, *logical_attempt)
         }
         _ => {
             return Err(ServiceError::invalid(
@@ -2220,8 +2264,61 @@ async fn advance_inference_canonical_transition_head(
             ));
         }
     };
+    let predecessor = attempt
+        .canonical_transition_predecessor
+        .as_ref()
+        .ok_or_else(|| ServiceError::invalid("canonical transition predecessor is missing"))?;
+    let parent_result = attempt.canonical_transition_parent_result.as_ref();
+    let result = attempt
+        .canonical_transition_result
+        .as_ref()
+        .ok_or_else(|| ServiceError::invalid("canonical transition result is missing"))?;
+    let recovery_mode = attempt
+        .canonical_transition_recovery_mode
+        .ok_or_else(|| ServiceError::invalid("canonical transition recovery mode is missing"))?;
+    let payload = attempt
+        .canonical_transition_payload
+        .as_deref()
+        .ok_or_else(|| ServiceError::invalid("canonical transition WAL payload is missing"))?;
+    let payload_hash = attempt
+        .canonical_transition_hash
+        .as_deref()
+        .ok_or_else(|| ServiceError::invalid("canonical transition WAL hash is missing"))?;
+    let payload_bytes = i64::try_from(payload.len())
+        .map_err(|_| ServiceError::invalid("canonical transition WAL payload is too large"))?;
+    if payload_bytes
+        > i64::try_from(astra_turn_types::MAX_PROVIDER_CANONICAL_WAL_BYTES).unwrap_or(i64::MAX)
+    {
+        return Err(ServiceError::conflict(
+            "canonical transition WAL entry exceeds the recoverable turn budget",
+        ));
+    }
+    let result_count = i64::from(result.message_count);
+    let recovery_mode_str = match recovery_mode {
+        astra_turn_types::ProviderCanonicalRecoveryModeV2::AppendFromDurableBase => {
+            "append_from_durable_base"
+        }
+        astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase => {
+            "replace_from_durable_base"
+        }
+    };
+    let wal_insert = CanonicalTransitionWalInsert {
+        session_id,
+        turn,
+        round,
+        logical_attempt,
+        transition_id,
+        payload,
+        payload_hash,
+        payload_bytes,
+        predecessor,
+        result,
+        recovery_mode: recovery_mode_str,
+    };
     let current = sqlx::query(
-        "SELECT head_transition_id, head_attempt_id
+        "SELECT head_transition_id, head_attempt_id,
+                head_result_count, head_result_root_hash,
+                chain_length, chain_payload_bytes
          FROM inference_canonical_transition_heads
          WHERE user_id = ? AND session_id = ? AND turn_index = ?
          FOR UPDATE",
@@ -2255,6 +2352,46 @@ async fn advance_inference_canonical_transition_head(
                 error,
             )
         })?;
+        let current_result_count: i64 = current.try_get("head_result_count").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode inference canonical transition head result count",
+                error,
+            )
+        })?;
+        let current_result_root_hash: String =
+            current.try_get("head_result_root_hash").map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "decode inference canonical transition head result root",
+                    error,
+                )
+            })?;
+        let current_chain_length: i64 = current.try_get("chain_length").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode inference canonical transition WAL length",
+                error,
+            )
+        })?;
+        let current_chain_payload_bytes: i64 =
+            current.try_get("chain_payload_bytes").map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "decode inference canonical transition WAL bytes",
+                    error,
+                )
+            })?;
+        if !(1..=i64::from(astra_turn_types::MAX_PROVIDER_CANONICAL_WAL_ENTRIES))
+            .contains(&current_chain_length)
+            || !(1..=i64::try_from(astra_turn_types::MAX_PROVIDER_CANONICAL_WAL_BYTES)
+                .unwrap_or(i64::MAX))
+                .contains(&current_chain_payload_bytes)
+        {
+            return Err(ServiceError::conflict(
+                "canonical transition head has invalid WAL bounds",
+            ));
+        }
         let exact_retry = current_transition_id == transition_id;
         if !exact_retry
             && attempt.canonical_parent_transition_id.as_deref()
@@ -2265,39 +2402,135 @@ async fn advance_inference_canonical_transition_head(
                 transition_id, current_transition_id
             )));
         }
-        if current_attempt_id != attempt.attempt_id {
-            let retired = sqlx::query(
-                "UPDATE inference_provider_attempts
-                 SET canonical_transition_json = NULL
-                 WHERE user_id = ? AND attempt_id = ?
-                   AND canonical_transition_id = ?
-                   AND canonical_transition_json IS NOT NULL",
+        if exact_retry {
+            if current_result_count != result_count || current_result_root_hash != result.root_hash
+            {
+                return Err(ServiceError::conflict(
+                    "canonical transition retry does not preserve the durable head result",
+                ));
+            }
+            let moved = sqlx::query(
+                "UPDATE inference_canonical_transition_wal
+                 SET attempt_id = ?, physical_attempt = ?
+                 WHERE user_id = ? AND session_id = ? AND turn_index = ?
+                   AND transition_id = ? AND attempt_id = ? AND payload_hash = ?",
             )
+            .bind(&attempt.attempt_id)
+            .bind(i64::from(attempt.attempt_index))
             .bind(&attempt.user_id)
+            .bind(session_id)
+            .bind(i64::from(turn))
+            .bind(transition_id)
             .bind(&current_attempt_id)
-            .bind(&current_transition_id)
+            .bind(payload_hash)
             .execute(&mut *connection)
             .await
             .map_err(|error| {
                 ServiceError::with_source(
                     ServiceErrorKind::Persistence,
-                    "retire previous inference canonical transition payload",
+                    "move canonical transition WAL ownership to an exact retry",
                     error,
                 )
             })?;
-            if retired.rows_affected() != 1 {
+            if moved.rows_affected() != 1 {
                 return Err(ServiceError::conflict(
-                    "current canonical transition head has no unique recoverable payload",
+                    "canonical transition retry has no exact recoverable WAL entry",
                 ));
             }
+        } else {
+            if recovery_mode
+                == astra_turn_types::ProviderCanonicalRecoveryModeV2::AppendFromDurableBase
+                && parent_result.is_none_or(|parent_result| {
+                    current_result_count != i64::from(parent_result.message_count)
+                        || current_result_root_hash != parent_result.root_hash
+                })
+            {
+                return Err(ServiceError::conflict(
+                    "canonical transition predecessor does not match the durable head result",
+                ));
+            }
+            let (next_chain_length, next_chain_payload_bytes) = if recovery_mode
+                == astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase
+            {
+                sqlx::query(
+                    "DELETE FROM inference_canonical_transition_wal
+                     WHERE user_id = ? AND session_id = ? AND turn_index = ?",
+                )
+                .bind(&attempt.user_id)
+                .bind(session_id)
+                .bind(i64::from(turn))
+                .execute(&mut *connection)
+                .await
+                .map_err(|error| {
+                    ServiceError::with_source(
+                        ServiceErrorKind::Persistence,
+                        "truncate canonical transition WAL at a replacement checkpoint",
+                        error,
+                    )
+                })?;
+                (1_i64, payload_bytes)
+            } else {
+                let next_length = current_chain_length.checked_add(1).ok_or_else(|| {
+                    ServiceError::invalid("canonical transition WAL length overflow")
+                })?;
+                let next_bytes = current_chain_payload_bytes
+                    .checked_add(payload_bytes)
+                    .ok_or_else(|| {
+                        ServiceError::invalid("canonical transition WAL byte count overflow")
+                    })?;
+                if next_length > i64::from(astra_turn_types::MAX_PROVIDER_CANONICAL_WAL_ENTRIES)
+                    || next_bytes
+                        > i64::try_from(astra_turn_types::MAX_PROVIDER_CANONICAL_WAL_BYTES)
+                            .unwrap_or(i64::MAX)
+                {
+                    return Err(ServiceError::conflict(
+                        "canonical transition WAL requires a replacement checkpoint",
+                    ));
+                }
+                (next_length, next_bytes)
+            };
+            insert_inference_canonical_transition_wal(connection, attempt, &wal_insert).await?;
+            let updated = sqlx::query(
+                "UPDATE inference_canonical_transition_heads
+                 SET head_transition_id = ?, head_attempt_id = ?,
+                     head_result_count = ?, head_result_root_hash = ?,
+                     chain_length = ?, chain_payload_bytes = ?, updated_at = NOW(6)
+                 WHERE user_id = ? AND session_id = ? AND turn_index = ?
+                   AND head_transition_id = ? AND head_attempt_id = ?",
+            )
+            .bind(transition_id)
+            .bind(&attempt.attempt_id)
+            .bind(result_count)
+            .bind(&result.root_hash)
+            .bind(next_chain_length)
+            .bind(next_chain_payload_bytes)
+            .bind(&attempt.user_id)
+            .bind(session_id)
+            .bind(i64::from(turn))
+            .bind(&current_transition_id)
+            .bind(&current_attempt_id)
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "advance inference canonical transition head",
+                    error,
+                )
+            })?;
+            if updated.rows_affected() != 1 {
+                return Err(ServiceError::conflict(
+                    "canonical transition head changed during provider-attempt admission",
+                ));
+            }
+            return Ok(());
         }
         let updated = sqlx::query(
             "UPDATE inference_canonical_transition_heads
-             SET head_transition_id = ?, head_attempt_id = ?, updated_at = NOW(6)
+             SET head_attempt_id = ?, updated_at = NOW(6)
              WHERE user_id = ? AND session_id = ? AND turn_index = ?
                AND head_transition_id = ? AND head_attempt_id = ?",
         )
-        .bind(transition_id)
         .bind(&attempt.attempt_id)
         .bind(&attempt.user_id)
         .bind(session_id)
@@ -2326,16 +2559,21 @@ async fn advance_inference_canonical_transition_head(
             "canonical transition {transition_id} names a parent but no durable head exists"
         )));
     }
+    insert_inference_canonical_transition_wal(connection, attempt, &wal_insert).await?;
     let inserted = sqlx::query(
         "INSERT INTO inference_canonical_transition_heads
-         (user_id, session_id, turn_index, head_transition_id, head_attempt_id, updated_at)
-         VALUES (?, ?, ?, ?, ?, NOW(6))",
+         (user_id, session_id, turn_index, head_transition_id, head_attempt_id,
+          head_result_count, head_result_root_hash, chain_length, chain_payload_bytes, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, NOW(6))",
     )
     .bind(&attempt.user_id)
     .bind(session_id)
     .bind(i64::from(turn))
     .bind(transition_id)
     .bind(&attempt.attempt_id)
+    .bind(result_count)
+    .bind(&result.root_hash)
+    .bind(payload_bytes)
     .execute(&mut *connection)
     .await
     .map_err(|error| {
@@ -2353,6 +2591,56 @@ async fn advance_inference_canonical_transition_head(
     Ok(())
 }
 
+async fn insert_inference_canonical_transition_wal(
+    connection: &mut sqlx::MySqlConnection,
+    attempt: &InferenceProviderAttemptPlan,
+    entry: &CanonicalTransitionWalInsert<'_>,
+) -> ServiceResult<()> {
+    let insert_sql = matrixone_statement_with_null_shape(
+        "INSERT INTO inference_canonical_transition_wal
+         (user_id, session_id, turn_index, round_index, logical_attempt, physical_attempt,
+          transition_id, parent_transition_id,
+          attempt_id, payload_json, payload_hash, payload_bytes,
+          predecessor_count, predecessor_root_hash, result_count, result_root_hash,
+          recovery_mode, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(6))",
+        [attempt.canonical_parent_transition_id.is_some()],
+    );
+    let inserted = sqlx::query(&insert_sql)
+        .bind(&attempt.user_id)
+        .bind(entry.session_id)
+        .bind(i64::from(entry.turn))
+        .bind(i64::from(entry.round))
+        .bind(i64::from(entry.logical_attempt))
+        .bind(i64::from(attempt.attempt_index))
+        .bind(entry.transition_id)
+        .bind(&attempt.canonical_parent_transition_id)
+        .bind(&attempt.attempt_id)
+        .bind(entry.payload)
+        .bind(entry.payload_hash)
+        .bind(entry.payload_bytes)
+        .bind(i64::from(entry.predecessor.message_count))
+        .bind(&entry.predecessor.root_hash)
+        .bind(i64::from(entry.result.message_count))
+        .bind(&entry.result.root_hash)
+        .bind(entry.recovery_mode)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "append inference canonical transition WAL",
+                error,
+            )
+        })?;
+    if inserted.rows_affected() != 1 {
+        return Err(ServiceError::conflict(
+            "canonical transition WAL entry was not appended exactly once",
+        ));
+    }
+    Ok(())
+}
+
 async fn insert_inference_provider_attempt_admission(
     connection: &mut sqlx::MySqlConnection,
     attempt: &InferenceProviderAttemptPlan,
@@ -2363,10 +2651,10 @@ async fn insert_inference_provider_attempt_admission(
          (attempt_id, invocation_id, user_id, session_id, run_id, harness_run_id, attempt_index,
           provider, admission_token, provider_protocol, provider_wire_hash, provider_wire_bytes,
           canonical_transition_id, canonical_parent_transition_id,
-          canonical_transition_json, canonical_transition_hash,
+          canonical_transition_hash,
           status, usage_status, started_at, terminal_at)
          SELECT ?, invocation_id, user_id, session_id, run_id, harness_run_id,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', 'unavailable', NOW(6), NULL
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', 'unavailable', NOW(6), NULL
          FROM inference_invocations
          WHERE user_id = ? AND invocation_id = ? AND status = 'admitted'
            AND NOT EXISTS (
@@ -2378,7 +2666,6 @@ async fn insert_inference_provider_attempt_admission(
         [
             attempt.canonical_transition_id.is_some(),
             attempt.canonical_parent_transition_id.is_some(),
-            attempt.canonical_transition_json.is_some(),
             attempt.canonical_transition_hash.is_some(),
         ],
     );
@@ -2392,7 +2679,6 @@ async fn insert_inference_provider_attempt_admission(
         .bind(provider_wire_bytes)
         .bind(&attempt.canonical_transition_id)
         .bind(&attempt.canonical_parent_transition_id)
-        .bind(&attempt.canonical_transition_json)
         .bind(&attempt.canonical_transition_hash)
         .bind(&attempt.user_id)
         .bind(&attempt.invocation_id)
@@ -2812,10 +3098,10 @@ pub async fn begin_inference_provider_attempt(
          (attempt_id, invocation_id, user_id, session_id, run_id, harness_run_id, attempt_index,
           provider, admission_token, provider_protocol, provider_wire_hash, provider_wire_bytes,
           canonical_transition_id, canonical_parent_transition_id,
-          canonical_transition_json, canonical_transition_hash,
+          canonical_transition_hash,
           status, usage_status, started_at, terminal_at)
          SELECT ?, invocation_id, user_id, session_id, run_id, harness_run_id,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', 'unavailable', NOW(6), NULL
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', 'unavailable', NOW(6), NULL
          FROM inference_invocations
          WHERE user_id = ? AND invocation_id = ? AND status = 'admitted'
            AND owner_token = ? AND owner_generation = ?
@@ -2836,7 +3122,6 @@ pub async fn begin_inference_provider_attempt(
         [
             attempt.canonical_transition_id.is_some(),
             attempt.canonical_parent_transition_id.is_some(),
-            attempt.canonical_transition_json.is_some(),
             attempt.canonical_transition_hash.is_some(),
         ],
     );
@@ -2850,7 +3135,6 @@ pub async fn begin_inference_provider_attempt(
         .bind(provider_wire_bytes)
         .bind(&attempt.canonical_transition_id)
         .bind(&attempt.canonical_parent_transition_id)
-        .bind(&attempt.canonical_transition_json)
         .bind(&attempt.canonical_transition_hash)
         .bind(&attempt.user_id)
         .bind(&attempt.invocation_id)
@@ -2933,10 +3217,10 @@ pub async fn begin_inference_provider_attempt(
     }
 }
 
-/// Load the single database-authoritative WAL head for one unfinished turn.
-/// Parent validation and head advancement happen in provider-attempt admission;
-/// recovery therefore reads and materializes one snapshot, independent of the
-/// number or size of earlier physical attempts.
+/// Load the bounded, database-authoritative WAL chain for one unfinished turn.
+/// Every row is an immutable append delta except an explicit replacement
+/// checkpoint. The head stores exact chain cardinality and byte totals, so a
+/// partial, foreign, oversized, or orphaned chain always fails closed.
 pub async fn load_inference_canonical_transitions_for_session(
     pool: &SharedPool,
     user_id: &str,
@@ -2945,7 +3229,7 @@ pub async fn load_inference_canonical_transitions_for_session(
 ) -> ServiceResult<Vec<InferenceCanonicalTransitionReceipt>> {
     let max_payload_bytes = checked_i64(
         astra_turn_types::MAX_PROVIDER_CANONICAL_TRANSITION_DURABLE_BYTES.saturating_add(2),
-        "canonical_transition_json byte bound",
+        "canonical transition WAL entry byte bound",
     )?;
     validate_identity(user_id, "user_id", 128)?;
     validate_identity(session_id, "session_id", 64)?;
@@ -2970,7 +3254,8 @@ pub async fn load_inference_canonical_transitions_for_session(
     reconcile_provider_canonical_transition_boundary(pool.get(), user_id, session_id, first_turn)
         .await?;
     let head = sqlx::query(
-        "SELECT head_transition_id, head_attempt_id
+        "SELECT head_transition_id, head_attempt_id, head_result_count,
+                head_result_root_hash, chain_length, chain_payload_bytes
          FROM inference_canonical_transition_heads
          WHERE user_id = ? AND session_id = ? AND turn_index = ?",
     )
@@ -3003,130 +3288,395 @@ pub async fn load_inference_canonical_transitions_for_session(
             error,
         )
     })?;
-    let row = sqlx::query(
-        "SELECT invocation.turn_index, invocation.round_index,
-                invocation.logical_attempt, attempt.attempt_index,
-                attempt.canonical_transition_id, attempt.canonical_parent_transition_id,
-                attempt.canonical_transition_json,
-                attempt.canonical_transition_hash
-         FROM inference_provider_attempts AS attempt
-         INNER JOIN inference_invocations AS invocation
-           ON invocation.user_id = attempt.user_id
-          AND invocation.invocation_id = attempt.invocation_id
-         WHERE attempt.user_id = ? AND attempt.session_id = ?
-           AND attempt.attempt_id = ? AND attempt.canonical_transition_id = ?
-           AND invocation.turn_index = ?
-           AND invocation.scope_kind = 'run'
-           AND invocation.purpose = 'primary_agent'
-           AND attempt.canonical_transition_json IS NOT NULL
-           AND OCTET_LENGTH(attempt.canonical_transition_json) <= ?
-         LIMIT 1",
+    let head_result_count: i64 = head.try_get("head_result_count").map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "decode canonical WAL head result count",
+            error,
+        )
+    })?;
+    let head_result_root_hash: String = head.try_get("head_result_root_hash").map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "decode canonical WAL head result root",
+            error,
+        )
+    })?;
+    let chain_length: i64 = head.try_get("chain_length").map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "decode canonical WAL chain length",
+            error,
+        )
+    })?;
+    let chain_payload_bytes: i64 = head.try_get("chain_payload_bytes").map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "decode canonical WAL chain bytes",
+            error,
+        )
+    })?;
+    if !(1..=i64::from(astra_turn_types::MAX_PROVIDER_CANONICAL_WAL_ENTRIES))
+        .contains(&chain_length)
+        || !(1..=i64::try_from(astra_turn_types::MAX_PROVIDER_CANONICAL_WAL_BYTES)
+            .unwrap_or(i64::MAX))
+            .contains(&chain_payload_bytes)
+    {
+        return Err(ServiceError::conflict(
+            "canonical transition WAL head declares invalid recovery bounds",
+        ));
+    }
+    let rows = sqlx::query(
+        "SELECT turn_index, round_index, logical_attempt, physical_attempt,
+                transition_id, parent_transition_id, attempt_id,
+                payload_json, payload_hash, payload_bytes,
+                predecessor_count, predecessor_root_hash,
+                result_count, result_root_hash, recovery_mode
+         FROM inference_canonical_transition_wal
+         WHERE user_id = ? AND session_id = ? AND turn_index = ?
+           AND payload_bytes <= ?
+         ORDER BY created_at ASC, transition_id ASC
+         LIMIT ?",
     )
     .bind(user_id)
     .bind(session_id)
-    .bind(&head_attempt_id)
-    .bind(&head_transition_id)
     .bind(i64::from(first_turn))
     .bind(max_payload_bytes)
-    .fetch_optional(pool.get())
+    .bind(i64::from(astra_turn_types::MAX_PROVIDER_CANONICAL_WAL_ENTRIES) + 1)
+    .fetch_all(pool.get())
     .await
     .map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
-            "load inference canonical transition head payload",
+            "load bounded inference canonical transition WAL",
             error,
         )
-    })?
-    .ok_or_else(|| {
-        ServiceError::conflict(
-            "inference canonical transition head has no owner-matched attempt payload",
-        )
     })?;
-    let turn = decode_non_negative_u32(&row, "turn_index")?;
-    let round = decode_non_negative_u32(&row, "round_index")?;
-    let logical_attempt = decode_non_negative_u32(&row, "logical_attempt")?;
-    let physical_attempt = decode_non_negative_u32(&row, "attempt_index")?;
-    let persisted_transition_id: Option<String> =
-        row.try_get("canonical_transition_id").map_err(|error| {
+    if i64::try_from(rows.len()).ok() != Some(chain_length) {
+        return Err(ServiceError::conflict(
+            "canonical transition WAL cardinality does not match its durable head",
+        ));
+    }
+
+    struct WalEntry {
+        round: u32,
+        logical_attempt: u32,
+        physical_attempt: u32,
+        attempt_id: String,
+        payload_hash: String,
+        transition: astra_turn_types::ProviderCanonicalTransitionV2,
+    }
+    let mut entries = std::collections::HashMap::with_capacity(rows.len());
+    let mut actual_chain_bytes = 0_i64;
+    for row in rows {
+        let transition_id: String = row.try_get("transition_id").map_err(|error| {
             ServiceError::with_source(
                 ServiceErrorKind::Persistence,
-                "decode canonical transition id",
+                "decode canonical WAL transition id",
                 error,
             )
         })?;
-    let persisted_parent_transition_id: Option<String> = row
-        .try_get("canonical_parent_transition_id")
+        let persisted_parent: Option<String> =
+            row.try_get("parent_transition_id").map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "decode canonical WAL parent id",
+                    error,
+                )
+            })?;
+        let payload: Vec<u8> = row.try_get("payload_json").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode canonical WAL payload",
+                error,
+            )
+        })?;
+        let payload_hash: String = row.try_get("payload_hash").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode canonical WAL payload hash",
+                error,
+            )
+        })?;
+        let payload_bytes: i64 = row.try_get("payload_bytes").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode canonical WAL payload bytes",
+                error,
+            )
+        })?;
+        actual_chain_bytes = actual_chain_bytes
+            .checked_add(payload_bytes)
+            .ok_or_else(|| {
+                ServiceError::conflict("canonical transition WAL byte total overflow")
+            })?;
+        if usize::try_from(payload_bytes).ok() != Some(payload.len())
+            || payload_hash != format!("{:x}", Sha256::digest(&payload))
+        {
+            return Err(ServiceError::conflict(
+                "canonical transition WAL payload bytes or hash do not match",
+            ));
+        }
+        let transitions: Vec<astra_turn_types::ProviderCanonicalTransitionV2> =
+            serde_json::from_slice(&payload).map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "parse canonical transition WAL payload",
+                    error,
+                )
+            })?;
+        if transitions.len() != 1 {
+            return Err(ServiceError::conflict(
+                "canonical transition WAL entry must contain exactly one transition",
+            ));
+        }
+        let transition = transitions.into_iter().next().expect("length checked");
+        transition.validate().map_err(|error| {
+            ServiceError::conflict(format!(
+                "provider canonical transition WAL is invalid: {error}"
+            ))
+        })?;
+        let persisted_predecessor_count: i64 =
+            row.try_get("predecessor_count").map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "decode canonical WAL predecessor count",
+                    error,
+                )
+            })?;
+        let persisted_predecessor_root: String =
+            row.try_get("predecessor_root_hash").map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "decode canonical WAL predecessor root",
+                    error,
+                )
+            })?;
+        let persisted_result_count: i64 = row.try_get("result_count").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode canonical WAL result count",
+                error,
+            )
+        })?;
+        let persisted_result_root: String = row.try_get("result_root_hash").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode canonical WAL result root",
+                error,
+            )
+        })?;
+        let persisted_mode: String = row.try_get("recovery_mode").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode canonical WAL recovery mode",
+                error,
+            )
+        })?;
+        let expected_mode = match transition.recovery_mode {
+            astra_turn_types::ProviderCanonicalRecoveryModeV2::AppendFromDurableBase => {
+                "append_from_durable_base"
+            }
+            astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase => {
+                "replace_from_durable_base"
+            }
+        };
+        if transition.transition_id != transition_id
+            || transition.parent_transition_id != persisted_parent
+            || i64::from(transition.predecessor.message_count) != persisted_predecessor_count
+            || transition.predecessor.root_hash != persisted_predecessor_root
+            || i64::from(transition.result.message_count) != persisted_result_count
+            || transition.result.root_hash != persisted_result_root
+            || persisted_mode != expected_mode
+        {
+            return Err(ServiceError::conflict(
+                "canonical transition WAL metadata does not match its payload",
+            ));
+        }
+        let entry = WalEntry {
+            round: decode_non_negative_u32(&row, "round_index")?,
+            logical_attempt: decode_non_negative_u32(&row, "logical_attempt")?,
+            physical_attempt: decode_non_negative_u32(&row, "physical_attempt")?,
+            attempt_id: row.try_get("attempt_id").map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "decode canonical WAL attempt id",
+                    error,
+                )
+            })?,
+            payload_hash,
+            transition,
+        };
+        if entries.insert(transition_id, entry).is_some() {
+            return Err(ServiceError::conflict(
+                "canonical transition WAL contains duplicate transition identities",
+            ));
+        }
+    }
+    if actual_chain_bytes != chain_payload_bytes {
+        return Err(ServiceError::conflict(
+            "canonical transition WAL byte total does not match its durable head",
+        ));
+    }
+
+    // Prove that every recovery row is owned by the exact provider attempt
+    // admitted in the same transaction. Keep this as a bounded indexed lookup
+    // rather than a multi-table join: MatrixOne can otherwise choose a scan-
+    // heavy join plan as historical attempt tables grow.
+    let entries_by_attempt = entries
+        .values()
+        .map(|entry| (entry.attempt_id.as_str(), entry))
+        .collect::<std::collections::HashMap<_, _>>();
+    if entries_by_attempt.len() != entries.len() {
+        return Err(ServiceError::conflict(
+            "canonical transition WAL contains duplicate provider-attempt owners",
+        ));
+    }
+    let mut audit_query = sqlx::QueryBuilder::<sqlx::MySql>::new(
+        "SELECT attempt_id, attempt_index, canonical_transition_id,
+                canonical_parent_transition_id, canonical_transition_hash
+         FROM inference_provider_attempts WHERE user_id = ",
+    );
+    audit_query
+        .push_bind(user_id)
+        .push(" AND session_id = ")
+        .push_bind(session_id)
+        .push(" AND attempt_id IN (");
+    {
+        let mut ids = audit_query.separated(", ");
+        for attempt_id in entries_by_attempt.keys() {
+            ids.push_bind(*attempt_id);
+        }
+    }
+    audit_query.push(")");
+    let audit_rows = audit_query
+        .build()
+        .fetch_all(pool.get())
+        .await
         .map_err(|error| {
             ServiceError::with_source(
                 ServiceErrorKind::Persistence,
-                "decode canonical parent transition id",
+                "load canonical WAL provider-attempt audit owners",
                 error,
             )
         })?;
-    let encoded: Option<Vec<u8>> = row.try_get("canonical_transition_json").map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "decode canonical transition JSON bytes",
-            error,
-        )
-    })?;
-    let encoded = encoded.ok_or_else(|| {
-        ServiceError::conflict("inference canonical transition head payload was retired early")
-    })?;
-    let persisted_hash: Option<String> =
-        row.try_get("canonical_transition_hash").map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "decode canonical transition hash",
-                error,
-            )
-        })?;
-    let actual_hash = format!("{:x}", Sha256::digest(&encoded));
-    if persisted_hash.as_deref() != Some(actual_hash.as_str()) {
+    if audit_rows.len() != entries.len() {
         return Err(ServiceError::conflict(
-            "provider canonical transition WAL hash does not match its payload",
+            "canonical transition WAL has a missing provider-attempt audit owner",
         ));
     }
-    let transitions: Vec<astra_turn_types::ProviderCanonicalTransitionV1> =
-        serde_json::from_slice(&encoded).map_err(|error| {
+    for row in audit_rows {
+        let attempt_id: String = row.try_get("attempt_id").map_err(|error| {
             ServiceError::with_source(
                 ServiceErrorKind::Persistence,
-                "parse canonical transition WAL payload",
+                "decode canonical WAL audit attempt id",
                 error,
             )
         })?;
-    if transitions.len() != 1 {
+        let entry = entries_by_attempt
+            .get(attempt_id.as_str())
+            .copied()
+            .ok_or_else(|| {
+                ServiceError::conflict(
+                    "canonical transition WAL has a foreign provider-attempt audit owner",
+                )
+            })?;
+        let attempt_index = decode_non_negative_u32(&row, "attempt_index")?;
+        let transition_id: Option<String> =
+            row.try_get("canonical_transition_id").map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "decode canonical WAL audit transition id",
+                    error,
+                )
+            })?;
+        let parent_transition_id: Option<String> = row
+            .try_get("canonical_parent_transition_id")
+            .map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "decode canonical WAL audit parent transition id",
+                    error,
+                )
+            })?;
+        let payload_hash: Option<String> =
+            row.try_get("canonical_transition_hash").map_err(|error| {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "decode canonical WAL audit payload hash",
+                    error,
+                )
+            })?;
+        if attempt_index != entry.physical_attempt
+            || transition_id.as_deref() != Some(entry.transition.transition_id.as_str())
+            || parent_transition_id != entry.transition.parent_transition_id
+            || payload_hash.as_deref() != Some(entry.payload_hash.as_str())
+        {
+            return Err(ServiceError::conflict(
+                "canonical transition WAL does not match its provider-attempt audit owner",
+            ));
+        }
+    }
+    drop(entries_by_attempt);
+
+    let mut cursor = head_transition_id.clone();
+    let mut chain = Vec::with_capacity(entries.len());
+    loop {
+        let entry = entries.remove(&cursor).ok_or_else(|| {
+            ServiceError::conflict("canonical transition WAL head has a missing ancestor")
+        })?;
+        let stop_at_checkpoint = entry.transition.recovery_mode
+            == astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase;
+        let parent = entry.transition.parent_transition_id.clone();
+        chain.push(entry);
+        if stop_at_checkpoint || parent.is_none() {
+            break;
+        }
+        cursor = parent.expect("checked above");
+    }
+    if !entries.is_empty() {
         return Err(ServiceError::conflict(
-            "provider canonical WAL head payload must contain exactly one transition",
+            "canonical transition WAL contains entries outside the authoritative head chain",
         ));
     }
-    let transition = &transitions[0];
-    transition.validate().map_err(|error| {
-        ServiceError::conflict(format!(
-            "provider canonical transition WAL is invalid: {error}"
-        ))
+    chain.reverse();
+    for pair in chain.windows(2) {
+        if pair[1].transition.parent_transition_id.as_deref()
+            != Some(pair[0].transition.transition_id.as_str())
+            || pair[1].transition.parent_result.as_ref() != Some(&pair[0].transition.result)
+            || pair[1].transition.durable_base != pair[0].transition.durable_base
+        {
+            return Err(ServiceError::conflict(
+                "canonical transition WAL chain has a discontinuous predecessor",
+            ));
+        }
+    }
+    let head_entry = chain.last().ok_or_else(|| {
+        ServiceError::conflict("canonical transition WAL head has an empty chain")
     })?;
-    if persisted_transition_id.as_deref() != Some(transition.transition_id.as_str())
-        || transition.transition_id != head_transition_id
-        || persisted_parent_transition_id != transition.parent_transition_id
+    if head_entry.attempt_id != head_attempt_id
+        || i64::from(head_entry.transition.result.message_count) != head_result_count
+        || head_entry.transition.result.root_hash != head_result_root_hash
     {
         return Err(ServiceError::conflict(
-            "provider canonical WAL head metadata does not match its payload",
+            "canonical transition WAL head metadata does not match its leaf",
         ));
     }
+    let round = head_entry.round;
+    let logical_attempt = head_entry.logical_attempt;
+    let physical_attempt = head_entry.physical_attempt;
     Ok(vec![InferenceCanonicalTransitionReceipt {
-        turn,
+        turn: first_turn,
         round,
         logical_attempt,
         physical_attempt,
-        transitions,
+        transitions: chain.into_iter().map(|entry| entry.transition).collect(),
     }])
 }
 
-/// Remove recoverable message payloads after the canonical coordinator has
-/// absorbed them. The content hash remains as immutable audit evidence; owner,
-/// session, turn, run-scope, and primary-purpose predicates prevent one
-/// conversation surface from retiring another's WAL.
+/// Remove recoverable WAL entries after the canonical coordinator has absorbed
+/// them. Immutable transition ids and payload hashes remain on provider-attempt
+/// audit rows; exact owner/session predicates prevent cross-tenant retirement.
 pub async fn retire_inference_canonical_transitions_through_turn(
     pool: &SharedPool,
     user_id: &str,
@@ -3143,16 +3693,8 @@ pub async fn retire_inference_canonical_transitions_through_turn(
         )
     })?;
     let result = sqlx::query(
-        "UPDATE inference_provider_attempts AS attempt
-         INNER JOIN inference_invocations AS invocation
-           ON invocation.user_id = attempt.user_id
-          AND invocation.invocation_id = attempt.invocation_id
-         SET attempt.canonical_transition_json = NULL
-         WHERE attempt.user_id = ? AND attempt.session_id = ?
-           AND invocation.turn_index <= ?
-           AND invocation.scope_kind = 'run'
-           AND invocation.purpose = 'primary_agent'
-           AND attempt.canonical_transition_json IS NOT NULL",
+        "DELETE FROM inference_canonical_transition_wal
+         WHERE user_id = ? AND session_id = ? AND turn_index <= ?",
     )
     .bind(user_id)
     .bind(session_id)
@@ -3162,7 +3704,7 @@ pub async fn retire_inference_canonical_transitions_through_turn(
     .map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Persistence,
-            "retire absorbed inference canonical transition payloads",
+            "retire absorbed inference canonical transition WAL",
             error,
         )
     })?;
@@ -5891,7 +6433,7 @@ mod tests {
             "test_authority",
             astra_turn_types::RuntimeAuthorityLifetime::NextAssistantDecision,
         );
-        let transition = astra_turn_types::ProviderCanonicalTransitionV1::new(
+        let transition = astra_turn_types::ProviderCanonicalTransitionV2::new(
             None,
             &[json!({"role": "user", "content": "goal"})],
             vec![authority],
@@ -5926,10 +6468,10 @@ mod tests {
             ServiceErrorKind::Conflict
         );
 
-        let transitions: Vec<astra_turn_types::ProviderCanonicalTransitionV1> =
+        let transitions: Vec<astra_turn_types::ProviderCanonicalTransitionV2> =
             serde_json::from_str(
                 attempt
-                    .canonical_transition_json
+                    .canonical_transition_payload
                     .as_deref()
                     .expect("transition JSON"),
             )
@@ -5966,12 +6508,12 @@ mod tests {
     }
 
     #[test]
-    fn provider_attempt_owns_one_self_contained_canonical_snapshot() {
+    fn provider_attempt_owns_exactly_one_canonical_wal_entry() {
         let attempt = exact_provider_attempt_with_transition();
-        let transitions: Vec<astra_turn_types::ProviderCanonicalTransitionV1> =
+        let transitions: Vec<astra_turn_types::ProviderCanonicalTransitionV2> =
             serde_json::from_str(
                 attempt
-                    .canonical_transition_json
+                    .canonical_transition_payload
                     .as_deref()
                     .expect("transition JSON"),
             )
@@ -5980,7 +6522,7 @@ mod tests {
         assert_eq!(
             exact_provider_attempt()
                 .with_canonical_transitions(&[transitions[0].clone(), transitions[0].clone()])
-                .expect_err("one physical request cannot own competing snapshots")
+                .expect_err("one physical request cannot own competing WAL entries")
                 .kind,
             ServiceErrorKind::Invalid
         );
