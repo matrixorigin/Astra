@@ -10,9 +10,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use astra_pipeline::{step_protocol::InMemoryIdempotencyCache, step_recorder::StepRecorder};
 use astra_runtime::{
-    pipeline::step_protocol::InMemoryIdempotencyCache,
-    pipeline::step_recorder::StepRecorder,
     semantic_dedup::SemanticDedup,
     turn::agentic::headless_round::HeadlessStderrStyle,
     turn::agentic_loop::finalization::run_agentic_loop_with_host,

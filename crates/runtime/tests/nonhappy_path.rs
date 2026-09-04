@@ -242,8 +242,8 @@ mod turn_guard_integration {
     /// Proves: cross-session health respects minimum call threshold
     #[test]
     fn cross_session_min_calls_protection() {
-        use astra_runtime::pipeline::persistence::ToolHealthEntry;
         use astra_turn_core::tool_health::ToolHealthTracker;
+        use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 
         // Tool A: 3 calls, 100% failure → no health avoidance (too few calls, need >=8)
         // Tool B: 10 calls, 80% failure → health avoidance (enough data + above 70% threshold)
@@ -627,10 +627,10 @@ mod error_recovery_integration {
 // and confirms behavioral evidence does not mutate hard restrictions or budget.
 
 mod chat_stream_turnguard_e2e {
-    use astra_runtime::pipeline::persistence::ToolHealthEntry;
     use astra_runtime::turn::result_quality::ResultQuality;
     use astra_turn_core::guardrails::turn_guard::{TurnGuard, TurnVerdict, VerdictSeverity};
     use astra_turn_core::tool_health::ToolHealthTracker;
+    use astra_turn_core::tool_health_persistence::ToolHealthEntry;
     use serde_json::json;
     use std::collections::HashSet;
 
@@ -1210,8 +1210,8 @@ mod chat_stream_turnguard_e2e {
     /// TurnGuard created with pre-existing health data preserves health avoidance.
     #[test]
     fn cross_session_health_preserved() {
-        use astra_runtime::pipeline::persistence::ToolHealthEntry;
         use astra_turn_core::tool_health::ToolHealthTracker;
+        use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 
         let entries = vec![ToolHealthEntry {
             name: "flaky_tool".to_string(),

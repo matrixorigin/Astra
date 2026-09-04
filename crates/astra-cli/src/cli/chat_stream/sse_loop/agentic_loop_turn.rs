@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use astra_config::user_profile::{Scenario, TurnIntent, WorkspaceMutationIntent};
+use astra_pipeline::step_recorder::StepRecorder;
 use astra_runtime::{
-    pipeline::step_recorder::StepRecorder,
     prompts,
     tool_registry::{self, ToolRegistry},
     turn::agentic_loop::host::{TurnInteractionMode, TurnInteractionPolicy, VolatileInjection},

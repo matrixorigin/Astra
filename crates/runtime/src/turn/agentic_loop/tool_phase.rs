@@ -699,14 +699,14 @@ async fn refresh_runtime_promotion_signals_from_db(state: &mut AgenticLoopState)
     };
     let verdict_warning =
         crate::server::run::lifecycle::has_turn_verdict_warning(&state.stall.verdict_events);
-    let evaluation = crate::pipeline::evaluation::evaluate_tool_call_records_with_thresholds(
+    let evaluation = astra_turn_core::evaluation::evaluate_tool_call_records_with_thresholds(
         &state.message,
         &state.recent_tools,
         &state.stall.tool_call_records,
         state.stall.events.len(),
         verdict_warning,
         state.telemetry.first_budget_pressure,
-        crate::pipeline::evaluation::current_evaluation_thresholds(),
+        crate::turn::runtime_policy::configured_evaluation_thresholds(),
     );
     let assessment = build_runtime_session_quality_assessment(
         &session_id,
@@ -3150,7 +3150,7 @@ pub(crate) async fn execute_tool_phase<H: AgenticLoopHost>(
         policy_subject,
         &state.stall.tool_call_records,
         state.llm_rounds_completed,
-        crate::pipeline::evaluation::current_evaluation_thresholds(),
+        crate::turn::runtime_policy::configured_evaluation_thresholds(),
     );
     state.stall.runtime_policy_evaluation = policy_state;
     if let Some(policy_feedback) = policy_update {

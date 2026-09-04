@@ -576,22 +576,21 @@ fn extend_runtime_sidecar_events(
     }
 
     if local_tool_observability_is_complete(result) {
-        let turn_eval_event =
-            astra_runtime::pipeline::evaluation::build_turn_evaluation_journal_event(
-                state.session_id.as_deref(),
-                Some(state.turn),
-                "cli_repl",
-                &latest_user_input,
-                &state.recent_tools,
-                &result.tool_call_records,
-                result.stall_events.len(),
-                result.verdict_events.iter().any(|event| {
-                    event.severity.eq_ignore_ascii_case("warning")
-                        || event.severity.eq_ignore_ascii_case("critical")
-                }),
-                result.budget_pressure,
-                &learning_snap.eval,
-            );
+        let turn_eval_event = astra_turn_core::evaluation::build_turn_evaluation_journal_event(
+            state.session_id.as_deref(),
+            Some(state.turn),
+            "cli_repl",
+            &latest_user_input,
+            &state.recent_tools,
+            &result.tool_call_records,
+            result.stall_events.len(),
+            result.verdict_events.iter().any(|event| {
+                event.severity.eq_ignore_ascii_case("warning")
+                    || event.severity.eq_ignore_ascii_case("critical")
+            }),
+            result.budget_pressure,
+            &learning_snap.eval,
+        );
         sidecar_events.push(turn_eval_event);
     }
 }

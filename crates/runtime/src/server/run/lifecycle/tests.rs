@@ -5509,7 +5509,7 @@ fn completed_subrun_lifecycle_is_not_inferred_from_tool_outcome_votes() {
             ..Default::default()
         },
     ]);
-    let evaluation = crate::pipeline::evaluation::evaluate_tool_call_records(
+    let evaluation = astra_turn_core::evaluation::evaluate_tool_call_records(
         &state.message,
         &state.recent_tools,
         &state.stall.tool_call_records,

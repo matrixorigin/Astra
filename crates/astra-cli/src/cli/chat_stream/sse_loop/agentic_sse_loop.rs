@@ -5,15 +5,15 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use astra_core::canonical_names::normalize_name_list;
+use astra_pipeline::{step_protocol::StepCheckpoint, step_recorder::StepRecorder};
 use astra_runtime::{
-    pipeline::persistence::ToolHealthEntry,
-    pipeline::step_protocol::StepCheckpoint,
-    pipeline::step_recorder::StepRecorder,
     turn::agentic_turn_telemetry::{format_token_count_compact, session_id_footer_abbrev},
     turn::turn_guard::TurnGuard,
 };
 use astra_services::session_journal::ToolCallRecord;
-use astra_turn_core::tool_registry_report::ToolSelectionReport;
+use astra_turn_core::{
+    tool_health_persistence::ToolHealthEntry, tool_registry_report::ToolSelectionReport,
+};
 use crossterm::style::Stylize;
 use serde_json::Value;
 
@@ -440,7 +440,7 @@ pub(crate) fn build_stream_result(ctx: StreamResultBuild<'_>) -> StreamResult {
 #[cfg(test)]
 mod tests {
     use super::{StreamResultBuild, build_stream_result, resolved_tool_metrics};
-    use astra_runtime::pipeline::step_recorder::StepRecorder;
+    use astra_pipeline::step_recorder::StepRecorder;
     use astra_runtime::turn::turn_guard::TurnGuard;
     use astra_services::session_journal::ToolCallRecord;
     use std::collections::HashSet;

@@ -3873,9 +3873,9 @@ fn build_runtime_turn_evaluation_event(
     state: &AgenticLoopState,
 ) -> astra_services::session_journal::JournalEvent {
     let verdict_warning = has_turn_verdict_warning(&state.stall.verdict_events);
-    let eval_thresholds = crate::pipeline::evaluation::current_evaluation_thresholds();
+    let eval_thresholds = crate::turn::runtime_policy::configured_evaluation_thresholds();
     let eval =
-        crate::pipeline::evaluation::evaluate_tool_call_records_with_thresholds_and_telemetry(
+        astra_turn_core::evaluation::evaluate_tool_call_records_with_thresholds_and_telemetry(
             &state.message,
             &state.recent_tools,
             &state.stall.tool_call_records,
@@ -3883,14 +3883,14 @@ fn build_runtime_turn_evaluation_event(
             verdict_warning,
             state.telemetry.first_budget_pressure,
             eval_thresholds,
-            crate::pipeline::evaluation::TurnEvaluationTelemetry {
+            astra_turn_core::evaluation::TurnEvaluationTelemetry {
                 llm_rounds: Some(state.llm_rounds_completed),
                 prompt_tokens: Some(state.total_prompt),
                 first_round_prompt_tokens: state.telemetry.first_round_prompt_tokens,
                 max_round_prompt_tokens: state.telemetry.max_round_prompt_tokens,
             },
         );
-    crate::pipeline::evaluation::build_turn_evaluation_journal_event(
+    astra_turn_core::evaluation::build_turn_evaluation_journal_event(
         Some(session_id),
         Some(state.session_turn),
         source,

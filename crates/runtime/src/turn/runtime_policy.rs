@@ -25,6 +25,18 @@ use astra_turn_core::context_feedback::{
     RuntimePolicySignal, RuntimePolicyStage, RuntimePolicySubject,
 };
 
+pub fn configured_evaluation_thresholds() -> astra_turn_core::evaluation::EvaluationThresholds {
+    let policy = astra_config::RuntimeConfig::load().tool_policy;
+    astra_turn_core::evaluation::EvaluationThresholds {
+        redundant_overlapping_reads: policy.effective_redundant_reads_eval_threshold() as usize,
+        search_fanout: policy.effective_search_fanout_eval_threshold() as usize,
+        redundant_validation_retries: policy.effective_redundant_validation_retries_eval_threshold()
+            as usize,
+        llm_round_churn: astra_turn_core::evaluation::LLM_ROUND_CHURN_THRESHOLD,
+        exploration_family_churn: astra_turn_core::evaluation::EXPLORATION_FAMILY_CHURN_THRESHOLD,
+    }
+}
+
 // ─── Framework Actions ────────────────────────────────────────────────────────
 
 /// Urgency level for context-pressure guidance.

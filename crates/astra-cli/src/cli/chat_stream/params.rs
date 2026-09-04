@@ -1,5 +1,5 @@
-use astra_runtime::pipeline::persistence::ToolHealthEntry;
 use astra_turn_core::orchestration_fanout_group::AgentFanoutSlotIdentity;
+use astra_turn_core::tool_health_persistence::ToolHealthEntry;
 use astra_turn_core::turn_event_sink::IncrementalTurnState;
 use std::collections::HashSet;
 use std::sync::Arc;

@@ -4,7 +4,7 @@ use crate::cli::stream::streaming_types::StreamResult;
 use astra_services::session_journal;
 
 pub(crate) struct TurnLearningSnapshot {
-    pub eval: astra_runtime::pipeline::evaluation::TurnEvaluation,
+    pub eval: astra_turn_core::evaluation::TurnEvaluation,
 }
 
 pub(crate) fn analyze_chat_turn_learning(
@@ -13,9 +13,8 @@ pub(crate) fn analyze_chat_turn_learning(
     recent_tools: &[String],
     result: &StreamResult,
 ) -> TurnLearningSnapshot {
-    use astra_runtime::pipeline::evaluation::{
-        TurnEvaluationTelemetry, current_evaluation_thresholds,
-        evaluate_tool_call_records_with_thresholds_and_telemetry,
+    use astra_turn_core::evaluation::{
+        TurnEvaluationTelemetry, evaluate_tool_call_records_with_thresholds_and_telemetry,
     };
     let latest_user_input = result.latest_user_input(line);
 
@@ -65,7 +64,7 @@ pub(crate) fn analyze_chat_turn_learning(
         result.stall_events.len(),
         has_verdict_warning,
         result.budget_pressure,
-        current_evaluation_thresholds(),
+        astra_runtime::turn::runtime_policy::configured_evaluation_thresholds(),
         TurnEvaluationTelemetry {
             llm_rounds: result.llm_rounds,
             prompt_tokens: Some(result.prompt_tokens),
@@ -78,9 +77,9 @@ pub(crate) fn analyze_chat_turn_learning(
 
 pub(crate) fn turn_quality_feedback_from_eval(
     turn: u32,
-    eval: &astra_runtime::pipeline::evaluation::TurnEvaluation,
+    eval: &astra_turn_core::evaluation::TurnEvaluation,
 ) -> Option<astra_runtime::self_model::TurnQualityFeedback> {
-    use astra_runtime::pipeline::evaluation::EvalSignal;
+    use astra_turn_core::evaluation::EvalSignal;
     use std::collections::BTreeSet;
 
     let mut findings = Vec::new();
@@ -214,14 +213,14 @@ mod tests {
         assert!(
             !learning.eval.signals.iter().any(|signal| matches!(
                 signal,
-                astra_runtime::pipeline::evaluation::EvalSignal::LlmRoundChurn { .. }
+                astra_turn_core::evaluation::EvalSignal::LlmRoundChurn { .. }
             )),
             "round count and prompt growth alone are not proof of low-yield work: {:?}",
             learning.eval.signals
         );
         assert!(learning.eval.signals.iter().any(|signal| matches!(
             signal,
-            astra_runtime::pipeline::evaluation::EvalSignal::PromptGrowthChurn {
+            astra_turn_core::evaluation::EvalSignal::PromptGrowthChurn {
                 first_prompt_tokens: 9_401,
                 max_prompt_tokens: 20_954,
                 delta_tokens: 11_553,
@@ -255,7 +254,7 @@ mod tests {
         assert!(
             !learning.eval.signals.iter().any(|signal| matches!(
                 signal,
-                astra_runtime::pipeline::evaluation::EvalSignal::PromptGrowthChurn { .. }
+                astra_turn_core::evaluation::EvalSignal::PromptGrowthChurn { .. }
             )),
             "a cache-lane transition is cost evidence, not context ballooning: {:?}",
             learning.eval.signals
@@ -264,9 +263,7 @@ mod tests {
 
     #[test]
     fn turn_quality_feedback_mentions_batching_repeats_and_stalls() {
-        use astra_runtime::pipeline::evaluation::{
-            EvalSignal, EvaluationThresholds, TurnEvaluation,
-        };
+        use astra_turn_core::evaluation::{EvalSignal, EvaluationThresholds, TurnEvaluation};
 
         let eval = TurnEvaluation {
             success: false,
@@ -314,9 +311,7 @@ mod tests {
 
     #[test]
     fn turn_quality_feedback_ignores_untracked_or_empty_signals() {
-        use astra_runtime::pipeline::evaluation::{
-            EvalSignal, EvaluationThresholds, TurnEvaluation,
-        };
+        use astra_turn_core::evaluation::{EvalSignal, EvaluationThresholds, TurnEvaluation};
 
         let eval = TurnEvaluation {
             success: true,
