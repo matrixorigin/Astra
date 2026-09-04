@@ -978,7 +978,7 @@ impl RuntimeToolExecutor {
     }
 
     pub(super) fn adjust_config(&self, args: &Value) -> String {
-        let outcome = crate::server::tool_session_config::execute_adjust_config(
+        crate::server::tool_session_config::execute_adjust_config(
             &self.user_id,
             &self.session_id,
             self.observability_session.as_ref(),
@@ -987,20 +987,18 @@ impl RuntimeToolExecutor {
             || self.publish_current_workspace("adjust_config"),
             &self.session_state_journal,
             self.journal_turn_index.load(Ordering::Relaxed),
-        );
-        outcome.output
+        )
     }
 
     pub(super) fn compress_context(&self, args: &Value) -> String {
-        let outcome = crate::server::tool_session_config::execute_compress_context(
+        crate::server::tool_session_config::execute_compress_context(
             &self.user_id,
             &self.session_id,
             self.observability_session.as_ref(),
             args,
             &self.session_state_journal,
             self.journal_turn_index.load(Ordering::Relaxed),
-        );
-        outcome.output
+        )
     }
 
     // ── Introspect snapshot update ──────────────────────────────────────────

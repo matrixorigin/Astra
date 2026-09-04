@@ -268,26 +268,8 @@ pub(crate) fn persist_config_override(
     )
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub(crate) struct AdjustConfigRollback {
-    pub(crate) path: String,
-    pub(crate) old_value: Value,
-    pub(crate) snapshot: crate::observability::ObservabilitySessionRollbackSnapshot,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub(crate) struct AdjustConfigOutcome {
-    pub(crate) output: String,
-    pub(crate) rollback: Option<AdjustConfigRollback>,
-}
-
-fn adjust_config_output(value: Value) -> AdjustConfigOutcome {
-    AdjustConfigOutcome {
-        output: value.to_string(),
-        rollback: None,
-    }
+fn session_tool_output(value: Value) -> String {
+    value.to_string()
 }
 
 pub(crate) fn execute_adjust_config<PublishWorkspace>(
@@ -299,7 +281,7 @@ pub(crate) fn execute_adjust_config<PublishWorkspace>(
     publish_workspace: PublishWorkspace,
     session_state_journal: &Mutex<SessionStateRollbackJournal>,
     journal_turn_index: u32,
-) -> AdjustConfigOutcome
+) -> String
 where
     PublishWorkspace: FnOnce() -> Result<(), String>,
 {
@@ -307,16 +289,16 @@ where
 
     let path = match args.get("path").and_then(Value::as_str) {
         Some(path) if !path.trim().is_empty() => path.trim(),
-        _ => return adjust_config_output(json!({"error": "Missing required parameter: path"})),
+        _ => return session_tool_output(json!({"error": "Missing required parameter: path"})),
     };
     let value = match args.get("value") {
         Some(value) => value,
-        None => return adjust_config_output(json!({"error": "Missing required parameter: value"})),
+        None => return session_tool_output(json!({"error": "Missing required parameter: value"})),
     };
     let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
 
     let Some(observability_session) = observability_session else {
-        return adjust_config_output(json!({"error": "No observability session available"}));
+        return session_tool_output(json!({"error": "No observability session available"}));
     };
 
     let constraints = crate::self_model::ConstraintSet::default();
@@ -327,7 +309,7 @@ where
         let mut session = match observability_session.write() {
             Ok(guard) => guard,
             Err(_) => {
-                return adjust_config_output(
+                return session_tool_output(
                     json!({"error": "Failed to acquire observability session"}),
                 );
             }
@@ -338,14 +320,14 @@ where
         let mut inner = match config.lock() {
             Ok(inner) => inner,
             Err(_) => {
-                return adjust_config_output(json!({"error": "Failed to access session config"}));
+                return session_tool_output(json!({"error": "Failed to access session config"}));
             }
         };
         if inner.mutation_counter.0 != turn {
             inner.mutation_counter = (turn, 0);
         }
         if !force && inner.mutation_counter.1 >= constraints.max_mutations_per_turn {
-            return adjust_config_output(json!({
+            return session_tool_output(json!({
                 "error": "mutation_limit_exceeded",
                 "turn": turn,
                 "max_mutations_per_turn": constraints.max_mutations_per_turn,
@@ -358,7 +340,7 @@ where
         let update =
             match apply_runtime_config_update(&mut session.config, path, value, force, ceiling) {
                 Ok(update) => update,
-                Err(error) => return adjust_config_output(error),
+                Err(error) => return session_tool_output(error),
             };
 
         (turn, update, session_snapshot, 1u32)
@@ -376,7 +358,7 @@ where
         if let Ok(mut session) = observability_session.write() {
             session.restore_rollback_snapshot(&session_snapshot);
         }
-        return adjust_config_output(json!({
+        return session_tool_output(json!({
             "error": "failed_to_persist_config_override",
             "path": path,
             "detail": error,
@@ -386,7 +368,7 @@ where
         if let Ok(mut session) = observability_session.write() {
             session.restore_rollback_snapshot(&session_snapshot);
         }
-        return adjust_config_output(json!({
+        return session_tool_output(json!({
             "error": "failed_to_publish_workspace_artifact",
             "path": path,
             "detail": error,
@@ -399,11 +381,7 @@ where
         inner_mutation_increment = inner.mutation_counter.1;
     }
 
-    let rollback = AdjustConfigRollback {
-        path: path.to_string(),
-        old_value: update.old_value.clone(),
-        snapshot: session_snapshot.clone(),
-    };
+    let old_value = update.old_value.clone();
     tool_session_state_rollback::record(
         session_state_journal,
         journal_turn_index,
@@ -414,21 +392,18 @@ where
             snapshot: session_snapshot,
         },
     );
-    AdjustConfigOutcome {
-        output: json!({
-            "status": "ok",
-            "path": path,
-            "old": rollback.old_value,
-            "new": update.new_value,
-            "turn": turn,
-            "mutations_this_turn": inner_mutation_increment,
-            "max_mutations_per_turn": constraints.max_mutations_per_turn,
-            "drift": update.drift,
-            "drift_ceiling": constraints.config_drift_ceiling,
-        })
-        .to_string(),
-        rollback: Some(rollback),
-    }
+    json!({
+        "status": "ok",
+        "path": path,
+        "old": old_value,
+        "new": update.new_value,
+        "turn": turn,
+        "mutations_this_turn": inner_mutation_increment,
+        "max_mutations_per_turn": constraints.max_mutations_per_turn,
+        "drift": update.drift,
+        "drift_ceiling": constraints.config_drift_ceiling,
+    })
+    .to_string()
 }
 
 pub(crate) fn persist_manual_compression(
@@ -455,27 +430,6 @@ pub(crate) fn persist_manual_compression(
     writer.append(&event).map_err(|e| e.to_string())
 }
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub(crate) struct CompressContextRollback {
-    pub(crate) turn: u32,
-    pub(crate) snapshot: crate::observability::ObservabilitySessionRollbackSnapshot,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub(crate) struct CompressContextOutcome {
-    pub(crate) output: String,
-    pub(crate) rollback: Option<CompressContextRollback>,
-}
-
-fn compress_context_output(value: Value) -> CompressContextOutcome {
-    CompressContextOutcome {
-        output: value.to_string(),
-        rollback: None,
-    }
-}
-
 pub(crate) fn execute_compress_context(
     user_id: &str,
     session_id: &str,
@@ -483,18 +437,18 @@ pub(crate) fn execute_compress_context(
     args: &Value,
     session_state_journal: &Mutex<SessionStateRollbackJournal>,
     journal_turn_index: u32,
-) -> CompressContextOutcome {
+) -> String {
     let reason = args
         .get("reason")
         .and_then(Value::as_str)
         .unwrap_or("manual_request");
     let Some(observability_session) = observability_session else {
-        return compress_context_output(json!({"error": "No observability session available"}));
+        return session_tool_output(json!({"error": "No observability session available"}));
     };
     let mut session = match observability_session.write() {
         Ok(guard) => guard,
         Err(_) => {
-            return compress_context_output(
+            return session_tool_output(
                 json!({"error": "Failed to acquire observability session"}),
             );
         }
@@ -516,7 +470,7 @@ pub(crate) fn execute_compress_context(
         reason,
         "runtime_tool_executor:compress_context",
     ) {
-        return compress_context_output(json!({
+        return session_tool_output(json!({
             "error": "failed_to_persist_manual_compression",
             "detail": error,
             "turn": turn,
@@ -533,33 +487,27 @@ pub(crate) fn execute_compress_context(
         format!("compress_context:turn-{turn}"),
         SessionStateRollbackAction::Compression {
             turn,
-            snapshot: session_snapshot.clone(),
+            snapshot: session_snapshot,
         },
     );
 
-    CompressContextOutcome {
-        output: json!({
-            "status": "ok",
-            "turn": turn,
-            "reason": reason,
-            "previous_compression_count": previous_compression_count,
-            "already_compressed_this_turn": already_compressed_this_turn,
-            "compression_count": compression_count,
-        })
-        .to_string(),
-        rollback: Some(CompressContextRollback {
-            turn,
-            snapshot: session_snapshot,
-        }),
-    }
+    json!({
+        "status": "ok",
+        "turn": turn,
+        "reason": reason,
+        "previous_compression_count": previous_compression_count,
+        "already_compressed_this_turn": already_compressed_this_turn,
+        "compression_count": compression_count,
+    })
+    .to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn execute_compress_context_records_compression_and_returns_rollback() {
+    #[tokio::test]
+    async fn execute_compress_context_records_and_replays_canonical_rollback() {
         let sessions = tempfile::TempDir::new().expect("sessions tempdir");
         let _journal_guard = astra_services::session_journal::JournalDirGuard::new(sessions.path());
         let session_id = "sess-compress-context";
@@ -569,7 +517,7 @@ mod tests {
         session.write().expect("session write").turn_number = 3;
 
         let journal = Mutex::new(SessionStateRollbackJournal::default());
-        let outcome = execute_compress_context(
+        let output = execute_compress_context(
             "test-user",
             session_id,
             Some(&session),
@@ -577,7 +525,7 @@ mod tests {
             &journal,
             0,
         );
-        let output: Value = serde_json::from_str(&outcome.output).expect("json output");
+        let output: Value = serde_json::from_str(&output).expect("json output");
 
         assert_eq!(output["status"], "ok");
         assert_eq!(output["turn"], 3);
@@ -591,9 +539,32 @@ mod tests {
                 .compressed_turns
                 .contains(&3)
         );
-        let rollback = outcome.rollback.expect("successful compression rollback");
-        assert_eq!(rollback.turn, 3);
-        assert!(rollback.snapshot.compressed_turns.is_empty());
+        let rollback_entries = tool_session_state_rollback::entries(&journal);
+        assert_eq!(rollback_entries.len(), 1);
+        match &rollback_entries[0].action {
+            SessionStateRollbackAction::Compression { turn, snapshot } => {
+                assert_eq!(*turn, 3);
+                assert!(snapshot.compressed_turns.is_empty());
+            }
+            other => panic!("expected compression rollback, got {other:?}"),
+        }
+        tool_session_state_rollback::restore_entry(
+            &tool_session_state_rollback::SessionStateRestoreContext {
+                user_id: "test-user",
+                session_id,
+                observability_session: Some(&session),
+            },
+            &rollback_entries[0],
+        )
+        .await
+        .expect("replay compression rollback");
+        assert!(
+            !session
+                .read()
+                .expect("session read after rollback")
+                .compressed_turns
+                .contains(&3)
+        );
 
         let events =
             astra_services::session_journal::read_journal_for_user("test-user", session_id)
@@ -703,8 +674,8 @@ mod tests {
         assert_eq!(update.new_value, json!(20));
     }
 
-    #[test]
-    fn execute_adjust_config_updates_session_counter_and_returns_rollback() {
+    #[tokio::test]
+    async fn execute_adjust_config_updates_and_replays_canonical_rollback() {
         let sessions = tempfile::TempDir::new().expect("sessions tempdir");
         let _journal_guard = astra_services::session_journal::JournalDirGuard::new(sessions.path());
         let session_id = "sess-adjust-config";
@@ -740,7 +711,7 @@ mod tests {
         let config = Mutex::new(SessionConfigInner::default());
 
         let journal = Mutex::new(SessionStateRollbackJournal::default());
-        let outcome = execute_adjust_config(
+        let output = execute_adjust_config(
             "test-user",
             session_id,
             Some(&session),
@@ -754,7 +725,7 @@ mod tests {
             &journal,
             0,
         );
-        let output: Value = serde_json::from_str(&outcome.output).expect("json output");
+        let output: Value = serde_json::from_str(&output).expect("json output");
 
         assert_eq!(output["status"], "ok");
         assert_eq!(output["path"], "memory.retrieval_top_k");
@@ -770,13 +741,47 @@ mod tests {
                 .retrieval_top_k,
             new_top_k
         );
-        let rollback = outcome.rollback.expect("config rollback");
-        assert_eq!(rollback.path, "memory.retrieval_top_k");
-        assert_eq!(rollback.old_value, json!(old_top_k));
-        assert_eq!(rollback.snapshot.config.memory.retrieval_top_k, old_top_k);
+        let rollback_entries = tool_session_state_rollback::entries(&journal);
+        assert_eq!(rollback_entries.len(), 1);
+        match &rollback_entries[0].action {
+            SessionStateRollbackAction::ConfigOverride {
+                path,
+                old_value,
+                snapshot,
+            } => {
+                assert_eq!(path, "memory.retrieval_top_k");
+                assert_eq!(old_value, &json!(old_top_k));
+                assert_eq!(snapshot.config.memory.retrieval_top_k, old_top_k);
+            }
+            other => panic!("expected config rollback, got {other:?}"),
+        }
         let workspace =
             astra_services::session_workspace::read_workspace(session_id).expect("workspace read");
         assert!(workspace.tuned_config_json.is_some());
+        assert_eq!(workspace.background_shell_tasks.len(), 1);
+
+        tool_session_state_rollback::restore_entry(
+            &tool_session_state_rollback::SessionStateRestoreContext {
+                user_id: "test-user",
+                session_id,
+                observability_session: Some(&session),
+            },
+            &rollback_entries[0],
+        )
+        .await
+        .expect("replay config rollback");
+        assert_eq!(
+            session
+                .read()
+                .expect("session read after rollback")
+                .config
+                .memory
+                .retrieval_top_k,
+            old_top_k
+        );
+        let workspace = astra_services::session_workspace::read_workspace(session_id)
+            .expect("workspace after rollback");
+        assert!(workspace.tuned_config_json.is_none());
         assert_eq!(workspace.background_shell_tasks.len(), 1);
     }
 }
