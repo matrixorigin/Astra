@@ -123,6 +123,16 @@ fn terminal_completion_disposition(
     let active_work_attempt = state.runtime_tool_executor.as_deref().is_some_and(
         crate::server::runtime_tool_executor::RuntimeToolExecutor::has_active_primary_work_attempt,
     );
+    // A successful generic task action may spend the one terminal fallback
+    // obligation, but it is still progress evidence rather than typed proof
+    // that an Unknown/MayMutate user goal completed. Keep the closing text
+    // boundary resumably incomplete in that case. Explicit ReadOnly intent
+    // and concrete mutation/verification receipts retain their existing
+    // completion authority.
+    let generic_task_action_spent = matches!(
+        workspace_mutation_intent(state),
+        WorkspaceMutationIntent::Unknown | WorkspaceMutationIntent::MayMutate
+    ) && has_successful_terminal_task_action(state);
     let bounded_synthesis_authorized = !active_work_attempt
         && !workspace_observation_is_quarantined(state)
         && state
@@ -131,6 +141,7 @@ fn terminal_completion_disposition(
             .foreground_fanout_pagination
             .is_none()
         && super::lifecycle::unfinished_parallel_agent_ids(state).is_empty()
+        && !generic_task_action_spent
         && pending_terminal_completion_action_for_work_state(state, false).is_none();
     if bounded_synthesis_authorized {
         return TerminalCompletionDisposition::RoundSliceTextDelivery;
@@ -15455,6 +15466,32 @@ mod tests {
             terminal_completion_disposition(&generic_action, false),
             TerminalCompletionDisposition::RoundSliceIncomplete,
             "a generic action proves execution, not completion of the user goal"
+        );
+
+        let mut spent_generic_action = make_state();
+        spent_generic_action.budget_wrapup_injected = true;
+        spent_generic_action.hooks.completion_settlement.text_only = true;
+        spent_generic_action
+            .hooks
+            .completion_settlement
+            .wrapup_origin = Some(super::super::host::BudgetWrapupOrigin::RoundSlice);
+        spent_generic_action
+            .stall
+            .tool_call_records
+            .push(executed_record(
+                "bash",
+                true,
+                Some(r#"{"command":"git worktree list"}"#),
+            ));
+        assert_eq!(
+            pending_terminal_completion_action_for_work_state(&spent_generic_action, false),
+            None,
+            "the successful action must not manufacture another terminal tool allowance"
+        );
+        assert_eq!(
+            terminal_completion_disposition(&spent_generic_action, false),
+            TerminalCompletionDisposition::RoundSliceIncomplete,
+            "spending the generic fallback proves progress, not goal completion"
         );
     }
 
