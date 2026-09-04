@@ -3097,6 +3097,15 @@ impl ServerAgenticLoopHostBuilder {
     }
 
     pub fn with_pool(mut self, pool: SharedPool) -> Self {
+        let memory = astra_core::MemoriaSettings::from_env();
+        self.memoria_client = Some(Arc::new(
+            crate::turn::cloud::memoria_compact::UserScopedMemoriaPort::new(
+                memory.base_url,
+                pool.clone(),
+                self.encryptor.as_ref().clone(),
+                self.user_id.clone(),
+            ),
+        ));
         self.shared_pool = Some(pool);
         self
     }

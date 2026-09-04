@@ -1897,7 +1897,7 @@ pub(crate) async fn close_session_handler(
         )
         .await?;
     astra_tools::memoria::MemoriaToolGateway::reset_session_process_state(&session_id);
-    schedule_session_end_governance(owner_id, session_id);
+    schedule_session_end_governance(&state, owner_id, session_id);
     Ok(Json(SessionResponse::from(session)))
 }
 
@@ -1910,16 +1910,22 @@ pub(crate) async fn close_session_handler(
 /// Memoria latency cannot make the UI wait, while the existing per-owner,
 /// per-session debouncer prevents duplicate close requests from writing two
 /// episodes or purging twice.
-fn schedule_session_end_governance(owner_id: String, session_id: String) {
-    let Some(memoria_client) = crate::turn::cloud::memoria_compact::HttpMemoriaPort::from_env()
-    else {
+fn schedule_session_end_governance(state: &AppState, owner_id: String, session_id: String) {
+    let Some(pool) = state.shared_pool.clone() else {
         tracing::debug!(
             owner_id = %owner_id,
             session_id = %session_id,
-            "session-end governance skipped because no memory provider is configured"
+            "session-end governance skipped because credential storage is unavailable"
         );
         return;
     };
+    let memory = astra_core::MemoriaSettings::from_env();
+    let memoria_client = crate::turn::cloud::memoria_compact::UserScopedMemoriaPort::new(
+        memory.base_url,
+        pool,
+        state.fernet_encryptor.clone(),
+        owner_id.clone(),
+    );
 
     tokio::spawn(async move {
         let debouncer = crate::turn::session_end_debounce::global();
@@ -1932,7 +1938,6 @@ fn schedule_session_end_governance(owner_id: String, session_id: String) {
             return;
         };
 
-        let memoria_client = memoria_client.with_owner_user_id(owner_id.clone());
         let session_facts = astra_turn_types::session_facts::SessionFacts::default();
         let governance = crate::turn::cloud::session_end_governance::run_session_end_governance(
             &session_facts,

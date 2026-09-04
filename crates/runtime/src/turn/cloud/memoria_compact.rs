@@ -295,7 +295,8 @@ impl HttpMemoriaPort {
         let request = self
             .http
             .request(method, url)
-            .header("Authorization", format!("Bearer {}", self.api_key));
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("X-Memoria-Tool", "astra");
         Ok(match owner {
             Some(owner) => request.header("X-User-Id", owner),
             None => request,
@@ -324,6 +325,246 @@ impl HttpMemoriaPort {
         Err(format!(
             "Memoria health check failed: status={status}, body={body}"
         ))
+    }
+}
+
+/// Resolves the current user's scoped Memoria credential for every operation.
+/// This makes revocation and access-mode changes effective without restarting
+/// an Astra runtime and prevents the server master key from becoming an
+/// implicit end-user consent path.
+#[derive(Clone)]
+pub struct UserScopedMemoriaPort {
+    base_url: String,
+    pool: astra_core::SharedPool,
+    encryptor: astra_services::FernetTokenEncryptor,
+    owner_user_id: Option<String>,
+}
+
+impl UserScopedMemoriaPort {
+    pub fn new(
+        base_url: String,
+        pool: astra_core::SharedPool,
+        encryptor: astra_services::FernetTokenEncryptor,
+        owner_user_id: String,
+    ) -> Self {
+        Self {
+            base_url,
+            pool,
+            encryptor,
+            owner_user_id: Some(owner_user_id),
+        }
+    }
+
+    pub fn template(
+        base_url: String,
+        pool: astra_core::SharedPool,
+        encryptor: astra_services::FernetTokenEncryptor,
+    ) -> Self {
+        Self {
+            base_url,
+            pool,
+            encryptor,
+            owner_user_id: None,
+        }
+    }
+
+    fn owner_user_id(&self) -> Result<&str, String> {
+        self.owner_user_id
+            .as_deref()
+            .ok_or_else(|| "Memoria transport requires an authenticated owner binding".to_string())
+    }
+
+    async fn client(&self, write: bool) -> Result<(HttpMemoriaPort, String), String> {
+        let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT encrypted_value, CAST(metadata AS CHAR) \
+             FROM auth_tokens \
+             WHERE type = 'memoria_connection' AND provider = 'memoria' \
+               AND scope_user_id = ? AND is_active = 1 \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(self.owner_user_id()?)
+        .fetch_optional(self.pool.get())
+        .await
+        .map_err(|error| format!("Memoria credential lookup failed: {error}"))?
+        .ok_or_else(|| "memory access is not enabled for this Astra account".to_string())?;
+        let metadata: Value = serde_json::from_str(row.1.as_deref().unwrap_or("{}"))
+            .map_err(|_| "Memoria credential metadata is invalid".to_string())?;
+        let access = metadata
+            .get("memory_access")
+            .and_then(Value::as_str)
+            .unwrap_or("none");
+        enforce_memory_access(access, write)?;
+        let encrypted = row
+            .0
+            .ok_or_else(|| "Memoria connection key is unavailable".to_string())?;
+        let key = self
+            .encryptor
+            .decrypt(&encrypted)
+            .map_err(|_| "Memoria connection key could not be decrypted".to_string())?;
+        let memoria_user_id = metadata
+            .get("memoria_user_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "Memoria credential owner is unavailable".to_string())?
+            .to_string();
+        Ok((
+            HttpMemoriaPort::new(self.base_url.clone(), key)
+                .with_owner_user_id(memoria_user_id.clone()),
+            memoria_user_id,
+        ))
+    }
+}
+
+fn enforce_memory_access(access: &str, write: bool) -> Result<(), String> {
+    if access == "none" {
+        return Err("memory access is disabled by the user".to_string());
+    }
+    if write && access != "read_write" {
+        return Err("memory write access is disabled by the user".to_string());
+    }
+    if access != "read_only" && access != "read_write" {
+        return Err("Memoria credential has an invalid access mode".to_string());
+    }
+    Ok(())
+}
+
+#[async_trait::async_trait]
+impl MemoriaPort for UserScopedMemoriaPort {
+    fn bind_owner(&self, user_id: &str) -> Result<std::sync::Arc<dyn MemoriaPort>, String> {
+        if self
+            .owner_user_id
+            .as_deref()
+            .is_some_and(|owner| owner != user_id)
+        {
+            return Err("memory_scope_violation: requested owner differs from bound owner".into());
+        }
+        let mut bound = self.clone();
+        bound.owner_user_id = Some(user_id.to_string());
+        Ok(std::sync::Arc::new(bound))
+    }
+
+    async fn retrieve_for_prompt(
+        &self,
+        query: &str,
+        user_id: &str,
+        session_id: &str,
+        top_k: usize,
+    ) -> Result<Vec<MemoriaMemory>, String> {
+        if user_id != self.owner_user_id()? {
+            return Err("memory_scope_violation: requested owner differs from bound owner".into());
+        }
+        let (client, memoria_user_id) = self.client(false).await?;
+        client
+            .retrieve_for_prompt(query, &memoria_user_id, session_id, top_k)
+            .await
+    }
+
+    async fn retrieve_ext(
+        &self,
+        query: &str,
+        session_id: Option<&str>,
+        top_k: usize,
+        filter_session: bool,
+    ) -> Result<Vec<MemoriaMemory>, String> {
+        self.client(false)
+            .await?
+            .0
+            .retrieve_ext(query, session_id, top_k, filter_session)
+            .await
+    }
+
+    async fn retrieve_scoped_typed(
+        &self,
+        query: &str,
+        session_id: &str,
+        top_k: usize,
+        memory_types: &[&str],
+    ) -> Result<Vec<MemoriaMemory>, String> {
+        self.client(false)
+            .await?
+            .0
+            .retrieve_scoped_typed(query, session_id, top_k, memory_types)
+            .await
+    }
+
+    async fn store(
+        &self,
+        content: &str,
+        memory_type: &str,
+        session_id: Option<&str>,
+        trust_tier: Option<&str>,
+    ) -> Result<String, String> {
+        self.client(true)
+            .await?
+            .0
+            .store(content, memory_type, session_id, trust_tier)
+            .await
+    }
+
+    async fn purge_working(&self, session_id: &str) -> Result<u64, String> {
+        self.client(true).await?.0.purge_working(session_id).await
+    }
+
+    async fn purge_memory_types(
+        &self,
+        session_id: &str,
+        memory_types: &[&str],
+    ) -> Result<u64, String> {
+        self.client(true)
+            .await?
+            .0
+            .purge_memory_types(session_id, memory_types)
+            .await
+    }
+
+    async fn delete(&self, memory_id: &str) -> Result<(), String> {
+        self.client(true).await?.0.delete(memory_id).await
+    }
+
+    async fn store_episode(&self, session_id: &str, overview: &str) -> Result<String, String> {
+        self.client(true)
+            .await?
+            .0
+            .store_episode(session_id, overview)
+            .await
+    }
+
+    async fn store_scene(
+        &self,
+        session_id: &str,
+        signal: &str,
+        summary: &str,
+    ) -> Result<String, String> {
+        self.client(true)
+            .await?
+            .0
+            .store_scene(session_id, signal, summary)
+            .await
+    }
+
+    async fn reflect_session(
+        &self,
+        session_id: &str,
+        force: bool,
+    ) -> Result<ReflectSummary, String> {
+        self.client(true)
+            .await?
+            .0
+            .reflect_session(session_id, force)
+            .await
+    }
+
+    async fn feedback(
+        &self,
+        memory_id: &str,
+        signal: &str,
+        context: Option<&str>,
+    ) -> Result<(), String> {
+        self.client(true)
+            .await?
+            .0
+            .feedback(memory_id, signal, context)
+            .await
     }
 }
 
@@ -1273,6 +1514,17 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn user_memory_access_is_enforced_before_transport_resolution() {
+        assert!(enforce_memory_access("none", false).is_err());
+        assert!(enforce_memory_access("none", true).is_err());
+        assert!(enforce_memory_access("read_only", false).is_ok());
+        assert!(enforce_memory_access("read_only", true).is_err());
+        assert!(enforce_memory_access("read_write", false).is_ok());
+        assert!(enforce_memory_access("read_write", true).is_ok());
+        assert!(enforce_memory_access("unexpected", false).is_err());
+    }
 
     async fn capture_one_http_request(
         status: &str,

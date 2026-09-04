@@ -5,6 +5,7 @@ use crate::cli::cli_config::cli_utils::{
 use crate::cli::session::session_state::SessionState;
 use serde::Deserialize;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Session authentication failure that can be repaired by `/login`.
 ///
@@ -136,6 +137,305 @@ pub(crate) async fn do_login(
     let tokens = request_login_tokens(api, username, password).await?;
     save_profile_auth_tokens(profile, username, &tokens)?;
     Ok(tokens.access_token)
+}
+
+pub(crate) async fn do_memoria_login_with_key(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+    connection_key: &str,
+) -> Result<String, String> {
+    let tokens = request_memoria_tokens(api, connection_key).await?;
+    save_profile_auth_tokens(profile, "memoria", &tokens)?;
+    credential_store()
+        .mutate(|creds| {
+            let name =
+                CredentialStore::resolve_profile_name(profile, creds.current_profile.as_deref());
+            if let Some(entry) = creds.profiles.get_mut(&name) {
+                // The connection key belongs only on the Astra server. Older
+                // CLI versions stored a Memoria key here, so clear it during
+                // the migration login as well.
+                entry.memoria_api_key = None;
+            }
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(tokens.access_token)
+}
+
+async fn request_memoria_tokens(
+    api: &astra_thin_client::ThinClient,
+    connection_key: &str,
+) -> Result<AuthTokenPayload, String> {
+    let body = api
+        .post_auth_memoria_json(&serde_json::json!({ "connection_key": connection_key }))
+        .await
+        .map_err(map_thin_err)?;
+    parse_auth_tokens(&body)
+}
+
+#[derive(Deserialize)]
+struct MemoriaConnectionCallback {
+    state: String,
+    memoria_connection_key: String,
+}
+
+pub(crate) async fn do_memoria_browser_login(
+    api: &astra_thin_client::ThinClient,
+    profile: Option<&str>,
+) -> Result<String, String> {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|error| format!("failed to start local login callback: {error}"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|error| format!("failed to inspect local login callback: {error}"))?
+        .port();
+    let mut state_bytes = [0_u8; 32];
+    state_bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    state_bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    let expected_state = URL_SAFE_NO_PAD.encode(state_bytes);
+    let website_base =
+        std::env::var("MEMORIA_WEB_URL").unwrap_or_else(|_| "https://thememoria.ai".to_string());
+    let website = url::Url::parse(&website_base)
+        .map_err(|_| "MEMORIA_WEB_URL must be an absolute HTTP(S) URL".to_string())?;
+    if website.scheme() != "http" && website.scheme() != "https" {
+        return Err("MEMORIA_WEB_URL must use HTTP or HTTPS".to_string());
+    }
+    let allowed_origin = website.origin().ascii_serialization();
+    let connect_url = format!(
+        "{}/connect/astra?port={port}&state={expected_state}&cli_version={}",
+        website_base.trim_end_matches('/'),
+        env!("CARGO_PKG_VERSION")
+    );
+    eprintln!("Open this page to connect Astra:\n{connect_url}");
+    open_login_url(&connect_url);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    let mut rejected = 0_u8;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("browser login timed out; run `astra login` to try again".to_string());
+        }
+        let (mut stream, _) = tokio::time::timeout(remaining, listener.accept())
+            .await
+            .map_err(|_| "browser login timed out; run `astra login` to try again".to_string())?
+            .map_err(|error| format!("local login callback failed: {error}"))?;
+        let request = read_callback_request(&mut stream).await;
+        let Ok(request) = request else {
+            write_callback_response(&mut stream, "400 Bad Request", None, "invalid request").await;
+            continue;
+        };
+        if request.method == "OPTIONS" {
+            let origin = (request.origin.as_deref() == Some(allowed_origin.as_str()))
+                .then_some(allowed_origin.as_str());
+            write_callback_response(&mut stream, "204 No Content", origin, "").await;
+            continue;
+        }
+        if request.method != "POST"
+            || request.path != "/callback"
+            || request.origin.as_deref() != Some(allowed_origin.as_str())
+            || request.content_type.as_deref() != Some("application/json")
+        {
+            rejected = rejected.saturating_add(1);
+            write_callback_response(&mut stream, "403 Forbidden", None, "callback rejected").await;
+            if rejected >= 3 {
+                return Err("too many invalid browser login callbacks".to_string());
+            }
+            continue;
+        }
+        let callback: MemoriaConnectionCallback = match serde_json::from_slice(&request.body) {
+            Ok(callback) => callback,
+            Err(_) => {
+                write_callback_response(
+                    &mut stream,
+                    "400 Bad Request",
+                    Some(&allowed_origin),
+                    "invalid callback",
+                )
+                .await;
+                continue;
+            }
+        };
+        if !constant_time_eq(callback.state.as_bytes(), expected_state.as_bytes())
+            || callback.memoria_connection_key.is_empty()
+            || callback.memoria_connection_key.len() > 4096
+        {
+            rejected = rejected.saturating_add(1);
+            write_callback_response(
+                &mut stream,
+                "403 Forbidden",
+                Some(&allowed_origin),
+                "callback rejected",
+            )
+            .await;
+            if rejected >= 3 {
+                return Err("too many invalid browser login callbacks".to_string());
+            }
+            continue;
+        }
+        match do_memoria_login_with_key(api, profile, &callback.memoria_connection_key).await {
+            Ok(token) => {
+                write_callback_response(
+                    &mut stream,
+                    "200 OK",
+                    Some(&allowed_origin),
+                    r#"{"status":"connected"}"#,
+                )
+                .await;
+                return Ok(token);
+            }
+            Err(error) => {
+                write_callback_response(
+                    &mut stream,
+                    "502 Bad Gateway",
+                    Some(&allowed_origin),
+                    "Astra could not verify the connection key.",
+                )
+                .await;
+                return Err(error);
+            }
+        }
+    }
+}
+
+struct CallbackRequest {
+    method: String,
+    path: String,
+    origin: Option<String>,
+    content_type: Option<String>,
+    body: Vec<u8>,
+}
+
+async fn read_callback_request(
+    stream: &mut tokio::net::TcpStream,
+) -> Result<CallbackRequest, String> {
+    let mut data = Vec::with_capacity(2048);
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk))
+            .await
+            .map_err(|_| "callback read timed out".to_string())?
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        data.extend_from_slice(&chunk[..read]);
+        if data.len() > 8192 {
+            return Err("callback request is too large".to_string());
+        }
+        if let Some(header_end) = data.windows(4).position(|window| window == b"\r\n\r\n") {
+            let header_end = header_end + 4;
+            let headers = std::str::from_utf8(&data[..header_end])
+                .map_err(|_| "callback headers are invalid".to_string())?;
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                })
+                .unwrap_or(0);
+            if content_length > 4096 {
+                return Err("callback body is too large".to_string());
+            }
+            if data.len() >= header_end + content_length {
+                break;
+            }
+        }
+    }
+    let header_end = data
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| "callback headers are incomplete".to_string())?
+        + 4;
+    let headers = std::str::from_utf8(&data[..header_end])
+        .map_err(|_| "callback headers are invalid".to_string())?;
+    let mut lines = headers.lines();
+    let mut request_line = lines
+        .next()
+        .ok_or_else(|| "callback request line is missing".to_string())?
+        .split_whitespace();
+    let method = request_line.next().unwrap_or_default().to_string();
+    let path = request_line.next().unwrap_or_default().to_string();
+    let origin = lines.find_map(|line| {
+        line.split_once(':').and_then(|(name, value)| {
+            name.eq_ignore_ascii_case("origin")
+                .then(|| value.trim().to_string())
+        })
+    });
+    let content_type = headers.lines().find_map(|line| {
+        line.split_once(':').and_then(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type").then(|| {
+                value
+                    .trim()
+                    .split(';')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase()
+            })
+        })
+    });
+    Ok(CallbackRequest {
+        method,
+        path,
+        origin,
+        content_type,
+        body: data[header_end..].to_vec(),
+    })
+}
+
+async fn write_callback_response(
+    stream: &mut tokio::net::TcpStream,
+    status: &str,
+    origin: Option<&str>,
+    body: &str,
+) {
+    let cors = origin
+        .map(|origin| {
+            format!(
+                "Access-Control-Allow-Origin: {origin}\r\nAccess-Control-Allow-Methods: POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nAccess-Control-Allow-Private-Network: true\r\nVary: Origin\r\n"
+            )
+        })
+        .unwrap_or_default();
+    let response = format!(
+        "HTTP/1.1 {status}\r\n{cors}Content-Type: application/json\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |diff, (left, right)| diff | (left ^ right))
+        == 0
+}
+
+fn open_login_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "linux")]
+    let result = std::process::Command::new("xdg-open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("cmd")
+        .args(["/C", "start", "", url])
+        .spawn();
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    let result: std::io::Result<std::process::Child> = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "browser launch is unsupported",
+    ));
+    if let Err(error) = result {
+        eprintln!("Could not open a browser automatically: {error}");
+    }
 }
 
 async fn request_login_tokens(
@@ -288,13 +588,44 @@ pub(crate) async fn do_register_for_session(
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthTokenPayload, clear_profile_auth, do_login, do_login_for_session, is_auth_error,
-        is_llm_provider_auth_error, parse_auth_tokens, save_refreshed_profile_tokens,
+        AuthTokenPayload, clear_profile_auth, do_login, do_login_for_session,
+        do_memoria_login_with_key, is_auth_error, is_llm_provider_auth_error, parse_auth_tokens,
+        read_callback_request, save_refreshed_profile_tokens,
     };
     use crate::cli::cli_config::cli_utils::{Profile, load_credentials, save_credentials};
     use serde_json::json;
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn loopback_callback_parser_reads_origin_content_type_and_secret_body() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            let body = r#"{"state":"abc","memoria_connection_key":"secret"}"#;
+            let request = format!(
+                "POST /callback HTTP/1.1\r\nOrigin: https://thememoria.ai\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(request.as_bytes()).await.unwrap();
+        });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_callback_request(&mut stream).await.unwrap();
+        client.await.unwrap();
+
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/callback");
+        assert_eq!(request.origin.as_deref(), Some("https://thememoria.ai"));
+        assert_eq!(request.content_type.as_deref(), Some("application/json"));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
+            json!({"state": "abc", "memoria_connection_key": "secret"})
+        );
+    }
 
     #[test]
     fn auth_token_payload_requires_server_issued_user_identity() {
@@ -527,5 +858,46 @@ mod tests {
         assert_eq!(profile.username.as_deref(), Some("astra-user"));
         assert_eq!(profile.access_token.as_deref(), Some("internal-access"));
         assert_eq!(profile.refresh_token.as_deref(), Some("internal-refresh"));
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn memoria_login_sends_key_once_and_does_not_persist_it() {
+        let _creds_guard = crate::tests::isolate_credentials();
+        let mut creds = load_credentials();
+        creds.profiles.insert(
+            "default".to_string(),
+            Profile {
+                memoria_api_key: Some("legacy-key".to_string()),
+                ..Default::default()
+            },
+        );
+        save_credentials(&creds).unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/auth/memoria"))
+            .and(body_json(json!({"connection_key": "scoped-key"})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "user_id": "memoria-user-id",
+                "access_token": "astra-access",
+                "refresh_token": "astra-refresh",
+                "memory_access": "read_only",
+                "granted_scopes": ["identity:read", "memory:read"]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        let token = do_memoria_login_with_key(&api, None, "scoped-key")
+            .await
+            .unwrap();
+
+        assert_eq!(token, "astra-access");
+        let creds = load_credentials();
+        let profile = &creds.profiles["default"];
+        assert_eq!(profile.account_id.as_deref(), Some("memoria-user-id"));
+        assert_eq!(profile.username.as_deref(), Some("memoria"));
+        assert_eq!(profile.memoria_api_key, None);
     }
 }

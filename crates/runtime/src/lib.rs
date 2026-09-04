@@ -161,7 +161,7 @@ pub use astra_services::{
         FernetTokenEncryptor, ReauthenticationProofRecord, ReauthenticationPurpose,
         ReauthenticationRequestData, SessionActivityRecord, SessionCreateRequestData,
         SessionListFilter, SessionListRecord, SessionRecord, SessionService,
-        SessionUpdateRequestData,
+        SessionUpdateRequestData, VerifiedIdentityLoginRequestData,
     },
     branches::{BranchService, DatabaseBranchService, UnconfiguredBranchService},
     context::{

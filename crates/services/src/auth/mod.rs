@@ -409,6 +409,18 @@ pub trait AuthService: Send + Sync {
         request: AuthLoginRequestData,
     ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)>;
 
+    /// Issue an Astra session for an identity already verified by a trusted
+    /// first-party integration boundary (for example, a scoped Memoria key).
+    async fn login_verified_identity(
+        &self,
+        _request: VerifiedIdentityLoginRequestData,
+    ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+        Err(error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "Verified identity login is not configured",
+        ))
+    }
+
     async fn refresh(
         &self,
         request: AuthRefreshRequestData,
@@ -560,6 +572,12 @@ pub struct AuthRegisterRequestData {
 pub struct AuthLoginRequestData {
     pub username: String,
     pub password: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedIdentityLoginRequestData {
+    pub user_id: String,
+    pub provider: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1735,6 +1753,132 @@ impl AuthService for DatabaseAuthService {
         tx.commit()
             .await
             .map_err(|e| map_auth_sqlx(e, "login.commit_tx", Some(&pool)))?;
+
+        Ok(AuthTokenRecord {
+            user_id: user.user_id,
+            access_token,
+            refresh_token,
+            token_type: "bearer".to_string(),
+            expires_in: self.access_token_expires_in_seconds(),
+        })
+    }
+
+    async fn login_verified_identity(
+        &self,
+        request: VerifiedIdentityLoginRequestData,
+    ) -> Result<AuthTokenRecord, (StatusCode, Json<ErrorResponse>)> {
+        let user_id = request.user_id.trim();
+        if user_id.is_empty() || user_id.len() > 128 || request.provider != "memoria" {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "Invalid verified identity",
+            ));
+        }
+        let pool = self
+            .get_pool()
+            .await
+            .map_err(|e| map_auth_sqlx(e, "verified_identity.get_pool", None))?;
+        self.ensure_default_roles(&pool)
+            .await
+            .map_err(|e| map_auth_sqlx(e, "verified_identity.ensure_default_roles", Some(&pool)))?;
+
+        let digest = sha256_hex(user_id);
+        let astra_user_id = format!("memoria_{digest}");
+        let username = format!("memoria_{}", &digest[..24]);
+        let email = format!("memoria_{digest}@external.astra.invalid");
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| map_auth_sqlx(e, "verified_identity.begin_tx", Some(&pool)))?;
+        let mapped_user_id = query(
+            "SELECT astra_user_id FROM auth_memoria_identities \
+             WHERE memoria_user_id = ? LIMIT 1",
+        )
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| map_auth_sqlx(e, "verified_identity.fetch_mapping", Some(&pool)))?
+        .and_then(|row| row.try_get::<String, _>("astra_user_id").ok());
+        let existing = if let Some(mapped_user_id) = mapped_user_id.as_deref() {
+            self.fetch_user_by_id_or_username(&mut *tx, mapped_user_id, None)
+                .await
+                .map_err(|e| map_auth_sqlx(e, "verified_identity.fetch_user", Some(&pool)))?
+        } else {
+            None
+        };
+        let user = if let Some(user) = existing {
+            if !user.is_active {
+                tx.rollback().await.ok();
+                return Err(error_response(StatusCode::FORBIDDEN, "User is inactive"));
+            }
+            user
+        } else {
+            query(
+                "INSERT INTO auth_users \
+                 (user_id, username, email, password_hash, display_name, is_active) \
+                 VALUES (?, ?, ?, '', 'Memoria user', 1)",
+            )
+            .bind(&astra_user_id)
+            .bind(&username)
+            .bind(&email)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| map_auth_sqlx(e, "verified_identity.insert_user", Some(&pool)))?;
+            query(
+                "INSERT INTO auth_memoria_identities (memoria_user_id, astra_user_id) \
+                 VALUES (?, ?)",
+            )
+            .bind(user_id)
+            .bind(&astra_user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| map_auth_sqlx(e, "verified_identity.insert_mapping", Some(&pool)))?;
+            query(
+                "INSERT IGNORE INTO auth_user_roles (user_id, role_id) \
+                 SELECT ?, role_id FROM auth_roles WHERE role_name = 'astra_user'",
+            )
+            .bind(&astra_user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| map_auth_sqlx(e, "verified_identity.assign_role", Some(&pool)))?;
+            DatabaseUserRecord {
+                user_id: astra_user_id,
+                username: username.clone(),
+                email,
+                password_hash: String::new(),
+                display_name: Some("Memoria user".to_string()),
+                is_active: true,
+            }
+        };
+
+        let session_id = Uuid::new_v4().to_string();
+        let access_token = self
+            .create_access_token(&user.user_id, &user.username, &session_id, "internal")
+            .map_err(internal_error)?;
+        let refresh_token = self
+            .create_refresh_token(&user.user_id, &session_id, "internal")
+            .map_err(internal_error)?;
+        query("UPDATE auth_users SET last_login_at = NOW() WHERE user_id = ?")
+            .bind(&user.user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| map_auth_sqlx(e, "verified_identity.update_login", Some(&pool)))?;
+        query(
+            "INSERT INTO auth_refresh_tokens \
+             (token_id, user_id, session_id, token_hash, expires_at, is_revoked) \
+             VALUES (?, ?, ?, ?, ?, 0)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&user.user_id)
+        .bind(&session_id)
+        .bind(sha256_hex(&refresh_token))
+        .bind(self.refresh_token_expires_at_string(Utc::now()))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| map_auth_sqlx(e, "verified_identity.insert_refresh", Some(&pool)))?;
+        tx.commit()
+            .await
+            .map_err(|e| map_auth_sqlx(e, "verified_identity.commit", Some(&pool)))?;
 
         Ok(AuthTokenRecord {
             user_id: user.user_id,

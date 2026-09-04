@@ -154,6 +154,7 @@ pub use auth::{
     HttpExternalProviderClient, ProviderRequestDescriptor, ReauthenticationProofRecord,
     ReauthenticationPurpose, ReauthenticationRequestData, SessionCreateRequestData,
     SessionListFilter, SessionListRecord, SessionRecord, SessionService, SessionUpdateRequestData,
+    VerifiedIdentityLoginRequestData,
 };
 pub use branches::{BranchService, DatabaseBranchService, UnconfiguredBranchService};
 pub use context::{

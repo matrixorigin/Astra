@@ -330,7 +330,9 @@ pub(crate) struct RegisterArgs {
 }
 
 #[derive(Args, Debug)]
-#[command(after_help = "Examples:\n  astra login --username alice --password secret")]
+#[command(
+    after_help = "Examples:\n  astra login\n  astra login --manual\n  astra login --username alice --password secret"
+)]
 pub(crate) struct LoginArgs {
     /// Username to log in with
     #[arg(long)]
@@ -338,6 +340,9 @@ pub(crate) struct LoginArgs {
     /// Password to log in with
     #[arg(long)]
     pub password: Option<String>,
+    /// Enter a Memoria connection key instead of opening the browser
+    #[arg(long)]
+    pub manual: bool,
 }
 
 #[derive(Args, Debug)]

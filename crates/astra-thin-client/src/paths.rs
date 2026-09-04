@@ -301,6 +301,7 @@ pub fn chat_run_delegations_resume(run_id: &str) -> String {
 
 pub const AUTH_REGISTER: &str = "/auth/register";
 pub const AUTH_LOGIN: &str = "/auth/login";
+pub const AUTH_MEMORIA: &str = "/auth/memoria";
 pub const AUTH_REFRESH: &str = "/auth/refresh";
 pub const AUTH_LOGOUT: &str = "/auth/logout";
 pub const AUTH_REAUTHENTICATE: &str = "/auth/reauthenticate";
