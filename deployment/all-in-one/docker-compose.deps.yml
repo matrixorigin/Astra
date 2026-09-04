@@ -81,9 +81,15 @@ services:
     networks:
       - mo-net
     healthcheck:
-      # The current Memoria image does not ship curl/wget; keep this process
-      # check until the image can self-probe http://localhost:8100/health.
-      test: ["CMD-SHELL", "grep -aq 'memoria' /proc/1/cmdline"]
+      # The Memoria image has Bash but no curl/wget. Probe the real HTTP
+      # boundary so dependents start only after the listener is ready.
+      test:
+        [
+          "CMD",
+          "bash",
+          "-c",
+          "exec 3<>/dev/tcp/127.0.0.1/8100 && printf 'GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 && head -n 1 <&3 | grep -qE '^HTTP/1\\.[01] 200 '",
+        ]
       interval: 15s
       timeout: 5s
       retries: 6

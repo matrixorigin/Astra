@@ -289,14 +289,28 @@ def main() -> None:
                 f"must be immutable ({dependency_image})"
             )
 
-    stack_compose = Path("deployment/all-in-one/docker-compose.yml").read_text(
-        encoding="utf-8"
-    )
+    stack_compose_path = Path("deployment/all-in-one/docker-compose.yml")
+    stack_compose = stack_compose_path.read_text(encoding="utf-8")
     for image_variable in ("ASTRA_IMAGE", "MEMORIA_IMAGE", "MATRIXONE_IMAGE"):
         if f"${{{image_variable}:-" in stack_compose:
             errors.append(
                 "deployment/all-in-one/docker-compose.yml: released stack must require "
                 f"the compatibility pin for {image_variable} instead of silently falling back"
+            )
+
+    for compose_path in (
+        stack_compose_path,
+        Path("deployment/all-in-one/docker-compose.deps.yml"),
+    ):
+        compose = compose_path.read_text(encoding="utf-8")
+        if (
+            "/dev/tcp/127.0.0.1/8100" not in compose
+            or "GET /health HTTP/1.1" not in compose
+            or "/proc/1/cmdline" in compose
+        ):
+            errors.append(
+                f"{compose_path}: Memoria healthcheck must probe its HTTP readiness "
+                "boundary instead of only checking that the process exists"
             )
 
     makefile = Path("Makefile").read_text(encoding="utf-8")
