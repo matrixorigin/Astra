@@ -96,15 +96,6 @@ impl LedgerEntryMeta {
             .unwrap_or(std::time::Duration::MAX)
             .as_millis() as u64;
     }
-
-    #[allow(dead_code)]
-    fn age_ms(&self) -> u64 {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or(std::time::Duration::MAX)
-            .as_millis() as u64;
-        now_ms.saturating_sub(self.created_at_ms)
-    }
 }
 
 /// Parallel side-channel of expected-or-present entry metadata for retry and

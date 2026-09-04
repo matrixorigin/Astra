@@ -85,8 +85,7 @@
 //! | [`assemble_ephemeral_pipeline_outcome`] | Ephemeral proxy, agentic loop | Full assembly: prompt + tool schemas + cache strategy |
 //! | [`assemble_system_message_via_pipeline`] | Ephemeral proxy | Build Anthropic multi-block or OpenAI split message |
 //! | [`annotate_tool_schemas_for_caching_with_always_load`] | Request build | Add `cache_control` to tool definitions |
-//! | [`add_message_cache_breakpoint`] | Request build | Insert breakpoint into final message array |
-//! | [`apply_anthropic_cache_metadata`] | Anthropic adapter | Emit Anthropic-specific cache metadata response fields |
+//! | [`apply_anthropic_cache_metadata`] | Anthropic adapter | Insert the final conversation cache breakpoint |
 //!
 //! ## Testing
 //!
@@ -843,20 +842,6 @@ pub(crate) fn resolve_always_load_tool_names_for_config(
         .collect()
 }
 
-/// Add a cache breakpoint on the last conversation message for Anthropic.
-/// This enables turn-to-turn KV cache reuse for the conversation prefix.
-///
-/// Runtime adapter: gates on `cache_cfg.should_annotate` then delegates to
-/// the pure pipeline primitive. Only used by tests now that
-/// `apply_anthropic_cache_metadata` calls the pipeline primitive directly.
-#[cfg(test)]
-pub(crate) fn add_message_cache_breakpoint(messages: &mut [Value], cache_cfg: &PromptCacheConfig) {
-    if !cache_cfg.should_annotate() {
-        return;
-    }
-    astra_turn_core::context_serializer::annotate_last_message_cache_breakpoint(messages);
-}
-
 /// Add Anthropic protocol-level cache metadata for cached prompts.
 ///
 /// Places exactly one `cache_control` breakpoint on the last conversation
@@ -889,6 +874,20 @@ pub(crate) fn apply_anthropic_cache_metadata(
 pub(crate) static CACHE_ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
+fn default_test_always_load_tool_names() -> std::collections::HashSet<String> {
+    resolve_always_load_tool_names_for_config(&ToolSurfaceConfig::default())
+}
+
+#[cfg(test)]
+fn annotate_test_tool_schemas_for_caching(tools: &mut [Value], cache_cfg: &PromptCacheConfig) {
+    annotate_tool_schemas_for_caching_with_always_load(
+        tools,
+        cache_cfg,
+        &default_test_always_load_tool_names(),
+    );
+}
+
+#[cfg(test)]
 mod tests {
     use super::CACHE_ENV_MUTEX;
     use super::*;
@@ -903,18 +902,6 @@ mod tests {
     /// Safe wrapper for `std::env::remove_var` in single-threaded tests.
     fn remove_test_env(key: &str) {
         unsafe { std::env::remove_var(key) }
-    }
-
-    fn default_test_always_load_tool_names() -> std::collections::HashSet<String> {
-        resolve_always_load_tool_names_for_config(&ToolSurfaceConfig::default())
-    }
-
-    fn annotate_test_tool_schemas_for_caching(tools: &mut [Value], cache_cfg: &PromptCacheConfig) {
-        annotate_tool_schemas_for_caching_with_always_load(
-            tools,
-            cache_cfg,
-            &default_test_always_load_tool_names(),
-        );
     }
 
     fn bedrock_cache_capability() -> astra_turn_core::cache_placement::CacheCapability {
@@ -2224,59 +2211,6 @@ mod tests {
     }
 
     #[test]
-    fn message_breakpoint_skips_system_only() {
-        let cfg = PromptCacheConfig {
-            cache_enabled: true,
-            is_anthropic: true,
-        };
-        let mut messages = vec![json!({"role": "system", "content": "system prompt"})];
-        let original = messages.clone();
-        add_message_cache_breakpoint(&mut messages, &cfg);
-        assert_eq!(
-            messages, original,
-            "system-only messages should not be modified"
-        );
-    }
-
-    #[test]
-    fn message_breakpoint_empty_messages_noop() {
-        let cfg = PromptCacheConfig {
-            cache_enabled: true,
-            is_anthropic: true,
-        };
-        let mut messages: Vec<Value> = vec![];
-        add_message_cache_breakpoint(&mut messages, &cfg);
-        assert!(messages.is_empty());
-    }
-
-    #[test]
-    fn message_breakpoint_array_content_appends_to_last_block() {
-        let cfg = PromptCacheConfig {
-            cache_enabled: true,
-            is_anthropic: true,
-        };
-        let mut messages = vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": [{"type": "text", "text": "hi"}]}),
-        ];
-        add_message_cache_breakpoint(&mut messages, &cfg);
-        let content = messages[1].get("content").unwrap().as_array().unwrap();
-        assert!(content[0].get("cache_control").is_some());
-    }
-
-    #[test]
-    fn add_message_cache_breakpoint_noop_for_openai() {
-        let cfg = PromptCacheConfig {
-            cache_enabled: true,
-            is_anthropic: false,
-        };
-        let mut messages = vec![json!({"role": "user", "content": "hello"})];
-        let original = messages.clone();
-        add_message_cache_breakpoint(&mut messages, &cfg);
-        assert_eq!(messages, original, "OpenAI should not be annotated");
-    }
-
-    #[test]
     fn declared_capability_enables_anthropic_style_cache_for_bedrock() {
         let _lock = astra_core::sync_poison::recover_mutex_lock(&CACHE_ENV_MUTEX);
         remove_test_env("ASTRA_TEST_PROMPT_CACHE_DISABLED");
@@ -2550,18 +2484,6 @@ mod cache_stability_regression {
             cache_enabled: true,
             is_anthropic: true,
         }
-    }
-
-    fn default_test_always_load_tool_names() -> std::collections::HashSet<String> {
-        resolve_always_load_tool_names_for_config(&ToolSurfaceConfig::default())
-    }
-
-    fn annotate_test_tool_schemas_for_caching(tools: &mut [Value], cache_cfg: &PromptCacheConfig) {
-        annotate_tool_schemas_for_caching_with_always_load(
-            tools,
-            cache_cfg,
-            &default_test_always_load_tool_names(),
-        );
     }
 
     /// Core invariant: adding, removing, or reordering tools AFTER the always_load

@@ -271,38 +271,6 @@ impl TurnMetrics {
         }
     }
 
-    /// Build metrics from raw tool-call records (legacy tuple API).
-    ///
-    /// Each record is `(tool_name, ok, round, file_path)`. Surgically-removed
-    /// placeholders should already be filtered out before calling this.
-    #[deprecated(note = "Use from_samples with ToolCallSample for richer error tracking")]
-    pub fn from_tool_records(
-        records: &[(&str, bool, Option<u32>, Option<&str>)],
-        rounds_completed: u32,
-        tokens_consumed: u64,
-    ) -> Self {
-        // Sliding window: only count records from the last DEFAULT_WINDOW rounds.
-        // Records without a round marker are always included (conservative).
-        // e.g., rounds_completed=6, window=3 → rounds 4,5,6
-        const DEFAULT_WINDOW: u32 = 3;
-        let window_start = rounds_completed.saturating_sub(DEFAULT_WINDOW.saturating_sub(1));
-        let filtered: Vec<&(_, _, _, _)> = records
-            .iter()
-            .filter(|r| r.2.is_none_or(|round| round >= window_start))
-            .collect();
-        let samples: Vec<ToolCallSample<'_>> = filtered
-            .iter()
-            .map(|&&(name, ok, round, file_path)| ToolCallSample {
-                name,
-                ok,
-                round,
-                file_path,
-                error: None,
-            })
-            .collect();
-        Self::from_samples(&samples, rounds_completed, tokens_consumed)
-    }
-
     /// Compute derived metrics that are ratios or aggregates.
     pub fn read_write_ratio(&self) -> Option<f64> {
         let reads = self

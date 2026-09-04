@@ -2009,7 +2009,7 @@ pub struct CapturedLlmRequest {
     pub system_dynamic: Option<Value>,
     /// Tool schemas after pruning + `annotate_tool_schemas_for_caching`.
     pub tools: Vec<Value>,
-    /// Conversation messages after `add_message_cache_breakpoint` was applied
+    /// Conversation messages after provider-specific cache metadata was applied
     /// (for Anthropic) or a clone of `state.messages` (otherwise).
     pub messages: Vec<Value>,
     /// Exact message array after provider-specific system consolidation and

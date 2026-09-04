@@ -365,13 +365,6 @@ const DEFERRED_TOOLS_BUDGET_NUM: u64 = 1;
 const DEFERRED_TOOLS_BUDGET_DEN: u64 = 12;
 const DEFERRED_TOOLS_DEFAULT_CHAR_BUDGET: usize = 16_000;
 
-#[allow(dead_code)]
-pub fn build_deferred_tools_section(
-    surface: &crate::tool_registry::surface::ToolSurface,
-) -> Option<PromptSection> {
-    build_deferred_tools_section_with_budget(surface, None)
-}
-
 #[derive(Debug, Clone)]
 pub struct DeferredToolsPromptBlock {
     pub section: PromptSection,

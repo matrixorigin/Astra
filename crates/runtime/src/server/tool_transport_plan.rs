@@ -19,8 +19,6 @@ pub(crate) enum EdgeTransportAttempt {
 
 #[derive(Debug, Clone)]
 pub(crate) struct EdgeBoundExecutionPlan {
-    #[allow(dead_code)]
-    user_id: String,
     selected_executor_id: Option<String>,
     dispatch_request_id: String,
     identity: astra_turn_types::ToolInvocationIdentity,
@@ -63,7 +61,6 @@ impl EdgeBoundExecutionPlan {
             &request.tool_call_id,
         )?;
         Ok(Self {
-            user_id: request.user_id.clone(),
             selected_executor_id: edge_executor_id(request).map(ToString::to_string),
             dispatch_request_id: identity.storage_key(),
             identity,
@@ -80,11 +77,6 @@ impl EdgeBoundExecutionPlan {
             runtime_edge_dispatch_authorization_required: request
                 .runtime_edge_dispatch_authorization_required,
         })
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn user_id(&self) -> &str {
-        &self.user_id
     }
 
     pub(crate) fn selected_executor_id(&self) -> Option<&str> {
