@@ -517,9 +517,11 @@ async fn large_canonical_payload_does_not_change_provider_terminal_identity() {
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0].transitions.len(), 1);
     let mut recovered = Vec::new();
-    receipts[0].transitions[0]
-        .apply_to(&mut recovered)
-        .expect("materialize the large canonical transition");
+    astra_turn_types::ProviderCanonicalTransitionV2::apply_chain_to(
+        &receipts[0].transitions,
+        &mut recovered,
+    )
+    .expect("materialize the large canonical transition");
     assert_eq!(recovered, history);
     let mut corrupted_payload = stored_payload;
     corrupted_payload.push(b' ');
@@ -858,11 +860,11 @@ async fn canonical_transition_wal_is_linear_and_recoverable_across_many_rounds()
         parent_transition_id.expect("final transition id")
     );
     let mut recovered = Vec::new();
-    for transition in &receipts[0].transitions {
-        transition
-            .apply_to(&mut recovered)
-            .expect("materialize the linked WAL chain");
-    }
+    astra_turn_types::ProviderCanonicalTransitionV2::apply_chain_to(
+        &receipts[0].transitions,
+        &mut recovered,
+    )
+    .expect("materialize the linked WAL chain");
     assert_eq!(recovered, history);
 
     retire_inference_canonical_transitions_through_turn(&shared_pool, &user_id, &session_id, 1)
@@ -956,11 +958,11 @@ async fn canonical_transition_wal_is_isolated_by_owner_and_session() {
         assert_eq!(receipts.len(), 1);
         assert_eq!(receipts[0].transitions.len(), 2);
         let mut recovered = Vec::new();
-        for transition in &receipts[0].transitions {
-            transition
-                .apply_to(&mut recovered)
-                .expect("replay isolated owner/session chain");
-        }
+        astra_turn_types::ProviderCanonicalTransitionV2::apply_chain_to(
+            &receipts[0].transitions,
+            &mut recovered,
+        )
+        .expect("replay isolated owner/session chain");
         assert_eq!(recovered[0]["content"], scope);
     }
 
@@ -1000,6 +1002,143 @@ async fn canonical_transition_wal_is_isolated_by_owner_and_session() {
     cleanup(pool, &user_a, &shared_session, &run_a).await;
     cleanup(pool, &user_b, &shared_session, &run_b).await;
     cleanup(pool, &user_a, &session_a2, &run_a2).await;
+}
+
+#[tokio::test]
+#[ignore = "requires live DB: run with ASTRA_TEST_DB_IT=1"]
+#[serial]
+async fn competing_canonical_roots_commit_exactly_one_branch_without_orphans() {
+    let (shared_pool, _) = common::setup_pool_and_settings().await;
+    let pool = shared_pool.get();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let user_id = format!("canonical-root-race-user-{suffix}");
+    let session_id = format!("canonical-root-race-session-{suffix}");
+    let run_id = format!("canonical-root-race-run-{suffix}");
+    seed_run(pool, &user_id, &session_id, &run_id).await;
+
+    let durable_base = astra_turn_types::CanonicalPrefixIdentityV1::from_messages(&[])
+        .expect("empty durable base");
+    let left = astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
+        None,
+        durable_base.clone(),
+        &[serde_json::json!({"role": "user", "content": "left root"})],
+        vec![canonical_authority("left-root")],
+    )
+    .expect("construct left canonical root");
+    let right = astra_turn_types::ProviderCanonicalTransitionV2::new_from_durable_base(
+        None,
+        durable_base,
+        &[serde_json::json!({"role": "user", "content": "right root"})],
+        vec![canonical_authority("right-root")],
+    )
+    .expect("construct right canonical root");
+    let left_plan = plan_inference_invocation(run_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        0,
+        "root-race-left",
+    ))
+    .expect("plan left root invocation");
+    let right_plan = plan_inference_invocation(run_input(
+        &user_id,
+        &session_id,
+        &run_id,
+        1,
+        "root-race-right",
+    ))
+    .expect("plan right root invocation");
+    admit_inference_invocation(&shared_pool, &left_plan)
+        .await
+        .expect("admit left root invocation");
+    admit_inference_invocation(&shared_pool, &right_plan)
+        .await
+        .expect("admit right root invocation");
+    let left_attempt = provider_attempt(&left_plan, 0)
+        .with_canonical_transitions(std::slice::from_ref(&left))
+        .expect("bind left root");
+    let right_attempt = provider_attempt(&right_plan, 0)
+        .with_canonical_transitions(std::slice::from_ref(&right))
+        .expect("bind right root");
+
+    let (left_outcome, right_outcome) = tokio::join!(
+        begin_inference_provider_attempt(&shared_pool, &left_attempt),
+        begin_inference_provider_attempt(&shared_pool, &right_attempt),
+    );
+    let outcomes = [&left_outcome, &right_outcome];
+    assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| outcome
+                .as_ref()
+                .is_err_and(|error| error.kind == ServiceErrorKind::Conflict))
+            .count(),
+        1
+    );
+    let (winner, winning_attempt, rejected_attempt_id) = if left_outcome.is_ok() {
+        (&left, &left_attempt, right_attempt.attempt_id())
+    } else {
+        (&right, &right_attempt, left_attempt.attempt_id())
+    };
+    let head: String = sqlx::query_scalar(
+        "SELECT head_transition_id FROM inference_canonical_transition_heads
+         WHERE user_id = ? AND session_id = ? AND turn_index = 1",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(pool)
+    .await
+    .expect("load winning canonical root");
+    assert_eq!(head, winner.transition_id);
+    let wal_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_canonical_transition_wal
+         WHERE user_id = ? AND session_id = ? AND turn_index = 1",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .fetch_one(pool)
+    .await
+    .expect("count canonical root WAL rows");
+    assert_eq!(wal_rows, 1, "the losing root must roll back its WAL row");
+    let rejected_attempts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM inference_provider_attempts
+         WHERE user_id = ? AND attempt_id = ?",
+    )
+    .bind(&user_id)
+    .bind(rejected_attempt_id)
+    .fetch_one(pool)
+    .await
+    .expect("count rejected root provider attempts");
+    assert_eq!(
+        rejected_attempts, 0,
+        "the losing root must not authorize provider delivery"
+    );
+
+    let terminal = InferenceInvocationTerminal {
+        status: InferenceTerminalStatus::Cancelled,
+        usage: InferenceUsage::default(),
+        usage_status: InferenceUsageStatus::Unavailable,
+        provider_response_id: None,
+        error_kind: Some("canonical_root_race_resolved".to_string()),
+        error_message: Some("close both sides of the canonical root race".to_string()),
+    };
+    finish_inference_provider_attempt(&shared_pool, winning_attempt, &terminal)
+        .await
+        .expect("finish winning root provider attempt");
+    finish_inference_invocation(&shared_pool, &left_plan, &terminal)
+        .await
+        .expect("finish left root invocation");
+    finish_inference_invocation(&shared_pool, &right_plan, &terminal)
+        .await
+        .expect("finish right root invocation");
+    let receipts =
+        load_inference_canonical_transitions_for_session(&shared_pool, &user_id, &session_id, 1)
+            .await
+            .expect("load exactly the winning canonical root");
+    assert_eq!(receipts[0].transitions, vec![winner.clone()]);
+
+    cleanup(pool, &user_id, &session_id, &run_id).await;
 }
 
 #[tokio::test]
@@ -1479,6 +1618,23 @@ async fn canonical_transition_wal_fails_closed_and_replacement_is_an_atomic_chec
     let mut expected = replacement_history;
     expected.extend(replacement.appended_messages.iter().cloned());
     assert_eq!(restored, expected);
+
+    sqlx::query(
+        "DELETE FROM inference_canonical_transition_heads
+         WHERE user_id = ? AND session_id = ? AND turn_index = 1",
+    )
+    .bind(&user_id)
+    .bind(&session_id)
+    .execute(pool)
+    .await
+    .expect("inject a WAL chain without its authoritative head");
+    assert_eq!(
+        load_inference_canonical_transitions_for_session(&shared_pool, &user_id, &session_id, 1,)
+            .await
+            .expect_err("recoverable WAL rows without a head must fail closed")
+            .kind,
+        ServiceErrorKind::Conflict
+    );
 
     cleanup(pool, &user_id, &session_id, &run_id).await;
 }

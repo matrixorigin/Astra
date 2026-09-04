@@ -2095,34 +2095,26 @@ fn apply_provider_canonical_transition_receipts(
         .next()
         .map(|receipt| receipt.transitions)
         .expect("the turn receipt cardinality was checked above");
-    let mut candidate = messages.clone();
-    let mut replacement = None;
-    for transition in &transitions {
-        transition.validate().map_err(|error| {
-            astra_core::ClassifiedError::new(
-                astra_core::ErrorKind::ContractViolation,
-                format!("validate provider canonical WAL entry: {error}"),
-            )
-        })?;
-        transition.apply_to(&mut candidate).map_err(|error| {
+    let replacement = transitions
+        .first()
+        .filter(|transition| {
+            transition.recovery_mode
+                == astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase
+        })
+        .cloned();
+    astra_turn_types::ProviderCanonicalTransitionV2::apply_chain_to(&transitions, messages)
+        .map_err(|error| {
             astra_core::ClassifiedError::new(
                 astra_core::ErrorKind::ContractViolation,
                 format!("reconcile provider canonical transition WAL chain: {error}"),
             )
         })?;
-        if transition.recovery_mode
-            == astra_turn_types::ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase
-        {
-            replacement = Some(transition.clone());
-        }
-    }
     let head_transition_id = transitions
         .last()
         .map(|transition| transition.transition_id.clone());
     let head_result = transitions
         .last()
         .map(|transition| transition.result.clone());
-    *messages = candidate;
     Ok(ProviderCanonicalHydrationOutcome {
         reconciled_transitions: transitions.len(),
         head_transition_id,

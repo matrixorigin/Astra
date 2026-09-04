@@ -113,6 +113,14 @@ pub enum ProviderCanonicalTransitionError {
     InvalidRuntimeAuthority,
     #[error("provider canonical transition contains an invalid hash")]
     InvalidHash,
+    #[error("provider canonical transition WAL chain exceeds its entry bound")]
+    TooManyWalEntries,
+    #[error("provider canonical transition WAL chain exceeds its byte bound")]
+    TooManyWalBytes,
+    #[error("provider canonical transition WAL chain is discontinuous")]
+    DiscontinuousChain,
+    #[error("provider canonical replacement must anchor the WAL chain")]
+    ReplacementNotChainAnchor,
     #[error("provider canonical transition identity does not match its content")]
     IdentityMismatch,
     #[error("provider canonical transition result count does not extend its predecessor")]
@@ -400,47 +408,110 @@ impl ProviderCanonicalTransitionV2 {
         &self,
         messages: &mut Vec<Value>,
     ) -> Result<ProviderCanonicalTransitionApply, ProviderCanonicalTransitionError> {
-        self.validate()?;
-        let predecessor_count = usize::try_from(self.predecessor.message_count)
-            .map_err(|_| ProviderCanonicalTransitionError::MessageCountOverflow)?;
-        let result_count = usize::try_from(self.result.message_count)
-            .map_err(|_| ProviderCanonicalTransitionError::MessageCountOverflow)?;
+        Self::apply_chain_to(std::slice::from_ref(self), messages)
+    }
 
-        if messages.len() == result_count
-            && canonical_conversation_identity(messages).0 == self.result.root_hash
-        {
+    /// Atomically apply an ordered WAL chain with work proportional to the
+    /// materialized history and transition payloads. Intermediate prefix
+    /// identities are causally bound by transition ids and parent-result
+    /// links; the fully reconstructed canonical root is hashed exactly once.
+    pub fn apply_chain_to(
+        transitions: &[Self],
+        messages: &mut Vec<Value>,
+    ) -> Result<ProviderCanonicalTransitionApply, ProviderCanonicalTransitionError> {
+        if transitions.is_empty() {
             return Ok(ProviderCanonicalTransitionApply::AlreadyApplied);
         }
-        let mut candidate = messages.clone();
-        let predecessor_is_present = candidate.len() == predecessor_count
-            && canonical_conversation_identity(&candidate).0 == self.predecessor.root_hash;
-        if !predecessor_is_present {
-            if self.recovery_mode == ProviderCanonicalRecoveryModeV2::AppendFromDurableBase
-                && self.parent_transition_id.is_some()
+        if transitions.len() > MAX_PROVIDER_CANONICAL_WAL_ENTRIES as usize {
+            return Err(ProviderCanonicalTransitionError::TooManyWalEntries);
+        }
+
+        let mut durable_bytes = 0_u64;
+        for (index, transition) in transitions.iter().enumerate() {
+            transition.validate()?;
+            let entry_bytes = crate::json_serialized_len(std::slice::from_ref(transition))
+                .map_err(|_| ProviderCanonicalTransitionError::TooManyWalBytes)?;
+            durable_bytes = durable_bytes
+                .checked_add(entry_bytes)
+                .ok_or(ProviderCanonicalTransitionError::TooManyWalBytes)?;
+            if durable_bytes > MAX_PROVIDER_CANONICAL_WAL_BYTES {
+                return Err(ProviderCanonicalTransitionError::TooManyWalBytes);
+            }
+            if index == 0 {
+                continue;
+            }
+            let parent = &transitions[index - 1];
+            if transition.recovery_mode == ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase {
+                return Err(ProviderCanonicalTransitionError::ReplacementNotChainAnchor);
+            }
+            if transition.parent_transition_id.as_deref() != Some(parent.transition_id.as_str())
+                || transition.parent_result.as_ref() != Some(&parent.result)
+                || transition.durable_base != parent.durable_base
             {
-                let parent_result = self
-                    .parent_result
-                    .as_ref()
-                    .ok_or(ProviderCanonicalTransitionError::MissingLinkedPredecessor)?;
-                if CanonicalPrefixIdentityV1::from_messages(&candidate)? != *parent_result {
-                    return Err(ProviderCanonicalTransitionError::MissingLinkedPredecessor);
-                }
-                candidate.extend(self.recovery_messages.iter().cloned());
-                if CanonicalPrefixIdentityV1::from_messages(&candidate)? != self.predecessor {
-                    return Err(ProviderCanonicalTransitionError::RecoveryRootMismatch);
-                }
-            } else {
-                candidate = self.reconstruct_predecessor_from_durable_base(&candidate)?;
+                return Err(ProviderCanonicalTransitionError::DiscontinuousChain);
             }
         }
-        candidate.splice(
-            predecessor_count..predecessor_count,
-            self.appended_messages.iter().cloned(),
-        );
-        if canonical_conversation_identity(&candidate[..result_count]).0 != self.result.root_hash {
+
+        let first = &transitions[0];
+        let current = CanonicalPrefixIdentityV1::from_messages(messages)?;
+        let final_result = &transitions
+            .last()
+            .expect("non-empty canonical transition chain")
+            .result;
+        if current == *final_result {
+            return Ok(ProviderCanonicalTransitionApply::AlreadyApplied);
+        }
+
+        let mut candidate = messages.clone();
+        if current != first.predecessor {
+            match first.recovery_mode {
+                ProviderCanonicalRecoveryModeV2::AppendFromDurableBase => {
+                    let expected_base = match (
+                        first.parent_transition_id.as_ref(),
+                        first.parent_result.as_ref(),
+                    ) {
+                        (Some(_), Some(parent_result)) => parent_result,
+                        (None, None) => &first.durable_base,
+                        _ => {
+                            return Err(ProviderCanonicalTransitionError::RecoveryCountMismatch);
+                        }
+                    };
+                    if current != *expected_base {
+                        return Err(if first.parent_transition_id.is_some() {
+                            ProviderCanonicalTransitionError::MissingLinkedPredecessor
+                        } else {
+                            ProviderCanonicalTransitionError::PrefixConflict
+                        });
+                    }
+                    candidate.extend(first.recovery_messages.iter().cloned());
+                }
+                ProviderCanonicalRecoveryModeV2::ReplaceFromDurableBase => {
+                    if current != first.durable_base {
+                        return Err(ProviderCanonicalTransitionError::PrefixConflict);
+                    }
+                    candidate.clear();
+                    candidate.extend(first.recovery_messages.iter().cloned());
+                }
+            }
+        }
+
+        for (index, transition) in transitions.iter().enumerate() {
+            if index != 0 {
+                candidate.extend(transition.recovery_messages.iter().cloned());
+            }
+            if u32::try_from(candidate.len()).ok() != Some(transition.predecessor.message_count) {
+                return Err(ProviderCanonicalTransitionError::RecoveryCountMismatch);
+            }
+            candidate.extend(transition.appended_messages.iter().cloned());
+            if u32::try_from(candidate.len()).ok() != Some(transition.result.message_count) {
+                return Err(ProviderCanonicalTransitionError::ResultCountMismatch);
+            }
+        }
+
+        if CanonicalPrefixIdentityV1::from_messages(&candidate)? != *final_result {
             return Err(ProviderCanonicalTransitionError::ResultRootMismatch);
         }
-        crate::validate_canonical_tool_pairing(&candidate[..result_count])
+        crate::validate_canonical_tool_pairing(&candidate)
             .map_err(|_| ProviderCanonicalTransitionError::InvalidCanonicalRecovery)?;
         *messages = candidate;
         Ok(ProviderCanonicalTransitionApply::Applied)
@@ -810,7 +881,7 @@ mod tests {
 
         assert_eq!(
             second.apply_to(&mut parent_result_messages),
-            Err(ProviderCanonicalTransitionError::RecoveryRootMismatch)
+            Err(ProviderCanonicalTransitionError::ResultRootMismatch)
         );
         assert_eq!(parent_result_messages, before);
     }
@@ -823,6 +894,7 @@ mod tests {
         let mut history = durable.clone();
         let mut parent = None;
         let mut encoded_lengths = Vec::with_capacity(ENTRIES);
+        let mut transitions = Vec::with_capacity(ENTRIES);
 
         for _ in 0..ENTRIES {
             let transition = ProviderCanonicalTransitionV2::new_from_durable_base(
@@ -834,13 +906,85 @@ mod tests {
             .unwrap();
             encoded_lengths.push(serde_json::to_vec(&[&transition]).unwrap().len());
             history.extend(transition.appended_messages.iter().cloned());
-            parent = Some(transition.transition_id);
+            parent = Some(transition.transition_id.clone());
+            transitions.push(transition);
         }
 
         let minimum = encoded_lengths.iter().skip(1).copied().min().unwrap();
         let maximum = encoded_lengths.iter().skip(1).copied().max().unwrap();
         assert!(maximum <= minimum + 128);
         assert!(encoded_lengths.iter().sum::<usize>() <= ENTRIES * 2_048);
+
+        let mut restored = durable;
+        assert_eq!(
+            ProviderCanonicalTransitionV2::apply_chain_to(&transitions, &mut restored).unwrap(),
+            ProviderCanonicalTransitionApply::Applied
+        );
+        assert_eq!(restored, history);
+        assert_eq!(
+            ProviderCanonicalTransitionV2::apply_chain_to(&transitions, &mut restored).unwrap(),
+            ProviderCanonicalTransitionApply::AlreadyApplied
+        );
+    }
+
+    #[test]
+    fn chain_replay_rejects_discontinuity_without_mutating_history() {
+        let durable = vec![json!({"role": "user", "content": "goal"})];
+        let first =
+            ProviderCanonicalTransitionV2::new(None, &durable, vec![authority("first")]).unwrap();
+        let unrelated =
+            ProviderCanonicalTransitionV2::new(None, &durable, vec![authority("unrelated")])
+                .unwrap();
+        let mut restored = durable.clone();
+
+        assert_eq!(
+            ProviderCanonicalTransitionV2::apply_chain_to(&[first, unrelated], &mut restored,),
+            Err(ProviderCanonicalTransitionError::DiscontinuousChain)
+        );
+        assert_eq!(restored, durable);
+    }
+
+    #[test]
+    fn chain_replay_enforces_its_own_entry_budget_before_materialization() {
+        let durable = vec![json!({"role": "user", "content": "goal"})];
+        let transition =
+            ProviderCanonicalTransitionV2::new(None, &durable, vec![authority("work")]).unwrap();
+        let oversized = vec![transition; MAX_PROVIDER_CANONICAL_WAL_ENTRIES as usize + 1];
+        let mut restored = durable.clone();
+
+        assert_eq!(
+            ProviderCanonicalTransitionV2::apply_chain_to(&oversized, &mut restored),
+            Err(ProviderCanonicalTransitionError::TooManyWalEntries)
+        );
+        assert_eq!(restored, durable);
+    }
+
+    #[test]
+    fn chain_replay_rejects_a_non_anchor_replacement_atomically() {
+        let durable = vec![json!({"role": "user", "content": "goal"})];
+        let durable_base = CanonicalPrefixIdentityV1::from_messages(&durable).unwrap();
+        let first = ProviderCanonicalTransitionV2::new_from_durable_base(
+            None,
+            durable_base.clone(),
+            &durable,
+            vec![authority("first")],
+        )
+        .unwrap();
+        let replacement = ProviderCanonicalTransitionV2::new_replacement_from_durable_base(
+            Some(first.transition_id.clone()),
+            durable_base,
+            1,
+            &[json!({"role": "user", "content": "checkpoint"})],
+            vec![authority("replacement")],
+        )
+        .unwrap();
+        let mut restored = durable.clone();
+
+        assert_eq!(
+            ProviderCanonicalTransitionV2::apply_chain_to(&[first, replacement], &mut restored,),
+            Err(ProviderCanonicalTransitionError::ReplacementNotChainAnchor)
+        );
+        assert_eq!(restored, durable);
     }
 
     #[test]

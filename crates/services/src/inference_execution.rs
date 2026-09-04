@@ -2577,11 +2577,17 @@ async fn advance_inference_canonical_transition_head(
     .execute(&mut *connection)
     .await
     .map_err(|error| {
-        ServiceError::with_source(
-            ServiceErrorKind::Persistence,
-            "create inference canonical transition head",
-            error,
-        )
+        if astra_core::is_duplicate_key_error(&error) {
+            ServiceError::conflict(
+                "canonical transition head was created concurrently by another provider attempt",
+            )
+        } else {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "create inference canonical transition head",
+                error,
+            )
+        }
     })?;
     if inserted.rows_affected() != 1 {
         return Err(ServiceError::conflict(
@@ -2627,11 +2633,17 @@ async fn insert_inference_canonical_transition_wal(
         .execute(&mut *connection)
         .await
         .map_err(|error| {
-            ServiceError::with_source(
-                ServiceErrorKind::Persistence,
-                "append inference canonical transition WAL",
-                error,
-            )
+            if astra_core::is_duplicate_key_error(&error) {
+                ServiceError::conflict(
+                    "canonical transition WAL identity was committed by another provider attempt",
+                )
+            } else {
+                ServiceError::with_source(
+                    ServiceErrorKind::Persistence,
+                    "append inference canonical transition WAL",
+                    error,
+                )
+            }
         })?;
     if inserted.rows_affected() != 1 {
         return Err(ServiceError::conflict(
@@ -3253,6 +3265,62 @@ pub async fn load_inference_canonical_transitions_for_session(
     }
     reconcile_provider_canonical_transition_boundary(pool.get(), user_id, session_id, first_turn)
         .await?;
+    // Reconciliation intentionally runs before acquiring the shared session
+    // child-write fence because expired-owner recovery needs that same lock.
+    // Once fenced, recheck admission inside this transaction: a provider
+    // attempt that won the intervening race is then observed as a blocker,
+    // while later attempts wait until this bounded snapshot is complete.
+    let mut recovery_tx = pool.get().begin().await.map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "begin canonical transition WAL recovery snapshot",
+            error,
+        )
+    })?;
+    match crate::storage::admit_session_event_write(&mut recovery_tx, session_id, user_id, false)
+        .await
+    {
+        Ok(()) => {}
+        Err(sqlx::Error::RowNotFound) => {
+            return Err(ServiceError::not_found(
+                "canonical transition WAL session is unavailable",
+            ));
+        }
+        Err(error) => {
+            return Err(ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "lock canonical transition WAL recovery boundary",
+                error,
+            ));
+        }
+    }
+    let concurrent_invocation: Option<String> = sqlx::query_scalar(
+        "SELECT invocation_id
+         FROM inference_invocations
+         WHERE user_id = ? AND session_id = ? AND turn_index >= ?
+           AND scope_kind = 'run' AND purpose = 'primary_agent'
+           AND status = 'admitted'
+         ORDER BY turn_index ASC, round_index ASC, logical_attempt ASC,
+                  invocation_id ASC
+         LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(i64::from(first_turn))
+    .fetch_optional(&mut *recovery_tx)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "recheck canonical recovery boundary under the session fence",
+            error,
+        )
+    })?;
+    if let Some(invocation_id) = concurrent_invocation {
+        return Err(ServiceError::conflict(format!(
+            "inference invocation {invocation_id} became active at the canonical recovery boundary"
+        )));
+    }
     let head = sqlx::query(
         "SELECT head_transition_id, head_attempt_id, head_result_count,
                 head_result_root_hash, chain_length, chain_payload_bytes
@@ -3262,7 +3330,7 @@ pub async fn load_inference_canonical_transitions_for_session(
     .bind(user_id)
     .bind(session_id)
     .bind(i64::from(first_turn))
-    .fetch_optional(pool.get())
+    .fetch_optional(&mut *recovery_tx)
     .await
     .map_err(|error| {
         ServiceError::with_source(
@@ -3271,7 +3339,98 @@ pub async fn load_inference_canonical_transitions_for_session(
             error,
         )
     })?;
+    let wal_metadata = sqlx::query(
+        "SELECT CAST(COUNT(*) AS SIGNED) AS row_count,
+                CAST(COALESCE(SUM(payload_bytes), 0) AS SIGNED) AS declared_bytes,
+                CAST(COALESCE(SUM(actual_payload_bytes), 0) AS SIGNED) AS actual_bytes,
+                CAST(COALESCE(MIN(payload_bytes), 0) AS SIGNED) AS min_payload_bytes,
+                CAST(COALESCE(MAX(payload_bytes), 0) AS SIGNED) AS max_payload_bytes
+         FROM (
+             SELECT payload_bytes,
+                    CAST(LENGTH(payload_json) AS SIGNED) AS actual_payload_bytes
+             FROM inference_canonical_transition_wal
+             WHERE user_id = ? AND session_id = ? AND turn_index = ?
+             LIMIT ?
+         ) AS bounded_wal",
+    )
+    .bind(user_id)
+    .bind(session_id)
+    .bind(i64::from(first_turn))
+    .bind(i64::from(astra_turn_types::MAX_PROVIDER_CANONICAL_WAL_ENTRIES) + 1)
+    .fetch_one(&mut *recovery_tx)
+    .await
+    .map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "preflight inference canonical transition WAL metadata",
+            error,
+        )
+    })?;
+    let wal_row_count: i64 = wal_metadata.try_get("row_count").map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "decode canonical WAL preflight row count",
+            error,
+        )
+    })?;
+    let wal_declared_bytes: i64 = wal_metadata.try_get("declared_bytes").map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "decode canonical WAL preflight declared bytes",
+            error,
+        )
+    })?;
+    let wal_actual_bytes: i64 = wal_metadata.try_get("actual_bytes").map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "decode canonical WAL preflight actual bytes",
+            error,
+        )
+    })?;
+    let wal_min_payload_bytes: i64 =
+        wal_metadata.try_get("min_payload_bytes").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode canonical WAL preflight minimum entry bytes",
+                error,
+            )
+        })?;
+    let wal_max_payload_bytes: i64 =
+        wal_metadata.try_get("max_payload_bytes").map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "decode canonical WAL preflight maximum entry bytes",
+                error,
+            )
+        })?;
+    let max_chain_bytes =
+        i64::try_from(astra_turn_types::MAX_PROVIDER_CANONICAL_WAL_BYTES).unwrap_or(i64::MAX);
+    if wal_row_count < 0
+        || wal_row_count > i64::from(astra_turn_types::MAX_PROVIDER_CANONICAL_WAL_ENTRIES)
+        || wal_declared_bytes < 0
+        || wal_declared_bytes > max_chain_bytes
+        || wal_actual_bytes != wal_declared_bytes
+        || (wal_row_count > 0
+            && (!(1..=max_payload_bytes).contains(&wal_min_payload_bytes)
+                || !(1..=max_payload_bytes).contains(&wal_max_payload_bytes)))
+    {
+        return Err(ServiceError::conflict(
+            "canonical transition WAL failed its bounded metadata preflight",
+        ));
+    }
     let Some(head) = head else {
+        if wal_row_count != 0 {
+            return Err(ServiceError::conflict(
+                "canonical transition WAL has recoverable rows but no authoritative head",
+            ));
+        }
+        recovery_tx.commit().await.map_err(|error| {
+            ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "finish empty canonical transition WAL recovery snapshot",
+                error,
+            )
+        })?;
         return Ok(Vec::new());
     };
     let head_transition_id: String = head.try_get("head_transition_id").map_err(|error| {
@@ -3326,6 +3485,11 @@ pub async fn load_inference_canonical_transitions_for_session(
             "canonical transition WAL head declares invalid recovery bounds",
         ));
     }
+    if wal_row_count != chain_length || wal_declared_bytes != chain_payload_bytes {
+        return Err(ServiceError::conflict(
+            "canonical transition WAL metadata does not match its durable head",
+        ));
+    }
     let rows = sqlx::query(
         "SELECT turn_index, round_index, logical_attempt, physical_attempt,
                 transition_id, parent_transition_id, attempt_id,
@@ -3343,7 +3507,7 @@ pub async fn load_inference_canonical_transitions_for_session(
     .bind(i64::from(first_turn))
     .bind(max_payload_bytes)
     .bind(i64::from(astra_turn_types::MAX_PROVIDER_CANONICAL_WAL_ENTRIES) + 1)
-    .fetch_all(pool.get())
+    .fetch_all(&mut *recovery_tx)
     .await
     .map_err(|error| {
         ServiceError::with_source(
@@ -3551,7 +3715,7 @@ pub async fn load_inference_canonical_transitions_for_session(
     audit_query.push(")");
     let audit_rows = audit_query
         .build()
-        .fetch_all(pool.get())
+        .fetch_all(&mut *recovery_tx)
         .await
         .map_err(|error| {
             ServiceError::with_source(
@@ -3665,13 +3829,21 @@ pub async fn load_inference_canonical_transitions_for_session(
     let round = head_entry.round;
     let logical_attempt = head_entry.logical_attempt;
     let physical_attempt = head_entry.physical_attempt;
-    Ok(vec![InferenceCanonicalTransitionReceipt {
+    let receipt = InferenceCanonicalTransitionReceipt {
         turn: first_turn,
         round,
         logical_attempt,
         physical_attempt,
         transitions: chain.into_iter().map(|entry| entry.transition).collect(),
-    }])
+    };
+    recovery_tx.commit().await.map_err(|error| {
+        ServiceError::with_source(
+            ServiceErrorKind::Persistence,
+            "finish canonical transition WAL recovery snapshot",
+            error,
+        )
+    })?;
+    Ok(vec![receipt])
 }
 
 /// Remove recoverable WAL entries after the canonical coordinator has absorbed
@@ -3692,6 +3864,25 @@ pub async fn retire_inference_canonical_transitions_through_turn(
             error,
         )
     })?;
+    // Retirement and admission mutate the same session-scoped WAL. Sharing
+    // the canonical session child-write fence prevents a recovery snapshot,
+    // replacement checkpoint, or provider admission from observing half of
+    // this head/payload deletion pair.
+    match crate::storage::admit_session_event_write(&mut tx, session_id, user_id, false).await {
+        Ok(()) => {}
+        Err(sqlx::Error::RowNotFound) => {
+            return Err(ServiceError::not_found(
+                "canonical transition WAL session is unavailable for retirement",
+            ));
+        }
+        Err(error) => {
+            return Err(ServiceError::with_source(
+                ServiceErrorKind::Persistence,
+                "lock canonical transition WAL retirement boundary",
+                error,
+            ));
+        }
+    }
     let result = sqlx::query(
         "DELETE FROM inference_canonical_transition_wal
          WHERE user_id = ? AND session_id = ? AND turn_index <= ?",
