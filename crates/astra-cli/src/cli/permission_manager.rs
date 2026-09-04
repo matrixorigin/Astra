@@ -1730,8 +1730,7 @@ impl PermissionManager {
     /// Export the current effective permission envelope for a spawned child agent.
     ///
     /// Issue #326 P0 / R1 Major 10 / task #17: previously this method
-    /// called `session_overrides.to_legacy_overrides()`, which collapses
-    /// every fingerprinted decision into a `tool_name → bool` map. So
+    /// collapsed every fingerprinted decision into a `tool_name → bool` map. So
     /// a parent who pressed "Always" on `Bash(argv_prefix="cargo test")`
     /// would hand the child a `Bash -> Allow` envelope, and the child could
     /// then run `Bash(rm -rf …)` without ever asking. That is exactly
@@ -1741,9 +1740,9 @@ impl PermissionManager {
     /// as JSON because runtime types can't depend on
     /// `approval_fingerprint`). The child is expected to consult those
     /// fingerprints first; only if no fingerprint matches does it fall
-    /// through to the inherited `allow_rules` / `deny_rules`. The
-    /// `to_legacy_overrides()` helper still exists for telemetry /
-    /// display but is **no longer wired into enforcement**.
+    /// through to the inherited `allow_rules` / `deny_rules`. There is no
+    /// tool-name-only downgrade path: display and enforcement both retain the
+    /// structured fingerprints.
     pub(crate) fn inherited_permissions_for_child(
         &self,
         is_background: bool,
@@ -1783,10 +1782,9 @@ impl PermissionManager {
         // of session-level decisions. We serialize the
         // FingerprintedOverrides to JSON so the runtime type stays
         // dependency-free; the child decodes it back. If serialization
-        // fails (it shouldn't — these are simple owned strings/enums),
-        // we deliberately do NOT fall back to to_legacy_overrides:
-        // a downgrade-on-error would re-introduce the bypass we're
-        // fixing here.
+        // fails (it shouldn't — these are simple owned strings/enums), we do
+        // not fall back to a tool-name-only map: a downgrade-on-error would
+        // re-introduce the bypass we're fixing here.
         match serde_json::to_value(&self.session_overrides) {
             Ok(value) if !value.is_null() => {
                 inherited.fingerprinted_overrides = Some(value);

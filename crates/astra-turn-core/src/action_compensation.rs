@@ -85,30 +85,11 @@ pub struct ExecutionOutcomeInput<'a> {
     pub exit_semantics: Option<&'a str>,
 }
 
-/// Classify a tool result into a typed execution outcome.
+/// Classify a tool result from structured facts.
 ///
-/// Legacy convenience wrapper. Prefer [`classify_execution_outcome_from_input`]
-/// so callers can provide typed `error_kind`, `result_class`, or
-/// `exit_semantics` instead of relying on output prose.
-pub fn classify_execution_outcome(
-    result_text: &str,
-    is_error: bool,
-    duration_ms: u64,
-    was_rejected: bool,
-) -> ExecutionOutcomeClassification {
-    classify_execution_outcome_from_input(ExecutionOutcomeInput {
-        result_text,
-        is_error,
-        duration_ms,
-        was_rejected,
-        error_kind: None,
-        result_class: None,
-        exit_semantics: None,
-    })
-}
-
-/// Classify a tool result from structured facts first, falling back to text only
-/// for legacy callers that have not yet been migrated.
+/// When optional typed metadata is absent, classification remains conservative:
+/// rejection, error status, and duration determine the outcome. Result text is
+/// retained only as a bounded diagnostic snippet and never drives the category.
 pub fn classify_execution_outcome_from_input(
     input: ExecutionOutcomeInput<'_>,
 ) -> ExecutionOutcomeClassification {
@@ -914,6 +895,23 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn classify_untyped_for_test(
+        result_text: &str,
+        is_error: bool,
+        duration_ms: u64,
+        was_rejected: bool,
+    ) -> ExecutionOutcomeClassification {
+        classify_execution_outcome_from_input(ExecutionOutcomeInput {
+            result_text,
+            is_error,
+            duration_ms,
+            was_rejected,
+            error_kind: None,
+            result_class: None,
+            exit_semantics: None,
+        })
+    }
+
     #[test]
     fn file_write_and_delete_compensation() {
         // write_file: requires pre-state capture, RestoreOrDeleteFile
@@ -1465,8 +1463,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_wrapper_does_not_infer_category_from_output_text() {
-        let c = classify_execution_outcome("error[E0433]: compile error", true, 2000, false);
+    fn untyped_input_does_not_infer_category_from_output_text() {
+        let c = classify_untyped_for_test("error[E0433]: compile error", true, 2000, false);
         assert_eq!(c.outcome, ExecutionOutcome::Failure);
         assert_eq!(c.failure_category, Some(FailureCategory::Unknown));
     }
@@ -1474,16 +1472,16 @@ mod tests {
     #[test]
     fn classify_success_and_edge_outcomes() {
         // success
-        let c = classify_execution_outcome(r#"{"ok":true,"result":"done"}"#, false, 500, false);
+        let c = classify_untyped_for_test(r#"{"ok":true,"result":"done"}"#, false, 500, false);
         assert_eq!(c.outcome, ExecutionOutcome::Success);
         assert!(c.failure_category.is_none());
         assert!(c.error_snippet.is_none());
         // rejected
-        let c = classify_execution_outcome("rejected by policy", true, 0, true);
+        let c = classify_untyped_for_test("rejected by policy", true, 0, true);
         assert_eq!(c.outcome, ExecutionOutcome::Rejected);
         assert!(c.failure_category.is_none());
         // rejected takes priority over content
-        let c = classify_execution_outcome("error[E0433]: some compile error", true, 100, true);
+        let c = classify_untyped_for_test("error[E0433]: some compile error", true, 100, true);
         assert_eq!(c.outcome, ExecutionOutcome::Rejected);
         assert!(c.failure_category.is_none());
         // structured resource limit
@@ -1502,11 +1500,11 @@ mod tests {
             Some(FailureCategory::ResourceExhaustion)
         );
         // timeout from duration, not output prose
-        let c = classify_execution_outcome("long-running failure", true, 130_000, false);
+        let c = classify_untyped_for_test("long-running failure", true, 130_000, false);
         assert_eq!(c.outcome, ExecutionOutcome::Timeout);
         assert_eq!(c.failure_category, Some(FailureCategory::Timeout));
         // success with resource-limit text stays success (didn't fail)
-        let c = classify_execution_outcome("Killed", false, 100, false);
+        let c = classify_untyped_for_test("Killed", false, 100, false);
         assert_eq!(c.outcome, ExecutionOutcome::Success);
     }
 
@@ -1534,7 +1532,7 @@ mod tests {
     #[test]
     fn classify_snippet_truncation() {
         let long_error = format!("error[E0433]: {}", "x".repeat(500));
-        let c = classify_execution_outcome(&long_error, true, 2000, false);
+        let c = classify_untyped_for_test(&long_error, true, 2000, false);
         assert!(c.error_snippet.as_ref().unwrap().len() <= 210);
     }
 }
