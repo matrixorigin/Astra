@@ -85,11 +85,11 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
         run: |
           set -euo pipefail
-          feature_args=()
+          set --
           if [ -n "${RELEASE_FEATURES}" ]; then
-            feature_args=(--features "${RELEASE_FEATURES}")
+            set -- --features "${RELEASE_FEATURES}"
           fi
-          cargo build --release --locked --no-default-features "${feature_args[@]}" \
+          cargo build --release --locked --no-default-features "$@" \
             --manifest-path Cargo.toml --target "${{ matrix.target }}" \
             -p astra-cli --bin astra \
             -p astra-edge --bin astra-edge

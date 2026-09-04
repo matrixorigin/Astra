@@ -70,6 +70,7 @@ def main() -> None:
         Path("scripts/ops/test_production_env_contract.sh"),
         Path("scripts/ci/test_release_contract.sh"),
         Path("scripts/ci/test_release_manifest_contract.sh"),
+        Path("scripts/ci/test_release_build_shells.py"),
         Path("scripts/ci/test_sccache_fallback.sh"),
     ]
     for contract_script in contract_scripts:

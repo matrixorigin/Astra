@@ -23,13 +23,13 @@ ARG DEBIAN_MIRROR
 WORKDIR /app
 
 RUN set -eux; \
-    if [ -n "${CARGO_REGISTRY}" ]; then \
+    if [ -n "${CARGO_REGISTRY:-}" ]; then \
         mkdir -p "${CARGO_HOME}"; \
         printf '[source.crates-io]\nreplace-with = "mirror"\n[source.mirror]\nregistry = "%s"\n' "${CARGO_REGISTRY}" > "${CARGO_HOME}/config.toml"; \
     fi
 
 RUN set -eux; \
-    if [ -n "${DEBIAN_MIRROR}" ]; then \
+    if [ -n "${DEBIAN_MIRROR:-}" ]; then \
         mirror="${DEBIAN_MIRROR%/}"; \
         case "${mirror}" in http://*|https://*) ;; *) mirror="https://${mirror}" ;; esac; \
         find /etc/apt -type f \( -name 'sources.list' -o -name '*.sources' \) -print0 \
@@ -102,7 +102,7 @@ RUN set -eux; \
         find /etc/apt -type f \( -name 'sources.list' -o -name '*.sources' \) -print0 \
             | xargs -0 -r sed -i -E "s#${from_regex}#${to_base}#g"; \
     }; \
-    if [ -n "${DEBIAN_MIRROR}" ]; then \
+    if [ -n "${DEBIAN_MIRROR:-}" ]; then \
         mirror="${DEBIAN_MIRROR%/}"; \
         case "${mirror}" in http://*|https://*) ;; *) mirror="https://${mirror}" ;; esac; \
         mirror_host="${mirror#http://}"; \
@@ -114,7 +114,7 @@ RUN set -eux; \
     fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates; \
-    if [ -n "${DEBIAN_MIRROR}" ]; then \
+    if [ -n "${DEBIAN_MIRROR:-}" ]; then \
         if [ "${mirror}" != "${bootstrap_mirror}" ]; then \
             replace_apt_sources "https?://${mirror_host_regex}" "${mirror}"; \
             apt-get update; \
