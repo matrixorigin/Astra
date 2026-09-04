@@ -224,7 +224,11 @@ pub(crate) async fn do_memoria_browser_login(
             .map_err(|error| format!("local login callback failed: {error}"))?;
         let request = read_callback_request(&mut stream).await;
         let Ok(request) = request else {
+            rejected = rejected.saturating_add(1);
             write_callback_response(&mut stream, "400 Bad Request", None, "invalid request").await;
+            if rejected >= 3 {
+                return Err("too many invalid browser login callbacks".to_string());
+            }
             continue;
         };
         if request.method == "OPTIONS" {
@@ -248,6 +252,7 @@ pub(crate) async fn do_memoria_browser_login(
         let callback: MemoriaConnectionCallback = match serde_json::from_slice(&request.body) {
             Ok(callback) => callback,
             Err(_) => {
+                rejected = rejected.saturating_add(1);
                 write_callback_response(
                     &mut stream,
                     "400 Bad Request",
@@ -255,6 +260,9 @@ pub(crate) async fn do_memoria_browser_login(
                     "invalid callback",
                 )
                 .await;
+                if rejected >= 3 {
+                    return Err("too many invalid browser login callbacks".to_string());
+                }
                 continue;
             }
         };
