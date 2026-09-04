@@ -196,40 +196,6 @@ pub(crate) fn effective_runtime_config(
     }
 }
 
-pub(crate) fn replace_json_path(
-    root: &mut Value,
-    path: &str,
-    new_value: Value,
-) -> Result<Value, String> {
-    let segments: Vec<&str> = path
-        .split('.')
-        .filter(|segment| !segment.is_empty())
-        .collect();
-    if segments.is_empty() {
-        return Err("mutation path cannot be empty".to_string());
-    }
-
-    let mut current = root;
-    for segment in &segments[..segments.len() - 1] {
-        current = current
-            .get_mut(*segment)
-            .ok_or_else(|| format!("unknown config path segment '{segment}'"))?;
-    }
-
-    let Some(last) = segments.last() else {
-        return Err("mutation path cannot be empty".to_string());
-    };
-    let object = current
-        .as_object_mut()
-        .ok_or_else(|| format!("config path '{path}' does not point to an object parent"))?;
-    let slot = object
-        .get_mut(*last)
-        .ok_or_else(|| format!("unknown config leaf '{last}'"))?;
-    let old_value = slot.clone();
-    *slot = new_value;
-    Ok(old_value)
-}
-
 pub(crate) fn append_config_change_event(
     user_id: &str,
     session_id: &str,
@@ -267,7 +233,8 @@ pub(crate) fn persist_config_override(
         astra_services::session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
     let base_config = effective_runtime_config(Some(&workspace))?;
     let mut value = serde_json::to_value(&base_config).map_err(|e| e.to_string())?;
-    let old_value = replace_json_path(&mut value, path, new_value.clone())?;
+    let old_value = astra_config::replace_existing_json_path(&mut value, path, new_value.clone())
+        .map_err(|error| error.to_string())?;
     let candidate_config: astra_config::runtime_config::RuntimeConfig =
         serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
     let baseline_json = serde_json::to_value(astra_config::runtime_config::RuntimeConfig::load())
@@ -811,40 +778,5 @@ mod tests {
             astra_services::session_workspace::read_workspace(session_id).expect("workspace read");
         assert!(workspace.tuned_config_json.is_some());
         assert_eq!(workspace.background_shell_tasks.len(), 1);
-    }
-
-    #[test]
-    fn replace_json_path_mutates_leaf_and_returns_previous_value() {
-        let mut value = json!({
-            "memory": {
-                "retrieval_top_k": 5
-            }
-        });
-
-        let old = replace_json_path(&mut value, "memory.retrieval_top_k", json!(8)).unwrap();
-
-        assert_eq!(old, json!(5));
-        assert_eq!(value["memory"]["retrieval_top_k"], json!(8));
-    }
-
-    #[test]
-    fn replace_json_path_reports_empty_unknown_and_non_object_paths() {
-        let mut value = json!({"memory": {"retrieval_top_k": 5}});
-
-        assert!(
-            replace_json_path(&mut value, "", json!(8))
-                .expect_err("empty path must fail")
-                .contains("empty")
-        );
-        assert!(
-            replace_json_path(&mut value, "memory.missing", json!(8))
-                .expect_err("missing leaf must fail")
-                .contains("unknown config leaf")
-        );
-        assert!(
-            replace_json_path(&mut value, "memory.retrieval_top_k.value", json!(8))
-                .expect_err("non-object parent must fail")
-                .contains("does not point to an object parent")
-        );
     }
 }

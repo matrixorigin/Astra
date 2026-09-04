@@ -735,7 +735,8 @@ fn preview_config_mutation_value(
     let base_config = effective_runtime_config(Some(&workspace))?;
     let base_json = serde_json::to_value(&base_config).map_err(|e| e.to_string())?;
     let mut value = base_json.clone();
-    let old_value = replace_json_path(&mut value, path, new_value.clone())?;
+    let old_value = astra_config::replace_existing_json_path(&mut value, path, new_value.clone())
+        .map_err(|error| error.to_string())?;
     let candidate_config: RuntimeConfig = serde_json::from_value(value.clone())
         .map_err(|e| format!("mutation produced invalid RuntimeConfig at '{}': {e}", path))?;
     let candidate_json = serde_json::to_string(&candidate_config).map_err(|e| e.to_string())?;
@@ -775,7 +776,8 @@ fn persist_config_mutation_value(
     let ws = session_workspace::read_workspace(session_id).map_err(|e| e.to_string())?;
     let base_config = effective_runtime_config(Some(&ws))?;
     let mut value = serde_json::to_value(&base_config).map_err(|e| e.to_string())?;
-    replace_json_path(&mut value, path, new_value)?;
+    astra_config::replace_existing_json_path(&mut value, path, new_value)
+        .map_err(|error| error.to_string())?;
     let candidate_config: RuntimeConfig =
         serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
     let baseline_json = serde_json::to_value(RuntimeConfig::load()).map_err(|e| e.to_string())?;
@@ -1146,38 +1148,6 @@ pub(crate) fn cli_provider_visible_tool_names() -> Vec<String> {
     names
 }
 
-fn replace_json_path(
-    root: &mut serde_json::Value,
-    path: &str,
-    new_value: serde_json::Value,
-) -> Result<serde_json::Value, String> {
-    let segments: Vec<&str> = path
-        .split('.')
-        .filter(|segment| !segment.is_empty())
-        .collect();
-    if segments.is_empty() {
-        return Err("mutation path cannot be empty".to_string());
-    }
-
-    let mut current = root;
-    for segment in &segments[..segments.len() - 1] {
-        current = current
-            .get_mut(*segment)
-            .ok_or_else(|| format!("unknown config path segment '{segment}'"))?;
-    }
-
-    let last = segments.last().expect("checked non-empty");
-    let object = current
-        .as_object_mut()
-        .ok_or_else(|| format!("config path '{}' does not point to an object parent", path))?;
-    let slot = object
-        .get_mut(*last)
-        .ok_or_else(|| format!("unknown config leaf '{}'", last))?;
-    let old_value = slot.clone();
-    *slot = new_value;
-    Ok(old_value)
-}
-
 fn parse_value_arg(raw: &str) -> serde_json::Value {
     serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_string()))
 }
@@ -1445,7 +1415,7 @@ mod tests {
     use super::{
         EventPreview, analysis_view_recent_event_previews, build_reflect_response,
         cli_provider_visible_tool_names, event_preview_has_adverse_signal, event_preview_summary,
-        execute_self_command, persist_config_override, replace_json_path, resolve_session_id,
+        execute_self_command, persist_config_override, resolve_session_id,
         restored_recent_turn_previews, session_agent_delivery_summary, verify_runtime_config,
     };
     use crate::cli::cli_config::cli_args::{SelfCmd, SelfReflectArgs, SelfSessionArgs};
@@ -1774,25 +1744,6 @@ mod tests {
             ))
             .mount(server)
             .await;
-    }
-
-    #[test]
-    fn replace_json_path_updates_existing_leaf() {
-        let mut value = serde_json::json!({
-            "verification": {
-                "strictness": 0.5
-            }
-        });
-
-        let old = replace_json_path(
-            &mut value,
-            "verification.strictness",
-            serde_json::json!(0.8),
-        )
-        .unwrap();
-
-        assert_eq!(old, serde_json::json!(0.5));
-        assert_eq!(value["verification"]["strictness"], serde_json::json!(0.8));
     }
 
     #[test]
