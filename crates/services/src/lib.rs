@@ -40,6 +40,7 @@ pub(crate) mod registry_payload;
 pub use registry_payload::validate_registered_endpoint_url;
 pub mod replay;
 pub mod resource_governor;
+pub mod runner_model_bindings;
 pub mod runs;
 pub mod runtime_maintenance;
 pub mod sandbox;
@@ -254,18 +255,19 @@ pub use model_request_context::{
 pub use models::{
     AdmittedModelExecution, DatabaseModelService, DeclaredModelAccess, ModelAccessAction,
     ModelAccessAvailability, ModelAccessKind, ModelAccessProjectionResponse, ModelAccessReason,
-    ModelAccessStatus, ModelAccessViewResponse, ModelCreateRequestData, ModelDefaultCandidate,
-    ModelDefaultInvalidReason, ModelDefaultResolution, ModelDefaultScope, ModelDefaultSource,
-    ModelExecutionPlacement, ModelListCursor, ModelListItem, ModelListItemResponse, ModelListPage,
-    ModelListPageResponse, ModelOfferingResolutionError, ModelRecord, ModelService,
-    ModelUpdateRequestData, PricingData, PromptCacheCapabilityData, PromptCacheProtocolData,
-    PromptCacheReuseScopeData, PromptCacheVolatileDeliveryData, PromptCacheVolatilePlacementData,
-    QuirksData, ResolvedActiveLlmModel, ResolvedModelOffering, UnconfiguredModelService,
-    model_catalog_revision, project_model_access, project_model_access_page,
-    project_model_access_page_with_default_catalog, project_model_access_with_default,
-    prompt_cache_capability_from_models_yaml, resolve_active_llm_model,
-    resolve_active_llm_offering, resolve_memory_offerings, resolve_reasoning_offering,
-    revalidate_active_llm_offering, validate_model_offering_id,
+    ModelAccessStatus, ModelAccessViewResponse, ModelAdmissionSource, ModelCreateRequestData,
+    ModelDefaultCandidate, ModelDefaultInvalidReason, ModelDefaultResolution, ModelDefaultScope,
+    ModelDefaultSource, ModelExecutionMaterial, ModelExecutionPlacement, ModelListCursor,
+    ModelListItem, ModelListItemResponse, ModelListPage, ModelListPageResponse,
+    ModelOfferingResolutionError, ModelRecord, ModelService, ModelUpdateRequestData, PricingData,
+    PromptCacheCapabilityData, PromptCacheProtocolData, PromptCacheReuseScopeData,
+    PromptCacheVolatileDeliveryData, PromptCacheVolatilePlacementData, QuirksData,
+    ResolvedActiveLlmModel, ResolvedModelOffering, ServerModelExecutionMaterial,
+    UnconfiguredModelService, model_catalog_revision, project_model_access,
+    project_model_access_page, project_model_access_page_with_default_catalog,
+    project_model_access_with_default, prompt_cache_capability_from_models_yaml,
+    resolve_active_llm_model, resolve_active_llm_offering, resolve_memory_offerings,
+    resolve_reasoning_offering, revalidate_active_llm_offering, validate_model_offering_id,
 };
 pub use multi_agent::{
     DatabaseEdgeDispatchService, DatabaseEdgeRegistryService, EdgeAgentRecord,

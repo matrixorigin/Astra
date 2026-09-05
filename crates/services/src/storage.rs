@@ -121,7 +121,7 @@ pub const AGENT_ID_LEN: usize = 255;
 pub const AGENT_EVENT_ID_LEN: usize = 128;
 static CORE_SCHEMA_INIT_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 const CORE_SCHEMA_CONTRACT_COMPONENT: &str = "astra-core";
-pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-04-v70";
+pub const CORE_SCHEMA_CONTRACT_VERSION: &str = "2026-09-05-v71";
 const CORE_SCHEMA_CONTRACT_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS astra_schema_contracts (
     component VARCHAR(64) NOT NULL PRIMARY KEY,
     contract_version VARCHAR(64) NOT NULL,
@@ -6760,6 +6760,7 @@ async fn ensure_core_schema_while_leased(
             execution_placement VARCHAR(32) NOT NULL,
             access_kind VARCHAR(32) NOT NULL,
             purpose VARCHAR(64) NOT NULL,
+            runner_binding_json TEXT NULL,
             created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, route_id),
             CONSTRAINT chk_inference_routes_scope_kind
@@ -6903,6 +6904,23 @@ async fn ensure_core_schema_while_leased(
             started_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             terminal_at DATETIME(6) NULL,
             context_expired_at DATETIME(6) NULL,
+            runner_id VARCHAR(64) NULL,
+            runner_journal_id VARCHAR(64) NULL,
+            runner_grant_json TEXT NULL,
+            runner_grant_expires_at DATETIME(6) NULL,
+            runner_deadline_at DATETIME(6) NULL,
+            runner_cancel_requested_at DATETIME(6) NULL,
+            runner_response_artifact_id VARCHAR(64) NULL,
+            runner_response_hash CHAR(64) NULL,
+            runner_response_bytes BIGINT NULL,
+            runner_terminal_hash CHAR(64) NULL,
+            runner_terminal_conflict BOOLEAN NOT NULL DEFAULT FALSE,
+            runner_continuation_pending BOOLEAN NOT NULL DEFAULT FALSE,
+            runner_dispatch_claim_token VARCHAR(64) NULL,
+            runner_dispatch_claim_expires_at DATETIME(6) NULL,
+            runner_local_fence_at DATETIME(6) NULL,
+            runner_provider_started_at DATETIME(6) NULL,
+            runner_no_start_evidence VARCHAR(32) NULL,
             PRIMARY KEY (user_id, attempt_id),
             CONSTRAINT chk_inference_provider_attempts_scope_owner
                 CHECK ((session_id IS NOT NULL AND harness_run_id IS NULL)
@@ -6923,6 +6941,100 @@ async fn ensure_core_schema_while_leased(
     )
     .execute(&pool)
     .await?;
+
+    add_column_if_missing(
+        &pool,
+        &settings.database,
+        "inference_routes",
+        "runner_binding_json",
+        "ALTER TABLE inference_routes ADD COLUMN runner_binding_json TEXT NULL",
+    )
+    .await?;
+    for (column, statement) in [
+        (
+            "runner_id",
+            "ALTER TABLE inference_provider_attempts ADD COLUMN runner_id VARCHAR(64) NULL",
+        ),
+        (
+            "runner_journal_id",
+            "ALTER TABLE inference_provider_attempts ADD COLUMN runner_journal_id VARCHAR(64) NULL",
+        ),
+        (
+            "runner_grant_json",
+            "ALTER TABLE inference_provider_attempts ADD COLUMN runner_grant_json TEXT NULL",
+        ),
+        (
+            "runner_grant_expires_at",
+            "ALTER TABLE inference_provider_attempts ADD COLUMN runner_grant_expires_at DATETIME(6) NULL",
+        ),
+        (
+            "runner_deadline_at",
+            "ALTER TABLE inference_provider_attempts ADD COLUMN runner_deadline_at DATETIME(6) NULL",
+        ),
+        (
+            "runner_cancel_requested_at",
+            "ALTER TABLE inference_provider_attempts ADD COLUMN runner_cancel_requested_at DATETIME(6) NULL",
+        ),
+        (
+            "runner_response_artifact_id",
+            "ALTER TABLE inference_provider_attempts ADD COLUMN runner_response_artifact_id VARCHAR(64) NULL",
+        ),
+        (
+            "runner_response_hash",
+            "ALTER TABLE inference_provider_attempts ADD COLUMN runner_response_hash CHAR(64) NULL",
+        ),
+        (
+            "runner_response_bytes",
+            "ALTER TABLE inference_provider_attempts ADD COLUMN runner_response_bytes BIGINT NULL",
+        ),
+        (
+            "runner_terminal_hash",
+            "ALTER TABLE inference_provider_attempts ADD COLUMN runner_terminal_hash CHAR(64) NULL",
+        ),
+        (
+            "runner_terminal_conflict",
+            "ALTER TABLE inference_provider_attempts ADD COLUMN runner_terminal_conflict BOOLEAN NOT NULL DEFAULT FALSE",
+        ),
+        (
+            "runner_continuation_pending",
+            "ALTER TABLE inference_provider_attempts ADD COLUMN runner_continuation_pending BOOLEAN NOT NULL DEFAULT FALSE",
+        ),
+        (
+            "runner_dispatch_claim_token",
+            "ALTER TABLE inference_provider_attempts ADD COLUMN runner_dispatch_claim_token VARCHAR(64) NULL",
+        ),
+        (
+            "runner_dispatch_claim_expires_at",
+            "ALTER TABLE inference_provider_attempts ADD COLUMN runner_dispatch_claim_expires_at DATETIME(6) NULL",
+        ),
+        (
+            "runner_local_fence_at",
+            "ALTER TABLE inference_provider_attempts ADD COLUMN runner_local_fence_at DATETIME(6) NULL",
+        ),
+        (
+            "runner_provider_started_at",
+            "ALTER TABLE inference_provider_attempts ADD COLUMN runner_provider_started_at DATETIME(6) NULL",
+        ),
+        (
+            "runner_no_start_evidence",
+            "ALTER TABLE inference_provider_attempts ADD COLUMN runner_no_start_evidence VARCHAR(32) NULL",
+        ),
+    ] {
+        add_column_if_missing(
+            &pool,
+            &settings.database,
+            "inference_provider_attempts",
+            column,
+            statement,
+        )
+        .await?;
+    }
+    ensure_index_shape(&pool, &settings.database, "inference_provider_attempts", "idx_inference_runner_recovery",
+        &["runner_id", "status", "runner_grant_expires_at", "user_id", "attempt_id"],
+        "ALTER TABLE inference_provider_attempts ADD INDEX idx_inference_runner_recovery (runner_id, status, runner_grant_expires_at, user_id, attempt_id)").await?;
+    ensure_index_shape(&pool, &settings.database, "inference_provider_attempts", "idx_inference_runner_continuation",
+        &["runner_continuation_pending", "user_id", "session_id", "attempt_id"],
+        "ALTER TABLE inference_provider_attempts ADD INDEX idx_inference_runner_continuation (runner_continuation_pending, user_id, session_id, attempt_id)").await?;
 
     core_schema_create!(
         pool,
@@ -7433,6 +7545,10 @@ async fn ensure_core_schema_while_leased(
             registration_claim_expires_at DATETIME(6) NULL,
             registration_state TINYINT NOT NULL DEFAULT 1,
             registration_previous_edge_id VARCHAR(128) NULL,
+            inference_journal_id VARCHAR(64) NULL,
+            inference_boot_nonce VARCHAR(64) NULL,
+            inference_edge_id VARCHAR(128) NULL,
+            inference_publication_revision BIGINT NOT NULL DEFAULT 0,
             registered_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             last_heartbeat_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
             PRIMARY KEY (user_id, registry_id),
@@ -7499,6 +7615,53 @@ async fn ensure_core_schema_while_leased(
         "ALTER TABLE edge_agent_registry ADD INDEX idx_edge_registry_agent_workspace (edge_agent_id, workspace_id)",
     )
     .await?;
+
+    for (column, statement) in [
+        (
+            "inference_journal_id",
+            "ALTER TABLE edge_agent_registry ADD COLUMN inference_journal_id VARCHAR(64) NULL",
+        ),
+        (
+            "inference_boot_nonce",
+            "ALTER TABLE edge_agent_registry ADD COLUMN inference_boot_nonce VARCHAR(64) NULL",
+        ),
+        (
+            "inference_edge_id",
+            "ALTER TABLE edge_agent_registry ADD COLUMN inference_edge_id VARCHAR(128) NULL",
+        ),
+        (
+            "inference_publication_revision",
+            "ALTER TABLE edge_agent_registry ADD COLUMN inference_publication_revision BIGINT NOT NULL DEFAULT 0",
+        ),
+    ] {
+        add_column_if_missing(
+            &pool,
+            &settings.database,
+            "edge_agent_registry",
+            column,
+            statement,
+        )
+        .await?;
+    }
+    core_schema_create!(pool, "runner_model_binding_publications",
+        "CREATE TABLE IF NOT EXISTS runner_model_binding_publications (
+            user_id VARCHAR(128) NOT NULL,
+            runner_id VARCHAR(64) NOT NULL,
+            journal_id VARCHAR(64) NOT NULL,
+            publication_revision BIGINT NOT NULL,
+            operation_id VARCHAR(64) NOT NULL,
+            operation_hash CHAR(64) NOT NULL,
+            binding_id VARCHAR(64) NOT NULL,
+            binding_revision BIGINT NOT NULL,
+            profile_revision BIGINT NOT NULL,
+            enabled BOOLEAN NOT NULL,
+            definition_json TEXT NULL,
+            created_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+            PRIMARY KEY (user_id, runner_id, journal_id, publication_revision),
+            UNIQUE KEY uq_runner_binding_operation (user_id, runner_id, journal_id, operation_id),
+            INDEX idx_runner_binding_latest (user_id, runner_id, journal_id, binding_id, publication_revision)
+        )"
+    ).execute(&pool).await?;
 
     migrate_legacy_edge_pending_dispatch_if_needed(&pool, &settings.database).await?;
     core_schema_create!(pool, "edge_pending_dispatch",

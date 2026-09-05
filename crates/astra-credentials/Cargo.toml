@@ -8,11 +8,13 @@ publish = false
 [dependencies]
 dirs.workspace = true
 fs2.workspace = true
+libc.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+tempfile.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 temp-env.workspace = true
-tempfile.workspace = true

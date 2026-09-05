@@ -10,6 +10,9 @@ pub(crate) struct CliContext {
     pub(crate) permission_mode: Option<String>,
     pub(crate) session_id: Option<String>,
     pub(crate) session_name: Option<String>,
+    /// Identity of the CLI-managed Runner for this process. It is used only
+    /// to resolve the exact local Offering returned by the Server catalog.
+    pub(crate) local_runner_id: Option<String>,
 }
 
 impl CliContext {
@@ -43,6 +46,7 @@ impl CliContext {
             permission_mode: None,
             session_id,
             session_name,
+            local_runner_id: None,
         })
     }
 

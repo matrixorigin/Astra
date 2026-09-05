@@ -136,6 +136,7 @@ dependencies = [
  "astra-core",
  "astra-credentials",
  "astra-harness",
+ "astra-inference-adapter",
  "astra-logging",
  "astra-mcp",
  "astra-messaging",
@@ -258,6 +259,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -267,12 +269,14 @@ version = "0.2.0"
 dependencies = [
  "dirs",
  "fs2",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
  "temp-env",
  "tempfile",
  "thiserror 1.0.69",
+ "url",
 ]
 
 [[package]]
@@ -281,17 +285,20 @@ version = "0.2.0"
 dependencies = [
  "astra-core",
  "astra-credentials",
+ "astra-inference-adapter",
  "astra-logging",
  "astra-runtime-env",
  "astra-server-types",
  "astra-tools",
  "astra-turn-types",
  "base64",
+ "bytes",
  "clap",
  "fastrand",
  "fs2",
  "futures-util",
  "hostname",
+ "libc",
  "md-5",
  "nix 0.31.3",
  "reqwest 0.12.28",
@@ -318,6 +325,22 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "astra-inference-adapter"
+version = "0.2.0"
+dependencies = [
+ "async-stream",
+ "axum",
+ "bytes",
+ "futures-util",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -442,6 +465,7 @@ dependencies = [
  "astra-config",
  "astra-core",
  "astra-harness",
+ "astra-inference-adapter",
  "astra-logging",
  "astra-mcp",
  "astra-memoria",
@@ -756,6 +780,7 @@ name = "astra-turn-core"
 version = "0.2.0"
 dependencies = [
  "astra-core",
+ "astra-inference-adapter",
  "astra-messaging",
  "astra-pipeline",
  "astra-prompts",

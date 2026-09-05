@@ -868,6 +868,8 @@ pub(crate) async fn stream_chat_sse(
         repeated_cache_hit_suppression: resolved_tool_policy.repeated_cache_hit_suppression,
         max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
         stall: StallTrackingState {
+            runner_continuation_receipts: Vec::new(),
+            restored_from_heavy_checkpoint: false,
             workspace_observation_quarantine: p.workspace_observation_quarantine.clone(),
             work_unit_observations: Default::default(),
             active_work_registry: None,

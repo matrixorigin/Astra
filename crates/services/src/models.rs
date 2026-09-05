@@ -670,20 +670,63 @@ impl ModelExecutionPlacement {
     }
 }
 
-/// Non-serializable execution material produced once at the trusted model
-/// admission boundary and consumed by every inference surface.
+/// Authority that materialized an admitted Offering. This selects revalidation,
+/// independently of where provider HTTP executes or who owns Model Access.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelAdmissionSource {
+    ServerCatalog,
+    ProviderGateway,
+    RunnerBinding,
+}
+
+/// Server-local transport material. Never serialize it into an admitted identity,
+/// durable record, or a future Runner dispatch envelope.
+#[derive(Clone, PartialEq)]
+pub struct ServerModelExecutionMaterial {
+    pub api_key: String,
+    pub base_url: String,
+    pub header_overrides: HashMap<String, String>,
+    pub completions_url_override: Option<String>,
+    pub request_timeout_ms: Option<u64>,
+}
+
+impl std::fmt::Debug for ServerModelExecutionMaterial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut header_names = self.header_overrides.keys().collect::<Vec<_>>();
+        header_names.sort_unstable();
+        f.debug_struct("ServerModelExecutionMaterial")
+            .field("credential_present", &!self.api_key.is_empty())
+            .field("header_names", &header_names)
+            .field(
+                "completions_url_override_present",
+                &self.completions_url_override.is_some(),
+            )
+            .field("request_timeout_ms", &self.request_timeout_ms)
+            .finish()
+    }
+}
+
+/// Material for the actual executor. Runner material is an owner-scoped public
+/// binding reference; Server cannot resolve its endpoint or credentials.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ModelExecutionMaterial {
+    Server(ServerModelExecutionMaterial),
+    Runner(crate::runner_model_bindings::ResolvedRunnerModelBinding),
+}
+
+/// Non-serializable admitted identity, request configuration and executor
+/// material produced at the trusted model admission boundary.
 ///
-/// Credential origin is intentionally absent. Executors receive one normalized
-/// invocation shape and never branch on the product source that produced it.
+/// Source controls revalidation only. Inference adapters consume the typed
+/// executor material and never choose transport from a product access label.
 #[derive(Clone, PartialEq)]
 pub struct AdmittedModelExecution {
     pub offering_id: String,
     pub access_kind: ModelAccessKind,
-    pub execution_placement: ModelExecutionPlacement,
+    pub source: ModelAdmissionSource,
+    pub execution_material: ModelExecutionMaterial,
     pub model_name: String,
     pub wire_model_name: Option<String>,
-    pub api_key: String,
-    pub base_url: String,
     pub provider: String,
     pub cache_capability: Option<PromptCacheCapabilityData>,
     /// Probe-derived reasoning control contract. Inference adapters use this
@@ -693,31 +736,72 @@ pub struct AdmittedModelExecution {
     pub request_body_overrides: Option<Map<String, Value>>,
     pub context_window: Option<u32>,
     pub max_completion_tokens: Option<u32>,
-    pub header_overrides: HashMap<String, String>,
-    pub completions_url_override: Option<String>,
-    pub request_timeout_ms: Option<u64>,
 }
 
 impl AdmittedModelExecution {
+    #[must_use]
+    pub fn execution_placement(&self) -> ModelExecutionPlacement {
+        match &self.execution_material {
+            ModelExecutionMaterial::Server(_) => ModelExecutionPlacement::Server,
+            ModelExecutionMaterial::Runner(_) => ModelExecutionPlacement::Edge,
+        }
+    }
+
+    /// Borrow transport material only at a Server execution boundary. This
+    /// exhaustive match must be revisited when another executor is implemented.
+    pub fn server_material(&self) -> Result<&ServerModelExecutionMaterial, &'static str> {
+        match &self.execution_material {
+            ModelExecutionMaterial::Server(material) => Ok(material),
+            ModelExecutionMaterial::Runner(_) => {
+                Err("Runner execution has no Server transport material")
+            }
+        }
+    }
+
+    pub fn from_runner_binding(
+        binding: crate::runner_model_bindings::ResolvedRunnerModelBinding,
+    ) -> Self {
+        let definition = &binding.definition;
+        Self {
+            offering_id: crate::runner_model_bindings::runner_offering_id(
+                &binding.user_id,
+                &definition.identity,
+            ),
+            access_kind: ModelAccessKind::ThisDevice,
+            source: ModelAdmissionSource::RunnerBinding,
+            model_name: definition.model_name.as_str().to_owned(),
+            wire_model_name: None,
+            provider: "openai".into(),
+            cache_capability: None,
+            thinking_capability: None,
+            request_body_overrides: None,
+            context_window: Some(definition.context_window.get()),
+            max_completion_tokens: Some(definition.max_output_tokens.get()),
+            execution_material: ModelExecutionMaterial::Runner(binding),
+        }
+    }
+
     pub fn from_offering(offering: ResolvedModelOffering) -> Result<Self, String> {
         let header_overrides = offering.model.execution_header_overrides()?;
         Ok(Self {
             offering_id: offering.offering_id,
             access_kind: ModelAccessKind::SelfHosted,
-            execution_placement: ModelExecutionPlacement::Server,
+            source: ModelAdmissionSource::ServerCatalog,
+            execution_material: ModelExecutionMaterial::Server(ServerModelExecutionMaterial {
+                api_key: offering.model.api_key,
+                base_url: offering.model.base_url,
+                header_overrides,
+                completions_url_override: None,
+                request_timeout_ms: None,
+            }),
             model_name: offering.model.model_name,
             wire_model_name: offering.model.wire_model_name,
-            api_key: offering.model.api_key,
-            base_url: offering.model.base_url,
             provider: offering.model.provider,
             cache_capability: offering.model.prompt_cache_capability,
             thinking_capability: offering.model.thinking_capability,
             request_body_overrides: offering.model.request_body_overrides,
             context_window: offering.model.context_window,
             max_completion_tokens: offering.model.max_completion_tokens,
-            header_overrides,
-            completions_url_override: None,
-            request_timeout_ms: None,
         })
     }
 
@@ -733,42 +817,37 @@ impl AdmittedModelExecution {
         Self {
             offering_id,
             access_kind: ModelAccessKind::ThisDevice,
-            execution_placement: ModelExecutionPlacement::Edge,
+            source: ModelAdmissionSource::ProviderGateway,
+            execution_material: ModelExecutionMaterial::Server(ServerModelExecutionMaterial {
+                api_key: String::new(),
+                base_url: String::new(),
+                header_overrides: HashMap::from([("authorization".to_string(), authorization)]),
+                completions_url_override: Some(endpoint_url),
+                request_timeout_ms: timeout_ms,
+            }),
             model_name,
             wire_model_name: None,
-            api_key: String::new(),
-            base_url: String::new(),
             provider,
             cache_capability: None,
             thinking_capability: None,
             request_body_overrides: None,
             context_window: Some(context_window),
             max_completion_tokens: None,
-            header_overrides: HashMap::from([("authorization".to_string(), authorization)]),
-            completions_url_override: Some(endpoint_url),
-            request_timeout_ms: timeout_ms,
         }
     }
 }
 
 impl std::fmt::Debug for AdmittedModelExecution {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut header_names = self.header_overrides.keys().collect::<Vec<_>>();
-        header_names.sort_unstable();
         f.debug_struct("AdmittedModelExecution")
             .field("offering_id", &self.offering_id)
             .field("access_kind", &self.access_kind)
-            .field("execution_placement", &self.execution_placement)
+            .field("source", &self.source)
+            .field("execution_placement", &self.execution_placement())
             .field("model_name", &self.model_name)
             .field("wire_model_name", &self.wire_model_name)
             .field("provider", &self.provider)
-            .field("credential_present", &!self.api_key.is_empty())
-            .field("header_names", &header_names)
-            .field(
-                "completions_url_override_present",
-                &self.completions_url_override.is_some(),
-            )
-            .field("request_timeout_ms", &self.request_timeout_ms)
+            .field("execution_material", &self.execution_material)
             .field("context_window", &self.context_window)
             .field("max_completion_tokens", &self.max_completion_tokens)
             .finish()
@@ -812,6 +891,28 @@ fn model_offering_resolution_error_response(
         }
     };
     error_response_coded(status, error.to_string(), code)
+}
+
+fn runner_model_error_response(
+    error: crate::service_error::ServiceError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    use crate::service_error::ServiceErrorKind;
+
+    let (status, code) = match error.kind {
+        ServiceErrorKind::NotFound | ServiceErrorKind::Conflict => {
+            (StatusCode::NOT_FOUND, "model_offering_unavailable")
+        }
+        ServiceErrorKind::Invalid | ServiceErrorKind::Verification => {
+            (StatusCode::BAD_REQUEST, "model_selection_invalid")
+        }
+        ServiceErrorKind::ConflictTransient
+        | ServiceErrorKind::Persistence
+        | ServiceErrorKind::Network
+        | ServiceErrorKind::Internal => {
+            (StatusCode::SERVICE_UNAVAILABLE, "model_catalog_unavailable")
+        }
+    };
+    error_response_coded(status, error.message, code)
 }
 
 impl std::fmt::Display for ModelOfferingResolutionError {
@@ -2118,6 +2219,19 @@ pub trait ModelService: Send + Sync {
         self.resolve_model_offering(offering_id).await
     }
 
+    /// Resolve the exact executor material for one authenticated user. The
+    /// default preserves Server-catalog implementations; the database service
+    /// additionally resolves the user's live Runner inventory. Callers must
+    /// use this boundary instead of inferring execution from an Offering id.
+    async fn revalidate_model_execution(
+        &self,
+        _user_id: String,
+        offering_id: String,
+    ) -> Result<AdmittedModelExecution, (StatusCode, Json<ErrorResponse>)> {
+        let offering = self.revalidate_model_offering(offering_id).await?;
+        AdmittedModelExecution::from_offering(offering).map_err(internal_error)
+    }
+
     async fn update_model(
         &self,
         model_name: String,
@@ -2142,20 +2256,6 @@ pub struct DatabaseModelService {
     matrixone: MatrixOneSettings,
     pool: Option<SharedPool>,
     encryptor: std::sync::Arc<FernetTokenEncryptor>,
-    catalog_revision_cache: Arc<Mutex<HashMap<bool, CachedCatalogRevision>>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CachedCatalogRevision {
-    fingerprint: CatalogRevisionFingerprint,
-    revision: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CatalogRevisionFingerprint {
-    total: i64,
-    min_updated_at: Option<String>,
-    max_updated_at: Option<String>,
 }
 
 /// Parse a required JSON column without degrading malformed persisted data to defaults.
@@ -2176,7 +2276,6 @@ impl DatabaseModelService {
             matrixone,
             encryptor,
             pool: None,
-            catalog_revision_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -2258,15 +2357,26 @@ impl DatabaseModelService {
         self
     }
 
-    fn invalidate_catalog_revision_cache(&self) {
-        self.catalog_revision_cache
-            .lock()
-            .expect("catalog revision cache lock poisoned")
-            .clear();
-    }
-
     async fn get_pool(&self) -> Result<sqlx::Pool<sqlx::MySql>, sqlx::Error> {
         crate::require_shared_pool(self.pool.as_ref(), "DatabaseModelService", &self.matrixone)
+    }
+
+    async fn runner_catalog_items(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
+        let Some(pool) = self.pool.as_ref() else {
+            return Ok(Vec::new());
+        };
+        crate::runner_model_bindings::list_runner_model_catalog_bindings(pool, user_id)
+            .await
+            .map(|bindings| {
+                bindings
+                    .iter()
+                    .map(crate::runner_model_bindings::RunnerModelCatalogBinding::catalog_item)
+                    .collect()
+            })
+            .map_err(runner_model_error_response)
     }
 
     fn model_list_item_from_row(
@@ -2427,7 +2537,6 @@ impl ModelService for DatabaseModelService {
         .await
         .map_err(internal_error)?;
         invalidate_active_llm_model_resolution_cache();
-        self.invalidate_catalog_revision_cache();
 
         // Thinking probe is NOT run during create — it's a separate
         // concern triggered by `model check`.  create_model only validates
@@ -2450,7 +2559,7 @@ impl ModelService for DatabaseModelService {
 
     async fn list_models(
         &self,
-        _user_id: String,
+        user_id: String,
         is_admin: bool,
     ) -> Result<Vec<ModelListItem>, (StatusCode, Json<ErrorResponse>)> {
         let pool = self.get_pool().await.map_err(internal_error)?;
@@ -2498,12 +2607,14 @@ impl ModelService for DatabaseModelService {
                 },
             });
         }
+        models.extend(self.runner_catalog_items(&user_id).await?);
+        sort_model_list_items(&mut models);
         Ok(models)
     }
 
     async fn list_models_page(
         &self,
-        _user_id: String,
+        user_id: String,
         is_admin: bool,
         limit: u32,
         cursor: Option<ModelListCursor>,
@@ -2514,6 +2625,7 @@ impl ModelService for DatabaseModelService {
             .map(validate_model_list_cursor)
             .transpose()?;
         let pool = self.get_pool().await.map_err(internal_error)?;
+        let mut runner_items = self.runner_catalog_items(&user_id).await?;
 
         let visibility = if is_admin { "1 = 1" } else { "is_active = 1" };
         let count_sql =
@@ -2524,6 +2636,9 @@ impl ModelService for DatabaseModelService {
             .map_err(internal_error)?
             .try_get("total")
             .map_err(internal_error)?;
+        let total_i64 = total_i64
+            .checked_add(i64::try_from(runner_items.len()).map_err(internal_error)?)
+            .ok_or_else(|| internal_error("model list total overflow"))?;
         let total = u32::try_from(total_i64)
             .map_err(|error| internal_error(format!("model list total exceeds u32: {error}")))?;
 
@@ -2552,6 +2667,11 @@ impl ModelService for DatabaseModelService {
             .iter()
             .map(Self::model_list_item_from_row)
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some(cursor) = &cursor {
+            runner_items.retain(|item| model_list_item_after_cursor(item, cursor));
+        }
+        items.extend(runner_items);
+        sort_model_list_items(&mut items);
         let has_more = items.len() > limit as usize;
         if has_more {
             items.truncate(limit as usize);
@@ -2571,53 +2691,16 @@ impl ModelService for DatabaseModelService {
 
     async fn model_catalog_revision(
         &self,
-        _user_id: String,
+        user_id: String,
         is_admin: bool,
     ) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
-        let pool = self.get_pool().await.map_err(internal_error)?;
-        let visibility = if is_admin { "1 = 1" } else { "is_active = 1" };
-        let fingerprint_sql = format!(
-            "SELECT COUNT(*) AS total, \
-                    CAST(MIN(updated_at) AS CHAR) AS min_updated_at, \
-                    CAST(MAX(updated_at) AS CHAR) AS max_updated_at \
-             FROM infra_llm_models WHERE {visibility}"
-        );
-        let row = query(&fingerprint_sql)
-            .fetch_one(&pool)
+        // Runner availability is user-scoped and can change through heartbeat
+        // expiry without passing through this service instance. Derive the
+        // revision from the complete current projection so a stale process
+        // cache can never keep a disappeared personal model selectable.
+        self.list_models(user_id, is_admin)
             .await
-            .map_err(internal_error)?;
-        let fingerprint = CatalogRevisionFingerprint {
-            total: row.try_get("total").map_err(internal_error)?,
-            min_updated_at: row.try_get("min_updated_at").map_err(internal_error)?,
-            max_updated_at: row.try_get("max_updated_at").map_err(internal_error)?,
-        };
-        if let Some(cached) = self
-            .catalog_revision_cache
-            .lock()
-            .expect("catalog revision cache lock poisoned")
-            .get(&is_admin)
-            .filter(|cached| cached.fingerprint == fingerprint)
-        {
-            return Ok(cached.revision.clone());
-        }
-
-        // The fingerprint is cheap and changes on every catalog mutation made
-        // through this service. Only a new fingerprint pays the full
-        // canonical serialization cost; page drains therefore stay O(pages),
-        // not O(rows × pages).
-        let items = self.list_models(String::new(), is_admin).await?;
-        let revision = model_catalog_revision(&items);
-        self.catalog_revision_cache
-            .lock()
-            .expect("catalog revision cache lock poisoned")
-            .insert(
-                is_admin,
-                CachedCatalogRevision {
-                    fingerprint,
-                    revision: revision.clone(),
-                },
-            );
-        Ok(revision)
+            .map(|items| model_catalog_revision(&items))
     }
 
     async fn get_model(
@@ -2655,6 +2738,25 @@ impl ModelService for DatabaseModelService {
         )
         .await
         .map_err(model_offering_resolution_error_response)
+    }
+
+    async fn revalidate_model_execution(
+        &self,
+        user_id: String,
+        offering_id: String,
+    ) -> Result<AdmittedModelExecution, (StatusCode, Json<ErrorResponse>)> {
+        if offering_id.starts_with("runner-") {
+            let pool = self.pool.as_ref().ok_or_else(|| {
+                internal_error("Runner model resolution requires durable storage")
+            })?;
+            let binding =
+                crate::runner_model_bindings::resolve_runner_offering(pool, &user_id, &offering_id)
+                    .await
+                    .map_err(runner_model_error_response)?;
+            return Ok(AdmittedModelExecution::from_runner_binding(binding));
+        }
+        let offering = self.revalidate_model_offering(offering_id).await?;
+        AdmittedModelExecution::from_offering(offering).map_err(internal_error)
     }
 
     async fn revalidate_model_offering(
@@ -2812,7 +2914,6 @@ impl ModelService for DatabaseModelService {
         let mut record = Self::model_record_from_row(row)?;
         record.connectivity = conn_result;
         invalidate_active_llm_model_resolution_cache();
-        self.invalidate_catalog_revision_cache();
         Ok(record)
     }
 
@@ -2839,7 +2940,6 @@ impl ModelService for DatabaseModelService {
             .await
             .map_err(internal_error)?;
         invalidate_active_llm_model_resolution_cache();
-        self.invalidate_catalog_revision_cache();
         Ok(())
     }
 
@@ -2954,7 +3054,6 @@ impl ModelService for DatabaseModelService {
         record.connectivity = Some(check.unwrap_or_else(|| "ok".to_string()));
         record.thinking_probe = thinking_probe;
         invalidate_active_llm_model_resolution_cache();
-        self.invalidate_catalog_revision_cache();
         Ok(record)
     }
 }
@@ -4540,11 +4639,38 @@ mod tests {
             128_000,
         );
 
-        let debug = format!("{execution:?}");
-        assert!(!debug.contains("top-secret"));
-        assert!(!debug.contains("private.example"));
-        assert!(debug.contains("authorization"));
-        assert!(debug.contains("completions_url_override_present: true"));
+        for debug in [
+            format!("{execution:?}"),
+            format!("{:?}", execution.execution_material),
+            format!("{:?}", execution.server_material()),
+        ] {
+            assert!(!debug.contains("top-secret"));
+            assert!(!debug.contains("private.example"));
+            assert!(debug.contains("authorization"));
+            assert!(debug.contains("completions_url_override_present: true"));
+        }
+    }
+
+    #[test]
+    fn admitted_execution_server_material_debug_redacts_catalog_key_and_base_url() {
+        let material = ServerModelExecutionMaterial {
+            api_key: "catalog-secret".into(),
+            base_url: "https://private-catalog.example/v1?key=private-query".into(),
+            header_overrides: HashMap::from([("x-api-key".into(), "header-secret".into())]),
+            completions_url_override: None,
+            request_timeout_ms: None,
+        };
+        let debug = format!("{material:?}");
+        for secret in [
+            "catalog-secret",
+            "private-catalog.example",
+            "private-query",
+            "header-secret",
+        ] {
+            assert!(!debug.contains(secret));
+        }
+        assert!(debug.contains("credential_present: true"));
+        assert!(debug.contains("x-api-key"));
     }
 
     // ── resolve_model_alias ──

@@ -17,6 +17,18 @@ fn completion_response_id(response_id: Option<&str>) -> String {
         .unwrap_or_else(|| format!("chatcmpl-proxy-{}", uuid::Uuid::new_v4().simple()))
 }
 
+fn completion_provider_http_error(
+    error: astra_core::ClassifiedError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    let detail = crate::turn::llm::client::redact_provider_secrets(&error.message);
+    let detail = astra_text_utils::str_preview::truncate_str(&detail, 500);
+    crate::error_response_coded(
+        StatusCode::BAD_GATEWAY,
+        format!("Upstream LLM request failed ({}): {detail}", error.kind),
+        "model_provider_request_failed",
+    )
+}
+
 fn completion_timeout(timeout_ms: u64) -> Result<Duration, (StatusCode, Json<ErrorResponse>)> {
     if timeout_ms == 0 || timeout_ms > 120_000 {
         return Err(crate::error_response_coded(
@@ -89,6 +101,7 @@ pub(super) async fn completions_handler(
         };
         super::model_execution_admission::admit_model_execution(
             &state.model_service,
+            &user.user_id,
             &selection,
             None,
             None,
@@ -168,16 +181,25 @@ pub(super) async fn completions_handler(
     );
     // 4. Execute through the same typed provider boundary as agent turns.
     let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+    let route =
+        crate::turn::llm::client::LlmExecutionRoute::from_admitted(&admitted).map_err(|_| {
+            crate::error_response_coded(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Selected Offering requires a connected Runner executor",
+                "runner_inference_unavailable",
+            )
+        })?;
     let parsed = durable_ledger
         .execute_nonstream(
-            &state.http_client,
+            crate::turn::llm::transport::global_llm_client()
+                .map_err(completion_provider_http_error)?,
             invocation_scope,
             crate::turn::llm::client::LlmCall {
                 purpose,
                 messages: &messages,
                 tools: &[],
                 cache_capability: None,
-                route: crate::turn::llm::client::LlmExecutionRoute::from_admitted(&admitted),
+                route,
                 max_output_tokens: Some(request.max_tokens as usize),
                 temperature: Some(request.temperature),
                 has_fallback: false,
@@ -192,13 +214,7 @@ pub(super) async fn completions_handler(
             return Err(inference_ledger_http_error(error));
         }
         Err(error) => {
-            let detail = crate::turn::llm::client::redact_provider_secrets(&error.message);
-            let detail = astra_text_utils::str_preview::truncate_str(&detail, 500);
-            return Err(crate::error_response_coded(
-                StatusCode::BAD_GATEWAY,
-                format!("Upstream LLM request failed ({}): {detail}", error.kind),
-                "model_provider_request_failed",
-            ));
+            return Err(completion_provider_http_error(error));
         }
     };
 

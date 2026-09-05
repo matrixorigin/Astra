@@ -11,6 +11,7 @@ pub(crate) mod in_flight_agents_view;
 pub(crate) mod info_view;
 pub(crate) mod list_selection_view;
 pub(crate) mod login_view;
+pub(crate) mod model_setup_view;
 pub(crate) mod paste_burst;
 pub(crate) mod plan_review_view;
 pub(crate) mod root_transcript_view;

@@ -4,6 +4,7 @@ pub mod conflict_resolver;
 #[cfg(feature = "server")]
 pub mod edge_connection_pool;
 pub mod edge_ws_protocol;
+pub use astra_turn_types::runner_inference;
 pub mod session_run_tree;
 #[cfg(feature = "server")]
 pub mod team_orchestrator_traits;

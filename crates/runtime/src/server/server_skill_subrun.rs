@@ -1368,8 +1368,8 @@ mod tests {
     }
 
     #[test]
-    fn execution_policy_is_identical_for_server_and_edge_bindings() {
-        let edge_execution = AdmittedModelExecution::from_endpoint(
+    fn execution_policy_is_independent_from_tool_execution_binding() {
+        let execution = AdmittedModelExecution::from_endpoint(
             "offer-skill".to_string(),
             "test-model".to_string(),
             "openai".to_string(),
@@ -1378,8 +1378,6 @@ mod tests {
             None,
             128_000,
         );
-        let mut server_execution = edge_execution.clone();
-        server_execution.execution_placement = astra_services::ModelExecutionPlacement::Server;
 
         let build = |execution| {
             ServerSkillSubRunExecutor::new(
@@ -1390,13 +1388,13 @@ mod tests {
             )
             .with_admitted_model_execution(Some(execution))
         };
-        let server = build(server_execution)
+        let server = build(execution.clone())
             .resolve_execution_policy(
                 astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default(),
                 Some("test-model"),
             )
             .expect("Server execution policy");
-        let edge = build(edge_execution)
+        let edge = build(execution)
             .with_execution_binding_snapshot(edge_runtime_snapshot())
             .resolve_execution_policy(
                 astra_turn_core::chat_turn_heuristics::TaskExecutionProfile::default(),

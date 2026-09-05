@@ -1,8 +1,9 @@
 use astra_core::{SharedPool, matrixone_statement_with_null_shape};
 use astra_turn_types::{InferenceInvocationScope, InferencePurpose};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
+
+pub mod runner;
 
 use crate::model_request_context::{
     MODEL_REQUEST_CONTEXT_SCHEMA, ModelRequestContextEvent, ModelRequestContextScope,
@@ -13,6 +14,15 @@ use crate::models::{ModelAccessKind, ModelExecutionPlacement, validate_model_off
 use crate::service_error::{ServiceError, ServiceErrorKind, ServiceResult};
 
 const INFERENCE_ID_HEX_LEN: usize = 32;
+
+fn require_server_ledger_path(input: &InferenceInvocationInput) -> ServiceResult<()> {
+    if input.execution_placement != ModelExecutionPlacement::Server {
+        return Err(ServiceError::invalid(
+            "Runner inference requires exact remote grant and custody APIs",
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InferenceInvocationInput {
@@ -128,6 +138,11 @@ impl InferenceInvocationPlan {
     #[must_use]
     pub fn owner_generation(&self) -> u64 {
         self.owner_generation
+    }
+
+    #[must_use]
+    pub fn input(&self) -> &InferenceInvocationInput {
+        &self.input
     }
 
     /// Stable attempt identity within the caller-owned inference round.
@@ -321,58 +336,9 @@ impl InferenceProviderWireIdentity {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InferenceTerminalStatus {
-    Succeeded,
-    Failed,
-    Cancelled,
-    DeliveryUnknown,
-}
-
-impl InferenceTerminalStatus {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Succeeded => "succeeded",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-            Self::DeliveryUnknown => "delivery_unknown",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InferenceUsage {
-    /// Provider-normalized input buckets. Fresh input, cache reads, and cache
-    /// creation are disjoint and have one shared representation everywhere.
-    pub input: astra_turn_types::NormalizedPromptCacheUsage,
-    pub output_tokens: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InferenceUsageStatus {
-    /// The provider supplied terminal usage for the complete response.
-    ProviderExact,
-    /// The provider supplied usage before an interrupted/uncertain terminal.
-    ProviderPartial,
-    /// No provider usage fact was available. Numeric zeroes are placeholders,
-    /// not measured zero-token billing.
-    #[default]
-    Unavailable,
-}
-
-impl InferenceUsageStatus {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::ProviderExact => "provider_exact",
-            Self::ProviderPartial => "provider_partial",
-            Self::Unavailable => "unavailable",
-        }
-    }
-}
+pub use astra_turn_types::runner_inference::{
+    InferenceInvocationTerminal, InferenceTerminalStatus, InferenceUsage, InferenceUsageStatus,
+};
 
 /// Provider-I/O authority at an exact-attempt settlement boundary.
 ///
@@ -424,30 +390,6 @@ impl InferenceProviderDeliveryState {
         match self {
             Self::PreDelivery => "pre_delivery",
             Self::DeliveryAuthorized => "delivery_authorized",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InferenceInvocationTerminal {
-    pub status: InferenceTerminalStatus,
-    pub usage: InferenceUsage,
-    pub usage_status: InferenceUsageStatus,
-    pub provider_response_id: Option<String>,
-    pub error_kind: Option<String>,
-    pub error_message: Option<String>,
-}
-
-impl InferenceInvocationTerminal {
-    #[must_use]
-    pub fn succeeded(usage: InferenceUsage, provider_response_id: Option<String>) -> Self {
-        Self {
-            status: InferenceTerminalStatus::Succeeded,
-            usage,
-            usage_status: InferenceUsageStatus::ProviderExact,
-            provider_response_id,
-            error_kind: None,
-            error_message: None,
         }
     }
 }
@@ -691,22 +633,13 @@ fn checked_i64(value: u64, label: &str) -> ServiceResult<i64> {
 }
 
 fn terminal_fingerprint(terminal: &InferenceInvocationTerminal) -> ServiceResult<String> {
-    let payload = serde_json::to_vec(&serde_json::json!({
-        "status": terminal.status,
-        "usage": terminal.usage,
-        "usage_status": terminal.usage_status,
-        "provider_response_id": terminal.provider_response_id,
-        "error_kind": terminal.error_kind,
-        "error_message": terminal.error_message,
-    }))
-    .map_err(|error| {
+    astra_turn_types::runner_inference::inference_terminal_fingerprint(terminal).map_err(|error| {
         ServiceError::with_source(
             ServiceErrorKind::Internal,
             "serialize inference terminal fingerprint",
             error,
         )
-    })?;
-    Ok(format!("{:x}", Sha256::digest(payload)))
+    })
 }
 
 fn checked_optional_i64(value: Option<u64>, label: &str) -> ServiceResult<Option<i64>> {
@@ -1530,6 +1463,7 @@ pub async fn admit_inference_invocation(
     pool: &SharedPool,
     plan: &InferenceInvocationPlan,
 ) -> ServiceResult<()> {
+    require_server_ledger_path(&plan.input)?;
     let db = pool.get();
     if let Some(persisted) = load_invocation_admission_fact(db, plan).await? {
         return Err(existing_invocation_error(plan, &persisted));
@@ -2768,6 +2702,7 @@ pub async fn admit_inference_invocation_with_first_provider_attempt(
     invocation: &InferenceInvocationPlan,
     attempt: &InferenceProviderAttemptPlan,
 ) -> ServiceResult<()> {
+    require_server_ledger_path(&invocation.input)?;
     validate_first_provider_attempt_binding(invocation, attempt)?;
     let provider_wire_bytes = checked_i64(attempt.wire.provider_wire_bytes, "provider_wire_bytes")?;
     let db = pool.get();
@@ -3009,6 +2944,7 @@ pub async fn begin_inference_provider_attempt(
     pool: &SharedPool,
     attempt: &InferenceProviderAttemptPlan,
 ) -> ServiceResult<()> {
+    require_server_ledger_path(&attempt.invocation_input)?;
     let provider_wire_bytes = checked_i64(attempt.wire.provider_wire_bytes, "provider_wire_bytes")?;
     let db = pool.get();
     if let Some(persisted) = load_provider_attempt_fact(db, attempt).await? {
@@ -4146,6 +4082,7 @@ pub async fn finish_successful_inference_provider_attempt_and_invocation(
     attempt: &InferenceProviderAttemptPlan,
     terminal: &InferenceInvocationTerminal,
 ) -> ServiceResult<()> {
+    require_server_ledger_path(&plan.input)?;
     validate_first_provider_attempt_binding(plan, attempt)?;
     if terminal.status != InferenceTerminalStatus::Succeeded {
         return Err(ServiceError::invalid(
@@ -4333,6 +4270,7 @@ pub async fn finish_inference_provider_attempt(
     attempt: &InferenceProviderAttemptPlan,
     terminal: &InferenceInvocationTerminal,
 ) -> ServiceResult<()> {
+    require_server_ledger_path(&attempt.invocation_input)?;
     let fingerprint = terminal_fingerprint(terminal)?;
     let terminal_state = DurableInferenceTerminal::from_terminal(terminal, fingerprint.clone())?;
     let provider_wire_bytes = checked_i64(attempt.wire.provider_wire_bytes, "provider_wire_bytes")?;
@@ -6013,6 +5951,23 @@ async fn recover_expired_inference_invocation(
             "inference owner generation exhausted for {user_id}/{invocation_id}"
         ))
     })?;
+    // A remote grant may have escaped and its Runner may still own response
+    // custody. Lease expiry cannot synthesize away that authority. The Runner
+    // recovery owner derives reconciliation/continuation work from these same
+    // attempt rows and accepts exact late terminal evidence.
+    if sqlx::query(
+        "SELECT 1 FROM inference_provider_attempts
+        WHERE user_id = ? AND invocation_id = ? AND runner_grant_json IS NOT NULL LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(invocation_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .is_some()
+    {
+        tx.rollback().await?;
+        return Ok(0);
+    }
     let settlement_exists = sqlx::query(
         "SELECT 1 FROM inference_invocation_settlement_debts
          WHERE user_id = ? AND invocation_id = ? LIMIT 1",
@@ -6209,6 +6164,12 @@ async fn recover_expired_inference_invocations_batch(
              WHERE invocation.status = 'admitted'
                AND invocation.owner_lease_expires_at <= NOW(6)
                AND NOT EXISTS (
+                   SELECT 1 FROM inference_provider_attempts AS remote_attempt
+                   WHERE remote_attempt.user_id = invocation.user_id
+                     AND remote_attempt.invocation_id = invocation.invocation_id
+                     AND remote_attempt.runner_grant_json IS NOT NULL
+               )
+               AND NOT EXISTS (
                    SELECT 1 FROM inference_invocation_settlement_debts AS debt
                    WHERE debt.user_id = invocation.user_id
                      AND debt.invocation_id = invocation.invocation_id
@@ -6389,6 +6350,7 @@ pub async fn finish_inference_invocation(
     plan: &InferenceInvocationPlan,
     terminal: &InferenceInvocationTerminal,
 ) -> ServiceResult<()> {
+    require_server_ledger_path(&plan.input)?;
     let fingerprint = terminal_fingerprint(terminal)?;
     let terminal_state = DurableInferenceTerminal::from_terminal(terminal, fingerprint.clone())?;
     let db = pool.get();

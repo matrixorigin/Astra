@@ -245,9 +245,6 @@ pub struct AppState {
     /// All executors share a clone of this service so admin API changes
     /// take effect immediately on in-flight sessions.
     pub tool_execution_service: ToolExecutionService,
-    /// Shared HTTP client for upstream LLM proxy requests (completions handler).
-    /// Reuses connection pool and TLS state across requests.
-    pub(crate) http_client: reqwest::Client,
     /// Cloud-authoritative repository for plan state and step-run history.
     /// Defaults to [`astra_plan::InMemoryPlanRepository`]; production wires
     /// [`astra_plan::CloudPlanRepository`] backed by the MatrixOne pool.
@@ -353,12 +350,6 @@ impl AppState {
                 .unwrap_or_else(|| format!("astra-runtime-{}", uuid::Uuid::new_v4())),
             edge_connection_pool,
             tool_execution_service,
-            http_client: reqwest::Client::builder()
-                .no_proxy()
-                .connect_timeout(std::time::Duration::from_secs(30))
-                .timeout(std::time::Duration::from_secs(120))
-                .build()
-                .expect("failed to build shared HTTP client"),
             plan_repo: Arc::new(astra_plan::InMemoryPlanRepository::new()),
             cors_origins: None,
             metrics_registry: Arc::new(astra_turn_core::pipeline_metrics::MetricsRegistry::new()),

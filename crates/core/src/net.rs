@@ -75,38 +75,104 @@ pub fn apply_env_proxy(mut builder: reqwest::ClientBuilder) -> reqwest::ClientBu
         if proxy_url.is_empty() {
             continue;
         }
-        let is_all = matches!(*var, "ALL_PROXY" | "all_proxy");
-        let parsed = if is_all {
-            reqwest::Proxy::all(&proxy_url)
-        } else {
-            reqwest::Proxy::https(&proxy_url)
-        };
-        match parsed {
-            Ok(mut proxy) => {
-                if let Some(np) = no_proxy.clone() {
-                    proxy = proxy.no_proxy(Some(np));
-                }
-                tracing::info!(
-                    target: "astra_core::net",
-                    env_var = *var,
-                    proxy = %proxy_url,
-                    "applying proxy from environment"
-                );
-                builder = builder.proxy(proxy);
-                return builder;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: "astra_core::net",
-                    env_var = *var,
-                    proxy = %proxy_url,
-                    error = %e,
-                    "failed to parse proxy URL; ignoring"
-                );
-            }
+        if let Some(proxy) = parse_environment_proxy(var, &proxy_url, no_proxy.clone()) {
+            builder = builder.proxy(proxy);
+            return builder;
         }
     }
     builder
+}
+
+/// Build the client used by Runner-local model traffic.
+///
+/// Proxy settings use the same explicit external-egress policy as Server
+/// providers. Enterprises may additionally point `ASTRA_RUNNER_CA_BUNDLE` at
+/// a PEM bundle. The path and certificate contents are deliberately excluded
+/// from errors because this function is also used by user-facing diagnostics.
+pub fn runner_provider_client_builder()
+-> Result<reqwest::ClientBuilder, RunnerProviderNetworkConfigError> {
+    const MAX_CA_BUNDLE_BYTES: u64 = 4 * 1024 * 1024;
+
+    // A provider credential is authorized for exactly the configured origin.
+    // Following even a seemingly harmless redirect would let an untrusted or
+    // compromised endpoint choose the next Authorization recipient. Provider
+    // migrations must therefore be an explicit binding revision, not HTTP
+    // control flow.
+    let mut builder = apply_env_proxy(
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none()),
+    );
+    let Some(path) = std::env::var_os("ASTRA_RUNNER_CA_BUNDLE") else {
+        return Ok(builder);
+    };
+    let metadata = std::fs::metadata(&path)
+        .map_err(|_| RunnerProviderNetworkConfigError::CaBundleUnreadable)?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_CA_BUNDLE_BYTES {
+        return Err(RunnerProviderNetworkConfigError::CaBundleInvalid);
+    }
+    let bytes =
+        std::fs::read(path).map_err(|_| RunnerProviderNetworkConfigError::CaBundleUnreadable)?;
+    let certificates = reqwest::Certificate::from_pem_bundle(&bytes)
+        .map_err(|_| RunnerProviderNetworkConfigError::CaBundleInvalid)?;
+    if certificates.is_empty() {
+        return Err(RunnerProviderNetworkConfigError::CaBundleInvalid);
+    }
+    for certificate in certificates {
+        builder = builder.add_root_certificate(certificate);
+    }
+    Ok(builder)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunnerProviderNetworkConfigError {
+    CaBundleUnreadable,
+    CaBundleInvalid,
+}
+
+impl std::fmt::Display for RunnerProviderNetworkConfigError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::CaBundleUnreadable => "Runner private CA bundle cannot be read",
+            Self::CaBundleInvalid => {
+                "Runner private CA bundle must be a non-empty PEM certificate bundle of at most 4 MiB"
+            }
+        })
+    }
+}
+
+impl std::error::Error for RunnerProviderNetworkConfigError {}
+
+fn parse_environment_proxy(
+    var: &str,
+    proxy_url: &str,
+    no_proxy: Option<reqwest::NoProxy>,
+) -> Option<reqwest::Proxy> {
+    let parsed = if matches!(var, "ALL_PROXY" | "all_proxy") {
+        reqwest::Proxy::all(proxy_url)
+    } else {
+        reqwest::Proxy::https(proxy_url)
+    };
+    match parsed {
+        Ok(proxy) => {
+            tracing::info!(
+                target: "astra_core::net",
+                env_var = var,
+                "applying proxy from environment"
+            );
+            Some(proxy.no_proxy(no_proxy))
+        }
+        Err(_) => {
+            // URLs and parser errors can contain credentials, private hosts,
+            // and local paths. The variable name is enough to locate repair.
+            tracing::warn!(
+                target: "astra_core::net",
+                env_var = var,
+                "failed to parse proxy URL; ignoring"
+            );
+            None
+        }
+    }
 }
 
 /// Returns `true` when `url` targets the local host (`localhost`,
@@ -169,7 +235,75 @@ mod client_builder_for_target_tests {
 
 #[cfg(test)]
 mod apply_env_proxy_tests {
-    use super::apply_env_proxy;
+    use super::{apply_env_proxy, parse_environment_proxy, runner_provider_client_builder};
+
+    #[test]
+    fn proxy_configuration_logs_never_include_private_material() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("capture lock")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured = Capture(Arc::new(Mutex::new(Vec::new())));
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(
+                parse_environment_proxy(
+                    "HTTPS_PROXY",
+                    "http://canary-user:canary-secret@canary-proxy.invalid/private-path",
+                    None,
+                )
+                .is_some()
+            );
+            assert!(
+                parse_environment_proxy(
+                    "ALL_PROXY",
+                    "http://canary-user:canary-secret@[invalid/private-path",
+                    None,
+                )
+                .is_none()
+            );
+        });
+        let output = String::from_utf8(captured.0.lock().expect("capture lock").clone())
+            .expect("UTF-8 logs");
+        assert!(output.contains("applying proxy from environment"));
+        assert!(output.contains("failed to parse proxy URL; ignoring"));
+        assert!(output.contains("HTTPS_PROXY"));
+        assert!(output.contains("ALL_PROXY"));
+        for private_value in [
+            "canary-user",
+            "canary-secret",
+            "canary-proxy",
+            "private-path",
+            "[invalid",
+        ] {
+            assert!(
+                !output.contains(private_value),
+                "private configuration in logs"
+            );
+        }
+    }
 
     /// All four recognized env var names must be cleared for isolation, since
     /// `apply_env_proxy` reads them in precedence order.
@@ -242,5 +376,18 @@ mod apply_env_proxy_tests {
                 assert!(builder.build().is_ok());
             },
         );
+    }
+
+    #[test]
+    fn runner_ca_failures_do_not_disclose_private_paths() {
+        let private_path = "/private/customer/canary-ca.pem";
+        temp_env::with_var("ASTRA_RUNNER_CA_BUNDLE", Some(private_path), || {
+            let diagnostic = runner_provider_client_builder()
+                .expect_err("missing CA bundle must fail closed")
+                .to_string();
+            assert!(diagnostic.contains("cannot be read"));
+            assert!(!diagnostic.contains(private_path));
+            assert!(!diagnostic.contains("customer"));
+        });
     }
 }

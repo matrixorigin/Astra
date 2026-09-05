@@ -2,7 +2,7 @@
 //!
 //! ## What the hunt found
 //!
-//! The current parser in [`astra_turn_core::sse_data_lines`] intentionally
+//! The current parser in [`astra_inference_adapter::sse::data_lines`] intentionally
 //! treats every `data:` line inside a single SSE event-block as its own JSON
 //! payload. That is **not** what WHATWG Server-Sent Events § 9.2 specifies:
 //!
@@ -45,7 +45,7 @@
 //! 3. **Real bug-hunt results** captured inline so future readers see
 //!    *why* these tests exist, not just *what* they assert.
 
-use astra_turn_core::sse_data_lines::{
+use astra_inference_adapter::sse::data_lines::{
     json_events_from_sse_event_block, parse_sse_data_json_events, validate_sse_event_block_json,
 };
 use serde_json::{Value, json};

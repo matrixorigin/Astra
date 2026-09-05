@@ -706,6 +706,10 @@ pub(crate) struct CanonicalTerminalSettlementCommit {
     pub(crate) terminal_assistant_source_event_id: Option<String>,
 }
 
+fn should_acknowledge_runner_continuations(status: &str) -> bool {
+    astra_services::runs::durable_run_status_is_terminal(status)
+}
+
 fn atomic_terminal_request<'a>(
     append: &'a CanonicalLoopAppend<'a>,
     settlement: CanonicalTerminalSettlement<'a>,
@@ -1240,7 +1244,28 @@ async fn persist_server_loop_canonical_append_inner(
             )
             .await
         {
-            Ok(Some(commit)) => Some((store, commit)),
+            Ok(Some(commit)) => {
+                if should_acknowledge_runner_continuations(settlement.status)
+                    && let Err(error) = astra_services::inference_execution::runner::acknowledge_runner_continuations_for_terminal_run_tx(
+                    &mut tx,
+                    append.user_id,
+                    append.session_id,
+                    append.run_id,
+                    settlement.expected_owner_generation,
+                )
+                .await
+                {
+                    let rollback_error = tx.rollback().await.err();
+                    return Err(if let Some(rollback_error) = rollback_error {
+                        format!(
+                            "acknowledge Runner continuations failed: {error}; rollback also failed: {rollback_error}"
+                        )
+                    } else {
+                        format!("acknowledge Runner continuations failed: {error}")
+                    });
+                }
+                Some((store, commit))
+            }
             Ok(None) => {
                 let _ = tx.rollback().await;
                 return match resolve_existing_atomic_terminal_settlement(
@@ -1655,6 +1680,14 @@ pub(crate) fn restore_step_checkpoint_runtime_state(
             restored.workspace_observation_quarantine;
     }
     loop_state.consecutive_context_window_errors = restored.consecutive_context_window_errors;
+    // Do not derive these cursors from the attempt ledger.  The checkpoint is
+    // the only durable statement that its conversation has absorbed exactly
+    // these provider rounds; attempt rows can include retries, continuations,
+    // and work from a later executor.
+    loop_state.llm_rounds_completed = restored.llm_rounds_completed;
+    loop_state.current_round_index = restored.current_round_index;
+    loop_state.stall.runner_continuation_receipts = restored.runner_continuation_receipts;
+    loop_state.stall.restored_from_heavy_checkpoint = true;
     if let Some(compaction_state) = restored.compaction_state.as_ref() {
         loop_state.compaction_effectiveness =
             crate::turn::compaction_replay::CompactionEffectivenessTracker::from_json_lossy(
@@ -3837,6 +3870,16 @@ mod tests {
 
     static SHARED_BOOTSTRAP: tokio::sync::OnceCell<astra_core::SharedPool> =
         tokio::sync::OnceCell::const_new();
+
+    #[test]
+    fn runner_continuation_ack_is_reserved_for_irreversible_run_terminals() {
+        for status in ["completed", "delegated", "failed", "cancelled"] {
+            assert!(should_acknowledge_runner_continuations(status), "{status}");
+        }
+        for status in ["running", "waiting", "paused", "unknown"] {
+            assert!(!should_acknowledge_runner_continuations(status), "{status}");
+        }
+    }
 
     fn resolved_terminal_fixture() -> astra_services::runs::AtomicRunTerminalSettlementCommit {
         astra_services::runs::AtomicRunTerminalSettlementCommit {

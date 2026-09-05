@@ -101,10 +101,106 @@ struct EdgeConfig {
     edge_id: String,
     reconnect: bool,
     invocation_journal_root: Option<PathBuf>,
+    inference_host:
+        tokio::sync::Mutex<Option<(String, Arc<astra_edge::inference_host::InferenceHost>)>>,
 }
 
 #[derive(Debug)]
 struct PermanentEdgeConnectionError(String);
+
+async fn local_inference_host(
+    config: &EdgeConfig,
+    user_id: String,
+) -> Result<
+    Arc<astra_edge::inference_host::InferenceHost>,
+    astra_edge::inference_host::InferenceHostError,
+> {
+    use astra_credentials::{LocalModelConfigStore, ResolvedLocalCredential};
+    use astra_edge::inference_host::{InferenceHost, InferenceHostError, InferenceOwner};
+    use astra_inference_adapter::transport::ProviderTransport;
+    use astra_turn_types::runner_inference::RunnerInferenceId;
+
+    let scope = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&(&config.server_url, &user_id, &config.edge_id))
+                .map_err(|_| InferenceHostError::OwnerMismatch)?,
+        )
+    );
+    let mut cached = config.inference_host.lock().await;
+    if let Some((existing_scope, host)) = cached.as_ref() {
+        if existing_scope != &scope {
+            return Err(InferenceHostError::OwnerMismatch);
+        }
+        return Ok(host.clone());
+    }
+    let models_path = LocalModelConfigStore::new().path().to_owned();
+    let local_root = models_path
+        .parent()
+        .ok_or(InferenceHostError::UnsafeStorage)?
+        .to_owned();
+    // Provider traffic follows the shared external-egress policy. Proxy
+    // credentials and NO_PROXY stay in this local process and never enter a
+    // binding publication or Server request.
+    let transport = ProviderTransport::build(
+        astra_core::net::runner_provider_client_builder()
+            .map_err(|_| InferenceHostError::InvalidRequest)?,
+    )
+    .map_err(|_| InferenceHostError::InvalidRequest)?;
+    let host = InferenceHost::open(
+        local_root.join("runner-inference").join(&scope),
+        InferenceOwner {
+            deployment_identity: config.server_url.clone(),
+            user_id,
+            runner_id: RunnerInferenceId::new(config.edge_id.clone())
+                .map_err(|_| InferenceHostError::OwnerMismatch)?,
+        },
+        models_path.clone(),
+        local_root.join("model-secrets"),
+        transport,
+    )
+    .await?;
+    // This standalone executable is itself the attaching terminal. Refreshing
+    // the attachment lets an already-running TUI publish a newly configured
+    // environment-backed model without ever sending the value to Server.
+    async fn refresh_environment(
+        host: &Arc<InferenceHost>,
+        path: &std::path::Path,
+    ) -> Result<(), InferenceHostError> {
+        let path = path.to_owned();
+        let models =
+            tokio::task::spawn_blocking(move || LocalModelConfigStore::with_path(path).load())
+                .await
+                .map_err(|_| InferenceHostError::BindingUnavailable)?
+                .map_err(|_| InferenceHostError::BindingUnavailable)?;
+        for (name, model) in &models.models {
+            if let Ok(Some(credential)) =
+                ResolvedLocalCredential::from_environment(&model.credential, |name| {
+                    std::env::var(name).ok()
+                })
+            {
+                host.attach_environment(name.clone(), model.binding_revision, credential)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+    refresh_environment(&host, &models_path).await?;
+    let attachment_host = host.clone();
+    let attachment_path = models_path.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if let Err(error) = refresh_environment(&attachment_host, &attachment_path).await {
+                tracing::debug!(category = %error, "local environment attachment refresh deferred");
+            }
+        }
+    });
+    *cached = Some((scope, host.clone()));
+    Ok(host)
+}
 
 impl std::fmt::Display for PermanentEdgeConnectionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -483,6 +579,7 @@ fn resolve_config(args: Args) -> Result<EdgeConfig, String> {
         edge_id,
         reconnect: args.reconnect,
         invocation_journal_root: astra_runtime_env::local_state_root_override(),
+        inference_host: tokio::sync::Mutex::new(None),
     })
 }
 
@@ -986,7 +1083,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
     let auth_timeout = Duration::from_secs(EDGE_AUTH_TIMEOUT_SECS);
     let auth_response = tokio::time::timeout(auth_timeout, read.next()).await;
 
-    match auth_response {
+    let authenticated_user = match auth_response {
         Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<EdgeServerMessage>(&text)
         {
             Ok(EdgeServerMessage::AuthOk {
@@ -1005,6 +1102,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                 // connection authenticated with. The manager applies the
                 // generation rule and owns any persistence retry.
                 config.token_manager.mark_proven(&token_snapshot).await;
+                user_id
             }
             Ok(EdgeServerMessage::AuthError { message }) => {
                 tracing::error!(
@@ -1035,7 +1133,15 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
             );
             return Err("Auth timeout or connection closed".into());
         }
-    }
+    };
+
+    let mut inference = match local_inference_host(config, authenticated_user).await {
+        Ok(host) => Some(astra_edge::inference_connection::InferenceConnectionWorker::spawn(host)),
+        Err(error) => {
+            tracing::warn!(category = %error, "Runner inference unavailable; tool execution remains available");
+            None
+        }
+    };
 
     let session_id = format!("edge-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let executor = Arc::new(astra_tools::executor::DefaultToolExecutor::for_workspace(
@@ -1292,8 +1398,26 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                             Ok(EdgeServerMessage::AuthOk { .. } | EdgeServerMessage::AuthError { .. }) => {
                                 // ignore duplicate auth
                             }
+                            Ok(message @ (EdgeServerMessage::InferenceHelloAck { .. }
+                                | EdgeServerMessage::InferenceBindingAck { .. }
+                                | EdgeServerMessage::InferenceBindingRejected { .. }
+                                | EdgeServerMessage::InferenceDispatch { .. }
+                                | EdgeServerMessage::InferenceRequestChunk { .. }
+                                | EdgeServerMessage::InferenceCancel { .. }
+                                | EdgeServerMessage::InferenceReconcile { .. }
+                                | EdgeServerMessage::InferenceTerminalAck { .. }
+                                | EdgeServerMessage::InferenceResponseCredit { .. }
+                                | EdgeServerMessage::InferenceRejected { .. })) => {
+                                if let Some(worker) = &inference
+                                    && worker.commands.try_send(message).is_err()
+                                {
+                                    tracing::warn!("Runner inference input unavailable; reconnecting with durable custody");
+                                    break;
+                                }
+                            }
                             Err(e) => {
-                                tracing::warn!(error = %e, "Failed to parse server message");
+                                let diagnostic = astra_server_types::edge_ws_protocol::EdgeMessageDecodeDiagnostic::from(&e);
+                                tracing::warn!(category = diagnostic.category, line = diagnostic.line, column = diagnostic.column, "Failed to parse server message");
                             }
                         }
                     }
@@ -1305,6 +1429,17 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                         break;
                     }
                     _ => {}
+                }
+            }
+            message = async {
+                match inference.as_mut() {
+                    Some(worker) => worker.messages.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match message {
+                    Some(message) => write.send(Message::Text(serde_json::to_string(&message)?.into())).await?,
+                    None => { break; }
                 }
             }
             Some(completed) = completed_rx.recv() => {

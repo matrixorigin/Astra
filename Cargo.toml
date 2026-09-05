@@ -24,6 +24,7 @@ members = [
     "crates/astra-test-harness",
     "crates/astra-harness",
     "crates/astra-credentials",
+    "crates/astra-inference-adapter",
     "crates/astra-mcp",
     "crates/astra-memoria",
 ]
@@ -36,6 +37,7 @@ license = "Apache-2.0"
 
 [workspace.dependencies]
 astra-core = { path = "crates/core" }
+astra-inference-adapter = { path = "crates/astra-inference-adapter" }
 astra-credentials = { path = "crates/astra-credentials" }
 astra-harness = { path = "crates/astra-harness" }
 astra-logging = { path = "crates/astra-logging" }
@@ -101,6 +103,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
     "time",
 ] }
 unicode-normalization = "0.1"
+url = "2.5"
 # Keep the OpenTelemetry crates on one version line; tracing-opentelemetry 0.33
 # integrates with opentelemetry 0.32.
 opentelemetry = { version = "0.32.0", default-features = false, features = ["trace"] }

@@ -8898,7 +8898,11 @@ impl AgenticRunLifecycleService {
                 }],
                 offerings
                     .into_iter()
-                    .filter(|offering| offering.is_active)
+                    .filter(|offering| {
+                        offering.is_active
+                            && offering.execution_placement
+                                == astra_services::ModelExecutionPlacement::Server
+                    })
                     .map(astra_services::ModelListItemResponse::from)
                     .collect(),
                 chrono::Utc::now().to_rfc3339(),
@@ -8921,6 +8925,7 @@ impl AgenticRunLifecycleService {
             let selection = ModelSelection { offering_id };
             let admitted = crate::server::model_execution_admission::admit_model_execution(
                 &self.model_service,
+                user_id,
                 &selection,
                 None,
                 None,
@@ -8975,6 +8980,7 @@ impl AgenticRunLifecycleService {
             request.admitted_model_execution = Some(
                 crate::server::model_execution_admission::admit_model_execution(
                     &self.model_service,
+                    user_id,
                     selection,
                     Some(resolved),
                     Some(gateway),
@@ -8994,6 +9000,7 @@ impl AgenticRunLifecycleService {
         }
         let admitted = crate::server::model_execution_admission::admit_model_execution(
             &self.model_service,
+            user_id,
             selection,
             None,
             None,
@@ -10510,6 +10517,9 @@ impl AgenticRunLifecycleService {
 
         if let Some(pool) = &self.shared_pool {
             builder = builder.with_pool(pool.clone());
+        }
+        if let Some(pool) = &self.edge_connection_pool {
+            builder = builder.with_edge_connection_pool(pool.clone());
         }
         if let Some(svc) = &self.edge_dispatch_service {
             builder = builder.with_edge_dispatch_service(Arc::clone(svc));
@@ -21007,6 +21017,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
 
         if let Some(pool) = &self.shared_pool {
             builder = builder.with_pool(pool.clone());
+        }
+        if let Some(pool) = &self.edge_connection_pool {
+            builder = builder.with_edge_connection_pool(pool.clone());
         }
         if let Some(svc) = &self.edge_dispatch_service {
             builder = builder.with_edge_dispatch_service(Arc::clone(svc));

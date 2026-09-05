@@ -28,6 +28,7 @@ astra-core.workspace = true
 astra-sync-protocol.workspace = true
 astra-credentials.workspace = true
 astra-harness = { workspace = true, optional = true }
+astra-inference-adapter.workspace = true
 astra-logging.workspace = true
 astra-mcp.workspace = true
 astra-prompts.workspace = true

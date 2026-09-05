@@ -278,6 +278,17 @@ pub(crate) trait InferenceLedgerPersistence: Send + Sync {
         attempt: &astra_services::InferenceProviderAttemptPlan,
     ) -> astra_services::ServiceResult<()>;
 
+    async fn admit_runner_provider_attempt(
+        &self,
+        _plan: &astra_services::inference_execution::runner::RunnerProviderAttemptDispatchPlan,
+    ) -> astra_services::ServiceResult<
+        astra_turn_types::runner_inference::RunnerInferenceDispatchGrant,
+    > {
+        Err(astra_services::ServiceError::invalid(
+            "Runner provider attempts require durable database custody",
+        ))
+    }
+
     async fn finish_provider_attempt(
         &self,
         attempt: &astra_services::InferenceProviderAttemptPlan,
@@ -374,6 +385,19 @@ impl InferenceLedgerPersistence for DatabaseInferenceLedgerPersistence {
         attempt: &astra_services::InferenceProviderAttemptPlan,
     ) -> astra_services::ServiceResult<()> {
         astra_services::begin_inference_provider_attempt(&self.shared_pool, attempt).await
+    }
+
+    async fn admit_runner_provider_attempt(
+        &self,
+        plan: &astra_services::inference_execution::runner::RunnerProviderAttemptDispatchPlan,
+    ) -> astra_services::ServiceResult<
+        astra_turn_types::runner_inference::RunnerInferenceDispatchGrant,
+    > {
+        astra_services::inference_execution::runner::admit_runner_provider_attempt_dispatch(
+            &self.shared_pool,
+            plan,
+        )
+        .await
     }
 
     async fn finish_provider_attempt(
@@ -2694,9 +2718,29 @@ impl DurableInferenceLedger {
             upstream_model_name: upstream_model_name.to_string(),
             provider: provider.to_string(),
             purpose,
-            execution_placement: self.admitted_execution.execution_placement,
+            execution_placement: self.admitted_execution.execution_placement(),
             access_kind: self.admitted_execution.access_kind,
         }
+    }
+
+    /// Rebuild the fenced authority input for validating a historical
+    /// checkpoint marker before a new provider admission.  This is validation
+    /// only; it neither reserves an invocation nor authorizes provider I/O.
+    pub(crate) fn checkpoint_marker_input(
+        &self,
+        scope: astra_turn_types::InferenceInvocationScope,
+        purpose: astra_turn_types::InferencePurpose,
+        resolved_model_name: &str,
+        upstream_model_name: &str,
+        provider: &str,
+    ) -> astra_services::InferenceInvocationInput {
+        self.invocation_input(
+            scope,
+            purpose,
+            resolved_model_name,
+            upstream_model_name,
+            provider,
+        )
     }
 
     pub(crate) async fn next_logical_attempt_pair_base(
@@ -2727,13 +2771,7 @@ impl DurableInferenceLedger {
         upstream_model_name: &str,
         provider: &str,
     ) -> Result<DurableInferenceInvocation, DurableInferenceAdmissionFailure> {
-        let mut request_context = astra_services::ModelRequestContextSeed::server_default();
-        if self.admitted_execution.execution_placement
-            == astra_services::ModelExecutionPlacement::Edge
-        {
-            request_context.topology = astra_services::ModelRequestTopology::EdgeServer;
-            request_context.execution_binding = "edge".to_string();
-        }
+        let request_context = astra_services::ModelRequestContextSeed::server_default();
         self.admit_with_request_context(
             scope,
             purpose,
@@ -2798,7 +2836,7 @@ impl DurableInferenceLedger {
         }
         let request_context = normalize_request_context_for_execution(
             request_context,
-            self.admitted_execution.execution_placement,
+            self.admitted_execution.execution_placement(),
         );
         let mut scope = scope;
         let mut foreground_recoveries = 0_u32;
@@ -3080,7 +3118,7 @@ impl DurableInferenceLedger {
 
     pub(crate) async fn execute_nonstream(
         &self,
-        client: &reqwest::Client,
+        client: &astra_inference_adapter::transport::ProviderTransport,
         scope: astra_turn_types::InferenceInvocationScope,
         call: LlmCall<'_>,
         timeout: std::time::Duration,
@@ -3477,7 +3515,7 @@ pub(crate) struct DurableProviderRequestIdentity {
     pub request_id: String,
     pub request_hash: String,
     pub attempt: u32,
-    pub protocol: crate::turn::llm::client::LlmProviderProtocol,
+    pub protocol: astra_inference_adapter::ProviderProtocol,
     pub provider_wire_bytes: u64,
     pub composition: crate::turn::llm::client::ProviderWireComposition,
     pub fingerprints: crate::turn::llm::client::ProviderWireFingerprints,
@@ -3504,12 +3542,49 @@ impl DurableInferenceInvocation {
         self.plan.logical_attempt()
     }
 
+    pub(crate) fn runner_continuation_input(&self) -> astra_services::InferenceInvocationInput {
+        self.plan.input().clone()
+    }
+
+    pub(crate) fn owner_token(&self) -> &str {
+        self.plan.owner_token()
+    }
+
     pub(crate) fn attempt_observer(&self) -> &dyn ProviderAttemptObserver {
         self.observer.as_ref()
     }
 
     pub(crate) fn attempt_observer_arc(&self) -> Arc<dyn ProviderAttemptObserver> {
         self.observer.clone()
+    }
+
+    pub(crate) async fn admit_runner_attempt(
+        &self,
+        prepared: &crate::turn::llm::client::PreparedRunnerRequest,
+        binding: &astra_services::runner_model_bindings::ResolvedRunnerModelBinding,
+        deadline_unix_ms: u64,
+    ) -> Result<
+        (
+            u32,
+            astra_turn_types::runner_inference::RunnerInferenceDispatchGrant,
+        ),
+        astra_core::ClassifiedError,
+    > {
+        let body = prepared.exact_body();
+        self.observer
+            .admit_runner_attempt(prepared.identity(), &body, binding, deadline_unix_ms)
+            .await
+    }
+
+    pub(crate) async fn observe_runner_terminal(
+        &self,
+        attempt_index: u32,
+        physical_terminal: astra_services::InferenceInvocationTerminal,
+        logical_terminal: astra_services::InferenceInvocationTerminal,
+    ) {
+        self.observer
+            .observe_runner_terminal(attempt_index, physical_terminal, logical_terminal)
+            .await;
     }
 
     /// Bind the canonical append WAL before the first physical attempt is
@@ -3674,6 +3749,9 @@ impl DurableInferenceInvocation {
         &self,
         result: &LlmCallResult,
     ) -> Result<(), astra_core::ClassifiedError> {
+        if let Some(terminal) = self.observer.committed_logical_terminal().await {
+            return self.finish(&terminal).await;
+        }
         self.finish(&terminal_from_result(result)).await
     }
 
@@ -3681,6 +3759,16 @@ impl DurableInferenceInvocation {
         &self,
         error: &astra_core::ClassifiedError,
     ) -> Result<(), astra_core::ClassifiedError> {
+        if let Some(terminal) = self.observer.committed_logical_terminal().await {
+            return self.finish(&terminal).await;
+        }
+        // Once a Runner grant may have committed, its durable response custody
+        // and continuation are the only safe settlement authority. A local
+        // timeout, disconnect, or ambiguous database acknowledgement must not
+        // manufacture a competing Server-side physical terminal.
+        if self.observer.runner_custody.load(Ordering::Acquire) {
+            return Ok(());
+        }
         if is_ledger_error(error) {
             // The detached provider-attempt operation still owns its exact
             // terminal. Keep the foreground bounded, but transfer logical
@@ -3870,6 +3958,7 @@ struct DurableProviderAttemptObserver {
     admitted_canonical_transition_id: std::sync::Mutex<Option<String>>,
     next_attempt: AtomicU32,
     dispatch_started: AtomicBool,
+    runner_custody: AtomicBool,
     dispatched_attempts: std::sync::Mutex<BTreeSet<u32>>,
     state: Arc<tokio::sync::Mutex<ProviderAttemptState>>,
     operations: ProviderOperationGate,
@@ -4026,6 +4115,149 @@ where
 }
 
 impl DurableProviderAttemptObserver {
+    async fn admit_runner_attempt(
+        &self,
+        wire: &ProviderWireRequestIdentity,
+        exact_body: &[u8],
+        binding: &astra_services::runner_model_bindings::ResolvedRunnerModelBinding,
+        deadline_unix_ms: u64,
+    ) -> Result<
+        (
+            u32,
+            astra_turn_types::runner_inference::RunnerInferenceDispatchGrant,
+        ),
+        astra_core::ClassifiedError,
+    > {
+        self.owner_lease
+            .ensure_live("Runner provider attempt admission")?;
+        let _permit = self
+            .operations
+            .register("Runner provider attempt admission")?;
+        let attempt_index = self.next_attempt.fetch_add(1, Ordering::AcqRel);
+        let service_wire = astra_services::InferenceProviderWireIdentity::new(
+            wire.protocol.as_str(),
+            wire.provider_wire_hash.clone(),
+            wire.provider_wire_bytes,
+        )
+        .map_err(|error| service_error("Runner provider wire identity", error))?
+        .with_composition(astra_services::ModelRequestWireComposition {
+            system_bytes: wire.composition.system_bytes,
+            conversation_bytes: wire.composition.conversation_bytes,
+            tool_schema_bytes: wire.composition.tool_schema_bytes,
+            provider_envelope_bytes: wire.composition.provider_envelope_bytes,
+            system_items: wire.composition.system_items,
+            conversation_items: wire.composition.conversation_items,
+            tool_schema_items: wire.composition.tool_schema_items,
+        });
+        let transitions = self
+            .canonical_transitions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let plan =
+            astra_services::inference_execution::runner::plan_runner_provider_attempt_dispatch(
+                astra_services::inference_execution::runner::RunnerProviderAttemptDispatchInput {
+                    invocation: &self.invocation,
+                    attempt_index,
+                    wire: service_wire,
+                    request_context: self.request_context.clone(),
+                    canonical_transitions: &transitions,
+                    binding,
+                    request: exact_body,
+                    deadline_unix_ms,
+                },
+            )
+            .map_err(|error| service_error("Runner provider attempt planning", error))?;
+        let request = DurableProviderRequestIdentity {
+            request_id: plan.attempt().request_id().to_string(),
+            request_hash: wire.provider_wire_hash.clone(),
+            attempt: attempt_index,
+            protocol: wire.protocol,
+            provider_wire_bytes: wire.provider_wire_bytes,
+            composition: wire.composition.clone(),
+            fingerprints: wire.fingerprints.clone(),
+        };
+        {
+            let mut state = self.state.lock().await;
+            state.requests.insert(attempt_index, request);
+            state
+                .open_attempts
+                .insert(attempt_index, plan.attempt().clone());
+        }
+        // From this point an acknowledgement failure is ambiguous: the atomic
+        // admission may already be committed. Transfer settlement authority
+        // before the await so Drop/error paths can never invent a competing
+        // Server transport outcome.
+        self.runner_custody.store(true, Ordering::Release);
+        let mut retry_delay = std::time::Duration::from_millis(25);
+        let grant = loop {
+            match self.persistence.admit_runner_provider_attempt(&plan).await {
+                Ok(grant) => break grant,
+                Err(error)
+                    if matches!(
+                        error.kind,
+                        astra_services::ServiceErrorKind::Persistence
+                            | astra_services::ServiceErrorKind::Network
+                            | astra_services::ServiceErrorKind::ConflictTransient
+                    ) && retry_delay <= std::time::Duration::from_millis(100) =>
+                {
+                    // The transaction outcome may be unknown. Reconcile only
+                    // by replaying the byte-identical plan; a fresh grant or
+                    // attempt identity could duplicate provider work.
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay *= 2;
+                }
+                Err(error) => {
+                    let ambiguous = matches!(
+                        error.kind,
+                        astra_services::ServiceErrorKind::Persistence
+                            | astra_services::ServiceErrorKind::Network
+                            | astra_services::ServiceErrorKind::ConflictTransient
+                    );
+                    if !ambiguous {
+                        let mut state = self.state.lock().await;
+                        state.requests.remove(&attempt_index);
+                        state.open_attempts.remove(&attempt_index);
+                        // No durable Runner authority can exist for a
+                        // definitive pre-commit rejection. Restore ordinary
+                        // invocation settlement instead of stranding it in
+                        // Runner custody.
+                        self.runner_custody.store(false, Ordering::Release);
+                    }
+                    return Err(service_error("Runner provider attempt admission", error));
+                }
+            }
+        };
+        if let Some(transition_id) = transitions.first().map(|item| item.transition_id.clone()) {
+            *self
+                .admitted_canonical_transition_id
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(transition_id);
+        }
+        self.owner_lease
+            .ensure_live("Runner provider delivery authorization")?;
+        self.state
+            .lock()
+            .await
+            .delivery_authorized
+            .insert(attempt_index);
+        self.note_dispatch_started(attempt_index);
+        Ok((attempt_index, grant))
+    }
+
+    async fn observe_runner_terminal(
+        &self,
+        attempt_index: u32,
+        physical_terminal: astra_services::InferenceInvocationTerminal,
+        logical_terminal: astra_services::InferenceInvocationTerminal,
+    ) {
+        let mut state = self.state.lock().await;
+        state.open_attempts.remove(&attempt_index);
+        state.delivery_authorized.remove(&attempt_index);
+        state.terminals.insert(attempt_index, physical_terminal);
+        state.logical_terminal = Some(logical_terminal);
+    }
+
     #[cfg(test)]
     fn new_with_persistence(
         persistence: Arc<dyn InferenceLedgerPersistence>,
@@ -4065,6 +4297,7 @@ impl DurableProviderAttemptObserver {
             admitted_canonical_transition_id: std::sync::Mutex::new(None),
             next_attempt: AtomicU32::new(0),
             dispatch_started: AtomicBool::new(false),
+            runner_custody: AtomicBool::new(false),
             dispatched_attempts: std::sync::Mutex::new(BTreeSet::new()),
             state: Arc::new(tokio::sync::Mutex::new(ProviderAttemptState::default())),
             operations: ProviderOperationGate::default(),
@@ -4208,6 +4441,10 @@ impl Drop for DurableProviderAttemptObserver {
         else {
             return;
         };
+        if self.runner_custody.load(Ordering::Acquire) {
+            drop(reservation);
+            return;
+        }
         if self.owner_lease.is_lost() {
             drop(reservation);
             return;
@@ -4591,20 +4828,24 @@ mod tests {
         let execution = astra_services::AdmittedModelExecution {
             offering_id: "offering-test".to_string(),
             access_kind: astra_services::ModelAccessKind::SelfHosted,
-            execution_placement: astra_services::ModelExecutionPlacement::Server,
+            source: astra_services::ModelAdmissionSource::ServerCatalog,
+            execution_material: astra_services::ModelExecutionMaterial::Server(
+                astra_services::ServerModelExecutionMaterial {
+                    api_key: "test-key".to_string(),
+                    base_url: base_url.to_string(),
+                    header_overrides: std::collections::HashMap::new(),
+                    completions_url_override: None,
+                    request_timeout_ms: None,
+                },
+            ),
             model_name: "model-test".to_string(),
             wire_model_name: None,
-            api_key: "test-key".to_string(),
-            base_url: base_url.to_string(),
             provider: "openai".to_string(),
             cache_capability: None,
             thinking_capability: None,
             request_body_overrides: None,
             context_window: Some(8_192),
             max_completion_tokens: Some(1_024),
-            header_overrides: std::collections::HashMap::new(),
-            completions_url_override: None,
-            request_timeout_ms: None,
         };
         DurableInferenceLedger::required_with_persistence(
             None,
@@ -4694,10 +4935,10 @@ mod tests {
         let base = spawn_test_server(app).await;
         let (ledger, persistence) = test_ledger(&base);
         let messages = vec![serde_json::json!({"role":"user","content":"x"})];
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("test client");
+        let client = astra_inference_adapter::transport::ProviderTransport::build(
+            reqwest::Client::builder().no_proxy(),
+        )
+        .expect("test client");
         let started = std::time::Instant::now();
 
         let error = ledger
@@ -4740,10 +4981,10 @@ mod tests {
         let (ledger, persistence) = test_ledger(&base);
         let caller = tokio::spawn(async move {
             let messages = vec![serde_json::json!({"role":"user","content":"x"})];
-            let client = reqwest::Client::builder()
-                .no_proxy()
-                .build()
-                .expect("test client");
+            let client = astra_inference_adapter::transport::ProviderTransport::build(
+                reqwest::Client::builder().no_proxy(),
+            )
+            .expect("test client");
             ledger
                 .execute_nonstream(
                     &client,
@@ -4836,10 +5077,10 @@ mod tests {
         let persistence = Arc::new(DelayedTrackedTerminalPersistence::default());
         let ledger = test_ledger_with_persistence(&base, persistence.clone());
         let messages = vec![serde_json::json!({"role":"user","content":"x"})];
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("test client");
+        let client = astra_inference_adapter::transport::ProviderTransport::build(
+            reqwest::Client::builder().no_proxy(),
+        )
+        .expect("test client");
 
         let error = ledger
             .execute_nonstream(
@@ -5873,7 +6114,7 @@ mod tests {
             owner_lease: observer.owner_lease.clone(),
         };
         let wire = ProviderWireRequestIdentity {
-            protocol: crate::turn::llm::client::LlmProviderProtocol::OpenAiCompatible,
+            protocol: astra_inference_adapter::ProviderProtocol::OpenAiCompatible,
             provider_wire_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .to_string(),
             provider_wire_bytes: 2,
@@ -6343,10 +6584,10 @@ mod tests {
             let mut ledger = test_ledger_with_persistence(&base, persistence.clone());
             ledger.settlement_coordinator = coordinator.clone();
             let messages = vec![serde_json::json!({"role":"user","content":"x"})];
-            let client = reqwest::Client::builder()
-                .no_proxy()
-                .build()
-                .expect("test client");
+            let client = astra_inference_adapter::transport::ProviderTransport::build(
+                reqwest::Client::builder().no_proxy(),
+            )
+            .expect("test client");
 
             let result = ledger
                 .execute_nonstream(
@@ -7454,7 +7695,7 @@ mod tests {
             owner_lease: observer.owner_lease.clone(),
         };
         let wire = ProviderWireRequestIdentity {
-            protocol: crate::turn::llm::client::LlmProviderProtocol::OpenAiCompatible,
+            protocol: astra_inference_adapter::ProviderProtocol::OpenAiCompatible,
             provider_wire_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .into(),
             provider_wire_bytes: 2,
@@ -7515,7 +7756,7 @@ mod tests {
             owner_lease: observer.owner_lease.clone(),
         };
         let wire = ProviderWireRequestIdentity {
-            protocol: crate::turn::llm::client::LlmProviderProtocol::OpenAiCompatible,
+            protocol: astra_inference_adapter::ProviderProtocol::OpenAiCompatible,
             provider_wire_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .into(),
             provider_wire_bytes: 2,
@@ -7606,7 +7847,7 @@ mod tests {
             owner_lease: observer.owner_lease.clone(),
         };
         let wire = ProviderWireRequestIdentity {
-            protocol: crate::turn::llm::client::LlmProviderProtocol::OpenAiCompatible,
+            protocol: astra_inference_adapter::ProviderProtocol::OpenAiCompatible,
             provider_wire_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .into(),
             provider_wire_bytes: 2,
@@ -7662,7 +7903,7 @@ mod tests {
             astra_services::ModelRequestContextSeed::server_default(),
         );
         let wire = ProviderWireRequestIdentity {
-            protocol: crate::turn::llm::client::LlmProviderProtocol::OpenAiCompatible,
+            protocol: astra_inference_adapter::ProviderProtocol::OpenAiCompatible,
             provider_wire_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .into(),
             provider_wire_bytes: 2,
@@ -7752,7 +7993,7 @@ mod tests {
 
     fn test_wire_identity() -> ProviderWireRequestIdentity {
         ProviderWireRequestIdentity {
-            protocol: crate::turn::llm::client::LlmProviderProtocol::OpenAiCompatible,
+            protocol: astra_inference_adapter::ProviderProtocol::OpenAiCompatible,
             provider_wire_hash: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                 .to_string(),
             provider_wire_bytes: 128,
@@ -7821,6 +8062,54 @@ mod tests {
             .await
             .unwrap();
         invocation.finish(&terminal).await.unwrap();
+        persistence.assert_quiescent();
+    }
+
+    #[tokio::test]
+    async fn provider_gateway_ledger_records_server_execution() {
+        let persistence = TestInferenceLedgerPersistence::default();
+        let invocation = test_invocation(persistence.clone()).await;
+        // Route identity includes physical placement and access ownership.
+        // Compare the admitted result through the public plan contract rather
+        // than exposing its private input merely to inspect these facts.
+        let expected =
+            astra_services::plan_inference_invocation(astra_services::InferenceInvocationInput {
+                user_id: "user-test".to_string(),
+                run_authority: Some(astra_services::InferenceRunAdmissionAuthority {
+                    expected_owner_generation: 0,
+                    expected_owner_pod_id: "test-inference-owner".to_string(),
+                    expected_control_epoch: 0,
+                }),
+                scope: astra_turn_types::InferenceInvocationScope::Run {
+                    session_id: "session-test".to_string(),
+                    run_id: "run-test".to_string(),
+                    turn: 1,
+                    round: 0,
+                    operation_id: "agent_turn".to_string(),
+                    logical_attempt: 0,
+                },
+                offering_id: "offer-test".to_string(),
+                resolved_model_name: "model-test".to_string(),
+                upstream_model_name: "model-test".to_string(),
+                provider: "openai".to_string(),
+                purpose: astra_turn_types::InferencePurpose::PrimaryAgent,
+                execution_placement: astra_services::ModelExecutionPlacement::Server,
+                access_kind: astra_services::ModelAccessKind::ThisDevice,
+            })
+            .expect("expected Server gateway route");
+        assert_eq!(invocation.plan.route_id(), expected.route_id());
+        assert_eq!(
+            invocation.observer.request_context.execution_binding,
+            "server"
+        );
+        assert_eq!(
+            invocation.observer.request_context.topology,
+            astra_services::ModelRequestTopology::ServerOnly
+        );
+        invocation
+            .finish(&pre_provider_cancelled_terminal())
+            .await
+            .expect("close undispatched gateway invocation");
         persistence.assert_quiescent();
     }
 
@@ -8298,7 +8587,7 @@ mod tests {
                         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
                             .to_string(),
                     attempt,
-                    protocol: crate::turn::llm::client::LlmProviderProtocol::OpenAiCompatible,
+                    protocol: astra_inference_adapter::ProviderProtocol::OpenAiCompatible,
                     provider_wire_bytes: 128,
                     composition: crate::turn::llm::client::ProviderWireComposition {
                         provider_envelope_bytes: 128,

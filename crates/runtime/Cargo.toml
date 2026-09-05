@@ -35,6 +35,7 @@ astra-logging.workspace = true
 astra-memoria.workspace = true
 astra-config.workspace = true
 astra-core.workspace = true
+astra-inference-adapter.workspace = true
 astra-messaging.workspace = true
 astra-text-utils.workspace = true
 astra-pipeline.workspace = true

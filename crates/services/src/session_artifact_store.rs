@@ -1008,6 +1008,51 @@ pub(crate) async fn load_json_artifact_from_pool(
     row.as_ref().map(stored_artifact_from_row).transpose()
 }
 
+/// Transactional immutable-artifact owner used by inference custody. The caller
+/// holds canonical session admission locks; payload and its durable reference
+/// become visible in the same commit as the referencing execution fact.
+pub(crate) async fn persist_referenced_json_artifact_tx(
+    connection: &mut sqlx::MySqlConnection,
+    record: &SessionArtifactJsonRecord,
+) -> Result<(), SessionArtifactStoreError> {
+    validate_session_id(&record.session_id)?;
+    if record.artifact_id.is_empty() || is_mutable_artifact_projection_id(&record.artifact_id) {
+        return Err(SessionArtifactStoreError::ReservedMutableProjectionId(
+            record.artifact_id.clone(),
+        ));
+    }
+    validate_artifact_references(&record.references)?;
+    let retention_until = (!record.references.is_empty())
+        .then(|| (chrono::Utc::now() + chrono::Duration::days(30)).naive_utc());
+    query(
+        "INSERT INTO session_artifacts
+         (artifact_id, session_id, user_id, artifact_kind, source, turn, round, content_json, metadata, retention_until, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(6))",
+    )
+    .bind(&record.artifact_id).bind(&record.session_id).bind(&record.user_id)
+    .bind(&record.artifact_kind).bind(record.source.as_deref())
+    .bind(encode_counter(record.turn, SessionArtifactStoreError::TurnOverflow)?)
+    .bind(encode_counter(record.round, SessionArtifactStoreError::RoundOverflow)?)
+    .bind(serde_json::to_string(&record.content)?)
+    .bind(record.metadata.as_ref().map(|value| value.to_string())).bind(retention_until)
+    .execute(&mut *connection).await?;
+    for reference in &record.references {
+        query(
+            "INSERT INTO session_artifact_references
+            (user_id, session_id, artifact_id, reference_kind, reference_id, created_at)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP(6))",
+        )
+        .bind(&record.user_id)
+        .bind(&record.session_id)
+        .bind(&record.artifact_id)
+        .bind(reference.kind.wire_name())
+        .bind(reference.reference_id.trim())
+        .execute(&mut *connection)
+        .await?;
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
     async fn persist_json_artifact(
@@ -1027,52 +1072,8 @@ impl SessionArtifactJsonStore for DatabaseSessionArtifactStore {
         let pool = self.get_pool().await?;
         self.require_owned_session(&pool, &record.user_id, &record.session_id)
             .await?;
-        let content_json = serde_json::to_string(&record.content)?;
-        let metadata_json = record
-            .metadata
-            .as_ref()
-            .map(|metadata| metadata.to_string());
-        let retention_until = (!record.references.is_empty())
-            .then(|| (chrono::Utc::now() + chrono::Duration::days(30)).naive_utc());
         let mut tx = pool.begin().await?;
-        query(
-            "INSERT INTO session_artifacts \
-             (artifact_id, session_id, user_id, artifact_kind, source, turn, round, content_json, metadata, retention_until, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(6))",
-        )
-        .bind(&record.artifact_id)
-        .bind(&record.session_id)
-        .bind(&record.user_id)
-        .bind(&record.artifact_kind)
-        .bind(record.source.as_deref())
-        .bind(encode_counter(
-            record.turn,
-            SessionArtifactStoreError::TurnOverflow,
-        )?)
-        .bind(encode_counter(
-            record.round,
-            SessionArtifactStoreError::RoundOverflow,
-        )?)
-        .bind(&content_json)
-        .bind(metadata_json)
-        .bind(retention_until)
-        .execute(&mut *tx)
-        .await?;
-
-        for reference in &record.references {
-            query(
-                "INSERT INTO session_artifact_references \
-                 (user_id, session_id, artifact_id, reference_kind, reference_id, created_at) \
-                 VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP(6))",
-            )
-            .bind(&record.user_id)
-            .bind(&record.session_id)
-            .bind(&record.artifact_id)
-            .bind(reference.kind.wire_name())
-            .bind(reference.reference_id.trim())
-            .execute(&mut *tx)
-            .await?;
-        }
+        persist_referenced_json_artifact_tx(&mut tx, &record).await?;
         tx.commit().await?;
 
         let row = query(

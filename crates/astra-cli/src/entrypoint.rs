@@ -292,7 +292,7 @@ async fn run_async() -> i32 {
     }
 
     let _ = (startup_trace, bare);
-    let cli_context = match cli::cli_config::cli_context::CliContext::from_launch_options(
+    let mut cli_context = match cli::cli_config::cli_context::CliContext::from_launch_options(
         no_journal_content,
         &allowed_tools,
         &disallowed_tools,
@@ -377,6 +377,64 @@ async fn run_async() -> i32 {
         None
     };
     let resolved_model = normalize_model_override_owned(cli_model.or(config_default_model));
+
+    let runner_surface = print_mode
+        || continue_last
+        || resume.is_some()
+        || matches!(
+            command.as_ref(),
+            None | Some(cli::cli_config::cli_args::Command::Interactive)
+                | Some(cli::cli_config::cli_args::Command::Chat(_))
+                | Some(cli::cli_config::cli_args::Command::Message(_))
+                | Some(cli::cli_config::cli_args::Command::Review(_))
+                | Some(cli::cli_config::cli_args::Command::Team(_))
+                | Some(cli::cli_config::cli_args::Command::Work(_))
+        );
+    let local_models_configured = astra_credentials::LocalModelConfigStore::new()
+        .load()
+        .map(|config| !config.models.is_empty())
+        .unwrap_or(false);
+    let interactive_runner_surface = !print_mode
+        && (continue_last
+            || resume.is_some()
+            || matches!(
+                command.as_ref(),
+                None | Some(cli::cli_config::cli_args::Command::Interactive)
+            ));
+    let local_runner = if runner_surface && (local_models_configured || interactive_runner_surface)
+    {
+        let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        match cli::local_runner_lifecycle::start(&api.api_origin(), profile.as_deref(), &workspace)
+        {
+            Ok(mut runner) => match runner
+                .wait_until_alive(std::time::Duration::from_millis(500))
+                .await
+            {
+                Ok(()) => Some(runner),
+                Err(error) if local_models_configured => {
+                    eprintln!("{}", format!("Error: {error}").red());
+                    return i32::from(ExitCode::ApiError);
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "User Runner exited before model setup was requested");
+                    None
+                }
+            },
+            Err(error) if local_models_configured => {
+                eprintln!("{}", format!("Error: {error}").red());
+                return i32::from(ExitCode::ApiError);
+            }
+            Err(error) => {
+                tracing::debug!(%error, "User Runner is not installed; Server models remain available");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    cli_context.local_runner_id = local_runner
+        .as_ref()
+        .map(|runner| runner.edge_id().to_owned());
 
     // Make the resolved model available to slash commands that print
     // model-aware diagnostics without mutating the process environment.

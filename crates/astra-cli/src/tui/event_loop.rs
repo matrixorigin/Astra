@@ -182,6 +182,44 @@ struct WorkStartCompletion {
     result: Result<serde_json::Value, String>,
 }
 
+struct ModelSetupCompletion {
+    name: String,
+    result: Result<ModelSetupReady, String>,
+}
+
+struct ModelSetupReady {
+    offering_id: Option<String>,
+    catalog: Vec<crate::cli::slash::slash_router::ModelCatalogEntry>,
+}
+
+fn local_runner_offering<'a>(
+    catalog: &'a [crate::cli::slash::slash_router::ModelCatalogEntry],
+    runner_id: &str,
+    display_name: &str,
+) -> Result<&'a crate::cli::slash::slash_router::ModelCatalogEntry, String> {
+    // The local model name is the user's configuration key, not a routing
+    // identity. Restrict this one-time catalog reconciliation to the exact
+    // Runner identity, reject ambiguity, and return the opaque Offering ID for
+    // every subsequent selection/request path.
+    let access_id = format!("runner-{runner_id}");
+    let mut matches = catalog.iter().filter(|entry| {
+        entry.access_id == access_id
+            && crate::cli::slash::slash_router::entry_model_name(entry)
+                .is_some_and(|name| name.eq_ignore_ascii_case(display_name))
+    });
+    let Some(entry) = matches.next() else {
+        return Err(format!(
+            "the local Runner published no Offering for '{display_name}'"
+        ));
+    };
+    if matches.next().is_some() {
+        return Err(format!(
+            "the local Runner published multiple Offerings for '{display_name}'"
+        ));
+    }
+    Ok(entry)
+}
+
 fn work_start_request_id(session_id: &str, goal: &str) -> String {
     use sha2::{Digest, Sha256};
 
@@ -276,13 +314,15 @@ fn apply_model_catalog_effect(
 ) -> bool {
     match effect {
         ModelCatalogEffect::Ready(Ok(catalog)) => {
-            let names = catalog
-                .iter()
-                .filter_map(crate::cli::slash::slash_router::entry_model_name)
-                .map(ToOwned::to_owned)
-                .collect();
+            if let Some(message) =
+                crate::cli::slash::slash_router::unavailable_model_repair_summary(&catalog)
+            {
+                chat_widget.commit_system(history_cell::system::SystemCell::info(message));
+            }
+            let opened =
+                slash_dispatch::push_model_picker(state, bottom_pane, chat_widget, &catalog);
             *cached_catalog = Some(catalog);
-            slash_dispatch::push_model_picker(state, bottom_pane, chat_widget, names)
+            opened
         }
         ModelCatalogEffect::Ready(Err(error)) => {
             chat_widget.commit_system(history_cell::system::SystemCell::error(error));
@@ -5067,6 +5107,10 @@ pub(crate) async fn run_tui_session(
     let mut model_catalog_tasks = tokio::task::JoinSet::new();
     let mut model_catalog_loading = false;
     let mut model_catalog_cache = None;
+    let (model_setup_tx, mut model_setup_rx) =
+        tokio::sync::mpsc::channel::<ModelSetupCompletion>(2);
+    let mut model_setup_tasks = tokio::task::JoinSet::new();
+    let local_runner_id = cli_context.local_runner_id.clone();
     let (slash_background_read_tx, mut slash_background_read_rx) =
         tokio::sync::mpsc::channel::<SlashBackgroundReadCompletion>(8);
     let mut slash_background_read_tasks = tokio::task::JoinSet::new();
@@ -5368,6 +5412,53 @@ pub(crate) async fn run_tui_session(
                         ));
                     }
                 }
+                let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+                flush_chat_widget(&mut guard, &mut chat_widget, width);
+                frame_requester.schedule_frame();
+            }
+            Some(completion) = model_setup_rx.recv() => {
+                match completion.result {
+                    Ok(ready) => {
+                        if let Some(offering_id) = ready.offering_id {
+                            state.model = Some(completion.name.clone());
+                            crate::cli::slash::slash_config::set_active_model_for_display(
+                                Some(completion.name.clone()),
+                            );
+                            crate::cli::slash::slash_config::set_active_offering_id_for_request(
+                                Some(offering_id),
+                            );
+                            bottom_pane.footer.model = Some(completion.name.clone());
+                            model_catalog_cache = Some(ready.catalog);
+                            chat_widget.commit_system(
+                                history_cell::system::SystemCell::response(format!(
+                                    "Local model '{}' is connected and selected.",
+                                    completion.name
+                                )),
+                            );
+                        } else {
+                            chat_widget.commit_system(
+                                history_cell::system::SystemCell::response(format!(
+                                    "Local model '{}' saved as unverified. Use /model to test and select it.",
+                                    completion.name
+                                )),
+                            );
+                        }
+                    }
+                    Err(error) => chat_widget.commit_system(
+                        history_cell::system::SystemCell::error(format!(
+                            "Local model '{}' needs repair: {error}",
+                            completion.name
+                        )),
+                    ),
+                }
+                let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
+                flush_chat_widget(&mut guard, &mut chat_widget, width);
+                frame_requester.schedule_frame();
+            }
+            Some(Err(error)) = model_setup_tasks.join_next(), if !model_setup_tasks.is_empty() => {
+                chat_widget.commit_system(history_cell::system::SystemCell::error(format!(
+                    "Local model setup stopped unexpectedly: {error}"
+                )));
                 let width = guard.terminal.size().map(|size| size.width).unwrap_or(80);
                 flush_chat_widget(&mut guard, &mut chat_widget, width);
                 frame_requester.schedule_frame();
@@ -8053,21 +8144,187 @@ pub(crate) async fn run_tui_session(
                                         continue;
                                     }
 
-                                    // `/model` picker → check thinking capability.
-                                    if let bottom_pane::view::ViewResult::Model { name: base_model } = &result {
-                                        let base_model = base_model.clone();
-                                        let raw = model_catalog_cache.clone().unwrap_or_default();
-                                        let entry = crate::cli::slash::slash_router::find_model_entry_by_name(
-                                            &raw,
-                                            &base_model,
+                                    if let bottom_pane::view::ViewResult::ModelSetup(draft) = &result {
+                                        let draft = draft.clone();
+                                        let model_name = draft.name.clone();
+                                        let action = draft.action;
+                                        let runner_id = local_runner_id.clone();
+                                        let api = api.clone();
+                                        let profile = profile.map(str::to_string);
+                                        let completion_tx = model_setup_tx.clone();
+                                        model_setup_tasks.spawn(async move {
+                                            let credential = match draft.credential {
+                                                bottom_pane::view::ModelSetupCredentialDraft::Environment { name } => {
+                                                    crate::cli::local_model_command::LocalModelCredentialInput::Environment(name)
+                                                }
+                                                bottom_pane::view::ModelSetupCredentialDraft::Stored { secret } => {
+                                                    crate::cli::local_model_command::LocalModelCredentialInput::Stored(secret.expose().to_owned())
+                                                }
+                                                bottom_pane::view::ModelSetupCredentialDraft::None => {
+                                                    crate::cli::local_model_command::LocalModelCredentialInput::None
+                                                }
+                                            };
+                                            let saved = tokio::task::spawn_blocking(move || {
+                                                crate::cli::local_model_command::add_from_tui(
+                                                    draft.name,
+                                                    draft.base_url,
+                                                    draft.provider_model,
+                                                    draft.context_window,
+                                                    draft.max_output_tokens,
+                                                    credential,
+                                                )
+                                            })
+                                            .await
+                                            .map_err(|_| "local model setup task stopped unexpectedly".to_string())
+                                            .and_then(|result| result);
+                                            let result = match (saved, action) {
+                                                (Err(error), _) => Err(error),
+                                                (Ok(_), bottom_pane::view::ModelSetupAction::SaveWithoutTest) => {
+                                                    Ok(ModelSetupReady {
+                                                        offering_id: None,
+                                                        catalog: Vec::new(),
+                                                    })
+                                                }
+                                                (Ok(_), bottom_pane::view::ModelSetupAction::TestAndUse) => {
+                                                    if let Err(error) = crate::cli::local_model_command::check(
+                                                        crate::cli::cli_config::cli_args::ModelCheckArgs {
+                                                            name: model_name.clone(),
+                                                        },
+                                                    )
+                                                    .await
+                                                    {
+                                                        let _ = completion_tx
+                                                            .send(ModelSetupCompletion {
+                                                                name: model_name,
+                                                                result: Err(error),
+                                                            })
+                                                            .await;
+                                                        return;
+                                                    }
+                                                    let Some(runner_id) = runner_id else {
+                                                        let _ = completion_tx
+                                                            .send(ModelSetupCompletion {
+                                                                name: model_name,
+                                                                result: Err(
+                                                                    "provider check passed, but this CLI has no managed Runner identity; restart the interactive session to attach it".to_string(),
+                                                                ),
+                                                            })
+                                                            .await;
+                                                        return;
+                                                    };
+                                                    let deadline = tokio::time::Instant::now()
+                                                        + std::time::Duration::from_secs(12);
+                                                    let mut last_catalog_error = None;
+                                                    loop {
+                                                        match slash_dispatch::load_model_catalog(
+                                                            api.clone(),
+                                                            profile.clone(),
+                                                        )
+                                                        .await
+                                                        {
+                                                            Ok(catalog) => {
+                                                                match local_runner_offering(
+                                                                    &catalog,
+                                                                    &runner_id,
+                                                                    &model_name,
+                                                                ) {
+                                                                    Ok(offering)
+                                                                        if offering.execution_placement
+                                                                            == astra_services::ModelExecutionPlacement::Edge
+                                                                            && offering.is_active =>
+                                                                    {
+                                                                        break Ok(ModelSetupReady {
+                                                                            offering_id: Some(offering.offering_id.clone()),
+                                                                            catalog,
+                                                                        });
+                                                                    }
+                                                                    Ok(_) => {}
+                                                                    Err(_) => {}
+                                                                }
+                                                            }
+                                                            Err(error) => {
+                                                                last_catalog_error = Some(error);
+                                                            }
+                                                        }
+                                                        if tokio::time::Instant::now() >= deadline {
+                                                            break Err(if let Some(error) = last_catalog_error {
+                                                                format!(
+                                                                    "provider check passed, but the local Runner catalog could not be refreshed after 12 seconds (Runner {runner_id}): {error}"
+                                                                )
+                                                            } else {
+                                                                format!(
+                                                                    "provider check passed and the model was saved, but Runner {runner_id} did not publish an active Offering for '{model_name}' within 12 seconds; keep the session open and retry /model"
+                                                                )
+                                                            });
+                                                        }
+                                                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                                    }
+                                                }
+                                            };
+                                            let _ = completion_tx
+                                                .send(ModelSetupCompletion {
+                                                    name: model_name,
+                                                    result,
+                                                })
+                                                .await;
+                                        });
+                                        chat_widget.commit_system(
+                                            history_cell::system::SystemCell::info(
+                                                if action
+                                                    == bottom_pane::view::ModelSetupAction::TestAndUse
+                                                {
+                                                    "Saving local model, then running one disclosed bounded provider stream check…"
+                                                } else {
+                                                    "Saving local model without contacting the provider…"
+                                                },
+                                            ),
                                         );
+                                        pending_deferred_slash_flush = false;
+                                        let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                        flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                        bottom_pane.sync_popups();
+                                        frame_requester.schedule_frame();
+                                        continue;
+                                    }
+
+                                    // `/model` picker → check thinking capability.
+                                    if let bottom_pane::view::ViewResult::Model {
+                                        name: base_model,
+                                        offering_id,
+                                    } = &result
+                                    {
+                                        let base_model = base_model.clone();
+                                        let selected_offering_id = offering_id.clone();
+                                        let raw = model_catalog_cache.clone().unwrap_or_default();
+                                        let entry = match selected_offering_id.as_deref() {
+                                            Some(offering_id) => raw
+                                                .iter()
+                                                .find(|entry| entry.offering_id == offering_id),
+                                            None => crate::cli::slash::slash_router::find_model_entry_by_name(
+                                                &raw,
+                                                &base_model,
+                                            ),
+                                        };
+                                        if offering_id.is_some() && entry.is_none() {
+                                            chat_widget.commit_system(
+                                                history_cell::system::SystemCell::error(
+                                                    "The selected model is no longer available; reopen /model and choose it again.",
+                                                ),
+                                            );
+                                            pending_deferred_slash_flush = false;
+                                            let w = guard.terminal.size().map(|s| s.width).unwrap_or(80);
+                                            flush_chat_widget(&mut guard, &mut chat_widget, w);
+                                            bottom_pane.sync_popups();
+                                            frame_requester.schedule_frame();
+                                            continue;
+                                        }
                                         let thinking_cap = entry
                                             .and_then(crate::cli::slash::slash_router::entry_thinking_capability);
                                         let provider =
                                             entry.and_then(crate::cli::slash::slash_router::entry_provider);
-                                        let offering_id = entry
+                                        let offering_id = selected_offering_id.or_else(|| entry
                                             .map(crate::cli::slash::slash_router::entry_offering_id)
-                                            .map(ToOwned::to_owned);
+                                            .map(ToOwned::to_owned));
                                         let opts = astra_turn_core::thinking_config::thinking_options_with_capability(
                                             &base_model,
                                             provider,
@@ -8114,6 +8371,7 @@ pub(crate) async fn run_tui_session(
                                                     .map(|option| bottom_pane::view::ViewResult::ModelThinking {
                                                         base_model: base_model.clone(),
                                                         config: option.config,
+                                                        offering_id: offering_id.clone(),
                                                     })
                                                     .collect(),
                                             );
@@ -8128,15 +8386,15 @@ pub(crate) async fn run_tui_session(
                                     if let bottom_pane::view::ViewResult::ModelThinking {
                                         base_model,
                                         config,
+                                        offering_id,
                                     } = &result {
                                         let raw = model_catalog_cache.clone().unwrap_or_default();
-                                        let entry = crate::cli::slash::slash_router::find_model_entry_by_name(
-                                            &raw,
-                                            &base_model,
-                                        );
-                                        let offering_id = entry
+                                        let entry = offering_id.as_deref().and_then(|offering_id| {
+                                            raw.iter().find(|entry| entry.offering_id == offering_id)
+                                        });
+                                        let offering_id = offering_id.clone().or_else(|| entry
                                             .map(crate::cli::slash::slash_router::entry_offering_id)
-                                            .map(ToOwned::to_owned);
+                                            .map(ToOwned::to_owned));
                                         let suffix = astra_turn_core::thinking_config::thinking_suffix_for(config);
                                         let composed = format!("{base_model}{suffix}");
                                         state.model = Some(composed.clone());
@@ -8937,6 +9195,8 @@ pub(crate) async fn run_tui_session(
     }
     slash_background_read_tasks.abort_all();
     while slash_background_read_tasks.join_next().await.is_some() {}
+    model_setup_tasks.abort_all();
+    while model_setup_tasks.join_next().await.is_some() {}
     work_start_tasks.abort_all();
     while work_start_tasks.join_next().await.is_some() {}
     // Post-commit projections are recoverable from the canonical journal.
@@ -9222,6 +9482,7 @@ fn event_may_have_committed_work_graph(event: &TuiAppEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::slash::slash_router::ModelCatalogEntry;
 
     #[test]
     fn primary_guidance_durable_disposition_maps_only_exact_identity() {
@@ -14109,6 +14370,20 @@ mod tests {
             "context_window": 128000,
             "max_completion_tokens": null,
             "architecture": null
+        }, {
+            "offering_id": "offer-local-offline",
+            "access_id": "runner-personal",
+            "access_kind": "this_device",
+            "access_label": "Personal Runner",
+            "execution_placement": "edge",
+            "name": "local-offline",
+            "provider": "openai",
+            "description": "Runner offline",
+            "thinking_capability": null,
+            "is_active": false,
+            "context_window": 128000,
+            "max_completion_tokens": 8192,
+            "architecture": null
         }]))
         .expect("canonical model catalog");
 
@@ -14126,8 +14401,17 @@ mod tests {
                 .map(|models| models[0].offering_id.as_str()),
             Some("offer-gpt-5")
         );
+        assert_eq!(cached_catalog.as_ref().map(Vec::len), Some(2));
         assert!(matches!(
             widget.history()[0].to_persist(),
+            Some(crate::tui::turn_event::TurnEvent::System {
+                level: crate::tui::turn_event::SystemLevel::Info,
+                text,
+                ..
+            }) if text.contains("local-offline") && text.contains("Reconnect")
+        ));
+        assert!(matches!(
+            widget.history()[1].to_persist(),
             Some(crate::tui::turn_event::TurnEvent::System {
                 level: crate::tui::turn_event::SystemLevel::Response,
                 text,
@@ -14176,6 +14460,45 @@ mod tests {
                 ..
             }) if text == "Cannot reach server — check connection"
         ));
+    }
+
+    #[test]
+    fn local_setup_resolves_its_offering_by_runner_identity_and_display_name() {
+        let catalog = serde_json::from_value::<Vec<ModelCatalogEntry>>(serde_json::json!([
+            {
+                "offering_id": "offer-other",
+                "access_id": "runner-other",
+                "access_kind": "this_device",
+                "access_label": "Personal Runner",
+                "execution_placement": "edge",
+                "name": "work",
+                "provider": "openai",
+                "description": null,
+                "is_active": true,
+                "context_window": 128000,
+                "max_completion_tokens": 8192,
+                "architecture": null,
+                "thinking_capability": null
+            },
+            {
+                "offering_id": "offer-local",
+                "access_id": "runner-local",
+                "access_kind": "this_device",
+                "access_label": "Personal Runner",
+                "execution_placement": "edge",
+                "name": "work",
+                "provider": "openai",
+                "description": null,
+                "is_active": true,
+                "context_window": 128000,
+                "max_completion_tokens": 8192,
+                "architecture": null,
+                "thinking_capability": null
+            }
+        ]))
+        .unwrap();
+        let selected = local_runner_offering(&catalog, "local", "work").unwrap();
+        assert_eq!(selected.offering_id, "offer-local");
     }
 
     #[test]

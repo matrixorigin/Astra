@@ -21,10 +21,12 @@ use crate::chat_turn_sse_dispatch::{
     DurableRunTerminalStatus, EdgeApprovalRequest, SseRenderEffect, StreamRootIdentity,
     dispatch_chat_turn_sse_event_block, durable_run_terminal_from_event,
 };
-use crate::sse::blocks::SseBlankLineUtf8Buf;
-use crate::sse::data_lines::{json_events_from_sse_event_block, validate_sse_event_block_json};
 pub use crate::tool::policy::is_tool_concurrency_safe;
 use crate::tool::policy::tool_batch_coalesce_duration;
+use astra_inference_adapter::sse::blocks::SseBlankLineUtf8Buf;
+use astra_inference_adapter::sse::data_lines::{
+    json_events_from_sse_event_block, validate_sse_event_block_json,
+};
 use astra_thin_client::ApprovalKind;
 use async_trait::async_trait;
 use serde_json::Value;

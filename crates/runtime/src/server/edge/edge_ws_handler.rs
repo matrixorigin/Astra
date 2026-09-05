@@ -789,6 +789,30 @@ async fn handle_edge_connection(
     });
 
     // ── Phase 3: Bidirectional message loop ──────────────────────────
+    // Inference has a bounded control worker. The reader never awaits its DB
+    // enrollment, grant, evidence, or custody writes. A queue overflow closes
+    // the connection without ACK; the device retains and replays its journal.
+    let (inference_tx, inference_task) =
+        match astra_turn_types::runner_inference::RunnerInferenceId::new(edge_agent_id.clone()) {
+            Ok(runner_id) => {
+                let (sender, receiver) = mpsc::channel(super::runner_inference::CONTROL_CAPACITY);
+                let connection =
+                    astra_services::runner_model_bindings::AuthenticatedRunnerConnection {
+                        user_id: user_id.clone(),
+                        runner_id,
+                        edge_id: edge_id_for_registry.clone(),
+                    };
+                let task = tokio::spawn(super::runner_inference::run(
+                    state.shared_pool.clone(),
+                    state.edge_connection_pool.clone(),
+                    connection,
+                    pool_generation,
+                    receiver,
+                ));
+                (Some(sender), Some(task))
+            }
+            Err(_) => (None, None),
+        };
     let heartbeat_interval = Duration::from_secs(EDGE_HEARTBEAT_INTERVAL_SECS);
 
     let ws_sink_write = ws_sink.clone();
@@ -971,14 +995,40 @@ async fn handle_edge_connection(
                                 Ok(EdgeClientMessage::Ping {}) => {
                                     let _ = send_edge_msg(&ws_sink_write, EdgeServerMessage::Pong {}).await;
                                 }
+                                Ok(message @ (EdgeClientMessage::InferenceHello { .. }
+                                    | EdgeClientMessage::InferenceBindingPublish { .. }
+                                    | EdgeClientMessage::InferenceStartEvidence { .. }
+                                    | EdgeClientMessage::InferenceTerminal { .. }
+                                    | EdgeClientMessage::InferenceResponseChunk { .. }
+                                    | EdgeClientMessage::InferenceRequestCredit { .. })) => {
+                                    if !state.edge_connection_pool.is_current_inference_connection(&user_id, &edge_agent_id, pool_generation)
+                                        || !super::runner_inference::validate_ingress(&message, &user_id, &edge_agent_id, pool_generation) {
+                                        break;
+                                    }
+                                    if let Some(sender) = &inference_tx {
+                                        if sender.try_send(message).is_err() {
+                                            let _ = send_edge_msg(&ws_sink_write, EdgeServerMessage::Closing { reason: "inference control capacity unavailable".into() }).await;
+                                            break;
+                                        }
+                                    } else {
+                                        let _ = send_edge_msg(&ws_sink_write, EdgeServerMessage::InferenceHelloAck {
+                                            negotiation: astra_turn_types::runner_inference::RunnerInferenceNegotiation::Unavailable {
+                                                reason: astra_turn_types::runner_inference::RunnerInferenceRejection::InferenceUnsupported,
+                                            },
+                                        }).await;
+                                    }
+                                }
                                 Ok(EdgeClientMessage::Auth { .. }) => {
                                     // Already authenticated, ignore duplicate auth
                                 }
                                 Err(e) => {
+                                    let diagnostic = astra_server_types::edge_ws_protocol::EdgeMessageDecodeDiagnostic::from(&e);
                                     tracing::warn!(
                                         user_id = %user_id,
                                         edge_agent_id = %edge_agent_id,
-                                        error = %e,
+                                        category = diagnostic.category,
+                                        line = diagnostic.line,
+                                        column = diagnostic.column,
                                         "Edge: invalid message"
                                     );
                                 }
@@ -1047,6 +1097,16 @@ async fn handle_edge_connection(
     };
 
     read_loop.await;
+
+    drop(inference_tx);
+    if let Some(mut task) = inference_task {
+        if tokio::time::timeout(Duration::from_millis(250), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
+        }
+    }
 
     // ── Cleanup ──────────────────────────────────────────────────────
     forward_task.abort();
@@ -1743,6 +1803,18 @@ mod tests {
                 .expect("edge advertisement parses");
         advert.binding.executor.executor_id = executor_id.to_string();
         serde_json::to_value(advert).expect("edge advertisement serializes")
+    }
+
+    #[test]
+    fn validate_edge_capabilities_does_not_enroll_self_declared_inference() {
+        let mut capabilities = edge_advertisement_with_tools(&["read_file"]);
+        capabilities["protocol_capabilities"] = serde_json::json!({"runner_inference_v1": true});
+        capabilities["inference_bindings"] =
+            serde_json::json!([{"binding_id": "forged-binding", "model_name": "public-model"}]);
+        let sanitized = validate_edge_capabilities(Some(capabilities), "edge-agent", "user-1")
+            .expect("tool registration remains independent from inference");
+        assert!(sanitized.get("inference_bindings").is_none());
+        assert!(sanitized.get("protocol_capabilities").is_none());
     }
 
     #[test]

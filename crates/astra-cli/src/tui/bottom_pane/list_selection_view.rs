@@ -290,9 +290,11 @@ mod tests {
         .with_results(vec![
             ViewResult::Model {
                 name: "deepseek-v4-flash".into(),
+                offering_id: Some("offer-fast".into()),
             },
             ViewResult::Model {
                 name: "deepseek-v4-flash-anthropic".into(),
+                offering_id: Some("offer-research".into()),
             },
         ]);
 
@@ -305,6 +307,47 @@ mod tests {
             view.completion().and_then(|completion| completion.result),
             Some(ViewResult::Model {
                 name: "deepseek-v4-flash-anthropic".into(),
+                offering_id: Some("offer-research".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn duplicate_display_names_keep_the_selected_offering_identity() {
+        let mut view = ListSelectionView::new(
+            vec![
+                SelectionItem {
+                    name: "work".into(),
+                    description: Some("Personal Runner · offering …local".into()),
+                    is_current: false,
+                },
+                SelectionItem {
+                    name: "work".into(),
+                    description: Some("Personal Runner · offering …other".into()),
+                    is_current: false,
+                },
+            ],
+            Some("Select model".into()),
+        )
+        .with_results(vec![
+            ViewResult::Model {
+                name: "work".into(),
+                offering_id: Some("offer-local".into()),
+            },
+            ViewResult::Model {
+                name: "work".into(),
+                offering_id: Some("offer-other".into()),
+            },
+        ]);
+
+        view.handle_key(key(KeyCode::Down));
+        view.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            view.completion().and_then(|completion| completion.result),
+            Some(ViewResult::Model {
+                name: "work".into(),
+                offering_id: Some("offer-other".into()),
             })
         );
     }

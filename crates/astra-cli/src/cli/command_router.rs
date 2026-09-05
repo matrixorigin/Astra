@@ -2027,11 +2027,33 @@ async fn execute_cli_command_impl(
         }
 
         Some(Command::Model(ModelCmd::Show(args))) => {
+            if let Some(body) = crate::cli::local_model_command::show(&args.model_name)? {
+                print_json_or_raw(&body);
+                return Ok(ExitCode::Success);
+            }
             let (_, _, _, token) = get_profile_and_token(profile.as_deref())?;
             let body = api
                 .get_model_text(&token, &args.model_name)
                 .await
                 .map_err(map_thin_err)?;
+            print_json_or_raw(&body);
+            Ok(ExitCode::Success)
+        }
+
+        Some(Command::Model(ModelCmd::Add(args))) => {
+            let body = crate::cli::local_model_command::add(args)?;
+            print_json_or_raw(&body);
+            Ok(ExitCode::Success)
+        }
+
+        Some(Command::Model(ModelCmd::Check(args))) => {
+            let body = crate::cli::local_model_command::check(args).await?;
+            print_json_or_raw(&body);
+            Ok(ExitCode::Success)
+        }
+
+        Some(Command::Model(ModelCmd::Remove(args))) => {
+            let body = crate::cli::local_model_command::remove(args)?;
             print_json_or_raw(&body);
             Ok(ExitCode::Success)
         }

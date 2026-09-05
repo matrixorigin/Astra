@@ -13,7 +13,8 @@ use astra_turn_types::InferencePurpose;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::turn::llm::client::{LlmCall, LlmExecutionRoute, global_llm_client};
+use crate::turn::llm::client::{LlmCall, LlmExecutionRoute};
+use crate::turn::llm::transport::global_llm_client;
 
 #[cfg(test)]
 use crate::turn::llm::client::call_llm_nonstream;
@@ -152,7 +153,7 @@ impl MemoryInferencePort for DurableMemoryInferenceClient {
         let result = self
             .ledger
             .execute_nonstream(
-                global_llm_client(),
+                global_llm_client()?,
                 request.invocation_scope.clone(),
                 LlmCall {
                     purpose: request.purpose,
@@ -206,7 +207,7 @@ impl MemoryInferencePort for DirectMemoryInferenceClient {
         request: MemoryInferenceRequest<'_>,
     ) -> Result<String, astra_core::ClassifiedError> {
         let result = call_llm_nonstream(
-            global_llm_client(),
+            global_llm_client()?,
             LlmCall {
                 purpose: request.purpose,
                 messages: request.messages,

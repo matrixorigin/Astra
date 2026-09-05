@@ -1009,17 +1009,62 @@ pub(crate) struct SessionShowArgs {
 }
 
 #[derive(Subcommand, Debug)]
-#[command(after_help = "Examples:\n  astra model list\n  astra model show gpt-4o")]
+#[command(
+    after_help = "Examples:\n  astra model list\n  astra model show gpt-4o\n  astra model add\n  astra model check work"
+)]
 pub(crate) enum ModelCmd {
     /// List available models
     List,
     /// Show model details
     Show(ModelShowArgs),
+    /// Configure a Runner-local model without sending its credential to Server
+    Add(ModelAddArgs),
+    /// Validate a local model and its credential in this terminal
+    Check(ModelCheckArgs),
+    /// Remove a local model definition and its owned credential
+    Remove(ModelRemoveArgs),
 }
 
 #[derive(Args, Debug)]
 pub(crate) struct ModelShowArgs {
     pub model_name: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ModelAddArgs {
+    /// Friendly local name; prompted when omitted in a terminal
+    pub name: Option<String>,
+    /// OpenAI-compatible API base URL
+    #[arg(long)]
+    pub base_url: Option<String>,
+    /// Provider model identifier
+    #[arg(long = "provider-model")]
+    pub provider_model: Option<String>,
+    /// Declared provider context window; prompted when omitted in a terminal
+    #[arg(long)]
+    pub context_window: Option<u32>,
+    /// Declared maximum completion tokens; prompted when omitted in a terminal
+    #[arg(long)]
+    pub max_output_tokens: Option<u32>,
+    /// Read the credential from this environment variable in each attaching terminal
+    #[arg(long, conflicts_with_all = ["no_auth", "store_secret"])]
+    pub credential_env: Option<String>,
+    /// Configure a keyless local endpoint
+    #[arg(long, conflicts_with_all = ["credential_env", "store_secret"])]
+    pub no_auth: bool,
+    /// Prompt for and save a credential in an owner-private local file
+    #[arg(long, conflicts_with_all = ["credential_env", "no_auth"])]
+    pub store_secret: bool,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ModelCheckArgs {
+    pub name: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ModelRemoveArgs {
+    pub name: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1370,7 +1415,7 @@ pub(crate) struct ConfigShowPolicyArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, SessionCmd, WorkSubcommand};
+    use super::{Cli, Command, ModelCmd, SessionCmd, WorkSubcommand};
     use clap::Parser;
 
     #[test]
@@ -1432,5 +1477,38 @@ mod tests {
 
         let message = Cli::try_parse_from(["astra", "explain", "history", "please"]).unwrap();
         assert!(message.validate_external_message_shorthand().is_ok());
+    }
+
+    #[test]
+    fn local_model_setup_is_typed_and_never_accepts_an_inline_secret() {
+        let cli = Cli::try_parse_from([
+            "astra",
+            "model",
+            "add",
+            "work",
+            "--base-url",
+            "https://provider.example/v1",
+            "--provider-model",
+            "coding-model",
+            "--credential-env",
+            "WORK_LLM_API_KEY",
+        ])
+        .expect("local model setup");
+        let Some(Command::Model(ModelCmd::Add(args))) = cli.command else {
+            panic!("expected typed local model add")
+        };
+        assert_eq!(args.name.as_deref(), Some("work"));
+        assert_eq!(args.credential_env.as_deref(), Some("WORK_LLM_API_KEY"));
+
+        let error = Cli::try_parse_from([
+            "astra",
+            "model",
+            "add",
+            "work",
+            "--api-key",
+            "secret-canary",
+        ])
+        .expect_err("secrets in argv are not a supported contract");
+        assert!(!error.to_string().contains("secret-canary"));
     }
 }

@@ -376,6 +376,13 @@ pub(crate) fn try_write_heavy_checkpoint(state: &mut AgenticLoopState) {
     // checkpoint.  The next process must not infer safety from a trimmed
     // local record window or from prose-only conversation state.
     heavy.workspace_observation_quarantine = state.stall.workspace_observation_quarantine.clone();
+    // The checkpoint's conversation is a canonical post-round projection, so
+    // persist the matching logical cursor with it.  A recovery path must not
+    // reconstruct this from provider-attempt chronology (retries and output
+    // continuation chains do not have one-to-one round numbering).
+    heavy.llm_rounds_completed = state.llm_rounds_completed;
+    heavy.current_round_index = state.current_round_index;
+    heavy.runner_continuation_receipts = state.stall.runner_continuation_receipts.clone();
     let cp = StepCheckpoint::Heavy(Box::new(heavy));
     if state
         .stall

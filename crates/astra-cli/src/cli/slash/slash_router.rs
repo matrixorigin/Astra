@@ -700,7 +700,11 @@ pub(crate) async fn fetch_model_catalog(
                     page.total
                 )));
             }
-            return Ok(all.into_iter().filter(model_list_entry_is_active).collect());
+            // Preserve known-but-unavailable Offerings in the client-side
+            // catalog. Selection surfaces decide which rows are actionable;
+            // dropping them here makes a disconnected Runner look deleted and
+            // prevents a useful repair explanation.
+            return Ok(all);
         };
         if !page_had_items {
             return Err(ModelCatalogError::Protocol(
@@ -746,6 +750,33 @@ pub(crate) fn entry_model_is_active(entry: &ModelCatalogEntry) -> bool {
     model_list_entry_is_active(entry)
 }
 
+/// Bounded repair summary for known Offerings that are currently unavailable.
+/// Catalogs are user-controlled up to the Server limit, so never pour every
+/// name into one TUI history row.
+pub(crate) fn unavailable_model_repair_summary(entries: &[ModelCatalogEntry]) -> Option<String> {
+    const DISPLAY_LIMIT: usize = 3;
+    let unavailable = entries
+        .iter()
+        .filter(|entry| !model_list_entry_is_active(entry))
+        .filter_map(model_list_entry_name)
+        .collect::<Vec<_>>();
+    if unavailable.is_empty() {
+        return None;
+    }
+    let mut displayed = unavailable
+        .iter()
+        .take(DISPLAY_LIMIT)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if unavailable.len() > DISPLAY_LIMIT {
+        displayed.push_str(&format!(" and {} more", unavailable.len() - DISPLAY_LIMIT));
+    }
+    Some(format!(
+        "Unavailable models: {displayed}. Reconnect the owning Runner or choose another model."
+    ))
+}
+
 /// Public accessor for a model entry's `provider` field.
 pub(crate) fn entry_provider(entry: &ModelCatalogEntry) -> Option<&str> {
     model_list_entry_provider(entry)
@@ -756,6 +787,7 @@ mod model_list_json_tests {
     use super::{
         ModelCatalogError, entry_model_is_active, entry_model_name, entry_offering_id,
         find_model_entry_by_name, model_list_entry_thinking_capability, parse_model_catalog,
+        unavailable_model_repair_summary,
     };
 
     fn canonical_catalog_json() -> serde_json::Value {
@@ -826,5 +858,22 @@ mod model_list_json_tests {
         object.insert("model_id".into(), serde_json::json!("provider-model-id"));
         parse_model_catalog(&serde_json::json!([obsolete]).to_string())
             .expect_err("provider model ids cannot select an Offering");
+    }
+
+    #[test]
+    fn unavailable_model_repair_summary_is_bounded() {
+        let template = canonical_catalog_json()["items"][0].clone();
+        let entries = (0..5)
+            .map(|index| {
+                let mut item = template.clone();
+                item["name"] = serde_json::json!(format!("offline-{index}"));
+                item["offering_id"] = serde_json::json!(format!("offer-{index}"));
+                item["is_active"] = serde_json::json!(false);
+                serde_json::from_value(item).expect("catalog entry")
+            })
+            .collect::<Vec<_>>();
+        let message = unavailable_model_repair_summary(&entries).expect("repair summary");
+        assert!(message.contains("offline-0, offline-1, offline-2 and 2 more"));
+        assert!(!message.contains("offline-3"));
     }
 }

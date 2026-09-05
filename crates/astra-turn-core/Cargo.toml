@@ -13,6 +13,7 @@ db-store = ["dep:sqlx"]
 
 [dependencies]
 astra-core.workspace = true
+astra-inference-adapter.workspace = true
 astra-messaging.workspace = true
 astra-pipeline.workspace = true
 astra-sandbox.workspace = true

@@ -1,7 +1,8 @@
 # Model access and inference
 
 > Status: target design contract.
-> Last updated: 2026-07-20.
+> Last updated: 2026-09-05.
+> Runner execution follows the staged implementation contract in [Runner inference and BYOK](runner-inference.md); it is not yet available.
 
 Model access and inference defines how Astra presents model capability as a product, binds cloud accounts, resolves an eligible model to a trusted execution path, and records inference usage consistently across Web, CLI, Server, and Edge.
 
@@ -12,10 +13,14 @@ This document owns:
 - the user-facing Model Access product model;
 - TaaS instance and account-binding semantics;
 - model catalog, Offering, connection, and credential boundaries;
-- Server versus Edge inference placement;
+- Server versus Runner inference placement;
 - inference resolution, invocation, provider-attempt, and usage facts;
 - billing-owner and data-boundary invariants;
 - model-access failure and recovery behavior.
+
+[Runner inference and BYOK](runner-inference.md) owns the detailed remote
+execution facet: local binding, dispatch, custody, streaming, and reconciliation.
+It extends this domain without introducing another route or inference ledger.
 
 It does not own:
 
@@ -78,8 +83,8 @@ must preserve the first-page server decision.
 | Product source | Credential owner | Billing owner | Execution | Availability |
 | --- | --- | --- | --- | --- |
 | Astra Cloud | User-linked TaaS account | User TaaS account | Server | All clients |
-| Workspace | Organization | Organization account | Server | Authorized workspace clients |
-| This device | User/device | User external account or local compute | Edge | While the bound Edge is available |
+| Workspace | Organization | Organization account or local compute | Server or enterprise Runner | Authorized workspace clients; Runner availability applies |
+| Personal | User | User external account or local compute | Runner | While the selected Runner is available |
 | Self-hosted | Deployment administrator | Deployment administrator | Server | Self-hosted deployment |
 
 The Server projects these sources through one client contract:
@@ -104,12 +109,12 @@ struct ModelAccessView {
 enum ModelAccessKind {
     AstraCloud,
     Workspace,
-    ThisDevice,
+    Personal,
     SelfHosted,
 }
 ```
 
-`ModelAccessView` is a projection, not a new independently writable source-of-truth table. Its fields are derived from bindings, entitlement, policy, connection health, and Edge presence.
+`ModelAccessView` is a projection, not a new independently writable source-of-truth table. Its fields are derived from bindings, entitlement, policy, connection health, and Runner presence. Source, credential owner, billing owner, and executor are independent facts. `This device` is a display label only when the current client can establish colocation with that Runner; other clients show its stable name.
 
 ### Astra Cloud
 
@@ -129,14 +134,23 @@ Workspace access is owned and paid for by an organization. Personal Cloud and Wo
 
 Routing between them is allowed only when policy explicitly permits crossing the billing owner and data boundary. A generic fallback flag is insufficient authority.
 
-### This device
+### Personal and enterprise Runners
 
-Non-TaaS provider credentials, private endpoints, Ollama, LM Studio, and other user-local models belong to This device.
+Personal provider credentials, private endpoints, and user-local models may be
+supplied through an enrolled Runner. Enterprise Runners publish organization-owned
+Workspace Offerings under explicit audience and purpose policy.
 
-- Secrets remain in the device vault.
-- Edge advertises a typed, leased capability and non-secret model metadata.
+- Secrets and provider network configuration remain in the Runner's local secret/configuration boundary.
+- Runner advertises typed capability, non-secret model metadata, revisions, and leased presence.
 - Server remains authoritative for the canonical run, transcript, task, route summary, and usage projection.
-- Edge is an inference executor, not a second conversation implementation.
+- Runner is an inference executor, not a second conversation implementation.
+- Inference does not require shell, file, Git, or a workspace mount. Tool and model execution can bind different Runners.
+- A known permitted Offering remains visible when offline; availability controls selection, not identity retention.
+
+BYOK is a credential-ownership choice, not an execution-placement enum. A
+self-hosted administrator can also explicitly entrust a key to Server. Only a
+Runner execution route promises that provider credentials and provider I/O stay
+off Server. Context and model results still pass through the Server Backbone.
 
 ### Self-hosted
 
@@ -158,12 +172,18 @@ If the selected model becomes unavailable, it remains visible with a typed reaso
 
 ### Model Access settings
 
+CLI/TUI exposes the same product through the existing `/model` picker and native
+setup/manage overlays. The [TUI interaction contract](client-surfaces-and-deployment.md#model-access-in-the-tui)
+defines selection by Offering ID, local-only secret forms, active-run status,
+and repair without leaving the conversation. It shares catalog, admission, and
+setup services with command-line and Web consumers where authority permits.
+
 Settings presents task-oriented source cards:
 
 ```text
 Astra Cloud    Ready · personal billing               Manage billing
 Workspace      8 models · managed by MatrixOrigin     View policy
-This device    Xupeng's Mac · online · 3 models       Manage device
+Personal       My laptop · online · 3 models          Manage Runner
 ```
 
 Authentication, reauthorization, billing action, reconnect, and diagnostics expand only when needed.
@@ -206,7 +226,7 @@ Disabling an Offering must preview the effect on new inference, active streams, 
 7. Create, link, reauthorize, and unlink operations are idempotent at the storage boundary.
 8. Disabling access never deletes historical routes, transcript, usage, or billing attribution.
 9. All clients render Server-projected typed state; clients do not infer behavior from error text.
-10. Repairing access resumes from a durable inference boundary and does not restart completed agents.
+10. Repairing access resumes from a durable inference boundary and does not restart completed agents or ambiguously dispatched provider work.
 
 ## TaaS account binding
 
@@ -287,13 +307,13 @@ Signup and account linking are separate durable operations. Astra signup succeed
 
 ## Product status projection
 
-Binding, billing, connection health, and Edge presence are independent facts:
+Binding, billing, connection health, and Runner presence are independent facts:
 
 ```text
 Binding:    provisioning / active / reauth_required / failed_retryable / revoked
 Billing:    unknown / active / action_required / suspended
 Connection: unknown / healthy / degraded / unavailable
-Edge:       unpaired / online / offline / stale
+Runner:     unpaired / online / offline / stale
 ```
 
 They project deterministically to:
@@ -315,7 +335,7 @@ enum ModelAccessReason {
     BillingActionRequired,
     ConnectionDegraded,
     ConnectionUnavailable,
-    DeviceOffline,
+    RunnerOffline,
     PolicyDisabled,
 }
 ```
@@ -326,16 +346,24 @@ Projection rules include:
 - reauthorization, payment, or administrator action → `ActionRequired`;
 - valid binding and billing with temporary endpoint failure → `Degraded` or `Unavailable`;
 - administrator policy denial → `Disabled`;
-- `Ready` requires usable entitlement, credential materialization, and at least one effective Offering.
+- `Ready` requires usable entitlement, at least one selectable Offering, and fresh executor readiness evidence. A Runner credential is checked locally; a readiness projection never requires Server to materialize it.
+
+Executor readiness is separate from provider probe evidence. The public view
+also carries typed `probe_status` (`not_run`, `succeeded`, `failed`, or `stale`)
+and an observation timestamp when applicable. Explicit use without a probe can
+be selectable when local prerequisites and policy permit it; clients render
+`Available; not tested` and never imply a successful provider test. Known failures
+retain their typed reason and cannot be cleared by choosing to skip a probe.
 
 The wire projection keeps `status`, optional typed `reason`, `usable`, optional
 `retry_after_seconds`, and allowed actions as separate fields. This avoids a
 client-specific tagged-union encoding while preserving the same state
 semantics. A source declared `Ready` with no effective Offering projects to
-`ActionRequired / NoEligibleOfferings`; a non-usable source that still exposes
-an effective Offering is a contract error. Error-message matching is not a
-state machine. The projection revision and observation timestamp provide
-freshness for the complete snapshot.
+`ActionRequired / NoEligibleOfferings`. A non-usable source may expose known
+but unavailable Offerings, each with a reason and recovery actions; it must not
+expose them as selectable. Error-message matching is not a state machine. The
+projection revision and observation timestamp provide freshness for the complete
+snapshot.
 
 ## Model and access data model
 
@@ -359,14 +387,13 @@ struct ModelSpec {
 
 ### Inference connection
 
-`InferenceConnection` describes a governed endpoint/protocol path and the credential category it requires. A shared TaaS connection does not embed one user's account credential.
+`InferenceConnection` describes a governed Server endpoint/protocol path and the credential category it requires. A shared TaaS connection does not embed one user's account credential. Runner execution uses an opaque local binding reference instead of uploading an endpoint into this entity.
 
 ```rust
 struct InferenceConnection {
     id: ConnectionId,
     owner: OwnershipScope,
     kind: ConnectionKind,
-    execution: ExecutionPlacement,
     protocol: InferenceProtocol,
     endpoint_ref: EndpointRef,
     credential_requirement: CredentialRequirement,
@@ -380,7 +407,6 @@ enum CredentialRequirement {
     TaasOwnerBinding { instance_id: TaasInstanceId },
     ServerVault(SecretRef),
     WorkloadIdentity(WorkloadIdentityRef),
-    EdgeVault { edge_id: EdgeId, credential_ref: EdgeCredentialRef },
     None,
 }
 ```
@@ -388,12 +414,11 @@ enum CredentialRequirement {
 The resolver selects the exact personal, Workspace, or deployment binding for an invocation and records it in the route.
 
 There is no independently writable `Model Gateway` registry. Server-owned
-endpoints are governed `InferenceConnection` facts. Provider- or Edge-owned
-endpoints arrive as authenticated, leased runtime capabilities and become
-route inputs only after admission. They are neither durable global gateway
-rows nor client-selectable routing identities. This keeps endpoint authority
-with its actual owner and prevents an administrative resource that appears
-configurable but has no effect on inference.
+endpoints are governed `InferenceConnection` facts. Runner-owned endpoints stay
+local; only typed, authenticated binding references and public capability profiles
+become route inputs after admission. A provider-authorized gateway contacted by
+Server is Server execution, regardless of who operates that gateway. Placement
+must describe the actual process opening provider transport.
 
 ### Offering definition and effective Offering
 
@@ -403,7 +428,7 @@ A shared catalog definition and a user's currently selectable product are differ
 struct ModelOfferingDefinition {
     id: OfferingDefinitionId,
     model_spec_id: ModelSpecId,
-    connection_id: ConnectionId,
+    executor: OfferingExecutorRef,
     upstream_model_name: String,
     audience: AudienceScope,
     display: OfferingDisplay,
@@ -412,6 +437,11 @@ struct ModelOfferingDefinition {
     base_pricing: OfferingPricing,
     allowed_purposes: BTreeSet<InferencePurpose>,
     revision: u64,
+}
+
+enum OfferingExecutorRef {
+    ServerConnection(ConnectionId),
+    RunnerBinding { runner_id: RunnerId, binding_id: RunnerModelBindingId },
 }
 
 struct EffectiveModelOffering {
@@ -432,9 +462,25 @@ Offering definitions are stored once. Effective Offerings are computed from defi
 
 The client wire field remains `offering_id`, whose semantic type is `EffectiveOfferingId`. The opaque value is bound to the principal, access source, definition, and revisions and is revalidated by Server.
 
+An effective Offering is a revision-bound catalog choice, not a permanent model
+preference. On accepting a choice, Server stores its stable selection target:
+definition/access identity and the selected model, executor ownership, and
+data/billing boundary. The next request resolves that same target against current
+authorization; it does not look up a bare name or reuse an expired catalog token.
+Routine credential/profile revision changes can therefore take effect without
+making a user reselect the model. A different model, account, executor owner, or
+data boundary requires an explicit authorized selection/repair. An opaque key
+change alone is not proof that the provider account stayed the same.
+
+Turns pin this semantic target, while routes pin the exact resolved revisions
+for each invocation. If a stale client token cannot be safely resolved to the
+same target under current policy, return a typed refresh/conflict response; never
+choose a different eligible Offering as a fallback. UI focus may use the stable
+target across catalog refreshes, but only the current effective ID is submitted.
+
 ## Policy and eligibility
 
-Effective Offerings are the intersection of independently authoritative facts:
+Permitted Offering candidates are the intersection of independently authoritative facts:
 
 ```text
 catalog definition
@@ -444,9 +490,12 @@ catalog definition
   ∩ user policy
   ∩ session data boundary
   ∩ inference-purpose requirements
-  ∩ current reachability
-= effective Offerings
+= permitted Offering candidates
 ```
+
+Reachability, capacity, and credential readiness determine each candidate's
+current availability. The catalog keeps permitted offline Offerings visible;
+admission requires current selectability and revalidates authority.
 
 Lower scopes may narrow but cannot expand higher-scope authorization.
 
@@ -491,11 +540,9 @@ struct ResolvedInferenceRoute {
     access_id: ModelAccessId,
     access_revision: u64,
     model_spec_id: ModelSpecId,
-    connection_id: ConnectionId,
-    connection_revision: u64,
     upstream_model_name: String,
     protocol: InferenceProtocol,
-    execution: ExecutionPlacement,
+    executor: InferenceExecutorBinding,
     credential_binding: ResolvedCredentialBinding,
     credential_owner: OwnershipScope,
     billing_owner: BillingOwner,
@@ -503,6 +550,20 @@ struct ResolvedInferenceRoute {
     purpose: InferencePurpose,
     policy_version: PolicyVersion,
     fallback_policy: ResolvedFallbackPolicy,
+}
+
+enum InferenceExecutorBinding {
+    Server {
+        connection_id: ConnectionId,
+        connection_revision: u64,
+    },
+    Runner {
+        runner_id: RunnerId,
+        journal_incarnation: JournalIncarnationId,
+        binding_id: RunnerModelBindingId,
+        binding_revision: u64,
+        serialization_profile_revision: u64,
+    },
 }
 
 enum ResolvedCredentialBinding {
@@ -518,16 +579,15 @@ enum ResolvedCredentialBinding {
         identity_ref: WorkloadIdentityRef,
         identity_revision: u64,
     },
-    Edge {
-        edge_id: EdgeId,
-        connection_id: ConnectionId,
-        lease_epoch: u64,
+    RunnerLocal {
+        // Opaque revision; Server cannot dereference local secret material.
+        credential_generation: String,
     },
     None,
 }
 ```
 
-The route contains references and revisions, never a bearer token, API key, signed URL, or serializable secret material.
+The route contains references and revisions, never a bearer token, API key, signed URL, or serializable secret material. Placement is derived from the executor binding (`server` or `runner`), not independently asserted by the client. Connection generations are delivery facts and do not change the route on reconnect. The exact Runner/journal binding remains immutable.
 
 A trusted materializer creates short-lived `InvocationMaterial` in the execution process. The material is not `Debug`, not serializable, and never written to run state, journal, transcript, SSE, or ordinary logs.
 
@@ -567,9 +627,20 @@ durable ownership before provider I/O. Producers must never invent a run ID to
 make auxiliary work billable, and consumers must never infer ownership from an
 operation label or prompt text.
 
-Server persists route, admitted invocation, and first provider-attempt identity before contacting the provider.
+Server persists route, admitted invocation, and first provider-attempt identity before contacting the provider or granting Runner dispatch. The exact compiled body hash/length and provider canonical transition belong to that admission boundary.
 
-Retries reuse the logical invocation but create a new provider attempt. The invocation ID is sent upstream as an idempotency key only when the final provider explicitly supports that contract. If delivery may have occurred and the provider cannot answer idempotently, the result is `DeliveryUnknown`; Astra does not blindly retry or claim zero usage.
+Retries under the same immutable route reuse the logical invocation but create
+a new provider attempt. A newly resolved route or boundary-changing fallback
+creates a linked invocation and route under the same logical operation and
+budget, after settling the prior attempt sufficiently to permit replacement.
+Neither route nor billing ownership is rewritten in place.
+
+A provider idempotency key is used only when the provider explicitly defines
+its operation, payload, account, and retention scope. Equivalent retransmissions
+share that key only within that contract. Changing models or bodies does not
+automatically reuse the invocation ID as a key. If delivery may have occurred
+and cannot be reconciled, preserve `DeliveryUnknown`; Astra does not blindly retry
+or claim zero usage.
 
 ## Control plane and data plane
 
@@ -584,8 +655,8 @@ Client / Web / CLI
                        │ canonical inference request
               ┌────────┴────────┐
               ▼                 ▼
-      Server executor       Edge executor
-      provider adapters     device secret vault
+      Server executor       Runner executor
+      provider adapters     local secret store
       secret materializer   local/provider adapter
               │                 │
               ▼                 ▼
@@ -596,11 +667,11 @@ Astra Server ── account/link/entitlement/billing/credential ──▶ TaaS c
 
 TaaS account, OAuth, billing, and credential APIs remain on the control/materialization path. Prompt, tool schema, and inference stream go only to the resolved model endpoint. If TaaS itself serves the model endpoint, it is handled by a normal provider adapter.
 
-The agent loop does not branch on whether a credential originated from TaaS, a Server vault, workload identity, or an Edge vault.
+The agent loop does not branch on whether a credential originated from TaaS, a Server vault, workload identity, or a Runner-local store.
 
 ## Canonical inference contract
 
-Server and Edge share one request and stream contract:
+Server and Runner share one canonical request and typed response contract:
 
 ```rust
 struct InferenceRequest {
@@ -628,7 +699,13 @@ enum InferenceStreamEvent {
 }
 ```
 
-Provider adapters translate the canonical contract to OpenAI, Anthropic, Bedrock, local, or other supported protocols. Adapter differences do not leak into agent state-machine behavior.
+Provider adapters translate the canonical contract to supported protocols.
+One shared compiler produces the immutable provider body before attempt
+admission; Runner receives the exact compiled body and adds local transport
+material without altering model-visible bytes. Shared decoders normalize the
+response. The [Runner inference protocol](runner-inference.md#wire-protocol-and-bounded-streaming)
+distinguishes provisional progress from a durable terminal aggregate. Adapter
+differences do not create another agent state machine.
 
 ## Client and SDK contract
 
@@ -653,12 +730,13 @@ Normal run requests never contain:
 - connection or gateway ID;
 - TaaS account/OAuth payload;
 - request-scoped model-service URL;
-- claimed Server/Edge placement.
+- claimed Server/Runner placement.
 
 The SDK exposes the same semantics to Web, CLI, and integrations:
 
 ```text
 get_model_access(principal, workspace, purpose)
+set_session_model_selection(session_id, selection, expected_revision, idempotency_key)
 create_run(model_selection, data_boundary_profile, budget, idempotency_key)
 submit_turn(run_id, message, optional_model_selection, idempotency_key)
 stream_run_events(run_id, cursor)
@@ -690,10 +768,10 @@ Each inference boundary performs:
 3. Revalidate principal binding, definition/access revisions, policy, purpose, capabilities, data boundary, and reachability.
 4. Resolve the exact connection, credential owner, billing owner, and execution placement.
 5. Reserve budget and concurrency capacity.
-6. Persist the route, admitted invocation, and provider-attempt identity.
+6. Persist the route, admitted invocation, exact compiled body identity, and provider-attempt authority.
 7. Materialize short-lived credential data inside the selected executor.
-8. Execute and stream typed events with bounded backpressure.
-9. Persist provider request identity, usage, cost, and terminal state.
+8. Execute and stream provisional typed events with bounded backpressure.
+9. Persist provider request identity, actual response custody, usage provenance, and terminal evidence before acknowledging a Runner result.
 10. Settle the reservation and publish durable UI/SDK projection updates.
 
 A selected Offering is not a trusted route. Client selection never bypasses Server-side resolution.
@@ -731,48 +809,79 @@ A reliable encrypted secret backend may store a manually imported key. Public AP
 
 ### Server Only and Web Agent
 
-Available sources are Astra Cloud, Workspace, and administrator-trusted Server-local access. Device Offerings are absent unless a real Edge is bound and online.
+Available sources are Astra Cloud, Workspace, and administrator-trusted Server-local access. Runner Offerings require actual enrolled capacity; permitted known Offerings remain visible while offline but cannot start new inference.
 
 The existence of a browser does not imply local inference capability.
 
 ### CLI + Server
 
-CLI is a client of the same Server catalog and submits the same Offering selection. Local inference appears only through a typed Edge capability, whether implemented by a separate Edge process or a deliberately embedded Edge runtime.
+CLI is a client of the same Server catalog and submits the same Offering selection. Local inference appears only through a typed Runner capability, whether implemented by a separate Runner process or an explicitly embedded instance of the same Runner execution code.
 
 CLI configuration cannot create a parallel model-selection or billing truth.
 
 ### Edge + Server
 
-Edge adds This device Offerings. Server remains authoritative for canonical run and invocation state; Edge owns the local secret and execution. Disconnect is a recoverable transport state, not a second session.
+Runner adds personal or Workspace Offerings. Server remains authoritative for canonical run and invocation state; Runner owns the local secret and execution. Disconnect is a transport state whose recovery must preserve dispatch uncertainty, not a new session or permission to retry.
 
-An extreme mode where prompt and agent state never reach Astra Server requires an Edge-owned backbone and is a separate architecture, not a `local=true` flag.
+If prompt and agent state must not leave the enterprise, deploy the same Server
+Backbone within that boundary. Runner BYOK alone does not provide context
+confidentiality from the Server that runs the agent.
 
 ## Long-running and multi-agent behavior
 
 - A run stores the user selection and immutable route facts for each inference.
-- UI model changes affect only a later inference boundary, never an active provider request.
+- A session preference change defaults to the next user turn. Each admitted turn
+  captures its selection; internal model/tool rounds and already-running children
+  do not reread a mutable UI preference to choose another Offering.
 - Subagents may use purpose-specific Offerings only within inherited data and billing policy.
 - If access expires, only branches needing another inference pause; completed transcript and task state remain readable.
 - Repair resumes from durable invocation state and does not relaunch completed children.
 - Agent Workbench shows actual model, Model Access, state, and usage for each branch.
 
+Before session creation, a model choice is a client draft submitted atomically
+with the first turn. Existing-session preference commands use an expected
+selection revision and idempotency identity; concurrent clients receive a typed
+conflict instead of silently overwriting one another. A lost acknowledgement is
+reconciled from Server state. Clients distinguish draft/pending preference,
+acknowledged preference, and actual admitted selection.
+
+Retargeting a blocked current run is an explicit repair command, separate from
+changing the next-turn preference. It serializes with inference admission,
+requires proof that no active or uncertain provider attempt can be replaced,
+revalidates inherited data/billing/purpose policy, and records the effective
+future inference boundary. It does not rewrite completed or admitted routes.
+Pinning a turn's stable selection target does not pin an effective catalog token
+or authorization: every request still revalidates access, current binding
+revisions, and revocation. Applied invocation routes remain immutable.
+
+Changing viewers does not change the work, branch, model target, or executor.
+Disconnecting is not cancellation. Resuming reconciles the same invocations;
+forking inherits an eligible preference, never a live invocation, grant, secret,
+or usage settlement. Child access is freshly resolved through existing
+work/session and fork authority, not a BYOK-specific lifecycle. See
+[Runner continuity and forks](runner-inference.md#continuity-across-surfaces-resume-and-fork)
+for local credential availability, attachment scope, and partial-state rules.
+
 ### Execution-authority boundaries
 
 The following boundaries are normative for every inference surface:
 
-1. **Offering admission owns route material.** A run may remember the selected
-   effective Offering ID, but it must not treat a previously decrypted route as
-   authorization for a later provider request. Immediately before each provider
-   request, Server revalidates the Offering and materializes the current route and
-   credential generation. This check occurs per request, never per streamed token.
+1. **Offering admission owns route material.** A run remembers the stable
+   selection target and historical effective IDs, but must not treat a decrypted
+   route as authorization for a later provider request. Immediately before each provider
+   request, Server revalidates the Offering and resolves the current route and
+   credential generation. Only the selected executor materializes secrets.
+   This check occurs per request, never per streamed token.
    A disabled Offering therefore blocks the next request; credential and endpoint
-   rotation therefore affect the next request without restarting the run.
+   rotation within the accepted data/billing boundary therefore affect the next
+   request without restarting the run. Boundary-changing updates require repair.
 2. **The durable ledger owns inference termination.** Admission returns a
    cancellation-safe invocation handle. Exactly one supervisor owns its deadline
-   and provider attempt. Dropping, aborting, or timing out the caller converges the
-   attempt to `DeliveryUnknown` after provider I/O begins, or `Cancelled` before
-   provider I/O begins, and then settles the logical invocation. Callers must not
-   wrap the same operation in an independent competing timeout.
+   and provider attempt. Dropping, aborting, or timing out the caller preserves
+   `DeliveryUnknown` when provider dispatch may have occurred, or `Cancelled`
+   when no-dispatch evidence exists. Remote custody and late evidence are
+   reconciled by that same ledger, even after a caller or run terminates. Callers
+   must not wrap the operation in an independent competing invocation timeout.
 3. **Each API surface owns its producer identity.** Public completion proxy calls
    are session-owned auxiliary inference, not arbitrary internal run or harness
    work. Server derives their producer namespace, purpose, and durable scope from a
@@ -798,8 +907,9 @@ tests use MatrixOne plus a controllable mock provider and prove observable cause
 
 - disable an Offering between two requests and assert that the second request
   never reaches the provider;
-- rotate route or credential generation and assert that the next request uses the
-  new material;
+- rotate route or credential generation within the same semantic target and
+  assert that the next request uses new material without reselecting or changing
+  admitted routes; an account/boundary change requires explicit selection;
 - abort a non-streaming call after the provider accepts it and assert durable
   provider-attempt and logical-invocation terminals;
 - retry the same auxiliary request concurrently and assert one producer-owned
@@ -828,7 +938,7 @@ not satisfy these gates.
 | Fixed Offering unavailable | Do not silently replace it. |
 | Optional memory/reflection route unavailable | Record structured degraded evidence and continue the primary task. |
 | Required primary route unavailable | Block that inference with typed reason and recovery choices, not the whole session history. |
-| Administrator emergency revoke | Prevent new inference immediately; handle active streams according to explicit revoke policy; audit the action. |
+| Administrator emergency revoke | Deny new admission/grants immediately; already-issued remote grants remain bounded by their start window. Handle active streams according to explicit revoke policy and audit the action. |
 | Server crashes after upstream accept | Recover from durable route/attempt facts and provider identity; never invent terminal usage. |
 
 Retry is coordinated at one layer. Server, gateway, and provider adapters cannot independently multiply retries.
@@ -840,10 +950,10 @@ Retry is coordinated at one layer. Server, gateway, and provider adapters cannot
 - Secret material never appears in profile responses, route records, transcript, journal, SSE, traces, errors, or snapshots.
 - Effective Offering IDs are principal-bound and revalidated.
 - Tenant/organization/user/device ownership is enforced at query and mutation boundaries.
-- Cache namespaces include trust, connection, credential generation, and tenant scope where content may be sensitive.
+- Prompt-cache namespaces include model/serialization compatibility and provider account/trust/tenant scope. Transport reconnect and credential revision alone do not invalidate them; rotate the opaque cache scope when account equivalence cannot be established. Credential-material caches remain generation-keyed and are not prompt caches.
 - Control-plane TaaS requests do not include prompt, messages, tool schema, or model stream.
 - Edge claims require authenticated device identity and leases; client-declared placement is not trusted.
-- Revocation affects new inference immediately through revision invalidation.
+- Revocation denies new admission/grants through revision invalidation. Previously issued remote grants have a finite validity window; instantaneous revoke across a network partition is not promised. Active cancellation follows explicit provider semantics.
 
 ## Durability, concurrency, and scale
 
@@ -868,7 +978,12 @@ Server instances remain horizontally replaceable:
 - no database query occurs per token or stream chunk;
 - hundreds of simultaneous sessions do not serialize on one global lock.
 
-Prompt-cache identity includes actual provider, upstream model, connection, trust scope, and cache protocol. Per-turn runtime feedback remains outside the stable prompt prefix.
+Prompt-cache identity includes actual provider/model/protocol, stable serializer
+semantics, and tenant/account trust scope. Transport reconnect, heartbeat, and
+health freshness do not change cache identity. Credential rotation changes the
+namespace when account/security scope changes or equivalence is unproven; it
+does not unconditionally invalidate the stable prefix. Per-turn runtime feedback
+remains outside that prefix.
 
 ## Observability and audit
 
@@ -954,7 +1069,7 @@ Cover Web, CLI + Server, Server Only, and Edge + Server:
 - A normal user can understand available models without provider configuration knowledge.
 - The UI always states execution placement and billing owner when it affects a decision.
 - TaaS account handling never becomes a special branch in the agent loop.
-- Non-TaaS personal credentials remain on Edge.
+- Personal Runner credentials remain local to Runner; Server-managed keys require an explicit Server trust choice.
 - All inference purposes use one resolver and invocation contract.
 - Every upstream request is attributable to a durable provider attempt.
 - No client can select an endpoint, credential, or placement directly.
