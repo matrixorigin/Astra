@@ -69,6 +69,7 @@ def main() -> None:
         Path("scripts/ci/test_interactive_setup_contract.sh"),
         Path("scripts/ops/test_production_env_contract.sh"),
         Path("scripts/ci/test_release_contract.sh"),
+        Path("scripts/ci/test_github_release_lookup.sh"),
         Path("scripts/ci/test_release_manifest_contract.sh"),
         Path("scripts/ci/test_release_build_shells.py"),
         Path("scripts/ci/test_sccache_fallback.sh"),
@@ -137,12 +138,10 @@ def main() -> None:
         "Reject conflicting Docker version before creating the tag",
         "Resolve publication continuation state",
         "Release-Run:",
-        "Could not safely determine whether GitHub Release",
         "Recovery cannot adopt manual or legacy tags",
         "Recovery will not trust an unverifiable release owner",
         'run.get("path", "")',
-        "releases?per_page=100",
-        "--paginate --jq '.[] |",
+        "scripts/resolve-github-release.sh",
         "release_id=${release_id}",
         "steps.stage_release.outputs.id",
         "Create or validate the immutable release tag",
@@ -155,6 +154,21 @@ def main() -> None:
         if required not in release_controller:
             errors.append(
                 f".github/workflows/release.yml: missing unified release contract ({required})"
+            )
+
+    release_lookup = Path("scripts/resolve-github-release.sh").read_text(
+        encoding="utf-8"
+    )
+    for required in (
+        "Could not safely determine whether GitHub Release",
+        "--paginate",
+        ".tag_name, .draft, .id",
+        "refusing an ambiguous publication",
+    ):
+        if required not in release_lookup:
+            errors.append(
+                "scripts/resolve-github-release.sh: missing draft-aware, fail-closed "
+                f"release lookup contract ({required})"
             )
 
     docker_manifest = release_controller.find(

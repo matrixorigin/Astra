@@ -330,27 +330,8 @@ jobs:
           SAME_RUN: ${{ steps.publication_state.outputs.same_run }}
         run: |
           set -euo pipefail
-          state=none
-          release_id=""
-          lookup_error="${RUNNER_TEMP}/release-lookup-error"
-          if release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --paginate --jq '.[] | [.tag_name, .draft, .id] | @tsv' 2>"${lookup_error}")"; then
-            while IFS=$'\t' read -r release_tag release_draft candidate_id; do
-              if [ "${release_tag}" = "${SOURCE_TAG}" ]; then
-                release_id="${candidate_id}"
-                if [ "${release_draft}" = "true" ]; then
-                  state=draft
-                else
-                  state=published
-                fi
-                break
-              fi
-            done <<< "${release_json}"
-          elif ! grep -Eq 'HTTP 404' "${lookup_error}"; then
-            echo "Could not safely determine whether GitHub Release ${SOURCE_TAG} exists:" >&2
-            cat "${lookup_error}" >&2
-            exit 1
-          fi
-          rm -f "${lookup_error}"
+          release_info="$(scripts/resolve-github-release.sh "${GITHUB_REPOSITORY}" "${SOURCE_TAG}")"
+          IFS=$'\t' read -r state release_id <<< "${release_info}"
           if [ "${RECOVER_EXISTING_TAG}" != "true" ] \
             && [ "${SAME_RUN}" != "true" ] \
             && [ "${state}" != "none" ]; then
@@ -509,22 +490,16 @@ jobs:
           STAGED_RELEASE_ID: ${{ steps.stage_release.outputs.id }}
         run: |
           set -euo pipefail
-          release_id="${EXISTING_RELEASE_ID:-${STAGED_RELEASE_ID:-}}"
+          if [ -n "${EXISTING_RELEASE_ID}" ] \
+            && [ -n "${STAGED_RELEASE_ID}" ] \
+            && [ "${EXISTING_RELEASE_ID}" != "${STAGED_RELEASE_ID}" ]; then
+            echo "Staged release ID ${STAGED_RELEASE_ID} does not match detected draft ${EXISTING_RELEASE_ID}." >&2
+            exit 1
+          fi
+          release_id="${STAGED_RELEASE_ID:-${EXISTING_RELEASE_ID:-}}"
           if [ -z "${release_id}" ]; then
-            release_list="$(
-              gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --paginate --jq '.[] | [.tag_name, .id] | @tsv'
-            )"
-            matches=0
-            while IFS=$'\t' read -r release_tag candidate_id; do
-              if [ "${release_tag}" = "${SOURCE_TAG}" ]; then
-                release_id="${candidate_id}"
-                matches=$((matches + 1))
-              fi
-            done <<< "${release_list}"
-            if [ "${matches}" -ne 1 ]; then
-              echo "expected one staged release for ${SOURCE_TAG}, found ${matches}" >&2
-              exit 1
-            fi
+            release_info="$(scripts/resolve-github-release.sh "${GITHUB_REPOSITORY}" "${SOURCE_TAG}")"
+            IFS=$'\t' read -r _release_state release_id <<< "${release_info}"
           fi
           if [ -z "${release_id}" ]; then
             echo "GitHub Release ${SOURCE_TAG} was staged but its release ID was not discoverable." >&2
