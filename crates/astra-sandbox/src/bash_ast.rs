@@ -55,15 +55,19 @@ fn collect_simple_commands(node: Node<'_>, source: &str, commands: &mut Vec<Vec<
 #[derive(Debug)]
 enum CommandWord {
     Literal(String),
-    Dynamic,
+    Dynamic { may_split: bool },
 }
 
 impl CommandWord {
     fn literal(&self) -> Option<&str> {
         match self {
             Self::Literal(value) => Some(value),
-            Self::Dynamic => None,
+            Self::Dynamic { .. } => None,
         }
+    }
+
+    fn may_split(&self) -> bool {
+        matches!(self, Self::Dynamic { may_split: true })
     }
 }
 
@@ -82,17 +86,57 @@ fn command_words(node: Node<'_>, source: &str) -> Option<Vec<CommandWord>> {
             | "heredoc_redirect"
             | "herestring_redirect" => continue,
             _ => {
-                words.push(CommandWord::Dynamic);
+                words.push(CommandWord::Dynamic {
+                    may_split: dynamic_word_may_split(child, source),
+                });
                 continue;
             }
         };
         words.push(
             literal_command_word(word_node, source)
                 .map(CommandWord::Literal)
-                .unwrap_or(CommandWord::Dynamic),
+                .unwrap_or_else(|| CommandWord::Dynamic {
+                    may_split: dynamic_word_may_split(word_node, source),
+                }),
         );
     }
     (!words.is_empty()).then_some(words)
+}
+
+/// Whether a runtime-dependent shell word can expand into multiple argv
+/// entries. A double-quoted scalar variable remains exactly one argv entry;
+/// every other dynamic spelling is kept conservative because unquoted field
+/// splitting, arrays, `$@`, or substitutions can change command boundaries.
+fn dynamic_word_may_split(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "string" {
+        return true;
+    }
+
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| match child.kind() {
+            "string_content" => false,
+            "simple_expansion" | "expansion" => {
+                let raw = child.utf8_text(source.as_bytes()).unwrap_or_default();
+                !is_quoted_scalar_expansion(raw)
+            }
+            _ => true,
+        })
+}
+
+fn is_quoted_scalar_expansion(raw: &str) -> bool {
+    let name = raw
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+        .or_else(|| raw.strip_prefix('$'));
+    let Some(name) = name else {
+        return false;
+    };
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 fn literal_command_word(node: Node<'_>, source: &str) -> Option<String> {
@@ -215,9 +259,9 @@ const SHELL_SHORT_OPTIONS: &str = "abefhiklmnprstuvxBCEHPTDqVE";
 
 fn nested_shell_script(words: &[CommandWord]) -> NestedShellScript<'_> {
     let index = match resolve_transparent_launcher(words, 0) {
-        Ok(Some(index)) => index,
-        Ok(None) => return NestedShellScript::None,
-        Err(()) => return NestedShellScript::Ambiguous,
+        LauncherResolution::Dispatch(index) => index,
+        LauncherResolution::NoDispatch => return NestedShellScript::None,
+        LauncherResolution::Ambiguous => return NestedShellScript::Ambiguous,
     };
     let Some(executable) = words
         .get(index)
@@ -325,9 +369,9 @@ fn resolve_destructive_command(
     shell_depth: usize,
 ) -> DestructiveCommandResolution {
     let index = match resolve_transparent_launcher(words, 0) {
-        Ok(Some(index)) => index,
-        Ok(None) => return DestructiveCommandResolution::Safe,
-        Err(()) => return DestructiveCommandResolution::Ambiguous,
+        LauncherResolution::Dispatch(index) => index,
+        LauncherResolution::NoDispatch => return DestructiveCommandResolution::Safe,
+        LauncherResolution::Ambiguous => return DestructiveCommandResolution::Ambiguous,
     };
     let Some(executable) = words.get(index).and_then(CommandWord::literal) else {
         return DestructiveCommandResolution::Ambiguous;
@@ -368,7 +412,28 @@ fn resolve_destructive_command(
     }
 }
 
-fn resolve_transparent_launcher(
+enum LauncherResolution {
+    Dispatch(usize),
+    NoDispatch,
+    Ambiguous,
+}
+
+/// Resolve the executable owned by a known command-dispatch surface.
+///
+/// This registry is defense in depth. OS isolation and workspace capability
+/// enforcement remain the security boundary; an arbitrary executable may
+/// itself launch another process and cannot be proven otherwise from Bash AST
+/// alone. Entries here cover standard dispatch surfaces in Astra's supported
+/// runtime environments and fail closed when an argv boundary is ambiguous.
+fn resolve_transparent_launcher(words: &[CommandWord], index: usize) -> LauncherResolution {
+    match resolve_transparent_launcher_index(words, index) {
+        Ok(Some(index)) => LauncherResolution::Dispatch(index),
+        Ok(None) => LauncherResolution::NoDispatch,
+        Err(()) => LauncherResolution::Ambiguous,
+    }
+}
+
+fn resolve_transparent_launcher_index(
     words: &[CommandWord],
     mut index: usize,
 ) -> Result<Option<usize>, ()> {
@@ -383,7 +448,8 @@ fn resolve_transparent_launcher(
                 let Some(next) = skip_launcher_options(
                     words,
                     index,
-                    LauncherOptionGrammar::new("pVv", "", &[], &[], &[]),
+                    LauncherOptionGrammar::new("p", "", &[], &[], &[])
+                        .with_terminal_flags("Vv", &[]),
                 )?
                 else {
                     return Ok(None);
@@ -394,7 +460,8 @@ fn resolve_transparent_launcher(
                 let Some(next) = skip_launcher_options(
                     words,
                     index,
-                    LauncherOptionGrammar::new("", "", &["--help"], &[], &[]),
+                    LauncherOptionGrammar::new("", "", &[], &[], &[])
+                        .with_terminal_flags("", &["--help"]),
                 )?
                 else {
                     return Ok(None);
@@ -405,7 +472,8 @@ fn resolve_transparent_launcher(
                 let Some(next) = skip_launcher_options(
                     words,
                     index,
-                    LauncherOptionGrammar::new("cl", "a", &["--help"], &[], &[]),
+                    LauncherOptionGrammar::new("cl", "a", &[], &[], &[])
+                        .with_terminal_flags("", &["--help"]),
                 )?
                 else {
                     return Ok(None);
@@ -416,7 +484,8 @@ fn resolve_transparent_launcher(
                 let Some(next) = skip_launcher_options(
                     words,
                     index,
-                    LauncherOptionGrammar::new("", "", &["--help", "--version"], &[], &[]),
+                    LauncherOptionGrammar::new("", "", &[], &[], &[])
+                        .with_terminal_flags("", &["--help", "--version"]),
                 )?
                 else {
                     return Ok(None);
@@ -435,12 +504,11 @@ fn resolve_transparent_launcher(
                             "--null",
                             "--debug",
                             "--list-signal-handling",
-                            "--help",
-                            "--version",
                         ],
                         &["--unset", "--chdir", "--path", "--argv0"],
                         &["--block-signal", "--default-signal", "--ignore-signal"],
-                    ),
+                    )
+                    .with_terminal_flags("", &["--help", "--version"]),
                 )?
                 else {
                     return Ok(None);
@@ -459,25 +527,19 @@ fn resolve_transparent_launcher(
                     words,
                     index,
                     LauncherOptionGrammar::new(
-                        "ABbEHikKlNnPSseVv",
+                        "ABbEHikNnPSs",
                         "CDghpRTUurt",
                         &[
                             "--askpass",
                             "--background",
                             "--bell",
-                            "--edit",
                             "--set-home",
-                            "--help",
                             "--login",
-                            "--remove-timestamp",
                             "--reset-timestamp",
-                            "--list",
                             "--non-interactive",
                             "--preserve-groups",
                             "--stdin",
                             "--shell",
-                            "--version",
-                            "--validate",
                         ],
                         &[
                             "--close-from",
@@ -493,6 +555,17 @@ fn resolve_transparent_launcher(
                             "--user",
                         ],
                         &["--preserve-env"],
+                    )
+                    .with_terminal_flags(
+                        "eKlVv",
+                        &[
+                            "--edit",
+                            "--help",
+                            "--list",
+                            "--remove-timestamp",
+                            "--version",
+                            "--validate",
+                        ],
                     ),
                 )?
                 else {
@@ -504,7 +577,9 @@ fn resolve_transparent_launcher(
                 let Some(next) = skip_launcher_options(
                     words,
                     index,
-                    LauncherOptionGrammar::new("Lns", "aCu", &[], &[], &[]),
+                    LauncherOptionGrammar::new("ns", "au", &[], &[], &[])
+                        .with_terminal_flags("L", &[])
+                        .with_terminal_value_options("C", &[]),
                 )?
                 else {
                     return Ok(None);
@@ -518,10 +593,11 @@ fn resolve_transparent_launcher(
                     LauncherOptionGrammar::new(
                         "",
                         "",
-                        &["--disable-internal-agent", "--keep-cwd", "--version"],
+                        &["--disable-internal-agent", "--keep-cwd"],
                         &["--user"],
                         &[],
-                    ),
+                    )
+                    .with_terminal_flags("", &["--version"]),
                 )?
                 else {
                     return Ok(None);
@@ -535,16 +611,11 @@ fn resolve_transparent_launcher(
                     LauncherOptionGrammar::new(
                         "fpv",
                         "ks",
-                        &[
-                            "--foreground",
-                            "--preserve-status",
-                            "--verbose",
-                            "--help",
-                            "--version",
-                        ],
+                        &["--foreground", "--preserve-status", "--verbose"],
                         &["--kill-after", "--signal"],
                         &[],
-                    ),
+                    )
+                    .with_terminal_flags("", &["--help", "--version"]),
                 )?
                 else {
                     return Ok(None);
@@ -558,14 +629,9 @@ fn resolve_transparent_launcher(
                 let Some(next) = skip_launcher_options(
                     words,
                     index,
-                    LauncherOptionGrammar::new(
-                        "",
-                        "n",
-                        &["--help", "--version"],
-                        &["--adjustment"],
-                        &[],
-                    )
-                    .with_legacy_numeric_short_option(),
+                    LauncherOptionGrammar::new("", "n", &[], &["--adjustment"], &[])
+                        .with_terminal_flags("", &["--help", "--version"])
+                        .with_legacy_numeric_short_option(),
                 )?
                 else {
                     return Ok(None);
@@ -577,12 +643,14 @@ fn resolve_transparent_launcher(
                     words,
                     index,
                     LauncherOptionGrammar::new(
-                        "thV",
-                        "cnpPu",
-                        &["--ignore", "--help", "--version"],
-                        &["--class", "--classdata", "--pid", "--pgid", "--uid"],
+                        "t",
+                        "cn",
+                        &["--ignore"],
+                        &["--class", "--classdata"],
                         &[],
-                    ),
+                    )
+                    .with_terminal_flags("hV", &["--help", "--version"])
+                    .with_terminal_value_options("pPu", &["--pid", "--pgid", "--uid"]),
                 )?
                 else {
                     return Ok(None);
@@ -594,12 +662,122 @@ fn resolve_transparent_launcher(
                     words,
                     index,
                     LauncherOptionGrammar::new(
-                        "cfwhV",
+                        "cfw",
                         "",
-                        &["--ctty", "--fork", "--wait", "--help", "--version"],
+                        &["--ctty", "--fork", "--wait"],
                         &[],
                         &[],
-                    ),
+                    )
+                    .with_terminal_flags("hV", &["--help", "--version"]),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "stdbuf" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new(
+                        "",
+                        "ioe",
+                        &[],
+                        &["--input", "--output", "--error"],
+                        &[],
+                    )
+                    .with_terminal_flags("", &["--help", "--version"]),
+                )?
+                else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "taskset" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new("ac", "", &["--all-tasks", "--cpu-list"], &[], &[])
+                        .with_terminal_flags("phV", &["--pid", "--help", "--version"]),
+                )?
+                else {
+                    return Ok(None);
+                };
+                let Some(next) = skip_launcher_operands(words, next, 1)? else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "chroot" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new(
+                        "",
+                        "",
+                        &["--skip-chdir"],
+                        &["--groups", "--userspec"],
+                        &[],
+                    )
+                    .with_terminal_flags("", &["--help", "--version"]),
+                )?
+                else {
+                    return Ok(None);
+                };
+                let Some(next) = skip_launcher_operands(words, next, 1)? else {
+                    return Ok(None);
+                };
+                index = next;
+            }
+            "unshare" => {
+                let Some(next) = skip_launcher_options(
+                    words,
+                    index,
+                    LauncherOptionGrammar::new(
+                        "fmuinpCTUrc",
+                        "RwSGl",
+                        &[
+                            "--fork",
+                            "--forward-signals",
+                            "--map-root-user",
+                            "--map-current-user",
+                            "--map-auto",
+                            "--map-subids",
+                            "--keep-caps",
+                            "--clear-env",
+                        ],
+                        &[
+                            "--load-interp",
+                            "--map-user",
+                            "--map-users",
+                            "--map-group",
+                            "--map-groups",
+                            "--owner",
+                            "--propagation",
+                            "--setgroups",
+                            "--setuid",
+                            "--setgid",
+                            "--root",
+                            "--wd",
+                            "--monotonic",
+                            "--boottime",
+                            "--whitelist-env",
+                        ],
+                        &[
+                            "--mount",
+                            "--uts",
+                            "--ipc",
+                            "--net",
+                            "--pid",
+                            "--user",
+                            "--cgroup",
+                            "--time",
+                            "--kill-child",
+                            "--mount-proc",
+                            "--mount-binfmt",
+                        ],
+                    )
+                    .with_terminal_flags("hV", &["--help", "--version"]),
                 )?
                 else {
                     return Ok(None);
@@ -618,6 +796,10 @@ struct LauncherOptionGrammar {
     long_flags: &'static [&'static str],
     long_options_with_value: &'static [&'static str],
     long_options_with_optional_value: &'static [&'static str],
+    terminal_short_flags: &'static str,
+    terminal_short_options_with_value: &'static str,
+    terminal_long_flags: &'static [&'static str],
+    terminal_long_options_with_value: &'static [&'static str],
     legacy_numeric_short_option: bool,
 }
 
@@ -635,8 +817,32 @@ impl LauncherOptionGrammar {
             long_flags,
             long_options_with_value,
             long_options_with_optional_value,
+            terminal_short_flags: "",
+            terminal_short_options_with_value: "",
+            terminal_long_flags: &[],
+            terminal_long_options_with_value: &[],
             legacy_numeric_short_option: false,
         }
+    }
+
+    const fn with_terminal_flags(
+        mut self,
+        short: &'static str,
+        long: &'static [&'static str],
+    ) -> Self {
+        self.terminal_short_flags = short;
+        self.terminal_long_flags = long;
+        self
+    }
+
+    const fn with_terminal_value_options(
+        mut self,
+        short: &'static str,
+        long: &'static [&'static str],
+    ) -> Self {
+        self.terminal_short_options_with_value = short;
+        self.terminal_long_options_with_value = long;
+        self
     }
 
     const fn with_legacy_numeric_short_option(mut self) -> Self {
@@ -663,6 +869,15 @@ fn skip_launcher_options(
             let (option, inline_value) = argument
                 .split_once('=')
                 .map_or((argument, false), |(name, _)| (name, true));
+            if grammar.terminal_long_flags.contains(&option) && !inline_value {
+                return Ok(None);
+            }
+            if grammar.terminal_long_options_with_value.contains(&option) {
+                if !inline_value && words.get(index + 1).is_none() {
+                    return Err(());
+                }
+                return Ok(None);
+            }
             if grammar.long_flags.contains(&option) && !inline_value
                 || grammar.long_options_with_optional_value.contains(&option)
             {
@@ -696,6 +911,15 @@ fn skip_launcher_options(
             return Ok(Some(index));
         }
         while let Some(flag) = flags.next() {
+            if grammar.terminal_short_flags.contains(flag) {
+                return Ok(None);
+            }
+            if grammar.terminal_short_options_with_value.contains(flag) {
+                if flags.peek().is_none() && words.get(index + 1).is_none() {
+                    return Err(());
+                }
+                return Ok(None);
+            }
             if grammar.short_flags.contains(flag) {
                 continue;
             }
@@ -840,11 +1064,19 @@ fn resolve_find_commands(
     shell_depth: usize,
 ) -> DestructiveCommandResolution {
     let mut index = 0;
+    let mut expression_started = false;
     while index < words.len() {
         let Some(argument) = words[index].literal() else {
+            // A quoted scalar path remains one argv entry and cannot mint a
+            // complete predicate. Unquoted splitting, or any dynamic word
+            // after the expression begins, can change find's grammar.
+            if words[index].may_split() || expression_started {
+                return DestructiveCommandResolution::Ambiguous;
+            }
             index += 1;
             continue;
         };
+        expression_started |= is_find_expression_start(argument);
         if !matches!(argument, "-exec" | "-execdir" | "-ok" | "-okdir") {
             index += 1;
             continue;
@@ -857,6 +1089,12 @@ fn resolve_find_commands(
         }) else {
             return DestructiveCommandResolution::Ambiguous;
         };
+        if words[command_start..command_end]
+            .iter()
+            .any(CommandWord::may_split)
+        {
+            return DestructiveCommandResolution::Ambiguous;
+        }
         match resolve_destructive_command(&words[command_start..command_end], shell_depth) {
             DestructiveCommandResolution::Safe => {}
             result => return result,
@@ -864,6 +1102,10 @@ fn resolve_find_commands(
         index = command_end + 1;
     }
     DestructiveCommandResolution::Safe
+}
+
+fn is_find_expression_start(argument: &str) -> bool {
+    argument.starts_with('-') || matches!(argument, "!" | "(" | ")" | ",")
 }
 
 fn command_basename(raw: &str) -> String {
@@ -1236,6 +1478,11 @@ mod tests {
             "ionice -c 2 dd if=/dev/zero of=/dev/sda",
             "setsid wipefs -a /dev/sdb",
             "setsid env MODE=secure timeout 5 sudo dd if=/dev/zero of=/dev/sda",
+            "stdbuf -o0 dd if=/dev/zero of=/dev/sda",
+            "sudo stdbuf --output=0 wipefs -a /dev/sdb",
+            "taskset -c 0 wipefs -a /dev/sdb",
+            "chroot /mnt dd if=/dev/zero of=/dev/sda",
+            "unshare --fork truncate -s 0 important.db",
             "printf '%s\\n' data | xargs -n 1 dd if=/dev/zero of=/dev/sda",
             "find . -exec dd if=/dev/zero of=/dev/sda {} \\;",
             "find . -execdir sh -c 'wipefs -a /dev/sdb' {} \\;",
@@ -1267,10 +1514,21 @@ mod tests {
             "nice -n 5 printf '%s\\n' dd",
             "ionice -c 2 printf '%s\\n' dd",
             "setsid printf '%s\\n' dd",
+            "stdbuf -o0 printf '%s\\n' dd",
+            "taskset -c 0 printf '%s\\n' dd",
+            "chroot /mnt printf '%s\\n' dd",
+            "unshare --fork printf '%s\\n' dd",
             "busybox echo dd",
             "printf '%s\\n' dd | xargs printf '%s\\n'",
             "printf '%s\\n' dd | xargs",
             "find . -name dd -print",
+            "root=src; find \"$root\" -name dd -print",
+            "command -v dd",
+            "command -V dd",
+            "sudo -l dd",
+            "sudo --help dd",
+            "timeout --help dd",
+            "ionice -p 123 dd",
         ] {
             assert!(
                 !analyze_bash_risks_ast(command)
@@ -1302,6 +1560,7 @@ mod tests {
             "busybox \"$tool\" if=/dev/zero of=/dev/sda",
             "printf data | xargs \"$tool\" if=/dev/zero of=/dev/sda",
             "find . -exec \"$tool\" if=/dev/zero of=/dev/sda {} \\;",
+            "find_args='-exec truncate -s 0 important.db {} ;'; find . $find_args",
         ] {
             assert!(
                 analyze_bash_risks_ast(command).contains(&CommandRisk::RemoteCodeExecution),
@@ -1320,6 +1579,10 @@ mod tests {
             "nice --future-option dd if=/dev/zero of=/dev/sda",
             "ionice --future-option dd if=/dev/zero of=/dev/sda",
             "setsid --future-option dd if=/dev/zero of=/dev/sda",
+            "stdbuf --future-option dd if=/dev/zero of=/dev/sda",
+            "taskset --future-option 0 dd if=/dev/zero of=/dev/sda",
+            "chroot --future-option /mnt dd if=/dev/zero of=/dev/sda",
+            "unshare --future-option dd if=/dev/zero of=/dev/sda",
         ] {
             assert!(
                 analyze_bash_risks_ast(command).contains(&CommandRisk::RemoteCodeExecution),

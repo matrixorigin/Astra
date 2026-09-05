@@ -5124,8 +5124,14 @@ printf 'probe.txt:1:needle\n'
             "ionice -c 2 dd if=/dev/zero of=/dev/sda",
             "setsid wipefs -a /dev/sdb",
             "setsid env MODE=secure timeout 5 sudo dd if=/dev/zero of=/dev/sda",
+            "stdbuf -o0 dd if=/dev/zero of=/dev/sda",
+            "sudo stdbuf --output=0 wipefs -a /dev/sdb",
+            "taskset -c 0 wipefs -a /dev/sdb",
+            "chroot /mnt dd if=/dev/zero of=/dev/sda",
+            "unshare --fork truncate -s 0 important.db",
             "printf data | xargs dd if=/dev/zero of=/dev/sda",
             "find . -exec wipefs -a /dev/sdb {} \\;",
+            "find_args='-exec truncate -s 0 important.db {} ;'; find . $find_args",
             "tool=dd; \"$tool\" if=/dev/zero of=/dev/sda",
             "cat ~/.ssh/id_rsa",
             "echo data > ../outside.txt",
@@ -5156,6 +5162,28 @@ printf 'probe.txt:1:needle\n'
         assert!(validate_execute_bash_command("nice -n 5 printf '%s\\n' dd").is_ok());
         assert!(validate_execute_bash_command("ionice -c 2 printf '%s\\n' dd").is_ok());
         assert!(validate_execute_bash_command("setsid printf '%s\\n' dd").is_ok());
+        assert!(validate_execute_bash_command("stdbuf -o0 printf '%s\\n' dd").is_ok());
+        assert!(validate_execute_bash_command("taskset -c 0 printf '%s\\n' dd").is_ok());
+        assert!(validate_execute_bash_command("chroot /mnt printf '%s\\n' dd").is_ok());
+        assert!(validate_execute_bash_command("unshare --fork printf '%s\\n' dd").is_ok());
+        assert!(validate_execute_bash_command("root=src; find \"$root\" -name dd -print").is_ok());
+    }
+
+    #[test]
+    fn validate_execute_bash_allows_non_dispatch_modes() {
+        for command in [
+            "command -v dd",
+            "command -V dd",
+            "sudo -l dd",
+            "sudo --help dd",
+            "timeout --help dd",
+            "ionice -p 123 dd",
+        ] {
+            assert!(
+                validate_execute_bash_command(command).is_ok(),
+                "query or terminal mode must not inspect an unexecuted operand: {command}"
+            );
+        }
     }
 
     #[test]
@@ -5165,6 +5193,10 @@ printf 'probe.txt:1:needle\n'
             "nice --future-option dd if=/dev/zero of=/dev/sda",
             "ionice --future-option dd if=/dev/zero of=/dev/sda",
             "setsid --future-option dd if=/dev/zero of=/dev/sda",
+            "stdbuf --future-option dd if=/dev/zero of=/dev/sda",
+            "taskset --future-option 0 dd if=/dev/zero of=/dev/sda",
+            "chroot --future-option /mnt dd if=/dev/zero of=/dev/sda",
+            "unshare --future-option dd if=/dev/zero of=/dev/sda",
         ] {
             assert!(
                 validate_execute_bash_command(command).is_err(),
