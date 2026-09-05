@@ -331,9 +331,20 @@ jobs:
         run: |
           set -euo pipefail
           state=none
+          release_id=""
           lookup_error="${RUNNER_TEMP}/release-lookup-error"
-          if release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${SOURCE_TAG}" 2>"${lookup_error}")"; then
-            state="$(printf '%s' "${release_json}" | python3 -c 'import json,sys; print("draft" if json.load(sys.stdin)["draft"] else "published")')"
+          if release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --paginate --jq '.[] | [.tag_name, .draft, .id] | @tsv' 2>"${lookup_error}")"; then
+            while IFS=$'\t' read -r release_tag release_draft candidate_id; do
+              if [ "${release_tag}" = "${SOURCE_TAG}" ]; then
+                release_id="${candidate_id}"
+                if [ "${release_draft}" = "true" ]; then
+                  state=draft
+                else
+                  state=published
+                fi
+                break
+              fi
+            done <<< "${release_json}"
           elif ! grep -Eq 'HTTP 404' "${lookup_error}"; then
             echo "Could not safely determine whether GitHub Release ${SOURCE_TAG} exists:" >&2
             cat "${lookup_error}" >&2
@@ -347,6 +358,7 @@ jobs:
             exit 1
           fi
           echo "state=${state}" >> "${GITHUB_OUTPUT}"
+          echo "release_id=${release_id}" >> "${GITHUB_OUTPUT}"
 
       - name: Reject conflicting Docker version before creating the tag
         if: >-
@@ -472,6 +484,7 @@ jobs:
 
       - name: Stage GitHub Release and verified assets
         if: ${{ steps.existing_release.outputs.state != 'published' }}
+        id: stage_release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           token: ${{ github.token }}
@@ -492,9 +505,31 @@ jobs:
           SOURCE_TAG: ${{ needs.preflight.outputs.source_tag }}
           PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
           PUBLISH_LATEST: ${{ needs.preflight.outputs.publish_latest }}
+          EXISTING_RELEASE_ID: ${{ steps.existing_release.outputs.release_id }}
+          STAGED_RELEASE_ID: ${{ steps.stage_release.outputs.id }}
         run: |
           set -euo pipefail
-          release_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${SOURCE_TAG}" --jq .id)"
+          release_id="${EXISTING_RELEASE_ID:-${STAGED_RELEASE_ID:-}}"
+          if [ -z "${release_id}" ]; then
+            release_list="$(
+              gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" --paginate --jq '.[] | [.tag_name, .id] | @tsv'
+            )"
+            matches=0
+            while IFS=$'\t' read -r release_tag candidate_id; do
+              if [ "${release_tag}" = "${SOURCE_TAG}" ]; then
+                release_id="${candidate_id}"
+                matches=$((matches + 1))
+              fi
+            done <<< "${release_list}"
+            if [ "${matches}" -ne 1 ]; then
+              echo "expected one staged release for ${SOURCE_TAG}, found ${matches}" >&2
+              exit 1
+            fi
+          fi
+          if [ -z "${release_id}" ]; then
+            echo "GitHub Release ${SOURCE_TAG} was staged but its release ID was not discoverable." >&2
+            exit 1
+          fi
           gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
             -F draft=false \
             -F prerelease="${PRERELEASE}" \
