@@ -59,7 +59,7 @@ async fn edge_registry_register_twice_keeps_registry_id() {
     assert_eq!(second.hostname.as_deref(), Some("h2"));
 
     registry
-        .heartbeat(&user, &edge_agent, "transport-b")
+        .heartbeat(&user, &edge_agent, "transport-b", None)
         .await
         .expect("heartbeat");
 

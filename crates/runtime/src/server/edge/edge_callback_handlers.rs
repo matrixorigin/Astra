@@ -1638,7 +1638,7 @@ pub(crate) async fn post_agents_edge_heartbeat_handler(
     state
         .execution
         .edge_registry_service
-        .heartbeat(&user.user_id, &body.edge_agent_id, &edge_id)
+        .heartbeat(&user.user_id, &body.edge_agent_id, &edge_id, None)
         .await
         .map_err(|e| match e {
             astra_services::multi_agent::HeartbeatError::Superseded => error_response(

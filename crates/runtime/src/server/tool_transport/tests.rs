@@ -846,6 +846,7 @@ impl astra_services::multi_agent::EdgeRegistryService for StaticEdgeRegistry {
         _user_id: &str,
         _edge_agent_id: &str,
         _edge_id_header: &str,
+        _registration_claim_id: Option<&str>,
     ) -> Result<(), astra_services::multi_agent::HeartbeatError> {
         Ok(())
     }

@@ -1165,25 +1165,43 @@ struct BlockingLeaseEdgeRegistry {
     claim_release_started: Notify,
     claim_release_gate: Notify,
     rollback_count: AtomicUsize,
-    release_succeeds: bool,
+    release_attempts: AtomicUsize,
+    release_outcomes: std::sync::Mutex<std::collections::VecDeque<Result<bool, String>>>,
+    block_first_release: bool,
 }
 
 impl BlockingLeaseEdgeRegistry {
     fn new() -> Self {
+        Self::with_release_outcomes([Ok(true)], true)
+    }
+
+    fn with_claim_loss() -> Self {
+        Self::with_release_outcomes([Ok(false)], true)
+    }
+
+    fn with_release_recovery() -> Self {
+        Self::with_release_outcomes(
+            [
+                Err("simulated release outcome unknown".to_string()),
+                Ok(true),
+            ],
+            false,
+        )
+    }
+
+    fn with_release_outcomes(
+        outcomes: impl IntoIterator<Item = Result<bool, String>>,
+        block_first_release: bool,
+    ) -> Self {
         Self {
             registration_started: Notify::new(),
             release_registration: Notify::new(),
             claim_release_started: Notify::new(),
             claim_release_gate: Notify::new(),
             rollback_count: AtomicUsize::new(0),
-            release_succeeds: true,
-        }
-    }
-
-    fn with_claim_loss() -> Self {
-        Self {
-            release_succeeds: false,
-            ..Self::new()
+            release_attempts: AtomicUsize::new(0),
+            release_outcomes: std::sync::Mutex::new(outcomes.into_iter().collect()),
+            block_first_release,
         }
     }
 }
@@ -1246,9 +1264,16 @@ impl astra_services::multi_agent::EdgeRegistryService for BlockingLeaseEdgeRegis
         &self,
         _lease: &astra_services::multi_agent::EdgeRegistrationLease,
     ) -> Result<bool, String> {
+        let attempt = self.release_attempts.fetch_add(1, Ordering::SeqCst);
         self.claim_release_started.notify_one();
-        self.claim_release_gate.notified().await;
-        Ok(self.release_succeeds)
+        if self.block_first_release && attempt == 0 {
+            self.claim_release_gate.notified().await;
+        }
+        self.release_outcomes
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(true))
     }
 
     async fn heartbeat(
@@ -1256,6 +1281,7 @@ impl astra_services::multi_agent::EdgeRegistryService for BlockingLeaseEdgeRegis
         _user_id: &str,
         _edge_agent_id: &str,
         _edge_id_header: &str,
+        _registration_claim_id: Option<&str>,
     ) -> Result<(), astra_services::multi_agent::HeartbeatError> {
         Ok(())
     }
@@ -1363,7 +1389,7 @@ async fn edge_ws_close_during_registration_rolls_back_without_pool_commit() {
 }
 
 #[tokio::test]
-async fn edge_ws_auth_ok_precedes_claim_release_wait() {
+async fn pending_claim_release_does_not_block_websocket_messages_or_disconnect() {
     let registry = Arc::new(BlockingLeaseEdgeRegistry::new());
     let state = AppState::new(
         ServiceInfo::new("edge-auth-order-test", "0.0.0-test", ""),
@@ -1371,6 +1397,7 @@ async fn edge_ws_auth_ok_precedes_claim_release_wait() {
     )
     .with_auth_service(Arc::new(StubAuthService))
     .with_edge_registry_service(registry.clone());
+    let observed_state = state.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -1421,8 +1448,32 @@ async fn edge_ws_auth_ok_precedes_claim_release_wait() {
     let first: serde_json::Value = serde_json::from_str(&first).unwrap();
     assert_eq!(first["type"], "edge_auth_ok");
 
-    registry.claim_release_gate.notify_one();
-    ws.close(None).await.ok();
+    // Keep release_registration permanently pending. The application data
+    // plane must remain responsive while durable publication is reconciling.
+    ws.send(Message::Text(
+        json!({ "type": "edge_ping" }).to_string().into(),
+    ))
+    .await
+    .expect("send ping while release is pending");
+    let pong = tokio::time::timeout(std::time::Duration::from_secs(2), ws.next())
+        .await
+        .expect("pong timeout while release is pending")
+        .expect("pong frame while release is pending")
+        .expect("valid pong while release is pending");
+    let pong: serde_json::Value = serde_json::from_str(&pong.into_text().unwrap()).unwrap();
+    assert_eq!(pong["type"], "edge_pong");
+
+    ws.close(None).await.expect("close websocket");
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while observed_state
+            .edge_connection_pool
+            .has_connected_edge("test-user-1")
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("pending release future must be cancelled during disconnect cleanup");
     server.abort();
 }
 
@@ -1485,7 +1536,7 @@ async fn claim_loss_after_pool_commit_removes_the_unpublished_connection() {
         serde_json::from_str(&second.into_text().unwrap()).unwrap();
     assert!(matches!(
         second,
-        astra_server_types::edge_ws_protocol::EdgeServerMessage::AuthError { .. }
+        astra_server_types::edge_ws_protocol::EdgeServerMessage::Closing { .. }
     ));
     assert!(
         !observed_state
@@ -1517,6 +1568,7 @@ impl astra_services::multi_agent::EdgeRegistryService for FailingEdgeRegistry {
         _user_id: &str,
         _edge_agent_id: &str,
         _edge_id_header: &str,
+        _registration_claim_id: Option<&str>,
     ) -> Result<(), astra_services::multi_agent::HeartbeatError> {
         Ok(())
     }
@@ -1594,6 +1646,91 @@ async fn edge_ws_rejects_connection_when_db_registration_fails() {
     server.abort();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn release_outcome_unknown_is_reconciled_while_the_connection_is_alive() {
+    let registry = Arc::new(BlockingLeaseEdgeRegistry::with_release_recovery());
+    let state = AppState::new(
+        ServiceInfo::new("edge-release-recovery-test", "0.0.0-test", ""),
+        Arc::new(StubHealthChecker),
+    )
+    .with_auth_service(Arc::new(StubAuthService))
+    .with_edge_registry_service(registry.clone());
+    let observed_state = state.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, astra_runtime::build_app(state))
+            .await
+            .unwrap()
+    });
+
+    let (mut ws, _) = connect_async(ws_request(addr, "test-edge-token"))
+        .await
+        .expect("WS connect");
+    ws.send(Message::Text(
+        json!({
+            "type": "edge_auth",
+            "edge_agent_id": "edge-release-recovery",
+            "interaction_api_major": astra_server_types::AGENT_INTERACTION_API_MAJOR,
+            "hostname": "host",
+            "workspace_dir": "/workspace",
+            "capabilities": edge_capabilities("edge-release-recovery")
+        })
+        .to_string()
+        .into(),
+    ))
+    .await
+    .unwrap();
+    registry.registration_started.notified().await;
+    registry.release_registration.notify_one();
+
+    let auth = ws.next().await.unwrap().unwrap();
+    let auth: astra_server_types::edge_ws_protocol::EdgeServerMessage =
+        serde_json::from_str(&auth.into_text().unwrap()).unwrap();
+    assert!(matches!(
+        auth,
+        astra_server_types::edge_ws_protocol::EdgeServerMessage::AuthOk { .. }
+    ));
+
+    ws.send(Message::Text(
+        json!({ "type": "edge_ping" }).to_string().into(),
+    ))
+    .await
+    .expect("send readiness ping");
+    let pong = ws
+        .next()
+        .await
+        .expect("readiness pong frame")
+        .expect("pong");
+    let pong: astra_server_types::edge_ws_protocol::EdgeServerMessage =
+        serde_json::from_str(&pong.into_text().unwrap()).unwrap();
+    assert!(matches!(
+        pong,
+        astra_server_types::edge_ws_protocol::EdgeServerMessage::Pong { .. }
+    ));
+
+    tokio::time::pause();
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while registry.release_attempts.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("durable publication retry");
+    tokio::time::resume();
+
+    assert_eq!(registry.release_attempts.load(Ordering::SeqCst), 2);
+    assert!(
+        observed_state
+            .edge_connection_pool
+            .has_connected_edge("test-user-1"),
+        "a transient release failure must converge without discarding the healthy socket"
+    );
+    ws.close(None).await.ok();
+    server.abort();
+}
+
 // ── B3: heartbeat tick updates DB registry ────────────────────────────
 
 #[derive(Default)]
@@ -1634,6 +1771,7 @@ impl astra_services::multi_agent::EdgeRegistryService for RecordingEdgeRegistry 
         user_id: &str,
         edge_agent_id: &str,
         edge_id_header: &str,
+        _registration_claim_id: Option<&str>,
     ) -> Result<(), astra_services::multi_agent::HeartbeatError> {
         self.heartbeats.lock().unwrap().push((
             user_id.to_string(),

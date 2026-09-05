@@ -14,6 +14,8 @@ use axum::response::IntoResponse;
 use futures_util::StreamExt;
 use futures_util::stream::{SplitSink, SplitStream};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -23,6 +25,52 @@ use tokio::sync::mpsc;
 const MAX_EDGE_WS_CONNECTIONS: usize = 1024;
 const EDGE_REGISTRY_UNREGISTER_ATTEMPTS: usize = 3;
 const EDGE_HEARTBEAT_STORAGE_FAILURE_BUDGET: usize = 3;
+const EDGE_REGISTRY_RELEASE_RETRY_BASE: Duration = Duration::from_secs(1);
+const EDGE_REGISTRY_RELEASE_RETRY_MAX: Duration = Duration::from_secs(30);
+const EDGE_REGISTRY_RELEASE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+type EdgeRegistryReleaseReconciliation = Pin<Box<dyn Future<Output = bool> + Send>>;
+
+fn reconcile_edge_registry_release(
+    registry: Arc<dyn astra_services::multi_agent::EdgeRegistryService>,
+    lease: astra_services::multi_agent::EdgeRegistrationLease,
+) -> EdgeRegistryReleaseReconciliation {
+    Box::pin(async move {
+        let mut retry_delay = EDGE_REGISTRY_RELEASE_RETRY_BASE;
+        loop {
+            match tokio::time::timeout(
+                EDGE_REGISTRY_RELEASE_ATTEMPT_TIMEOUT,
+                registry.release_registration(&lease),
+            )
+            .await
+            {
+                Ok(Ok(settled)) => return settled,
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        target: "astra_runtime::edge_ws",
+                        user_id = %lease.current.user_id,
+                        edge_agent_id = %lease.current.edge_agent_id,
+                        %error,
+                        "edge WebSocket: durable registration publication remains unresolved"
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        target: "astra_runtime::edge_ws",
+                        user_id = %lease.current.user_id,
+                        edge_agent_id = %lease.current.edge_agent_id,
+                        timeout_ms = EDGE_REGISTRY_RELEASE_ATTEMPT_TIMEOUT.as_millis(),
+                        "edge WebSocket: durable registration publication attempt timed out"
+                    );
+                }
+            }
+            tokio::time::sleep(retry_delay).await;
+            retry_delay = retry_delay
+                .saturating_mul(2)
+                .min(EDGE_REGISTRY_RELEASE_RETRY_MAX);
+        }
+    })
+}
 
 /// Global counter of active edge WebSocket connections.
 static EDGE_WS_CONNECTION_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -628,47 +676,13 @@ async fn handle_edge_connection(
         workspace_id.clone(),
         pool_tx,
     );
-    match edge_registry
-        .release_registration(&registration_lease)
-        .await
-    {
-        Ok(false) if registration_lease.claim_id.is_some() => {
-            // A definite claim mismatch means another pod already owns the
-            // durable generation. Fail closed instead of publishing a local
-            // connection that cross-pod routing cannot consistently target.
-            state.edge_connection_pool.unregister_generation(
-                &user_id,
-                &edge_agent_id,
-                pool_generation,
-            );
-            forward_task.abort();
-            drop(reconnect_guard);
-            state
-                .edge_connection_pool
-                .gc_reconnect_lock(&user_id, &edge_agent_id);
-            let _ = send_edge_msg(
-                &ws_sink,
-                EdgeServerMessage::AuthError {
-                    message: "edge registry registration claim lost".into(),
-                },
-            )
-            .await;
-            return;
-        }
-        Err(error) => {
-            // The claim has a DB-side expiry, so an outcome-unknown release
-            // delays another cross-pod reconnect but cannot fence this healthy
-            // connection forever.
-            tracing::error!(
-                target: "astra_runtime::edge_ws",
-                user_id = %user_id,
-                edge_agent_id = %edge_agent_id,
-                %error,
-                "edge WebSocket: failed to release durable registration claim"
-            );
-        }
-        _ => {}
-    }
+    // Reconcile publication as a cancellable future polled alongside the
+    // WebSocket. A slow or half-open control-plane write must not prevent Ping,
+    // ToolResult, Close, or heartbeat handling. Dropping this connection future
+    // cancels the in-flight database attempt as well.
+    let mut registration_release = registration_lease.claim_id.as_ref().map(|_| {
+        reconcile_edge_registry_release(edge_registry.clone(), registration_lease.clone())
+    });
     drop(reconnect_guard);
     // Release the per-key reconnect lock entry now that the reconnect is done.
     state
@@ -1002,7 +1016,12 @@ async fn handle_edge_connection(
                     // edge_id so a stale connection cannot refresh a row that a
                     // newer connection has already claimed.
                     match edge_registry
-                        .heartbeat(&user_id, &edge_agent_id, &edge_id_for_registry)
+                        .heartbeat(
+                            &user_id,
+                            &edge_agent_id,
+                            &edge_id_for_registry,
+                            registration_lease.claim_id.as_deref(),
+                        )
                         .await
                     {
                         Ok(()) => consecutive_heartbeat_storage_failures = 0,
@@ -1040,6 +1059,37 @@ async fn handle_edge_connection(
                                 break;
                             }
                         }
+                    }
+                }
+                released = async {
+                    match registration_release.as_mut() {
+                        Some(release) => release.as_mut().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    registration_release = None;
+                    if released {
+                        tracing::info!(
+                            target: "astra_runtime::edge_ws",
+                            user_id = %user_id,
+                            edge_agent_id = %edge_agent_id,
+                            "edge WebSocket: reconciled durable registration publication"
+                        );
+                    } else {
+                        tracing::info!(
+                            target: "astra_runtime::edge_ws",
+                            user_id = %user_id,
+                            edge_agent_id = %edge_agent_id,
+                            "edge WebSocket: durable registration was superseded during publication reconciliation"
+                        );
+                        let _ = send_edge_msg(
+                            &ws_sink_write,
+                            EdgeServerMessage::Closing {
+                                reason: "edge registry registration claim lost".into(),
+                            },
+                        )
+                        .await;
+                        break;
                     }
                 }
             }
@@ -1575,6 +1625,7 @@ mod tests {
             _user_id: &str,
             _edge_agent_id: &str,
             _edge_id_header: &str,
+            _registration_claim_id: Option<&str>,
         ) -> Result<(), astra_services::multi_agent::HeartbeatError> {
             unreachable!("heartbeat is not used by unregister retry tests")
         }
