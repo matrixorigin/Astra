@@ -560,8 +560,8 @@ struct SearchIgnoreRule {
 /// boundary because command parsing cannot enumerate arbitrary writers.
 ///
 /// Layering:
-/// 1. Local substring/heuristic rules (destructive `rm`, pipe-to-shell, netcat, etc.).
-/// 2. [`analyze_command_risks`] (tree-sitter + legacy): any reported risk **blocks** except
+/// 1. Local rules for shell syntax with no ordinary executable (`rm -rf`, fork bombs, etc.).
+/// 2. [`analyze_command_risks`] (tree-sitter command analysis): any reported risk **blocks** except
 ///    [`CommandRisk::PathTraversal`] and [`CommandRisk::NetworkAccess`], which are allowed here
 ///    so normal `cd ../..` and `curl`/`wget` workflows remain usable (network still subject to
 ///    sandbox/permissions elsewhere). All other sandbox risks (e.g. [`CommandRisk::Eval`],
@@ -734,25 +734,10 @@ pub fn validate_execute_bash_command_in_workspace(
     }
     validate_bash_background_task_contract(cmd)?;
     let lower = cmd.to_ascii_lowercase();
-    let blocked_substrings = [
-        "mkfs",
-        "mkswap",
-        " wipefs",
-        " dd if=",
-        " dd of=",
-        "shutdown",
-        "reboot",
-        "poweroff",
-        "halt",
-        "telinit",
-        "kill -9",
-        "pkill",
-        "killall",
-        " :(){",
-        ":(){ :",
-        "fork bomb",
-    ];
-    for pat in blocked_substrings {
+    // Fork bombs are shell syntax rather than an executable invocation, so
+    // they remain an explicit syntax check. Executable risks are owned by the
+    // AST analyzer below and must not scan heredoc/interpreter source text.
+    for pat in [" :(){", ":(){ :"] {
         if lower.contains(pat) {
             return Err(format!(
                 "Error: bash command matches a blocked destructive pattern ({pat:?})"
@@ -6152,6 +6137,29 @@ printf 'probe.txt:1:needle\n'
     fn validate_execute_bash_blocks_top5_security_risks() {
         for command in [
             "dd if=/dev/zero of=/dev/sda",
+            "exec -a alias dd if=/dev/zero of=/dev/sda",
+            "sudo -D /tmp dd if=/dev/zero of=/dev/sda",
+            "doas -a passwd dd if=/dev/zero of=/dev/sda",
+            "pkexec --user root dd if=/dev/zero of=/dev/sda",
+            "env -u HOME dd if=/dev/zero of=/dev/sda",
+            "bash --norc -c 'dd if=/dev/zero of=/dev/sda'",
+            "env MODE=secure bash --rcfile /tmp/bashrc -c 'wipefs -a /dev/sdb'",
+            "busybox dd if=/dev/zero of=/dev/sda",
+            "timeout 5 dd if=/dev/zero of=/dev/sda",
+            "sudo timeout -s KILL 5 dd if=/dev/zero of=/dev/sda",
+            "nice -n 5 wipefs -a /dev/sdb",
+            "ionice -c 2 dd if=/dev/zero of=/dev/sda",
+            "setsid wipefs -a /dev/sdb",
+            "setsid env MODE=secure timeout 5 sudo dd if=/dev/zero of=/dev/sda",
+            "stdbuf -o0 dd if=/dev/zero of=/dev/sda",
+            "sudo stdbuf --output=0 wipefs -a /dev/sdb",
+            "taskset -c 0 wipefs -a /dev/sdb",
+            "chroot /mnt dd if=/dev/zero of=/dev/sda",
+            "unshare --fork truncate -s 0 important.db",
+            "printf data | xargs dd if=/dev/zero of=/dev/sda",
+            "find . -exec wipefs -a /dev/sdb {} \\;",
+            "find_args='-exec truncate -s 0 important.db {} ;'; find . $find_args",
+            "tool=dd; \"$tool\" if=/dev/zero of=/dev/sda",
             "cat ~/.ssh/id_rsa",
             "echo data > ../outside.txt",
             "eval \"echo hi\"",
@@ -6165,9 +6173,63 @@ printf 'probe.txt:1:needle\n'
     }
 
     #[test]
+    fn validate_execute_bash_allows_destructive_words_inside_heredoc_data() {
+        let command = "python3 <<'PY'\ndd = {'chart': 'bar'}\nprint(dd)\nPY";
+        assert!(
+            validate_execute_bash_command(command).is_ok(),
+            "Python identifiers in heredoc data must not be treated as shell commands"
+        );
+    }
+
+    #[test]
     fn validate_execute_bash_allows_typical_build_commands() {
         assert!(validate_execute_bash_command("cargo test -p foo --quiet").is_ok());
         assert!(validate_execute_bash_command("echo hello && ls").is_ok());
+        assert!(validate_execute_bash_command("timeout 5 printf '%s\\n' dd").is_ok());
+        assert!(validate_execute_bash_command("nice -n 5 printf '%s\\n' dd").is_ok());
+        assert!(validate_execute_bash_command("ionice -c 2 printf '%s\\n' dd").is_ok());
+        assert!(validate_execute_bash_command("setsid printf '%s\\n' dd").is_ok());
+        assert!(validate_execute_bash_command("stdbuf -o0 printf '%s\\n' dd").is_ok());
+        assert!(validate_execute_bash_command("taskset -c 0 printf '%s\\n' dd").is_ok());
+        assert!(validate_execute_bash_command("chroot /mnt printf '%s\\n' dd").is_ok());
+        assert!(validate_execute_bash_command("unshare --fork printf '%s\\n' dd").is_ok());
+        assert!(validate_execute_bash_command("root=src; find \"$root\" -name dd -print").is_ok());
+    }
+
+    #[test]
+    fn validate_execute_bash_allows_non_dispatch_modes() {
+        for command in [
+            "command -v dd",
+            "command -V dd",
+            "sudo -l dd",
+            "sudo --help dd",
+            "timeout --help dd",
+            "ionice -p 123 dd",
+        ] {
+            assert!(
+                validate_execute_bash_command(command).is_ok(),
+                "query or terminal mode must not inspect an unexecuted operand: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_execute_bash_rejects_ambiguous_dispatcher_options() {
+        for command in [
+            "timeout --future-option 5 dd if=/dev/zero of=/dev/sda",
+            "nice --future-option dd if=/dev/zero of=/dev/sda",
+            "ionice --future-option dd if=/dev/zero of=/dev/sda",
+            "setsid --future-option dd if=/dev/zero of=/dev/sda",
+            "stdbuf --future-option dd if=/dev/zero of=/dev/sda",
+            "taskset --future-option 0 dd if=/dev/zero of=/dev/sda",
+            "chroot --future-option /mnt dd if=/dev/zero of=/dev/sda",
+            "unshare --future-option dd if=/dev/zero of=/dev/sda",
+        ] {
+            assert!(
+                validate_execute_bash_command(command).is_err(),
+                "unknown dispatcher option arity must fail closed: {command}"
+            );
+        }
     }
 
     #[test]

@@ -230,8 +230,8 @@ fn analyze_command_risks_with_workspace(
 ) -> Vec<CommandRisk> {
     let mut risks = Vec::new();
 
-    // 1) AST-level analysis (best-effort). This avoids many string-literal false positives.
-    // If parsing fails, we still fall back to the legacy heuristic scanner below.
+    // AST owns command-invocation risks, including destructive executables. The
+    // remaining checks below are limited to path and shell-feature diagnostics.
     let ast_risks = super::bash_ast::analyze_bash_risks_ast(command);
     let ast_parsed = super::bash_ast::parse_bash(command).is_some();
     risks.extend(ast_risks);
@@ -257,10 +257,6 @@ fn analyze_command_risks_with_workspace(
 
     if let Some(path) = credential_access_target(&lower) {
         push_unique(&mut risks, CommandRisk::CredentialAccess(path));
-    }
-
-    if let Some(cmd) = destructive_command(&lower) {
-        push_unique(&mut risks, CommandRisk::DestructiveCommand(cmd.to_string()));
     }
 
     if let Some(target) = workspace_out_write_target(command, workspace_root) {
@@ -324,26 +320,6 @@ fn analyze_command_risks_with_workspace(
     risks
 }
 
-const DESTRUCTIVE_COMMANDS: &[&str] = &[
-    "dd",
-    "mkfs",
-    "mkfs.ext4",
-    "mkfs.xfs",
-    "truncate",
-    "shred",
-    "wipefs",
-    "blkdiscard",
-    "fdisk",
-    "sfdisk",
-    "parted",
-    "cryptsetup",
-    "pvremove",
-    "vgremove",
-    "lvremove",
-    "zpool",
-    "zfs",
-];
-
 const CREDENTIAL_PATH_PREFIXES: &[&str] = &[
     "/.ssh/",
     "~/.ssh/",
@@ -368,18 +344,6 @@ const CREDENTIAL_PATH_PREFIXES: &[&str] = &[
 ];
 
 const CREDENTIAL_FILE_NAMES: &[&str] = &["id_rsa", "id_ed25519", "id_ecdsa", "id_ed25519_sk"];
-
-fn destructive_command(lower: &str) -> Option<&'static str> {
-    for command in DESTRUCTIVE_COMMANDS {
-        if lower
-            .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_'))
-            .any(|token| token == *command)
-        {
-            return Some(*command);
-        }
-    }
-    None
-}
 
 fn credential_access_target(lower: &str) -> Option<String> {
     for fragment in lower.split(|ch: char| ch.is_whitespace() || [';', '|', '&'].contains(&ch)) {
@@ -2142,14 +2106,15 @@ mod tests {
     }
 
     #[test]
-    fn concrete_hazards_inside_inline_source_remain_visible() {
+    fn inline_source_is_not_reinterpreted_as_shell_commands() {
         assert!(
             analyze_command_risks("python3 -c \"open('/etc/shadow').read()\"")
                 .contains(&CommandRisk::SensitivePathAccess("/etc/".into()))
         );
         assert!(
-            analyze_command_risks("node -e 'require(\"child_process\").exec(\"dd\")'")
-                .contains(&CommandRisk::DestructiveCommand("dd".into()))
+            !analyze_command_risks("node -e 'require(\"child_process\").exec(\"dd\")'")
+                .iter()
+                .any(|risk| matches!(risk, CommandRisk::DestructiveCommand(_)))
         );
     }
 }
