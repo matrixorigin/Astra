@@ -156,7 +156,10 @@ port_is_available() {
     return 0
 }
 docker() {
-    local arg filter=""
+    local arg filter="" last_arg=""
+    for arg in "$@"; do
+        last_arg="$arg"
+    done
     if [[ "${1:-}" == ps ]]; then
         for arg in "$@"; do
             case "$arg" in label=com.docker.compose.project=*) filter="${arg##*=}" ;; esac
@@ -167,7 +170,7 @@ docker() {
     elif [[ "${1:-} ${2:-}" == "volume inspect" ]]; then
         if [[ " $* " == *' --format '* ]]; then
             printf '%s\n' "${identity_volume_owner:-}"
-        elif [[ "${*: -1}" == "${identity_existing_volume:-}" ]]; then
+        elif [[ -n "${identity_existing_volume:-}" && "$last_arg" == "$identity_existing_volume" ]]; then
             return 0
         else
             return 1
@@ -256,6 +259,7 @@ stack_env="$identity_env"
 
 set_env_value ASTRA_STACK_NAME requested-name
 set_env_value MATRIXONE_DATA_VOLUME shared-volume
+identity_existing_volume=shared-volume
 identity_volume_owner=older-installation
 identity_choice=1
 identity_answer=journey-recovered
@@ -266,6 +270,7 @@ recovered_env="$stack_env"
 [[ "$(env_file_read "$recovered_env" MATRIXONE_DATA_VOLUME)" == journey-recovered-matrixone-data ]]
 [[ "$(env_file_read "$identity_env" ASTRA_STACK_NAME)" == requested-name ]]
 stack_env="$identity_env"
+identity_existing_volume=""
 
 # An existing volume without a trusted owner label is also unsafe; it must not
 # be silently attached to the selected installation.
