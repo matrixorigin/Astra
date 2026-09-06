@@ -786,7 +786,13 @@ finish_infrastructure_only() {
         echo "  Manage this installation with: STACK_ENV=$stack_env make stack-status"
     fi
     echo
-    echo "Chat is not ready until an administrator and an active model are configured."
+    if [[ "${admin_state:-not configured}" == ready && "${active_model_count:-0}" -gt 0 ]]; then
+        echo "Chat configuration is present; provider connectivity was not rechecked in this run."
+    elif [[ "${admin_state:-not configured}" == ready ]]; then
+        echo "Chat is not ready: add and activate an LLM model with astra admin setup."
+    else
+        echo "Chat is not ready: configure an administrator and an active model with astra admin setup."
+    fi
     exit 0
 }
 
