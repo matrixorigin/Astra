@@ -2,7 +2,8 @@
 
 Run Astra with the all-in-one Docker Compose stack.
 
-The guided setup requires Docker Compose v2, OpenSSL, and Python 3.9 or newer.
+The guided setup requires a current Docker Compose v2 with `--dry-run` support,
+OpenSSL, and Python 3.9 or newer.
 
 ## Quick Start
 
@@ -19,17 +20,28 @@ cd "Astra-${ASTRA_VERSION}"
 # 3. Start the stack and follow the guided prompts
 make stack-setup
 
-# 4. First agent response
+# 4. Open the interactive client
+astra
+
+# Optional non-interactive smoke
 astra chat -m "Explain what you can and cannot do in this deployment"
 ```
 
-`make stack-setup` validates a mock or real embedding configuration before
-starting services, detects and safely reconciles an existing stack, verifies a
-real memory round trip, then runs `astra admin setup`. It never deletes volumes;
-on failure it lets you retry, stop containers while preserving data, or leave
-the state for inspection. The CLI defaults to `http://127.0.0.1:17001`; set
-`ASTRA_API_URL` if you remapped `ASTRA_API_PORT`. For CI or scripts, use explicit
-`make stack-env`, `make stack-up`, and `make stack-verify` targets instead.
+`make stack-setup` first asks what should happen when an older or differently
+configured installation exists: update it while preserving data, create a
+separate installation with new data and automatically selected ports, or leave
+it unchanged. It then validates a mock or real embedding configuration, starts
+and verifies the services, proves a real memory round trip, and runs `astra
+admin setup`. It never deletes volumes. Failures offer retry, stop-and-preserve,
+or leave-for-inspection actions. Finally, it saves the chosen API URL in CLI
+settings so both `astra` and one-shot commands keep working after a port change.
+For CI or scripts, use explicit `make stack-env`, `make stack-up`, and
+`make stack-verify` targets instead.
+
+Mock embeddings make the memory check deterministic; they are not a chat model.
+You still configure an LLM in the final model step. When that model server runs
+on the Docker host, enter `http://host.docker.internal:<port>` rather than
+`localhost`; the Compose stack maps that name on Linux and Docker Desktop.
 
 For a non-interactive local evaluation, use deterministic mock embeddings:
 
@@ -184,6 +196,7 @@ make stack-status
 
 # API health
 curl http://localhost:17001/health
+astra health # exits non-zero for unhealthy or degraded service health
 
 # MatrixOne
 cd deployment/all-in-one && docker compose exec matrixone mysql -h127.0.0.1 -P6001 -uroot -p111 -e "SELECT 1"
@@ -219,12 +232,17 @@ cd deployment/all-in-one && docker compose restart matrixone
 
 ### Port Conflicts
 
-If ports are already in use, modify `.env`:
+Guided setup detects conflicts and offers another port. If you manage `.env`
+yourself, change the relevant values and then save the API address for the CLI:
 
 ```bash
 ASTRA_API_PORT=8001
 MATRIXONE_PORT=26002
 MATRIXONE_DEBUG_HTTP_PORT=26061
+```
+
+```bash
+astra config set api_url http://127.0.0.1:8001
 ```
 
 ### Clean Restart

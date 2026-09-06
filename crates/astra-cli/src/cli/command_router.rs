@@ -1077,7 +1077,13 @@ async fn execute_cli_command_impl(
         Some(Command::Health) => {
             let body = api.get_health_text().await.map_err(map_thin_err)?;
             print_json_or_raw(&body);
-            Ok(ExitCode::Success)
+            Ok(
+                if crate::cli::surface::health_status_surface::api_health_body_is_healthy(&body) {
+                    ExitCode::Success
+                } else {
+                    ExitCode::ApiError
+                },
+            )
         }
 
         Some(Command::Team(args)) => {

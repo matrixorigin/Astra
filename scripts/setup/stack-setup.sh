@@ -43,6 +43,8 @@ trap on_interrupt INT TERM
 
 command -v docker >/dev/null 2>&1 || die "docker is required"
 docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required"
+docker compose up --help 2>/dev/null | grep -q -- '--dry-run' ||
+    die "Docker Compose is too old for safe change planning; upgrade to a version whose 'docker compose up --help' includes --dry-run"
 docker info >/dev/null 2>&1 || die "Docker is not running or is not accessible"
 
 python_cmd=""
@@ -62,8 +64,9 @@ setup_overrides=""
 for key in \
     MEMORIA_EMBEDDING_PROVIDER MEMORIA_EMBEDDING_BASE_URL \
     MEMORIA_EMBEDDING_MODEL MEMORIA_EMBEDDING_DIM MEMORIA_EMBEDDING_API_KEY \
-    MEMORIA_EMBEDDING_ENDPOINTS ASTRA_BIND_ADDRESS ASTRA_API_PORT MEMORIA_PORT \
-    MATRIXONE_PORT MATRIXONE_DEBUG_HTTP_PORT; do
+    MEMORIA_EMBEDDING_ENDPOINTS ASTRA_STACK_NAME MATRIXONE_DATA_VOLUME \
+    MATRIXONE_LOG_DIR MEMORIA_LOG_DIR ASTRA_BIND_ADDRESS ASTRA_API_URL \
+    ASTRA_API_PORT MEMORIA_PORT MATRIXONE_PORT MATRIXONE_DEBUG_HTTP_PORT; do
     if printenv "$key" >/dev/null 2>&1; then
         setup_overrides="${setup_overrides}${setup_overrides:+, }$key"
     fi
@@ -76,7 +79,7 @@ fi
 compose() {
     (
         cd "$stack_dir"
-        env UID="$(id -u)" GID="$(id -g)" \
+        env UID="$(id -u)" GID="$(id -g)" ASTRA_STACK_ENV_FILE="$stack_env" \
             docker compose --env-file "$stack_env" "$@"
     )
 }
@@ -367,12 +370,14 @@ stack_exists() {
 }
 
 service_matches_configuration() {
-    local service="$1" container_id desired actual
-    container_id="$(compose ps -a -q "$service" 2>/dev/null | head -n 1)"
-    [[ -n "$container_id" ]] || return 1
-    desired="$(compose config --hash "$service" 2>/dev/null | awk -v service="$service" '$1 == service { print $2; exit }')"
-    actual="$(docker inspect --format '{{index .Config.Labels "com.docker.compose.config-hash"}}' "$container_id" 2>/dev/null || true)"
-    [[ -n "$desired" && "$desired" == "$actual" ]]
+    local service="$1" plan
+    # Compose's `config --hash` does not match the runtime label for every
+    # env_file configuration. Ask Compose for its own read-only execution plan
+    # so the wizard makes the same recreate decision as `compose up`.
+    if ! plan="$(COMPOSE_ANSI=never compose --dry-run up -d --no-deps --no-build --pull never "$service" 2>&1)"; then
+        return 1
+    fi
+    compose_plan_keeps_service "$plan"
 }
 
 stack_matches_configuration() {
@@ -414,6 +419,8 @@ finally:
     sock.close()
 PY
 }
+
+. "$repo_root/scripts/setup/stack_identity.sh"
 
 listener_pid() {
     local port="$1" pid=""
@@ -549,24 +556,26 @@ choose_existing_stack_action() {
         return
     fi
 
-    echo "Existing all-in-one stack detected:"
+    echo "Existing local Astra installation detected:"
     compose ps -a
     echo
     echo "  matrixone: $(service_state matrixone)"
     echo "  memoria:   $(service_state memoria)"
     echo "  api:       $(service_state api)"
 
-    if [[ "$embedding_changed" == true ]]; then
-        warn "embedding settings changed, so running containers must be recreated"
-        startup_mode=repair
-        return
+    if ! stack_matches_configuration; then
+        warn "the existing installation differs from this release or the current .env"
+        choose "Choose the intended outcome:" \
+            "Update the existing installation (recreate containers, preserve its data)" \
+            "Create a separate installation (new data and ports; existing installation untouched)" \
+            "Leave the existing installation unchanged and exit"
+        case "$menu_choice" in
+            1) startup_mode=repair; return ;;
+            2) configure_isolated_stack; startup_mode=normal; return ;;
+            3) echo "Existing installation left unchanged."; exit 0 ;;
+        esac
     fi
     if stack_is_healthy; then
-        if ! stack_matches_configuration; then
-            warn "the running stack differs from the current .env or Compose configuration"
-            startup_mode=repair
-            return
-        fi
         if confirm "Reuse this healthy stack without restarting it?" yes; then
             reuse_stack=true
             return
@@ -643,12 +652,12 @@ verify_stack() {
 
 echo
 printf '\033[1;36mAstra local setup\033[0m\n'
-echo "A state-aware setup for memory, services, administrator, and model."
+echo "A guided setup for one local installation, memory, administrator, and model."
 echo "No persistent data is removed by this wizard. Secrets are never displayed."
 
 cli="$(resolve_cli)"
 
-step "1/5" "Checking prerequisites and local configuration"
+step "1/5" "Choosing the local installation and checking prerequisites"
 make --no-print-directory stack-env STACK_ENV="$stack_env"
 chmod 600 "$stack_env"
 . scripts/lib/env_file.sh
@@ -657,7 +666,9 @@ if [[ -n "$embedding_endpoints" ]]; then
     die "make stack-setup supports one embedding endpoint, but MEMORIA_EMBEDDING_ENDPOINTS is configured.
    Keep the advanced endpoint set and use make stack-start, or clear it before running the wizard."
 fi
+ensure_data_volume_is_not_shared
 ok "Docker, Compose, Python, CLI, and local secrets are ready"
+choose_existing_stack_action
 
 step "2/5" "Configuring and testing semantic memory"
 refresh_embedding_state
@@ -679,9 +690,13 @@ fi
 refresh_embedding_state
 probe_embedding
 unset embedding_key
+if [[ "$embedding_changed" == true && "$reuse_stack" == true ]]; then
+    warn "embedding settings changed, so the existing containers must be recreated"
+    reuse_stack=false
+    startup_mode=repair
+fi
 
 step "3/5" "Reconciling and starting Astra services"
-choose_existing_stack_action
 if [[ "$reuse_stack" == true ]]; then
     ok "healthy existing stack reused"
 else
@@ -701,11 +716,28 @@ step "5/5" "Configuring administrator and model"
 api_port="$(env_resolve_value "$stack_env" ASTRA_API_PORT 2>/dev/null || true)"
 bind_address="$(env_resolve_value "$stack_env" ASTRA_BIND_ADDRESS 2>/dev/null || true)"
 api_host="$(env_http_host_from_bind "$bind_address")"
-export ASTRA_API_URL="${ASTRA_API_URL:-http://${api_host}:${api_port:-17001}}"
-"$cli" admin setup
+export ASTRA_API_URL="http://${api_host}:${api_port:-17001}"
+echo "  Model requests originate inside Docker. For a model server on this host,"
+echo "  use http://host.docker.internal:<port> instead of localhost."
+if ! "$cli" admin setup; then
+    warn "services are healthy, but administrator/model setup did not complete"
+    printf '  Resume without restarting services: ASTRA_API_URL=%q %q admin setup\n' \
+        "$ASTRA_API_URL" "$cli" >&2
+    exit 1
+fi
+
+cli_api_prefix=""
+if "$cli" config set api_url "$ASTRA_API_URL"; then
+    ok "saved this installation as the CLI default"
+else
+    warn "could not save the API URL in CLI settings"
+    warn "until that is fixed, prefix CLI commands with ASTRA_API_URL=$ASTRA_API_URL"
+    printf -v cli_api_prefix 'ASTRA_API_URL=%q ' "$ASTRA_API_URL"
+fi
 
 echo
 printf '\033[1;32mAstra is ready.\033[0m\n'
 echo "  API:  $ASTRA_API_URL"
-echo "  Chat: $cli chat -m \"Hello Astra\""
+echo "  TUI:  ${cli_api_prefix}${cli}"
+echo "  One-shot: ${cli_api_prefix}${cli} chat -m \"Hello Astra\""
 echo "  Edge: astra-edge --help (connect a local runner when private tools are needed)"

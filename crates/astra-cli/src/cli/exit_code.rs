@@ -7,7 +7,7 @@ pub(crate) enum ExitCode {
     ToolFailure = 1,
     /// Cancellation (2) - the task was explicitly cancelled
     Cancelled = 2,
-    /// API/network error (3) - failed to communicate with server
+    /// API/network/health error (3) - server communication or health failed
     ApiError = 3,
     /// Local session durability failure after the turn itself succeeded (4)
     PersistenceError = 4,

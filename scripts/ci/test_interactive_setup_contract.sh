@@ -9,6 +9,7 @@ script="$repo_root/scripts/setup/stack-setup.sh"
 makefile="$repo_root/Makefile"
 cli_setup="$repo_root/crates/astra-cli/src/admin_cli/setup.rs"
 embedding_probe="$repo_root/scripts/setup/check_embedding.py"
+identity_helpers="$repo_root/scripts/setup/stack_identity.sh"
 
 grep -q '^stack-setup:' "$makefile"
 grep -q '^stack-start: stack-env' "$makefile"
@@ -30,6 +31,13 @@ grep -q 'admin setup --help' "$script"
 grep -q 'stop_detected_api' "$script"
 grep -q 'guided setup cannot safely edit .env while exported overrides are active' "$script"
 grep -q 'MEMORIA_EMBEDDING_ENDPOINTS is configured' "$script"
+grep -q 'Choose the intended outcome' "$script"
+grep -q 'Create a separate installation' "$script"
+grep -q 'compose --dry-run up' "$script"
+grep -q 'Docker Compose is too old for safe change planning' "$script"
+grep -q 'config set api_url' "$script"
+grep -q 'TUI:.*cli_api_prefix' "$script"
+grep -q 'Resume without restarting services' "$script"
 grep -q 'Edge: astra-edge --help' "$script"
 if grep -q '\$cli edge --help' "$script"; then
     echo "interactive setup contract failed: astra edge is a chat message, not the User Runner command" >&2
@@ -92,6 +100,119 @@ fi
 if grep -Eq '\$\{[^}]+,,\}|^[[:space:]]*select |dev-api-stop|recreate=true; break|start_stack true; break' "$script"; then
     echo "interactive setup contract failed: non-portable or unsafe recovery control flow" >&2
     exit 1
+fi
+
+# Exercise the installation-identity state changes without Docker. These are
+# the destructive-boundary decisions behind the interactive wording, so a
+# static grep is not enough.
+identity_env="$fixture_dir/identity.env"
+printf '%s\n' \
+    'ASTRA_IMAGE=matrixorigin/astra:0.2.1' \
+    'ASTRA_STACK_NAME=all-in-one' \
+    'MATRIXONE_DATA_VOLUME=astra-matrixone-data' \
+    'ASTRA_BIND_ADDRESS=127.0.0.1' \
+    'ASTRA_API_PORT=17001' \
+    'MEMORIA_PORT=8100' \
+    'MATRIXONE_PORT=26001' \
+    'MATRIXONE_DEBUG_HTTP_PORT=26060' > "$identity_env"
+stack_env="$identity_env"
+grep -q '^name: ${ASTRA_STACK_NAME:-all-in-one}' "$repo_root/deployment/all-in-one/docker-compose.yml"
+grep -q 'ASTRA_STACK_ENV_FILE' "$repo_root/deployment/all-in-one/docker-compose.yml"
+grep -q 'host.docker.internal:host-gateway' "$repo_root/deployment/all-in-one/docker-compose.yml"
+
+set_env_value() {
+    local key="$1" value="$2" temporary
+    temporary="$identity_env.tmp"
+    awk -v key="$key" -v value="$value" '
+        BEGIN { updated = 0 }
+        $0 ~ "^" key "=" { print key "=" value; updated = 1; next }
+        { print }
+        END { if (!updated) print key "=" value }
+    ' "$identity_env" > "$temporary"
+    mv "$temporary" "$identity_env"
+}
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+warn() { :; }
+ok() { :; }
+die() { exit 41; }
+read_default() { prompt_value="$identity_answer"; }
+choose() { menu_choice="$identity_choice"; }
+port_is_available() { [[ "$2" != "${identity_blocked_port:-}" ]]; }
+docker() {
+    local arg filter=""
+    if [[ "${1:-}" == ps ]]; then
+        for arg in "$@"; do
+            case "$arg" in label=com.docker.compose.project=*) filter="${arg##*=}" ;; esac
+        done
+        if [[ -n "${identity_existing_project:-}" && "$filter" == "$identity_existing_project" ]]; then
+            printf '%s\n' fake-container-id
+        fi
+    elif [[ "${1:-} ${2:-}" == "volume inspect" ]]; then
+        if [[ " $* " == *' --format '* ]]; then
+            printf '%s\n' "${identity_volume_owner:-}"
+        elif [[ "${*: -1}" == "${identity_existing_volume:-}" ]]; then
+            return 0
+        else
+            return 1
+        fi
+    fi
+}
+. "$identity_helpers"
+
+compose_plan_keeps_service 'DRY-RUN MODE - Container astra-api-1 Running'
+if compose_plan_keeps_service 'DRY-RUN MODE - Container astra-api-1 Recreate'; then
+    echo "interactive setup contract failed: recreate plan was treated as reusable" >&2
+    exit 1
+fi
+if compose_plan_keeps_service ''; then
+    echo "interactive setup contract failed: empty plan was treated as reusable" >&2
+    exit 1
+fi
+
+identity_existing_project=astra-0-2-1
+identity_existing_volume=""
+suggestion="$(suggest_isolated_stack_name)"
+[[ "$suggestion" == astra-0-2-1-2 ]] || {
+    echo "interactive setup contract failed: occupied installation name was not skipped" >&2
+    exit 1
+}
+
+identity_existing_project=""
+identity_existing_volume=astra-0-2-1-matrixone-data
+suggestion="$(suggest_isolated_stack_name)"
+[[ "$suggestion" == astra-0-2-1-2 ]] || {
+    echo "interactive setup contract failed: retained data volume name was not skipped" >&2
+    exit 1
+}
+
+identity_existing_volume=""
+identity_answer=journey-test
+identity_blocked_port=17002
+configure_isolated_stack >/dev/null
+[[ "$(env_file_read "$identity_env" ASTRA_STACK_NAME)" == journey-test ]]
+[[ "$(env_file_read "$identity_env" MATRIXONE_DATA_VOLUME)" == journey-test-matrixone-data ]]
+[[ "$(env_file_read "$identity_env" MATRIXONE_LOG_DIR)" == ./data/stacks/journey-test/matrixone/logs ]]
+[[ "$(env_file_read "$identity_env" ASTRA_API_PORT)" == 17003 ]]
+[[ "$(env_file_read "$identity_env" MEMORIA_PORT)" == 8101 ]]
+
+set_env_value ASTRA_STACK_NAME requested-name
+set_env_value MATRIXONE_DATA_VOLUME shared-volume
+identity_volume_owner=older-installation
+identity_choice=1
+identity_answer=journey-recovered
+identity_blocked_port=""
+ensure_data_volume_is_not_shared >/dev/null
+[[ "$(env_file_read "$identity_env" ASTRA_STACK_NAME)" == journey-recovered ]]
+[[ "$(env_file_read "$identity_env" MATRIXONE_DATA_VOLUME)" == journey-recovered-matrixone-data ]]
+
+set_env_value ASTRA_STACK_NAME 'Invalid Name'
+identity_volume_owner=""
+if (ensure_data_volume_is_not_shared >/dev/null 2>&1); then
+    echo "interactive setup contract failed: invalid installation name was accepted" >&2
+    exit 1
+else
+    status=$?
+    [[ "$status" == 41 ]] || exit "$status"
 fi
 
 echo "interactive setup contract: ok"

@@ -11,7 +11,7 @@ use axum::{Router, routing::get, routing::post};
 
 #[serial_test::serial]
 #[tokio::test]
-async fn execute_cli_health_command() {
+async fn execute_cli_health_command_reports_healthy_without_auth() {
     let _creds_dir = isolate_credentials();
     let app = Router::new().route(
         "/health",
@@ -30,8 +30,31 @@ async fn execute_cli_health_command() {
         &crate::cli::cli_config::cli_context::CliContext::default(),
     )
     .await;
-    // Health command should succeed regardless of auth
-    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), crate::cli::exit_code::ExitCode::Success);
+}
+
+#[serial_test::serial]
+#[tokio::test]
+async fn execute_cli_health_command_fails_for_unhealthy_service() {
+    let _creds_dir = isolate_credentials();
+    let app = Router::new().route(
+        "/health",
+        get(|| async { axum::Json(serde_json::json!({"status": "unhealthy"})) }),
+    );
+    let base = spawn_mock(app).await;
+    let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
+    let result = execute_cli_command(
+        Some(Command::Health),
+        Some("nonexistent-profile".to_string()),
+        None,
+        false,
+        None,
+        &api,
+        false,
+        &crate::cli::cli_config::cli_context::CliContext::default(),
+    )
+    .await;
+    assert_eq!(result.unwrap(), crate::cli::exit_code::ExitCode::ApiError);
 }
 
 // ── chat_turn pure functions ──────────────────────────────────────────

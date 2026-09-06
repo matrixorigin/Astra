@@ -90,7 +90,7 @@ dependency data; that command prompts before deletion.
 
 | Command | Description |
 | --- | --- |
-| `make stack-setup` | State-aware wizard for embedding preflight, data-preserving stack reconciliation, runtime verification, admin, and model probe |
+| `make stack-setup` | Guided installation selection, embedding preflight, data-preserving reconciliation, runtime verification, admin/model probe, and CLI endpoint setup |
 | `make stack-start` | Non-interactively initialize configuration, start the stack, and verify health plus a memory round trip |
 | `make stack-env` | Create local `.env` and generate secrets without prompting |
 | `make stack-up` | Start the configured Compose stack |

@@ -421,7 +421,8 @@ pub(crate) async fn run_setup(api: &ThinClient, profile: Option<&str>) -> Result
 
     stdout_println!();
     stdout_println!("{}", "Setup complete".bold().green());
-    stdout_println!("Try: astra chat -m \"Hello Astra\"");
+    stdout_println!("Open the interactive TUI: astra");
+    stdout_println!("One-shot check: astra chat -m \"Hello Astra\"");
     stdout_println!("More admin commands: astra admin --help");
     Ok(())
 }

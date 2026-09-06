@@ -918,8 +918,7 @@ mod tests {
             &cli::cli_config::cli_context::CliContext::default(),
         )
         .await;
-        // Health command should succeed regardless of auth
-        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), cli::exit_code::ExitCode::Success);
     }
 
     #[tokio::test(flavor = "multi_thread")]

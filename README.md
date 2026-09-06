@@ -225,14 +225,17 @@ cd "Astra-${ASTRA_VERSION}"
 make stack-setup
 ```
 
-The guided setup validates the embedding endpoint, credentials, model, and
-vector dimension before starting containers. It detects an existing stack,
-reuses healthy services, and offers a data-preserving repair when containers or
-networks are partial. Startup and verification failures offer retry, stop, or
-leave-for-inspection choices before the administrator/model wizard begins.
+The guided setup first identifies the intended local installation. If an older
+or differently configured stack exists, you explicitly choose whether to
+update it, create a separate installation with its own data and ports, or leave
+it untouched. It then validates the embedding endpoint, credentials, model,
+and vector dimension before starting containers. Healthy services are reused;
+partial services get explicit repair, stop, and inspect choices.
 API keys are hidden while typing and the local `.env` is owner-only. Choose mock
 embeddings for deterministic evaluation; use a real OpenAI-compatible endpoint
-for production retrieval. The wizard never deletes persistent volumes.
+for production retrieval. Mock embeddings do not provide an LLM: the model step
+still needs a supported hosted or local model endpoint. The wizard never
+deletes persistent volumes and saves the selected API URL for later CLI runs.
 The released clients and full guided path support Linux, macOS, and Windows
 through WSL. Native Windows and Git Bash are not release targets yet.
 
@@ -260,15 +263,17 @@ binary installed in step 1 drives it:
 
 ```bash
 astra health
+astra
 ```
 
-The CLI defaults to `http://127.0.0.1:17001`, which is where the stack binds,
-so no extra configuration is needed. If you remapped `ASTRA_API_PORT`, set
-`ASTRA_API_URL` or pass `--api-url` to each command. Pass `-v <version>` to the
-installer to select an older or prerelease client; always use its matching Git
-tag for the deployment checkout. MatrixOne and Memoria are pinned to the
-compatibility set exercised by that Astra release instead of floating on
-`latest`.
+`astra health` returns a non-zero status when the API reports an unhealthy or
+degraded dependency. Guided setup saves its API address in CLI settings, so a
+remapped port also works for later `astra` TUI sessions. For a manually managed
+stack, run `astra config set api_url http://127.0.0.1:<port>`. Pass `-v
+<version>` to the installer to select an older or prerelease client; always use
+its matching Git tag for the deployment checkout. MatrixOne and Memoria are
+pinned to the compatibility set exercised by that Astra release instead of
+floating on `latest`.
 
 For scripted or advanced environments, replace the guided account/model phase
 with the following two operations.

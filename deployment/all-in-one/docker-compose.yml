@@ -3,8 +3,12 @@
 # Starts MatrixOne, Memoria, and astra-server with one compose stack.
 # Development deps still use docker-compose.deps.yml via `make dev-deps-*`.
 
+# Keep the historical default project name while allowing the guided setup to
+# give a parallel installation its own containers, network, and volume labels.
+name: ${ASTRA_STACK_NAME:-all-in-one}
+
 x-env-files: &astra-env-files
-  - path: ./.env
+  - path: ${ASTRA_STACK_ENV_FILE:-./.env}
     required: false
 
 services:
@@ -213,6 +217,10 @@ services:
         condition: service_healthy
     networks:
       - mo-net
+    extra_hosts:
+      # Makes host-local OpenAI-compatible endpoints reachable from the API
+      # container on Linux as well as Docker Desktop.
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test:
         [

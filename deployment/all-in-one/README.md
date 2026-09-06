@@ -2,7 +2,8 @@
 
 This compose stack starts MatrixOne, Memoria, and `astra-server`.
 
-The guided setup requires Docker Compose v2, OpenSSL, and Python 3.9 or newer.
+The guided setup requires a current Docker Compose v2 with `--dry-run` support,
+OpenSSL, and Python 3.9 or newer.
 
 The development flow is separate and still uses `docker-compose.deps.yml` through the repo-root `make dev-deps-*` targets, followed by `make dev-api-start` for a locally built API server.
 
@@ -29,12 +30,15 @@ From the repository root, the recommended first-run path is guided:
 make stack-setup
 ```
 
-The guided path tests the embedding endpoint, credentials, model, and dimension
-before starting Compose. It inventories an existing stack, reuses healthy
-services, repairs disconnected containers without deleting volumes, verifies a
-memory round trip, and then launches `astra admin setup`. Startup failures offer
-repair/retry, stop-and-preserve, and leave-for-inspection choices. API keys are
-hidden and the local `.env` is owner-only. The released clients and full
+The guided path first identifies the installation the user intends to change.
+When an older or differently configured stack exists, it offers an explicit
+update, a separate installation with independent containers, data, logs, and
+ports, or a no-change exit. It then tests the embedding endpoint, credentials,
+model, and dimension, reuses or repairs services, verifies a memory round trip,
+and launches `astra admin setup`. Startup failures offer repair/retry,
+stop-and-preserve, and leave-for-inspection choices. API keys are hidden and the
+local `.env` is owner-only. The final API address is saved in CLI settings, and
+the completion screen leads with the `astra` TUI. The released clients and full
 guided path support Linux, macOS, and Windows through WSL. Native Windows and
 Git Bash are not release targets yet.
 Loopback embedding probes bypass HTTP proxies; other endpoints honor the host
@@ -45,6 +49,12 @@ For a non-interactive local evaluation, use deterministic mock embeddings:
 ```bash
 MEMORIA_EMBEDDING_PROVIDER=mock make stack-start
 ```
+
+Mock embeddings replace only semantic-memory embedding calls. They do not
+provide the agent's LLM; `astra admin setup` still needs a hosted model or an
+OpenAI-compatible local endpoint. Because model inference is server-side, a
+model running on the Docker host is reached as
+`http://host.docker.internal:<port>`, not `localhost`.
 
 When configuring the file by hand, set `MEMORIA_EMBEDDING_BASE_URL` and, when
 required, `MEMORIA_EMBEDDING_API_KEY`. For no-credential evaluation, set
@@ -227,6 +237,11 @@ All published ports bind to `127.0.0.1` by default. `ASTRA_BIND_ADDRESS` changes
 that interface, and `ASTRA_API_PORT` controls the host-facing API port. The API
 container itself listens on `17001`. Do not use a non-loopback bind with the
 development credentials on an untrusted network.
+
+`ASTRA_STACK_NAME` identifies the Compose installation. A separate installation
+must also use a separate `MATRIXONE_DATA_VOLUME`, log paths, and host ports;
+changing only the name is unsafe. Prefer `make stack-setup`, which keeps these
+values together and refuses to attach a volume owned by another installation.
 
 ## Images
 
