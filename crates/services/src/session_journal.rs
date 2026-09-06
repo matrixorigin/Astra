@@ -2112,6 +2112,17 @@ impl SessionExecutionLease {
     }
 }
 
+impl Drop for SessionExecutionLease {
+    fn drop(&mut self) {
+        // Do not rely solely on closing the descriptor to release the lock.
+        // Darwin runners can retain the advisory flock across the failed
+        // contender's descriptor lifetime, which makes a lease appear active
+        // after its owner has been dropped. Explicitly unlock before File's
+        // destructor closes the descriptor so the next turn can be admitted.
+        let _ = <std::fs::File as fs2::FileExt>::unlock(&self._file);
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn acquire_execution_kernel_authority(
     owner_scope: &OwnerScope,
