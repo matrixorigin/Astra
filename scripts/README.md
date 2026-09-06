@@ -94,6 +94,9 @@ explicit variables for automation. Installation naming, independent volume/log
 paths, automatic port selection, and final host-port uniqueness checks are owned by
 `scripts/setup/stack_identity.sh` and its contract tests.
 
+`scripts/setup/stack_env_write.sh` owns credential-safe environment updates and
+the EXIT cleanup contract for setup staging and per-write temporary files.
+
 `scripts/setup/stack_status.sh` owns the read-only model-catalog projection
 used by the wizard's status summary, including active and inactive model names.
 

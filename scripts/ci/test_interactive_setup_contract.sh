@@ -11,6 +11,7 @@ cli_setup="$repo_root/crates/astra-cli/src/admin_cli/setup.rs"
 embedding_probe="$repo_root/scripts/setup/check_embedding.py"
 identity_helpers="$repo_root/scripts/setup/stack_identity.sh"
 status_helpers="$repo_root/scripts/setup/stack_status.sh"
+env_write_helpers="$repo_root/scripts/setup/stack_env_write.sh"
 
 grep -q '^stack-setup:' "$makefile"
 grep -q '^stack-start: stack-env' "$makefile"
@@ -48,6 +49,8 @@ grep -q 'Chat configuration is present; provider connectivity was not rechecked'
 grep -q 'Chat is not ready: configure an administrator and an active model' "$script"
 grep -q 'admin_model_state' "$script"
 grep -q 'print_stack_inspect_commands' "$script"
+grep -q 'stack_env_write.sh' "$script"
+grep -q 'trap cleanup_setup_temporary_files EXIT' "$script"
 grep -q 'make stack-down STACK_ENV=' "$makefile"
 grep -q 'TUI:.*cli_api_prefix' "$script"
 grep -q 'Resume without restarting services' "$script"
@@ -78,6 +81,33 @@ done
 generated_mode="$(stat -c '%a' "$generated_env" 2>/dev/null || stat -f '%Lp' "$generated_env")"
 if [[ "$generated_mode" != 600 ]]; then
     echo "interactive setup contract failed: generated stack env mode is $generated_mode, expected 600" >&2
+    exit 1
+fi
+
+# SIGTERM uses EXIT rather than a function RETURN trap. Both per-write files
+# and an in-progress isolated descriptor must be removed on that path.
+write_cleanup_dir="$fixture_dir/write-cleanup"
+mkdir -p "$write_cleanup_dir"
+set +e
+TMPDIR="$write_cleanup_dir" bash -c '
+    set -euo pipefail
+    stack_env="$1/source.env"
+    . "$2"
+    stack_write_env_temp="$1/astra-stack-env.interrupted"
+    stack_write_value_temp="$1/astra-stack-value.interrupted"
+    stack_staging_env="$1/.env.isolated.env.staging.interrupted"
+    printf "%s" complete-secret > "$stack_write_env_temp"
+    printf "%s" api-key-secret > "$stack_write_value_temp"
+    printf "%s" staged-secret > "$stack_staging_env"
+    trap cleanup_setup_temporary_files EXIT
+    trap "exit 130" TERM
+    kill -TERM "$$"
+' _ "$write_cleanup_dir" "$env_write_helpers"
+cleanup_status=$?
+set -e
+[[ "$cleanup_status" == 130 ]]
+if find "$write_cleanup_dir" -type f -print -quit | grep -q .; then
+    echo "interactive setup contract failed: cancellation left secret-bearing temporary files" >&2
     exit 1
 fi
 
@@ -173,7 +203,7 @@ service_owns_host_port() { return 1; }
 listener_pid() { printf '%s' "${identity_listener_pid:-}"; }
 process_name() { printf '%s' "${identity_process_name:-}"; }
 stop_detected_api() { return 1; }
-cleanup_staging_env() {
+cleanup_setup_temporary_files() {
     if [[ -n "${stack_staging_env:-}" ]]; then
         rm -f -- "$stack_staging_env"
         stack_staging_env=""

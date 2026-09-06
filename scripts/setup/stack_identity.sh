@@ -120,14 +120,14 @@ configure_isolated_stack() {
     stack_staging_env="$temporary_env"
     chmod 600 "$temporary_env"
     if ! cp "$old_stack_env" "$temporary_env"; then
-        cleanup_staging_env
+        cleanup_setup_temporary_files
         die "could not copy the existing installation descriptor"
     fi
     if ! set_env_value ASTRA_STACK_NAME "$name" "$temporary_env" ||
         ! set_env_value MATRIXONE_DATA_VOLUME "${name}-matrixone-data" "$temporary_env" ||
         ! set_env_value MATRIXONE_LOG_DIR "./data/stacks/${name}/matrixone/logs" "$temporary_env" ||
         ! set_env_value MEMORIA_LOG_DIR "./data/stacks/${name}/memoria/logs" "$temporary_env"; then
-        cleanup_staging_env
+        cleanup_setup_temporary_files
         die "could not stage the separate installation descriptor"
     fi
     for key in ASTRA_API_PORT MEMORIA_PORT MATRIXONE_PORT MATRIXONE_DEBUG_HTTP_PORT; do
@@ -135,12 +135,12 @@ configure_isolated_stack() {
         selected_ports="${selected_ports#* }"
         [[ "$selected_ports" == "$port" ]] && selected_ports=""
         if ! set_env_value "$key" "$port" "$temporary_env"; then
-            cleanup_staging_env
+            cleanup_setup_temporary_files
             die "could not stage the separate installation descriptor"
         fi
     done
     if ! mv "$temporary_env" "$isolated_env"; then
-        cleanup_staging_env
+        cleanup_setup_temporary_files
         die "could not activate the separate installation descriptor"
     fi
     stack_staging_env=""

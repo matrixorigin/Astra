@@ -18,7 +18,7 @@ if [[ "$stack_env" != /* ]]; then
 fi
 stack_dir="$repo_root/deployment/all-in-one"
 . "$repo_root/scripts/setup/stack_status.sh"
-stack_staging_env=""
+. "$repo_root/scripts/setup/stack_env_write.sh"
 
 die() {
     echo "❌ $*" >&2
@@ -35,13 +35,6 @@ cancel_setup() {
     exit 0
 }
 
-cleanup_staging_env() {
-    if [[ -n "${stack_staging_env:-}" ]]; then
-        rm -f -- "$stack_staging_env"
-        stack_staging_env=""
-    fi
-}
-
 on_interrupt() {
     printf '\n\nSetup interrupted. No persistent data was deleted.\n' >&2
     printf 'Services may be partially started if Compose was already running.\n' >&2
@@ -52,7 +45,7 @@ on_interrupt() {
     exit 130
 }
 trap on_interrupt INT TERM
-trap cleanup_staging_env EXIT
+trap cleanup_setup_temporary_files EXIT
 
 command -v docker >/dev/null 2>&1 || die "docker is required"
 docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required"
@@ -100,38 +93,6 @@ compose() {
             docker compose --project-name "$project_name" \
             --file "$stack_dir/docker-compose.yml" --env-file "$stack_env" "$@"
     )
-}
-
-set_env_value() {
-    local key="$1" value="$2" target="${3:-$stack_env}" temporary value_file
-    temporary="$(mktemp "${TMPDIR:-/tmp}/astra-stack-env.XXXXXX")"
-    value_file="$(mktemp "${TMPDIR:-/tmp}/astra-stack-value.XXXXXX")"
-    chmod 600 "$value_file"
-    printf '%s' "$value" > "$value_file"
-    trap 'rm -f "$temporary" "$value_file"' RETURN
-    ASTRA_SETUP_VALUE_FILE="$value_file" awk -v key="$key" '
-        BEGIN {
-            value_file = ENVIRON["ASTRA_SETUP_VALUE_FILE"]
-            if ((getline file_value < value_file) > 0) value = file_value
-            close(value_file)
-            updated = 0
-        }
-        {
-            line = $0
-            sub(/^[[:space:]]*/, "", line)
-            if (line ~ "^" key "[[:space:]]*=") {
-                print key "=" value
-                updated = 1
-                next
-            }
-            print
-        }
-        END { if (!updated) print key "=" value }
-    ' "$target" > "$temporary"
-    chmod 600 "$temporary"
-    mv "$temporary" "$target"
-    rm -f "$value_file"
-    trap - RETURN
 }
 
 read_default() {
