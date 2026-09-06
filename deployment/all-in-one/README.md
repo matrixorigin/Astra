@@ -46,7 +46,7 @@ clients and full guided path support Linux, macOS, and Windows through WSL.
 Native Windows and Git Bash are not release targets yet.
 Separate installations use sibling descriptors (for example
 `.env.astra-0-2-1.env`) so the original `.env` remains usable. Pass the selected
-file explicitly when managing one: `STACK_ENV=deployment/all-in-one/.env.astra-0-2-1.env make stack-status`.
+file explicitly when managing one: `make stack-status STACK_ENV=deployment/all-in-one/.env.astra-0-2-1.env`.
 Loopback embedding probes bypass HTTP proxies; other endpoints honor the host
 proxy configuration and suggest `NO_PROXY` when a private URL is intercepted.
 

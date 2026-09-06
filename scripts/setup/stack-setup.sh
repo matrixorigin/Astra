@@ -17,6 +17,7 @@ if [[ "$stack_env" != /* ]]; then
     stack_env="$repo_root/$stack_env"
 fi
 stack_dir="$repo_root/deployment/all-in-one"
+. "$repo_root/scripts/setup/stack_status.sh"
 
 die() {
     echo "❌ $*" >&2
@@ -36,7 +37,10 @@ cancel_setup() {
 on_interrupt() {
     printf '\n\nSetup interrupted. No persistent data was deleted.\n' >&2
     printf 'Services may be partially started if Compose was already running.\n' >&2
-    printf 'Inspect: make stack-status    Stop safely: make stack-down\n' >&2
+    print_stack_inspect_commands >&2
+    printf 'Stop safely: ' >&2
+    print_stack_command stack-down >&2
+    printf '\n' >&2
     exit 130
 }
 trap on_interrupt INT TERM
@@ -630,7 +634,7 @@ start_stack() {
         case "$menu_choice" in
                 1) recreate=true; continue ;;
                 2) stop_and_exit ;;
-                3) echo "Inspect with: make stack-status  or  make stack-logs"; exit 0 ;;
+                3) print_stack_inspect_commands; exit 0 ;;
         esac
     done
 }
@@ -650,7 +654,7 @@ verify_stack() {
                 1) continue ;;
                 2) start_stack true; continue ;;
                 3) stop_and_exit ;;
-                4) echo "Inspect with: make stack-status  or  make stack-logs"; exit 0 ;;
+                4) print_stack_inspect_commands; exit 0 ;;
         esac
     done
 }
@@ -659,7 +663,7 @@ verify_stack() {
 # a read-only status probe: setup can be rerun for a healthy stack and will
 # explain exactly which user-layer pieces are still missing.
 admin_model_state() {
-    local whoami_json model_json model_summary
+    local whoami_json model_json
     admin_state="not configured"
     admin_identity=""
     active_model_count=0
@@ -708,31 +712,7 @@ if isinstance(value, dict):
 
     model_json="$(ASTRA_API_URL="$ASTRA_API_URL" "$cli" admin model list 2>/dev/null || true)"
     [[ -n "$model_json" ]] || return 0
-    model_summary="$("$python_cmd" -c '
-import json
-import sys
-
-try:
-    value = json.loads(sys.argv[1])
-except (IndexError, json.JSONDecodeError):
-    raise SystemExit(0)
-items = value.get("items", []) if isinstance(value, dict) else value
-if not isinstance(items, list):
-    raise SystemExit(0)
-active = []
-inactive = []
-for item in items:
-    if not isinstance(item, dict):
-        continue
-    name = item.get("name")
-    if not isinstance(name, str) or not name.strip():
-        continue
-    (active if item.get("is_active") is True else inactive).append(name.strip())
-print("\t".join((str(len(active)), str(len(inactive)), ", ".join(sorted(set(active))), ", ".join(sorted(set(inactive))))))
-' "$model_json" 2>/dev/null || true)"
-    if [[ -n "$model_summary" ]]; then
-        IFS=$'\t' read -r active_model_count inactive_model_count active_model_names inactive_model_names <<< "$model_summary"
-    fi
+    parse_model_catalog_state "$model_json"
 }
 
 show_setup_state() {
@@ -796,7 +776,9 @@ finish_infrastructure_only() {
     echo "  Health: ${cli_api_prefix}${cli} health"
     if [[ -n "${stack_original_env:-}" ]]; then
         echo "  Existing installation descriptor kept at: $stack_original_env"
-        echo "  Manage this installation with: STACK_ENV=$stack_env make stack-status"
+        printf '  Manage this installation with: '
+        print_stack_command stack-status
+        printf '\n'
     fi
     echo
     if [[ "${admin_state:-not configured}" == ready && "${active_model_count:-0}" -gt 0 ]]; then
@@ -935,5 +917,7 @@ echo "  Edge: astra-edge --help (connect a local runner when private tools are n
 if [[ -n "${stack_original_env:-}" ]]; then
     echo "  Env:  $stack_env"
     echo "  Existing installation descriptor kept at: $stack_original_env"
-    echo "  Manage this installation: STACK_ENV=$stack_env make stack-status"
+    printf '  Manage this installation: '
+    print_stack_command stack-status
+    printf '\n'
 fi

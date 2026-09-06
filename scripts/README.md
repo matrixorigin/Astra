@@ -94,6 +94,9 @@ explicit variables for automation. Installation naming, independent volume/log
 paths, and automatic port selection are owned by
 `scripts/setup/stack_identity.sh` and its contract tests.
 
+`scripts/setup/stack_status.sh` owns the read-only model-catalog projection
+used by the wizard's status summary, including active and inactive model names.
+
 ### `scripts/setup/check_embedding.py`
 Performs the credential-safe OpenAI-compatible embedding probe used by the
 wizard and verifies that the returned vector matches the configured dimension.

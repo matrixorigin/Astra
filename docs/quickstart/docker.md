@@ -41,8 +41,8 @@ step so a later retry does not require restarting services.
 When a separate installation is selected, setup writes a sibling env file such
 as `deployment/all-in-one/.env.astra-0-2-1.env` and keeps the original
 descriptor addressable. Manage that installation explicitly with
-`STACK_ENV=deployment/all-in-one/.env.astra-0-2-1.env make stack-status` (and
-the same prefix for `stack-logs` or `stack-down`).
+`make stack-status STACK_ENV=deployment/all-in-one/.env.astra-0-2-1.env` (and
+the same argument for `stack-logs` or `stack-down`).
 For CI or scripts, use explicit `make stack-env`, `make stack-up`, and
 `make stack-verify` targets instead.
 

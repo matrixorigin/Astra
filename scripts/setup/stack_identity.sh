@@ -18,6 +18,11 @@ volume_name_exists() {
     docker volume inspect "$1" >/dev/null 2>&1
 }
 
+isolated_stack_env_path() {
+    local source_env="$1" name="$2"
+    printf '%s.%s.env' "$source_env" "$name"
+}
+
 suggest_isolated_stack_name() {
     local image version base candidate suffix=2
     image="$(env_resolve_value "$stack_env" ASTRA_IMAGE 2>/dev/null || true)"
@@ -61,7 +66,7 @@ next_available_port() {
 
 configure_isolated_stack() {
     local suggested name bind_address key current default port
-    local old_stack_env env_dir env_prefix isolated_env temporary_env
+    local old_stack_env env_dir isolated_env temporary_env
     local reserved_ports="" selected_ports=""
     suggested="$(suggest_isolated_stack_name)"
     echo
@@ -69,7 +74,6 @@ configure_isolated_stack() {
     echo "Setup will create a new MatrixOne volume and choose unused local ports."
     old_stack_env="$stack_env"
     env_dir="${stack_env%/*}"
-    env_prefix="${stack_env%.env}"
     while true; do
         read_default "Name for the separate installation" "$suggested"
         name="$(lower "$prompt_value")"
@@ -79,7 +83,7 @@ configure_isolated_stack() {
                 continue
                 ;;
         esac
-        isolated_env="${env_prefix}.${name}.env"
+        isolated_env="$(isolated_stack_env_path "$old_stack_env" "$name")"
         if project_name_exists "$name" || volume_name_exists "${name}-matrixone-data" ||
             [[ -e "$isolated_env" ]]; then
             warn "an installation or retained data named '$name' already exists"

@@ -10,6 +10,7 @@ makefile="$repo_root/Makefile"
 cli_setup="$repo_root/crates/astra-cli/src/admin_cli/setup.rs"
 embedding_probe="$repo_root/scripts/setup/check_embedding.py"
 identity_helpers="$repo_root/scripts/setup/stack_identity.sh"
+status_helpers="$repo_root/scripts/setup/stack_status.sh"
 
 grep -q '^stack-setup:' "$makefile"
 grep -q '^stack-start: stack-env' "$makefile"
@@ -46,6 +47,8 @@ grep -q 'Finish the stack and configure chat later' "$script"
 grep -q 'Chat configuration is present; provider connectivity was not rechecked' "$script"
 grep -q 'Chat is not ready: configure an administrator and an active model' "$script"
 grep -q 'admin_model_state' "$script"
+grep -q 'print_stack_inspect_commands' "$script"
+grep -q 'make stack-down STACK_ENV=' "$makefile"
 grep -q 'TUI:.*cli_api_prefix' "$script"
 grep -q 'Resume without restarting services' "$script"
 grep -q 'Edge: astra-edge --help' "$script"
@@ -178,6 +181,18 @@ docker() {
     fi
 }
 . "$identity_helpers"
+. "$status_helpers"
+python_cmd=python3
+
+ignored_descriptor="$(isolated_stack_env_path "$repo_root/deployment/all-in-one/.env" astra-0-2-1)"
+[[ "$ignored_descriptor" == "$repo_root/deployment/all-in-one/.env.astra-0-2-1.env" ]]
+git -C "$repo_root" check-ignore -q deployment/all-in-one/.env.astra-0-2-1.env
+
+parse_model_catalog_state '{"items":[{"name":"inactive-only","is_active":false}]}'
+[[ "$active_model_count" == 0 ]]
+[[ -z "$active_model_names" ]]
+[[ "$inactive_model_count" == 1 ]]
+[[ "$inactive_model_names" == inactive-only ]]
 
 compose_plan_keeps_service 'DRY-RUN MODE - Container astra-api-1 Running'
 if compose_plan_keeps_service 'DRY-RUN MODE - Container astra-api-1 Recreate'; then
@@ -245,6 +260,12 @@ for managed_env in "$identity_env" "$isolated_env"; do
     grep -q -- "--env-file \"$managed_env_abs\"" <<< "$managed_preview"
     grep -q -- '--project-name "$project_name"' <<< "$managed_preview"
 done
+stack_env="$isolated_env"
+isolated_env_quoted="$(printf '%q' "$isolated_env")"
+[[ "$(print_stack_command stack-down)" == "make stack-down STACK_ENV=$isolated_env_quoted" ]]
+failure_preview="$(make --no-print-directory -n stack-up STACK_ENV="$isolated_env")"
+stack_down_recovery="$(grep -F 'make stack-down STACK_ENV=' <<< "$failure_preview")"
+grep -Fq "$isolated_env" <<< "$stack_down_recovery"
 stack_env="$identity_env"
 
 # The allocator must reserve ports selected earlier in the same pass.

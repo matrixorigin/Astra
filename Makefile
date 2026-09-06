@@ -682,7 +682,7 @@ stack-start: stack-env
 	@$(MAKE) stack-verify
 	@echo ""
 	@echo "✅ Astra local stack is ready"
-	@echo "   Next: make stack-setup (resume guided status and optional chat setup)"
+	@echo "   Next: make stack-setup STACK_ENV=\"$(STACK_ENV)\" (resume guided status and optional chat setup)"
 	@echo "   Try:  astra chat -m \"Explain what you can do in this deployment\""
 
 .PHONY: stack-up
@@ -704,11 +704,11 @@ stack-up: stack-config
 		if [ -n "$$failed_services" ]; then \
 			( $(STACK_COMPOSE) logs --no-color --tail=80 $$failed_services ) || true; \
 		else \
-			echo "No failed container was identified; run 'make stack-logs' for full logs."; \
+			echo "No failed container was identified; run 'make stack-logs STACK_ENV=\"$(STACK_ENV)\"' for full logs."; \
 		fi; \
 		echo ""; \
-		echo "Fix the first reported error, then rerun 'make stack-up'."; \
-		echo "The partial stack is left running so it can be inspected; use 'make stack-down' to stop it."; \
+		echo "Fix the first reported error, then rerun 'make stack-up STACK_ENV=\"$(STACK_ENV)\"'."; \
+		echo "The partial stack is left running so it can be inspected; use 'make stack-down STACK_ENV=\"$(STACK_ENV)\"' to stop it."; \
 		exit 1; \
 	fi
 	@echo "✅ Compose stack started"
