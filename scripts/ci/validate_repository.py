@@ -70,6 +70,7 @@ def main() -> None:
         Path("scripts/ops/test_production_env_contract.sh"),
         Path("scripts/ci/test_release_contract.sh"),
         Path("scripts/ci/test_github_release_lookup.sh"),
+        Path("scripts/ci/test_release_owner_artifacts.sh"),
         Path("scripts/ci/test_release_manifest_contract.sh"),
         Path("scripts/ci/test_release_build_shells.py"),
         Path("scripts/ci/test_sccache_fallback.sh"),
@@ -190,6 +191,7 @@ def main() -> None:
         "make stack-up",
         "make stack-verify",
         "release-digest-",
+        "retention-days: 30",
         "Write container candidate summary",
         "Candidate image version",
     ):
@@ -250,13 +252,29 @@ def main() -> None:
         "--locked",
         "source_sha",
         "astra-edge",
+        "create_reproducible_release_archive.py",
         "scripts/verify-release-artifacts.sh",
         "release-client-assets",
+        "retention-days: 30",
     ):
         if required not in binary_release_workflow:
             errors.append(
                 ".github/workflows/release-binaries.yml: missing verified client candidate contract "
                 f"({required})"
+            )
+
+    for required in (
+        "owner_run_id:",
+        "inputs.recover_existing_tag != true",
+        "Download original verified client candidates for recovery",
+        "Download original verified server candidates for recovery",
+        "run-id: ${{ needs.preflight.outputs.owner_run_id }}",
+        "scripts/verify-release-owner-artifacts.sh",
+    ):
+        if required not in release_controller:
+            errors.append(
+                ".github/workflows/release.yml: recovery must reuse the original "
+                f"verified candidate set ({required})"
             )
 
     dockerfile = Path("Dockerfile").read_text(encoding="utf-8")

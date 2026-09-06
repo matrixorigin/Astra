@@ -37,6 +37,7 @@ jobs:
       rolling_version: ${{ steps.resolve.outputs.rolling_version }}
       publish_latest: ${{ steps.resolve.outputs.publish_latest }}
       matrix: ${{ steps.resolve.outputs.matrix }}
+      owner_run_id: ${{ steps.resolve.outputs.owner_run_id }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -133,6 +134,8 @@ jobs:
               echo "Expected Release Astra on ${DEFAULT_BRANCH} at ${source_sha}." >&2
               exit 1
             fi
+            scripts/verify-release-owner-artifacts.sh \
+              "${GITHUB_REPOSITORY}" "${marker_run_id}"
             if ! git merge-base --is-ancestor "${source_sha}" "${default_sha}"; then
               echo "Release tag ${source_tag} is not reachable from ${DEFAULT_BRANCH}." >&2
               exit 1
@@ -151,6 +154,7 @@ jobs:
             fi
             source_sha="${selected_sha}"
             tag_object=""
+            marker_run_id=""
           fi
 
           git checkout --detach "${source_sha}"
@@ -176,6 +180,7 @@ jobs:
             echo "rolling_version=${rolling_version}"
             echo "publish_latest=${publish_latest}"
             echo "matrix=${matrix}"
+            echo "owner_run_id=${marker_run_id}"
           } >> "${GITHUB_OUTPUT}"
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -216,6 +221,7 @@ jobs:
   clients:
     name: Build and Verify Client Candidates
     needs: preflight
+    if: ${{ inputs.recover_existing_tag != true }}
     uses: ./.github/workflows/release-binaries.yml
     with:
       version: ${{ needs.preflight.outputs.version }}
@@ -224,6 +230,7 @@ jobs:
   containers:
     name: Build and Verify Server Candidates
     needs: preflight
+    if: ${{ inputs.recover_existing_tag != true }}
     uses: ./.github/workflows/release-container-candidates.yml
     with:
       image_version: ${{ needs.preflight.outputs.version }}
@@ -237,10 +244,20 @@ jobs:
       - preflight
       - clients
       - containers
+    if: >-
+      ${{
+        always() &&
+        needs.preflight.result == 'success' &&
+        (
+          inputs.recover_existing_tag == true ||
+          (needs.clients.result == 'success' && needs.containers.result == 'success')
+        )
+      }}
     runs-on: ubuntu-latest
     environment: release
     timeout-minutes: 30
     permissions:
+      actions: read
       contents: write
 
     steps:
@@ -262,16 +279,41 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.preflight.outputs.source_sha }}
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - name: Download verified client candidates from this run
+        if: ${{ inputs.recover_existing_tag != true }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: release-client-assets
           path: dist
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - name: Download verified server candidates from this run
+        if: ${{ inputs.recover_existing_tag != true }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: release-digest-*
           path: /tmp/digests
           merge-multiple: true
+
+      - name: Download original verified client candidates for recovery
+        if: ${{ inputs.recover_existing_tag == true }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-client-assets
+          path: dist
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.preflight.outputs.owner_run_id }}
+
+      - name: Download original verified server candidates for recovery
+        if: ${{ inputs.recover_existing_tag == true }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-digest-*
+          path: /tmp/digests
+          merge-multiple: true
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.preflight.outputs.owner_run_id }}
 
       - name: Revalidate client assets at the publication boundary
         shell: bash

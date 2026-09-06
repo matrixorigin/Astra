@@ -9,9 +9,10 @@ trap 'rm -rf "$fixture_root"' EXIT HUP INT TERM
 
 package_dir="${fixture_root}/package"
 dist_dir="${fixture_root}/dist"
+second_dist_dir="${fixture_root}/second-dist"
 fake_bin_dir="${fixture_root}/fake-bin"
 install_dir="${fixture_root}/installed"
-mkdir -p "$package_dir" "$dist_dir" "$fake_bin_dir" "$install_dir"
+mkdir -p "$package_dir" "$dist_dir" "$second_dist_dir" "$fake_bin_dir" "$install_dir"
 printf '%s\n' '#!/bin/sh' 'echo "astra 0.1.0"' > "${package_dir}/astra"
 printf '%s\n' '#!/bin/sh' 'echo "astra-edge 0.1.0"' > "${package_dir}/astra-edge"
 chmod 0755 "${package_dir}/astra" "${package_dir}/astra-edge"
@@ -27,10 +28,49 @@ sha256_file() {
 
 for suffix in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
     archive="astra-v0.1.0-${suffix}.tar.gz"
-    tar -czf "${dist_dir}/${archive}" -C "$package_dir" astra astra-edge LICENSE
+    "${repo_root}/scripts/create_reproducible_release_archive.py" \
+        "$package_dir" "${dist_dir}/${archive}" 1700000000
     printf '%s  %s\n' "$(sha256_file "${dist_dir}/${archive}")" "$archive" \
         > "${dist_dir}/${archive}.sha256"
 done
+
+# Repackaging the same release source must reproduce the exact archives even
+# when filesystem metadata has changed between runs.
+touch "${package_dir}/astra" "${package_dir}/astra-edge" "${package_dir}/LICENSE"
+for suffix in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
+    archive="astra-v0.1.0-${suffix}.tar.gz"
+    "${repo_root}/scripts/create_reproducible_release_archive.py" \
+        "$package_dir" "${second_dist_dir}/${archive}" 1700000000
+    cmp "${dist_dir}/${archive}" "${second_dist_dir}/${archive}"
+done
+
+python3 - "${dist_dir}/astra-v0.1.0-linux-amd64.tar.gz" <<'PY'
+import sys
+import tarfile
+
+with tarfile.open(sys.argv[1], mode="r:gz") as archive:
+    members = archive.getmembers()
+assert [member.name for member in members] == ["astra", "astra-edge", "LICENSE"]
+assert [member.mode for member in members] == [0o755, 0o755, 0o644]
+assert all(member.uid == 0 and member.gid == 0 for member in members)
+assert all(member.uname == "root" and member.gname == "root" for member in members)
+assert all(member.mtime == 1700000000 for member in members)
+PY
+
+if "${repo_root}/scripts/create_reproducible_release_archive.py" \
+    "$package_dir" "${second_dist_dir}/invalid.tar.gz" not-an-epoch >/dev/null 2>&1; then
+    echo "release archiver accepted an invalid source date epoch" >&2
+    exit 1
+fi
+mv "${package_dir}/astra" "${package_dir}/astra.real"
+ln -s astra.real "${package_dir}/astra"
+if "${repo_root}/scripts/create_reproducible_release_archive.py" \
+    "$package_dir" "${second_dist_dir}/invalid.tar.gz" 1700000000 >/dev/null 2>&1; then
+    echo "release archiver accepted a symbolic-link member" >&2
+    exit 1
+fi
+rm "${package_dir}/astra"
+mv "${package_dir}/astra.real" "${package_dir}/astra"
 
 "${repo_root}/scripts/verify-release-artifacts.sh" 0.1.0 "$dist_dir"
 expected_manifest_hash="$(awk '{ print $1 }' "${dist_dir}/checksums.txt.sha256")"
@@ -146,7 +186,8 @@ fi
 rm -f "${dist_dir}/unexpected.txt"
 
 # A mutated archive must never survive the checksum gate.
-install -m 0644 /bin/false "${dist_dir}/astra-v0.1.0-linux-amd64.tar.gz"
+install -m 0644 "${repo_root}/LICENSE" \
+    "${dist_dir}/astra-v0.1.0-linux-amd64.tar.gz"
 if "${repo_root}/scripts/verify-release-artifacts.sh" 0.1.0 "$dist_dir" >/dev/null 2>&1; then
     echo "release artifact verification accepted a mutated archive" >&2
     exit 1

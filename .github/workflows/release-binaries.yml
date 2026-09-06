@@ -132,7 +132,9 @@ jobs:
           done
           install -m 0644 LICENSE "${package_dir}/LICENSE"
           archive="astra-v${RELEASE_VERSION}-${{ matrix.suffix }}.tar.gz"
-          tar -czf "dist/${archive}" -C "${package_dir}" astra astra-edge LICENSE
+          source_date_epoch="$(git show -s --format=%ct "${RELEASE_SOURCE_SHA}")"
+          python3 scripts/create_reproducible_release_archive.py \
+            "${package_dir}" "dist/${archive}" "${source_date_epoch}"
           (cd dist && checksum_file "${archive}" > "${archive}.sha256")
 
       - name: Upload client candidate
@@ -184,4 +186,4 @@ jobs:
           name: release-client-assets
           path: dist/
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30

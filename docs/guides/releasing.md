@@ -212,9 +212,20 @@ the annotated tag but its original run can no longer be resumed. Recovery
 rejects manual and legacy tags, verifies the recorded owner is a real
 **Release Astra** run from the default branch at the same source SHA, then
 validates the unchanged tag, checksums, and any existing versioned Docker
-manifest. It never moves a tag or silently replaces different immutable
-output. If the recorded Actions run is no longer available, publish a patch
-version instead of weakening ownership checks.
+manifest. Recovery skips candidate rebuilds and downloads the exact verified
+client archives and server digests from the run recorded in the annotated tag.
+Those publication candidates are retained for 30 days; short-lived per-platform
+client build artifacts are not part of the recovery contract.
+It never moves a tag, silently replaces different immutable output, or treats a
+new build as proof of the old release. If the recorded run or its retained
+candidate artifacts are no longer available, publish a patch version instead
+of weakening ownership checks.
+
+Client archives use the selected source commit time as `SOURCE_DATE_EPOCH` and
+normalize member order, ownership, modes, paths, and gzip metadata. Rebuilding
+the same binaries for the same source therefore produces byte-identical
+archives; recovery still prefers the original verified artifacts rather than
+depending on a rebuild.
 
 Do not rewrite a tag or replace a completed release in place. Fix product or
 packaging defects through a normal pull request and publish a patch version. If
