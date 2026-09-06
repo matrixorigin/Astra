@@ -582,6 +582,7 @@ dependencies = [
  "futures-util",
  "hmac",
  "jsonwebtoken",
+ "libc",
  "openssl",
  "regex",
  "reqwest 0.12.28",

@@ -109,6 +109,18 @@ jobs:
             "${candidate}" --help >/dev/null
           done
 
+      - name: Verify Darwin session execution lease contract
+        if: ${{ contains(matrix.target, 'apple-darwin') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --release --locked --no-default-features \
+            --manifest-path Cargo.toml --target "${{ matrix.target }}" \
+            -p astra-services --lib macos_session_execution_lease
+          cargo test --release --locked --no-default-features \
+            --manifest-path Cargo.toml --target "${{ matrix.target }}" \
+            -p astra-cli --lib session_execution_lease::tests
+
       - name: Package client archive
         shell: bash
         run: |

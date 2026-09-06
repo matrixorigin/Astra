@@ -195,6 +195,8 @@ Verify all of the following before announcing it:
   are present;
 - a clean Linux and macOS machine can run the documented installer;
 - `astra --version`, `astra-edge --version`, and `astra --help` work;
+- Darwin release jobs prove that a session execution lease admits one owner,
+  rejects a concurrent owner, and can be reacquired after release;
 - the exact Docker version resolves to Linux AMD64 and ARM64;
 - the all-in-one source checkout at `vX.Y.Z` uses the same Astra version plus
   the tested MatrixOne and Memoria digests;
@@ -214,8 +216,14 @@ rejects manual and legacy tags, verifies the recorded owner is a real
 validates the unchanged tag, checksums, and any existing versioned Docker
 manifest. Recovery skips candidate rebuilds and downloads the exact verified
 client archives and server digests from the run recorded in the annotated tag.
-Those publication candidates are retained for 30 days; short-lived per-platform
-client build artifacts are not part of the recovery contract.
+Each digest-addressed server candidate is also retained by an immutable
+`astra-candidate-RUN_ID-PLATFORM-DIGEST` Docker tag. Including the digest keeps
+retries immutable even if a rebuilt OCI provenance envelope changes. Recovery
+verifies both the digest object and its run-scoped tag before requesting
+protected publication approval.
+The owner artifacts that carry the client archives and server coordinates are
+retained for 30 days; short-lived per-platform client build artifacts are not
+part of the recovery contract.
 It never moves a tag, silently replaces different immutable output, or treats a
 new build as proof of the old release. If the recorded run or its retained
 candidate artifacts are no longer available, publish a patch version instead
@@ -227,6 +235,10 @@ is checked out into a separate source directory for inspection and remains an
 immutable release input, not executable control-plane code. Before a
 draft becomes public, its remote asset names, sizes, upload states, and GitHub
 SHA-256 digests must exactly match the locally verified candidate set.
+Draft release notes carry the immutable owner run and source identity. Repeated
+staging preserves and overwrites the same canonical body without regenerating
+notes; a manual or differently owned draft fails closed instead of contributing
+text to the public release.
 
 Client archives use the selected source commit time as `SOURCE_DATE_EPOCH` and
 normalize member order, ownership, modes, paths, and gzip metadata. Rebuilding

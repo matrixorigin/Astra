@@ -309,9 +309,18 @@ mod tests {
 
     #[test]
     fn distinct_session_admission_scales_without_a_global_lock() {
+        // macOS commonly starts test processes with a 256-descriptor soft limit.
+        // Each live lease intentionally retains one descriptor, so keep enough
+        // headroom for the test harness while still exercising concurrent,
+        // independent admission rather than a process-global lock.
+        #[cfg(target_os = "macos")]
+        const SESSION_COUNT: usize = 64;
+        #[cfg(not(target_os = "macos"))]
+        const SESSION_COUNT: usize = 256;
+
         let started = std::time::Instant::now();
-        let mut threads = Vec::with_capacity(256);
-        for index in 0..256 {
+        let mut threads = Vec::with_capacity(SESSION_COUNT);
+        for index in 0..SESSION_COUNT {
             let session_id = session_id(&format!("concurrent-{index}"));
             threads.push(std::thread::spawn(move || {
                 RequestSessionExecutionLease::new(Some(&session_id)).unwrap()
@@ -322,10 +331,10 @@ mod tests {
             .map(|thread| thread.join().unwrap())
             .collect::<Vec<_>>();
         let elapsed = started.elapsed();
-        assert_eq!(holders.len(), 256);
+        assert_eq!(holders.len(), SESSION_COUNT);
         assert!(
             elapsed < std::time::Duration::from_secs(10),
-            "256 distinct session admissions took {elapsed:?}"
+            "{SESSION_COUNT} distinct session admissions took {elapsed:?}"
         );
     }
 }

@@ -1,7 +1,7 @@
 # Durable agent runs
 
 > Status: target design contract.
-> Last updated: 2026-07-07.
+> Last updated: 2026-09-06.
 
 Durable agent runs define how agent execution survives long tasks, reconnects, cancellation, owner changes, provider failures, and process crashes.
 
@@ -53,6 +53,12 @@ Checkpoint must include enough information to resume safely:
 - Lease expiry enables recovery.
 - Recovery must avoid double execution of non-idempotent actions.
 - Session execution slots prevent conflicting root runs when required by product semantics.
+- Local client session execution leases use one stable, never-rotated file
+  authority in the owner-local state directory. Linux adds a kernel-named
+  abstract Unix socket so path replacement cannot admit a second executor;
+  macOS rejects symlink authorities and verifies path-to-inode continuity
+  around its advisory lock. Unsupported platforms fail closed rather than
+  running without an execution owner.
 
 ## Terminal outcomes
 
@@ -87,3 +93,5 @@ Buffered completion may finalize without resuming execution when the answer is a
 - Duplicate resume attempts.
 - Sub-run lineage recovery.
 - Provider offline during resume.
+- Native client release targets acquire, conflict, release, and reacquire the
+  session execution authority before they are packaged.

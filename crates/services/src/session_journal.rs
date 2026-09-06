@@ -2019,12 +2019,13 @@ pub enum SessionExecutionLeaseError {
 
 /// Process-independent admission token for one session execution.
 ///
-/// On Linux, a kernel-named abstract Unix socket is the primary admission
-/// authority. It cannot be renamed or unlinked, so replacing the advisory
-/// lock-file inode cannot create two simultaneous owners. The lock file is a
-/// second fence for cooperating processes in other network namespaces and on
-/// shared filesystems. It is deliberately independent from the rotatable
-/// journal inode and is never removed. Dropping the token releases both locks.
+/// The dedicated lock file is independent from the rotatable journal inode and
+/// is never removed. On Linux, a kernel-named abstract Unix socket adds a
+/// rename-resistant primary authority; the file lock is a second fence for
+/// cooperating processes in other network namespaces and on shared filesystems.
+/// macOS has no abstract Unix socket namespace, so it uses the stable owner-local
+/// lock file after rejecting symlinks and verifying that the opened inode still
+/// owns the canonical path. Dropping the token releases every held authority.
 #[derive(Debug)]
 pub struct SessionExecutionLease {
     #[cfg(target_os = "linux")]
@@ -2046,8 +2047,8 @@ impl SessionExecutionLease {
                 }
             })?;
         let lock_path = execution_lease_path(&journal_path, session_id);
-        // On Linux this binds a kernel-held guard that must live for the whole
-        // lease; the non-Linux fallback returns unit, which trips the lint.
+        // Linux binds a kernel-held guard that must live for the whole lease;
+        // macOS relies on the stable owner-local file fence and returns unit.
         #[allow(clippy::let_unit_value)]
         let _kernel_authority =
             acquire_execution_kernel_authority(&owner_scope, &journal_path, session_id)?;
@@ -2063,16 +2064,12 @@ impl SessionExecutionLease {
                 source,
             });
         }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|source| SessionExecutionLeaseError::Io {
+        let file = open_execution_lease_file(&lock_path).map_err(|source| {
+            SessionExecutionLeaseError::Io {
                 session_id: session_id.to_string(),
                 source,
-            })?;
+            }
+        })?;
         use fs2::FileExt;
         match file.try_lock_exclusive() {
             Ok(()) => {}
@@ -2162,7 +2159,16 @@ fn acquire_execution_kernel_authority(
     })
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn acquire_execution_kernel_authority(
+    _owner_scope: &OwnerScope,
+    _journal_path: &Path,
+    _session_id: &str,
+) -> Result<(), SessionExecutionLeaseError> {
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn acquire_execution_kernel_authority(
     _owner_scope: &OwnerScope,
     _journal_path: &Path,
@@ -2175,6 +2181,17 @@ fn acquire_execution_kernel_authority(
             "this platform has no rename-resistant session execution authority",
         ),
     })
+}
+
+fn open_execution_lease_file(lock_path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(lock_path)
 }
 
 fn execution_lease_path(journal_path: &Path, session_id: &str) -> PathBuf {
@@ -12120,6 +12137,83 @@ mod turn_event_buffer_tests {
         );
         drop(winner_lease);
         assert!(SessionExecutionLease::try_acquire(session_id).is_ok());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_session_execution_lease_is_available_and_fails_closed_on_conflict() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let session_id = "sess-macos-execution-lease";
+
+        let first = SessionExecutionLease::try_acquire(session_id)
+            .expect("the documented macOS client must be able to start a turn");
+        assert!(matches!(
+            SessionExecutionLease::try_acquire(session_id),
+            Err(SessionExecutionLeaseError::Conflict { session_id: conflict })
+                if conflict == session_id
+        ));
+
+        drop(first);
+        SessionExecutionLease::try_acquire(session_id)
+            .expect("dropping the macOS file authority must admit the next turn");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_session_execution_lease_rejects_a_competing_process() {
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let session_id = "sess-macos-execution-lease-process";
+        let _first = SessionExecutionLease::try_acquire(session_id).unwrap();
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("session_journal::turn_event_buffer_tests::macos_session_execution_lease_child_probe")
+            .arg("--exact")
+            .env("ASTRA_MACOS_LEASE_PROBE_DIR", tmp.path())
+            .env("ASTRA_MACOS_LEASE_PROBE_SESSION", session_id)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "competing-process probe failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_session_execution_lease_child_probe() {
+        let Ok(dir) = std::env::var("ASTRA_MACOS_LEASE_PROBE_DIR") else {
+            return;
+        };
+        let session_id = std::env::var("ASTRA_MACOS_LEASE_PROBE_SESSION").unwrap();
+        let _guard = JournalDirGuard::new(dir);
+        assert!(matches!(
+            SessionExecutionLease::try_acquire(&session_id),
+            Err(SessionExecutionLeaseError::Conflict { .. })
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_session_execution_lease_rejects_symlink_authority() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempdir().unwrap();
+        let _guard = JournalDirGuard::new(tmp.path());
+        let session_id = "sess-macos-execution-lease-symlink";
+        let writer = JournalWriter::new(session_id).unwrap();
+        let lock_path = execution_lease_path(writer.path(), session_id);
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let detached_target = tmp.path().join("detached-authority");
+        std::fs::write(&detached_target, b"not the canonical authority").unwrap();
+        symlink(&detached_target, &lock_path).unwrap();
+
+        assert!(matches!(
+            SessionExecutionLease::try_acquire(session_id),
+            Err(SessionExecutionLeaseError::Io { .. })
+        ));
     }
 
     #[cfg(target_os = "linux")]

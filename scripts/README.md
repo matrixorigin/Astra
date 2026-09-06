@@ -250,6 +250,9 @@ Docker-tag creation, exact recovery, and rejection of duplicate platform
 candidates with an offline registry fixture. The shared
 `scripts/reconcile-docker-manifest.sh` performs the same platform-to-digest
 reconciliation at the actual publication boundary.
+`scripts/reconcile-docker-candidate-tag.sh` creates or verifies one immutable,
+run-scoped staging tag per server platform so registry cleanup cannot discard
+an otherwise retained recovery candidate.
 
 ### `scripts/verify_github_release_assets.py`
 
@@ -257,6 +260,11 @@ Before a draft GitHub Release becomes public, this gate requires the remote
 asset set to match the locally verified files exactly by name, byte size,
 upload state, and GitHub SHA-256 digest. Missing, additional, incomplete, and
 changed assets all fail closed.
+
+`scripts/prepare_github_release_body.py` binds a draft body to its immutable
+release owner and source. A repeated staging attempt reuses and verifies the
+same body without appending generated notes, while unrelated manual drafts are
+rejected.
 
 ### `scripts/prepare-release-version.py`
 

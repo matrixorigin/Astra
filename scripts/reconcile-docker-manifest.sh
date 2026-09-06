@@ -35,7 +35,10 @@ if [[ ! -d "${digest_dir}" ]]; then
     exit 1
 fi
 
-mapfile -t expected_platform_names < <(
+expected_platform_names=()
+while IFS= read -r platform_name; do
+    expected_platform_names+=("${platform_name}")
+done < <(
     python3 -c '
 import json, sys
 document = json.load(sys.stdin)
@@ -137,7 +140,10 @@ for digest_file in "${digest_files[@]}"; do
     fi
     source="${image_name}@sha256:${digest}"
     sources+=("${source}")
-    mapfile -t source_platforms < <(platform_digest_set "${source}")
+    source_platforms=()
+    while IFS= read -r source_platform; do
+        source_platforms+=("${source_platform}")
+    done < <(platform_digest_set "${source}")
     if [[ "${#source_platforms[@]}" -ne 1 ]]; then
         echo "candidate ${source} must contain exactly one supported Linux platform" >&2
         exit 1
@@ -146,7 +152,10 @@ for digest_file in "${digest_files[@]}"; do
 done
 sort -u -o "${candidate_platforms_file}" "${candidate_platforms_file}"
 
-mapfile -t candidate_platform_names < <(cut -d= -f1 "${candidate_platforms_file}" | sort -u)
+candidate_platform_names=()
+while IFS= read -r platform_name; do
+    candidate_platform_names+=("${platform_name}")
+done < <(cut -d= -f1 "${candidate_platforms_file}" | sort -u)
 if [[ "$(printf '%s\n' "${expected_platform_names[@]}")" != "$(printf '%s\n' "${candidate_platform_names[@]}")" ]]; then
     echo "candidate platforms do not match the requested build matrix" >&2
     diff \

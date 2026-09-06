@@ -185,7 +185,51 @@ jobs:
           } >> "${GITHUB_OUTPUT}"
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-        if: ${{ inputs.recover_existing_tag != true }}
+
+      - name: Authenticate for recovery candidate verification
+        if: ${{ inputs.recover_existing_tag == true }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Download retained server candidate coordinates for recovery preflight
+        if: ${{ inputs.recover_existing_tag == true }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-digest-*
+          path: /tmp/recovery-digests
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.resolve.outputs.owner_run_id }}
+
+      - name: Verify retained server candidates before publication approval
+        if: ${{ inputs.recover_existing_tag == true }}
+        shell: bash
+        env:
+          BUILD_MATRIX_JSON: ${{ steps.resolve.outputs.matrix }}
+          OWNER_RUN_ID: ${{ steps.resolve.outputs.owner_run_id }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r slug; do
+            candidate_dir="/tmp/recovery-digests/release-digest-${slug}"
+            shopt -s nullglob
+            digest_files=("${candidate_dir}"/*)
+            shopt -u nullglob
+            if [ "${#digest_files[@]}" -ne 1 ]; then
+              echo "Expected one retained ${slug} digest, found ${#digest_files[@]}." >&2
+              exit 1
+            fi
+            digest="$(basename "${digest_files[0]}")"
+            scripts/reconcile-docker-candidate-tag.sh \
+              matrixorigin/astra \
+              "astra-candidate-${OWNER_RUN_ID}-${slug}-${digest}" \
+              "sha256:${digest}" \
+              verify
+          done < <(
+            python3 -c 'import json, sys; entries = json.load(sys.stdin).get("include", []); slugs = [entry.get("slug") for entry in entries]; invalid = not slugs or any(not isinstance(slug, str) or not slug for slug in slugs); invalid and sys.exit("release matrix entry has no candidate slug"); print(*slugs, sep="\n")' \
+              <<< "${BUILD_MATRIX_JSON}"
+          )
 
       - name: Reject an existing Docker version before candidate builds
         if: ${{ inputs.recover_existing_tag != true }}
@@ -515,6 +559,41 @@ jobs:
           cmp dist/checksums.txt "${existing_dir}/checksums.txt"
           cmp dist/checksums.txt.sha256 "${existing_dir}/checksums.txt.sha256"
 
+      - name: Prepare canonical GitHub Release body
+        if: ${{ steps.existing_release.outputs.state != 'published' }}
+        id: release_body
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXISTING_RELEASE_ID: ${{ steps.existing_release.outputs.release_id }}
+          ORIGINAL_OWNER_RUN_ID: ${{ needs.preflight.outputs.owner_run_id }}
+          SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+          SOURCE_TAG: ${{ needs.preflight.outputs.source_tag }}
+        run: |
+          set -euo pipefail
+          owner_run_id="${ORIGINAL_OWNER_RUN_ID:-${GITHUB_RUN_ID}}"
+          body_path="${RUNNER_TEMP}/release-body.md"
+          set --
+          if [ -n "${EXISTING_RELEASE_ID}" ]; then
+            existing_json="${RUNNER_TEMP}/existing-release.json"
+            gh api "repos/${GITHUB_REPOSITORY}/releases/${EXISTING_RELEASE_ID}" \
+              > "${existing_json}"
+            set -- --existing-release-json "${existing_json}"
+          fi
+          generate_notes="$(
+            python3 scripts/prepare_github_release_body.py prepare \
+              --owner-run-id "${owner_run_id}" \
+              --source-sha "${SOURCE_SHA}" \
+              --source-tag "${SOURCE_TAG}" \
+              --output "${body_path}" \
+              "$@"
+          )"
+          {
+            echo "body_path=${body_path}"
+            echo "generate_notes=${generate_notes}"
+            echo "owner_run_id=${owner_run_id}"
+          } >> "${GITHUB_OUTPUT}"
+
       - name: Stage GitHub Release and verified assets
         if: ${{ steps.existing_release.outputs.state != 'published' }}
         id: stage_release
@@ -525,7 +604,8 @@ jobs:
           tag_name: ${{ needs.preflight.outputs.source_tag }}
           draft: true
           prerelease: ${{ needs.preflight.outputs.prerelease }}
-          generate_release_notes: true
+          body_path: ${{ steps.release_body.outputs.body_path }}
+          generate_release_notes: ${{ steps.release_body.outputs.generate_notes }}
           make_latest: false
           files: dist/*
           fail_on_unmatched_files: true
@@ -557,6 +637,29 @@ jobs:
             exit 1
           fi
           echo "release_id=${release_id}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify canonical staged GitHub Release body
+        if: ${{ steps.existing_release.outputs.state != 'published' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.publish_release.outputs.release_id }}
+          SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
+          SOURCE_TAG: ${{ needs.preflight.outputs.source_tag }}
+          OWNER_RUN_ID: ${{ steps.release_body.outputs.owner_run_id }}
+          BODY_PATH: ${{ steps.release_body.outputs.body_path }}
+          GENERATED_NOTES: ${{ steps.release_body.outputs.generate_notes }}
+        run: |
+          set -euo pipefail
+          staged_json="${RUNNER_TEMP}/staged-release.json"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > "${staged_json}"
+          python3 scripts/prepare_github_release_body.py verify \
+            --owner-run-id "${OWNER_RUN_ID}" \
+            --source-sha "${SOURCE_SHA}" \
+            --source-tag "${SOURCE_TAG}" \
+            --release-json "${staged_json}" \
+            --expected-body "${BODY_PATH}" \
+            --generated-notes "${GENERATED_NOTES}"
 
       - name: Verify exact staged GitHub Release assets
         if: ${{ steps.existing_release.outputs.state != 'published' }}

@@ -695,7 +695,7 @@ mod tests {
         server.verify().await;
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test(flavor = "current_thread")]
     async fn interactive_turn_loses_to_headless_before_any_llm_invocation() {
         let server = wiremock::MockServer::start().await;
@@ -738,7 +738,7 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn interactive_admission_refreshes_terminal_turn_authority_before_execution() {
         use astra_services::session_journal::{JournalEvent, JournalWriter};

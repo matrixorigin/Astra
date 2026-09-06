@@ -85,6 +85,17 @@ jobs:
           fi
           touch "/tmp/digests/${digest#sha256:}"
 
+      - name: Retain candidate with a run-scoped immutable tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="${{ steps.build.outputs.digest }}"
+          scripts/reconcile-docker-candidate-tag.sh \
+            "${IMAGE_NAME}" \
+            "astra-candidate-${GITHUB_RUN_ID}-${{ matrix.slug }}-${digest#sha256:}" \
+            "${digest}" \
+            create
+
       - name: Upload candidate digest
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
