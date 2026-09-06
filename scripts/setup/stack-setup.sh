@@ -687,7 +687,20 @@ if isinstance(value, dict):
         # A non-admin account may still be useful for a later login, but it
         # cannot complete this wizard's server-wide model configuration.
         whoami_json="$(ASTRA_API_URL="$ASTRA_API_URL" "$cli" admin whoami 2>/dev/null || true)"
-        if [[ -n "$whoami_json" ]]; then
+        admin_identity="$("$python_cmd" -c '
+import json
+import sys
+
+try:
+    value = json.loads(sys.argv[1])
+except (IndexError, json.JSONDecodeError):
+    raise SystemExit(0)
+if isinstance(value, dict):
+    identity = value.get("username") or value.get("email") or value.get("user_id")
+    if isinstance(identity, str) and identity.strip():
+        print(identity.strip())
+' "$whoami_json" 2>/dev/null || true)"
+        if [[ -n "$admin_identity" ]]; then
             admin_state="signed in (admin role not verified)"
         fi
         return 0
@@ -820,7 +833,7 @@ choose_admin_model_action() {
     if [[ "$admin_state" == ready && "$active_model_count" -gt 0 ]]; then
         choose "Administrator and model state is already present. What should setup do?" \
             "Verify the existing administrator and model (recommended)" \
-            "Reconfigure administrator or model" \
+            "Open setup to choose a different administrator or model" \
             "Finish the stack and leave chat settings unchanged"
         case "$menu_choice" in
             1|2) return 0 ;;

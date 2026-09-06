@@ -239,6 +239,12 @@ isolated_env="$stack_env"
 [[ "$(env_file_read "$isolated_env" ASTRA_API_PORT)" == 17003 ]]
 [[ "$(env_file_read "$isolated_env" MEMORIA_PORT)" == 8101 ]]
 [[ "$(env_file_read "$identity_env" ASTRA_STACK_NAME)" == all-in-one ]]
+for managed_env in "$identity_env" "$isolated_env"; do
+    managed_preview="$(make --no-print-directory -n stack-status STACK_ENV="$managed_env")"
+    managed_env_abs="$(cd "$(dirname "$managed_env")" && pwd)/$(basename "$managed_env")"
+    grep -q -- "--env-file \"$managed_env_abs\"" <<< "$managed_preview"
+    grep -q -- '--project-name "$project_name"' <<< "$managed_preview"
+done
 stack_env="$identity_env"
 
 # The allocator must reserve ports selected earlier in the same pass.
