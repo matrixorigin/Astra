@@ -44,10 +44,23 @@ Publication is deliberately ordered:
 1. validate the exact source and version;
 2. build and execute all client candidates;
 3. build untagged server digests and smoke every platform;
-4. create or validate the immutable annotated tag;
-5. create or verify the exact Docker version manifest;
+4. immediately create or validate the immutable annotated tag, before waiting
+   for publication approval;
+5. after approval, revalidate the tag and create or verify the exact Docker
+   version manifest;
 6. stage and publish the GitHub Release with verified client assets;
 7. update stable rolling Docker tags.
+
+Tag staging is deliberately separate from the protected publication job.
+GitHub's workflow token cannot create a tag for an older default-branch commit
+when a newer commit changes workflow files. Staging immediately after candidate
+verification prevents a later approval delay from turning the pinned source
+into an untaggable historical commit. If `main` gains workflow changes before
+candidate verification finishes, staging fails without creating a tag and
+tells the maintainer to start a new run from the current protected head.
+Unrelated later commits do not change the selected release source and do not
+force a rebuild. Re-running the same staging job is idempotent only for the
+exact tag, source, and owning run.
 
 The GitHub Release is not published until the exact Docker version exists. If
 a late step fails, rerun the failed jobs from the same Actions run so its
@@ -94,8 +107,9 @@ A manually created tag cannot publish anything and cannot be adopted by
 recovery, but it will reserve that version until an administrator removes it.
 
 Repository Actions should default to read-only permissions. The release
-controller grants `contents: write` only to the publication job that creates
-the tag and GitHub Release.
+controller grants `contents: write` only to the tag-staging job and the
+publication job. The former creates one immutable version tag after all
+candidates pass; the latter creates the GitHub Release.
 
 The source tree versions `@astra/sdk` and the Helm chart, but the workflow does
 not yet publish either to npm or a chart registry. Treat them as explicit
@@ -192,9 +206,11 @@ release commit; it does not modify files, create tags, or publish data.
    The command validates the synchronized version metadata, requires a clean
    checkout at the exact `origin/main` SHA, and dispatches **Release Astra**
    with recovery disabled. It does not create a tag locally.
-3. Wait for the client and server candidate matrices to pass.
-4. Review the preflight summary and approve the single `release` Environment
-   gate for the publication job.
+3. Wait for the client and server candidate matrices to pass and for the
+   workflow to stage the immutable tag. If `main` gained workflow changes while
+   candidates were running, start a new run from the current `main` head.
+4. Review the preflight and tag-staging summaries, then approve the single
+   `release` Environment gate for the publication job.
 
 Do not create the tag manually. The workflow creates `vX.Y.Z` as an annotated
 tag on the source SHA after all candidate verification succeeds.

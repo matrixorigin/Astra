@@ -191,6 +191,128 @@ class ReleaseShellTests(unittest.TestCase):
                                  "-p", "astra-edge", "--bin", "astra-edge"]
                     self.assertEqual(result.stdout.splitlines(), expected)
 
+    def test_release_tag_staging_rejects_workflow_drift_before_mutation(self):
+        script = workflow_run_script(
+            ".github/workflows/release.yml",
+            "Create or validate the immutable release tag",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            fake_bin = fixture / "bin"
+            fake_bin.mkdir()
+            calls = fixture / "calls"
+            output = fixture / "output"
+            (fake_bin / "git").write_text(
+                """#!/bin/sh
+set -eu
+printf '%s\\n' "git $*" >> "${ASTRA_TEST_CALLS}"
+case "$*" in
+  "ls-remote origin refs/tags/"*) exit 0 ;;
+  "ls-remote origin refs/heads/main")
+    printf '%s\\trefs/heads/main\\n' "${ASTRA_TEST_DEFAULT_SHA}"
+    ;;
+  "fetch --no-tags origin refs/heads/main:refs/remotes/origin/main") exit 0 ;;
+  "merge-base --is-ancestor verified-source-sha new-main-sha") exit 0 ;;
+  "diff --quiet verified-source-sha new-main-sha -- .github/workflows") exit 1 ;;
+  *) exit 2 ;;
+esac
+""",
+                encoding="utf-8",
+            )
+            (fake_bin / "gh").write_text(
+                """#!/bin/sh
+set -eu
+printf '%s\\n' "gh $*" >> "${ASTRA_TEST_CALLS}"
+exit 99
+""",
+                encoding="utf-8",
+            )
+            (fake_bin / "git").chmod(0o755)
+            (fake_bin / "gh").chmod(0o755)
+            env = {
+                **os.environ,
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "ASTRA_TEST_CALLS": str(calls),
+                "ASTRA_TEST_DEFAULT_SHA": "new-main-sha",
+                "DEFAULT_BRANCH": "main",
+                "SOURCE_SHA": "verified-source-sha",
+                "SOURCE_TAG": "v0.2.2",
+                "GITHUB_SERVER_URL": "https://github.com",
+                "GITHUB_REPOSITORY": "matrixorigin/Astra",
+                "GITHUB_RUN_ID": "123",
+                "GITHUB_OUTPUT": str(output),
+            }
+            result = subprocess.run(
+                ["bash", "-c", script], env=env, capture_output=True, text=True
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "main advanced with workflow changes during candidate verification",
+                result.stderr,
+            )
+            self.assertIn("no tag was created", result.stderr)
+            self.assertNotIn("gh ", calls.read_text(encoding="utf-8"))
+
+    def test_release_tag_staging_is_idempotent_for_the_same_run(self):
+        script = workflow_run_script(
+            ".github/workflows/release.yml",
+            "Create or validate the immutable release tag",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            fake_bin = fixture / "bin"
+            fake_bin.mkdir()
+            calls = fixture / "calls"
+            output = fixture / "output"
+            (fake_bin / "git").write_text(
+                """#!/bin/sh
+set -eu
+printf '%s\\n' "git $*" >> "${ASTRA_TEST_CALLS}"
+case "$*" in
+  "ls-remote origin refs/tags/v0.2.2")
+    printf '%s\\trefs/tags/v0.2.2\\n' 'owned-tag-object'
+    ;;
+  *) exit 2 ;;
+esac
+""",
+                encoding="utf-8",
+            )
+            (fake_bin / "gh").write_text(
+                """#!/bin/sh
+set -eu
+printf '%s\\n' "gh $*" >> "${ASTRA_TEST_CALLS}"
+case "$*" in
+  *"--method POST"*) exit 99 ;;
+esac
+printf '{"object":{"sha":"%s"},"message":"Astra v0.2.2\\\\n\\\\nRelease-Run: https://github.com/matrixorigin/Astra/actions/runs/123"}\\n' \
+  "${SOURCE_SHA}"
+""",
+                encoding="utf-8",
+            )
+            (fake_bin / "git").chmod(0o755)
+            (fake_bin / "gh").chmod(0o755)
+            env = {
+                **os.environ,
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "ASTRA_TEST_CALLS": str(calls),
+                "DEFAULT_BRANCH": "main",
+                "SOURCE_SHA": "verified-source-sha",
+                "SOURCE_TAG": "v0.2.2",
+                "GITHUB_SERVER_URL": "https://github.com",
+                "GITHUB_REPOSITORY": "matrixorigin/Astra",
+                "GITHUB_RUN_ID": "123",
+                "GITHUB_OUTPUT": str(output),
+            }
+            result = subprocess.run(
+                ["bash", "-c", script], env=env, capture_output=True, text=True
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                output.read_text(encoding="utf-8"),
+                "tag_object=owned-tag-object\n",
+            )
+            self.assertNotIn("--method POST", calls.read_text(encoding="utf-8"))
+
     def test_docker_optional_mirrors_unset_and_empty(self):
         dockerfile = (ROOT / "Dockerfile").read_text().replace("\\\n", "")
         commands = re.findall(r"^RUN (set -eux;.*)$", dockerfile, re.MULTILINE)
