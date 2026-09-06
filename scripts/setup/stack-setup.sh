@@ -18,6 +18,7 @@ if [[ "$stack_env" != /* ]]; then
 fi
 stack_dir="$repo_root/deployment/all-in-one"
 . "$repo_root/scripts/setup/stack_status.sh"
+stack_staging_env=""
 
 die() {
     echo "❌ $*" >&2
@@ -34,6 +35,13 @@ cancel_setup() {
     exit 0
 }
 
+cleanup_staging_env() {
+    if [[ -n "${stack_staging_env:-}" ]]; then
+        rm -f -- "$stack_staging_env"
+        stack_staging_env=""
+    fi
+}
+
 on_interrupt() {
     printf '\n\nSetup interrupted. No persistent data was deleted.\n' >&2
     printf 'Services may be partially started if Compose was already running.\n' >&2
@@ -44,6 +52,7 @@ on_interrupt() {
     exit 130
 }
 trap on_interrupt INT TERM
+trap cleanup_staging_env EXIT
 
 command -v docker >/dev/null 2>&1 || die "docker is required"
 docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required"
@@ -94,7 +103,7 @@ compose() {
 }
 
 set_env_value() {
-    local key="$1" value="$2" temporary value_file
+    local key="$1" value="$2" target="${3:-$stack_env}" temporary value_file
     temporary="$(mktemp "${TMPDIR:-/tmp}/astra-stack-env.XXXXXX")"
     value_file="$(mktemp "${TMPDIR:-/tmp}/astra-stack-value.XXXXXX")"
     chmod 600 "$value_file"
@@ -118,9 +127,9 @@ set_env_value() {
             print
         }
         END { if (!updated) print key "=" value }
-    ' "$stack_env" > "$temporary"
+    ' "$target" > "$temporary"
     chmod 600 "$temporary"
-    mv "$temporary" "$stack_env"
+    mv "$temporary" "$target"
     rm -f "$value_file"
     trap - RETURN
 }
@@ -470,86 +479,6 @@ stop_detected_api() {
         return 1
     fi
     ok "stopped the detected source-mode Astra API (PID $pid)"
-}
-
-ensure_host_port() {
-    local env_key="$1" label="$2" service="$3" default_port="$4" container_port="$5"
-    local bind_address port pid owner suggested answer
-    bind_address="$(env_file_read "$stack_env" ASTRA_BIND_ADDRESS 2>/dev/null || true)"
-    bind_address="${bind_address:-127.0.0.1}"
-    port="$(env_file_read "$stack_env" "$env_key" 2>/dev/null || true)"
-    port="${port:-$default_port}"
-    case "$port" in
-        ''|*[!0-9]*|0) die "$env_key must be a valid TCP port" ;;
-    esac
-    port=$((10#$port))
-    ((port <= 65535)) || die "$env_key must be a TCP port from 1 to 65535"
-
-    # A running container from this compose project already owns its declared
-    # port. Compose can safely preserve or recreate that container itself.
-    if service_owns_host_port "$service" "$port" "$container_port"; then
-        return 0
-    fi
-
-    while ! port_is_available "$bind_address" "$port"; do
-        pid="$(listener_pid "$port")"
-        owner=""
-        if [[ -n "$pid" ]]; then
-            owner="$(process_name "$pid")"
-        fi
-        warn "$label port $bind_address:$port is already in use${owner:+ by $owner (PID $pid)}"
-
-        if [[ "$env_key" == ASTRA_API_PORT && "$owner" == astra-server ]]; then
-            choose "Resolve the API port conflict:" \
-                "Stop the detected source-mode Astra API (PID $pid) and continue" \
-                "Use a different all-in-one API port" \
-                "Exit without further changes"
-            case "$menu_choice" in
-                    1)
-                        stop_detected_api "$pid" "$port" || true
-                        continue
-                        ;;
-                    2)
-                        suggested="$((port + 1))"
-                        read_tcp_port 'New all-in-one API port' "$suggested"
-                        answer="$prompt_value"
-                        set_env_value "$env_key" "$answer"
-                        port="$answer"
-                        continue
-                        ;;
-                    3)
-                        echo "Existing services and data were left unchanged."
-                        exit 0
-                        ;;
-            esac
-        else
-            choose "Resolve the $label port conflict:" \
-                "Use a different $label port" \
-                "Exit and stop the conflicting service yourself"
-            case "$menu_choice" in
-                    1)
-                        suggested="$((port + 1))"
-                        read_tcp_port "New $label port" "$suggested"
-                        answer="$prompt_value"
-                        set_env_value "$env_key" "$answer"
-                        port="$answer"
-                        continue
-                        ;;
-                    2)
-                        echo "Existing services and data were left unchanged."
-                        exit 0
-                        ;;
-            esac
-        fi
-    done
-}
-
-check_host_ports() {
-    ensure_host_port ASTRA_API_PORT "API" api 17001 17001
-    ensure_host_port MEMORIA_PORT "Memoria" memoria 8100 8100
-    ensure_host_port MATRIXONE_PORT "MatrixOne SQL" matrixone 26001 6001
-    ensure_host_port MATRIXONE_DEBUG_HTTP_PORT "MatrixOne debug" matrixone 26060 6060
-    ok "required host ports are available or owned by this stack"
 }
 
 stop_and_exit() {

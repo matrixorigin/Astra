@@ -27,7 +27,7 @@ grep -q 'check_embedding.py' "$script"
 grep -q 'STACK_RECREATE=1' "$script"
 grep -q 'Repair containers and network' "$script"
 grep -q 'Stop services and exit' "$script"
-grep -q 'ensure_host_port ASTRA_API_PORT' "$script"
+grep -q 'ensure_host_port ASTRA_API_PORT' "$identity_helpers"
 grep -q 'admin setup --help' "$script"
 grep -q 'stop_detected_api' "$script"
 grep -q 'guided setup cannot safely edit .env while exported overrides are active' "$script"
@@ -135,7 +135,7 @@ grep -q 'host.docker.internal:host-gateway' "$repo_root/deployment/all-in-one/do
 
 set_env_value() {
     local key="$1" value="$2" temporary target
-    target="${stack_env:-$identity_env}"
+    target="${3:-${stack_env:-$identity_env}}"
     temporary="$target.tmp"
     awk -v key="$key" -v value="$value" '
         BEGIN { updated = 0 }
@@ -144,6 +144,15 @@ set_env_value() {
         END { if (!updated) print key "=" value }
     ' "$target" > "$temporary"
     mv "$temporary" "$target"
+    identity_set_count=$((${identity_set_count:-0} + 1))
+    if [[ -n "${identity_fail_after_set:-}" && "$identity_set_count" == "$identity_fail_after_set" ]]; then
+        {
+            printf '%s\n%s\n' "$stack_env" "$target"
+            print_stack_command stack-down
+            printf '\n'
+        } > "$identity_interrupt_observation"
+        return 1
+    fi
 }
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 warn() { :; }
@@ -151,6 +160,25 @@ ok() { :; }
 die() { exit 41; }
 read_default() { prompt_value="$identity_answer"; }
 choose() { menu_choice="$identity_choice"; }
+read_tcp_port() {
+    prompt_value="${identity_port_answers%% *}"
+    if [[ "$identity_port_answers" == *' '* ]]; then
+        identity_port_answers="${identity_port_answers#* }"
+    else
+        identity_port_answers=""
+    fi
+    identity_port_prompt_count=$((${identity_port_prompt_count:-0} + 1))
+}
+service_owns_host_port() { return 1; }
+listener_pid() { printf '%s' "${identity_listener_pid:-}"; }
+process_name() { printf '%s' "${identity_process_name:-}"; }
+stop_detected_api() { return 1; }
+cleanup_staging_env() {
+    if [[ -n "${stack_staging_env:-}" ]]; then
+        rm -f -- "$stack_staging_env"
+        stack_staging_env=""
+    fi
+}
 port_is_available() {
     [[ "$2" != "${identity_blocked_port:-}" ]] || return 1
     case " ${identity_blocked_ports:-} " in
@@ -187,6 +215,7 @@ python_cmd=python3
 ignored_descriptor="$(isolated_stack_env_path "$repo_root/deployment/all-in-one/.env" astra-0-2-1)"
 [[ "$ignored_descriptor" == "$repo_root/deployment/all-in-one/.env.astra-0-2-1.env" ]]
 git -C "$repo_root" check-ignore -q deployment/all-in-one/.env.astra-0-2-1.env
+git -C "$repo_root" check-ignore -q deployment/all-in-one/.env.astra-0-2-1.env.staging.fixture
 
 parse_model_catalog_state '{"items":[{"name":"inactive-only","is_active":false}]}'
 [[ "$active_model_count" == 0 ]]
@@ -220,6 +249,33 @@ grep -q -- '--file "/.*deployment/all-in-one/docker-compose.yml"' <<< "$compose_
 # Port allocation is staged: a failure after the first allocation leaves the
 # original descriptor byte-for-byte unchanged.
 identity_blocked_ports=""
+
+# Staging never changes the active descriptor. A failure after the first
+# mutation cleans the ignored staging file and leaves recovery pointed at the
+# original installation.
+identity_answer=interrupted
+identity_fail_after_set=1
+identity_set_count=0
+identity_interrupt_observation="$fixture_dir/interrupted.observation"
+if (configure_isolated_stack >/dev/null 2>&1); then
+    echo "interactive setup contract failed: injected staging interruption was accepted" >&2
+    exit 1
+fi
+active_during_staging="$(sed -n '1p' "$identity_interrupt_observation")"
+target_during_staging="$(sed -n '2p' "$identity_interrupt_observation")"
+recovery_during_staging="$(sed -n '3p' "$identity_interrupt_observation")"
+[[ "$active_during_staging" == "$identity_env" ]]
+[[ "$recovery_during_staging" == "make stack-down STACK_ENV=$(printf '%q' "$identity_env")" ]]
+case "$target_during_staging" in
+    "$identity_env.interrupted.env.staging."*) ;;
+    *) echo "interactive setup contract failed: staging descriptor is outside the ignored namespace" >&2; exit 1 ;;
+esac
+if find "$fixture_dir" -name 'identity.env.interrupted.env.staging.*' -print -quit | grep -q .; then
+    echo "interactive setup contract failed: staging descriptor survived failure cleanup" >&2
+    exit 1
+fi
+identity_fail_after_set=""
+identity_set_count=0
 for blocked_port in $(seq 8101 8200); do
     identity_blocked_ports="${identity_blocked_ports}${identity_blocked_ports:+ }${blocked_port}"
 done
@@ -283,6 +339,19 @@ converging_ports="$(env_file_read "$converging_env" ASTRA_API_PORT) $(env_file_r
     exit 1
 }
 stack_env="$identity_env"
+
+# Final preflight rejects duplicate free ports. Selecting the same reserved
+# port once more must reprompt instead of allowing Compose to partially start.
+set_env_value ASTRA_API_PORT 31000
+set_env_value MEMORIA_PORT 31000
+set_env_value MATRIXONE_PORT 31002
+set_env_value MATRIXONE_DEBUG_HTTP_PORT 31003
+identity_choice=1
+identity_port_answers="31000 31001"
+identity_port_prompt_count=0
+check_host_ports >/dev/null
+[[ "$(env_file_read "$identity_env" MEMORIA_PORT)" == 31001 ]]
+[[ "$identity_port_prompt_count" == 2 ]]
 
 set_env_value ASTRA_STACK_NAME requested-name
 set_env_value MATRIXONE_DATA_VOLUME shared-volume

@@ -91,7 +91,7 @@ of output, verifies the complete stack, persists the CLI API URL, shows
 administrator/model status, and optionally delegates admin/model configuration
 to `astra admin setup`. Use `make stack-up` and
 explicit variables for automation. Installation naming, independent volume/log
-paths, and automatic port selection are owned by
+paths, automatic port selection, and final host-port uniqueness checks are owned by
 `scripts/setup/stack_identity.sh` and its contract tests.
 
 `scripts/setup/stack_status.sh` owns the read-only model-catalog projection
