@@ -35,13 +35,22 @@ suggest_isolated_stack_name() {
     printf '%s' "$candidate"
 }
 
+port_is_reserved() {
+    local port="$1" reserved="${2:-}"
+    case " $reserved " in
+        *" $port ") return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 next_available_port() {
-    local bind_address="$1" port="$2" last_port
+    local bind_address="$1" port="$2" last_port reserved="${3:-}"
     port=$((10#$port))
     last_port=$((port + 99))
     ((last_port > 65535)) && last_port=65535
     while ((port <= last_port)); do
-        if port_is_available "$bind_address" "$port"; then
+        if ! port_is_reserved "$port" "$reserved" &&
+            port_is_available "$bind_address" "$port"; then
             printf '%s' "$port"
             return 0
         fi
@@ -52,10 +61,15 @@ next_available_port() {
 
 configure_isolated_stack() {
     local suggested name bind_address key current default port
+    local old_stack_env env_dir env_prefix isolated_env temporary_env
+    local reserved_ports="" selected_ports=""
     suggested="$(suggest_isolated_stack_name)"
     echo
     echo "A separate installation keeps the existing containers and data untouched."
     echo "Setup will create a new MatrixOne volume and choose unused local ports."
+    old_stack_env="$stack_env"
+    env_dir="${stack_env%/*}"
+    env_prefix="${stack_env%.env}"
     while true; do
         read_default "Name for the separate installation" "$suggested"
         name="$(lower "$prompt_value")"
@@ -65,17 +79,14 @@ configure_isolated_stack() {
                 continue
                 ;;
         esac
-        if project_name_exists "$name" || volume_name_exists "${name}-matrixone-data"; then
+        isolated_env="${env_prefix}.${name}.env"
+        if project_name_exists "$name" || volume_name_exists "${name}-matrixone-data" ||
+            [[ -e "$isolated_env" ]]; then
             warn "an installation or retained data named '$name' already exists"
             continue
         fi
         break
     done
-
-    set_env_value ASTRA_STACK_NAME "$name"
-    set_env_value MATRIXONE_DATA_VOLUME "${name}-matrixone-data"
-    set_env_value MATRIXONE_LOG_DIR "./data/stacks/${name}/matrixone/logs"
-    set_env_value MEMORIA_LOG_DIR "./data/stacks/${name}/memoria/logs"
 
     bind_address="$(env_file_read "$stack_env" ASTRA_BIND_ADDRESS 2>/dev/null || true)"
     bind_address="${bind_address:-127.0.0.1}"
@@ -91,15 +102,57 @@ configure_isolated_stack() {
         case "$current" in
             ''|*[!0-9]*|0) die "$key must be a valid TCP port before creating a separate installation" ;;
         esac
-        port="$(next_available_port "$bind_address" "$((10#$current + 1))")" ||
+        port="$(next_available_port "$bind_address" "$((10#$current + 1))" "$reserved_ports")" ||
             die "no unused TCP port was found in the next 100 ports after $current for $key"
-        set_env_value "$key" "$port"
+        selected_ports="${selected_ports}${selected_ports:+ }$port"
+        reserved_ports="${reserved_ports}${reserved_ports:+ }$port"
     done
+
+    # Build the complete descriptor in a sibling temporary file. The current
+    # descriptor remains the source of truth until every value has been
+    # validated and written, so an allocation or filesystem failure is safe to
+    # retry and cannot strand the existing installation.
+    temporary_env="$(mktemp "${env_dir}/.stack-setup.XXXXXX")" ||
+        die "could not stage the separate installation descriptor"
+    chmod 600 "$temporary_env"
+    if ! cp "$old_stack_env" "$temporary_env"; then
+        rm -f "$temporary_env"
+        die "could not copy the existing installation descriptor"
+    fi
+    stack_env="$temporary_env"
+    if ! set_env_value ASTRA_STACK_NAME "$name" ||
+        ! set_env_value MATRIXONE_DATA_VOLUME "${name}-matrixone-data" ||
+        ! set_env_value MATRIXONE_LOG_DIR "./data/stacks/${name}/matrixone/logs" ||
+        ! set_env_value MEMORIA_LOG_DIR "./data/stacks/${name}/memoria/logs"; then
+        stack_env="$old_stack_env"
+        rm -f "$temporary_env"
+        die "could not stage the separate installation descriptor"
+    fi
+    for key in ASTRA_API_PORT MEMORIA_PORT MATRIXONE_PORT MATRIXONE_DEBUG_HTTP_PORT; do
+        port="${selected_ports%% *}"
+        selected_ports="${selected_ports#* }"
+        [[ "$selected_ports" == "$port" ]] && selected_ports=""
+        if ! set_env_value "$key" "$port"; then
+            stack_env="$old_stack_env"
+            rm -f "$temporary_env"
+            die "could not stage the separate installation descriptor"
+        fi
+    done
+    if ! mv "$temporary_env" "$isolated_env"; then
+        stack_env="$old_stack_env"
+        rm -f "$temporary_env"
+        die "could not activate the separate installation descriptor"
+    fi
+    if [[ -z "${stack_original_env:-}" ]]; then
+        stack_original_env="$old_stack_env"
+    fi
+    stack_env="$isolated_env"
 
     echo "  New installation: $name"
     echo "  New data volume:  ${name}-matrixone-data"
     echo "  API port:         $(env_file_read "$stack_env" ASTRA_API_PORT)"
-    ok "separate installation configured; the existing installation was not changed"
+    echo "  Env file:         $stack_env"
+    ok "separate installation staged atomically; the existing installation descriptor and data were not changed"
 }
 
 ensure_data_volume_is_not_shared() {
@@ -113,12 +166,20 @@ ensure_data_volume_is_not_shared() {
             die "ASTRA_STACK_NAME must start with a lowercase letter or number and contain only lowercase letters, numbers, hyphens, or underscores"
             ;;
     esac
-    owner="$(docker volume inspect --format '{{index .Labels "com.docker.compose.project"}}' "$volume_name" 2>/dev/null || true)"
-    if [[ -z "$owner" || "$owner" == '<no value>' || "$owner" == "$stack_name" ]]; then
+    if ! docker volume inspect "$volume_name" >/dev/null 2>&1; then
         return 0
     fi
 
-    warn "MatrixOne volume '$volume_name' belongs to the existing '$owner' installation"
+    owner="$(docker volume inspect --format '{{index .Labels "com.docker.compose.project"}}' "$volume_name" 2>/dev/null || true)"
+    if [[ "$owner" == "$stack_name" ]]; then
+        return 0
+    fi
+
+    if [[ -z "$owner" || "$owner" == '<no value>' ]]; then
+        warn "MatrixOne volume '$volume_name' already exists but has no trusted Compose owner"
+    else
+        warn "MatrixOne volume '$volume_name' belongs to the existing '$owner' installation"
+    fi
     choose "Using it from '$stack_name' could fail or produce unexpected data. What should setup do?" \
         "Create a separate installation with new data and unused ports" \
         "Exit without starting or changing containers"

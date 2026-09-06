@@ -77,10 +77,15 @@ if [[ -n "$setup_overrides" ]]; then
 fi
 
 compose() {
+    local project_name
+    project_name="$(env_file_read "$stack_env" ASTRA_STACK_NAME 2>/dev/null || true)"
+    project_name="${project_name:-all-in-one}"
     (
         cd "$stack_dir"
-        env UID="$(id -u)" GID="$(id -g)" ASTRA_STACK_ENV_FILE="$stack_env" \
-            docker compose --env-file "$stack_env" "$@"
+        env -u COMPOSE_PROJECT_NAME -u COMPOSE_FILE \
+            UID="$(id -u)" GID="$(id -g)" ASTRA_STACK_ENV_FILE="$stack_env" \
+            docker compose --project-name "$project_name" \
+            --file "$stack_dir/docker-compose.yml" --env-file "$stack_env" "$@"
     )
 }
 
@@ -650,9 +655,185 @@ verify_stack() {
     done
 }
 
+# Inspect server-side setup without printing credentials. This is deliberately
+# a read-only status probe: setup can be rerun for a healthy stack and will
+# explain exactly which user-layer pieces are still missing.
+admin_model_state() {
+    local whoami_json model_json model_summary
+    admin_state="not configured"
+    admin_identity=""
+    active_model_count=0
+    inactive_model_count=0
+    active_model_names=""
+    inactive_model_names=""
+
+    if ASTRA_API_URL="$ASTRA_API_URL" "$cli" admin config list >/dev/null 2>&1; then
+        admin_state="ready"
+        whoami_json="$(ASTRA_API_URL="$ASTRA_API_URL" "$cli" admin whoami 2>/dev/null || true)"
+        admin_identity="$("$python_cmd" -c '
+import json
+import sys
+
+try:
+    value = json.loads(sys.argv[1])
+except (IndexError, json.JSONDecodeError):
+    raise SystemExit(0)
+if isinstance(value, dict):
+    identity = value.get("username") or value.get("email") or value.get("user_id")
+    if isinstance(identity, str) and identity.strip():
+        print(identity.strip())
+' "$whoami_json" 2>/dev/null || true)"
+    else
+        # A non-admin account may still be useful for a later login, but it
+        # cannot complete this wizard's server-wide model configuration.
+        whoami_json="$(ASTRA_API_URL="$ASTRA_API_URL" "$cli" admin whoami 2>/dev/null || true)"
+        if [[ -n "$whoami_json" ]]; then
+            admin_state="signed in (admin role not verified)"
+        fi
+        return 0
+    fi
+
+    model_json="$(ASTRA_API_URL="$ASTRA_API_URL" "$cli" admin model list 2>/dev/null || true)"
+    [[ -n "$model_json" ]] || return 0
+    model_summary="$("$python_cmd" -c '
+import json
+import sys
+
+try:
+    value = json.loads(sys.argv[1])
+except (IndexError, json.JSONDecodeError):
+    raise SystemExit(0)
+items = value.get("items", []) if isinstance(value, dict) else value
+if not isinstance(items, list):
+    raise SystemExit(0)
+active = []
+inactive = []
+for item in items:
+    if not isinstance(item, dict):
+        continue
+    name = item.get("name")
+    if not isinstance(name, str) or not name.strip():
+        continue
+    (active if item.get("is_active") is True else inactive).append(name.strip())
+print("\t".join((str(len(active)), str(len(inactive)), ", ".join(sorted(set(active))), ", ".join(sorted(set(inactive))))))
+' "$model_json" 2>/dev/null || true)"
+    if [[ -n "$model_summary" ]]; then
+        IFS=$'\t' read -r active_model_count inactive_model_count active_model_names inactive_model_names <<< "$model_summary"
+    fi
+}
+
+show_setup_state() {
+    local chat_state
+    admin_model_state
+    echo
+    echo "Current installation status"
+    echo "  Infrastructure: ready (API $ASTRA_API_URL; dependencies and memory verified)"
+    if [[ "$admin_state" == ready ]]; then
+        if [[ -n "$admin_identity" ]]; then
+            echo "  Administrator:  ready ($admin_identity)"
+        else
+            echo "  Administrator:  ready (authenticated admin profile)"
+        fi
+    else
+        echo "  Administrator:  $admin_state"
+    fi
+    if ((active_model_count > 0)); then
+        echo "  Models:          $active_model_count active${active_model_names:+ ($active_model_names)}"
+    else
+        echo "  Models:          no active model"
+    fi
+    if ((inactive_model_count > 0)); then
+        echo "                   $inactive_model_count inactive${inactive_model_names:+ ($inactive_model_names)}"
+    fi
+    if [[ "$admin_state" == ready && "$active_model_count" -gt 0 ]]; then
+        chat_state="configured (provider connectivity will be checked before completion)"
+    else
+        chat_state="incomplete"
+    fi
+    echo "  Chat:             $chat_state"
+}
+
+save_cli_api_url() {
+    cli_api_prefix=""
+    if "$cli" config set api_url "$ASTRA_API_URL" >/dev/null 2>&1; then
+        ok "saved this installation as the CLI default"
+    else
+        warn "could not save the API URL in CLI settings"
+        warn "prefix CLI commands with ASTRA_API_URL=$ASTRA_API_URL"
+        printf -v cli_api_prefix 'ASTRA_API_URL=%q ' "$ASTRA_API_URL"
+    fi
+}
+
+finish_infrastructure_only() {
+    echo
+    printf '\033[1;32mAstra stack is ready.\033[0m\n'
+    echo "  API:   $ASTRA_API_URL"
+    if [[ "${admin_state:-not configured}" == ready ]]; then
+        echo "  Admin: administrator is ready; existing chat settings were kept"
+    else
+        echo "  Admin: not configured or not verified in this run"
+    fi
+    if (( ${active_model_count:-0} > 0 )); then
+        echo "  Model: ${active_model_count} active model(s) present; connectivity was not rechecked"
+    else
+        echo "  Model: no active model configured"
+    fi
+    echo "  Resume: ${cli_api_prefix}${cli} admin setup"
+    echo "  TUI:   ${cli_api_prefix}${cli}"
+    echo "  Health: ${cli_api_prefix}${cli} health"
+    if [[ -n "${stack_original_env:-}" ]]; then
+        echo "  Existing installation descriptor kept at: $stack_original_env"
+        echo "  Manage this installation with: STACK_ENV=$stack_env make stack-status"
+    fi
+    echo
+    echo "Chat is not ready until an administrator and an active model are configured."
+    exit 0
+}
+
+run_admin_model_setup() {
+    while true; do
+        if "$cli" admin setup; then
+            return 0
+        fi
+        warn "services are healthy, but administrator/model setup did not complete"
+        printf '  Resume without restarting services: %s%q admin setup\n' \
+            "$cli_api_prefix" "$cli" >&2
+        choose "Choose how to continue:" \
+            "Retry administrator and model setup" \
+            "Finish the stack now and configure chat later" \
+            "Exit with an error for inspection"
+        case "$menu_choice" in
+            1) continue ;;
+            2) finish_infrastructure_only ;;
+            3) return 1 ;;
+        esac
+    done
+}
+
+choose_admin_model_action() {
+    if [[ "$admin_state" == ready && "$active_model_count" -gt 0 ]]; then
+        choose "Administrator and model state is already present. What should setup do?" \
+            "Verify the existing administrator and model (recommended)" \
+            "Reconfigure administrator or model" \
+            "Finish the stack and leave chat settings unchanged"
+        case "$menu_choice" in
+            1|2) return 0 ;;
+            3) finish_infrastructure_only ;;
+        esac
+    else
+        choose "Chat setup is incomplete. What should setup do?" \
+            "Configure administrator and model now (recommended)" \
+            "Finish the stack and configure chat later"
+        case "$menu_choice" in
+            1) return 0 ;;
+            2) finish_infrastructure_only ;;
+        esac
+    fi
+}
+
 echo
 printf '\033[1;36mAstra local setup\033[0m\n'
-echo "A guided setup for one local installation, memory, administrator, and model."
+echo "A guided setup for one local installation, memory, and optional chat configuration."
 echo "No persistent data is removed by this wizard. Secrets are never displayed."
 
 cli="$(resolve_cli)"
@@ -712,28 +893,19 @@ step "4/5" "Verifying the complete runtime"
 verify_stack
 ok "readiness, dependencies, and embedding memory round trip passed"
 
-step "5/5" "Configuring administrator and model"
+step "5/5" "Reviewing optional administrator and model setup"
 api_port="$(env_resolve_value "$stack_env" ASTRA_API_PORT 2>/dev/null || true)"
 bind_address="$(env_resolve_value "$stack_env" ASTRA_BIND_ADDRESS 2>/dev/null || true)"
 api_host="$(env_http_host_from_bind "$bind_address")"
 export ASTRA_API_URL="http://${api_host}:${api_port:-17001}"
 echo "  Model requests originate inside Docker. For a model server on this host,"
 echo "  use http://host.docker.internal:<port> instead of localhost."
-if ! "$cli" admin setup; then
-    warn "services are healthy, but administrator/model setup did not complete"
-    printf '  Resume without restarting services: ASTRA_API_URL=%q %q admin setup\n' \
-        "$ASTRA_API_URL" "$cli" >&2
-    exit 1
-fi
-
-cli_api_prefix=""
-if "$cli" config set api_url "$ASTRA_API_URL"; then
-    ok "saved this installation as the CLI default"
-else
-    warn "could not save the API URL in CLI settings"
-    warn "until that is fixed, prefix CLI commands with ASTRA_API_URL=$ASTRA_API_URL"
-    printf -v cli_api_prefix 'ASTRA_API_URL=%q ' "$ASTRA_API_URL"
-fi
+save_cli_api_url
+show_setup_state
+choose_admin_model_action
+echo
+echo "Continuing with administrator and model verification..."
+run_admin_model_setup
 
 echo
 printf '\033[1;32mAstra is ready.\033[0m\n'
@@ -741,3 +913,8 @@ echo "  API:  $ASTRA_API_URL"
 echo "  TUI:  ${cli_api_prefix}${cli}"
 echo "  One-shot: ${cli_api_prefix}${cli} chat -m \"Hello Astra\""
 echo "  Edge: astra-edge --help (connect a local runner when private tools are needed)"
+if [[ -n "${stack_original_env:-}" ]]; then
+    echo "  Env:  $stack_env"
+    echo "  Existing installation descriptor kept at: $stack_original_env"
+    echo "  Manage this installation: STACK_ENV=$stack_env make stack-status"
+fi

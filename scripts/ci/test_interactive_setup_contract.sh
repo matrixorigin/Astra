@@ -15,7 +15,7 @@ grep -q '^stack-setup:' "$makefile"
 grep -q '^stack-start: stack-env' "$makefile"
 grep -q '@$(MAKE) stack-up' "$makefile"
 grep -q '@$(MAKE) stack-verify' "$makefile"
-grep -q 'Next: astra admin setup' "$makefile"
+grep -q 'Next: make stack-setup' "$makefile"
 grep -q 'make --no-print-directory stack-env' "$script"
 grep -q 'make --no-print-directory stack-up' "$script"
 grep -q 'make --no-print-directory stack-verify' "$script"
@@ -34,8 +34,17 @@ grep -q 'MEMORIA_EMBEDDING_ENDPOINTS is configured' "$script"
 grep -q 'Choose the intended outcome' "$script"
 grep -q 'Create a separate installation' "$script"
 grep -q 'compose --dry-run up' "$script"
+grep -q -- '--project-name "$project_name"' "$script"
+grep -q -- '--file "$stack_dir/docker-compose.yml"' "$script"
+grep -q 'env -u COMPOSE_PROJECT_NAME -u COMPOSE_FILE' "$script"
+grep -q -- '--project-name "$$project_name"' "$makefile"
+grep -q -- '--file "$(abspath $(STACK_DIR)/docker-compose.yml)"' "$makefile"
 grep -q 'Docker Compose is too old for safe change planning' "$script"
 grep -q 'config set api_url' "$script"
+grep -q 'Current installation status' "$script"
+grep -q 'Finish the stack and configure chat later' "$script"
+grep -q 'Chat is not ready until an administrator and an active model are configured' "$script"
+grep -q 'admin_model_state' "$script"
 grep -q 'TUI:.*cli_api_prefix' "$script"
 grep -q 'Resume without restarting services' "$script"
 grep -q 'Edge: astra-edge --help' "$script"
@@ -121,15 +130,16 @@ grep -q 'ASTRA_STACK_ENV_FILE' "$repo_root/deployment/all-in-one/docker-compose.
 grep -q 'host.docker.internal:host-gateway' "$repo_root/deployment/all-in-one/docker-compose.yml"
 
 set_env_value() {
-    local key="$1" value="$2" temporary
-    temporary="$identity_env.tmp"
+    local key="$1" value="$2" temporary target
+    target="${stack_env:-$identity_env}"
+    temporary="$target.tmp"
     awk -v key="$key" -v value="$value" '
         BEGIN { updated = 0 }
         $0 ~ "^" key "=" { print key "=" value; updated = 1; next }
         { print }
         END { if (!updated) print key "=" value }
-    ' "$identity_env" > "$temporary"
-    mv "$temporary" "$identity_env"
+    ' "$target" > "$temporary"
+    mv "$temporary" "$target"
 }
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 warn() { :; }
@@ -137,7 +147,13 @@ ok() { :; }
 die() { exit 41; }
 read_default() { prompt_value="$identity_answer"; }
 choose() { menu_choice="$identity_choice"; }
-port_is_available() { [[ "$2" != "${identity_blocked_port:-}" ]]; }
+port_is_available() {
+    [[ "$2" != "${identity_blocked_port:-}" ]] || return 1
+    case " ${identity_blocked_ports:-} " in
+        *" $2 "*) return 1 ;;
+    esac
+    return 0
+}
 docker() {
     local arg filter=""
     if [[ "${1:-}" == ps ]]; then
@@ -177,6 +193,29 @@ suggestion="$(suggest_isolated_stack_name)"
     exit 1
 }
 
+# A process-level project override must not redirect the management commands.
+compose_preview="$(COMPOSE_PROJECT_NAME=all-in-one make --no-print-directory -n stack-status STACK_ENV="$identity_env")"
+grep -q -- '--project-name "$project_name"' <<< "$compose_preview"
+grep -q -- '--file "/.*deployment/all-in-one/docker-compose.yml"' <<< "$compose_preview"
+
+# Port allocation is staged: a failure after the first allocation leaves the
+# original descriptor byte-for-byte unchanged.
+identity_blocked_ports=""
+for blocked_port in $(seq 8101 8200); do
+    identity_blocked_ports="${identity_blocked_ports}${identity_blocked_ports:+ }${blocked_port}"
+done
+identity_answer=atomic-failure
+before_identity_env="$(cksum < "$identity_env")"
+if (configure_isolated_stack >/dev/null 2>&1); then
+    echo "interactive setup contract failed: mid-allocation failure was accepted" >&2
+    exit 1
+fi
+[[ "$(cksum < "$identity_env")" == "$before_identity_env" ]] || {
+    echo "interactive setup contract failed: failed allocation changed the original env" >&2
+    exit 1
+}
+identity_blocked_ports=""
+
 identity_existing_project=""
 identity_existing_volume=astra-0-2-1-matrixone-data
 suggestion="$(suggest_isolated_stack_name)"
@@ -189,11 +228,30 @@ identity_existing_volume=""
 identity_answer=journey-test
 identity_blocked_port=17002
 configure_isolated_stack >/dev/null
-[[ "$(env_file_read "$identity_env" ASTRA_STACK_NAME)" == journey-test ]]
-[[ "$(env_file_read "$identity_env" MATRIXONE_DATA_VOLUME)" == journey-test-matrixone-data ]]
-[[ "$(env_file_read "$identity_env" MATRIXONE_LOG_DIR)" == ./data/stacks/journey-test/matrixone/logs ]]
-[[ "$(env_file_read "$identity_env" ASTRA_API_PORT)" == 17003 ]]
-[[ "$(env_file_read "$identity_env" MEMORIA_PORT)" == 8101 ]]
+isolated_env="$stack_env"
+[[ "$(env_file_read "$isolated_env" ASTRA_STACK_NAME)" == journey-test ]]
+[[ "$(env_file_read "$isolated_env" MATRIXONE_DATA_VOLUME)" == journey-test-matrixone-data ]]
+[[ "$(env_file_read "$isolated_env" MATRIXONE_LOG_DIR)" == ./data/stacks/journey-test/matrixone/logs ]]
+[[ "$(env_file_read "$isolated_env" ASTRA_API_PORT)" == 17003 ]]
+[[ "$(env_file_read "$isolated_env" MEMORIA_PORT)" == 8101 ]]
+[[ "$(env_file_read "$identity_env" ASTRA_STACK_NAME)" == all-in-one ]]
+stack_env="$identity_env"
+
+# The allocator must reserve ports selected earlier in the same pass.
+set_env_value ASTRA_API_PORT 20000
+set_env_value MEMORIA_PORT 20001
+set_env_value MATRIXONE_PORT 20002
+set_env_value MATRIXONE_DEBUG_HTTP_PORT 20003
+identity_answer=converging-test
+identity_blocked_port=20001
+configure_isolated_stack >/dev/null
+converging_env="$stack_env"
+converging_ports="$(env_file_read "$converging_env" ASTRA_API_PORT) $(env_file_read "$converging_env" MEMORIA_PORT) $(env_file_read "$converging_env" MATRIXONE_PORT) $(env_file_read "$converging_env" MATRIXONE_DEBUG_HTTP_PORT)"
+[[ "$(printf '%s\n' $converging_ports | sort -u | wc -l | tr -d ' ')" == 4 ]] || {
+    echo "interactive setup contract failed: selected ports were not unique" >&2
+    exit 1
+}
+stack_env="$identity_env"
 
 set_env_value ASTRA_STACK_NAME requested-name
 set_env_value MATRIXONE_DATA_VOLUME shared-volume
@@ -202,8 +260,25 @@ identity_choice=1
 identity_answer=journey-recovered
 identity_blocked_port=""
 ensure_data_volume_is_not_shared >/dev/null
-[[ "$(env_file_read "$identity_env" ASTRA_STACK_NAME)" == journey-recovered ]]
-[[ "$(env_file_read "$identity_env" MATRIXONE_DATA_VOLUME)" == journey-recovered-matrixone-data ]]
+recovered_env="$stack_env"
+[[ "$(env_file_read "$recovered_env" ASTRA_STACK_NAME)" == journey-recovered ]]
+[[ "$(env_file_read "$recovered_env" MATRIXONE_DATA_VOLUME)" == journey-recovered-matrixone-data ]]
+[[ "$(env_file_read "$identity_env" ASTRA_STACK_NAME)" == requested-name ]]
+stack_env="$identity_env"
+
+# An existing volume without a trusted owner label is also unsafe; it must not
+# be silently attached to the selected installation.
+set_env_value ASTRA_STACK_NAME requested-name
+set_env_value MATRIXONE_DATA_VOLUME unlabeled-volume
+identity_existing_volume=unlabeled-volume
+identity_volume_owner=""
+identity_choice=1
+identity_answer=unlabeled-recovered
+ensure_data_volume_is_not_shared >/dev/null
+unlabeled_env="$stack_env"
+[[ "$(env_file_read "$unlabeled_env" MATRIXONE_DATA_VOLUME)" == unlabeled-recovered-matrixone-data ]]
+stack_env="$identity_env"
+identity_existing_volume=""
 
 set_env_value ASTRA_STACK_NAME 'Invalid Name'
 identity_volume_owner=""

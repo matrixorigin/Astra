@@ -30,17 +30,23 @@ From the repository root, the recommended first-run path is guided:
 make stack-setup
 ```
 
-The guided path first identifies the installation the user intends to change.
-When an older or differently configured stack exists, it offers an explicit
-update, a separate installation with independent containers, data, logs, and
-ports, or a no-change exit. It then tests the embedding endpoint, credentials,
-model, and dimension, reuses or repairs services, verifies a memory round trip,
-and launches `astra admin setup`. Startup failures offer repair/retry,
-stop-and-preserve, and leave-for-inspection choices. API keys are hidden and the
-local `.env` is owner-only. The final API address is saved in CLI settings, and
-the completion screen leads with the `astra` TUI. The released clients and full
-guided path support Linux, macOS, and Windows through WSL. Native Windows and
-Git Bash are not release targets yet.
+The guided path first identifies the installation the user intends to change
+and prints its current status. When an older or differently configured stack
+exists, it offers an explicit update, a separate installation with independent
+containers, data, logs, and ports, or a no-change exit. It then tests the
+embedding endpoint, credentials, model, and dimension, reuses or repairs
+services, and verifies a memory round trip. Administrator/model setup is
+optional: the recommended path launches `astra admin setup`, while skipping it
+finishes the stack and prints a resumable command. The summary distinguishes
+`Stack ready` from `Chat ready`. Startup failures offer repair/retry,
+stop-and-preserve, and leave-for-inspection choices. API keys are hidden and
+the local `.env` is owner-only. The API address is saved before the optional
+step, and the completion screen leads with the `astra` TUI. The released
+clients and full guided path support Linux, macOS, and Windows through WSL.
+Native Windows and Git Bash are not release targets yet.
+Separate installations use sibling descriptors (for example
+`.env.astra-0-2-1.env`) so the original `.env` remains usable. Pass the selected
+file explicitly when managing one: `STACK_ENV=deployment/all-in-one/.env.astra-0-2-1.env make stack-status`.
 Loopback embedding probes bypass HTTP proxies; other endpoints honor the host
 proxy configuration and suggest `NO_PROXY` when a private URL is intercepted.
 

@@ -225,17 +225,20 @@ cd "Astra-${ASTRA_VERSION}"
 make stack-setup
 ```
 
-The guided setup first identifies the intended local installation. If an older
-or differently configured stack exists, you explicitly choose whether to
-update it, create a separate installation with its own data and ports, or leave
-it untouched. It then validates the embedding endpoint, credentials, model,
-and vector dimension before starting containers. Healthy services are reused;
-partial services get explicit repair, stop, and inspect choices.
+The guided setup first identifies the intended local installation and prints a
+status snapshot on every run. If an older or differently configured stack
+exists, you explicitly choose whether to update it, create a separate
+installation with its own data and ports, or leave it untouched. It then
+validates the embedding endpoint, credentials, model, and vector dimension
+before starting containers. Healthy services are reused; partial services get
+explicit repair, stop, and inspect choices.
 API keys are hidden while typing and the local `.env` is owner-only. Choose mock
 embeddings for deterministic evaluation; use a real OpenAI-compatible endpoint
 for production retrieval. Mock embeddings do not provide an LLM: the model step
-still needs a supported hosted or local model endpoint. The wizard never
-deletes persistent volumes and saves the selected API URL for later CLI runs.
+still needs a supported hosted or local model endpoint. Administrator/model
+setup is optional: choose to finish the infrastructure and resume it later.
+The wizard distinguishes `Stack ready` from `Chat ready`, never deletes
+persistent volumes, and saves the selected API URL for later CLI runs.
 The released clients and full guided path support Linux, macOS, and Windows
 through WSL. Native Windows and Git Bash are not release targets yet.
 

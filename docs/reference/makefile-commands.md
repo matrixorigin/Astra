@@ -53,7 +53,7 @@
 | Command | Description |
 | --- | --- |
 | `make stack-env` | Create deployment environment files and generate local secrets |
-| `make stack-start` | Start the published all-in-one stack, wait for health, and print the next CLI steps |
+| `make stack-start` | Start the published all-in-one stack, wait for health, and point to `make stack-setup` for the guided continuation |
 | `make stack-up` | Start or resume the configured stack without running the guided verification |
 | `make stack-verify` | Check stack health and run a memory round trip |
 | `make stack-down` | Stop the stack while preserving its data |
@@ -90,7 +90,7 @@ dependency data; that command prompts before deletion.
 
 | Command | Description |
 | --- | --- |
-| `make stack-setup` | Guided installation selection, embedding preflight, data-preserving reconciliation, runtime verification, admin/model probe, and CLI endpoint setup |
+| `make stack-setup` | Single guided setup from any local stack state: installation selection, embedding preflight, data-preserving reconciliation, runtime verification, status snapshot, and optional admin/model setup |
 | `make stack-start` | Non-interactively initialize configuration, start the stack, and verify health plus a memory round trip |
 | `make stack-env` | Create local `.env` and generate secrets without prompting |
 | `make stack-up` | Start the configured Compose stack |

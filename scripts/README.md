@@ -87,8 +87,9 @@ Runs the human-facing first-run flow behind `make stack-setup`. It validates the
 intended installation before asking for provider configuration, validates the
 embedding endpoint before startup, inventories current Compose state, and gives
 explicit update/separate/leave and retry/stop/inspect choices. It keeps keys out
-of output, verifies the complete stack, persists the CLI API URL, and delegates
-admin/model configuration to `astra admin setup`. Use `make stack-up` and
+of output, verifies the complete stack, persists the CLI API URL, shows
+administrator/model status, and optionally delegates admin/model configuration
+to `astra admin setup`. Use `make stack-up` and
 explicit variables for automation. Installation naming, independent volume/log
 paths, and automatic port selection are owned by
 `scripts/setup/stack_identity.sh` and its contract tests.

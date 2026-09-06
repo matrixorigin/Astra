@@ -97,7 +97,7 @@ help:
 	@echo ""
 	@echo "All-in-One Docker Deployment:"
 	@echo "  make stack-env          - Create .env and generate stack secrets"
-	@echo "  make stack-setup        - Interactive first-run setup (embedding, admin, model)"
+	@echo "  make stack-setup        - Complete guided setup from any stack state (admin/model optional)"
 	@echo "  make stack-start        - Initialize, start, and verify the Compose stack"
 	@echo "  make stack-up           - Start MatrixOne + Memoria + API"
 	@echo "  make stack-up-server-only - Start compose stack without local edge provider"
@@ -145,7 +145,10 @@ DOCKER_METADATA_BUILD_ARGS := --build-arg IMAGE_VERSION=$(IMAGE_VERSION) --build
 DEFAULT_API_PORT := 17001
 STACK_DIR := deployment/all-in-one
 STACK_ENV := $(STACK_DIR)/.env
-STACK_COMPOSE := cd $(STACK_DIR) && env UID=$$(id -u) GID=$$(id -g) ASTRA_STACK_ENV_FILE="$(abspath $(STACK_ENV))" docker compose --env-file "$(abspath $(STACK_ENV))"
+# Always resolve the Compose project from the selected env file. Explicit
+# --project-name/--file plus clearing the two process-level overrides keeps
+# stack-setup's isolation decision authoritative even in a user's shell.
+STACK_COMPOSE := cd $(STACK_DIR) && project_name="$$(. "$(abspath scripts/lib/env_file.sh)"; env_file_read "$(abspath $(STACK_ENV))" ASTRA_STACK_NAME 2>/dev/null || true)"; project_name="$${project_name:-all-in-one}"; env -u COMPOSE_PROJECT_NAME -u COMPOSE_FILE UID=$$(id -u) GID=$$(id -g) ASTRA_STACK_ENV_FILE="$(abspath $(STACK_ENV))" docker compose --project-name "$$project_name" --file "$(abspath $(STACK_DIR)/docker-compose.yml)" --env-file "$(abspath $(STACK_ENV))"
 STACK_SECRET_ENV := ASTRA_JWT_SECRET ASTRA_TOKEN_ENCRYPTION_KEY ASTRA_RUNTIME_ROOT_SECRET MEMORIA_MASTER_KEY
 STACK_EMBEDDING_ENV := MEMORIA_EMBEDDING_BASE_URL
 STACK_RECREATE ?= 0
@@ -679,7 +682,7 @@ stack-start: stack-env
 	@$(MAKE) stack-verify
 	@echo ""
 	@echo "✅ Astra local stack is ready"
-	@echo "   Next: astra admin setup"
+	@echo "   Next: make stack-setup (resume guided status and optional chat setup)"
 	@echo "   Try:  astra chat -m \"Explain what you can do in this deployment\""
 
 .PHONY: stack-up

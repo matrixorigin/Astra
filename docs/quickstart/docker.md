@@ -27,14 +27,22 @@ astra
 astra chat -m "Explain what you can and cannot do in this deployment"
 ```
 
-`make stack-setup` first asks what should happen when an older or differently
-configured installation exists: update it while preserving data, create a
-separate installation with new data and automatically selected ports, or leave
-it unchanged. It then validates a mock or real embedding configuration, starts
-and verifies the services, proves a real memory round trip, and runs `astra
-admin setup`. It never deletes volumes. Failures offer retry, stop-and-preserve,
-or leave-for-inspection actions. Finally, it saves the chosen API URL in CLI
-settings so both `astra` and one-shot commands keep working after a port change.
+`make stack-setup` is the single guided entry point and is safe to rerun from
+any local stack state. It first prints the current installation status, then
+offers update-with-data-preserved, separate-installation, or leave-unchanged
+choices when needed. It validates a mock or real embedding configuration,
+starts and verifies the services, and proves a real memory round trip. The
+administrator/model part is optional: the default continues into `astra admin
+setup`, while an explicit skip finishes the infrastructure and prints the
+exact resume command. The summary distinguishes `Stack ready` from `Chat
+ready`. It never deletes volumes; failures offer retry, stop-and-preserve, or
+leave-for-inspection actions. The selected API URL is saved before the optional
+step so a later retry does not require restarting services.
+When a separate installation is selected, setup writes a sibling env file such
+as `deployment/all-in-one/.env.astra-0-2-1.env` and keeps the original
+descriptor addressable. Manage that installation explicitly with
+`STACK_ENV=deployment/all-in-one/.env.astra-0-2-1.env make stack-status` (and
+the same prefix for `stack-logs` or `stack-down`).
 For CI or scripts, use explicit `make stack-env`, `make stack-up`, and
 `make stack-verify` targets instead.
 
