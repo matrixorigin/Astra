@@ -176,8 +176,10 @@ ensure_host_port() {
             duplicate=true
             warn "$label port $bind_address:$port is already assigned to another service in this stack"
         elif service_owns_host_port "$service" "$port" "$container_port"; then
+            effective_host_port="$port"
             return 0
         elif port_is_available "$bind_address" "$port"; then
+            effective_host_port="$port"
             return 0
         else
             pid="$(listener_pid "$port")"
@@ -239,16 +241,13 @@ ensure_host_port() {
 }
 
 check_host_ports() {
-    local reserved_ports="" port
+    local reserved_ports=""
     ensure_host_port ASTRA_API_PORT "API" api 17001 17001 "$reserved_ports"
-    port="$(env_file_read "$stack_env" ASTRA_API_PORT)"
-    reserved_ports="$port"
+    reserved_ports="$effective_host_port"
     ensure_host_port MEMORIA_PORT "Memoria" memoria 8100 8100 "$reserved_ports"
-    port="$(env_file_read "$stack_env" MEMORIA_PORT)"
-    reserved_ports="${reserved_ports}${reserved_ports:+ }$port"
+    reserved_ports="${reserved_ports}${reserved_ports:+ }$effective_host_port"
     ensure_host_port MATRIXONE_PORT "MatrixOne SQL" matrixone 26001 6001 "$reserved_ports"
-    port="$(env_file_read "$stack_env" MATRIXONE_PORT)"
-    reserved_ports="${reserved_ports}${reserved_ports:+ }$port"
+    reserved_ports="${reserved_ports}${reserved_ports:+ }$effective_host_port"
     ensure_host_port MATRIXONE_DEBUG_HTTP_PORT "MatrixOne debug" matrixone 26060 6060 "$reserved_ports"
     ok "required host ports are unique and available or owned by this stack"
 }

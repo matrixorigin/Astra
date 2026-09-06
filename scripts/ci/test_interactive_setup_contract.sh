@@ -353,6 +353,30 @@ check_host_ports >/dev/null
 [[ "$(env_file_read "$identity_env" MEMORIA_PORT)" == 31001 ]]
 [[ "$identity_port_prompt_count" == 2 ]]
 
+# Missing optional keys use their effective defaults without a failing reread.
+awk '$0 !~ /^ASTRA_API_PORT=/' "$identity_env" > "$identity_env.tmp"
+mv "$identity_env.tmp" "$identity_env"
+set_env_value MEMORIA_PORT 32001
+set_env_value MATRIXONE_PORT 32002
+set_env_value MATRIXONE_DEBUG_HTTP_PORT 32003
+identity_port_answers=""
+identity_port_prompt_count=0
+check_host_ports >/dev/null
+[[ "$effective_host_port" == 32003 ]]
+[[ "$identity_port_prompt_count" == 0 ]]
+
+# Numerically equivalent text is normalized before reservation, so leading
+# zeroes cannot bypass duplicate detection.
+set_env_value ASTRA_API_PORT 031000
+set_env_value MEMORIA_PORT 31000
+set_env_value MATRIXONE_PORT 33002
+set_env_value MATRIXONE_DEBUG_HTTP_PORT 33003
+identity_port_answers="31001"
+identity_port_prompt_count=0
+check_host_ports >/dev/null
+[[ "$(env_file_read "$identity_env" MEMORIA_PORT)" == 31001 ]]
+[[ "$identity_port_prompt_count" == 1 ]]
+
 set_env_value ASTRA_STACK_NAME requested-name
 set_env_value MATRIXONE_DATA_VOLUME shared-volume
 identity_existing_volume=shared-volume
