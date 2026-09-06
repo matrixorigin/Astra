@@ -128,6 +128,18 @@ for invalid_version in 01.0.0 0.1.0-01 0.1.0-rc..1; do
 done
 "${repo_root}/scripts/validate-release-version.sh" \
     0.1.0-rc.1 --syntax-only >/dev/null
+"${repo_root}/scripts/validate-release-version.sh" \
+    0.1.0-rc.1 --root "${repo_root}" --syntax-only >/dev/null
+if "${repo_root}/scripts/validate-release-version.sh" \
+    0.1.0-rc.1 --root "${fixture_root}/missing-source" >/dev/null 2>&1; then
+    echo "release preflight accepted a missing source root" >&2
+    exit 1
+fi
+if "${repo_root}/scripts/validate-release-version.sh" \
+    0.1.0-rc.1 --unknown-option >/dev/null 2>&1; then
+    echo "release preflight accepted an unknown option" >&2
+    exit 1
+fi
 
 # If replacing the second binary fails, the installer must restore the previous
 # matching CLI/Runner pair instead of leaving a mixed installation behind.

@@ -157,9 +157,10 @@ jobs:
             marker_run_id=""
           fi
 
-          git checkout --detach "${source_sha}"
-          scripts/validate-release-version.sh "${version}"
           python3 scripts/ci/validate_repository.py
+          source_dir="${RUNNER_TEMP}/release-source"
+          git worktree add --detach "${source_dir}" "${source_sha}"
+          scripts/validate-release-version.sh "${version}" --root "${source_dir}"
 
           prerelease=false
           publish_latest=true
@@ -246,11 +247,19 @@ jobs:
       - containers
     if: >-
       ${{
-        always() &&
+        !cancelled() &&
         needs.preflight.result == 'success' &&
         (
-          inputs.recover_existing_tag == true ||
-          (needs.clients.result == 'success' && needs.containers.result == 'success')
+          (
+            inputs.recover_existing_tag == true &&
+            needs.clients.result == 'skipped' &&
+            needs.containers.result == 'skipped'
+          ) ||
+          (
+            inputs.recover_existing_tag != true &&
+            needs.clients.result == 'success' &&
+            needs.containers.result == 'success'
+          )
         )
       }}
     runs-on: ubuntu-latest
@@ -273,11 +282,12 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check out the trusted release controller
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ needs.preflight.outputs.source_sha }}
+          ref: ${{ github.sha }}
 
       - name: Download verified client candidates from this run
         if: ${{ inputs.recover_existing_tag != true }}
@@ -520,14 +530,13 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
 
-      - name: Publish GitHub Release
+      - name: Resolve staged GitHub Release ID
         if: ${{ steps.existing_release.outputs.state != 'published' }}
+        id: publish_release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_TAG: ${{ needs.preflight.outputs.source_tag }}
-          PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
-          PUBLISH_LATEST: ${{ needs.preflight.outputs.publish_latest }}
           EXISTING_RELEASE_ID: ${{ steps.existing_release.outputs.release_id }}
           STAGED_RELEASE_ID: ${{ steps.stage_release.outputs.id }}
         run: |
@@ -547,7 +556,31 @@ jobs:
             echo "GitHub Release ${SOURCE_TAG} was staged but its release ID was not discoverable." >&2
             exit 1
           fi
-          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+          echo "release_id=${release_id}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify exact staged GitHub Release assets
+        if: ${{ steps.existing_release.outputs.state != 'published' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          scripts/verify_github_release_assets.py \
+            "${GITHUB_REPOSITORY}" \
+            "${{ steps.publish_release.outputs.release_id }}" \
+            dist
+
+      - name: Publish GitHub Release
+        if: ${{ steps.existing_release.outputs.state != 'published' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: ${{ steps.publish_release.outputs.release_id }}
+          PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
+          PUBLISH_LATEST: ${{ needs.preflight.outputs.publish_latest }}
+        run: |
+          set -euo pipefail
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
             -F draft=false \
             -F prerelease="${PRERELEASE}" \
             -f make_latest="${PUBLISH_LATEST}" >/dev/null

@@ -221,6 +221,13 @@ new build as proof of the old release. If the recorded run or its retained
 candidate artifacts are no longer available, publish a patch version instead
 of weakening ownership checks.
 
+Recovery executes the release controller and verification scripts from the
+workflow revision selected on the protected default branch. The historical tag
+is checked out into a separate source directory for inspection and remains an
+immutable release input, not executable control-plane code. Before a
+draft becomes public, its remote asset names, sizes, upload states, and GitHub
+SHA-256 digests must exactly match the locally verified candidate set.
+
 Client archives use the selected source commit time as `SOURCE_DATE_EPOCH` and
 normalize member order, ownership, modes, paths, and gzip metadata. Rebuilding
 the same binaries for the same source therefore produces byte-identical

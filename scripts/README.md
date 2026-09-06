@@ -238,7 +238,9 @@ Memoria do not silently drift across releases.
 ### `scripts/validate-release-version.sh` and `scripts/verify-release-artifacts.sh`
 The release workflows use these scripts as shared, locally testable gates.
 The first requires every versioned workspace surface, including the default
-all-in-one Astra image, to match the selected release version. The
+all-in-one Astra image, to match the selected release version. Its optional
+`--root <path>` argument lets the trusted release controller inspect a
+historical source worktree without executing scripts from that worktree. The
 second requires the complete four-platform client archive set, verifies every
 checksum and archive layout, and creates the aggregate checksum manifest.
 `scripts/ci/test_release_contract.sh` exercises the success, rollback, and
@@ -248,6 +250,13 @@ Docker-tag creation, exact recovery, and rejection of duplicate platform
 candidates with an offline registry fixture. The shared
 `scripts/reconcile-docker-manifest.sh` performs the same platform-to-digest
 reconciliation at the actual publication boundary.
+
+### `scripts/verify_github_release_assets.py`
+
+Before a draft GitHub Release becomes public, this gate requires the remote
+asset set to match the locally verified files exactly by name, byte size,
+upload state, and GitHub SHA-256 digest. Missing, additional, incomplete, and
+changed assets all fail closed.
 
 ### `scripts/prepare-release-version.py`
 

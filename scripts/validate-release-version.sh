@@ -1,21 +1,48 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ $# -lt 1 ]]; then
+    echo "usage: $0 <version> [--syntax-only] [--root <path>]" >&2
+    exit 2
+fi
+
+release_input="$1"
+release_version="${release_input#v}"
+shift
 syntax_only=false
-if [[ $# -eq 2 && "$2" == "--syntax-only" ]]; then
-    syntax_only=true
-elif [[ $# -ne 1 ]]; then
-    echo "usage: $0 <version> [--syntax-only]" >&2
-    exit 2
-fi
-
-release_version="${1#v}"
-if [[ ! "$release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-    echo "invalid release version: $1" >&2
-    exit 2
-fi
-
 release_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --syntax-only)
+            syntax_only=true
+            shift
+            ;;
+        --root)
+            if [[ $# -lt 2 ]]; then
+                echo "--root requires a path" >&2
+                exit 2
+            fi
+            release_root="$2"
+            shift 2
+            ;;
+        *)
+            echo "unknown argument: $1" >&2
+            echo "usage: $0 <version> [--syntax-only] [--root <path>]" >&2
+            exit 2
+            ;;
+    esac
+done
+
+if [[ ! "$release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+    echo "invalid release version: $release_input" >&2
+    exit 2
+fi
+
+if [[ ! -d "$release_root" ]]; then
+    echo "release source root does not exist: $release_root" >&2
+    exit 2
+fi
+release_root="$(cd "$release_root" && pwd)"
 python3 - "$release_root" "$release_version" "$syntax_only" <<'PY'
 import json
 import re
