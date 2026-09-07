@@ -113,6 +113,16 @@ def main() -> None:
             ".github/workflows/static-checks.yml: CI must validate workflow semantics "
             "with the repository-pinned actionlint version"
         )
+    if 'name: "Astra SDK (typecheck, test+coverage, build)"' not in static_checks:
+        errors.append(
+            ".github/workflows/static-checks.yml: the SDK required check must use "
+            "the Mergify-safe name Astra SDK (typecheck, test+coverage, build)"
+        )
+    if 'name: "@astra/sdk (typecheck, test+coverage, build)"' in static_checks:
+        errors.append(
+            ".github/workflows/static-checks.yml: required check names must not "
+            "start with @, which Mergify reserves for App-qualified checks"
+        )
 
     release_controller = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
     container_candidates = Path(
