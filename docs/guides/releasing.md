@@ -35,9 +35,9 @@ therefore lets obsolete automation become the release control plane.
 The **Release Astra** workflow is manually dispatched from the protected
 default branch instead. It selects the current `main` commit, validates the
 complete version and release contract, builds every candidate, and creates the
-annotated tag only after all candidates pass. GitHub does not start a second
-workflow for a tag created with `GITHUB_TOKEN`, so one run remains the sole
-release owner.
+annotated tag only after all candidates pass. The release workflow has no
+tag-push trigger; its annotated tag records the sole release owner. App-token
+events can trigger other workflows, so this boundary must remain explicit.
 
 Publication is deliberately ordered:
 
@@ -109,6 +109,10 @@ controller keeps the built-in workflow token read-only and mints the
 repository-scoped App token only inside the approved publication job. Do not
 store a personal access token or the App private key as a repository-level
 secret.
+
+Draft lookup, body preparation, and staged body and asset verification also use
+the App token: draft visibility requires push access. The read-only built-in
+token remains sufficient for Actions artifacts and published release reads.
 
 The source tree versions `@astra/sdk` and the Helm chart, but the workflow does
 not yet publish either to npm or a chart registry. Treat them as explicit

@@ -2,6 +2,7 @@
 """Execute release shell entrypoints with build/network commands stubbed out."""
 
 import os
+import json
 from pathlib import Path
 import re
 import subprocess
@@ -26,6 +27,87 @@ def workflow_run_script(path, step_name):
 
 
 class ReleaseShellTests(unittest.TestCase):
+    def test_draft_reads_use_publication_credentials(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        for name in (
+            "Detect existing GitHub Release",
+            "Prepare canonical GitHub Release body",
+            "Resolve staged GitHub Release ID",
+            "Verify canonical staged GitHub Release body",
+            "Verify exact staged GitHub Release assets",
+        ):
+            with self.subTest(step=name):
+                block = workflow.split(f"      - name: {name}\n", 1)[1]
+                block = block.split("      - ", 1)[0]
+                self.assertIn("GH_TOKEN: ${{ steps.release_app.outputs.token }}", block)
+
+    def test_draft_detection_and_body_reuse_with_restricted_visibility(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = Path(directory)
+            fake_bin = fixture / "bin"
+            fake_bin.mkdir()
+            draft = fixture / "draft.json"
+            gh = fake_bin / "gh"
+            gh.write_text('''#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+draft = Path(os.environ["ASTRA_TEST_DRAFT"])
+visible = os.environ["GH_TOKEN"] == "app-write" and draft.exists()
+if "releases?" in sys.argv[2]:
+    if visible:
+        print("v0.2.2\\ttrue\\t42")
+elif visible:
+    print(draft.read_text())
+else:
+    sys.exit(1)
+''', encoding="utf-8")
+            gh.chmod(0o755)
+            env = {
+                **os.environ, "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "ASTRA_TEST_DRAFT": str(draft), "GITHUB_REPOSITORY": "matrixorigin/Astra",
+                "SOURCE_TAG": "v0.2.2", "SOURCE_SHA": "a" * 40,
+                "GITHUB_RUN_ID": "123", "ORIGINAL_OWNER_RUN_ID": "123",
+                "RECOVER_EXISTING_TAG": "false", "SAME_RUN": "false",
+                "RUNNER_TEMP": str(fixture), "GITHUB_OUTPUT": "/dev/stdout",
+            }
+
+            def run_step(name, **overrides):
+                block = workflow.split(f"      - name: {name}\n", 1)[1].split("      - ", 1)[0]
+                token = "app-write" if "GH_TOKEN: ${{ steps.release_app.outputs.token }}" in block else "builtin-read"
+                result = subprocess.run(
+                    ["bash", "-c", workflow_run_script(".github/workflows/release.yml", name)],
+                    cwd=ROOT, env={**env, "GH_TOKEN": token, **overrides},
+                    capture_output=True, text=True,
+                )
+                return result
+
+            first = run_step("Detect existing GitHub Release")
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertIn("state=none", first.stdout)
+            prepared = run_step("Prepare canonical GitHub Release body", EXISTING_RELEASE_ID="")
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+            self.assertIn("generate_notes=true", prepared.stdout)
+            body_path = fixture / "release-body.md"
+            body = body_path.read_text() + "Canonical generated notes\n"
+            draft.write_text(json.dumps({"draft": True, "tag_name": "v0.2.2", "body": body}))
+            for _ in range(2):
+                detected = run_step("Detect existing GitHub Release", SAME_RUN="true")
+                self.assertEqual(detected.returncode, 0, detected.stderr)
+                self.assertIn("state=draft", detected.stdout)
+                self.assertIn("release_id=42", detected.stdout)
+                reused = run_step("Prepare canonical GitHub Release body", EXISTING_RELEASE_ID="42")
+                self.assertEqual(reused.returncode, 0, reused.stderr)
+                self.assertIn("generate_notes=false", reused.stdout)
+                self.assertEqual(body_path.read_text(), body)
+                verified = run_step("Verify canonical staged GitHub Release body",
+                                    RELEASE_ID="42", OWNER_RUN_ID="123",
+                                    BODY_PATH=str(body_path), GENERATED_NOTES="false")
+                self.assertEqual(verified.returncode, 0, verified.stderr)
+            conflict = run_step("Detect existing GitHub Release")
+            self.assertNotEqual(conflict.returncode, 0)
+            self.assertIn("already exists", conflict.stderr)
+
     def run_idc_settings(self, **overrides):
         script = workflow_run_script(
             ".github/workflows/build_push_to_idc.yml",

@@ -437,7 +437,7 @@ jobs:
         id: existing_release
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.release_app.outputs.token }}
           SOURCE_TAG: ${{ needs.preflight.outputs.source_tag }}
           RECOVER_EXISTING_TAG: ${{ inputs.recover_existing_tag }}
           SAME_RUN: ${{ steps.publication_state.outputs.same_run }}
@@ -553,7 +553,7 @@ jobs:
         id: release_body
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.release_app.outputs.token }}
           EXISTING_RELEASE_ID: ${{ steps.existing_release.outputs.release_id }}
           ORIGINAL_OWNER_RUN_ID: ${{ needs.preflight.outputs.owner_run_id }}
           SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
@@ -604,7 +604,7 @@ jobs:
         id: publish_release
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.release_app.outputs.token }}
           SOURCE_TAG: ${{ needs.preflight.outputs.source_tag }}
           EXISTING_RELEASE_ID: ${{ steps.existing_release.outputs.release_id }}
           STAGED_RELEASE_ID: ${{ steps.stage_release.outputs.id }}
@@ -631,7 +631,7 @@ jobs:
         if: ${{ steps.existing_release.outputs.state != 'published' }}
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.release_app.outputs.token }}
           RELEASE_ID: ${{ steps.publish_release.outputs.release_id }}
           SOURCE_SHA: ${{ needs.preflight.outputs.source_sha }}
           SOURCE_TAG: ${{ needs.preflight.outputs.source_tag }}
@@ -654,7 +654,7 @@ jobs:
         if: ${{ steps.existing_release.outputs.state != 'published' }}
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.release_app.outputs.token }}
         run: |
           set -euo pipefail
           scripts/verify_github_release_assets.py \
