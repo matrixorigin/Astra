@@ -55,18 +55,6 @@ if [ -z "${remote_tag_object}" ]; then
             echo "No tag was created." >&2
             exit 1
         fi
-        if git diff --quiet "${source_sha}" "${current_default_sha}" -- .github/workflows; then
-            :
-        elif [ "$?" -eq 1 ]; then
-            echo "${default_branch} advanced with workflow changes during candidate verification." >&2
-            echo "The workflow token cannot tag the now-historical source ${source_sha}." >&2
-            echo "Start a new release run from the current protected branch; no tag was created." >&2
-            exit 1
-        else
-            echo "Could not verify workflow changes between ${source_sha} and ${current_default_sha}." >&2
-            echo "No tag was created." >&2
-            exit 1
-        fi
     fi
 
     tag_message="$(printf 'Astra %s\n\n%s' "${source_tag}" "${run_marker}")"
@@ -79,7 +67,7 @@ if [ -z "${remote_tag_object}" ]; then
             --jq .sha
     )"; then
         echo "GitHub refused to create ${source_tag}." >&2
-        echo "If ${default_branch} just gained workflow changes, restart from its current head; otherwise verify release-token and tag-ruleset permissions." >&2
+        echo "Verify the protected release GitHub App permissions and the release tag ruleset." >&2
         exit 1
     fi
     if ! gh api --method POST "repos/${repository}/git/refs" \

@@ -143,9 +143,12 @@ def main() -> None:
         "Require Docker publication credentials",
         "Reject an existing Docker version before candidate builds",
         "Reject conflicting Docker version before creating the tag",
-        "stage-tag:",
-        "Stage Immutable Release Tag",
-        "needs.stage-tag.result == 'success'",
+        "Mint the protected release GitHub App token",
+        "ASTRA_RELEASE_APP_CLIENT_ID",
+        "ASTRA_RELEASE_APP_PRIVATE_KEY",
+        "permission-contents: write",
+        "permission-workflows: write",
+        "steps.release_app.outputs.token",
         "Resolve publication continuation state",
         "Release-Run:",
         "Recovery cannot adopt manual or legacy tags",
@@ -188,8 +191,8 @@ def main() -> None:
         encoding="utf-8"
     )
     for required in (
-        "advanced with workflow changes during candidate verification",
-        "no tag was created",
+        "is no longer in ${default_branch} history",
+        "No tag was created",
         "Release-Run:",
         'gh api --method POST "repos/${repository}/git/tags"',
         'gh api --method POST "repos/${repository}/git/refs"',
@@ -204,14 +207,14 @@ def main() -> None:
     docker_manifest = release_controller.find(
         "Create or verify the immutable Docker version manifest"
     )
-    tag_stage = release_controller.find("\n  stage-tag:\n")
+    release_tag = release_controller.find("Create or validate the immutable release tag")
     publication_job = release_controller.find("\n  publish:\n")
     github_publish = release_controller.find("Publish GitHub Release")
     rolling_promotion = release_controller.find("Promote stable rolling Docker tags")
-    if not 0 <= tag_stage < publication_job < docker_manifest < github_publish < rolling_promotion:
+    if not 0 <= publication_job < release_tag < docker_manifest < github_publish < rolling_promotion:
         errors.append(
-            ".github/workflows/release.yml: the verified tag and version artifacts must be "
-            "staged before the GitHub Release and rolling Docker tags become public"
+            ".github/workflows/release.yml: the protected release tag and version "
+            "artifacts must be reconciled before the GitHub Release and rolling tags"
         )
 
     for required in (
@@ -363,25 +366,15 @@ def main() -> None:
                 f"verified candidate set ({required})"
             )
 
-    stage_tag_job, publish_job = release_controller.split("\n  stage-tag:\n", 1)[1].split(
-        "\n  publish:\n", 1
-    )
-    for required in (
-        "contents: write",
-        "ref: ${{ github.sha }}",
-        "scripts/reconcile-release-tag.sh create",
-    ):
-        if required not in stage_tag_job:
-            errors.append(
-                ".github/workflows/release.yml: verified tag staging must own the "
-                f"current-head GitHub mutation ({required})"
-            )
+    publish_job = release_controller.split("\n  publish:\n", 1)[1]
     for required in (
         "!cancelled()",
         "needs.clients.result == 'skipped'",
         "needs.containers.result == 'skipped'",
         "inputs.recover_existing_tag != true",
         "ref: ${{ github.sha }}",
+        "contents: read",
+        "scripts/reconcile-release-tag.sh",
     ):
         if required not in publish_job:
             errors.append(

@@ -44,23 +44,17 @@ Publication is deliberately ordered:
 1. validate the exact source and version;
 2. build and execute all client candidates;
 3. build untagged server digests and smoke every platform;
-4. immediately create or validate the immutable annotated tag, before waiting
-   for publication approval;
-5. after approval, revalidate the tag and create or verify the exact Docker
-   version manifest;
+4. create or validate the immutable annotated tag;
+5. create or verify the exact Docker version manifest;
 6. stage and publish the GitHub Release with verified client assets;
 7. update stable rolling Docker tags.
 
-Tag staging is deliberately separate from the protected publication job.
-GitHub's workflow token cannot create a tag for an older default-branch commit
-when a newer commit changes workflow files. Staging immediately after candidate
-verification prevents a later approval delay from turning the pinned source
-into an untaggable historical commit. If `main` gains workflow changes before
-candidate verification finishes, staging fails without creating a tag and
-tells the maintainer to start a new run from the current protected head.
-Unrelated later commits do not change the selected release source and do not
-force a rebuild. Re-running the same staging job is idempotent only for the
-exact tag, source, and owning run.
+The protected publication job mints a short-lived token for the repository's
+dedicated release GitHub App. This is required because the built-in workflow
+token cannot create a tag for a pinned source after a newer `main` commit
+changes workflow files. The App token is available only after Environment
+approval, so `main` may continue moving while candidates build or wait for
+approval without moving the selected source or weakening the publication gate.
 
 The GitHub Release is not published until the exact Docker version exists. If
 a late step fails, rerun the failed jobs from the same Actions run so its
@@ -76,6 +70,10 @@ Create a GitHub Environment named `release`:
 - require approval from release maintainers;
 - allow deployments only from `main`;
 - add the Environment secret `ASTRA_RELEASE_ENVIRONMENT_GUARD=configured`;
+- add the Environment variable `ASTRA_RELEASE_APP_CLIENT_ID` and secret
+  `ASTRA_RELEASE_APP_PRIVATE_KEY` for a GitHub App installed only on Astra with
+  repository permissions `Contents: Read and write` and
+  `Workflows: Read and write`;
 - use this as the single publication gate after every candidate is green.
 
 Create a second Environment named `release-snapshot` for reviewed snapshot
@@ -107,9 +105,10 @@ A manually created tag cannot publish anything and cannot be adopted by
 recovery, but it will reserve that version until an administrator removes it.
 
 Repository Actions should default to read-only permissions. The release
-controller grants `contents: write` only to the tag-staging job and the
-publication job. The former creates one immutable version tag after all
-candidates pass; the latter creates the GitHub Release.
+controller keeps the built-in workflow token read-only and mints the
+repository-scoped App token only inside the approved publication job. Do not
+store a personal access token or the App private key as a repository-level
+secret.
 
 The source tree versions `@astra/sdk` and the Helm chart, but the workflow does
 not yet publish either to npm or a chart registry. Treat them as explicit
@@ -206,11 +205,9 @@ release commit; it does not modify files, create tags, or publish data.
    The command validates the synchronized version metadata, requires a clean
    checkout at the exact `origin/main` SHA, and dispatches **Release Astra**
    with recovery disabled. It does not create a tag locally.
-3. Wait for the client and server candidate matrices to pass and for the
-   workflow to stage the immutable tag. If `main` gained workflow changes while
-   candidates were running, start a new run from the current `main` head.
-4. Review the preflight and tag-staging summaries, then approve the single
-   `release` Environment gate for the publication job.
+3. Wait for the client and server candidate matrices to pass.
+4. Review the preflight summary and approve the single `release` Environment
+   gate for the publication job.
 
 Do not create the tag manually. The workflow creates `vX.Y.Z` as an annotated
 tag on the source SHA after all candidate verification succeeds.
