@@ -74,6 +74,19 @@ Keep the following `main` branch-protection invariants aligned with the queue:
   complete reviewed queue merges;
 - administrators do not use bypass as the normal delivery path.
 
+Required check names must not begin with `@`. Mergify uses that prefix for a
+GitHub-App-qualified check (`@github-actions/<check-name>`), so a required
+workflow job named `@astra/sdk ...` cannot be matched by the injected branch
+protection condition even when GitHub reports the check as successful. The SDK
+job is therefore named `Astra SDK (typecheck, test+coverage, build)`.
+
+When this name changes, update the required status-check list in `main`
+branch protection in the same maintenance window: remove
+`@astra/sdk (typecheck, test+coverage, build)` and add
+`Astra SDK (typecheck, test+coverage, build)`. Keep the old entry until the new
+workflow check has appeared once, then remove it so a missing legacy check does
+not block every pull request.
+
 After changing the Mergify installation or branch protection, verify the
 effective state rather than relying on the settings form:
 

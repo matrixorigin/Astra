@@ -99,7 +99,9 @@ jobs:
         run: make audit
 
   sdk:
-    name: "@astra/sdk (typecheck, test+coverage, build)"
+    # Mergify reserves a leading '@' for GitHub-App-qualified check names.
+    # Keep this required check name literal and unambiguous for queue injection.
+    name: "Astra SDK (typecheck, test+coverage, build)"
     needs: scope
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.sdk == 'true') }}
     runs-on: ubuntu-latest
