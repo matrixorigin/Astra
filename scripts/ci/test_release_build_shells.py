@@ -29,6 +29,7 @@ def workflow_run_script(path, step_name):
 class ReleaseShellTests(unittest.TestCase):
     def test_draft_reads_use_publication_credentials(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        self.assertIn("contents: write", workflow.split("\n  publish:\n", 1)[1])
         for name in (
             "Detect existing GitHub Release",
             "Prepare canonical GitHub Release body",
@@ -39,7 +40,7 @@ class ReleaseShellTests(unittest.TestCase):
             with self.subTest(step=name):
                 block = workflow.split(f"      - name: {name}\n", 1)[1]
                 block = block.split("      - ", 1)[0]
-                self.assertIn("GH_TOKEN: ${{ steps.release_app.outputs.token }}", block)
+                self.assertIn("GH_TOKEN: ${{ github.token }}", block)
 
     def test_draft_detection_and_body_reuse_with_restricted_visibility(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
@@ -53,7 +54,7 @@ class ReleaseShellTests(unittest.TestCase):
 import json, os, sys
 from pathlib import Path
 draft = Path(os.environ["ASTRA_TEST_DRAFT"])
-visible = os.environ["GH_TOKEN"] == "app-write" and draft.exists()
+visible = os.environ["GH_TOKEN"] == "publication-write" and draft.exists()
 if "releases?" in sys.argv[2]:
     if visible:
         print("v0.2.2\\ttrue\\t42")
@@ -74,7 +75,7 @@ else:
 
             def run_step(name, **overrides):
                 block = workflow.split(f"      - name: {name}\n", 1)[1].split("      - ", 1)[0]
-                token = "app-write" if "GH_TOKEN: ${{ steps.release_app.outputs.token }}" in block else "builtin-read"
+                token = "publication-write" if "GH_TOKEN: ${{ github.token }}" in block and "contents: write" in workflow.split("\n  publish:\n", 1)[1] else "builtin-read"
                 result = subprocess.run(
                     ["bash", "-c", workflow_run_script(".github/workflows/release.yml", name)],
                     cwd=ROOT, env={**env, "GH_TOKEN": token, **overrides},
@@ -273,34 +274,7 @@ else:
                                  "-p", "astra-edge", "--bin", "astra-edge"]
                     self.assertEqual(result.stdout.splitlines(), expected)
 
-    def test_release_environment_requires_the_dedicated_app(self):
-        script = workflow_run_script(
-            ".github/workflows/release.yml",
-            "Require the configured release environment",
-        )
-        base_env = {
-            **os.environ,
-            "RELEASE_ENVIRONMENT_GUARD": "configured",
-            "RELEASE_APP_CLIENT_ID": "client-id",
-            "RELEASE_APP_PRIVATE_KEY": "private-key",
-        }
-        success = subprocess.run(
-            ["bash", "-c", script], env=base_env, capture_output=True, text=True
-        )
-        self.assertEqual(success.returncode, 0, success.stderr)
-        for missing in ("RELEASE_APP_CLIENT_ID", "RELEASE_APP_PRIVATE_KEY"):
-            with self.subTest(missing=missing):
-                result = subprocess.run(
-                    ["bash", "-c", script],
-                    env={**base_env, missing: ""},
-                    capture_output=True,
-                    text=True,
-                )
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn(missing.removeprefix("RELEASE_"), result.stderr)
-                self.assertNotIn("private-key", result.stdout + result.stderr)
-
-    def test_release_tag_creation_accepts_an_owned_historical_source(self):
+    def test_release_tag_creation_requires_current_head(self):
         script = ROOT / "scripts/reconcile-release-tag.sh"
         with tempfile.TemporaryDirectory() as directory:
             fixture = Path(directory)
@@ -347,7 +321,7 @@ esac
                 **os.environ,
                 "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
                 "ASTRA_TEST_CALLS": str(calls),
-                "ASTRA_TEST_DEFAULT_SHA": "new-main-sha",
+                "ASTRA_TEST_DEFAULT_SHA": "verified-source-sha",
                 "SOURCE_SHA": "verified-source-sha",
                 "GITHUB_SERVER_URL": "https://github.com",
             }
@@ -369,9 +343,19 @@ esac
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, "owned-tag-object\n")
             recorded_calls = calls.read_text(encoding="utf-8")
-            self.assertIn("git merge-base --is-ancestor", recorded_calls)
             self.assertIn("gh api --method POST repos/matrixorigin/Astra/git/tags", recorded_calls)
             self.assertIn("gh api --method POST repos/matrixorigin/Astra/git/refs", recorded_calls)
+
+            calls.write_text("")
+            stale = subprocess.run(
+                [str(script), "create", "matrixorigin/Astra", "v0.2.2",
+                 "verified-source-sha", "123", "main", ""],
+                env={**env, "ASTRA_TEST_DEFAULT_SHA": "new-main-sha"},
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(stale.returncode, 0)
+            self.assertIn("Start a new normal release run", stale.stderr)
+            self.assertNotIn("gh ", calls.read_text())
 
     def test_release_tag_creation_is_idempotent_for_the_same_run(self):
         script = ROOT / "scripts/reconcile-release-tag.sh"

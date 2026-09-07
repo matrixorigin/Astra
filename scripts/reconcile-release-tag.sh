@@ -48,13 +48,9 @@ if [ -z "${remote_tag_object}" ]; then
         exit 1
     fi
     if [ "${current_default_sha}" != "${source_sha}" ]; then
-        git fetch --no-tags origin \
-            "refs/heads/${default_branch}:refs/remotes/origin/${default_branch}"
-        if ! git merge-base --is-ancestor "${source_sha}" "${current_default_sha}"; then
-            echo "Release source ${source_sha} is no longer in ${default_branch} history." >&2
-            echo "No tag was created." >&2
-            exit 1
-        fi
+        echo "Release source ${source_sha} is no longer the current ${default_branch} head (${current_default_sha})." >&2
+        echo "No tag was created. Start a new normal release run from the current default branch; do not rerun these stale candidates." >&2
+        exit 1
     fi
 
     tag_message="$(printf 'Astra %s\n\n%s' "${source_tag}" "${run_marker}")"
@@ -67,7 +63,7 @@ if [ -z "${remote_tag_object}" ]; then
             --jq .sha
     )"; then
         echo "GitHub refused to create ${source_tag}." >&2
-        echo "Verify the protected release GitHub App permissions and the release tag ruleset." >&2
+        echo "Check the publication token permissions and tag ruleset. If the default branch advanced, start a new normal release run." >&2
         exit 1
     fi
     if ! gh api --method POST "repos/${repository}/git/refs" \

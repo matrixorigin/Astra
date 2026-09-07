@@ -143,12 +143,6 @@ def main() -> None:
         "Require Docker publication credentials",
         "Reject an existing Docker version before candidate builds",
         "Reject conflicting Docker version before creating the tag",
-        "Mint the protected release GitHub App token",
-        "ASTRA_RELEASE_APP_CLIENT_ID",
-        "ASTRA_RELEASE_APP_PRIVATE_KEY",
-        "permission-contents: write",
-        "permission-workflows: write",
-        "steps.release_app.outputs.token",
         "Resolve publication continuation state",
         "Release-Run:",
         "Recovery cannot adopt manual or legacy tags",
@@ -191,7 +185,7 @@ def main() -> None:
         encoding="utf-8"
     )
     for required in (
-        "is no longer in ${default_branch} history",
+        "is no longer the current ${default_branch} head",
         "No tag was created",
         "Release-Run:",
         'gh api --method POST "repos/${repository}/git/tags"',
@@ -373,7 +367,7 @@ def main() -> None:
         "needs.containers.result == 'skipped'",
         "inputs.recover_existing_tag != true",
         "ref: ${{ github.sha }}",
-        "contents: read",
+        "contents: write",
         "scripts/reconcile-release-tag.sh",
     ):
         if required not in publish_job:
