@@ -138,7 +138,7 @@ fn build_turn_stream_params<'a>(
         input_work_unit_observations: &prepared.input_work_unit_observations,
         semantic_query_override: input.semantic_query_override,
         session_id: Some(input.session_id),
-        offering_id: crate::cli::slash::slash_config::active_offering_id_for_request(),
+        offering_id: state.offering_id.clone(),
         model: astra_core::model_override::normalize_model_override(state.model.as_deref()),
         provider: None,
         explain: state.explain,

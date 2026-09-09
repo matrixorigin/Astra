@@ -351,6 +351,7 @@ async fn branch_deletion_fence_waits_for_runs_and_invalidates_old_writer_authori
                     conversation_seq: 1,
                     compaction_generation: 0,
                     config_version_id: None,
+                    provider_projection: None,
                     mode: CanonicalDeltaModeV1::Append,
                     logical_segments: vec![vec![serde_json::json!({
                         "role": "assistant",

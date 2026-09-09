@@ -242,16 +242,16 @@ async fn user_byok_models_are_owner_scoped_encrypted_and_admitted_for_owner_only
     );
 
     let admitted = service
-        .admit_model_offering(user_a.clone(), model_a.clone())
+        .revalidate_model_execution(user_a.clone(), model_a.clone())
         .await
         .expect("owner admits model");
     assert_eq!(admitted.access_kind, ModelAccessKind::CloudByok);
-    assert_eq!(admitted.api_key, secret_a);
+    assert_eq!(admitted.server_material().unwrap().api_key, secret_a);
     assert_eq!(admitted.wire_model_name.as_deref(), Some("deepseek-chat"));
     assert!(!format!("{admitted:?}").contains(secret_a));
 
     let error = service
-        .admit_model_offering(user_b.clone(), model_a.clone())
+        .revalidate_model_execution(user_b.clone(), model_a.clone())
         .await
         .expect_err("another user cannot admit the Offering");
     assert_eq!(error.0, StatusCode::NOT_FOUND);
@@ -294,7 +294,7 @@ async fn compatible_byok_admission_rechecks_trust_and_owner() {
     .await
     .unwrap();
     let initial = service
-        .admit_model_offering(owner.clone(), model_id.clone())
+        .revalidate_model_execution(owner.clone(), model_id.clone())
         .await;
     assert_eq!(
         initial.is_err(),
@@ -304,7 +304,7 @@ async fn compatible_byok_admission_rechecks_trust_and_owner() {
     sqlx::query("INSERT INTO runtime_llm_trusted_domains (domain_id, domain_host, domain_port, is_enabled) VALUES (?, ?, 443, 1)")
         .bind(&domain_id).bind(&host).execute(&pool).await.unwrap();
     let admitted = service
-        .admit_model_offering(owner.clone(), model_id.clone())
+        .revalidate_model_execution(owner.clone(), model_id.clone())
         .await
         .unwrap();
     assert_eq!(admitted.wire_model_name.as_deref(), Some("upstream-model"));
@@ -317,7 +317,7 @@ async fn compatible_byok_admission_rechecks_trust_and_owner() {
         .unwrap();
     assert_eq!(
         service
-            .admit_model_offering(owner.clone(), model_id.clone())
+            .revalidate_model_execution(owner.clone(), model_id.clone())
             .await
             .is_err(),
         strict,
@@ -331,7 +331,7 @@ async fn compatible_byok_admission_rechecks_trust_and_owner() {
         .unwrap();
     assert!(
         service
-            .admit_model_offering("another-user".into(), model_id.clone())
+            .revalidate_model_execution("another-user".into(), model_id.clone())
             .await
             .is_err()
     );
@@ -341,7 +341,7 @@ async fn compatible_byok_admission_rechecks_trust_and_owner() {
         .await
         .unwrap();
     let revoked = service
-        .admit_model_offering(owner.clone(), model_id.clone())
+        .revalidate_model_execution(owner.clone(), model_id.clone())
         .await;
     assert_eq!(
         revoked.is_err(),
@@ -355,7 +355,7 @@ async fn compatible_byok_admission_rechecks_trust_and_owner() {
         .unwrap();
     assert!(
         service
-            .admit_model_offering(owner.clone(), model_id.clone())
+            .revalidate_model_execution(owner.clone(), model_id.clone())
             .await
             .is_err(),
         "unsafe persisted endpoints must be denied in both modes"

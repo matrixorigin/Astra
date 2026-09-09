@@ -40,10 +40,12 @@ make check
 ## macOS Chat Reports No Session Execution Authority
 
 If `astra chat` reports `this platform has no rename-resistant session execution
-authority`, the installed client predates the macOS lease implementation. Check
-`astra --version`, install the current patch release, and keep the deployment
-checkout matched to that exact client version. Do not bypass the lease or reuse
-a Linux binary built for a different platform.
+authority`, the client is refusing to run without a kernel-backed execution
+owner. On macOS this normally means `/dev/dtracehelper` is unavailable or is
+not the expected root-owned device; on other platforms no supported authority
+has been installed. Check `astra --version`, repair the host/runtime image or
+use a supported Linux deployment, and retry. Do not bypass the lease or reuse a
+binary built for a different platform.
 
 ## Stale Run Projection
 

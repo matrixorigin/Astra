@@ -89,7 +89,8 @@ pub use resume::{
     RESUME_BUNDLE_SCHEMA_VERSION, ResumeActivationProjectionV1, ResumeBundleV1, ResumeCandidateV1,
     ResumeCheckpointProjectionV1, ResumeDegradedReasonV1, ResumeDescriptorV1,
     ResumeProjectionSetV1, ResumeProviderProjectionV1, ResumeRepairActionV1, ResumeSelectionError,
-    ResumeSourceV1, cursor_relation, select_resume_bundle, select_resume_candidate_index,
+    ResumeSourceV1, cursor_relation, is_valid_offering_id, select_resume_bundle,
+    select_resume_candidate_index,
 };
 pub use runtime_scaffolding::{
     APPEND_ONLY_RUNTIME_AUTHORITY_POLICY, APPEND_ONLY_RUNTIME_AUTHORITY_POLICY_FIELD,
@@ -166,3 +167,4 @@ pub use user_intent::{
     UserFeedbackKind, UserFeedbackTarget, UserIntentDelivery, UserIntentStatus, UserTurnSemantics,
     UserTurnSemanticsError, mark_user_turn_semantics, user_turn_semantics,
 };
+pub mod runner_inference;

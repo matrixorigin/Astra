@@ -1072,6 +1072,7 @@ async fn commit_test_conversation_turn(
                 conversation_seq: u64::from(turn),
                 compaction_generation: 0,
                 config_version_id: None,
+                provider_projection: None,
                 mode: CanonicalDeltaModeV1::Append,
                 logical_segments: vec![vec![serde_json::json!({
                     "role": "user",

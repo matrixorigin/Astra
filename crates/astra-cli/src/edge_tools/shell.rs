@@ -4826,10 +4826,20 @@ impl ToolExecutor {
         mut outcome: super::ToolExecutionOutcome,
         before: Option<&astra_tools::workspace_observation::ExternalEffectFingerprint>,
         scope_ownership: Option<astra_sandbox::ScopeOwnership>,
+        lease: Option<&astra_tools::workspace_observation::ExternalEffectObservationLease>,
     ) -> super::ToolExecutionOutcome {
+        if lease.is_some_and(|lease| !lease.integrity_valid()) {
+            return outcome;
+        }
         if let Some(receipt) = before.and_then(|before| {
             before.changed_receipt(scope_ownership.map(astra_sandbox::ScopeOwnership::as_str))
         }) {
+            // Keep the synchronous path aligned with the async boundary:
+            // fingerprinting is a filesystem operation and can still observe
+            // a generation revocation immediately before receipt minting.
+            if lease.is_some_and(|lease| !lease.integrity_valid()) {
+                return outcome;
+            }
             outcome
                 .tool_result_fields
                 .get_or_insert_with(serde_json::Map::new)
@@ -4858,6 +4868,12 @@ impl ToolExecutor {
             }
             None => None,
         } {
+            // Fingerprinting can yield to the async runtime. Recheck the
+            // external-state lease before minting its receipt so a revoked
+            // generation cannot publish a positive observation.
+            if lease.is_some_and(|lease| !lease.integrity_valid()) {
+                return outcome;
+            }
             outcome
                 .tool_result_fields
                 .get_or_insert_with(serde_json::Map::new)
@@ -4931,6 +4947,21 @@ impl ToolExecutor {
                 astra_tools::workspace_observation::WorkspaceObservationLease::integrity_valid,
             )
         {
+            // The lease may be revoked after the postimage capture. Recheck
+            // immediately at the receipt mint boundary; a detached/replaced
+            // coordination inode must never receive a positive receipt.
+            if observation_lease.is_some_and(|lease| {
+                !astra_tools::workspace_observation::WorkspaceObservationLease::integrity_valid(
+                    lease,
+                )
+            }) {
+                astra_tools::workspace_observation::mark_workspace_observation_unsettled(&root);
+                return require_explicit_workspace_verification_receipt(
+                    outcome,
+                    explicit_verification,
+                    false,
+                );
+            }
             outcome
                 .tool_result_fields
                 .get_or_insert_with(serde_json::Map::new)
@@ -4945,6 +4976,18 @@ impl ToolExecutor {
             );
         }
         if workspace_changed {
+            if observation_lease.is_some_and(|lease| {
+                !astra_tools::workspace_observation::WorkspaceObservationLease::integrity_valid(
+                    lease,
+                )
+            }) {
+                astra_tools::workspace_observation::mark_workspace_observation_unsettled(&root);
+                return require_explicit_workspace_verification_receipt(
+                    outcome,
+                    explicit_verification,
+                    false,
+                );
+            }
             if let Some(ownership) = scope_ownership {
                 if ownership.is_authoritative() {
                     outcome
@@ -5033,6 +5076,23 @@ impl ToolExecutor {
                 astra_tools::workspace_observation::WorkspaceObservationLease::integrity_valid,
             )
         {
+            // The asynchronous postimage capture yields to the runtime. A
+            // final lease check right before minting the receipt closes the
+            // postimage-to-settlement revocation window.
+            if observation_lease.is_some_and(|lease| {
+                !astra_tools::workspace_observation::WorkspaceObservationLease::integrity_valid(
+                    lease,
+                )
+            }) {
+                astra_tools::workspace_observation::mark_workspace_observation_unsettled(
+                    &quarantine_root,
+                );
+                return require_explicit_workspace_verification_receipt(
+                    outcome,
+                    explicit_verification,
+                    false,
+                );
+            }
             outcome
                 .tool_result_fields
                 .get_or_insert_with(serde_json::Map::new)
@@ -5047,6 +5107,20 @@ impl ToolExecutor {
             );
         }
         if workspace_changed {
+            if observation_lease.is_some_and(|lease| {
+                !astra_tools::workspace_observation::WorkspaceObservationLease::integrity_valid(
+                    lease,
+                )
+            }) {
+                astra_tools::workspace_observation::mark_workspace_observation_unsettled(
+                    &quarantine_root,
+                );
+                return require_explicit_workspace_verification_receipt(
+                    outcome,
+                    explicit_verification,
+                    false,
+                );
+            }
             if let Some(ownership) = scope_ownership {
                 if ownership.is_authoritative() {
                     outcome
@@ -5779,6 +5853,7 @@ impl ToolExecutor {
                         outcome,
                         external_before.as_ref(),
                         scope_ownership,
+                        external_lease.as_ref(),
                     )
                 } else {
                     outcome
@@ -5810,6 +5885,7 @@ impl ToolExecutor {
                         outcome,
                         external_before.as_ref(),
                         error.scope_ownership,
+                        external_lease.as_ref(),
                     )
                 } else {
                     outcome
@@ -6317,7 +6393,10 @@ mod tests {
     }
 
     fn test_executor() -> ToolExecutor {
-        ToolExecutor::new(std::env::temp_dir())
+        // Each shell test gets an isolated workspace. Sharing the process
+        // temp root lets one unhappy-path test's sticky ownership quarantine
+        // make unrelated tests fail before their command is even admitted.
+        ToolExecutor::new(tempfile::tempdir().expect("test workspace").keep())
     }
 
     #[test]
@@ -6370,6 +6449,9 @@ mod tests {
         );
     }
 
+    // The environment-lifetime implementation currently uses GNU `timeout`
+    // as its detached TTL supervisor; macOS does not ship that helper.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn structured_environment_background_waits_for_readiness_and_returns_handle() {
         let _lock = ENVIRONMENT_BACKGROUND_TEST_LOCK.lock().await;
@@ -6496,6 +6578,7 @@ mod tests {
         ToolExecutor::new(dir)
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn edge_bash_emits_executor_owned_receipt_for_generic_writer() {
         let dir = tempfile::tempdir().unwrap();
@@ -6526,6 +6609,7 @@ mod tests {
         ));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn edge_bash_timeout_preserves_partial_workspace_receipt() {
         let dir = tempfile::tempdir().unwrap();
@@ -6597,6 +6681,7 @@ mod tests {
         }));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn edge_bash_cancellation_preserves_supervisor_until_authoritative_settlement() {
         let dir = tempfile::tempdir().unwrap();
@@ -6635,6 +6720,7 @@ mod tests {
         assert!(dir.path().join("generated.txt").is_file());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn edge_bash_helper_crash_marks_terminal_ownership_unsettled() {
         let dir = tempfile::tempdir().unwrap();
@@ -6892,6 +6978,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn edge_error_projection_preserves_partial_workspace_receipt() {
         let dir = tempfile::tempdir().unwrap();
@@ -7131,22 +7218,23 @@ mod tests {
 
     #[test]
     fn bash_pure_sleep_blocked() {
-        let executor = test_executor();
         // Pure sleep without timeout should be blocked
-        let result = executor.bash(&serde_json::json!({"command": "sleep 5"}));
+        let result = test_executor().bash(&serde_json::json!({"command": "sleep 5"}));
         assert!(result.contains("not useful"), "got: {result}");
         // A server-authored command budget is not model explicitness. It must
         // not turn a pure sleep into an allowed timeout-bearing command.
-        let result = executor.bash(&serde_json::json!({
+        let result = test_executor().bash(&serde_json::json!({
             "command": "sleep 5",
             "_astra_command_timeout_cap_ms": 100,
         }));
         assert!(result.contains("not useful"), "got: {result}");
         // sleep with pipeline work should NOT be blocked
-        let result = executor.bash(&serde_json::json!({"command": "sleep 0.01 && echo done"}));
+        let result =
+            test_executor().bash(&serde_json::json!({"command": "sleep 0.01 && echo done"}));
         assert!(result.contains("done"), "got: {result}");
         // sleep with explicit timeout should NOT be blocked (test usage)
-        let result = executor.bash(&serde_json::json!({"command": "sleep 10", "timeout": 0.1}));
+        let result =
+            test_executor().bash(&serde_json::json!({"command": "sleep 10", "timeout": 0.1}));
         assert!(result.contains("timed out"), "got: {result}");
     }
 

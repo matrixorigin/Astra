@@ -3491,7 +3491,7 @@ mod context_cache_contract_tests {
             });
             let prepared = crate::turn::llm::client::PreparedProviderRequest::from_json(
                 &body,
-                crate::turn::llm::client::LlmProviderProtocol::OpenAiCompatible,
+                astra_inference_adapter::ProviderProtocol::OpenAiCompatible,
             )
             .expect("prepare provider body once");
             let wire = prepared.identity();

@@ -148,6 +148,7 @@ async fn run_chat_turn(request: TurnExecutionRequest<'_>) -> TurnAttempt {
     ensure_default_turn_model(state, input.api, input.token).await;
     if let Some(failure) = model_selection_preflight_failure(
         state.model.as_deref(),
+        state.provider_selection_requires_explicit,
         Some(input.session_id),
         state.turn.saturating_add(1),
     ) {
@@ -198,10 +199,13 @@ async fn ensure_default_turn_model(
 
 fn model_selection_preflight_failure(
     model: Option<&str>,
+    provider_selection_requires_explicit: bool,
     session_id: Option<&str>,
     turn_index: u32,
 ) -> Option<crate::TurnFailure> {
-    if astra_core::model_override::normalize_model_override(model).is_some() {
+    if !provider_selection_requires_explicit
+        && astra_core::model_override::normalize_model_override(model).is_some()
+    {
         return None;
     }
     tracing::warn!(
@@ -544,11 +548,12 @@ async fn ensure_multi_agent_runtime_for_turn(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use super::acquire_interactive_turn_admission;
     use super::{
-        ShellPassthroughDecision, TurnContext, acquire_interactive_turn_admission,
-        classify_shell_passthrough, ensure_interactive_session_identity,
-        ensure_multi_agent_runtime_for_turn, handle_chat_input_with_ui,
-        model_selection_preflight_failure,
+        ShellPassthroughDecision, TurnContext, classify_shell_passthrough,
+        ensure_interactive_session_identity, ensure_multi_agent_runtime_for_turn,
+        handle_chat_input_with_ui, model_selection_preflight_failure,
     };
     use crate::cli::session::session_state::SessionState;
 
@@ -801,8 +806,9 @@ mod tests {
     #[test]
     fn model_preflight_blocks_missing_selection_before_turn_side_effects() {
         for missing in [None, Some(""), Some(" default ")] {
-            let failure = model_selection_preflight_failure(missing, Some("sess-missing-model"), 2)
-                .expect("missing model must fail before turn side effects");
+            let failure =
+                model_selection_preflight_failure(missing, false, Some("sess-missing-model"), 2)
+                    .expect("missing model must fail before turn side effects");
             let classified = astra_core::ClassifiedError::from(failure.error.clone());
             assert_eq!(
                 classified.kind,
@@ -817,11 +823,18 @@ mod tests {
         assert!(
             model_selection_preflight_failure(
                 Some("deepseek-v4-pro-official(thinking:high)"),
+                false,
                 Some("sess-ok"),
                 2,
             )
             .is_none(),
             "thinking selectors are concrete model choices and must reach payload assembly"
+        );
+
+        assert!(
+            model_selection_preflight_failure(Some("stale-model"), true, Some("sess-unpinned"), 2,)
+                .is_some(),
+            "a display model without causal Offering provenance must not be admitted"
         );
     }
 

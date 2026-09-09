@@ -10,6 +10,10 @@ pub(crate) struct SessionContinuation {
     pub(crate) completed_turn_count: Option<u32>,
     pub(crate) messages: Vec<Value>,
     pub(crate) activated_deferred_tool_names: Vec<String>,
+    /// Exact Offering from the causally selected provider projection. This
+    /// is intentionally absent for legacy/local projections without durable
+    /// Offering provenance; callers must not infer it from `model`.
+    pub(crate) offering_id: Option<String>,
     pub(crate) active_conversation: astra_turn_core::active_conversation::ActiveConversation,
     pub(crate) resume: astra_turn_types::ResumeDescriptorV1,
 }
@@ -124,6 +128,10 @@ pub(crate) fn continuation_from_resume_bundle(
         .activation_at(&cursor)
         .into_iter()
         .flat_map(|projection| projection.deferred_tool_names.iter().cloned());
+    let offering_id = projections
+        .provider_at(&cursor)
+        .and_then(astra_turn_types::ResumeProviderProjectionV1::exact_offering_id)
+        .map(str::to_owned);
     let activated_deferred_tool_names =
         continuation_activation_names(&messages, projection_activation);
     let source = match resume_source {
@@ -164,6 +172,7 @@ pub(crate) fn continuation_from_resume_bundle(
     Some(SessionContinuation {
         completed_turn_count: Some(cursor.completed_turn),
         activated_deferred_tool_names,
+        offering_id,
         messages,
         active_conversation,
         resume: resume_descriptor(resume_source, cursor, degraded_reasons, repair_actions),
@@ -264,6 +273,7 @@ pub(crate) fn load_session_continuation_for_recovery(
             return Some(SessionContinuation {
                 completed_turn_count: Some(active_conversation.cursor().completed_turn),
                 activated_deferred_tool_names,
+                offering_id: None,
                 messages,
                 active_conversation,
                 resume,
@@ -353,6 +363,7 @@ pub(crate) fn load_session_continuation_for_recovery(
                 Some(SessionContinuation {
                     completed_turn_count: Some(cursor.completed_turn),
                     activated_deferred_tool_names,
+                    offering_id: None,
                     active_conversation,
                     messages,
                     resume,
@@ -552,6 +563,7 @@ pub(crate) fn load_csl_continuation(
         active_conversation,
         messages,
         activated_deferred_tool_names,
+        offering_id: None,
         resume,
     }))
 }
@@ -777,6 +789,75 @@ mod tests {
                 .cursor()
                 .canonical_root_hash,
             materialized_root
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn segmented_resume_consumes_only_causally_enveloped_offering() {
+        let _identity = crate::cli::cli_config::cli_utils::install_cli_profile_identity_for_test(
+            "segmented-offering-profile",
+            Some("account-offering"),
+        )
+        .unwrap();
+        let messages = vec![json!({"role": "user", "content": "resume"})];
+        let materialized_root = astra_turn_types::canonical_conversation_root(&messages);
+        let cursor = astra_turn_types::SessionCursorV1 {
+            schema_version: astra_turn_types::SESSION_CURSOR_SCHEMA_VERSION,
+            owner_id: "account-offering".into(),
+            session_id: "segmented-offering-session".into(),
+            branch_id: astra_turn_types::DEFAULT_CONVERSATION_BRANCH_ID.into(),
+            completed_turn: 1,
+            journal_event_seq: 1,
+            conversation_seq: 1,
+            canonical_root_hash: "b".repeat(64),
+            projection_schema: astra_turn_types::SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION,
+            compaction_generation: 0,
+            config_version_id: None,
+        };
+        let offering = astra_turn_types::ResumeProviderProjectionV1 {
+            offering_id: Some("runner-offer".into()),
+            model: Some("gpt-5".into()),
+            ..Default::default()
+        };
+        let continuation =
+            super::continuation_from_resume_bundle(astra_turn_types::ResumeBundleV1 {
+                schema_version: astra_turn_types::RESUME_BUNDLE_SCHEMA_VERSION,
+                cursor: cursor.clone(),
+                source: astra_turn_types::ResumeSourceV1::CanonicalJournal,
+                conversation_messages: messages,
+                materialized_conversation_root_hash: Some(materialized_root.clone()),
+                degraded_reasons: Vec::new(),
+                repair_actions: Vec::new(),
+                projections: astra_turn_types::ResumeProjectionSetV1 {
+                    provider: Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
+                        cursor.clone(),
+                        offering,
+                    )),
+                    ..Default::default()
+                },
+            })
+            .expect("causal Offering projection must survive CLI continuation");
+
+        assert_eq!(continuation.offering_id.as_deref(), Some("runner-offer"));
+
+        let mut unbound = continuation.resume.cursor.clone();
+        unbound.canonical_root_hash = "c".repeat(64);
+        let unbound_bundle = astra_turn_types::ResumeBundleV1 {
+            schema_version: astra_turn_types::RESUME_BUNDLE_SCHEMA_VERSION,
+            cursor: unbound,
+            source: astra_turn_types::ResumeSourceV1::CanonicalJournal,
+            conversation_messages: vec![json!({"role": "user", "content": "resume"})],
+            materialized_conversation_root_hash: Some(materialized_root),
+            degraded_reasons: Vec::new(),
+            repair_actions: Vec::new(),
+            projections: Default::default(),
+        };
+        // No provider payload means no implicit name-based Offering recovery.
+        assert_eq!(
+            super::continuation_from_resume_bundle(unbound_bundle)
+                .and_then(|continuation| continuation.offering_id),
+            None
         );
     }
 

@@ -34,6 +34,14 @@ A session is the continuity boundary for user-visible conversation, context, mem
 
 A session may span Web, CLI, Edge, and multiple devices. Surface changes do not create a new backbone.
 
+The canonical session head may carry a versioned provider projection for its
+causal boundary. When present, the projection records the exact opaque
+Offering selected at admission; resume may restore that identity only through
+the head's cursor-bound envelope. The display model name and workspace/session
+metadata are informational and cannot reconstruct an Offering. Older heads
+without this projection remain resumable for conversation history but must
+leave provider selection unresolved until a fresh explicit admission.
+
 ## Run
 
 A run is a durable execution attempt inside a session. It owns status, owner lease, checkpoint lineage, current stage, and terminal outcome.
@@ -54,6 +62,19 @@ archived
 ```
 
 A run may be resumed when its state and checkpoint indicate resumability. Resume must not guess from UI state.
+
+Resume reconciles the same canonical cursor and re-admits provider access under
+current policy. The exact Offering is a causal preference for that fresh
+admission, not a live grant or execution lease. A fork copies the parent's
+causal provider preference as a candidate, but performs fresh child admission;
+it never copies a live grant, credential, or in-flight invocation. If exact
+Offering provenance is absent or fails validation, the safe outcome is an
+unpinned resume that asks for a fresh explicit selection rather than a
+model-name lookup or first-eligible fallback.
+For headless one-shot entrypoints, an explicit `--model` is that fresh
+admission and takes precedence over the restored preference; a configured
+default is only a fallback for a new session and must not silently fill a
+missing Offering on resume.
 
 ## Turn
 

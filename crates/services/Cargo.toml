@@ -26,6 +26,7 @@ required-features = ["external-contract-tests"]
 [dependencies]
 astra-config.workspace = true
 astra-core.workspace = true
+astra-inference-adapter.workspace = true
 astra-logging.workspace = true
 astra-runtime-env.workspace = true
 astra-turn-types.workspace = true

@@ -160,7 +160,7 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
     );
     assert_eq!(
         models
-            .admit_model_offering(tokens.user_id.clone(), deployment.clone())
+            .revalidate_model_execution(tokens.user_id.clone(), deployment.clone())
             .await
             .unwrap_err()
             .0,
@@ -178,7 +178,7 @@ async fn memoria_refresh_revocation_and_deployment_model_isolation() {
     );
     assert_eq!(
         models
-            .admit_model_offering("local-test-user".into(), deployment.clone())
+            .revalidate_model_execution("local-test-user".into(), deployment.clone())
             .await
             .is_ok(),
         self_hosted

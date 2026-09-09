@@ -11,7 +11,9 @@ use super::client::{LlmCall, OwnedLlmExecutionRoute};
 use super::durable::DurableInferenceLedger;
 
 #[cfg(test)]
-use super::client::{global_llm_client, llm_nonstream_timeout};
+use super::client::llm_nonstream_timeout;
+#[cfg(test)]
+use super::transport::global_llm_client;
 
 #[derive(Clone)]
 struct DurableSummaryExecution {
@@ -35,7 +37,7 @@ pub(crate) struct DurableSummaryAttemptAllocator {
 }
 
 impl DurableSummaryAttemptAllocator {
-    fn reserve_pair_at_least(
+    pub(crate) fn reserve_pair_at_least(
         &self,
         scope_key: &str,
         durable_pair_base: u32,
@@ -275,7 +277,7 @@ impl SummaryLlmClient for RuntimeSummaryClient {
             #[cfg(test)]
             SummaryExecution::Direct => {
                 crate::turn::llm::client::call_llm_nonstream_no_tool_choice(
-                    global_llm_client(),
+                    global_llm_client().map_err(|error| error.to_string())?,
                     LlmCall {
                         purpose,
                         messages,
@@ -512,29 +514,34 @@ mod tests {
         astra_services::AdmittedModelExecution {
             offering_id: "summary-offering".to_string(),
             access_kind: astra_services::ModelAccessKind::SelfHosted,
-            execution_placement: astra_services::ModelExecutionPlacement::Server,
+            source: astra_services::ModelAdmissionSource::ServerCatalog,
+            execution_material: astra_services::ModelExecutionMaterial::Server(
+                astra_services::ServerModelExecutionMaterial {
+                    api_key: "summary-key".to_string(),
+                    base_url,
+                    header_overrides: HashMap::new(),
+                    completions_url_override: None,
+                    request_timeout_ms: None,
+                },
+            ),
             model_name: "summary-model".to_string(),
             wire_model_name: None,
-            api_key: "summary-key".to_string(),
-            base_url,
             provider: "openai".to_string(),
             cache_capability: None,
             thinking_capability: None,
             request_body_overrides: None,
             context_window: Some(8_192),
             max_completion_tokens: Some(1_024),
-            header_overrides: HashMap::new(),
-            completions_url_override: None,
-            request_timeout_ms: None,
         }
     }
 
     fn summary_route(execution: &astra_services::AdmittedModelExecution) -> OwnedLlmExecutionRoute {
+        let material = execution.server_material().expect("Server material");
         OwnedLlmExecutionRoute {
             model_name: execution.model_name.clone(),
             wire_model_name: None,
-            api_key: execution.api_key.clone(),
-            base_url: execution.base_url.clone(),
+            api_key: material.api_key.clone(),
+            base_url: material.base_url.clone(),
             provider: execution.provider.clone(),
             thinking_capability: None,
             header_overrides: HashMap::new(),
@@ -786,24 +793,7 @@ mod tests {
             }),
         );
         let base_url = spawn_summary_test_server(app).await;
-        let execution = astra_services::AdmittedModelExecution {
-            offering_id: "summary-offering".to_string(),
-            access_kind: astra_services::ModelAccessKind::SelfHosted,
-            execution_placement: astra_services::ModelExecutionPlacement::Server,
-            model_name: "summary-model".to_string(),
-            wire_model_name: None,
-            api_key: "summary-key".to_string(),
-            base_url: base_url.clone(),
-            provider: "openai".to_string(),
-            cache_capability: None,
-            thinking_capability: None,
-            request_body_overrides: None,
-            context_window: Some(8_192),
-            max_completion_tokens: Some(1_024),
-            header_overrides: HashMap::new(),
-            completions_url_override: None,
-            request_timeout_ms: None,
-        };
+        let execution = summary_execution(base_url.clone());
         let persistence = Arc::new(RecoverFirstAdmissionPersistence::default());
         persistence
             .recover_attempt_zero
@@ -827,7 +817,11 @@ mod tests {
             OwnedLlmExecutionRoute {
                 model_name: execution.model_name.clone(),
                 wire_model_name: None,
-                api_key: execution.api_key.clone(),
+                api_key: execution
+                    .server_material()
+                    .expect("Server material")
+                    .api_key
+                    .clone(),
                 base_url,
                 provider: execution.provider.clone(),
                 thinking_capability: None,

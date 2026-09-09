@@ -802,9 +802,7 @@ pub(crate) async fn complete_session_startup(
                             Some(&selection.name),
                             selection.context_window,
                         );
-                    crate::cli::slash::slash_config::set_active_offering_id_for_request(Some(
-                        selection.offering_id,
-                    ));
+                    state.offering_id = Some(selection.offering_id);
                     state.model = Some(selection.name);
                 }
                 session_runtime::ServerDefaultModel::NoModels => {
@@ -821,6 +819,37 @@ pub(crate) async fn complete_session_startup(
         && let Some(sid) = resume_session_id
     {
         slash_session::restore_session_into_state(sid, profile, api, state).await?;
+    }
+
+    // Restoring a session may legitimately replace its display model and
+    // causal Offering. A model explicitly supplied for this process is a new
+    // admission, however, so it must be re-applied after restore. Resolve it
+    // through the authoritative catalog; an unavailable choice stays
+    // fail-closed instead of falling through to a namesake or Server default.
+    if let Some(explicit_model) = cli_context.explicit_model.as_deref() {
+        state.model = Some(explicit_model.to_string());
+        state.offering_id = None;
+        state.provider_selection_requires_explicit = false;
+        match startup_token.as_deref() {
+            Some(token) => {
+                let _ = session_runtime::ensure_state_default_model(api, token, state).await;
+                if state.offering_id.is_none() {
+                    state.provider_selection_requires_explicit = true;
+                    eprintln!(
+                        "  {} Model '{}' is unavailable. No other model was selected; use /model to choose an available connection.",
+                        theme::icon_warn(),
+                        explicit_model
+                    );
+                }
+            }
+            None => {
+                state.provider_selection_requires_explicit = true;
+                eprintln!(
+                    "  {} Sign in to use the requested model, then select it with /model. No other model was selected.",
+                    theme::icon_warn()
+                );
+            }
+        }
     }
 
     print_session_banner(profile, state);

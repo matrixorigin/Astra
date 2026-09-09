@@ -10,8 +10,8 @@ mod dns;
 mod proxy;
 
 /// Keeps any private CONNECT tunnel alive for the entire response/stream lifetime.
-pub struct EndpointClient {
-    client: reqwest::Client,
+pub struct EndpointClient<T = reqwest::Client> {
+    client: T,
     tunnel: Option<tokio::task::JoinHandle<()>>,
 }
 impl From<reqwest::Client> for EndpointClient {
@@ -22,13 +22,13 @@ impl From<reqwest::Client> for EndpointClient {
         }
     }
 }
-impl std::ops::Deref for EndpointClient {
-    type Target = reqwest::Client;
+impl<T> std::ops::Deref for EndpointClient<T> {
+    type Target = T;
     fn deref(&self) -> &Self::Target {
         &self.client
     }
 }
-impl Drop for EndpointClient {
+impl<T> Drop for EndpointClient<T> {
     fn drop(&mut self) {
         if let Some(task) = &self.tunnel {
             task.abort();
@@ -169,6 +169,7 @@ pub async fn require_endpoint_policy_with_mode(
 fn transport_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .no_proxy()
+        .retry(reqwest::retry::never())
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(360))
@@ -181,6 +182,7 @@ fn validate_addresses(addresses: &[SocketAddr]) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 fn pinned_client(url: &reqwest::Url, addresses: &[SocketAddr]) -> Result<reqwest::Client, String> {
     validate_addresses(addresses)?;
     transport_builder()
@@ -194,13 +196,44 @@ fn pinned_client(url: &reqwest::Url, addresses: &[SocketAddr]) -> Result<reqwest
 /// Resolve and pin a fresh public address set for each outbound attempt.
 /// TLS still validates the original hostname. Redirects never forward keys.
 pub async fn endpoint_client(raw: &str) -> Result<EndpointClient, String> {
+    endpoint_client_with(raw, |builder| {
+        builder
+            .build()
+            .map_err(|_| "Unable to create model HTTP client".into())
+    })
+    .await
+}
+
+/// Same DNS/egress owner as credential probes, with exact-wire inference
+/// transport. The returned guard owns the tunnel for the entire response.
+pub async fn endpoint_transport(
+    raw: &str,
+) -> Result<EndpointClient<astra_inference_adapter::transport::ProviderTransport>, String> {
+    endpoint_client_with(raw, |builder| {
+        astra_inference_adapter::transport::ProviderTransport::build(builder)
+            .map_err(|_| "Unable to create model inference transport".into())
+    })
+    .await
+}
+
+async fn endpoint_client_with<T>(
+    raw: &str,
+    build: impl FnOnce(reqwest::ClientBuilder) -> Result<T, String>,
+) -> Result<EndpointClient<T>, String> {
     let url = parse_endpoint(raw)?;
     let proxy = proxy::EgressProxy::parse(configured_value(proxy::PROXY_ENV)?.as_deref())?;
     let addresses = dns::resolve(&url, configured_value(dns::DNS_SERVERS_ENV)?.as_deref()).await?;
     validate_addresses(&addresses)?;
     match proxy {
-        Some(proxy) => proxy::client(&url, &addresses, proxy, transport_builder()).await,
-        None => pinned_client(&url, &addresses).map(EndpointClient::from),
+        Some(proxy) => {
+            proxy::client_with(&url, &addresses, proxy, transport_builder(), build).await
+        }
+        None => Ok(EndpointClient {
+            client: build(
+                transport_builder().resolve_to_addrs(url.host_str().unwrap(), &addresses),
+            )?,
+            tunnel: None,
+        }),
     }
 }
 

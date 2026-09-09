@@ -13,7 +13,8 @@ use astra_turn_types::InferencePurpose;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::turn::llm::client::{LlmCall, LlmExecutionRoute, global_llm_client};
+use crate::turn::llm::client::{LlmCall, LlmExecutionRoute};
+use crate::turn::llm::transport::global_llm_client;
 
 #[cfg(test)]
 use crate::turn::llm::client::call_llm_nonstream;
@@ -149,7 +150,7 @@ impl MemoryInferencePort for DurableMemoryInferenceClient {
             &self.encryptor,
             &self.user_id,
             &self.offering_id,
-            Some(self.shared_pool.get()),
+            Some(&self.shared_pool),
         )
         .await
         .map_err(|error| {
@@ -158,13 +159,16 @@ impl MemoryInferencePort for DurableMemoryInferenceClient {
                 format!("Memory model admission failed: {error}"),
             )
         })?;
+        let material = execution.server_material().map_err(|error| {
+            astra_core::ClassifiedError::new(astra_core::ErrorKind::PolicyDenied, error)
+        })?;
         let direct = DirectMemoryInferenceClient {
-            base_url: execution.base_url.clone(),
-            api_key: execution.api_key.clone(),
+            base_url: material.base_url.clone(),
+            api_key: material.api_key.clone(),
             model_name: execution.model_name.clone(),
             wire_model_name: execution.wire_model_name.clone(),
             provider: execution.provider.clone(),
-            header_overrides: execution.header_overrides.clone(),
+            header_overrides: material.header_overrides.clone(),
             request_body_overrides: execution.request_body_overrides.clone(),
             completions_url_override: None,
             request_timeout: None,
@@ -176,7 +180,7 @@ impl MemoryInferencePort for DurableMemoryInferenceClient {
         );
         let result = ledger
             .execute_nonstream(
-                global_llm_client(),
+                global_llm_client()?,
                 request.invocation_scope.clone(),
                 LlmCall {
                     purpose: request.purpose,
@@ -230,7 +234,7 @@ impl MemoryInferencePort for DirectMemoryInferenceClient {
         request: MemoryInferenceRequest<'_>,
     ) -> Result<String, astra_core::ClassifiedError> {
         let result = call_llm_nonstream(
-            global_llm_client(),
+            global_llm_client()?,
             LlmCall {
                 purpose: request.purpose,
                 messages: request.messages,

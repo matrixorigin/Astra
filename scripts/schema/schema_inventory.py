@@ -290,6 +290,16 @@ TABLE_METADATA: dict[str, TableMetadata] = {
         migration_owner="astra_services::storage / inference_execution",
         product_owner="provider canonical context durability, bounded recovery, and multi-session isolation",
     ),
+    "runner_model_binding_publications": TableMetadata(
+        semantic_owner="astra_services::runner_model_bindings (Model Access)",
+        state_class="immutable personal Runner binding publication and idempotent receipt",
+        primary_query="latest binding revision and operation receipt by authenticated user, runner, journal, binding or operation",
+        retention_policy="retain all receipts while a journal is enrolled; retired journals remain through referenced inference route retention and are removed only with owner deletion",
+        rebuildability="not rebuildable from Runner presence or current local configuration; publication revision and replay receipts are durable authority",
+        merge_guidance="one append-only publication owner; edge_agent_registry serializes the enrolled journal publication counter; no independent presence or model lifecycle table",
+        migration_owner="astra_services::storage / runner_model_bindings",
+        product_owner="personal Model Access, immutable binding revisions, and replay isolation",
+    ),
     "inference_provider_attempts": TableMetadata(
         semantic_owner="astra_services::inference_execution",
         state_class="durable upstream inference delivery attempt fact",

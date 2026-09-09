@@ -793,6 +793,7 @@ async fn lock_parent_head(
         total_canonical_bytes,
         total_message_count,
         writer_epoch: current_head.writer_epoch,
+        provider_projection: node.provider_projection.clone(),
     })
 }
 
@@ -1123,6 +1124,7 @@ mod tests {
             conversation_seq: u64::from(turn),
             compaction_generation: 0,
             config_version_id: None,
+            provider_projection: None,
             mode: astra_turn_types::CanonicalDeltaModeV1::Append,
             logical_segments: vec![vec![
                 json!({"role":"user","content":format!("question-{turn}")}),
@@ -1425,6 +1427,7 @@ mod tests {
                     conversation_seq: 1,
                     compaction_generation: 0,
                     config_version_id: None,
+                    provider_projection: None,
                     mode: astra_turn_types::CanonicalDeltaModeV1::Append,
                     logical_segments: vec![vec![json!({
                         "role": "user",

@@ -5257,6 +5257,18 @@ async fn apply_restored_session(
         .max(local_state.total_cache_creation_tokens);
     let prepared_workspace = load_prepared_workspace_restore(&restored)?;
     let prepared_history = prepare_session_history(&restored.session_id).await?;
+    // Keep track of a remote provider preference before causal selection can
+    // discard that bundle in favour of a newer local generation. The local
+    // journal currently carries no exact Offering projection, so losing a
+    // remote preference must not turn into an implicit Server default.
+    let remote_provider_preference_exists =
+        typed_continuation.as_ref().is_some_and(|continuation| {
+            continuation.offering_id.is_some()
+                || restored
+                    .model
+                    .as_deref()
+                    .is_some_and(|model| !model.trim().is_empty())
+        });
     let use_typed_continuation = match (
         prepared_history.resume.as_ref(),
         typed_continuation.as_ref(),
@@ -5268,9 +5280,19 @@ async fn apply_restored_session(
                 session_continuation::portable_resume_descriptor(local.clone()),
                 session_continuation::portable_resume_descriptor(remote.resume.clone()),
             ];
-            astra_turn_types::select_resume_candidate_index(None, &candidates).map_err(|error| {
-                format!("TUI resume candidates are causally inconsistent: {error}")
-            })? == 1
+            let selected = astra_turn_types::select_resume_candidate_index(None, &candidates)
+                .map_err(|error| {
+                    format!("TUI resume candidates are causally inconsistent: {error}")
+                })?;
+            // At one exact cursor, the remote canonical bundle may carry the
+            // only durable provider projection. Prefer that richer side
+            // projection over the otherwise tie-winning local replica; the
+            // conversation root and cursor are still required to match.
+            let same_cursor = astra_turn_types::cursor_relation(
+                &session_continuation::portable_resume_cursor(local.cursor.clone()),
+                &session_continuation::portable_resume_cursor(remote.resume.cursor.clone()),
+            ) == astra_turn_types::CursorRelationV1::Exact;
+            selected == 1 || (same_cursor && remote.offering_id.is_some())
         }
     };
     let selected_cursor = if use_typed_continuation {
@@ -5309,6 +5331,16 @@ async fn apply_restored_session(
     } else {
         &[]
     };
+    // A restored session is still a resume when older persistence has no
+    // provider projection and no display model. Preserve that fact so the
+    // normal model-default path cannot silently move the next turn to an
+    // unrelated Server Offering. A current explicit selection clears this
+    // guard at the public selection boundaries.
+    let restored_session_has_resume_context = had_resume_bundle
+        || restored.turn_count > 0
+        || !restored.conversation_messages.is_empty()
+        || !prepared_history.history.is_empty()
+        || prepared_history.resume.is_some();
     let mut restored_activation = if use_restored_projection {
         restored.activated_deferred_tool_names.clone()
     } else {
@@ -5587,7 +5619,27 @@ async fn apply_restored_session(
         }
     }
     crate::cli::slash::slash_config::set_active_model_for_display(state.model.clone());
-    crate::cli::slash::slash_config::set_active_offering_id_for_request(None);
+    // Only a causally selected provider projection may restore an Offering.
+    // Display model metadata and local workspace state are deliberately not
+    // authority, so legacy generations remain unpinned until the user picks
+    // an Offering again.
+    state.offering_id = if use_typed_continuation {
+        typed_continuation
+            .as_ref()
+            .and_then(|continuation| continuation.offering_id.clone())
+    } else {
+        None
+    };
+    state.provider_selection_requires_explicit = (restored_session_has_resume_context
+        && state.offering_id.is_none())
+        || (!use_typed_continuation && remote_provider_preference_exists)
+        || (state.model.is_some() && state.offering_id.is_none());
+    if state.provider_selection_requires_explicit {
+        eprintln!(
+            "  {} This session's previous model connection cannot be restored safely. Your history is available; use /model to select a connection before continuing.",
+            theme::icon_warn()
+        );
+    }
 
     if use_typed_continuation {
         state.history = session_continuation::history_pairs_from_messages(restored_resume_messages);
@@ -6616,6 +6668,36 @@ mod resume_tests {
                 .iter()
                 .any(|(_, assistant)| assistant == "done")
         );
+        assert!(
+            state.provider_selection_requires_explicit,
+            "a typed resume without a provider projection must not fall back to a Server default"
+        );
+        assert!(state.offering_id.is_none());
+    }
+
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn legacy_resume_without_provider_or_model_requires_explicit_selection() {
+        let (_tmp, _guard) = crate::tests::isolated_sessions_dir();
+        let session_id = format!("resume-legacy-provider-{}", uuid::Uuid::new_v4());
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        write_local_resumable_session(&session_id, 1);
+
+        let restored = RestoredSession {
+            session_id,
+            turn_count: 1,
+            model: None,
+            restored_from_cloud: false,
+            ..Default::default()
+        };
+        let mut state = SessionState::default();
+
+        apply_restored_session(None, &api, &mut state, restored)
+            .await
+            .expect("legacy local resume should remain readable");
+
+        assert!(state.provider_selection_requires_explicit);
+        assert!(state.offering_id.is_none());
     }
 
     #[serial_test::serial]

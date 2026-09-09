@@ -79,6 +79,15 @@ pub struct RestoredSession {
     pub budget_remaining_tokens: u64,
     /// Remaining turn rounds
     pub budget_remaining_rounds: u32,
+    /// Durable provider-round cursor captured with the canonical message
+    /// boundary.  Legacy checkpoints deserialize as zero and are handled as
+    /// degraded candidates by the owning runtime.
+    pub llm_rounds_completed: u32,
+    /// Agent-loop iteration captured with the checkpoint.
+    pub current_round_index: u32,
+    /// Runner custody receipts bound to the restored canonical checkpoint.
+    pub runner_continuation_receipts:
+        Vec<astra_turn_types::runner_inference::RunnerInferenceContinuationReceipt>,
     /// Tools currently blocked (from stall/health tracking)
     pub blocked_tools: Vec<String>,
     /// Recently used tools (for selection context)
@@ -220,6 +229,9 @@ fn build_restored_session(
         messages: heavy.messages,
         budget_remaining_tokens: heavy.budget_remaining_tokens,
         budget_remaining_rounds: heavy.budget_remaining_rounds,
+        llm_rounds_completed: heavy.llm_rounds_completed,
+        current_round_index: heavy.current_round_index,
+        runner_continuation_receipts: heavy.runner_continuation_receipts,
         blocked_tools: heavy.blocked_tools,
         recent_tools: heavy.recent_tools,
         activated_deferred_tool_names: heavy.activated_deferred_tool_names,
@@ -528,6 +540,9 @@ mod tests {
             messages,
             budget_remaining_tokens: 50000,
             budget_remaining_rounds: 5,
+            llm_rounds_completed: 0,
+            current_round_index: 0,
+            runner_continuation_receipts: Vec::new(),
             blocked_tools,
             recent_tools: vec!["git".to_string()],
             activated_deferred_tool_names: Vec::new(),
@@ -685,6 +700,9 @@ mod tests {
             messages: vec![serde_json::json!({"role": "user", "content": "hello"})],
             budget_remaining_tokens: 50000,
             budget_remaining_rounds: 5,
+            llm_rounds_completed: 0,
+            current_round_index: 0,
+            runner_continuation_receipts: Vec::new(),
             blocked_tools: vec!["bash".to_string()],
             recent_tools: vec!["git".to_string()],
             activated_deferred_tool_names: Vec::new(),
@@ -705,6 +723,24 @@ mod tests {
         assert!(summary.contains("messages=1"));
         assert!(summary.contains("blocked=1"));
         assert!(summary.contains("budget_tokens=50000"));
+    }
+
+    #[test]
+    fn restore_preserves_provider_round_cursor_with_checkpoint_boundary() {
+        let mut checkpoint = make_heavy_checkpoint(
+            4,
+            vec![serde_json::json!({"role": "user", "content": "resume"})],
+            vec![],
+        );
+        checkpoint.llm_rounds_completed = 3;
+        checkpoint.current_round_index = 5;
+
+        let serialized = serde_json::to_string(&checkpoint).expect("checkpoint serializes");
+        let restored: HeavyCheckpoint =
+            serde_json::from_str(&serialized).expect("checkpoint restores");
+
+        assert_eq!(restored.llm_rounds_completed, 3);
+        assert_eq!(restored.current_round_index, 5);
     }
 
     // ── Event-based cache warming ──

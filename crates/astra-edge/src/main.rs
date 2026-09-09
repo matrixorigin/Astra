@@ -89,6 +89,19 @@ struct Args {
     /// Auto-reconnect on disconnect
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     reconnect: bool,
+
+    /// Host only local model inference. This process never advertises or
+    /// constructs a tool executor; provider credentials stay on this boundary.
+    #[arg(long)]
+    inference_only: bool,
+
+    /// Internal account fence for a CLI-managed inference attachment.
+    #[arg(long, hide = true, requires = "inference_only")]
+    expected_inference_owner: Option<String>,
+
+    /// Private local lifecycle; never enables the tool Runner.
+    #[arg(long, hide = true, requires = "expected_inference_owner")]
+    managed_inference_host: bool,
 }
 
 #[derive(Debug)]
@@ -101,10 +114,194 @@ struct EdgeConfig {
     edge_id: String,
     reconnect: bool,
     invocation_journal_root: Option<PathBuf>,
+    inference_only: bool,
+    expected_inference_owner: Option<String>,
+    /// A managed inference host authenticates with this explicit profile on
+    /// every connection attempt.  It must not fall back to ASTRA_TOKEN or a
+    /// token from an unrelated environment.
+    managed_profile: Option<String>,
+    #[cfg(unix)]
+    managed_host: Option<Arc<astra_edge::local_host::ManagedHost>>,
+    inference_host:
+        tokio::sync::Mutex<Option<(String, Arc<astra_edge::inference_host::InferenceHost>)>>,
 }
 
 #[derive(Debug)]
 struct PermanentEdgeConnectionError(String);
+
+fn validate_inference_owner(
+    expected: Option<&str>,
+    actual: &str,
+) -> Result<(), PermanentEdgeConnectionError> {
+    if expected.is_some_and(|owner| owner != actual) {
+        return Err(PermanentEdgeConnectionError("Local inference account changed. Sign in to the intended profile and restart Astra; no local model credentials were loaded.".into()));
+    }
+    Ok(())
+}
+
+/// Resolve the credential for a CLI-managed inference host from the selected
+/// profile, while keeping the authenticated account fence explicit.  This is
+/// intentionally a small wrapper around the canonical profile loader: the
+/// managed host has no independent refresh authority and never consults the
+/// ASTRA_TOKEN* environment variables.
+fn managed_profile_token_from_credentials(
+    creds: &CredentialsFile,
+    profile_name: &str,
+    expected_owner: &str,
+) -> Result<String, PermanentEdgeConnectionError> {
+    let profile = creds.profiles.get(profile_name).ok_or_else(|| {
+        PermanentEdgeConnectionError(format!(
+            "selected Astra profile '{profile_name}' is unavailable; sign in again"
+        ))
+    })?;
+    if profile.account_id.as_deref() != Some(expected_owner) {
+        return Err(PermanentEdgeConnectionError(
+            "selected Astra profile no longer belongs to the managed local inference account; sign in to the intended profile and restart Astra".into(),
+        ));
+    }
+    let (_, token) = token_from_credentials(creds, Some(profile_name)).map_err(|_| {
+        PermanentEdgeConnectionError(
+            "selected Astra profile is not authenticated; sign in again before using local inference".into(),
+        )
+    })?;
+    if token.trim().is_empty() {
+        return Err(PermanentEdgeConnectionError(
+            "selected Astra profile has no usable access token; sign in again before using local inference".into(),
+        ));
+    }
+    Ok(token)
+}
+
+fn load_managed_profile_token(
+    profile_name: &str,
+    expected_owner: &str,
+) -> Result<String, PermanentEdgeConnectionError> {
+    let creds = CredentialStore::new().load().map_err(|_| {
+        PermanentEdgeConnectionError(
+            "cannot read the selected Astra profile; local inference is unavailable until credentials are repaired".into(),
+        )
+    })?;
+    managed_profile_token_from_credentials(&creds, profile_name, expected_owner)
+}
+
+async fn next_connection_token(
+    config: &EdgeConfig,
+) -> Result<String, PermanentEdgeConnectionError> {
+    if let Some(profile_name) = config.managed_profile.as_deref() {
+        let expected_owner = config.expected_inference_owner.as_deref().ok_or_else(|| {
+            PermanentEdgeConnectionError(
+                "managed local inference is missing its authenticated account fence".into(),
+            )
+        })?;
+        // Reload only at the connection boundary.  A WebSocket Authorization
+        // header cannot be changed in place; the next reconnect must observe a
+        // profile refresh without creating a second background token owner.
+        load_managed_profile_token(profile_name, expected_owner)
+    } else {
+        Ok(config.token_manager.snapshot().await)
+    }
+}
+
+async fn local_inference_host(
+    config: &EdgeConfig,
+    user_id: String,
+) -> Result<
+    Arc<astra_edge::inference_host::InferenceHost>,
+    astra_edge::inference_host::InferenceHostError,
+> {
+    use astra_credentials::{LocalModelConfigStore, ResolvedLocalCredential};
+    use astra_edge::inference_host::{InferenceHost, InferenceHostError, InferenceOwner};
+    use astra_inference_adapter::transport::ProviderTransport;
+    use astra_turn_types::runner_inference::RunnerInferenceId;
+
+    validate_inference_owner(config.expected_inference_owner.as_deref(), &user_id)
+        .map_err(|_| InferenceHostError::OwnerMismatch)?;
+    let scope = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&(&config.server_url, &user_id, &config.edge_id))
+                .map_err(|_| InferenceHostError::OwnerMismatch)?,
+        )
+    );
+    let mut cached = config.inference_host.lock().await;
+    if let Some((existing_scope, host)) = cached.as_ref() {
+        if existing_scope != &scope {
+            return Err(InferenceHostError::OwnerMismatch);
+        }
+        return Ok(host.clone());
+    }
+    let model_scope = astra_credentials::LocalModelScope::for_owner(&config.server_url, &user_id)
+        .map_err(|_| InferenceHostError::OwnerMismatch)?;
+    let models_path = model_scope.models().path().to_owned();
+    let local_root = model_scope.root().to_owned();
+    // Provider traffic follows the shared external-egress policy. Proxy
+    // credentials and NO_PROXY stay in this local process and never enter a
+    // binding publication or Server request.
+    let transport = ProviderTransport::build(
+        astra_core::net::runner_provider_client_builder()
+            .map_err(|_| InferenceHostError::InvalidRequest)?,
+    )
+    .map_err(|_| InferenceHostError::InvalidRequest)?;
+    let host = InferenceHost::open(
+        local_root.join("runner-inference").join(&scope),
+        InferenceOwner {
+            deployment_identity: config.server_url.clone(),
+            user_id,
+            runner_id: RunnerInferenceId::new(config.edge_id.clone())
+                .map_err(|_| InferenceHostError::OwnerMismatch)?,
+        },
+        models_path.clone(),
+        local_root.join("model-secrets"),
+        transport,
+    )
+    .await?;
+    #[cfg(unix)]
+    if let Some(control) = &config.managed_host {
+        control.install(host.clone()).await?;
+        *cached = Some((scope, host.clone()));
+        return Ok(host);
+    }
+    // This standalone executable is itself the attaching terminal. Refreshing
+    // the attachment lets an already-running TUI publish a newly configured
+    // environment-backed model without ever sending the value to Server.
+    async fn refresh_environment(
+        host: &Arc<InferenceHost>,
+        path: &std::path::Path,
+    ) -> Result<(), InferenceHostError> {
+        let path = path.to_owned();
+        let models =
+            tokio::task::spawn_blocking(move || LocalModelConfigStore::with_path(path).load())
+                .await
+                .map_err(|_| InferenceHostError::BindingUnavailable)?
+                .map_err(|_| InferenceHostError::BindingUnavailable)?;
+        let mut credentials = Vec::new();
+        for (name, model) in &models.models {
+            if let Ok(Some(credential)) =
+                ResolvedLocalCredential::from_environment(&model.credential, |name| {
+                    std::env::var(name).ok()
+                })
+            {
+                credentials.push((name.clone(), model.binding_revision, credential));
+            }
+        }
+        host.refresh_environment(models.revision, credentials).await
+    }
+    refresh_environment(&host, &models_path).await?;
+    let attachment_host = host.clone();
+    let attachment_path = models_path.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if let Err(error) = refresh_environment(&attachment_host, &attachment_path).await {
+                tracing::debug!(category = %error, "local environment attachment refresh deferred");
+            }
+        }
+    });
+    *cached = Some((scope, host.clone()));
+    Ok(host)
+}
 
 impl std::fmt::Display for PermanentEdgeConnectionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -367,6 +564,11 @@ fn token_from_credentials(
         .access_token
         .clone()
         .ok_or_else(|| format!("profile '{profile_name}' is not logged in; run `astra login`"))?;
+    if token.trim().is_empty() {
+        return Err(format!(
+            "profile '{profile_name}' is not logged in; run `astra login`"
+        ));
+    }
     Ok((profile_name, token))
 }
 
@@ -384,7 +586,42 @@ fn resolve_token(args: &Args) -> Result<String, String> {
 
 fn resolve_config(args: Args) -> Result<EdgeConfig, String> {
     let raw_server_url = args.server_url.clone().unwrap_or_else(default_server_url);
-    let workspace_dir = canonical_workspace_dir(&args.workspace_dir)?;
+    // Managed inference is bound to one explicit CLI profile for the entire
+    // process lifetime. Read it once for startup validation, then reload the
+    // same named profile at every reconnect; never use --token/ASTRA_TOKEN as
+    // a fallback for this private host.
+    let managed_profile_and_token = if args.managed_inference_host {
+        let expected_owner = args
+            .expected_inference_owner
+            .as_deref()
+            .ok_or("Missing local inference owner")?;
+        let credentials = CredentialStore::new()
+            .load()
+            .map_err(|error| format!("failed to read Astra credentials: {error}"))?;
+        let profile_name = CredentialStore::resolve_profile_name(
+            args.profile.as_deref(),
+            credentials.current_profile.as_deref(),
+        );
+        let token =
+            managed_profile_token_from_credentials(&credentials, &profile_name, expected_owner)
+                .map_err(|error| error.to_string())?;
+        Some((profile_name, token))
+    } else {
+        None
+    };
+    let workspace_dir = if args.inference_only {
+        // Inference needs no checkout, tool workspace, or retained workspace
+        // token. The selected deployment/account owns its private state.
+        if let Some(owner) = args.expected_inference_owner.as_deref() {
+            astra_credentials::LocalModelScope::for_owner(&raw_server_url, owner)?
+                .root()
+                .to_owned()
+        } else {
+            astra_core::local_state::local_state_root().join("inference-auth")
+        }
+    } else {
+        canonical_workspace_dir(&args.workspace_dir)?
+    };
     // Prefer a valid persisted moi-user-token-v1 (written by a prior renewal)
     // over the env/flag token; astra JWT flows are untouched.
     let token_file = token_renewal::resolve_token_file_path(&workspace_dir);
@@ -396,8 +633,17 @@ fn resolve_config(args: Args) -> Result<EdgeConfig, String> {
     // reuses the workspace volume injects a fresh env token while the file
     // still holds the previous (revoked-but-unexpired) one; preferring the
     // file unconditionally would leave the edge permanently rejected.
-    let env_token = resolve_token(&args);
-    let file_token = token_renewal::read_valid_file_token(&token_file, now);
+    let env_token: Result<String, String> = match &managed_profile_and_token {
+        Some((_, token)) => Ok(token.clone()),
+        None => resolve_token(&args),
+    };
+    let file_token = if args.inference_only {
+        // Missing selected credentials must not silently attach local model
+        // capacity as the owner of a retained workspace token.
+        None
+    } else {
+        token_renewal::read_valid_file_token(&token_file, now)
+    };
     let mut fallback_token = None;
     let token = match (file_token, &env_token) {
         (Some(file_token), Ok(env)) => {
@@ -472,10 +718,32 @@ fn resolve_config(args: Args) -> Result<EdgeConfig, String> {
         }
         (None, _) => env_token?,
     };
-    let edge_id = args
+    let mut edge_id = args
         .edge_id
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| default_edge_id(&workspace_dir));
+    #[cfg(unix)]
+    let managed_host = if args.managed_inference_host {
+        let scope = astra_credentials::LocalModelScope::for_owner(
+            &raw_server_url,
+            args.expected_inference_owner
+                .as_deref()
+                .ok_or("Missing local inference owner")?,
+        )?;
+        let installation = astra_edge::local_host::Installation::open(&scope)
+            .map_err(|error| error.to_string())?;
+        edge_id = installation.runner_id.clone();
+        Some(
+            astra_edge::local_host::ManagedHost::bind(installation)
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    if args.managed_inference_host {
+        return Err("Managed local inference is not supported on this platform".into());
+    }
     Ok(EdgeConfig {
         server_url: edge_ws_url(&raw_server_url)?,
         token_manager: token_manager::TokenManager::new(token, fallback_token, token_file),
@@ -483,6 +751,12 @@ fn resolve_config(args: Args) -> Result<EdgeConfig, String> {
         edge_id,
         reconnect: args.reconnect,
         invocation_journal_root: astra_runtime_env::local_state_root_override(),
+        inference_only: args.inference_only,
+        expected_inference_owner: args.expected_inference_owner,
+        managed_profile: managed_profile_and_token.map(|(profile, _)| profile),
+        #[cfg(unix)]
+        managed_host,
+        inference_host: tokio::sync::Mutex::new(None),
     })
 }
 
@@ -531,6 +805,17 @@ fn edge_runtime_environment_capabilities(edge_id: &str, workspace: &Path) -> Val
         [astra_server_types::edge_ws_protocol::RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY] =
         Value::Bool(true);
     advertisement
+}
+
+fn edge_auth_message(edge_id: &str, workspace: &Path, inference_only: bool) -> EdgeClientMessage {
+    EdgeClientMessage::Auth {
+        edge_agent_id: edge_id.to_owned(),
+        interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.to_string(),
+        hostname: hostname::get().ok().and_then(|h| h.into_string().ok()),
+        workspace_dir: (!inference_only).then(|| workspace.to_string_lossy().to_string()),
+        capabilities: (!inference_only)
+            .then(|| edge_runtime_environment_capabilities(edge_id, workspace)),
+    }
 }
 
 // ─── Proxy helpers ───────────────────────────────────────────────────────────
@@ -896,7 +1181,10 @@ fn edge_ws_request(
 
 // ─── Connection loop ─────────────────────────────────────────────────────────
 
-async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_edge_connection(
+    config: &EdgeConfig,
+    token_snapshot: String,
+) -> Result<(), Box<dyn std::error::Error>> {
     let url = config.server_url.clone();
 
     tracing::info!(url = %url, edge_id = %config.edge_id, "Connecting to server...");
@@ -928,9 +1216,6 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
         })
     };
 
-    // Snapshot the live token per connection attempt: the renewal task may
-    // have replaced it since the previous (re)connect.
-    let token_snapshot = config.token_manager.snapshot().await;
     let ws_stream = if let Some(ref proxy_url) = proxy {
         connect_via_proxy(&url, proxy_url, &token_snapshot)
             .await
@@ -964,20 +1249,15 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
     tracing::info!("WebSocket connected, authenticating...");
 
     // Send auth
-    let hostname = hostname::get().ok().and_then(|h| h.into_string().ok());
-    let workspace = canonical_workspace_dir(&config.workspace_dir).map_err(|e| {
+    let workspace = if config.inference_only {
+        Ok(config.workspace_dir.clone())
+    } else {
+        canonical_workspace_dir(&config.workspace_dir)
+    }
+    .map_err(|e| {
         Box::new(std::io::Error::new(std::io::ErrorKind::NotFound, e)) as Box<dyn std::error::Error>
     })?;
-    let auth_msg = EdgeClientMessage::Auth {
-        edge_agent_id: config.edge_id.clone(),
-        interaction_api_major: astra_server_types::AGENT_INTERACTION_API_MAJOR.to_string(),
-        hostname,
-        workspace_dir: Some(workspace.to_string_lossy().to_string()),
-        capabilities: Some(edge_runtime_environment_capabilities(
-            &config.edge_id,
-            &workspace,
-        )),
-    };
+    let auth_msg = edge_auth_message(&config.edge_id, &workspace, config.inference_only);
     write
         .send(Message::Text(serde_json::to_string(&auth_msg)?.into()))
         .await?;
@@ -986,7 +1266,7 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
     let auth_timeout = Duration::from_secs(EDGE_AUTH_TIMEOUT_SECS);
     let auth_response = tokio::time::timeout(auth_timeout, read.next()).await;
 
-    match auth_response {
+    let authenticated_user = match auth_response {
         Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<EdgeServerMessage>(&text)
         {
             Ok(EdgeServerMessage::AuthOk {
@@ -1003,8 +1283,14 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                 // a later expiry (the renewal task owns forward progress).
                 // The token that just proved itself is the SNAPSHOT this
                 // connection authenticated with. The manager applies the
-                // generation rule and owns any persistence retry.
-                config.token_manager.mark_proven(&token_snapshot).await;
+                // generation rule and owns any persistence retry. Managed
+                // inference deliberately bypasses this manager: its profile
+                // file is the sole credential/refresh authority and must not
+                // be overwritten by the edge process.
+                if config.managed_profile.is_none() {
+                    config.token_manager.mark_proven(&token_snapshot).await;
+                }
+                user_id
             }
             Ok(EdgeServerMessage::AuthError { message }) => {
                 tracing::error!(
@@ -1035,7 +1321,54 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
             );
             return Err("Auth timeout or connection closed".into());
         }
+    };
+
+    validate_inference_owner(
+        config.expected_inference_owner.as_deref(),
+        &authenticated_user,
+    )?;
+    if config.inference_only {
+        let host = local_inference_host(config, authenticated_user).await?;
+        #[cfg(unix)]
+        if let Some(control) = &config.managed_host {
+            control.report_status(astra_edge::local_host::HostStatus::Ready);
+        }
+        let mut worker = astra_edge::inference_connection::InferenceConnectionWorker::spawn(host);
+        let mut heartbeat =
+            tokio::time::interval(Duration::from_secs(EDGE_HEARTBEAT_INTERVAL_SECS));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                frame = read.next() => match frame {
+                    Some(Ok(Message::Text(text))) => match decode_edge_server_message(&text) {
+                        Ok(EdgeServerMessage::Closing { .. }) => break,
+                        Ok(message) if message.is_inference_message() => {
+                            if worker.commands.try_send(message).is_err() { break; }
+                        }
+                        Ok(EdgeServerMessage::ToolRequest { .. }) => {
+                            // Even a stale/malicious dispatch cannot cross the capacity boundary.
+                            tracing::warn!("Tool dispatch rejected by inference-only Runner");
+                            break;
+                        }
+                        _ => {}
+                    },
+                    Some(Ok(Message::Ping(data))) => { write.send(Message::Pong(data)).await?; }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    _ => {}
+                },
+                message = worker.messages.recv() => match message {
+                    Some(message) => write.send(Message::Text(serde_json::to_string(&message)?.into())).await?,
+                    None => break,
+                },
+                _ = heartbeat.tick() => {
+                    write.send(Message::Text(serde_json::to_string(&EdgeClientMessage::Ping {})?.into())).await?;
+                }
+            }
+        }
+        return Ok(());
     }
+    // A general-purpose tool Runner never opens model configuration/secrets.
+    let mut inference: Option<astra_edge::inference_connection::InferenceConnectionWorker> = None;
 
     let session_id = format!("edge-{}", &uuid::Uuid::new_v4().to_string()[..8]);
     let executor = Arc::new(astra_tools::executor::DefaultToolExecutor::for_workspace(
@@ -1292,8 +1625,26 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                             Ok(EdgeServerMessage::AuthOk { .. } | EdgeServerMessage::AuthError { .. }) => {
                                 // ignore duplicate auth
                             }
+                            Ok(message @ (EdgeServerMessage::InferenceHelloAck { .. }
+                                | EdgeServerMessage::InferenceBindingAck { .. }
+                                | EdgeServerMessage::InferenceBindingRejected { .. }
+                                | EdgeServerMessage::InferenceDispatch { .. }
+                                | EdgeServerMessage::InferenceRequestChunk { .. }
+                                | EdgeServerMessage::InferenceCancel { .. }
+                                | EdgeServerMessage::InferenceReconcile { .. }
+                                | EdgeServerMessage::InferenceTerminalAck { .. }
+                                | EdgeServerMessage::InferenceResponseCredit { .. }
+                                | EdgeServerMessage::InferenceRejected { .. })) => {
+                                if let Some(worker) = &inference
+                                    && worker.commands.try_send(message).is_err()
+                                {
+                                    tracing::warn!("Runner inference input unavailable; reconnecting with durable custody");
+                                    break;
+                                }
+                            }
                             Err(e) => {
-                                tracing::warn!(error = %e, "Failed to parse server message");
+                                let diagnostic = astra_server_types::edge_ws_protocol::EdgeMessageDecodeDiagnostic::from(&e);
+                                tracing::warn!(category = diagnostic.category, line = diagnostic.line, column = diagnostic.column, "Failed to parse server message");
                             }
                         }
                     }
@@ -1305,6 +1656,17 @@ async fn run_edge_connection(config: &EdgeConfig) -> Result<(), Box<dyn std::err
                         break;
                     }
                     _ => {}
+                }
+            }
+            message = async {
+                match inference.as_mut() {
+                    Some(worker) => worker.messages.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match message {
+                    Some(message) => write.send(Message::Text(serde_json::to_string(&message)?.into())).await?,
+                    None => { break; }
                 }
             }
             Some(completed) = completed_rx.recv() => {
@@ -1384,27 +1746,62 @@ async fn main() {
     };
 
     eprintln!(
-        "astra-edge v{} — remote tool execution agent",
-        env!("CARGO_PKG_VERSION")
+        "astra-edge v{} — {}",
+        env!("CARGO_PKG_VERSION"),
+        if config.inference_only {
+            "local model inference"
+        } else {
+            "remote tool execution agent"
+        },
     );
     eprintln!("  server:    {}", config.server_url);
     eprintln!("  edge-id:   {}", config.edge_id);
-    eprintln!("  workspace: {}", config.workspace_dir.display());
+    if !config.inference_only {
+        eprintln!("  workspace: {}", config.workspace_dir.display());
+    }
     eprintln!();
 
-    // Background self-renewal of moi-user-token-v1 edge-registration tokens.
-    token_renewal::spawn_renewal_task(config.token_manager.clone());
+    // Background self-renewal belongs to standalone edge-registration tokens.
+    // A managed inference host reloads its selected CLI profile at reconnect;
+    // starting the MOI token task here would create a second refresh authority.
+    if config.managed_profile.is_none() {
+        token_renewal::spawn_renewal_task(config.token_manager.clone());
+    }
 
     let mut exit_with_error = false;
     let mut reconnect_delay_secs: u64 = 1;
     let max_reconnect_delay_secs: u64 = 60;
     loop {
+        let attempted_token = match next_connection_token(&config).await {
+            Ok(token) => token,
+            Err(error) => {
+                #[cfg(unix)]
+                if let Some(host) = &config.managed_host {
+                    host.report_status(astra_edge::local_host::HostStatus::AuthenticationFailed);
+                }
+                tracing::error!(
+                    error = %error,
+                    "managed inference credentials are unavailable; stopping"
+                );
+                exit_with_error = true;
+                break;
+            }
+        };
         let edge_span = tracing::info_span!(
             "edge.agent",
             edge_id = %config.edge_id,
             server_url = %config.server_url,
         );
-        match run_edge_connection(&config).instrument(edge_span).await {
+        let connection =
+            run_edge_connection(&config, attempted_token.clone()).instrument(edge_span);
+        #[cfg(unix)]
+        let result = tokio::select! {
+            result = connection => result,
+            _ = async { match &config.managed_host { Some(host) => host.shutdown_requested().await, None => std::future::pending().await } } => break,
+        };
+        #[cfg(not(unix))]
+        let result = connection.await;
+        match result {
             Ok(()) => {
                 reconnect_delay_secs = 1; // reset on clean disconnect
                 if !config.reconnect {
@@ -1416,7 +1813,52 @@ async fn main() {
                 );
             }
             Err(e) => {
+                #[cfg(unix)]
+                if let Some(host) = &config.managed_host {
+                    use astra_edge::local_host::HostStatus;
+                    host.report_status(if is_permanent_connection_error(e.as_ref()) {
+                        HostStatus::AuthenticationFailed
+                    } else if e
+                        .downcast_ref::<astra_edge::inference_host::InferenceHostError>()
+                        .is_some()
+                    {
+                        HostStatus::LocalStateUnavailable
+                    } else {
+                        HostStatus::ConnectionUnavailable
+                    });
+                }
                 if is_permanent_connection_error(e.as_ref()) {
+                    if let Some(profile_name) = config.managed_profile.as_deref() {
+                        let expected_owner = config
+                            .expected_inference_owner
+                            .as_deref()
+                            .expect("managed profile has an owner fence");
+                        match load_managed_profile_token(profile_name, expected_owner) {
+                            Ok(refreshed_token) if refreshed_token != attempted_token => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "managed profile token was rejected; retrying with the refreshed profile token"
+                                );
+                                reconnect_delay_secs = 1;
+                                continue;
+                            }
+                            Ok(_) => {
+                                tracing::error!(
+                                    error = %e,
+                                    "managed profile token was rejected and has not rotated"
+                                );
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    error = %error,
+                                    source_error = %e,
+                                    "managed profile is unavailable after authentication failure"
+                                );
+                            }
+                        }
+                        exit_with_error = true;
+                        break;
+                    }
                     // The chosen startup token may be revoked (e.g. a renewal
                     // rotated it away but the persist was lost). Before giving
                     // up, try the other startup candidate once.
@@ -1446,6 +1888,12 @@ async fn main() {
         // Exponential backoff with jitter
         // jitter in [0.5*delay, 1.5*delay) — spreads out thundering herd
         let jitter = reconnect_delay_secs as f64 * (0.5 + fastrand::f64());
+        #[cfg(unix)]
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs_f64(jitter)) => {},
+            _ = async { match &config.managed_host { Some(host) => host.shutdown_requested().await, None => std::future::pending().await } } => break,
+        }
+        #[cfg(not(unix))]
         tokio::time::sleep(Duration::from_secs_f64(jitter)).await;
         reconnect_delay_secs = (reconnect_delay_secs * 2).min(max_reconnect_delay_secs);
     }
@@ -1680,6 +2128,42 @@ mod tests {
     }
 
     #[test]
+    fn inference_only_is_explicit_and_cannot_advertise_tools_or_workspace() {
+        assert!(
+            Args::try_parse_from(["astra-edge", "--expected-inference-owner", "owner"]).is_err()
+        );
+        assert!(validate_inference_owner(Some("owner-a"), "owner-a").is_ok());
+        assert!(validate_inference_owner(Some("owner-a"), "owner-b").is_err());
+        assert!(!Args::try_parse_from(["astra-edge"]).unwrap().inference_only);
+        assert!(
+            Args::try_parse_from(["astra-edge", "--inference-only"])
+                .unwrap()
+                .inference_only
+        );
+        let auth = edge_auth_message("local-inference", Path::new("/private/workspace"), true);
+        let EdgeClientMessage::Auth {
+            workspace_dir,
+            capabilities,
+            ..
+        } = auth
+        else {
+            panic!("auth")
+        };
+        assert!(workspace_dir.is_none());
+        assert!(capabilities.is_none());
+        let message = EdgeServerMessage::ToolCancel {
+            request_id: "tool".into(),
+            delivery_generation: 1,
+        };
+        assert!(!message.is_inference_message());
+        assert!(EdgeServerMessage::InferenceHelloAck {
+            negotiation: astra_server_types::runner_inference::RunnerInferenceNegotiation::Unavailable {
+                reason: astra_server_types::runner_inference::RunnerInferenceRejection::ProtocolVersionUnsupported,
+            },
+        }.is_inference_message());
+    }
+
+    #[test]
     fn default_edge_id_is_stable_for_the_same_workspace() {
         let workspace = Path::new("/workspace/app");
         assert_eq!(default_edge_id(workspace), default_edge_id(workspace));
@@ -1825,6 +2309,80 @@ mod tests {
         assert_eq!(
             token_from_credentials(&creds, Some("other")).unwrap(),
             ("other".to_string(), "other-token".to_string())
+        );
+    }
+
+    #[test]
+    fn managed_profile_reload_tracks_rotation_for_the_selected_profile() {
+        let mut creds = CredentialsFile {
+            current_profile: Some("current".to_string()),
+            profiles: Default::default(),
+        };
+        creds.profiles.insert(
+            "selected".to_string(),
+            astra_credentials::Profile {
+                account_id: Some("owner-a".to_string()),
+                access_token: Some("token-a".to_string()),
+                ..Default::default()
+            },
+        );
+        creds.profiles.insert(
+            "unrelated".to_string(),
+            astra_credentials::Profile {
+                account_id: Some("owner-b".to_string()),
+                access_token: Some("token-b".to_string()),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            managed_profile_token_from_credentials(&creds, "selected", "owner-a").unwrap(),
+            "token-a"
+        );
+        creds.profiles.get_mut("selected").unwrap().access_token =
+            Some("token-a-rotated".to_string());
+        assert_eq!(
+            managed_profile_token_from_credentials(&creds, "selected", "owner-a").unwrap(),
+            "token-a-rotated",
+            "a reconnect must observe a token rotated in the canonical profile store"
+        );
+    }
+
+    #[test]
+    fn managed_profile_reload_fails_closed_on_owner_switch_or_logout() {
+        let mut creds = CredentialsFile {
+            current_profile: Some("selected".to_string()),
+            profiles: Default::default(),
+        };
+        creds.profiles.insert(
+            "selected".to_string(),
+            astra_credentials::Profile {
+                account_id: Some("owner-a".to_string()),
+                access_token: Some("token-a".to_string()),
+                ..Default::default()
+            },
+        );
+
+        creds.profiles.get_mut("selected").unwrap().account_id = Some("owner-b".to_string());
+        assert!(
+            managed_profile_token_from_credentials(&creds, "selected", "owner-a").is_err(),
+            "a profile switched to another account must not retain the old host lease"
+        );
+
+        {
+            let profile = creds.profiles.get_mut("selected").unwrap();
+            profile.account_id = Some("owner-a".to_string());
+            profile.access_token = None;
+        }
+        assert!(
+            managed_profile_token_from_credentials(&creds, "selected", "owner-a").is_err(),
+            "logout must not leave a credential-less managed host attached"
+        );
+
+        creds.profiles.get_mut("selected").unwrap().access_token = Some("  ".to_string());
+        assert!(
+            managed_profile_token_from_credentials(&creds, "selected", "owner-a").is_err(),
+            "a blank token is equivalent to logout"
         );
     }
 }

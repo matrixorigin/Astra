@@ -184,8 +184,12 @@ impl CommandMeta {
 // ── Subcommand completion arrays ────────────────────────────────────────────
 
 const MODEL_SUBCOMMANDS: &[(&str, &str)] = &[
+    ("add", "Configure a model on this device"),
     ("info", "Show details for the current model"),
     ("list", "Open the picker to choose a model"),
+    ("manage", "Show device model status and repair hints"),
+    ("status", "Show device model status and repair hints"),
+    ("check", "Test one device model and save provider evidence"),
     ("clear", "Clear the active model selection"),
 ];
 
@@ -411,7 +415,7 @@ pub static COMMANDS: &[CommandMeta] = &[
         CommandGroup::Core,
     )
     .with_subcommands(MODEL_SUBCOMMANDS)
-    .with_arg_hint("[info | list | clear | <name>]")
+    .with_arg_hint("[add | info | list | manage | status | clear | <name>]")
     .with_tui_route(TuiCommandRoute::Native)
     .primary(),
 CommandMeta::new("/clear", "Start a new session", CommandGroup::Core)
@@ -1145,7 +1149,7 @@ mod tests {
         // Commands with arg_hint defined in registry
         assert_eq!(
             get_arg_hint("/model"),
-            Some("[info | list | clear | <name>]")
+            Some("[add | info | list | manage | status | clear | <name>]")
         );
         assert_eq!(get_arg_hint("/undo"), Some("[N]"));
         assert_eq!(get_arg_hint("/resume"), Some("[session_id]"));

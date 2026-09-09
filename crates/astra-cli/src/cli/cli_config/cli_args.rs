@@ -1018,10 +1018,13 @@ pub(crate) struct SessionShowArgs {
     after_help = "Examples:\n  astra model add\n  astra model list\n  astra model add deepseek --provider deepseek --model deepseek-v4-flash --context-window 1000000 --api-key-stdin --default\n  astra model add gateway --provider openai-compatible --base-url https://gateway.example/v1 --model MODEL_ID --api-key-stdin\n  astra model show deepseek\n  astra model probe deepseek"
 )]
 pub(crate) enum ModelCmd {
+    /// Manage This device models; credentials stay on this device
+    #[command(subcommand)]
+    Local(LocalModelCmd),
     /// List available models
     List,
     /// Add a personal Cloud BYOK model
-    Add(ModelAddArgs),
+    Add(CloudModelAddArgs),
     /// Show model details
     Show(ModelShowArgs),
     /// Check a personal model credential and endpoint
@@ -1031,7 +1034,7 @@ pub(crate) enum ModelCmd {
 }
 
 #[derive(Args, Debug)]
-pub(crate) struct ModelAddArgs {
+pub(crate) struct CloudModelAddArgs {
     /// Configuration alias used with chat --model (wizard default: provider model ID)
     #[arg(value_name = "ALIAS")]
     pub name: Option<String>,
@@ -1055,9 +1058,63 @@ pub(crate) struct ModelAddArgs {
     pub context_window: i32,
 }
 
+#[derive(Subcommand, Debug)]
+#[command(
+    after_help = "Examples:\n  astra model local list\n  astra model local add\n  astra model local check work\n  astra model local show work\n  astra model local remove work\n\nThese commands never upload your provider credential to Astra Server. Use astra model add for Cloud BYOK."
+)]
+pub(crate) enum LocalModelCmd {
+    /// Show all local models and the next action for each one
+    List,
+    /// Save a model on this device without uploading its credential
+    Add(ModelAddArgs),
+    /// Test a local model with one explicit provider request
+    Check(ModelCheckArgs),
+    /// Show the saved local configuration
+    Show(ModelShowArgs),
+    /// Remove the local configuration and its owned credential
+    Remove(ModelRemoveArgs),
+}
+
 #[derive(Args, Debug)]
 pub(crate) struct ModelShowArgs {
     pub model_name: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ModelAddArgs {
+    /// Friendly local name; prompted when omitted in a terminal
+    pub name: Option<String>,
+    /// OpenAI-compatible API base URL
+    #[arg(long)]
+    pub base_url: Option<String>,
+    /// Provider model identifier
+    #[arg(long = "provider-model")]
+    pub provider_model: Option<String>,
+    /// Declared provider context window; prompted when omitted in a terminal
+    #[arg(long)]
+    pub context_window: Option<u32>,
+    /// Declared maximum completion tokens; prompted when omitted in a terminal
+    #[arg(long)]
+    pub max_output_tokens: Option<u32>,
+    /// Read the credential from this environment variable in each attaching terminal
+    #[arg(long, conflicts_with_all = ["no_auth", "store_secret"])]
+    pub credential_env: Option<String>,
+    /// Configure a keyless local endpoint
+    #[arg(long, conflicts_with_all = ["credential_env", "store_secret"])]
+    pub no_auth: bool,
+    /// Prompt for and save a credential in an owner-private local file
+    #[arg(long, conflicts_with_all = ["credential_env", "no_auth"])]
+    pub store_secret: bool,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ModelCheckArgs {
+    pub name: String,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct ModelRemoveArgs {
+    pub name: String,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1408,7 +1465,7 @@ pub(crate) struct ConfigShowPolicyArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, ModelCmd, SessionCmd, WorkSubcommand};
+    use super::{Cli, Command, LocalModelCmd, ModelCmd, SessionCmd, WorkSubcommand};
     use clap::Parser;
 
     #[test]
@@ -1470,6 +1527,72 @@ mod tests {
 
         let message = Cli::try_parse_from(["astra", "explain", "history", "please"]).unwrap();
         assert!(message.validate_external_message_shorthand().is_ok());
+    }
+
+    #[test]
+    fn local_model_commands_cannot_silently_select_cloud_storage() {
+        let cli = Cli::try_parse_from([
+            "astra",
+            "model",
+            "local",
+            "add",
+            "work",
+            "--base-url",
+            "http://127.0.0.1:8080/v1",
+            "--provider-model",
+            "o3",
+            "--context-window",
+            "8192",
+            "--max-output-tokens",
+            "1024",
+            "--credential-env",
+            "WORK_LLM_KEY",
+        ])
+        .unwrap();
+        let Some(Command::Model(ModelCmd::Local(LocalModelCmd::Add(args)))) = cli.command else {
+            panic!("explicit device-local configuration");
+        };
+        assert_eq!(args.credential_env.as_deref(), Some("WORK_LLM_KEY"));
+        assert!(matches!(
+            Cli::try_parse_from(["astra", "model", "local", "list"])
+                .unwrap()
+                .command,
+            Some(Command::Model(ModelCmd::Local(LocalModelCmd::List)))
+        ));
+        for action in ["show", "check", "remove"] {
+            assert!(matches!(
+                Cli::try_parse_from(["astra", "model", "local", action, "work"])
+                    .unwrap()
+                    .command,
+                Some(Command::Model(ModelCmd::Local(_)))
+            ));
+        }
+        assert!(
+            Cli::try_parse_from([
+                "astra",
+                "model",
+                "add",
+                "work",
+                "--credential-env",
+                "WORK_LLM_KEY"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["astra", "model", "local", "add", "work", "--api-key-stdin"])
+                .is_err()
+        );
+        let error = Cli::try_parse_from([
+            "astra",
+            "model",
+            "local",
+            "add",
+            "work",
+            "--api-key",
+            "secret-canary",
+        ])
+        .unwrap_err();
+        assert!(!error.to_string().contains("secret-canary"));
     }
 
     #[test]

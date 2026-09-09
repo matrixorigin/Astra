@@ -214,6 +214,11 @@ pub(crate) fn build_manual_heavy_step_checkpoint(
         // rounds. Zero here means "no active loop snapshot", and this legacy
         // diagnostic is never promoted into prompt or stop policy.
         budget_remaining_rounds: previous_budget_rounds.unwrap_or(0),
+        // A manual CLI checkpoint is not an Agent Loop round boundary. It
+        // must not fabricate Runner recovery identity or custody evidence.
+        llm_rounds_completed: 0,
+        current_round_index: 0,
+        runner_continuation_receipts: Vec::new(),
         blocked_tools: interrupted_blocked_tools,
         recent_tools: state.recent_tools.clone(),
         activated_deferred_tool_names,

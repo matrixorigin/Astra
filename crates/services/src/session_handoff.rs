@@ -2556,6 +2556,7 @@ mod tests {
                     conversation_seq: 1,
                     compaction_generation: 0,
                     config_version_id: None,
+                    provider_projection: None,
                     mode: astra_turn_types::CanonicalDeltaModeV1::Append,
                     logical_segments: vec![vec![
                         json!({"role": "user", "content": "question"}),

@@ -292,7 +292,7 @@ async fn run_async() -> i32 {
     }
 
     let _ = (startup_trace, bare);
-    let cli_context = match cli::cli_config::cli_context::CliContext::from_launch_options(
+    let mut cli_context = match cli::cli_config::cli_context::CliContext::from_launch_options(
         no_journal_content,
         &allowed_tools,
         &disallowed_tools,
@@ -356,8 +356,12 @@ async fn run_async() -> i32 {
         }
     }
 
-    // Resolve model: --model flag > config default_model > None
-    let config_default_model = if cli_model.is_none() {
+    // Resolve model: --model flag > config default_model > None. Keep the
+    // two sources separate so headless resume can distinguish an explicit
+    // admission from an ordinary configured fallback.
+    let cli_model_was_provided = cli_model.is_some();
+    let explicit_model = normalize_model_override_owned(cli_model);
+    let config_default_model = if !cli_model_was_provided {
         match cli::config_manager::read_config_default_model() {
             Ok(model) => model,
             Err(err) => {
@@ -376,12 +380,91 @@ async fn run_async() -> i32 {
     } else {
         None
     };
-    let resolved_model = normalize_model_override_owned(cli_model.or(config_default_model));
+    let fallback_model = normalize_model_override_owned(config_default_model);
+    let resolved_model = explicit_model.clone().or_else(|| fallback_model.clone());
+    cli_context.explicit_model = explicit_model.clone();
+
+    let runner_surface = print_mode
+        || continue_last
+        || resume.is_some()
+        || matches!(
+            command.as_ref(),
+            None | Some(cli::cli_config::cli_args::Command::Interactive)
+                | Some(cli::cli_config::cli_args::Command::Chat(_))
+                | Some(cli::cli_config::cli_args::Command::Message(_))
+                | Some(cli::cli_config::cli_args::Command::Review(_))
+                | Some(cli::cli_config::cli_args::Command::Team(_))
+                | Some(cli::cli_config::cli_args::Command::Work(_))
+        );
+    let local_models_configured = match astra_credentials::LocalModelScope::for_profile(
+        &api.api_origin(),
+        profile.as_deref(),
+    ) {
+        Ok(scope) => match scope.models().load() {
+            Ok(config) => !config.models.is_empty(),
+            Err(error) => {
+                eprintln!(
+                    "Warning: local model configuration needs repair: {error}. You can still inspect work or select another Offering."
+                );
+                false
+            }
+        },
+        // Authentication bootstrap has no provider configuration authority.
+        Err(_) => false,
+    };
+    // A cloud single-shot does not need local discovery. Resume retains the
+    // existing attachment path because its durable Offering owns placement.
+    let known_server_selection =
+        if print_mode && !continue_last && resume.is_none() && local_models_configured {
+            if let Some(token) =
+                cli::session::session_runtime::current_access_token(profile.as_deref())
+            {
+                cli::session::session_runtime::headless_selection_uses_server(
+                    &api,
+                    &token,
+                    resolved_model.as_deref(),
+                )
+                .await
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+    let local_runner = if runner_surface && local_models_configured && !known_server_selection {
+        let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        match cli::local_runner_lifecycle::start(&api.api_origin(), profile.as_deref(), &workspace)
+            .await
+        {
+            Ok(mut runner) => match runner
+                .wait_until_alive(std::time::Duration::from_millis(500))
+                .await
+            {
+                Ok(()) => Some(runner),
+                Err(error) => {
+                    eprintln!(
+                        "Warning: {error}. Work remains readable; local inference needs repair or an explicit model change."
+                    );
+                    None
+                }
+            },
+            Err(error) => {
+                eprintln!(
+                    "Warning: {error}. Work remains readable; local inference needs repair or an explicit model change."
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(runner) = local_runner.as_ref() {
+        runner.attach_context(&mut cli_context);
+    }
 
     // Make the resolved model available to slash commands that print
     // model-aware diagnostics without mutating the process environment.
     slash_config::set_active_model_for_display(resolved_model.clone());
-    slash_config::set_active_offering_id_for_request(None);
 
     // --print mode: headless single-shot, always auto-approve (can't prompt)
     if print_mode {
@@ -389,7 +472,8 @@ async fn run_async() -> i32 {
             &api,
             profile.as_deref(),
             &output_format,
-            resolved_model.as_deref(),
+            explicit_model.as_deref(),
+            fallback_model.as_deref(),
             system_prompt.as_deref(),
             command,
             &cli_context,
@@ -705,7 +789,6 @@ mod tests {
         let base = spawn_mock_app(app).await;
         let api = astra_thin_client::ThinClient::new(&base, None).unwrap();
         let mut state = SessionState::default();
-        cli::slash::slash_config::set_active_offering_id_for_request(None);
         let exit = handle_slash_command(
             "/model offer-model",
             &api,
@@ -718,11 +801,7 @@ mod tests {
 
         assert!(!exit);
         assert_eq!(state.model.as_deref(), Some("Display Model"));
-        assert_eq!(
-            cli::slash::slash_config::active_offering_id_for_request().as_deref(),
-            Some("offer-model")
-        );
-        cli::slash::slash_config::set_active_offering_id_for_request(None);
+        assert_eq!(state.offering_id.as_deref(), Some("offer-model"));
     }
 
     #[serial_test::serial]
@@ -743,7 +822,7 @@ mod tests {
             model: Some("old-model".to_string()),
             ..Default::default()
         };
-        cli::slash::slash_config::set_active_offering_id_for_request(Some("offer-old".to_string()));
+        state.offering_id = Some("offer-old".to_string());
         let exit = handle_slash_command(
             "/model offer-model",
             &api,
@@ -756,11 +835,7 @@ mod tests {
 
         assert!(!exit);
         assert_eq!(state.model.as_deref(), Some("old-model"));
-        assert_eq!(
-            cli::slash::slash_config::active_offering_id_for_request().as_deref(),
-            Some("offer-old")
-        );
-        cli::slash::slash_config::set_active_offering_id_for_request(None);
+        assert_eq!(state.offering_id.as_deref(), Some("offer-old"));
     }
 
     #[serial_test::serial]
@@ -784,7 +859,7 @@ mod tests {
             model: Some("old-model".to_string()),
             ..Default::default()
         };
-        cli::slash::slash_config::set_active_offering_id_for_request(Some("offer-old".to_string()));
+        state.offering_id = Some("offer-old".to_string());
         let exit = handle_slash_command(
             "/model offer-model",
             &api,
@@ -797,11 +872,7 @@ mod tests {
 
         assert!(!exit);
         assert_eq!(state.model.as_deref(), Some("old-model"));
-        assert_eq!(
-            cli::slash::slash_config::active_offering_id_for_request().as_deref(),
-            Some("offer-old")
-        );
-        cli::slash::slash_config::set_active_offering_id_for_request(None);
+        assert_eq!(state.offering_id.as_deref(), Some("offer-old"));
     }
 
     #[tokio::test]

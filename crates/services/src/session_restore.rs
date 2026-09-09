@@ -3930,6 +3930,60 @@ mod tests {
     }
 
     #[test]
+    fn canonical_provider_projection_restores_exact_offering_without_name_fallback() {
+        let messages = vec![serde_json::json!({"role": "user", "content": "resume"})];
+        let mut bundle = typed_resume_bundle("owner-1", "offering-session", 3, "resume");
+        bundle.projections.provider =
+            Some(astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
+                bundle.cursor.clone(),
+                astra_turn_types::ResumeProviderProjectionV1 {
+                    offering_id: Some("runner-offer".into()),
+                    model: Some("gpt-5".into()),
+                    ..Default::default()
+                },
+            ));
+        let mut restored = RestoredSession {
+            session_id: "offering-session".into(),
+            model: Some("gpt-5".into()),
+            resume_bundle: Some(bundle),
+            ..Default::default()
+        };
+        apply_selected_resume_bundle(&mut restored);
+        assert_eq!(restored.model.as_deref(), Some("gpt-5"));
+        assert_eq!(
+            restored
+                .resume_bundle
+                .as_ref()
+                .and_then(|bundle| bundle.projections.provider_at(&bundle.cursor))
+                .and_then(astra_turn_types::ResumeProviderProjectionV1::exact_offering_id),
+            Some("runner-offer")
+        );
+
+        // The legacy model field is not an Offering authority. A projection
+        // without an exact identity must not invent one from that name.
+        let mut legacy = RestoredSession {
+            session_id: "offering-session".into(),
+            model: Some("gpt-5".into()),
+            resume_bundle: Some(typed_resume_bundle_from_messages(
+                "owner-1",
+                "offering-session",
+                3,
+                messages,
+            )),
+            ..Default::default()
+        };
+        apply_selected_resume_bundle(&mut legacy);
+        assert!(
+            legacy
+                .resume_bundle
+                .as_ref()
+                .and_then(|bundle| bundle.projections.provider_at(&bundle.cursor))
+                .and_then(astra_turn_types::ResumeProviderProjectionV1::exact_offering_id)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn canonical_resume_never_restamps_side_state_from_an_older_materialization() {
         let messages = vec![serde_json::json!({"role": "user", "content": "resume"})];
         let source_cursor =

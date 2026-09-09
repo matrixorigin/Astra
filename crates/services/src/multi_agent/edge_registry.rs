@@ -348,8 +348,8 @@ impl DatabaseEdgeRegistryService {
                 let now = chrono::Utc::now()
                     .format("%Y-%m-%d %H:%M:%S%.6f")
                     .to_string();
-                // State 1 is the only published state. State 0 is a never-
-                // published insert and state 2 is a finalized generation whose
+                // State 1 is the only published state. State 0 is an unpublished
+                // insert or retained enrollment; state 2 is a finalized generation whose
                 // owner crashed before releasing its claim; neither is safe to
                 // resurrect as a rollback target.
                 let published_previous = (registration_state == 1).then_some(previous.clone());
@@ -765,17 +765,42 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
         edge_agent_id: &str,
         edge_id_header: &str,
     ) -> Result<bool, String> {
-        let deleted = sqlx::query(
-            "DELETE FROM edge_agent_registry \
-             WHERE user_id = ? AND edge_agent_id = ? AND edge_id = ?",
+        // Presence is disposable, enrollment is not. Keep the journal/revision
+        // anchor for an enrolled Runner so a normal disconnect cannot be
+        // mistaken for explicit journal retirement on its next enrollment.
+        // State 0 is unpublished and therefore grants no execution authority.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| format!("edge_registry unregister begin: {e}"))?;
+        let unpublished = sqlx::query(
+            "UPDATE edge_agent_registry SET registration_state = 0,
+                 inference_boot_nonce = NULL, inference_edge_id = NULL
+             WHERE user_id = ? AND edge_agent_id = ? AND edge_id = ?
+               AND inference_journal_id IS NOT NULL AND registration_state = 1",
         )
         .bind(user_id)
         .bind(edge_agent_id)
         .bind(edge_id_header)
-        .execute(&self.pool)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| format!("edge_registry unregister enrollment: {e}"))?;
+        let deleted = sqlx::query(
+            "DELETE FROM edge_agent_registry \
+             WHERE user_id = ? AND edge_agent_id = ? AND edge_id = ? \
+               AND inference_journal_id IS NULL",
+        )
+        .bind(user_id)
+        .bind(edge_agent_id)
+        .bind(edge_id_header)
+        .execute(&mut *tx)
         .await
         .map_err(|e| format!("edge_registry unregister: {e}"))?;
-        Ok(deleted.rows_affected() > 0)
+        tx.commit()
+            .await
+            .map_err(|e| format!("edge_registry unregister commit: {e}"))?;
+        Ok(unpublished.rows_affected() > 0 || deleted.rows_affected() > 0)
     }
 
     async fn rollback_registration(&self, lease: &EdgeRegistrationLease) -> Result<bool, String> {
@@ -789,17 +814,42 @@ impl EdgeRegistryService for DatabaseEdgeRegistryService {
             .await;
         };
         let Some(previous) = &lease.previous else {
-            let deleted = sqlx::query(
-                "DELETE FROM edge_agent_registry \
-                 WHERE user_id = ? AND registry_id = ? AND registration_claim_id = ?",
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| format!("edge_registry rollback begin: {e}"))?;
+            // A failed reconnect must not delete a retained enrollment merely
+            // because there was no published connection to restore.
+            let retained = sqlx::query(
+                "UPDATE edge_agent_registry SET registration_state = 0,
+                     registration_claim_id = NULL, registration_claim_expires_at = NULL,
+                     registration_previous_edge_id = NULL,
+                     inference_boot_nonce = NULL, inference_edge_id = NULL
+                 WHERE user_id = ? AND registry_id = ? AND registration_claim_id = ?
+                   AND inference_journal_id IS NOT NULL",
             )
             .bind(&lease.current.user_id)
             .bind(&lease.current.registry_id)
             .bind(claim_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("edge_registry rollback enrollment: {e}"))?;
+            let deleted = sqlx::query(
+                "DELETE FROM edge_agent_registry \
+                 WHERE user_id = ? AND registry_id = ? AND registration_claim_id = ? \
+                   AND inference_journal_id IS NULL",
+            )
+            .bind(&lease.current.user_id)
+            .bind(&lease.current.registry_id)
+            .bind(claim_id)
+            .execute(&mut *tx)
             .await
             .map_err(|e| format!("edge_registry rollback inserted registration: {e}"))?;
-            return Ok(deleted.rows_affected() > 0);
+            tx.commit()
+                .await
+                .map_err(|e| format!("edge_registry rollback commit: {e}"))?;
+            return Ok(retained.rows_affected() > 0 || deleted.rows_affected() > 0);
         };
         let capabilities_json = previous
             .capabilities

@@ -4927,6 +4927,10 @@ struct CanonicalTurnAdmission {
     reservation: astra_turn_types::TurnReservationV1,
     prior_messages: Vec<Value>,
     had_canonical_head: bool,
+    /// Exact provider identity captured after Server model admission. This is
+    /// persisted with the resulting causal head; a missing value is retained
+    /// for legacy callers and must fail closed on resume.
+    provider_projection: Option<astra_turn_types::ResumeProviderProjectionV1>,
     /// Leases supplied as an explicit controller capability outlive one run;
     /// only leases acquired internally by this run are released here.
     release_writer_on_finish: bool,
@@ -5185,6 +5189,19 @@ impl AgenticRunLifecycleService {
                     )
                 })?;
         let head = admission_snapshot.head;
+        let provider_projection = request.resolved_model_selection.as_ref().map(|resolved| {
+            astra_turn_types::ResumeProviderProjectionV1 {
+                offering_id: Some(resolved.offering_id.clone()),
+                model: Some(resolved.model_name.clone()),
+                // Interaction mode is a per-turn execution policy, not a
+                // durable session permission preference. Do not restamp it
+                // into resume state from an incomplete request projection.
+                permission_mode: None,
+                config_version_id: head
+                    .as_ref()
+                    .and_then(|head| head.cursor.config_version_id.clone()),
+            }
+        });
         let prior_canonical_bytes = head.as_ref().map_or(0, |head| head.total_canonical_bytes);
         let current_bytes = fresh_request_admission_bytes(request).map_err(|error| {
             error_response_coded(
@@ -5499,6 +5516,7 @@ impl AgenticRunLifecycleService {
             reservation,
             prior_messages,
             had_canonical_head: head.is_some(),
+            provider_projection,
             release_writer_on_finish,
             release_started: Arc::new(AtomicBool::new(false)),
             renewal_cancel,
@@ -5557,6 +5575,7 @@ impl AgenticRunLifecycleService {
                     base.map_or(0, |cursor| cursor.compaction_generation)
                 },
                 config_version_id: base.and_then(|cursor| cursor.config_version_id.clone()),
+                provider_projection: admission.provider_projection.clone(),
                 mode,
                 logical_segments,
             };
@@ -8926,7 +8945,11 @@ impl AgenticRunLifecycleService {
                 });
             let offering_views = offerings
                 .into_iter()
-                .filter(|offering| offering.is_active)
+                .filter(|offering| {
+                    offering.is_active
+                        && offering.execution_placement
+                            == astra_services::ModelExecutionPlacement::Server
+                })
                 .map(astra_services::ModelListItemResponse::from)
                 .collect::<Vec<_>>();
             let projection = astra_services::project_model_access_with_default(
@@ -10551,6 +10574,9 @@ impl AgenticRunLifecycleService {
 
         if let Some(pool) = &self.shared_pool {
             builder = builder.with_pool(pool.clone());
+        }
+        if let Some(pool) = &self.edge_connection_pool {
+            builder = builder.with_edge_connection_pool(pool.clone());
         }
         if let Some(svc) = &self.edge_dispatch_service {
             builder = builder.with_edge_dispatch_service(Arc::clone(svc));
@@ -20080,7 +20106,7 @@ impl ServerSubRunExecutor {
             self.encryptor.as_ref(),
             &config.user_id,
             offering_id,
-            self.shared_pool.as_ref().map(SharedPool::get),
+            self.shared_pool.as_ref(),
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -20109,7 +20135,7 @@ impl ServerSubRunExecutor {
             self.encryptor.as_ref(),
             &config.user_id,
             &selection.offering_id,
-            self.shared_pool.as_ref().map(SharedPool::get),
+            self.shared_pool.as_ref(),
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -21054,6 +21080,9 @@ impl SubRunExecutor for ServerSubRunExecutor {
 
         if let Some(pool) = &self.shared_pool {
             builder = builder.with_pool(pool.clone());
+        }
+        if let Some(pool) = &self.edge_connection_pool {
+            builder = builder.with_edge_connection_pool(pool.clone());
         }
         if let Some(svc) = &self.edge_dispatch_service {
             builder = builder.with_edge_dispatch_service(Arc::clone(svc));

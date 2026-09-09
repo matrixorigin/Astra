@@ -37,6 +37,8 @@ reqwest = { workspace = true }
 tempfile.workspace = true
 astra-runtime-env.workspace = true
 astra-credentials.workspace = true
+astra-inference-adapter.workspace = true
+bytes = "1"
 astra-tools.workspace = true
 astra-server-types.workspace = true
 astra-turn-types.workspace = true
@@ -45,6 +47,7 @@ md5 = { package = "md-5", version = "0.10" }
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 # `test-util` enables `#[tokio::test(start_paused = true)]` and virtual-time

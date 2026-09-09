@@ -440,6 +440,30 @@ pub(crate) async fn load_server_model_catalog_json(
     .map_err(|error| format!("failed to render complete model catalog: {error}"))
 }
 
+pub(crate) async fn headless_selection_uses_server(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    model: Option<&str>,
+) -> bool {
+    let resolve = async {
+        let projection = load_server_model_access(api, token).await?;
+        let selection = match model {
+            Some(model) => model_selection_for_name_from_catalog(&projection.offerings, model),
+            None => default_model_selection_from_access(&projection)?,
+        };
+        Ok::<_, String>(selection.is_some_and(|selected| {
+            projection.offerings.iter().any(|entry| {
+                entry.offering_id == selected.offering_id
+                    && entry.execution_placement
+                        == astra_services::models::ModelExecutionPlacement::Server
+            })
+        }))
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(3), resolve)
+        .await
+        .is_ok_and(|result| result.unwrap_or(false))
+}
+
 async fn load_server_model_access(
     api: &astra_thin_client::ThinClient,
     token: &str,
@@ -557,7 +581,7 @@ pub(crate) fn default_model_selection_from_access(
                 Ok(None)
             } else {
                 Err(
-                    "Model Access has no resolved default for a non-empty effective catalog"
+                    "Choose a model with /model or --model <offering_id>; Runner credentials are not selected automatically"
                         .to_string(),
                 )
             };
@@ -610,13 +634,9 @@ pub(crate) fn model_selection_for_name_from_catalog(
     model: &str,
 ) -> Option<ServerModelSelection> {
     let registry_model = astra_turn_core::thinking_config::resolve_model_thinking(model).0;
-    models
-        .iter()
+    crate::cli::slash::slash_router::resolve_model_catalog_entry(models, registry_model)
+        .ok()
         .filter(|entry| model_list_entry_is_active(entry))
-        .find(|entry| {
-            model_list_entry_name(entry)
-                .is_some_and(|name| name.eq_ignore_ascii_case(registry_model))
-        })
         .and_then(model_selection_from_list_entry)
 }
 
@@ -636,7 +656,22 @@ pub(crate) async fn resolve_server_model_selection(
     token: &str,
     model: &str,
 ) -> Result<ServerModelSelection, String> {
+    resolve_pinned_model_selection(api, token, model, None).await
+}
+
+/// Refresh an exact selection without re-resolving its friendly name. Missing
+/// or offline capacity is an error, never permission to use a namesake.
+pub(crate) async fn resolve_pinned_model_selection(
+    api: &astra_thin_client::ThinClient,
+    token: &str,
+    model: &str,
+    offering_id: Option<&str>,
+) -> Result<ServerModelSelection, String> {
     let (catalog, _) = load_server_model_catalog(api, token).await?;
+    if let Some(offering_id) = offering_id {
+        return model_selection_for_offering_from_catalog(&catalog, offering_id)
+            .ok_or_else(|| format!("Selected Offering '{offering_id}' is unavailable. Reconnect its Runner or explicitly choose another Offering with /model."));
+    }
     resolve_server_model_selection_from_catalog(api, token, model, &catalog).await
 }
 
@@ -649,13 +684,18 @@ pub(crate) async fn resolve_server_model_selection_from_catalog(
     model: &str,
     catalog: &[ModelListItemResponse],
 ) -> Result<ServerModelSelection, String> {
-    if let Some(selection) = model_selection_for_name_from_catalog(catalog, model) {
-        return Ok(selection);
-    }
     let _ = (api, token);
-    Err(format!(
-        "model '{model}' is not an active Server Offering in the authoritative catalog"
-    ))
+    let registry_name = astra_turn_core::thinking_config::resolve_model_thinking(model).0;
+    let entry =
+        crate::cli::slash::slash_router::resolve_model_catalog_entry(catalog, registry_name)?;
+    if !entry.is_active {
+        return Err(format!(
+            "Selected Offering '{}' is unavailable. Reconnect its Runner or explicitly choose another Offering with /model.",
+            entry.offering_id
+        ));
+    }
+    model_selection_from_list_entry(entry)
+        .ok_or_else(|| "Selected Offering has invalid catalog metadata".to_string())
 }
 
 fn model_selection_from_exact_response(
@@ -758,16 +798,39 @@ pub(crate) async fn ensure_state_default_model(
     token: &str,
     state: &mut SessionState,
 ) -> Option<String> {
-    if let Some(model) = normalize_model_override(state.model.as_deref()).map(str::to_string) {
-        match resolve_server_model_selection(api, token, &model).await {
+    if state.provider_selection_requires_explicit {
+        tracing::warn!(
+            target: "astra_cli::model_selection",
+            "resume has no exact causal Offering; refusing implicit provider admission"
+        );
+        return None;
+    }
+    let mut model = normalize_model_override(state.model.as_deref()).map(str::to_string);
+    if model.is_some() || state.offering_id.is_some() {
+        let requested_model = model.as_deref().unwrap_or_default();
+        match resolve_pinned_model_selection(
+            api,
+            token,
+            requested_model,
+            state.offering_id.as_deref(),
+        )
+        .await
+        {
             Ok(selection) => {
-                crate::cli::slash::slash_config::set_active_offering_id_for_request(Some(
-                    selection.offering_id,
-                ));
+                let selected_model = if requested_model.is_empty() {
+                    selection.name.clone()
+                } else {
+                    let base =
+                        astra_turn_core::thinking_config::resolve_model_thinking(requested_model).0;
+                    format!("{}{}", selection.name, &requested_model[base.len()..])
+                };
+                model = Some(selected_model);
+                state.model = model.clone();
+                state.offering_id = Some(selection.offering_id);
                 if let Some(context_window) = selection.context_window {
                     state.context_budget = astra_runtime::prompts::ContextBudget::from_runtime_config_with_context_window(
                         &state.runtime_config,
-                        Some(&model),
+                        model.as_deref(),
                         Some(context_window),
                     );
                 }
@@ -775,21 +838,19 @@ pub(crate) async fn ensure_state_default_model(
             Err(error) => {
                 tracing::warn!(
                     target: "astra_cli::model_selection",
-                    model,
+                    model = ?model,
                     error = %error,
                     "could not resolve explicit model context_window from server registry"
                 );
                 eprintln!("warning: {error}; keeping current context budget");
             }
         }
-        return Some(model);
+        return model;
     }
     match resolve_server_default_model(api, token).await {
         ServerDefaultModel::Selected(selection) => {
             state.model = Some(selection.name.clone());
-            crate::cli::slash::slash_config::set_active_offering_id_for_request(Some(
-                selection.offering_id.clone(),
-            ));
+            state.offering_id = Some(selection.offering_id.clone());
             if let Some(context_window) = selection.context_window {
                 state.context_budget =
                     astra_runtime::prompts::ContextBudget::from_runtime_config_with_context_window(
@@ -1948,9 +2009,9 @@ mod tests {
         default_model_selection_from_access, ensure_state_default_model, fresh_access_token,
         git_root_from, initialize_session_state, load_server_model_access,
         model_default_invalid_reason_message, model_selection_for_name_from_catalog,
-        model_selection_from_exact_response, pending_recovery_status_line,
-        resolve_server_default_model, resolve_server_model_selection, restore_history_from_journal,
-        restore_session_state_from_journal, restored_journal_state,
+        model_selection_for_offering_from_catalog, model_selection_from_exact_response,
+        pending_recovery_status_line, resolve_server_default_model, resolve_server_model_selection,
+        restore_history_from_journal, restore_session_state_from_journal, restored_journal_state,
         should_keep_credentials_on_refresh_error, style_banner_text,
     };
     use crate::cli::cli_config::cli_utils::{
@@ -1965,6 +2026,28 @@ mod tests {
     };
     use tempfile::tempdir;
     use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+
+    #[tokio::test]
+    async fn headless_host_selection_uses_exact_placement_and_default() {
+        let server = wiremock::MockServer::start().await;
+        let mut edge = catalog_entry("offer-edge", "same-name", true, 1024);
+        edge.execution_placement = ModelExecutionPlacement::Edge;
+        let projection = access_projection(
+            vec![catalog_entry("offer-cloud", "same-name", true, 1024), edge],
+            Some("offer-cloud"),
+        );
+        wiremock::Mock::given(method("GET"))
+            .and(path("/model-access"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&projection))
+            .mount(&server)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&server.uri(), None).unwrap();
+        assert!(super::headless_selection_uses_server(&api, "token", Some("offer-cloud")).await);
+        assert!(super::headless_selection_uses_server(&api, "token", None).await);
+        assert!(!super::headless_selection_uses_server(&api, "token", Some("offer-edge")).await);
+        assert!(!super::headless_selection_uses_server(&api, "token", Some("same-name")).await);
+        assert!(!super::headless_selection_uses_server(&api, "token", Some("absent")).await);
+    }
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     struct EnvGuard {
@@ -2108,14 +2191,15 @@ mod tests {
     }
 
     #[test]
-    fn named_selection_uses_active_model_entry() {
+    fn named_selection_rejects_ambiguous_accounts_including_offline_offerings() {
         let catalog = vec![
             catalog_entry("offer-inactive", "custom-model", false, 8_000),
             catalog_entry("offer-active", "custom-model", true, 500_000),
         ];
 
-        let selection = model_selection_for_name_from_catalog(&catalog, "CUSTOM-MODEL")
-            .expect("active Offering");
+        assert!(model_selection_for_name_from_catalog(&catalog, "CUSTOM-MODEL").is_none());
+        let selection = model_selection_for_offering_from_catalog(&catalog, "offer-active")
+            .expect("explicit active Offering");
         assert_eq!(selection.offering_id, "offer-active");
         assert_eq!(selection.context_window, Some(500_000));
     }
@@ -2213,7 +2297,7 @@ mod tests {
         let error = resolve_server_model_selection(&api, "token", "overflow-model(thinking:high)")
             .await
             .expect_err("a missing Offering must fail closed");
-        assert!(error.contains("authoritative catalog"), "{error}");
+        assert!(error.contains("was not found"), "{error}");
     }
 
     #[tokio::test]
@@ -2255,6 +2339,43 @@ mod tests {
             .await
             .expect("second-page Offering should resolve");
         assert_eq!(selection.offering_id, "offer-second");
+    }
+
+    #[tokio::test]
+    async fn explicit_id_refresh_normalizes_display_and_never_retargets_a_missing_pin() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(catalog_page(vec![
+                catalog_entry("runner-one", "Work", true, 8192),
+                catalog_entry("runner-three", "Work", true, 16384),
+            ])))
+            .mount(&mock)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+        let mut state = SessionState {
+            model: Some("runner-three(thinking:high)".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            ensure_state_default_model(&api, "token", &mut state)
+                .await
+                .as_deref(),
+            Some("Work(thinking:high)")
+        );
+        assert_eq!(state.offering_id.as_deref(), Some("runner-three"));
+        state.offering_id = Some("removed-runner".into());
+        let error = super::resolve_pinned_model_selection(
+            &api,
+            "token",
+            "Work",
+            state.offering_id.as_deref(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("removed-runner"));
+        ensure_state_default_model(&api, "token", &mut state).await;
+        assert_eq!(state.offering_id.as_deref(), Some("removed-runner"));
     }
 
     #[tokio::test]
@@ -2342,6 +2463,41 @@ mod tests {
             state.context_budget.model_limit, 1_000_000,
             "state diagnostics must reflect the server model context_window, not the client default"
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_state_default_model_refuses_unpinned_resume_preference() {
+        let api = astra_thin_client::ThinClient::new("http://127.0.0.1:9", None).unwrap();
+        let mut state = SessionState::default();
+        state.model = Some("stale-runner-model".into());
+        state.provider_selection_requires_explicit = true;
+
+        let selected = ensure_state_default_model(&api, "token", &mut state).await;
+
+        assert!(selected.is_none());
+        assert_eq!(state.model.as_deref(), Some("stale-runner-model"));
+        assert!(state.offering_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn ensure_state_default_model_revalidates_offering_without_display_name() {
+        let mock = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(catalog_page(vec![
+                catalog_entry("offer-exact", "current-model", true, 128_000),
+            ])))
+            .mount(&mock)
+            .await;
+        let api = astra_thin_client::ThinClient::new(&mock.uri(), None).unwrap();
+        let mut state = SessionState::default();
+        state.offering_id = Some("offer-exact".into());
+
+        let selected = ensure_state_default_model(&api, "token", &mut state).await;
+
+        assert_eq!(selected.as_deref(), Some("current-model"));
+        assert_eq!(state.model.as_deref(), Some("current-model"));
+        assert_eq!(state.offering_id.as_deref(), Some("offer-exact"));
     }
 
     #[test]

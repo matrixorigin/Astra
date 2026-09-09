@@ -122,6 +122,13 @@ pub(crate) struct SessionState {
     pub session_name: Option<String>,
     pub cli_context: CliContext,
     pub model: Option<String>,
+    /// Exact selected capacity. Display names never authorize a different
+    /// Offering during metadata refresh, reconnect, or the next turn.
+    pub offering_id: Option<String>,
+    /// A restored display model without exact causal Offering provenance must
+    /// not be silently rebound by name. The user must choose a fresh Offering
+    /// (for example with `/model`) before another turn is admitted.
+    pub provider_selection_requires_explicit: bool,
     pub turn: u32,
     pub last_response: Option<String>,
     /// Session-scoped file edit journal — shared with ToolExecutors for undo.
@@ -458,6 +465,8 @@ impl Default for SessionState {
             session_name: None,
             cli_context: CliContext::default(),
             model: None,
+            offering_id: None,
+            provider_selection_requires_explicit: false,
             turn: 0,
             last_response: None,
             file_journal: std::sync::Arc::new(std::sync::Mutex::new(
@@ -660,6 +669,7 @@ impl SessionState {
         }
         self.perm_manager.clear_active_session_id();
         self.session_id = None;
+        self.provider_selection_requires_explicit = false;
         // Deferred materialization is evidence from this session's retained
         // conversation. Never carry a selected schema into a newly bound
         // session after the identity is cleared.
@@ -686,6 +696,7 @@ impl SessionState {
         self.active_work_registry =
             std::sync::Arc::new(astra_core::work_unit::ActiveWorkRegistry::default());
         self.pending_recovery = None;
+        self.provider_selection_requires_explicit = false;
         self.run_id = None;
         *astra_core::sync_poison::recover_mutex_lock(&self.active_turn_local_run_control) = None;
         self.turn = 0;

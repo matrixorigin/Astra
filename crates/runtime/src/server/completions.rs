@@ -17,6 +17,18 @@ fn completion_response_id(response_id: Option<&str>) -> String {
         .unwrap_or_else(|| format!("chatcmpl-proxy-{}", uuid::Uuid::new_v4().simple()))
 }
 
+fn completion_provider_http_error(
+    error: astra_core::ClassifiedError,
+) -> (StatusCode, Json<ErrorResponse>) {
+    let detail = crate::turn::llm::client::redact_provider_secrets(&error.message);
+    let detail = astra_text_utils::str_preview::truncate_str(&detail, 500);
+    crate::error_response_coded(
+        StatusCode::BAD_GATEWAY,
+        format!("Upstream LLM request failed ({}): {detail}", error.kind),
+        "model_provider_request_failed",
+    )
+}
+
 fn completion_timeout(timeout_ms: u64) -> Result<Duration, (StatusCode, Json<ErrorResponse>)> {
     if timeout_ms == 0 || timeout_ms > 120_000 {
         return Err(crate::error_response_coded(
@@ -141,7 +153,7 @@ pub(super) async fn completions_handler(
         };
         state
             .model_service
-            .admit_model_offering(user.user_id.clone(), offering_id)
+            .revalidate_model_execution(user.user_id.clone(), offering_id)
             .await?
     };
 
@@ -158,6 +170,20 @@ pub(super) async fn completions_handler(
 
     let invocation_scope = request.invocation_scope();
     let purpose = request.purpose();
+    if matches!(
+        &admitted.execution_material,
+        astra_services::ModelExecutionMaterial::Runner(_)
+    ) {
+        astra_services::inference_execution::runner::require_runner_purpose(purpose).map_err(
+            |error| {
+                crate::error_response_coded(
+                    StatusCode::BAD_REQUEST,
+                    error.to_string(),
+                    "runner_inference_purpose_unsupported",
+                )
+            },
+        )?;
+    }
 
     // Use the same provider capacity policy as agent turns. This gate runs
     // before durable admission and provider I/O, so a rejected request cannot
@@ -180,39 +206,65 @@ pub(super) async fn completions_handler(
         user.user_id,
         admitted.clone(),
     );
-    // 4. Execute through the same typed provider boundary as agent turns.
-    let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
-    let parsed = durable_ledger
-        .execute_nonstream(
-            &state.http_client,
-            invocation_scope,
-            crate::turn::llm::client::LlmCall {
-                purpose,
-                messages: &messages,
-                tools: &[],
-                cache_capability: None,
-                route: crate::turn::llm::client::LlmExecutionRoute::from_admitted(&admitted),
-                max_output_tokens: Some(request.max_tokens as usize),
-                temperature: Some(request.temperature),
-                has_fallback: false,
-                thinking: &thinking,
-            },
-            provider_timeout,
-        )
-        .await;
-    let parsed = match parsed.into_result() {
+    // 4. Both placements share durable admission and the canonical execution
+    // coordinator; the HTTP surface only formats the collected response.
+    let parsed = match &admitted.execution_material {
+        astra_services::ModelExecutionMaterial::Runner(_) => {
+            crate::turn::llm::runner::execute_nonstream(
+                shared_pool,
+                &state.edge_connection_pool,
+                &durable_ledger,
+                &admitted,
+                invocation_scope,
+                crate::turn::llm::runner::RunnerAuxiliaryCall {
+                    purpose,
+                    messages: &messages,
+                    max_output_tokens: request.max_tokens as usize,
+                    temperature: request.temperature,
+                    timeout: provider_timeout,
+                },
+            )
+            .await
+        }
+        astra_services::ModelExecutionMaterial::Server(_) => {
+            let thinking = astra_turn_core::thinking_config::ThinkingConfig::Off;
+            let route = crate::turn::llm::client::LlmExecutionRoute::from_admitted(&admitted)
+                .map_err(|error| {
+                    crate::error_response_coded(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        error.to_string(),
+                        "model_execution_configuration_invalid",
+                    )
+                })?;
+            durable_ledger
+                .execute_nonstream(
+                    crate::turn::llm::transport::global_llm_client()
+                        .map_err(completion_provider_http_error)?,
+                    invocation_scope,
+                    crate::turn::llm::client::LlmCall {
+                        purpose,
+                        messages: &messages,
+                        tools: &[],
+                        cache_capability: None,
+                        route,
+                        max_output_tokens: Some(request.max_tokens as usize),
+                        temperature: Some(request.temperature),
+                        has_fallback: false,
+                        thinking: &thinking,
+                    },
+                    provider_timeout,
+                )
+                .await
+                .into_result()
+        }
+    };
+    let parsed = match parsed {
         Ok(parsed) => parsed,
         Err(error) if crate::turn::llm::durable::is_ledger_error(&error) => {
             return Err(inference_ledger_http_error(error));
         }
         Err(error) => {
-            let detail = crate::turn::llm::client::redact_provider_secrets(&error.message);
-            let detail = astra_text_utils::str_preview::truncate_str(&detail, 500);
-            return Err(crate::error_response_coded(
-                StatusCode::BAD_GATEWAY,
-                format!("Upstream LLM request failed ({}): {detail}", error.kind),
-                "model_provider_request_failed",
-            ));
+            return Err(completion_provider_http_error(error));
         }
     };
 
@@ -303,6 +355,7 @@ mod tests {
 
     struct CompletionModelService {
         base_url: String,
+        runner: Option<astra_services::runner_model_bindings::ResolvedRunnerModelBinding>,
     }
 
     fn unsupported_model_service_call<T>() -> Result<T, (StatusCode, Json<ErrorResponse>)> {
@@ -314,6 +367,29 @@ mod tests {
 
     #[async_trait]
     impl ModelService for CompletionModelService {
+        async fn revalidate_model_execution(
+            &self,
+            user_id: String,
+            offering_id: String,
+        ) -> Result<astra_services::AdmittedModelExecution, (StatusCode, Json<ErrorResponse>)>
+        {
+            if let Some(binding) = &self.runner {
+                let admitted =
+                    astra_services::AdmittedModelExecution::from_runner_binding(binding.clone());
+                if binding.user_id != user_id || admitted.offering_id != offering_id {
+                    return Err(crate::error_response_coded(
+                        StatusCode::NOT_FOUND,
+                        "Offering not found",
+                        "model_offering_not_found",
+                    ));
+                }
+                return Ok(admitted);
+            }
+            let offering = self.revalidate_model_offering(offering_id).await?;
+            astra_services::AdmittedModelExecution::from_offering(offering)
+                .map_err(|error| internal_error(error.to_string()))
+        }
+
         async fn create_model(
             &self,
             _: String,
@@ -412,6 +488,195 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer user-token"));
         headers
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live MatrixOne"]
+    #[serial_test::serial]
+    async fn runner_required_compaction_uses_custody_and_completions_reject_optional_purposes() {
+        use astra_services::inference_execution::runner::*;
+        use astra_services::runner_model_bindings::*;
+        use astra_turn_types::runner_inference::*;
+        assert_eq!(std::env::var("ASTRA_TEST_DB_IT").as_deref(), Ok("1"));
+        let settings = astra_core::config::MatrixOneSettings::from_env();
+        astra_services::ensure_core_schema(&settings, "mysql")
+            .await
+            .unwrap();
+        let pool = astra_core::SharedPool::new(&settings).await.unwrap();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let session = format!("runner-completion-{suffix}");
+        let runner = RunnerInferenceId::new(format!("runner-{suffix}")).unwrap();
+        let id = |value: &str| RunnerInferenceId::new(value).unwrap();
+        sqlx::query("INSERT INTO agent_sessions (session_id, user_id, status, event_count, project_retention_policy,
+            created_at, updated_at, last_active_at) VALUES (?, 'test-user', 'active', 0, 'session', NOW(6), NOW(6), NOW(6))")
+            .bind(&session).execute(pool.get()).await.unwrap();
+        sqlx::query("INSERT INTO edge_agent_registry (user_id, registry_id, edge_agent_id, edge_id, registration_state)
+            VALUES ('test-user', ?, ?, 'completion-socket', 1)")
+            .bind(&suffix).bind(runner.as_str()).execute(pool.get()).await.unwrap();
+        let connection = AuthenticatedRunnerConnection {
+            user_id: "test-user".into(),
+            runner_id: runner.clone(),
+            edge_id: "completion-socket".into(),
+        };
+        enroll_runner_inference(&pool, &connection, 1, &id("journal"), &id("boot"))
+            .await
+            .unwrap();
+        let publication: RunnerInferenceBindingPublication = serde_json::from_value(json!({
+            "protocol_version": 1, "operation_id": "publish", "expected_publication_revision": 0,
+            "change": {"action": "publish", "definition": {
+                "identity": {"runner_id": runner, "journal_id": "journal", "binding_id": "local",
+                    "binding_revision": 1, "profile_revision": 1},
+                "display_name": "Work", "model_name": "private-wire-model", "protocol": "openai_chat_completions",
+                "context_window": 8192, "max_output_tokens": 1024
+            }}
+        })).unwrap();
+        publish_runner_binding(&pool, &connection, &publication)
+            .await
+            .unwrap();
+        let binding =
+            resolve_runner_model_binding(&pool, "test-user", publication.change.identity())
+                .await
+                .unwrap();
+        let offering = runner_offering_id("test-user", &binding.definition.identity);
+        let admitted = astra_services::AdmittedModelExecution::from_runner_binding(binding.clone());
+        let state = AppState::new(Default::default(), Arc::new(Healthy))
+            .with_auth_service(Arc::new(astra_services::auth::StubAuthService))
+            .with_model_service(Arc::new(CompletionModelService {
+                // Any accidental Server transport would fail this test.
+                base_url: "http://127.0.0.1:1".into(),
+                runner: Some(binding),
+            }))
+            .with_shared_pool(pool.clone());
+        let mut request = explicit_completion_request(&offering);
+        request.session_id = session.clone();
+        request.temperature = 0.37;
+        let error = completions_handler(
+            State(state.clone()),
+            completion_headers(),
+            Json(request.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.1.0.error_code.as_deref(),
+            Some("runner_inference_purpose_unsupported")
+        );
+        assert!(
+            list_runner_reconciliation(&pool, &connection, 8)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let invocation_scope = astra_turn_types::InferenceInvocationScope::Session {
+            session_id: session.clone(),
+            turn: 1,
+            round: 0,
+            operation_id: "test:required_compaction".into(),
+            logical_attempt: 0,
+        };
+        let ledger = crate::turn::llm::durable::DurableInferenceLedger::new(
+            pool.clone(),
+            "test-user",
+            admitted.clone(),
+        );
+        let runner_pool = pool.clone();
+        let mut pending = tokio::spawn(async move {
+            crate::turn::llm::runner::execute_nonstream(
+                &runner_pool,
+                &state.edge_connection_pool,
+                &ledger,
+                &admitted,
+                invocation_scope,
+                crate::turn::llm::runner::RunnerAuxiliaryCall {
+                    purpose: astra_turn_types::InferencePurpose::RequiredCompaction,
+                    messages: &request.messages,
+                    max_output_tokens: 64,
+                    temperature: 0.37,
+                    timeout: Duration::from_secs(10),
+                },
+            )
+            .await
+        });
+        let grant = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(grant) = list_runner_reconciliation(&pool, &connection, 8)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                {
+                    break grant;
+                }
+                tokio::select! {
+                    result = &mut pending => panic!("completion ended before Runner dispatch: {result:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(25)) => {},
+                }
+            }
+        })
+        .await
+        .expect("HTTP admission creates a Runner grant");
+        let request = load_runner_request_custody(&pool, &connection, &grant)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(request.as_bytes()).unwrap();
+        assert_eq!(body["model"], "private-wire-model");
+        assert_eq!(body["temperature"], 0.37);
+        assert_eq!(body["max_completion_tokens"], 64);
+        assert_eq!(body["stream"], true);
+        let response = RunnerInferenceResponse {
+            events: vec![
+                RunnerInferenceProviderEvent::Json(json!({
+                    "id": "runner-response", "choices": [{"index": 0, "delta": {"content": "from local Runner"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 7, "completion_tokens": 5}
+                })),
+                RunnerInferenceProviderEvent::Done,
+                RunnerInferenceProviderEvent::Eof,
+            ],
+            transport: RunnerInferenceTransportTerminal {
+                status: RunnerInferenceTransportStatus::Complete,
+                delivery: RunnerInferenceDeliveryEvidence::ResponseHeaders,
+                provider_bytes: 100,
+                events_delivered: 3,
+            },
+        };
+        let response = serde_json::to_vec(&response).unwrap();
+        let terminal = astra_services::InferenceInvocationTerminal {
+            status: astra_services::InferenceTerminalStatus::Succeeded,
+            usage: astra_services::InferenceUsage {
+                input: astra_turn_types::NormalizedPromptCacheUsage::new(7, 0, 0),
+                output_tokens: 5,
+            },
+            usage_status: astra_services::InferenceUsageStatus::ProviderExact,
+            provider_response_id: Some("runner-response".into()),
+            error_kind: None,
+            error_message: None,
+        };
+        let hash = astra_turn_types::runner_inference::runner_terminal_digest(&terminal, &response)
+            .unwrap();
+        take_runner_terminal_custody(
+            &pool,
+            &connection,
+            &grant.attempt,
+            &terminal,
+            &response,
+            &hash,
+        )
+        .await
+        .unwrap();
+        // No local notify: emulate custody arriving on another socket pod.
+        let result = tokio::time::timeout(Duration::from_secs(10), pending)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.response_id.as_deref(), Some("runner-response"));
+        assert_eq!(result.full_text, "from local Runner");
+        assert_eq!(result.usage["input_tokens"], 7);
+        assert_eq!(result.usage["output_tokens"], 5);
+        let status: String = sqlx::query_scalar("SELECT status FROM inference_invocations WHERE user_id = 'test-user' AND invocation_id = ?")
+            .bind(grant.attempt.invocation_id.as_str()).fetch_one(pool.get()).await.unwrap();
+        assert_eq!(status, "succeeded");
     }
 
     #[test]
@@ -624,6 +889,7 @@ mod tests {
             .with_auth_service(Arc::new(astra_services::auth::StubAuthService))
             .with_model_service(Arc::new(CompletionModelService {
                 base_url: format!("http://{address}/v1"),
+                runner: None,
             }));
 
         let error = completions_handler(
@@ -656,6 +922,7 @@ mod tests {
             .with_auth_service(Arc::new(astra_services::auth::StubAuthService))
             .with_model_service(Arc::new(CompletionModelService {
                 base_url: "http://127.0.0.1:1/v1".into(),
+                runner: None,
             }));
 
         let error = completions_handler(
@@ -769,6 +1036,7 @@ mod tests {
             .with_auth_service(Arc::new(astra_services::auth::StubAuthService))
             .with_model_service(Arc::new(CompletionModelService {
                 base_url: format!("http://{provider_address}/v1"),
+                runner: None,
             }))
             .with_shared_pool(shared_pool.clone());
         let mut request = explicit_completion_request("offer-completion");

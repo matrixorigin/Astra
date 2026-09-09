@@ -24,6 +24,7 @@ uuid.workspace = true
 [dev-dependencies]
 temp-env = "0.3"
 tempfile = "3"
+tracing-subscriber.workspace = true
 
 [features]
 dev-defaults = []

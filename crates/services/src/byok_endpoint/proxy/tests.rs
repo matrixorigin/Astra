@@ -155,6 +155,44 @@ fn target() -> SocketAddr {
 }
 
 #[tokio::test]
+async fn exact_inference_transport_preserves_pinned_proxy_and_redirect_contract() {
+    use astra_inference_adapter::transport::{ProviderTransport, provider_headers};
+    use astra_inference_adapter::{ExactProviderRequest, ProviderProtocol};
+    for scheme in ["http", "https", "socks5", "socks5h"] {
+        for (status, response_bytes) in [
+            (200, &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"[..]),
+            (302, &b"HTTP/1.1 302 Found\r\nLocation: https://private.test/\r\nContent-Length: 0\r\n\r\n"[..]),
+        ] {
+            let tls = test_tls();
+            let (origin, observed, origin_task) = origin(&tls, response_bytes).await;
+            let (proxy, mut forwarded, proxy_task) = mock_proxy(scheme, &tls, origin, false).await;
+            let guard = client_with(&endpoint(), &[target()], proxy, test_builder(&tls), |builder| {
+                ProviderTransport::build(builder).map_err(|error| error.to_string())
+            }).await.unwrap();
+            let body = ExactProviderRequest::compile(
+                &serde_json::json!({"model":"o3", "messages":[], "max_completion_tokens":4}),
+                ProviderProtocol::OpenAiCompatible, 1024,
+            ).unwrap();
+            let headers = provider_headers(ProviderProtocol::OpenAiCompatible, "fixture-key", []).unwrap();
+            let request = guard.prepare("https://byok.test/v1", headers, &body, None).unwrap();
+            let response = guard.send_once(request).await.unwrap();
+            assert_eq!(response.status(), status, "{scheme}");
+            assert_eq!(response.text().await.unwrap(), if status == 200 { "OK" } else { "" });
+            let (sni, headers) = observed.await.unwrap();
+            assert_eq!(sni, "byok.test");
+            assert!(headers.starts_with("POST /v1 "));
+            assert!(headers.contains("fixture-key"));
+            assert!(!headers.to_lowercase().contains("proxy-authorization"));
+            forwarded.recv().await.unwrap();
+            assert!(forwarded.try_recv().is_err(), "no retry or redirect: {scheme}");
+            drop(guard);
+            origin_task.await.unwrap();
+            proxy_task.abort();
+        }
+    }
+}
+
+#[tokio::test]
 async fn http_https_and_socks_proxies_preserve_tls_host_auth_and_streaming() {
     for scheme in ["http", "https", "socks5", "socks5h"] {
         let tls = test_tls();

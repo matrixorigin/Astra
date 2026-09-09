@@ -22,10 +22,19 @@ pub(crate) enum ViewResult {
     },
     Model {
         name: String,
+        /// Opaque Offering identity selected from the catalog. The display
+        /// name is retained for the footer and context budget, but must never
+        /// be used to resolve the request when the catalog contains duplicate
+        /// names (for example, two personal Runners).
+        offering_id: Option<String>,
     },
+    ModelSetup(ModelSetupDraft),
     ModelThinking {
         base_model: String,
         config: astra_turn_core::thinking_config::ThinkingConfig,
+        /// Preserve the Offering selected by the preceding model picker while
+        /// the user chooses a thinking mode.
+        offering_id: Option<String>,
     },
     Session {
         session_id: String,
@@ -43,6 +52,55 @@ pub(crate) enum ViewResult {
     },
     Memory(MemorySelection),
     InsertCommand(String),
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct SecretInput(String);
+
+impl SecretInput {
+    pub(crate) fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SecretInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SecretInput")
+            .field("present", &!self.0.is_empty())
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ModelSetupCredentialDraft {
+    Environment { name: String },
+    Stored { secret: SecretInput },
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModelSetupAction {
+    /// Make one disclosed, bounded provider request, then select the model.
+    TestAndUse,
+    /// Persist the configuration without contacting the provider or selecting
+    /// it for the current turn.
+    SaveWithoutTest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ModelSetupDraft {
+    pub(crate) name: String,
+    pub(crate) base_url: String,
+    pub(crate) provider_model: String,
+    pub(crate) context_window: u32,
+    pub(crate) max_output_tokens: u32,
+    pub(crate) credential: ModelSetupCredentialDraft,
+    pub(crate) action: ModelSetupAction,
 }
 
 /// The only terminal outcomes of the config editor. The editor's internal

@@ -262,12 +262,28 @@ async fn bridge(
     Ok(())
 }
 
-pub(super) async fn client(
+#[cfg(test)]
+async fn client(
     url: &reqwest::Url,
     targets: &[SocketAddr],
     proxy: EgressProxy,
     builder: reqwest::ClientBuilder,
 ) -> Result<EndpointClient, String> {
+    client_with(url, targets, proxy, builder, |builder| {
+        builder
+            .build()
+            .map_err(|_| "Unable to initialize model proxy client".into())
+    })
+    .await
+}
+
+pub(super) async fn client_with<T>(
+    url: &reqwest::Url,
+    targets: &[SocketAddr],
+    proxy: EgressProxy,
+    builder: reqwest::ClientBuilder,
+    build: impl FnOnce(reqwest::ClientBuilder) -> Result<T, String>,
+) -> Result<EndpointClient<T>, String> {
     super::validate_addresses(targets)?;
     let authority = format!(
         "{}:{}",
@@ -285,12 +301,7 @@ pub(super) async fn client(
     let local_proxy = reqwest::Proxy::https(format!("http://{address}"))
         .map_err(|_| "Unable to initialize model proxy tunnel")?
         .basic_auth("astra", &token);
-    let client = builder
-        .no_proxy()
-        .https_only(true)
-        .proxy(local_proxy)
-        .build()
-        .map_err(|_| "Unable to initialize model proxy client")?;
+    let client = build(builder.no_proxy().https_only(true).proxy(local_proxy))?;
     let targets = targets.to_vec();
     let task = tokio::spawn(async move {
         let mut connections = JoinSet::new();

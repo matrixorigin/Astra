@@ -241,11 +241,20 @@ pub(crate) async fn stream_chat_sse(
         );
         return Err(missing_model_selection_turn_failure(p.session_id));
     };
-    p.model = Some(selected_model);
-    if model_context_window.is_none() {
-        match session_runtime::resolve_server_model_selection(p.api, p.token, selected_model).await
+    let mut selected_model = selected_model.to_string();
+    if model_context_window.is_none() || p.offering_id.is_none() {
+        match session_runtime::resolve_pinned_model_selection(
+            p.api,
+            p.token,
+            &selected_model,
+            p.offering_id.as_deref(),
+        )
+        .await
         {
             Ok(selection) => {
+                let base =
+                    astra_turn_core::thinking_config::resolve_model_thinking(&selected_model).0;
+                selected_model = format!("{}{}", selection.name, &selected_model[base.len()..]);
                 p.offering_id = Some(selection.offering_id);
                 model_context_window = selection.context_window;
             }
@@ -266,6 +275,7 @@ pub(crate) async fn stream_chat_sse(
             }
         }
     }
+    p.model = Some(&selected_model);
     let Some(context_window_tokens) = model_context_window else {
         let error = format!(
             "model '{selected_model}' is missing positive context_window metadata in the server registry"
@@ -868,6 +878,8 @@ pub(crate) async fn stream_chat_sse(
         repeated_cache_hit_suppression: resolved_tool_policy.repeated_cache_hit_suppression,
         max_consecutive_empty_name: resolved_tool_policy.max_consecutive_empty_name,
         stall: StallTrackingState {
+            runner_continuation_receipts: Vec::new(),
+            restored_from_heavy_checkpoint: false,
             workspace_observation_quarantine: p.workspace_observation_quarantine.clone(),
             work_unit_observations: Default::default(),
             active_work_registry: None,

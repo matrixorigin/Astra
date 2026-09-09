@@ -139,6 +139,27 @@ impl OneShotSessionRouting {
         self.resume_metadata.model.as_deref()
     }
 
+    /// Return the exact Offering only from the selected, cursor-bound resume
+    /// bundle. The legacy `model` field is display metadata and must not be
+    /// used to reconstruct a Runner or another Offering by name.
+    pub(crate) fn restored_offering_id(&self) -> Option<&str> {
+        let bundle = self.resume_metadata.resume_bundle.as_ref()?;
+        bundle
+            .projections
+            .provider_at(&bundle.cursor)
+            .and_then(astra_turn_types::ResumeProviderProjectionV1::exact_offering_id)
+    }
+
+    /// A resumed conversation remains a resume even when older persistence
+    /// has no provider projection (and no display model).  Callers must not
+    /// turn that missing causal identity into an implicit Server default.
+    /// An explicit model is still allowed to start a fresh admission for the
+    /// resumed conversation; the resolver applies that precedence first.
+    pub(crate) fn resume_requires_explicit_provider(&self) -> bool {
+        self.resume_metadata.resume_bundle.is_some()
+            || !self.resume_metadata.continuation_messages.is_empty()
+    }
+
     pub(crate) fn restored_permission_mode(&self) -> Option<&str> {
         self.resume_metadata.permission_mode.as_deref()
     }
@@ -407,6 +428,9 @@ mod tests {
             messages,
             budget_remaining_tokens: 0,
             budget_remaining_rounds: 0,
+            llm_rounds_completed: 0,
+            current_round_index: 0,
+            runner_continuation_receipts: Vec::new(),
             blocked_tools: Vec::new(),
             recent_tools: Vec::new(),
             activated_deferred_tool_names: Vec::new(),
@@ -584,6 +608,28 @@ mod tests {
             Some("local-session")
         );
         assert_eq!(routing.task_scope_session_id(), None);
+    }
+
+    #[test]
+    fn legacy_resume_without_model_or_offering_is_still_resume_context() {
+        let session_id = format!("routing-legacy-provider-{}", uuid::Uuid::new_v4());
+        let routing = OneShotSessionRouting {
+            server_session_id: Some(session_id.clone()),
+            history_source_session_id: Some(session_id.clone()),
+            resume_metadata: OneShotSessionResumeMetadata {
+                resume_bundle: Some(typed_resume_bundle(
+                    &session_id,
+                    1,
+                    vec![serde_json::json!({"role": "user", "content": "continue"})],
+                    Vec::new(),
+                )),
+                ..Default::default()
+            },
+        };
+
+        assert!(routing.restored_model().is_none());
+        assert!(routing.restored_offering_id().is_none());
+        assert!(routing.resume_requires_explicit_provider());
     }
 
     #[test]

@@ -2,17 +2,17 @@
 //!
 //! Shared between the CLI stream consumer and any future headless client: updates a structured
 //! accumulator and returns terminal UI hints. [`ChatTurnSseFramer`] turns arbitrary byte chunks
-//! into complete event blocks via [`super::sse_blocks`] and records time-to-first-token.
+//! into complete event blocks via [`astra_inference_adapter::sse::blocks`] and records time-to-first-token.
 
 use astra_core::canonical_names::{normalize_name, normalize_name_list};
 use astra_thin_client::ApprovalKind;
 use serde_json::Value;
 use std::time::Instant;
 
-use super::sse_blocks::{SseBlankLineUtf8Buf, SseUtf8Error};
 use crate::compaction_types::{CompactionKind, CompactionTier};
 use crate::context_feedback::RuntimeFeedbackFrame;
 use crate::tool_ledger_receipt::ToolLedgerReceipt;
+use astra_inference_adapter::sse::blocks::{SseBlankLineUtf8Buf, SseUtf8Error};
 
 /// Per-channel fingerprint emitted by the bridge via the
 /// `injection_freshness` SSE event. Carries only opaque metadata

@@ -54,11 +54,23 @@ Checkpoint must include enough information to resume safely:
 - Recovery must avoid double execution of non-idempotent actions.
 - Session execution slots prevent conflicting root runs when required by product semantics.
 - Local client session execution leases use one stable, never-rotated file
-  authority in the owner-local state directory. Linux adds a kernel-named
-  abstract Unix socket so path replacement cannot admit a second executor;
-  macOS rejects symlink authorities and verifies path-to-inode continuity
-  around its advisory lock. Unsupported platforms fail closed rather than
-  running without an execution owner.
+  witness in the owner-local state directory plus a kernel-owned authority.
+  Linux uses kernel-named abstract Unix sockets; macOS uses byte-range locks
+  on the root-owned `/dev/dtracehelper` device. The kernel authority holds a
+  stable owner/session key plus deterministic lexical and currently canonical
+  path keys: this keeps aliases and ancestor rebindings in one admission
+  domain, even if a root is retargeted, while independent sessions remain
+  concurrent. The file witness and macOS kqueue vnode history retain
+  replacement evidence, and both platforms re-check the lease generation at
+  canonical settlement. Platforms without a rename-resistant authority fail
+  closed rather than running without an execution owner.
+- Workspace mutation leases (typed writers, Bash observation, and recursive
+  writers) use a separate cross-user coordination authority when the workspace
+  is shared. Linux uses the abstract socket plus an owner-only witness; macOS
+  uses the same root-owned device with a key-derived byte-range lock, a shared
+  mode-0644 witness, and kqueue history. The two lease classes must not be
+  conflated: a session lease serializes one session journal, while a workspace
+  lease serializes mutation attribution.
 
 ## Terminal outcomes
 
@@ -95,3 +107,5 @@ Buffered completion may finalize without resuming execution when the answer is a
 - Provider offline during resume.
 - Native client release targets acquire, conflict, release, and reacquire the
   session execution authority before they are packaged.
+- Session execution tests cover lexical aliases, missing-then-created journals,
+  ancestor rebindings, and failed handoff cleanup.

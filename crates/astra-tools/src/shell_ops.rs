@@ -1148,6 +1148,28 @@ pub async fn execute_bash_with_environment(
     result
 }
 
+fn configure_bash_environment(
+    command: &mut std::process::Command,
+    workspace_root: &Path,
+    environment: &[(String, String)],
+    detached: bool,
+) {
+    command.env_clear();
+    if detached {
+        command
+            .env("PATH", crate::workspace_observation::DETACHABLE_PATH)
+            .env("LC_ALL", "C");
+    } else {
+        // Names of explicitly configured provider credentials are arbitrary;
+        // a secret-name denylist cannot make terminal inheritance safe.
+        command.envs(astra_sandbox::filter_environment(
+            &astra_sandbox::SandboxPolicy::strict(workspace_root),
+        ));
+        command.envs(environment.iter().map(|(key, value)| (key, value)));
+    }
+    command.env_remove("BASH_ENV").env_remove("ENV");
+}
+
 fn finalize_bash_scope_quarantine(
     workspace_root: &Path,
     execution_started: bool,
@@ -1262,43 +1284,40 @@ async fn execute_bash_inner(
     }
     bash_args.extend(["-c".to_string(), command.to_string()]);
     let mut foreground_owner = None;
-    let mut cmd = if detachable_requested {
-        let mut command = Command::new("bash");
+    let mut child_command = if detachable_requested {
+        let mut command = std::process::Command::new("bash");
         command.args(&bash_args);
         command
     } else {
-        let (mut command, owner) =
-            match astra_sandbox::BashInvocationOwner::prepare("bash", &bash_args) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    return ToolResult::error(format!(
-                        "Error: unable to establish Bash invocation owner: {error}"
-                    ));
-                }
-            };
-        if let Err(error) = owner.install(&mut command) {
-            return ToolResult::error(format!(
-                "Error: unable to install Bash invocation owner: {error}"
-            ));
-        }
+        let (command, owner) = match astra_sandbox::BashInvocationOwner::prepare("bash", &bash_args)
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return ToolResult::error(format!(
+                    "Error: unable to establish Bash invocation owner: {error}"
+                ));
+            }
+        };
         foreground_owner = Some(owner);
-        Command::from(command)
+        command
     };
-    cmd.current_dir(workspace_root).kill_on_drop(true);
-    cmd.envs(environment.iter().map(|(key, value)| (key, value)));
-    // Never let a caller-controlled shell startup hook execute in the tool
-    // process.  Detached commands additionally receive a minimal environment
-    // below, but foreground commands need the same invariant.
-    cmd.env_remove("BASH_ENV").env_remove("ENV");
-    if detachable_requested {
-        cmd.env_clear()
-            .env("PATH", crate::workspace_observation::DETACHABLE_PATH)
-            .env("LC_ALL", "C")
-            // Keep the invariant explicit even on platforms/runtimes where
-            // environment clearing is emulated by the process launcher.
-            .env("BASH_ENV", "")
-            .env("ENV", "");
+    configure_bash_environment(
+        &mut child_command,
+        workspace_root,
+        environment,
+        detachable_requested,
+    );
+    // Install private supervisor descriptors/nonce last: environment filtering
+    // must neither erase them nor allow call-specific material to replace them.
+    if let Some(owner) = &foreground_owner
+        && let Err(error) = owner.install(&mut child_command)
+    {
+        return ToolResult::error(format!(
+            "Error: unable to install Bash invocation owner: {error}"
+        ));
     }
+    let mut cmd = Command::from(child_command);
+    cmd.current_dir(workspace_root).kill_on_drop(true);
 
     let output_limit = per_tool_output_limit("bash");
     let raw_stdout_limit = output_limit.saturating_mul(2).max(16_384);
@@ -1653,8 +1672,8 @@ pub async fn execute_bash_with_filesystem_boundary(
     );
     config.timeout = Duration::from_secs_f64(timeout_secs);
     config.max_output_bytes = per_tool_output_limit("bash");
-    let mut environment = std::env::vars().collect::<std::collections::HashMap<_, _>>();
-    astra_sandbox::scrub_secrets_from_env(&mut environment);
+    let environment =
+        astra_sandbox::filter_environment(&astra_sandbox::SandboxPolicy::strict(workspace_root));
     let output = astra_sandbox::execute_isolated(command, &environment, &config).await;
     let rendered = output.combined_output();
     if !output.namespace_active {
@@ -4759,6 +4778,60 @@ fn glob_pattern_fragment(pattern: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn bash_child_environment_excludes_arbitrary_terminal_material() {
+        const MARKER: &str = "ASTRA_TEST_BASH_ENV_CHILD";
+        const ARBITRARY: &str = "AN_ORDINARY_SETTING";
+        if std::env::var_os(MARKER).is_none() {
+            // A subprocess supplies a real parent environment without racing
+            // the environment of other tests in this process.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "shell_ops::tests::bash_child_environment_excludes_arbitrary_terminal_material",
+                    "--nocapture",
+                ])
+                .env(MARKER, "1")
+                .env(ARBITRARY, "synthetic-private-value")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            return;
+        }
+        assert_eq!(std::env::var(ARBITRARY).unwrap(), "synthetic-private-value");
+        for detached in [false, true] {
+            let mut command = std::process::Command::new("bash");
+            command.args([
+                "-c",
+                "printf '%s|%s|%s' \"$AN_ORDINARY_SETTING\" \"$EXPLICIT_CALL_VALUE\" \"$BASH_ENV\"",
+            ]);
+            super::configure_bash_environment(
+                &mut command,
+                std::path::Path::new("."),
+                &[
+                    ("EXPLICIT_CALL_VALUE".into(), "allowed".into()),
+                    ("BASH_ENV".into(), "untrusted-hook".into()),
+                ],
+                detached,
+            );
+            let output = command.output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                output.stdout,
+                if detached {
+                    b"||".as_slice()
+                } else {
+                    b"|allowed|".as_slice()
+                }
+            );
+        }
+    }
+
     use serial_test::serial;
     use tempfile::tempdir;
     use tokio::sync::Mutex;

@@ -35,17 +35,24 @@ Show available commands and usage hints.
 
 ### `/model [subcommand]`
 
-Open the model picker, inspect the current model, or switch directly.
+Open the model picker, configure a device model, inspect the current model, or
+switch directly.
 
 | Subcommand       | Description                |
 | ---------------- | -------------------------- |
 | (none) or `list` | Open the model picker      |
+| `add`            | Configure a model on this device |
 | `info`           | Show current model details |
+| `manage` or `status` | Show device model status and repair hints |
+| `check <name>`   | Run one bounded provider check and save secret-safe evidence |
 | `clear`          | Reset to the API default   |
 | `<name>`         | Switch directly to a model |
 
 ```
 /model                      # Open picker
+/model add                  # Configure a device-local model
+/model status               # See saved device models and next actions
+/model check work            # Explicitly test one device model
 /model info                 # Inspect current model
 /model claude-sonnet-4.6    # Switch directly
 ```

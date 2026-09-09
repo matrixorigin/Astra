@@ -10,6 +10,17 @@ pub(crate) struct CliContext {
     pub(crate) permission_mode: Option<String>,
     pub(crate) session_id: Option<String>,
     pub(crate) session_name: Option<String>,
+    /// A model explicitly supplied at process launch. This remains separate
+    /// from the effective/configured model so resume can re-admit it after
+    /// restoring the prior session projection.
+    pub(crate) explicit_model: Option<String>,
+    /// Identity of the CLI-managed Runner for this process. It is used only
+    /// to resolve the exact local Offering returned by the Server catalog.
+    pub(crate) local_runner_id: Option<String>,
+    #[cfg(unix)]
+    pub(crate) local_runner_attachment: Option<astra_edge::local_host::Attachment>,
+    #[cfg(unix)]
+    pub(crate) local_runner_liveness: Option<astra_edge::local_host::ConnectionLiveness>,
 }
 
 impl CliContext {
@@ -43,6 +54,12 @@ impl CliContext {
             permission_mode: None,
             session_id,
             session_name,
+            explicit_model: None,
+            local_runner_id: None,
+            #[cfg(unix)]
+            local_runner_attachment: None,
+            #[cfg(unix)]
+            local_runner_liveness: None,
         })
     }
 

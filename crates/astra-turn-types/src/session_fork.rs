@@ -135,6 +135,13 @@ impl SessionForkManifestV1 {
             || self.parent_head.cursor.canonical_root_hash != self.parent_head.latest_manifest_root
             || self.parent_head.total_canonical_bytes == 0
             || self.parent_head.total_message_count == 0
+            || self
+                .parent_head
+                .provider_projection
+                .as_ref()
+                .is_some_and(|projection| {
+                    projection.offering_id.is_some() && projection.exact_offering_id().is_none()
+                })
             || self.created_at_unix_ms < 0
             || self
                 .activated_at_unix_ms
@@ -225,6 +232,7 @@ impl SessionForkActivationV1 {
             || self.child_head.total_canonical_bytes
                 != self.manifest.parent_head.total_canonical_bytes
             || self.child_head.total_message_count != self.manifest.parent_head.total_message_count
+            || self.child_head.provider_projection != self.manifest.parent_head.provider_projection
             || self.writer_lease.schema_version != SESSION_COORDINATION_SCHEMA_VERSION
             || self.writer_lease.key != self.manifest.child_key
             || self.writer_lease.expected_cursor.as_ref() != Some(&self.child_head.cursor)
@@ -316,6 +324,7 @@ mod tests {
                 total_canonical_bytes: 100,
                 total_message_count: 6,
                 writer_epoch: 2,
+                provider_projection: None,
             },
             dimensions: [
                 ForkBasisDimensionV1::Conversation,

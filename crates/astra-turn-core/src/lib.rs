@@ -231,8 +231,6 @@ pub use fork::reconstruct as fork_reconstruct;
 pub use fork::resolve as fork_resolve;
 
 // Re-exports: sse_* → sse::*
-pub use sse::blocks as sse_blocks;
-pub use sse::data_lines as sse_data_lines;
 pub use sse::edge_stderr_lines as sse_edge_stderr_lines;
 pub use sse::stream_host as sse_stream_host;
 

@@ -2185,7 +2185,15 @@ pub(crate) async fn resume_session_handler(
                 materialized_conversation_root_hash: Some(materialized_root),
                 degraded_reasons: Vec::new(),
                 repair_actions: Vec::new(),
-                projections: Default::default(),
+                projections: astra_turn_types::ResumeProjectionSetV1 {
+                    provider: head.provider_projection.clone().map(|provider| {
+                        astra_turn_types::CausalProjectionEnvelopeV1::at_cursor(
+                            head.cursor.clone(),
+                            provider,
+                        )
+                    }),
+                    ..Default::default()
+                },
             }],
         )
         .map_err(internal_error)?;

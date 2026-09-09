@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION, SessionCursorV1,
+    ResumeProviderProjectionV1, SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION, SessionCursorV1,
     canonical_conversation_identity,
 };
 
@@ -280,6 +280,11 @@ pub struct ContextManifestNodeV1 {
     pub compaction_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_version_id: Option<String>,
+    /// Exact provider selection admitted for the turn that produced this
+    /// causal node. A missing Offering is a legacy/unknown state and must be
+    /// treated as non-authoritative by resume consumers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_projection: Option<ResumeProviderProjectionV1>,
     /// This node contains the complete canonical projection at this point.
     /// Its parent remains committed for lineage/audit, but materialization
     /// must not read content through that parent.
@@ -309,6 +314,7 @@ impl ContextManifestNodeV1 {
             conversation_seq,
             compaction_generation,
             config_version_id,
+            None,
             false,
             appended_segments,
         )
@@ -333,6 +339,63 @@ impl ContextManifestNodeV1 {
             conversation_seq,
             compaction_generation,
             config_version_id,
+            None,
+            true,
+            appended_segments,
+        )
+    }
+
+    /// Construct an append node while retaining the exact provider selection
+    /// that was admitted at this causal boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_provider_projection(
+        key: SessionKeyV1,
+        parent_manifest_root: Option<String>,
+        completed_turn: u32,
+        journal_event_seq: u64,
+        conversation_seq: u64,
+        compaction_generation: u64,
+        config_version_id: Option<String>,
+        provider_projection: Option<ResumeProviderProjectionV1>,
+        appended_segments: Vec<ConversationSegmentRefV1>,
+    ) -> Result<Self, SessionCoordinationValidationError> {
+        Self::new_with_mode(
+            key,
+            parent_manifest_root,
+            completed_turn,
+            journal_event_seq,
+            conversation_seq,
+            compaction_generation,
+            config_version_id,
+            provider_projection,
+            false,
+            appended_segments,
+        )
+    }
+
+    /// Construct a replacement node while retaining the exact provider
+    /// selection that was admitted at this causal boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_replacement_with_provider_projection(
+        key: SessionKeyV1,
+        parent_manifest_root: Option<String>,
+        completed_turn: u32,
+        journal_event_seq: u64,
+        conversation_seq: u64,
+        compaction_generation: u64,
+        config_version_id: Option<String>,
+        provider_projection: Option<ResumeProviderProjectionV1>,
+        appended_segments: Vec<ConversationSegmentRefV1>,
+    ) -> Result<Self, SessionCoordinationValidationError> {
+        Self::new_with_mode(
+            key,
+            parent_manifest_root,
+            completed_turn,
+            journal_event_seq,
+            conversation_seq,
+            compaction_generation,
+            config_version_id,
+            provider_projection,
             true,
             appended_segments,
         )
@@ -347,6 +410,7 @@ impl ContextManifestNodeV1 {
         conversation_seq: u64,
         compaction_generation: u64,
         config_version_id: Option<String>,
+        provider_projection: Option<ResumeProviderProjectionV1>,
         replaces_history: bool,
         appended_segments: Vec<ConversationSegmentRefV1>,
     ) -> Result<Self, SessionCoordinationValidationError> {
@@ -367,6 +431,14 @@ impl ContextManifestNodeV1 {
         if let Some(parent) = &parent_manifest_root {
             validate_hash("parent_manifest_root", parent)?;
         }
+        if provider_projection.as_ref().is_some_and(|projection| {
+            projection.offering_id.is_some() && projection.exact_offering_id().is_none()
+        }) {
+            return Err(SessionCoordinationValidationError::InvalidIdentity {
+                field: "provider_projection.offering_id",
+                maximum_bytes: 64,
+            });
+        }
         let manifest_root = manifest_hash(
             &key,
             parent_manifest_root.as_deref(),
@@ -375,6 +447,7 @@ impl ContextManifestNodeV1 {
             conversation_seq,
             compaction_generation,
             config_version_id.as_deref(),
+            provider_projection.as_ref(),
             replaces_history,
             &appended_segments,
         );
@@ -387,6 +460,7 @@ impl ContextManifestNodeV1 {
             conversation_seq,
             compaction_generation,
             config_version_id,
+            provider_projection,
             replaces_history,
             appended_segments,
             manifest_root,
@@ -418,6 +492,7 @@ impl ContextManifestNodeV1 {
             self.conversation_seq,
             self.compaction_generation,
             self.config_version_id.clone(),
+            self.provider_projection.clone(),
             self.replaces_history,
             self.appended_segments.clone(),
         )?;
@@ -439,6 +514,11 @@ pub struct SessionContextHeadV1 {
     pub total_canonical_bytes: u64,
     pub total_message_count: u64,
     pub writer_epoch: u64,
+    /// Exact provider preference at this head. This is copied by a fork and
+    /// admitted into a resume envelope only when it belongs to this head;
+    /// every later execution still requires fresh policy/lease admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_projection: Option<ResumeProviderProjectionV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -583,6 +663,11 @@ pub struct CanonicalTurnDeltaV1 {
     pub compaction_generation: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_version_id: Option<String>,
+    /// Exact provider selection captured at turn admission. Older deltas may
+    /// omit this field; such state remains resumable for history but cannot
+    /// authorize an Offering on a later resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_projection: Option<ResumeProviderProjectionV1>,
     #[serde(default, skip_serializing_if = "is_append_delta")]
     pub mode: CanonicalDeltaModeV1,
     pub logical_segments: Vec<Vec<Value>>,
@@ -606,6 +691,14 @@ impl CanonicalTurnDeltaV1 {
         }
         if self.logical_segments.is_empty() || self.logical_segments.iter().any(Vec::is_empty) {
             return Err(SessionCoordinationValidationError::EmptyDelta);
+        }
+        if self.provider_projection.as_ref().is_some_and(|projection| {
+            projection.offering_id.is_some() && projection.exact_offering_id().is_none()
+        }) {
+            return Err(SessionCoordinationValidationError::InvalidIdentity {
+                field: "provider_projection.offering_id",
+                maximum_bytes: 64,
+            });
         }
         Ok(())
     }
@@ -719,6 +812,7 @@ fn manifest_hash(
     conversation_seq: u64,
     compaction_generation: u64,
     config_version_id: Option<&str>,
+    provider_projection: Option<&ResumeProviderProjectionV1>,
     replaces_history: bool,
     segments: &[ConversationSegmentRefV1],
 ) -> String {
@@ -743,6 +837,39 @@ fn manifest_hash(
         &mut digest,
         config_version_id.unwrap_or_default().as_bytes(),
     );
+    // Keep the legacy hash byte-for-byte stable when no provider projection
+    // exists, while binding every new exact Offering to its manifest root.
+    if let Some(provider) = provider_projection {
+        digest.update(b"provider_projection\0");
+        hash_field(
+            &mut digest,
+            provider
+                .offering_id
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        hash_field(
+            &mut digest,
+            provider.model.as_deref().unwrap_or_default().as_bytes(),
+        );
+        hash_field(
+            &mut digest,
+            provider
+                .permission_mode
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        hash_field(
+            &mut digest,
+            provider
+                .config_version_id
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+    }
     digest.update((segments.len() as u64).to_be_bytes());
     for segment in segments {
         hash_field(&mut digest, segment.segment_hash.as_bytes());
@@ -822,5 +949,49 @@ mod tests {
             child.cursor().projection_schema,
             SEGMENTED_CONVERSATION_PROJECTION_SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn manifest_root_binds_exact_provider_selection_and_legacy_nodes_fail_closed() {
+        let key = key("owner-a");
+        let segment = ConversationSegmentV1::new(
+            &key,
+            vec![json!({"role": "user", "content": "select runner"})],
+        )
+        .unwrap();
+        let provider = ResumeProviderProjectionV1 {
+            offering_id: Some("runner-offer".into()),
+            model: Some("gpt-5".into()),
+            permission_mode: Some("auto".into()),
+            config_version_id: None,
+        };
+        let legacy = ContextManifestNodeV1::new(
+            key.clone(),
+            None,
+            1,
+            1,
+            1,
+            0,
+            None,
+            vec![segment.reference()],
+        )
+        .unwrap();
+        let exact = ContextManifestNodeV1::new_with_provider_projection(
+            key,
+            None,
+            1,
+            1,
+            1,
+            0,
+            None,
+            Some(provider.clone()),
+            vec![segment.reference()],
+        )
+        .unwrap();
+
+        assert_ne!(legacy.manifest_root, exact.manifest_root);
+        assert!(legacy.provider_projection.is_none());
+        assert_eq!(exact.provider_projection, Some(provider));
+        exact.validate().unwrap();
     }
 }

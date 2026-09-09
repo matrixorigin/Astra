@@ -1,7 +1,7 @@
 //! Incremental parsing of SSE `data: …` lines into JSON values (OpenAI-style stream).
 //!
-//! [`super::server_loop`] buffers provider chunks, drains **blank-line** SSE events via
-//! [`super::sse_blocks::drain_complete_sse_event_blocks`], then parses each block with
+//! Consumers drain **blank-line** SSE events via
+//! [`super::blocks::SseBlankLineUtf8Buf`], then parse each block with
 //! [`json_events_from_sse_event_block`]. Any trailing bytes fall back to line-oriented
 //! [`drain_sse_data_lines`] / [`finish_sse_data_buffer`] (single-`\n` providers, partial tail).
 //! Contract tests use [`parse_sse_data_json_events`] and friends.
@@ -9,15 +9,24 @@
 use serde_json::Value;
 
 /// Parsed SSE payload from one or more `data:` lines.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct SseJsonDrain {
     pub events: Vec<Value>,
     /// Set when a line `data: [DONE]` is seen (OpenAI stream terminator).
     pub stream_finished: bool,
 }
 
+impl std::fmt::Debug for SseJsonDrain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SseJsonDrain")
+            .field("event_count", &self.events.len())
+            .field("stream_finished", &self.stream_finished)
+            .finish()
+    }
+}
+
 #[derive(Debug)]
-enum LineAction {
+pub(super) enum LineAction {
     Json(Value),
     Done,
     Skip,
@@ -41,7 +50,7 @@ fn process_trimmed_line(line: &str) -> LineAction {
     handle_data_payload(rest)
 }
 
-fn process_trimmed_line_strict(line: &str) -> Result<LineAction, String> {
+pub(super) fn process_trimmed_line_strict(line: &str) -> Result<LineAction, String> {
     let Some(rest) = line.strip_prefix("data: ") else {
         return Ok(LineAction::Skip);
     };
@@ -58,7 +67,7 @@ fn process_trimmed_line_strict(line: &str) -> Result<LineAction, String> {
 }
 
 /// Parse `data:` JSON payloads (and `data: [DONE]`) from lines inside one blank-line-delimited SSE
-/// event block (the same framing as [`super::sse_blocks`] and [`super::chat_turn_sse_dispatch::ChatTurnSseFramer`]).
+/// event block (the same framing as [`super::blocks`]).
 pub fn json_events_from_sse_event_block(block: &str) -> SseJsonDrain {
     let mut out = SseJsonDrain::default();
     for line in block.lines() {
@@ -194,14 +203,22 @@ pub fn validated_json_events_from_sse_block(block: &str) -> Result<Vec<Value>, S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sse_blocks::drain_complete_sse_event_blocks;
+    use crate::sse::blocks::SseBlankLineUtf8Buf;
     use serde_json::json;
 
     #[test]
+    fn decoded_payload_debug_does_not_expose_provider_content() {
+        let drain = json_events_from_sse_event_block("data: {\"text\":\"canary-private-output\"}");
+        let debug = format!("{drain:?}");
+        assert!(debug.contains("event_count: 1"));
+        assert!(!debug.contains("canary-private-output"));
+    }
+
+    #[test]
     fn json_events_from_block_matches_openai_framing() {
-        let mut buf = b"data: {\"a\":1}\n\n".to_vec();
-        let blocks = drain_complete_sse_event_blocks(&mut buf).unwrap();
-        assert!(buf.is_empty());
+        let mut input = SseBlankLineUtf8Buf::new();
+        let blocks = input.push_bytes(b"data: {\"a\":1}\n\n").unwrap();
+        assert!(input.into_inner().unwrap().is_empty());
         assert_eq!(blocks.len(), 1);
         let d = json_events_from_sse_event_block(&blocks[0]);
         assert_eq!(d.events, vec![json!({"a": 1})]);
@@ -210,8 +227,8 @@ mod tests {
 
     #[test]
     fn json_events_from_block_crlf_inside_block() {
-        let mut buf = b"data: {\"x\":2}\r\n\r\n".to_vec();
-        let blocks = drain_complete_sse_event_blocks(&mut buf).unwrap();
+        let mut input = SseBlankLineUtf8Buf::new();
+        let blocks = input.push_bytes(b"data: {\"x\":2}\r\n\r\n").unwrap();
         let d = json_events_from_sse_event_block(&blocks[0]);
         assert_eq!(d.events, vec![json!({"x": 2})]);
     }

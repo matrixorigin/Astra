@@ -160,6 +160,10 @@ impl ManifestDeltaV1 {
                 }
                 if expected_parent != Some(head.latest_manifest_root.as_str())
                     || head.cursor.canonical_root_hash != head.latest_manifest_root
+                    || self
+                        .missing_nodes
+                        .last()
+                        .is_some_and(|node| node.provider_projection != head.provider_projection)
                 {
                     return Err(SessionHandoffValidationError::InvalidManifestDelta);
                 }
@@ -733,6 +737,7 @@ mod tests {
             total_canonical_bytes: segment.canonical_bytes,
             total_message_count: u64::from(segment.message_count),
             writer_epoch: 1,
+            provider_projection: None,
         };
         let valid = ManifestDeltaV1 {
             schema_version: MANIFEST_DELTA_SCHEMA_VERSION,

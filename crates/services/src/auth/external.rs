@@ -176,7 +176,9 @@ impl ExternalCatalogModel {
             access_id: "this-device".to_string(),
             access_kind: crate::models::ModelAccessKind::ThisDevice,
             access_label: "This device".to_string(),
-            execution_placement: crate::models::ModelExecutionPlacement::Edge,
+            // This provider authorizes a gateway called by Server HTTP. Access
+            // ownership does not move the actual inference executor to Edge.
+            execution_placement: crate::models::ModelExecutionPlacement::Server,
             name,
             provider,
             description: string_value(&self.metadata, "description"),
@@ -1391,6 +1393,16 @@ mod tests {
     }
 
     #[test]
+    fn external_catalog_reports_server_execution_independently_of_access_owner() {
+        let item = external_catalog_model(Some("gateway-provider"));
+        assert_eq!(item.access_kind, crate::models::ModelAccessKind::ThisDevice);
+        assert_eq!(
+            item.execution_placement,
+            crate::models::ModelExecutionPlacement::Server
+        );
+    }
+
+    #[test]
     fn external_catalog_normalizes_provider_for_seek_identity() {
         assert_eq!(
             external_catalog_model(None).provider,
@@ -1510,7 +1522,7 @@ mod tests {
         );
         assert_eq!(
             model.execution_placement,
-            crate::models::ModelExecutionPlacement::Edge
+            crate::models::ModelExecutionPlacement::Server
         );
         assert_eq!(model.name, "Qwen 2.5");
 

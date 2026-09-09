@@ -10,6 +10,17 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod local_model_scope;
+mod local_models;
+
+pub use local_model_scope::LocalModelScope;
+
+pub use local_models::{
+    LOCAL_MODELS_FILE_VERSION, LocalCredentialRef, LocalInferenceProtocol, LocalModelConfig,
+    LocalModelConfigError, LocalModelConfigLease, LocalModelConfigStore, LocalModelDefinition,
+    LocalModelProbeState, LocalSecretStore, ResolvedLocalCredential,
+};
+
 #[derive(Debug, Error)]
 pub enum CredentialError {
     #[error("io error on {path}: {source}")]

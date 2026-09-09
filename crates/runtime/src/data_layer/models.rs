@@ -283,7 +283,7 @@ async fn effective_model_catalog(
                 id: "this-device".to_string(),
                 kind: ModelAccessKind::ThisDevice,
                 label: "This device".to_string(),
-                execution_placement: ModelExecutionPlacement::Edge,
+                execution_placement: ModelExecutionPlacement::Server,
                 availability: ModelAccessAvailability::Ready,
             }],
             offerings: page.items,
@@ -363,6 +363,19 @@ async fn effective_model_catalog(
             execution_placement: ModelExecutionPlacement::Server,
             availability: ModelAccessAvailability::Ready,
         });
+    }
+    for item in &page.items {
+        if item.access_kind == ModelAccessKind::ThisDevice
+            && !declared.iter().any(|access| access.id == item.access_id)
+        {
+            declared.push(DeclaredModelAccess {
+                id: item.access_id.clone(),
+                kind: ModelAccessKind::ThisDevice,
+                label: item.access_label.clone(),
+                execution_placement: ModelExecutionPlacement::Edge,
+                availability: ModelAccessAvailability::Ready,
+            });
+        }
     }
     Ok(EffectiveModelCatalog {
         declared,
@@ -608,7 +621,7 @@ mod tests {
             access_id: "this-device".to_string(),
             access_kind: ModelAccessKind::ThisDevice,
             access_label: "This device".to_string(),
-            execution_placement: ModelExecutionPlacement::Edge,
+            execution_placement: ModelExecutionPlacement::Server,
             name: name.to_string(),
             provider: "external".to_string(),
             description: None,
@@ -631,7 +644,7 @@ mod tests {
                 id: "this-device".to_string(),
                 kind: ModelAccessKind::ThisDevice,
                 label: "This device".to_string(),
-                execution_placement: ModelExecutionPlacement::Edge,
+                execution_placement: ModelExecutionPlacement::Server,
                 availability: ModelAccessAvailability::Ready,
             }],
             vec![full_catalog[0].clone()],
@@ -670,7 +683,7 @@ mod tests {
                 id: "this-device".to_string(),
                 kind: ModelAccessKind::ThisDevice,
                 label: "This device".to_string(),
-                execution_placement: ModelExecutionPlacement::Edge,
+                execution_placement: ModelExecutionPlacement::Server,
                 availability: ModelAccessAvailability::Ready,
             }],
             offerings.clone(),

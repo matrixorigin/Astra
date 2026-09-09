@@ -2360,6 +2360,7 @@ impl SessionContextCoordinator for DatabaseSessionContextCoordinator {
             total_canonical_bytes,
             total_message_count,
             writer_epoch: reservation.writer_epoch,
+            provider_projection: node.provider_projection,
         });
         state.last_commit = Some(CommitReceiptV1 {
             idempotency_key: idempotency_key.to_owned(),
@@ -3036,6 +3037,14 @@ fn materialize_nodes(
     nodes: Vec<ContextManifestNodeV1>,
     segments: &mut std::collections::HashMap<String, ConversationSegmentV1>,
 ) -> Result<MaterializedConversationV1, SessionContextCoordinatorError> {
+    if nodes
+        .last()
+        .is_none_or(|node| node.provider_projection != head.provider_projection)
+    {
+        return Err(SessionContextCoordinatorError::NeedsRepair(
+            "context head provider projection does not match its canonical manifest".into(),
+        ));
+    }
     let mut use_counts = std::collections::HashMap::<String, usize>::new();
     for node in &nodes {
         for segment in &node.appended_segments {
@@ -3722,6 +3731,7 @@ fn fork_child_head(manifest: &SessionForkManifestV1, writer_epoch: u64) -> Sessi
         total_canonical_bytes: manifest.parent_head.total_canonical_bytes,
         total_message_count: manifest.parent_head.total_message_count,
         writer_epoch,
+        provider_projection: manifest.parent_head.provider_projection.clone(),
     }
 }
 
@@ -3797,7 +3807,7 @@ fn manifest_node_for_delta(
         .map(ConversationSegmentV1::reference)
         .collect();
     match delta.mode {
-        CanonicalDeltaModeV1::Append => ContextManifestNodeV1::new(
+        CanonicalDeltaModeV1::Append => ContextManifestNodeV1::new_with_provider_projection(
             key.clone(),
             parent,
             delta.completed_turn,
@@ -3805,18 +3815,22 @@ fn manifest_node_for_delta(
             delta.conversation_seq,
             delta.compaction_generation,
             delta.config_version_id.clone(),
+            delta.provider_projection.clone(),
             references,
         ),
-        CanonicalDeltaModeV1::Replace => ContextManifestNodeV1::new_replacement(
-            key.clone(),
-            parent,
-            delta.completed_turn,
-            delta.journal_event_seq,
-            delta.conversation_seq,
-            delta.compaction_generation,
-            delta.config_version_id.clone(),
-            references,
-        ),
+        CanonicalDeltaModeV1::Replace => {
+            ContextManifestNodeV1::new_replacement_with_provider_projection(
+                key.clone(),
+                parent,
+                delta.completed_turn,
+                delta.journal_event_seq,
+                delta.conversation_seq,
+                delta.compaction_generation,
+                delta.config_version_id.clone(),
+                delta.provider_projection.clone(),
+                references,
+            )
+        }
     }
 }
 
@@ -3867,6 +3881,9 @@ fn validate_head(head: &SessionContextHeadV1) -> Result<(), SessionContextCoordi
         || !head.key.validates_cursor(&head.cursor)
         || head.cursor.canonical_root_hash != head.latest_manifest_root
         || head.total_message_count == 0
+        || head.provider_projection.as_ref().is_some_and(|projection| {
+            projection.offering_id.is_some() && projection.exact_offering_id().is_none()
+        })
     {
         return Err(SessionContextCoordinatorError::NeedsRepair(
             "invalid context head".into(),
@@ -4293,6 +4310,25 @@ fn turn_delta_hash(delta: &CanonicalTurnDeltaV1) -> String {
         &mut digest,
         delta.config_version_id.as_deref().unwrap_or_default(),
     );
+    // Preserve the legacy idempotency hash when the optional projection is
+    // absent. New commits bind the exact Offering and related provider state
+    // so a retry cannot silently substitute another selection.
+    if let Some(provider) = &delta.provider_projection {
+        digest.update(b"provider_projection\0");
+        hash_field(
+            &mut digest,
+            provider.offering_id.as_deref().unwrap_or_default(),
+        );
+        hash_field(&mut digest, provider.model.as_deref().unwrap_or_default());
+        hash_field(
+            &mut digest,
+            provider.permission_mode.as_deref().unwrap_or_default(),
+        );
+        hash_field(
+            &mut digest,
+            provider.config_version_id.as_deref().unwrap_or_default(),
+        );
+    }
     digest.update((delta.logical_segments.len() as u64).to_be_bytes());
     for messages in &delta.logical_segments {
         hash_field(&mut digest, &canonical_conversation_root(messages));

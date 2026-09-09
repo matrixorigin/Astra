@@ -187,6 +187,12 @@ pub struct ResumeActivationProjectionV1 {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResumeProviderProjectionV1 {
+    /// Exact opaque Offering identity selected at admission. This is a causal
+    /// provider preference for a later fresh admission, not a live grant or
+    /// execution lease; `model` remains display context and must never be
+    /// used as a name-based fallback when this value is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offering_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -197,8 +203,31 @@ pub struct ResumeProviderProjectionV1 {
 
 impl ResumeProviderProjectionV1 {
     pub fn is_empty(&self) -> bool {
-        self.model.is_none() && self.permission_mode.is_none() && self.config_version_id.is_none()
+        self.offering_id.is_none()
+            && self.model.is_none()
+            && self.permission_mode.is_none()
+            && self.config_version_id.is_none()
     }
+
+    /// Return the exact Offering only when it satisfies the same shape
+    /// contract as the model-access admission boundary. Missing or malformed
+    /// identities intentionally fail closed; callers must not infer one from
+    /// the display model name or workspace metadata.
+    pub fn exact_offering_id(&self) -> Option<&str> {
+        self.offering_id
+            .as_deref()
+            .filter(|offering_id| is_valid_offering_id(offering_id))
+    }
+}
+
+/// Canonical shape check for an opaque Offering identity. This deliberately
+/// validates syntax only; ownership, availability, and execution admission
+/// remain responsibilities of the authenticated Model Access boundary.
+pub fn is_valid_offering_id(offering_id: &str) -> bool {
+    !offering_id.is_empty()
+        && offering_id.len() <= 64
+        && offering_id.trim() == offering_id
+        && !offering_id.chars().any(char::is_control)
 }
 
 /// Independently persisted resume projections. Every payload carries its own
@@ -589,6 +618,35 @@ mod tests {
             repair_actions: Vec::new(),
             projections: ResumeProjectionSetV1::default(),
         }
+    }
+
+    #[test]
+    fn provider_projection_accepts_only_exact_offering_shape() {
+        let projection = ResumeProviderProjectionV1 {
+            offering_id: Some("runner-offer".into()),
+            model: Some("gpt-5".into()),
+            permission_mode: Some("auto".into()),
+            config_version_id: None,
+        };
+        assert_eq!(projection.exact_offering_id(), Some("runner-offer"));
+
+        for offering_id in ["", " runner-offer", "runner-offer ", "runner\noffer"] {
+            let projection = ResumeProviderProjectionV1 {
+                offering_id: Some(offering_id.into()),
+                ..projection.clone()
+            };
+            assert_eq!(projection.exact_offering_id(), None);
+        }
+    }
+
+    #[test]
+    fn legacy_provider_projection_without_offering_fails_closed() {
+        let projection = ResumeProviderProjectionV1 {
+            model: Some("gpt-5".into()),
+            ..Default::default()
+        };
+        assert_eq!(projection.exact_offering_id(), None);
+        assert!(!projection.is_empty());
     }
 
     #[test]

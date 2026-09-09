@@ -62,10 +62,12 @@ impl SlashResult {
     }
 }
 
-/// A read-only workbench action whose I/O is owned by the event loop rather
-/// than the slash dispatcher. These actions have no mutable session effect,
-/// so they can complete after the user keeps composing without borrowing UI
-/// state across a filesystem or process wait.
+/// A background workbench action whose I/O is owned by the event loop rather
+/// than the slash dispatcher. Most actions are read-only; the local-model
+/// check is the deliberate exception because it records secret-safe provider
+/// evidence in the owner-scoped local store. None of these actions mutate the
+/// active conversation, so they can complete after the user keeps composing
+/// without borrowing UI state across a filesystem or process wait.
 pub(crate) enum SlashBackgroundRead {
     Clipboard {
         text: String,
@@ -98,6 +100,10 @@ pub(crate) enum SlashBackgroundRead {
         breakdown: Box<crate::tui::context_panel::ContextBreakdown>,
         session_id: Option<String>,
         journal_dir_override: Option<std::path::PathBuf>,
+    },
+    LocalModelCheck {
+        scope: astra_credentials::LocalModelScope,
+        name: String,
     },
 }
 
@@ -288,6 +294,9 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
         //   /model                   → open the picker (legacy default)
         //   /model list              → explicit alias for the picker
         //   /model info              → details panel for current model
+        //   /model add               → native Runner-local setup
+        //   /model status            → local readiness without provider I/O
+        //   /model check <name>      → one explicit bounded provider check
         //   /model clear             → clear the active model selection
         //   /model <name>            → direct switch to <name>
         //
@@ -303,10 +312,34 @@ pub(crate) async fn dispatch(text: &str, ctx: &mut DispatchContext<'_>) -> Slash
             let (sub, rest) = split_sub(trimmed);
             match sub {
                 "info" => handle_model_info(ctx, rest).await,
+                "add" if rest.is_empty() => {
+                    if let Err(error) = astra_credentials::LocalModelScope::for_profile(
+                        &ctx.api.api_origin(),
+                        ctx.profile,
+                    ) {
+                        ctx.show_error(format!("Sign in before configuring a local model so it belongs to the correct account. {error}"));
+                        return SlashResult::Handled;
+                    }
+                    ctx.open_deferred_view(
+                        "Opened local model setup",
+                        Box::new(crate::tui::bottom_pane::model_setup_view::ModelSetupView::new()),
+                    );
+                    SlashResult::Deferred
+                }
+                "manage" | "status" if rest.is_empty() => handle_model_manage(ctx),
+                "check" if rest.is_empty() => {
+                    ctx.show_error("Usage: /model check <name>".into());
+                    SlashResult::Handled
+                }
+                "check" => handle_model_check(ctx, rest),
+                "add" => {
+                    ctx.show_error("Use `/model add` and complete the private setup form.".into());
+                    SlashResult::Handled
+                }
                 "clear" => handle_model_clear(ctx).await,
                 // Everything else is the `/model <name>` shorthand.
                 _ => {
-                    handle_model_set(ctx, trimmed);
+                    handle_model_set(ctx, trimmed).await;
                     SlashResult::Handled
                 }
             }
@@ -1434,6 +1467,7 @@ pub(crate) fn handle_view_result(
         | ViewResult::ConfigEdit { .. }
         | ViewResult::Model { .. }
         | ViewResult::ModelThinking { .. }
+        | ViewResult::ModelSetup(_)
         | ViewResult::Session { .. }
         | ViewResult::WorkspaceTrust(_) => {}
     }
@@ -2563,37 +2597,79 @@ pub(crate) fn push_model_picker(
     state: &SessionState,
     bottom_pane: &mut BottomPane,
     chat_widget: &mut crate::tui::chat_widget::ChatWidget,
-    models: Vec<String>,
+    models: &[crate::cli::slash::slash_router::ModelCatalogEntry],
 ) -> bool {
-    // Strip any `-thinking:*` suffix from the cached model when
-    // highlighting the current row — the picker shows base names only,
-    // and the suffix is re-applied by the thinking stage.
-    let current_raw = state.model.clone().unwrap_or_default();
-    let current_base = current_raw
-        .split_once("-thinking:")
-        .map(|(b, _)| b.to_string())
-        .unwrap_or(current_raw);
-    let items: Vec<SelectionItem> = models
+    let active_models: Vec<_> = models
         .iter()
-        .map(|m| {
-            let is_current = *m == current_base;
-            SelectionItem {
-                name: m.clone(),
-                description: None,
+        .filter(|entry| crate::cli::slash::slash_router::entry_model_is_active(entry))
+        .collect();
+    let mut name_counts = std::collections::HashMap::new();
+    for entry in models {
+        if let Some(name) = crate::cli::slash::slash_router::entry_model_name(entry) {
+            *name_counts
+                .entry(name.to_ascii_lowercase())
+                .or_insert(0usize) += 1;
+        }
+    }
+    // Use the canonical thinking parser; model labels are presentation only.
+    let current_base = astra_turn_core::thinking_config::resolve_model_thinking(
+        state.model.as_deref().unwrap_or_default(),
+    )
+    .0;
+    let active_offering_id = state.offering_id.clone();
+    let items: Vec<SelectionItem> = active_models
+        .iter()
+        .filter_map(|entry| {
+            let name = crate::cli::slash::slash_router::entry_model_name(entry)?;
+            let is_duplicate = name_counts
+                .get(&name.to_ascii_lowercase())
+                .is_some_and(|count| *count > 1);
+            let is_current = active_offering_id
+                .as_deref()
+                .is_some_and(|offering_id| offering_id == entry.offering_id)
+                || (active_offering_id.is_none() && !is_duplicate && name == current_base);
+            let description = if is_duplicate {
+                let tail = entry
+                    .offering_id
+                    .chars()
+                    .rev()
+                    .take(8)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>();
+                Some(format!("{} · offering …{tail}", entry.access_label))
+            } else {
+                Some(
+                    match entry.description.as_deref().filter(|text| !text.is_empty()) {
+                        Some(description) => format!("{} · {description}", entry.access_label),
+                        None => entry.access_label.clone(),
+                    },
+                )
+            };
+            Some(SelectionItem {
+                name: name.to_string(),
+                description,
                 is_current,
-            }
+            })
         })
         .collect();
     if items.is_empty() {
-        chat_widget.commit_system(SystemCell::info("No models available"));
+        chat_widget.commit_system(SystemCell::info("No models are ready. Reconnect your Runner or ask your administrator for model access. Use /model add to configure your own."));
         false
     } else {
         let view = ListSelectionView::new(items, Some("Select model:".into()))
             .with_footer_hint(MODEL_PICKER_FOOTER_HINT)
             .with_results(
-                models
+                active_models
                     .into_iter()
-                    .map(|name| ViewResult::Model { name })
+                    .filter_map(|entry| {
+                        Some(ViewResult::Model {
+                            name: crate::cli::slash::slash_router::entry_model_name(entry)?
+                                .to_string(),
+                            offering_id: Some(entry.offering_id.clone()),
+                        })
+                    })
                     .collect(),
             );
         chat_widget.commit_system(SystemCell::response("Opened model picker"));
@@ -2617,9 +2693,9 @@ fn model_catalog_error_message(
     }
 }
 
-/// Fetch the full active model catalog, including provider and thinking
-/// metadata. The caller owns scheduling; this function is free of TUI
-/// references so it can run outside the input event loop.
+/// Fetch the full model catalog, including known unavailable Offerings.
+/// Selection surfaces must check `is_active`; retaining inactive rows lets the
+/// product explain and repair disconnected Runner capacity.
 pub(crate) async fn load_model_catalog(
     api: astra_thin_client::ThinClient,
     profile: Option<String>,
@@ -2660,12 +2736,12 @@ pub(crate) async fn load_model_catalog(
 async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
     match load_model_catalog(ctx.api.clone(), ctx.profile.map(str::to_string)).await {
         Ok(models) => {
-            let names = models
-                .iter()
-                .filter_map(crate::cli::slash::slash_router::entry_model_name)
-                .map(ToOwned::to_owned)
-                .collect();
-            if push_model_picker(ctx.state, ctx.bottom_pane, ctx.chat_widget, names) {
+            if let Some(message) =
+                crate::cli::slash::slash_router::unavailable_model_repair_summary(&models)
+            {
+                ctx.show_info(message);
+            }
+            if push_model_picker(ctx.state, ctx.bottom_pane, ctx.chat_widget, &models) {
                 return SlashResult::Deferred;
             }
         }
@@ -2676,7 +2752,7 @@ async fn open_model_picker(ctx: &mut DispatchContext<'_>) -> SlashResult {
 
 /// `/model set <name>` — apply immediately.  Also used as the
 /// fallback for `/model <name>` shorthand.
-fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
+async fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
     let name = name.trim();
     if name.is_empty() {
         ctx.show_error("Model name cannot be empty — try `/model list`.".into());
@@ -2685,16 +2761,44 @@ fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
     let Some(name) = crate::cli::cli_config::cli_utils::normalize_model_override(Some(name)) else {
         ctx.state.model = None;
         crate::cli::slash::slash_config::set_active_model_for_display(None);
-        crate::cli::slash::slash_config::set_active_offering_id_for_request(None);
+        ctx.state.offering_id = None;
+        ctx.state.provider_selection_requires_explicit = false;
         ctx.bottom_pane.footer.model = None;
         ctx.show_response("Model selection cleared — choose a model before the next turn.".into());
         return;
     };
-    ctx.state.model = Some(name.to_string());
-    crate::cli::slash::slash_config::set_active_model_for_display(Some(name.to_string()));
-    crate::cli::slash::slash_config::set_active_offering_id_for_request(None);
-    ctx.bottom_pane.footer.model = Some(name.to_string());
-    ctx.show_response(format!("Set model to {name}"));
+    let catalog = match load_model_catalog(ctx.api.clone(), ctx.profile.map(str::to_owned)).await {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            ctx.show_error(error);
+            return;
+        }
+    };
+    let registry_name = astra_turn_core::thinking_config::resolve_model_thinking(name).0;
+    let selected = match crate::cli::slash::slash_router::resolve_model_catalog_entry(
+        &catalog,
+        registry_name,
+    ) {
+        Ok(selected) if selected.is_active => selected,
+        Ok(_) => {
+            ctx.show_error("Selected model is unavailable. Reconnect its Runner or choose another Offering with /model.".into());
+            return;
+        }
+        Err(error) => {
+            ctx.show_error(error);
+            return;
+        }
+    };
+    let display_name = format!("{}{}", selected.name, &name[registry_name.len()..]);
+    ctx.state.model = Some(display_name.clone());
+    crate::cli::slash::slash_config::set_active_model_for_display(Some(display_name.clone()));
+    ctx.state.offering_id = Some(selected.offering_id.clone());
+    ctx.state.provider_selection_requires_explicit = false;
+    ctx.bottom_pane.footer.model = Some(display_name.clone());
+    ctx.show_response(format!(
+        "Set model to {} · {}",
+        display_name, selected.access_label
+    ));
 }
 
 /// `/model clear` — unset the session model. Reports the change to
@@ -2702,10 +2806,208 @@ fn handle_model_set(ctx: &mut DispatchContext<'_>, name: &str) {
 async fn handle_model_clear(ctx: &mut DispatchContext<'_>) -> SlashResult {
     ctx.state.model = None;
     crate::cli::slash::slash_config::set_active_model_for_display(None);
-    crate::cli::slash::slash_config::set_active_offering_id_for_request(None);
+    ctx.state.offering_id = None;
+    ctx.state.provider_selection_requires_explicit = false;
     ctx.bottom_pane.footer.model = None;
     ctx.show_response("Model selection cleared — choose a model before the next turn.".into());
     SlashResult::Handled
+}
+
+/// `/model manage` and `/model status` expose device-local configuration
+/// without leaving the conversation or contacting a provider. The list is a
+/// projection of the same local store used by `astra model local list`; it
+/// intentionally contains no endpoint secrets or internal Runner identifiers.
+fn handle_model_manage(ctx: &mut DispatchContext<'_>) -> SlashResult {
+    use crate::tui::bottom_pane::info_view::InfoView;
+
+    let scope =
+        match astra_credentials::LocalModelScope::for_profile(&ctx.api.api_origin(), ctx.profile) {
+            Ok(scope) => scope,
+            Err(error) => {
+                ctx.show_error(format!(
+                    "Sign in before viewing device model status. {error}"
+                ));
+                return SlashResult::Handled;
+            }
+        };
+    let body = match crate::cli::local_model_command::list(&scope) {
+        Ok(body) => body,
+        Err(error) => {
+            ctx.show_error(format!("Could not read device model status. {error}"));
+            return SlashResult::Handled;
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            ctx.show_error(format!("Could not render device model status. {error}"));
+            return SlashResult::Handled;
+        }
+    };
+    let lines = local_model_management_lines(&value);
+    ctx.open_view(
+        "Opened device model status",
+        Box::new(
+            InfoView::from_plain("This device · Model access", lines).with_reopen("/model status"),
+        ),
+    );
+    SlashResult::Handled
+}
+
+/// `/model check <name>` performs one explicit bounded provider request in
+/// the event-loop worker. The scope is captured at submission time so a later
+/// profile/account switch cannot attach the resulting evidence to another
+/// owner. The command intentionally does not select the model.
+fn handle_model_check(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashResult {
+    let name = arg.trim();
+    if name.is_empty() {
+        ctx.show_error("Usage: /model check <name>".into());
+        return SlashResult::Handled;
+    }
+    let scope =
+        match astra_credentials::LocalModelScope::for_profile(&ctx.api.api_origin(), ctx.profile) {
+            Ok(scope) => scope,
+            Err(error) => {
+                ctx.show_error(format!("Sign in before checking a device model. {error}"));
+                return SlashResult::Handled;
+            }
+        };
+    ctx.show_response(format!("Checking local model '{name}'…"));
+    SlashResult::background_read(SlashBackgroundRead::LocalModelCheck {
+        scope,
+        name: name.to_owned(),
+    })
+}
+
+fn local_model_management_lines(value: &serde_json::Value) -> Vec<String> {
+    let mut lines = vec![
+        "Credentials and configuration stay on this signed-in device.".to_string(),
+        "Status is the last known local readiness; provider checks are explicit and may cost money."
+            .to_string(),
+        String::new(),
+    ];
+    let Some(models) = value.get("models").and_then(serde_json::Value::as_array) else {
+        lines.push("Could not read local model entries.".to_string());
+        return lines;
+    };
+    if models.is_empty() {
+        lines.push("No device models saved.".to_string());
+        lines.push("Use /model add to configure one.".to_string());
+        return lines;
+    }
+    for model in models {
+        let name = model
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("(unnamed)");
+        let provider_model = model
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown model");
+        let status = model
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let credential = model
+            .get("credential")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let probe = model
+            .get("provider_probe")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let checked_at = model
+            .get("probe_checked_at_unix_ms")
+            .and_then(serde_json::Value::as_u64)
+            .map(friendly_probe_checked_at);
+        let next = model
+            .get("next")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("open /model to choose an action");
+        let next = friendly_local_model_next_step(next);
+        lines.push(format!("{name} · {provider_model}"));
+        let failure = model
+            .get("probe_failure_code")
+            .and_then(serde_json::Value::as_str);
+        let status = friendly_local_model_status(status);
+        let credential = friendly_local_model_credential(credential);
+        let probe = friendly_local_model_probe(probe);
+        let check = failure
+            .map(|code| format!("{probe} ({})", friendly_probe_failure(code)))
+            .unwrap_or_else(|| probe.to_owned());
+        let check = checked_at
+            .map(|age| format!("{check} · last checked {age}"))
+            .unwrap_or(check);
+        lines.push(format!(
+            "  status: {status} · credential: {credential} · check: {check}"
+        ));
+        lines.push(format!("  next: {next}"));
+    }
+    lines.push(String::new());
+    lines.push(
+        "/model add · configure    /model · choose    /model check <name> · test".to_string(),
+    );
+    lines
+}
+
+fn friendly_local_model_status(status: &str) -> &str {
+    match status {
+        "ready" => "Ready",
+        "ready_for_check" => "Configured · not tested",
+        "needs_attention" => "Needs attention",
+        _ => status,
+    }
+}
+
+fn friendly_local_model_credential(credential: &str) -> &str {
+    match credential {
+        "available" => "available",
+        "missing" => "missing",
+        "not_required" => "not needed",
+        "unsupported" => "unsupported",
+        _ => credential,
+    }
+}
+
+fn friendly_local_model_probe(probe: &str) -> &str {
+    match probe {
+        "stream_verified" => "verified",
+        "not_run" => "not tested",
+        "failed" => "failed",
+        "stale" => "stale · credential changed; recheck",
+        "stream_eof_verified" => "verified (stream ended)",
+        _ => probe,
+    }
+}
+
+fn friendly_probe_failure(code: &str) -> &str {
+    match code {
+        "http_401" | "http_403" => "authentication rejected",
+        "http_404" => "endpoint or model not found",
+        "timeout" => "timed out",
+        "transport" => "provider unreachable",
+        "protocol" => "provider response invalid",
+        _ => "provider check failed",
+    }
+}
+
+fn friendly_local_model_next_step(next: &str) -> String {
+    next.replace("astra model local check", "/model check")
+        .replace("astra model local add", "/model add")
+}
+
+fn friendly_probe_checked_at(unix_ms: u64) -> String {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default();
+    let age_seconds = now_ms.saturating_sub(unix_ms) / 1_000;
+    match age_seconds {
+        0..=59 => "just now".to_string(),
+        60..=3_599 => format!("{}m ago", age_seconds / 60),
+        3_600..=86_399 => format!("{}h ago", age_seconds / 3_600),
+        _ => format!("{}d ago", age_seconds / 86_400),
+    }
 }
 
 /// `/model info [name]` — push a read-only [`InfoView`] with the
@@ -2714,39 +3016,22 @@ async fn handle_model_clear(ctx: &mut DispatchContext<'_>) -> SlashResult {
 async fn handle_model_info(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashResult {
     use crate::tui::bottom_pane::info_view::InfoView;
 
-    let target = if arg.is_empty() {
-        ctx.state.model.clone()
-    } else {
-        Some(arg.trim().to_string())
-    };
-    let Some(name) = target else {
-        ctx.show_error("No active model — try `/model set <name>` or `/model list`.".into());
+    let Some(name) = ctx.state.model.clone() else {
+        ctx.show_error(
+            "No model selected. Use /model to choose one, or /model add to configure your own."
+                .into(),
+        );
         return SlashResult::Handled;
     };
-
-    // Prefer the cached pricing the session already carries so
-    // `/model info` is instant — live refetch happens via
-    // `/model list` when the user explicitly asks.
-    let pricing = &ctx.state.cached_pricing;
-    let prompt_usd = if pricing.prompt > 0.0 {
-        format!("${:.3} / 1M tokens", pricing.prompt * 1_000_000.0)
-    } else {
-        "— (not cached)".into()
-    };
-    let completion_usd = if pricing.completion > 0.0 {
-        format!("${:.3} / 1M tokens", pricing.completion * 1_000_000.0)
-    } else {
-        "— (not cached)".into()
-    };
-    let cache_read = pricing
-        .cache_read
-        .map(|v| format!("${:.3} / 1M", v * 1_000_000.0))
-        .unwrap_or_else(|| "—".into());
-    let cache_write = pricing
-        .cache_write
-        .map(|v| format!("${:.3} / 1M", v * 1_000_000.0))
-        .unwrap_or_else(|| "—".into());
-
+    if !arg.trim().is_empty()
+        && arg.trim() != name
+        && ctx.state.offering_id.as_deref() != Some(arg.trim())
+    {
+        ctx.show_error("Model info describes the current selection. Choose the model with /model first, then run /model info.".into());
+        return SlashResult::Handled;
+    }
+    // Session pricing is a name-based estimate and may belong to a previous
+    // model. Never present it as the rate for an exact BYOK Offering.
     let cumulative_tokens = ctx
         .state
         .total_prompt_tokens
@@ -2754,17 +3039,21 @@ async fn handle_model_info(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashRes
     let pairs: Vec<(&str, String)> = vec![
         ("model", name.clone()),
         (
-            "current",
-            if ctx.state.model.as_deref() == Some(name.as_str()) {
-                "yes".into()
-            } else {
-                "no (info for override target)".into()
-            },
+            "offering ID",
+            ctx.state
+                .offering_id
+                .clone()
+                .unwrap_or_else(|| "Not resolved; open /model".into()),
         ),
-        ("prompt cost", prompt_usd),
-        ("completion cost", completion_usd),
-        ("cache read", cache_read),
-        ("cache write", cache_write),
+        ("availability", "Open /model to refresh the catalog".into()),
+        (
+            "model rates",
+            "Not available for this exact Offering; check your provider".into(),
+        ),
+        (
+            "usage scope",
+            "Entire session, across all selected models".into(),
+        ),
         (
             "session prompt tokens",
             fmt_tokens(ctx.state.total_prompt_tokens),
@@ -2783,7 +3072,7 @@ async fn handle_model_info(ctx: &mut DispatchContext<'_>, arg: &str) -> SlashRes
         ),
         ("session total tokens", fmt_tokens(cumulative_tokens)),
         (
-            "session cost",
+            "estimated session cost",
             format!("${:.4}", ctx.state.total_session_cost),
         ),
     ];
@@ -3341,7 +3630,8 @@ mod routing_tests {
         MODEL_PICKER_FOOTER_HINT, MODEL_THINKING_PICKER_FOOTER_HINT, MemoryCommandRoute,
         SkillCommandRoute, config_command_route, context_breakdown_for_panel,
         context_dump_argument, help_command_route, history_command_route, is_model_picker_request,
-        keyboard_shortcut_pairs, memory_command_route, skill_command_route,
+        keyboard_shortcut_pairs, local_model_management_lines, memory_command_route,
+        skill_command_route,
     };
     use crate::cli::session::session_state::SessionState;
     use crate::tui::context_panel::{
@@ -3412,6 +3702,90 @@ mod routing_tests {
         assert!(!is_model_picker_request("/model info"));
         assert!(!is_model_picker_request("/model gpt-5"));
         assert!(!is_model_picker_request("/context"));
+    }
+
+    #[test]
+    fn local_model_status_explains_empty_and_attention_states() {
+        let empty = local_model_management_lines(&serde_json::json!({"models": []}));
+        assert!(
+            empty
+                .iter()
+                .any(|line| line.contains("No device models saved"))
+        );
+        assert!(empty.iter().any(|line| line.contains("/model add")));
+
+        let attention = local_model_management_lines(&serde_json::json!({
+            "models": [{
+                "name": "work",
+                "model": "coding-model",
+                "status": "needs_attention",
+                "credential": "missing",
+                "provider_probe": "failed",
+                "probe_failure_code": "http_401",
+                "probe_checked_at_unix_ms": 1,
+                "next": "set the configured credential, then run astra model local check work"
+            }]
+        }));
+        assert!(
+            attention
+                .iter()
+                .any(|line| line.contains("Needs attention"))
+        );
+        assert!(
+            attention
+                .iter()
+                .any(|line| line.contains("authentication rejected"))
+        );
+        assert!(
+            attention
+                .iter()
+                .all(|line| !line.contains("needs_attention"))
+        );
+        assert!(
+            attention
+                .iter()
+                .any(|line| line.contains("set the configured credential"))
+        );
+        assert!(
+            attention
+                .iter()
+                .any(|line| line.contains("/model check work"))
+        );
+        assert!(attention.iter().any(|line| line.contains("last checked")));
+        assert!(
+            attention
+                .iter()
+                .all(|line| !line.contains("astra model local check"))
+        );
+        assert!(attention.iter().all(|line| !line.contains("base_url")));
+
+        let stale = local_model_management_lines(&serde_json::json!({
+            "models": [{
+                "name": "work",
+                "model": "coding-model",
+                "status": "ready_for_check",
+                "credential": "available",
+                "provider_probe": "stale",
+                "probe_checked_at_unix_ms": 1,
+                "next": "credential material changed since the last provider check; run astra model local check work"
+            }]
+        }));
+        assert!(
+            stale
+                .iter()
+                .any(|line| line.contains("credential changed; recheck"))
+        );
+        assert!(
+            stale
+                .iter()
+                .any(|line| line.contains("Configured · not tested"))
+        );
+    }
+
+    #[test]
+    fn local_model_check_is_an_explicit_action_not_a_status_refresh() {
+        assert_eq!(super::split_sub("check work"), ("check", "work"));
+        assert_eq!(super::split_sub("check"), ("check", ""));
     }
 
     #[test]

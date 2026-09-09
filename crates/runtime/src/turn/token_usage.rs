@@ -143,94 +143,12 @@ fn as_u64(v: Option<&Value>) -> Option<u64> {
 }
 
 fn extract_openai(u: &Map<String, Value>) -> Option<TokenUsage> {
-    if !u.contains_key("prompt_tokens")
-        && !u.contains_key("completion_tokens")
-        && (u.contains_key("input_tokens")
-            || u.contains_key("output_tokens")
-            || u.contains_key("cache_read_input_tokens")
-            || u.contains_key("cache_creation_input_tokens"))
-    {
-        return extract_anthropic(u);
-    }
-
-    // DeepSeek's native OpenAI-compatible response uses top-level hit/miss
-    // fields, but unlike Anthropic's top-level cache aliases `prompt_tokens`
-    // remains inclusive. Handle this shape before the generic field-location
-    // heuristic or cached input would be counted twice as fresh input.
-    let deepseek_hit = as_u64(u.get("prompt_cache_hit_tokens"));
-    let deepseek_miss = as_u64(u.get("prompt_cache_miss_tokens"));
-    if deepseek_hit.is_some() || deepseek_miss.is_some() {
-        let prompt_total = as_u64(u.get("prompt_tokens"));
-        let cached = deepseek_hit.unwrap_or(0);
-        let fresh = deepseek_miss
-            .or_else(|| prompt_total.map(|total| total.saturating_sub(cached)))
-            .unwrap_or(0);
-        if let Some(total) = prompt_total
-            && total != fresh.saturating_add(cached)
-        {
-            tracing::warn!(
-                prompt_tokens = total,
-                prompt_cache_hit_tokens = cached,
-                prompt_cache_miss_tokens = fresh,
-                "DeepSeek usage cache partition does not match prompt_tokens"
-            );
-        }
-        return Some(TokenUsage {
-            input_tokens: fresh,
-            cached_input_tokens: cached,
-            cache_creation_tokens: 0,
-            output_tokens: as_u64(u.get("completion_tokens")).unwrap_or(0),
-        });
-    }
-
-    // Required: prompt_tokens + completion_tokens (either one is enough to
-    // consider this a usage object).
-    let prompt_total = as_u64(u.get("prompt_tokens"));
-    let completion = as_u64(u.get("completion_tokens")).unwrap_or(0);
-    if prompt_total.is_none() && completion == 0 {
-        return None;
-    }
-    let prompt_total = prompt_total.unwrap_or(0);
-
-    let details = u.get("prompt_tokens_details").and_then(Value::as_object);
-    // Two accepted shapes, disambiguated by **field location**:
-    //
-    // - **Inclusive** (OpenAI native, MiniMax, DashScope): cache tokens are
-    //   nested under `prompt_tokens_details`. `prompt_tokens` INCLUDES them;
-    //   fresh = prompt - cached - creation.
-    // - **Disjoint** (Anthropic-native proxied as OpenAI): cache tokens are
-    //   at the TOP LEVEL (`cache_read_input_tokens`, `cache_creation_input_tokens`)
-    //   with no nested details. `prompt_tokens` IS fresh; cache is separate.
-    //
-    // Field location is deterministic and survives the `cached + creation ==
-    // prompt_tokens` boundary, which pure arithmetic cannot. When both
-    // signals coexist (a provider that echoes aliases), prefer inclusive —
-    // that matches the authoritative OpenAI shape.
-    let nested_cached = details.and_then(|d| as_u64(d.get("cached_tokens")));
-    let nested_creation = details.and_then(|d| as_u64(d.get("cache_creation_input_tokens")));
-    let top_cached = as_u64(u.get("cache_read_input_tokens"));
-    let top_creation = as_u64(u.get("cache_creation_input_tokens"));
-
-    let is_inclusive = nested_cached.is_some() || nested_creation.is_some();
-    let cached = nested_cached.or(top_cached).unwrap_or(0);
-    let cache_creation = nested_creation.or(top_creation).unwrap_or(0);
-
-    let fresh = if is_inclusive {
-        // Inclusive: fresh = prompt - cached - creation, saturating for safety
-        // against providers that violate the contract.
-        prompt_total
-            .saturating_sub(cached)
-            .saturating_sub(cache_creation)
-    } else {
-        // Disjoint: prompt_tokens is already fresh.
-        prompt_total
-    };
-
+    let usage = astra_turn_types::runner_inference::normalize_openai_compatible_usage(u)?;
     Some(TokenUsage {
-        input_tokens: fresh,
-        cached_input_tokens: cached,
-        cache_creation_tokens: cache_creation,
-        output_tokens: completion,
+        input_tokens: usage.input.fresh_input_tokens,
+        cached_input_tokens: usage.input.cache_read_tokens,
+        cache_creation_tokens: usage.input.cache_creation_tokens,
+        output_tokens: usage.output_tokens,
     })
 }
 

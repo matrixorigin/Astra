@@ -27,6 +27,30 @@ use serde_json::{Map, Value};
 
 pub use astra_turn_types::ToolInvocationIdentity;
 
+/// Content-free parse diagnostic shared by both ends of the connection. Serde
+/// error messages can quote secret-bearing malformed values or unknown fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EdgeMessageDecodeDiagnostic {
+    pub category: &'static str,
+    pub line: usize,
+    pub column: usize,
+}
+
+impl From<&serde_json::Error> for EdgeMessageDecodeDiagnostic {
+    fn from(error: &serde_json::Error) -> Self {
+        Self {
+            category: match error.classify() {
+                serde_json::error::Category::Io => "io",
+                serde_json::error::Category::Syntax => "syntax",
+                serde_json::error::Category::Data => "data",
+                serde_json::error::Category::Eof => "eof",
+            },
+            line: error.line(),
+            column: error.column(),
+        }
+    }
+}
+
 /// Edge can inject request-scoped provider authorization into one bash
 /// subprocess without receiving file-transfer metadata or bytes.
 pub const RUNTIME_PROCESS_AUTHORIZATION_V1_CAPABILITY: &str = "runtime_process_authorization_v1";
@@ -129,6 +153,59 @@ pub enum EdgeClientMessage {
     /// Edge heartbeat.
     #[serde(rename = "edge_ping")]
     Ping {},
+
+    /// Negotiate inference independently of tool execution. A declaration is
+    /// not authority to publish an executable model.
+    #[serde(rename = "inference_hello")]
+    InferenceHello {
+        protocol_version: u16,
+        journal_id: crate::runner_inference::RunnerInferenceId,
+        process_boot_nonce: crate::runner_inference::RunnerInferenceId,
+    },
+
+    /// Publish or disable one complete public binding revision. Transport
+    /// secrets and caller-claimed principal/session ownership are forbidden.
+    #[serde(rename = "inference_binding_publish")]
+    InferenceBindingPublish {
+        publication: Box<crate::runner_inference::RunnerInferenceBindingPublication>,
+    },
+
+    #[serde(rename = "inference_start_evidence")]
+    InferenceStartEvidence {
+        grant: Box<crate::runner_inference::RunnerInferenceDispatchGrant>,
+        delivery_generation: u64,
+        evidence: crate::runner_inference::RunnerInferenceStartEvidence,
+    },
+
+    /// Provisional normalized provider progress.  It is keyed by the full
+    /// immutable attempt identity; the Server may drop or lag this message,
+    /// but it must never treat it as terminal/usage/tool authority.
+    #[serde(rename = "inference_progress")]
+    InferenceProgress {
+        progress: Box<crate::runner_inference::RunnerInferenceProgressBatch>,
+        delivery_generation: u64,
+    },
+
+    #[serde(rename = "inference_terminal")]
+    InferenceTerminal {
+        transfer: Box<crate::runner_inference::RunnerInferenceTerminalTransfer>,
+        delivery_generation: u64,
+    },
+
+    #[serde(rename = "inference_response_chunk")]
+    InferenceResponseChunk {
+        attempt_id: crate::runner_inference::RunnerInferenceId,
+        delivery_generation: u64,
+        chunk: crate::runner_inference::RunnerInferencePayloadChunk,
+    },
+
+    #[serde(rename = "inference_request_credit")]
+    InferenceRequestCredit {
+        attempt_id: crate::runner_inference::RunnerInferenceId,
+        delivery_generation: u64,
+        next_offset: u32,
+        credit_bytes: u32,
+    },
 }
 
 /// Messages sent from server to edge agent.
@@ -193,9 +270,91 @@ pub enum EdgeServerMessage {
         request_id: String,
         delivery_generation: u64,
     },
+
+    #[serde(rename = "inference_hello_ack")]
+    InferenceHelloAck {
+        negotiation: crate::runner_inference::RunnerInferenceNegotiation,
+    },
+
+    #[serde(rename = "inference_binding_rejected")]
+    InferenceBindingRejected {
+        rejection: crate::runner_inference::RunnerInferenceBindingRejection,
+    },
+
+    #[serde(rename = "inference_binding_ack")]
+    InferenceBindingAck {
+        receipt: crate::runner_inference::RunnerInferenceBindingReceipt,
+    },
+
+    #[serde(rename = "inference_dispatch")]
+    InferenceDispatch {
+        grant: Box<crate::runner_inference::RunnerInferenceDispatchGrant>,
+        delivery_generation: u64,
+    },
+
+    #[serde(rename = "inference_request_chunk")]
+    InferenceRequestChunk {
+        attempt_id: crate::runner_inference::RunnerInferenceId,
+        delivery_generation: u64,
+        chunk: crate::runner_inference::RunnerInferencePayloadChunk,
+    },
+
+    #[serde(rename = "inference_cancel")]
+    InferenceCancel {
+        grant: Box<crate::runner_inference::RunnerInferenceDispatchGrant>,
+        delivery_generation: u64,
+    },
+
+    #[serde(rename = "inference_reconcile")]
+    InferenceReconcile {
+        grant: Box<crate::runner_inference::RunnerInferenceDispatchGrant>,
+        delivery_generation: u64,
+    },
+
+    #[serde(rename = "inference_terminal_ack")]
+    InferenceTerminalAck {
+        ack: Box<crate::runner_inference::RunnerInferenceTerminalAck>,
+        delivery_generation: u64,
+    },
+
+    #[serde(rename = "inference_response_credit")]
+    InferenceResponseCredit {
+        attempt_id: crate::runner_inference::RunnerInferenceId,
+        delivery_generation: u64,
+        next_offset: u32,
+        credit_bytes: u32,
+    },
+
+    #[serde(rename = "inference_rejected")]
+    InferenceRejected {
+        attempt_id: Option<crate::runner_inference::RunnerInferenceId>,
+        reason: crate::runner_inference::RunnerInferenceRejection,
+    },
 }
 
 impl EdgeServerMessage {
+    pub fn is_inference_message(&self) -> bool {
+        match self {
+            Self::InferenceHelloAck { .. }
+            | Self::InferenceBindingRejected { .. }
+            | Self::InferenceBindingAck { .. }
+            | Self::InferenceDispatch { .. }
+            | Self::InferenceRequestChunk { .. }
+            | Self::InferenceCancel { .. }
+            | Self::InferenceReconcile { .. }
+            | Self::InferenceTerminalAck { .. }
+            | Self::InferenceResponseCredit { .. }
+            | Self::InferenceRejected { .. } => true,
+            Self::AuthOk { .. }
+            | Self::AuthError { .. }
+            | Self::Pong { .. }
+            | Self::Closing { .. }
+            | Self::ToolRequest { .. }
+            | Self::ToolCancel { .. }
+            | Self::ToolResultAck { .. } => false,
+        }
+    }
+
     /// Short stable label for diagnostic logging (no payload).
     pub fn diagnostic_kind(&self) -> &'static str {
         match self {
@@ -206,6 +365,16 @@ impl EdgeServerMessage {
             EdgeServerMessage::Closing { .. } => "closing",
             EdgeServerMessage::ToolCancel { .. } => "tool_cancel",
             EdgeServerMessage::ToolResultAck { .. } => "tool_result_ack",
+            EdgeServerMessage::InferenceHelloAck { .. } => "inference_hello_ack",
+            EdgeServerMessage::InferenceBindingRejected { .. } => "inference_binding_rejected",
+            EdgeServerMessage::InferenceBindingAck { .. } => "inference_binding_ack",
+            EdgeServerMessage::InferenceDispatch { .. } => "inference_dispatch",
+            EdgeServerMessage::InferenceRequestChunk { .. } => "inference_request_chunk",
+            EdgeServerMessage::InferenceCancel { .. } => "inference_cancel",
+            EdgeServerMessage::InferenceReconcile { .. } => "inference_reconcile",
+            EdgeServerMessage::InferenceTerminalAck { .. } => "inference_terminal_ack",
+            EdgeServerMessage::InferenceResponseCredit { .. } => "inference_response_credit",
+            EdgeServerMessage::InferenceRejected { .. } => "inference_rejected",
         }
     }
 }
@@ -221,6 +390,115 @@ mod tests {
 
     fn identity() -> ToolInvocationIdentity {
         ToolInvocationIdentity::new("user", "session", "run", "turn", "call").unwrap()
+    }
+
+    #[test]
+    fn malformed_inference_values_never_enter_parse_diagnostics() {
+        let canary = "private-canary-credential";
+        let client_frame = format!(r#"{{"type":"inference_hello","protocol_version":"{canary}"}}"#);
+        let server_frame =
+            format!(r#"{{"type":"inference_hello_ack","negotiation":{{"status":"{canary}"}}}}"#);
+        let client = serde_json::from_str::<EdgeClientMessage>(&client_frame).unwrap_err();
+        let server = serde_json::from_str::<EdgeServerMessage>(&server_frame).unwrap_err();
+        for (frame, error) in [(client_frame, client), (server_frame, server)] {
+            assert!(
+                error.to_string().contains(canary),
+                "fixture must exercise a raw error that would leak"
+            );
+            let diagnostic = EdgeMessageDecodeDiagnostic::from(&error);
+            assert_eq!(diagnostic.category, "data");
+            // Derived-enum data errors may have no exact source location (0).
+            assert!(diagnostic.line <= 1);
+            assert!(diagnostic.column <= frame.len());
+            assert!(!format!("{diagnostic:?}").contains(canary));
+        }
+    }
+
+    #[test]
+    fn inference_negotiation_is_a_separate_strict_protocol_facet() {
+        let message: EdgeClientMessage = serde_json::from_value(json!({
+            "type": "inference_hello", "protocol_version": 1,
+            "journal_id": "journal", "process_boot_nonce": "boot"
+        }))
+        .unwrap();
+        assert!(matches!(
+            message,
+            EdgeClientMessage::InferenceHello {
+                protocol_version: 1,
+                ..
+            }
+        ));
+        for field in [
+            "authorization",
+            "endpoint_url",
+            "user_id",
+            "session_id",
+            "tool",
+            "args",
+        ] {
+            let mut frame = json!({"type": "inference_hello", "protocol_version": 1,
+                "journal_id": "journal", "process_boot_nonce": "boot"});
+            frame[field] = json!("canary-secret");
+            assert!(serde_json::from_value::<EdgeClientMessage>(frame).is_err());
+        }
+        let response = EdgeServerMessage::InferenceHelloAck {
+            negotiation: crate::runner_inference::RunnerInferenceNegotiation::accepted(1, 7, 1000),
+        };
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            json!({
+                "type": "inference_hello_ack", "negotiation": {"status": "accepted", "protocol_version": 1,
+                    "delivery_generation": 7, "max_artifact_bytes": 16777216, "server_unix_ms": 1000}
+            })
+        );
+    }
+
+    #[test]
+    fn inference_progress_roundtrips_as_bounded_non_authoritative_batches() {
+        let attempt: crate::runner_inference::RunnerInferenceAttemptIdentity =
+            serde_json::from_value(json!({
+                "user_id": "user-progress",
+                "scope": {
+                    "kind": "session", "session_id": "session-progress",
+                    "turn": 1, "round": 0, "operation_id": "primary_agent",
+                    "logical_attempt": 0
+                },
+                "invocation_id": "invocation-progress",
+                "attempt_id": "attempt-progress",
+                "binding": {
+                    "runner_id": "runner-progress", "journal_id": "journal-progress",
+                    "binding_id": "binding-progress", "binding_revision": 1,
+                    "profile_revision": 1
+                },
+                "request": {
+                    "artifact_id": "request-progress",
+                    "sha256": "d".repeat(64), "byte_len": 1
+                }
+            }))
+            .unwrap();
+        let message = EdgeClientMessage::InferenceProgress {
+            progress: Box::new(
+                crate::runner_inference::RunnerInferenceProgressBatch::new(
+                    attempt,
+                    vec![crate::runner_inference::RunnerInferenceProgressEvent {
+                        sequence: 0,
+                        event: crate::runner_inference::RunnerInferenceProviderEvent::Json(
+                            json!({"choices":[{"delta":{"content":"preview"}}]}),
+                        ),
+                    }],
+                )
+                .unwrap(),
+            ),
+            delivery_generation: 7,
+        };
+        let encoded = serde_json::to_value(&message).unwrap();
+        assert_eq!(encoded["type"], "inference_progress");
+        assert_eq!(encoded["delivery_generation"], 7);
+        let decoded: EdgeClientMessage = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+        let mut with_unknown = encoded;
+        with_unknown["progress"]["unexpected"] = json!("must-reject");
+        assert!(serde_json::from_value::<EdgeClientMessage>(with_unknown).is_err());
     }
 
     #[test]
