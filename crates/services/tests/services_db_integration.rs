@@ -64,6 +64,57 @@ async fn setup_pool_and_settings() -> (SharedPool, MatrixOneSettings) {
     common::setup_pool_and_settings().await
 }
 
+#[tokio::test]
+#[ignore = "requires live MatrixOne (ASTRA_TEST_DB_IT=1)"]
+async fn session_creation_returns_database_generated_fields_after_commit() {
+    let (shared, settings) = setup_pool_and_settings().await;
+    let pool = shared.get().clone();
+    let user_id = format!("session-create-it-{}", Uuid::new_v4());
+    let service = DatabaseSessionService::new(settings).with_pool(shared);
+    let metadata = serde_json::Map::from_iter([("marker".into(), serde_json::json!(user_id))]);
+    let record = service
+        .create_session(
+            user_id.clone(),
+            astra_services::auth::session::SessionCreateRequestData {
+                title: Some("Session creation visibility".into()),
+                agent_id: Some("test-agent".into()),
+                metadata: Some(metadata.clone()),
+            },
+        )
+        .await
+        .expect("create session and commit");
+
+    assert_eq!(record.user_id, user_id);
+    assert_eq!(record.metadata, metadata);
+    assert_eq!(record.title.as_deref(), Some("Session creation visibility"));
+    assert_eq!(record.agent_id.as_deref(), Some("test-agent"));
+    assert_eq!(record.status, "active");
+    assert_eq!(record.event_count, 0);
+    chrono::NaiveDateTime::parse_from_str(&record.created_at, "%Y-%m-%dT%H:%M:%S")
+        .expect("database-generated creation timestamp");
+    assert_eq!(
+        record.updated_at.as_deref(),
+        Some(record.created_at.as_str())
+    );
+    assert_eq!(record.ended_at, None);
+
+    // Do not verify persistence with an immediate pooled SELECT: its snapshot
+    // may predate the commit. The separate transaction contract test guards the
+    // read-before-commit ordering; this test checks the database-decoded result.
+
+    for table in [
+        "agent_sessions",
+        "agent_session_lifecycle_fences",
+        "auth_audit_logs",
+    ] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE user_id = ?"))
+            .bind(&user_id)
+            .execute(&pool)
+            .await
+            .expect("clean up test-owned rows");
+    }
+}
+
 async fn cleanup_skills_by_ids(pool: &sqlx::Pool<sqlx::MySql>, ids: &[String]) {
     for id in ids {
         let _ = sqlx::query("DELETE FROM skills_registry WHERE skill_id = ?")

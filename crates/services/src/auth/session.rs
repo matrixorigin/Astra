@@ -358,7 +358,7 @@ impl DatabaseSessionService {
 
     async fn fetch_session_for_user(
         &self,
-        pool: &sqlx::Pool<MySql>,
+        executor: impl sqlx::Executor<'_, Database = MySql>,
         session_id: &str,
         user_id: &str,
     ) -> Result<Option<SessionRecord>, (StatusCode, Json<ErrorResponse>)> {
@@ -372,7 +372,7 @@ impl DatabaseSessionService {
         )
         .bind(session_id)
         .bind(user_id)
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
         .map_err(internal_error)?
         .map(session_record_from_row)
@@ -461,12 +461,15 @@ impl SessionService for DatabaseSessionService {
         .execute(&mut *tx)
         .await
         .map_err(internal_error)?;
-        tx.commit().await.map_err(internal_error)?;
-
+        // Read our own insert in the same transaction. A new pooled transaction
+        // can use an older MatrixOne snapshot and miss a successfully committed
+        // session. Keep database-generated fields, but only return after commit
+        // succeeds so a commit failure cannot be reported as successful creation.
         let record = self
-            .fetch_session_for_user(&pool, &session_id, &user_id)
+            .fetch_session_for_user(&mut *tx, &session_id, &user_id)
             .await?
             .ok_or_else(|| internal_error("failed to read created session"))?;
+        tx.commit().await.map_err(internal_error)?;
         let details = serde_json::json!({
             "title": record.title,
             "agent_id": record.agent_id,
