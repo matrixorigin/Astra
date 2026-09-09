@@ -52,7 +52,7 @@ fn collect_simple_commands(node: Node<'_>, source: &str, commands: &mut Vec<Vec<
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum CommandWord {
     Literal(String),
     Dynamic {
@@ -253,20 +253,11 @@ fn analyze_bash_risks_ast_inner(command: &str, shell_depth: usize) -> Vec<Comman
                     ctx.push(CommandRisk::RemoteCodeExecution);
                 }
                 DestructiveCommandResolution::Safe => {}
-            }
-            match nested_shell_script(&words) {
-                NestedShellScript::Script(script) if shell_depth < 16 => {
-                    // Quoted `sh -c` input is a new shell program, unlike
-                    // heredoc input to Python/Node. Parse it as Bash so a real
-                    // destructive command cannot hide behind a shell wrapper.
-                    for risk in analyze_bash_risks_ast_inner(script, shell_depth + 1) {
+                DestructiveCommandResolution::ChildRisks(risks) => {
+                    for risk in risks {
                         ctx.push(risk);
                     }
                 }
-                NestedShellScript::Script(_) | NestedShellScript::Ambiguous => {
-                    ctx.push(CommandRisk::RemoteCodeExecution);
-                }
-                NestedShellScript::None => {}
             }
         }
         let mut cursor = node.walk();
@@ -324,10 +315,13 @@ fn nested_shell_script(words: &[CommandWord]) -> NestedShellScript<'_> {
         let Some(argument) = word.literal() else {
             return NestedShellScript::Ambiguous;
         };
-        if argument == "--"
-            || argument == "-"
-            || (!argument.starts_with('-') && !argument.starts_with('+'))
-        {
+        if argument == "--" || argument == "-" {
+            return match words.get(argument_index + 1) {
+                Some(CommandWord::Dynamic { .. }) => NestedShellScript::Ambiguous,
+                _ => NestedShellScript::None,
+            };
+        }
+        if !argument.starts_with('-') && !argument.starts_with('+') {
             return NestedShellScript::None;
         }
 
@@ -417,6 +411,7 @@ const DESTRUCTIVE_COMMANDS: &[&str] = &[
 enum DestructiveCommandResolution {
     Safe,
     Destructive(String),
+    ChildRisks(Vec<CommandRisk>),
     Ambiguous,
 }
 
@@ -449,11 +444,8 @@ fn resolve_destructive_command(
         }
         NestedShellScript::Script(script) => {
             let nested_risks = analyze_bash_risks_ast_inner(script, shell_depth + 1);
-            if let Some(name) = nested_risks.into_iter().find_map(|risk| match risk {
-                CommandRisk::DestructiveCommand(name) => Some(name),
-                _ => None,
-            }) {
-                return DestructiveCommandResolution::Destructive(name);
+            if !nested_risks.is_empty() {
+                return DestructiveCommandResolution::ChildRisks(nested_risks);
             }
         }
         NestedShellScript::Ambiguous => return DestructiveCommandResolution::Ambiguous,
@@ -1052,7 +1044,6 @@ fn resolve_xargs_command(
 ) -> DestructiveCommandResolution {
     const OPTIONS_WITH_VALUE: &[&str] = &[
         "-E",
-        "-I",
         "-L",
         "-n",
         "--max-args",
@@ -1066,8 +1057,8 @@ fn resolve_xargs_command(
         "-d",
         "--delimiter",
     ];
-    const LONG_OPTIONS_WITH_OPTIONAL_INLINE_VALUE: &[&str] = &["--eof", "--replace", "--max-lines"];
-    const OPTIONS_WITH_ATTACHED_VALUE: &[&str] = &["-E", "-I", "-L", "-n", "-P", "-s", "-a", "-d"];
+    const LONG_OPTIONS_WITH_OPTIONAL_INLINE_VALUE: &[&str] = &["--eof", "--max-lines"];
+    const OPTIONS_WITH_ATTACHED_VALUE: &[&str] = &["-E", "-L", "-n", "-P", "-s", "-a", "-d"];
     const FLAGS: &[&str] = &[
         "-0",
         "--null",
@@ -1083,6 +1074,7 @@ fn resolve_xargs_command(
     ];
     const TERMINAL_FLAGS: &[&str] = &["--help", "--version"];
 
+    let mut replacement = None;
     let mut index = 0;
     while let Some(word) = words.get(index) {
         let Some(argument) = word.literal() else {
@@ -1098,6 +1090,27 @@ fn resolve_xargs_command(
         let option = argument.split_once('=').map_or(argument, |(name, _)| name);
         if TERMINAL_FLAGS.contains(&argument) {
             return DestructiveCommandResolution::Safe;
+        }
+        if argument == "-I" {
+            let Some(value) = words.get(index + 1).and_then(CommandWord::literal) else {
+                return DestructiveCommandResolution::Ambiguous;
+            };
+            replacement = Some(value);
+            index += 2;
+            continue;
+        }
+        if let Some(value) = argument
+            .strip_prefix("-I")
+            .filter(|value| !value.is_empty())
+        {
+            replacement = Some(value);
+            index += 1;
+            continue;
+        }
+        if option == "--replace" {
+            replacement = Some(argument.split_once('=').map_or("{}", |(_, value)| value));
+            index += 1;
+            continue;
         }
         if LONG_OPTIONS_WITH_OPTIONAL_INLINE_VALUE.contains(&option) {
             index += 1;
@@ -1130,8 +1143,48 @@ fn resolve_xargs_command(
     if index == words.len() {
         DestructiveCommandResolution::Safe
     } else {
-        resolve_destructive_command(&words[index..], shell_depth)
+        match replacement {
+            Some(marker) => resolve_replaced_command(&words[index..], marker, false, shell_depth),
+            None => {
+                // Input supplies an unknown argv suffix, not just data: it can
+                // complete an unfinished launcher or shell option boundary.
+                let mut child = words[index..].to_vec();
+                child.push(CommandWord::Dynamic {
+                    may_split: true,
+                    proven_find_path: false,
+                });
+                resolve_destructive_command(&child, shell_depth)
+            }
+        }
     }
+}
+
+/// Replacement preserves argv boundaries but not literal contents. Reuse the
+/// normal resolver so data arguments stay allowed while executable/script and
+/// option boundaries must still be statically known.
+fn resolve_replaced_command(
+    words: &[CommandWord],
+    marker: &str,
+    replace_executable: bool,
+    shell_depth: usize,
+) -> DestructiveCommandResolution {
+    if marker.is_empty() {
+        return DestructiveCommandResolution::Ambiguous;
+    }
+    let replaced: Vec<_> = words
+        .iter()
+        .enumerate()
+        .map(|(index, word)| match word.literal() {
+            Some(value) if (replace_executable || index > 0) && value.contains(marker) => {
+                CommandWord::Dynamic {
+                    may_split: false,
+                    proven_find_path: false,
+                }
+            }
+            _ => word.clone(),
+        })
+        .collect();
+    resolve_destructive_command(&replaced, shell_depth)
 }
 
 fn resolve_find_commands(
@@ -1140,6 +1193,7 @@ fn resolve_find_commands(
 ) -> DestructiveCommandResolution {
     let mut index = 0;
     let mut expression_started = false;
+    let mut child_risks = Vec::new();
     while index < words.len() {
         let Some(argument) = words[index].literal() else {
             // Quoting proves one argv entry, but not that its value is a path:
@@ -1182,13 +1236,19 @@ fn resolve_find_commands(
         {
             return DestructiveCommandResolution::Ambiguous;
         }
-        match resolve_destructive_command(&words[command_start..command_end], shell_depth) {
+        match resolve_replaced_command(&words[command_start..command_end], "{}", true, shell_depth)
+        {
             DestructiveCommandResolution::Safe => {}
+            DestructiveCommandResolution::ChildRisks(risks) => child_risks.extend(risks),
             result => return result,
         }
         index = command_end + 1;
     }
-    DestructiveCommandResolution::Safe
+    if child_risks.is_empty() {
+        DestructiveCommandResolution::Safe
+    } else {
+        DestructiveCommandResolution::ChildRisks(child_risks)
+    }
 }
 
 fn is_find_expression_start(argument: &str) -> bool {
@@ -1196,6 +1256,12 @@ fn is_find_expression_start(argument: &str) -> bool {
 }
 
 fn find_predicate_operand_count(argument: &str) -> usize {
+    if let Some(suffix) = argument.strip_prefix("-newer") {
+        let bytes = suffix.as_bytes();
+        if bytes.len() == 2 && b"acmB".contains(&bytes[0]) && b"acmBt".contains(&bytes[1]) {
+            return 1;
+        }
+    }
     match argument {
         "-fprintf" => 2,
         "-name" | "-iname" | "-path" | "-ipath" | "-wholename" | "-iwholename" | "-regex"
